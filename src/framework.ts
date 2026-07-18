@@ -79,10 +79,17 @@ import { splitProseSegments } from './prose-segments.js';
  * `send_message` followed by "sent it" from double-posting, but a new message
  * starts a new conversational round and must be answerable with plain prose.
  * `skip_reply` ends the turn at the tool-result boundary.
+ *
+ * ROUTING_NO_SILENCE_ON_SEND=true narrows the set to `skip_reply` only:
+ * delivery tools no longer suppress prose routing, trading occasional
+ * double-posts for never dropping a reply (e.g. when the explicit send
+ * fails but still silences the turn).
  */
-const SILENCING_TOOLS = new Set([
-  'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
-]);
+const SILENCING_TOOLS = new Set(
+  process.env.ROUTING_NO_SILENCE_ON_SEND === 'true'
+    ? ['skip_reply']
+    : ['skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm'],
+);
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
