@@ -311,6 +311,17 @@ interface ChannelRegistryOptions {
    * wins), BEFORE `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /**
+   * Configured HOME channel for turns with no channel provenance (heartbeats,
+   * timers, subagent completions). Without it, such a turn's plain-text speech
+   * falls through to `defaultPublishChannel` — the most-recent inbound across
+   * ALL channels — so a heartbeat check-in lands in whatever channel last had
+   * activity, including public ones. Consulted AFTER `homeChannelResolver` and
+   * `activeChannelResolver` (a fork's home / a real triggering channel always
+   * wins), BEFORE `defaultPublishChannel`. Composite channel-id form, e.g.
+   * `discord:{guildId}:{channelId}`.
+   */
+  homeChannel?: string;
 }
 
 // ============================================================================
@@ -337,6 +348,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
+  private homeChannel?: string;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
@@ -388,6 +400,7 @@ export class ChannelRegistry {
     this.onRouteFailure = options?.onRouteFailure;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.homeChannel = options?.homeChannel;
     this.store = options?.store;
     this.initializeLifecycleStore();
   }
@@ -869,7 +882,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = home ?? active ?? this.homeChannel ?? this.defaultPublishChannel;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1448,11 +1461,16 @@ export class ChannelRegistry {
    * the speech simply stays in chronicle + module surfaces).
    */
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default). Public so a multi-segment caller can snapshot it
-   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
+   *  configured home channel → process-global default). Public so a
+   *  multi-segment caller can snapshot it ONCE and pin every segment to it via
+   *  routeSpeech's `overrideChannelId`. */
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return home
+      ?? this.activeChannelResolver?.(conversationId)
+      ?? this.homeChannel
+      ?? this.defaultPublishChannel
+      ?? null;
   }
 
   async routeSpeech(
@@ -1488,8 +1506,11 @@ export class ChannelRegistry {
     //      inference, so a concurrent inbound elsewhere can't hijack the reply
     //      (item-3 redux, trunk agents). Also carries DM channels, which arrive
     //      as push/events and never touch `defaultPublishChannel`.
-    //   3. the process-global `defaultPublishChannel` — last resort for turns
-    //      with no triggering channel (heartbeats, timers).
+    //   3. the configured `homeChannel` — where turns with no triggering
+    //      channel (heartbeats, timers) belong, so a check-in never lands in
+    //      whatever channel last had unrelated activity.
+    //   4. the process-global `defaultPublishChannel` — last resort when no
+    //      home channel is configured.
     // Using the global for a fork or a concurrent trunk turn is the item-3 bug:
     // it tracks the most-recent inbound across ALL channels, so a reply lands
     // wherever a message last happened to arrive rather than where it belongs.
