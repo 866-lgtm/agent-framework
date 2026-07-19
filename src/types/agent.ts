@@ -2,6 +2,12 @@ import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 
+export type SameRoundThinkTextPolicy = 'public' | 'private';
+export type SameRoundThinkTextPolicySource =
+  | 'runtime_override'
+  | 'recipe'
+  | 'compatibility_default';
+
 /**
  * Configuration for an agent.
  */
@@ -66,6 +72,11 @@ export interface AgentConfig {
    * and server-side compaction settings). */
   providerParams?: Record<string, unknown>;
   /**
+   * Same-round routing policy for ordinary text emitted beside `think`.
+   * Omitted preserves the compatibility carry-forward: public.
+   */
+  sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /**
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
    * with cryptographic signatures, and the API enforces `temperature: 1`
@@ -112,12 +123,15 @@ export interface AgentRuntimeSettingsPatch {
   contextBudgetTokens?: number;
   tailTokens?: number;
   transitionPaceTokens?: number;
+  sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
 }
 
 export interface AgentRuntimeSettingsSnapshot {
   contextBudgetTokens: number;
   tailTokens?: number;
   transitionPaceTokens?: number;
+  sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
+  sameRoundThinkTextPolicySource: SameRoundThinkTextPolicySource;
   transition: 'stable' | 'converging' | 'blocked';
   transitionReason?: 'transition_pace_too_small' | 'protected_context_exceeds_target';
 }

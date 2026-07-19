@@ -17,6 +17,8 @@ import type {
 import type {
   AgentConfig,
   AgentState,
+  SameRoundThinkTextPolicy,
+  SameRoundThinkTextPolicySource,
   PendingToolCall,
   CompletedToolCall,
   ToolCallId,
@@ -33,6 +35,7 @@ import type {
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
+const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
  * An agent wraps a context manager and manages inference state.
@@ -63,6 +66,7 @@ export class Agent {
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
+  readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -76,6 +80,7 @@ export class Agent {
   private readonly configuredContextBudgetTokens?: number;
   private readonly configuredTailTokens?: number;
   private readonly configuredTransitionPaceTokens?: number;
+  private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   private contextBudgetTargetTokens?: number;
   private runtimeSettingsOverrides: AgentRuntimeSettingsOverrides = {};
   private contextManager: ContextManager;
@@ -97,6 +102,7 @@ export class Agent {
     this.refusalHandling = config.refusalHandling;
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.providerParams = config.providerParams;
+    this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
@@ -105,6 +111,7 @@ export class Agent {
     const hot = this.getHotContextSettings();
     this.configuredTailTokens = hot?.tailTokens;
     this.configuredTransitionPaceTokens = hot?.transitionPaceTokens;
+    this.configuredSameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
   }
 
   /**
@@ -202,6 +209,8 @@ export class Agent {
       ...(hot?.transitionPaceTokens !== undefined
         ? { transitionPaceTokens: hot.transitionPaceTokens }
         : {}),
+      sameRoundThinkTextPolicy: this.getEffectiveSameRoundThinkTextPolicy(),
+      sameRoundThinkTextPolicySource: this.getSameRoundThinkTextPolicySource(),
       transition: this.contextBudgetTargetTokens === undefined
         ? 'stable'
         : hot?.blocked
@@ -217,6 +226,22 @@ export class Agent {
 
   getRuntimeSettingsOverrides(): AgentRuntimeSettingsOverrides {
     return { ...this.runtimeSettingsOverrides };
+  }
+
+  getEffectiveSameRoundThinkTextPolicy(): SameRoundThinkTextPolicy {
+    return this.runtimeSettingsOverrides.sameRoundThinkTextPolicy
+      ?? this.configuredSameRoundThinkTextPolicy
+      ?? DEFAULT_SAME_ROUND_THINK_TEXT_POLICY;
+  }
+
+  getSameRoundThinkTextPolicySource(): SameRoundThinkTextPolicySource {
+    if (this.runtimeSettingsOverrides.sameRoundThinkTextPolicy !== undefined) {
+      return 'runtime_override';
+    }
+    if (this.configuredSameRoundThinkTextPolicy !== undefined) {
+      return 'recipe';
+    }
+    return 'compatibility_default';
   }
 
   updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
@@ -263,13 +288,17 @@ export class Agent {
       this.runtimeSettingsOverrides.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
     }
     for (const [key, value] of Object.entries(patch)) {
-      if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, number>)[key] = value;
+      if (key === 'sameRoundThinkTextPolicy') continue;
+      if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, unknown>)[key] = value;
+    }
+    if (patch.sameRoundThinkTextPolicy !== undefined) {
+      this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
     }
     return this.getRuntimeSettings();
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
-    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens']);
+    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     const hotPatch: {
@@ -312,6 +341,9 @@ export class Agent {
     if (reset.has('transitionPaceTokens')) {
       delete this.runtimeSettingsOverrides.transitionPaceTokens;
     }
+    if (reset.has('sameRoundThinkTextPolicy')) {
+      delete this.runtimeSettingsOverrides.sameRoundThinkTextPolicy;
+    }
     return this.getRuntimeSettings();
   }
 
@@ -347,6 +379,11 @@ export class Agent {
     if (patch.transitionPaceTokens !== undefined &&
         (!Number.isSafeInteger(patch.transitionPaceTokens) || patch.transitionPaceTokens <= 0)) {
       throw new Error('transitionPaceTokens must be a positive safe integer');
+    }
+    if (patch.sameRoundThinkTextPolicy !== undefined &&
+        patch.sameRoundThinkTextPolicy !== 'public' &&
+        patch.sameRoundThinkTextPolicy !== 'private') {
+      throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
     }
     if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
         !this.getHotContextSettings()) {

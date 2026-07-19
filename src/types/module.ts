@@ -96,6 +96,39 @@ export interface Module {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
+
+  /**
+   * Declare extra settings for the synthesized `agent_settings` tool.
+   * Modules owning hot-tunable runtime state (e.g. a host settings module
+   * managing extended-thinking toggles) expose it here instead of registering
+   * their own tools — one settings surface for the agent instead of N.
+   * The framework merges the declared fields into agent_settings' schema and
+   * routes get/update/reset for the declared keys back to the extension.
+   */
+  getAgentSettingsExtension?(): AgentSettingsExtension;
+}
+
+/**
+ * A module-owned extension of the `agent_settings` tool: extra hot-tunable
+ * fields merged into the tool schema, with get/update/reset routed to the
+ * declaring module. Keys must not collide with the core settings
+ * (context_budget_tokens, tail_tokens, transition_pace_tokens) or with other
+ * extensions — colliding extensions are skipped loudly.
+ */
+export interface AgentSettingsExtension {
+  /** JSON-schema property definitions for the extension's fields, merged into
+   *  the agent_settings input schema (e.g. { reasoning_enabled: { type: 'boolean', … } }). */
+  properties: Record<string, unknown>;
+  /** The setting keys this extension owns (must match `properties` keys). */
+  keys: string[];
+  /** Current values for the extension's keys. */
+  get(agentName: string): Record<string, unknown>;
+  /** Apply a partial update (only this extension's keys present) and return
+   *  the new values. Throw to surface a validation error to the agent. */
+  update(agentName: string, patch: Record<string, unknown>): Record<string, unknown>;
+  /** Restore the listed keys (or all when omitted) to defaults and return the
+   *  new values. Optional — extensions without reset semantics are skipped. */
+  reset?(agentName: string, keys?: string[]): Record<string, unknown>;
 }
 
 /**

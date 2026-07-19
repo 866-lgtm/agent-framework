@@ -133,6 +133,11 @@ export interface ReadInput {
   limit?: number;
 }
 
+export interface ReadImageInput {
+  /** Image file path (mount-prefixed, e.g., "project/assets/logo.png") */
+  path: string;
+}
+
 export interface WriteInput {
   /** File path (mount-prefixed) */
   path: string;

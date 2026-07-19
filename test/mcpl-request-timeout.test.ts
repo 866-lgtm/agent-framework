@@ -160,3 +160,30 @@ test('a late STATEFUL orphaned response is surfaced via mcpl:orphaned-response (
   const list = await connection.sendToolsList();
   assert.equal(list.tools.length, 1);
 });
+
+test('a mandatory call deadline overrides requestTimeoutMs: 0 and surfaces its late response', async () => {
+  const SLOW_SERVER = HUNG_SERVER.replace(
+    '// tools/call: deliberately NO response, connection stays open.',
+    "else if (m.method === 'tools/call') setTimeout(() => reply({ content: [] }), 300);",
+  );
+  connection = await McplServerConnection.connect(
+    { id: 'mandatory-deadline', command: process.execPath, args: ['-e', SLOW_SERVER], requestTimeoutMs: 0 },
+    HOST_CAPS,
+  );
+  connection.ready();
+
+  const orphaned: Array<{ method?: string; hadState: boolean }> = [];
+  connection.on('orphaned-response', (info) => orphaned.push(info));
+  await assert.rejects(
+    connection.sendToolsCallWithDeadline('stuck', {}, 75),
+    /outcome is unknown.*verify state before retrying/i,
+  );
+  await new Promise((r) => setTimeout(r, 350));
+
+  assert.deepEqual(orphaned, [{
+    method: 'tools/call',
+    hadState: false,
+    hadCheckpoint: false,
+    id: 1,
+  }]);
+});

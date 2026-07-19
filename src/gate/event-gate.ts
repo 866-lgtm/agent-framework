@@ -72,6 +72,10 @@ interface PendingEvent {
    *  of a message the agent may have long since handled. */
   inContext: boolean;
   channelId?: string;
+  /** Human-readable channel name (e.g. Discord channel name) when the event's
+   *  metadata carries one — batched-wake lines render this instead of the raw
+   *  composite channel id. */
+  channelLabel?: string;
 }
 
 interface DebounceState {
@@ -1029,6 +1033,10 @@ export class EventGate {
       timestamp: Date.now(),
       inContext: info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event',
       channelId: info.channelId || undefined,
+      channelLabel:
+        typeof info.metadata?.channelName === 'string' && info.metadata.channelName
+          ? (info.metadata.channelName as string)
+          : undefined,
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1087,15 +1095,19 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { count: number; oldest: number }>();
+      const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
         const key = e.channelId ?? '(unknown channel)';
-        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp };
+        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
+        entry.label = entry.label ?? e.channelLabel;
         byChannel.set(key, entry);
       }
-      for (const [channel, { count, oldest }] of byChannel) {
+      for (const [channelId, { count, oldest, label }] of byChannel) {
+        // Prefer the human-readable name; keep the id parenthesized so the
+        // agent can still address tools that want the composite id.
+        const channel = label ? `#${label} (${channelId})` : channelId;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +

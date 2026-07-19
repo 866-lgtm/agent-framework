@@ -47,6 +47,8 @@ import type {
   AgentRuntimeSettingsPatch,
   AgentRuntimeSettingsOverrides,
   AgentRuntimeSettingsSnapshot,
+  AgentSettingsExtension,
+  SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
@@ -60,6 +62,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import type { WorkspaceModule } from './modules/workspace/index.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
 import { splitProseSegments } from './prose-segments.js';
 
@@ -71,8 +74,8 @@ import { splitProseSegments } from './prose-segments.js';
  *   - explicit delivery tools (channel_publish / *send_message /
  *     *reply_message / *send_dm) — already sent the message, so routing the
  *     prose again would double-post.
- * `think` is deliberately NOT here: it is silent *reasoning*, but prose
- * written around a think is the agent's actual voice and must be delivered.
+ * `think` is deliberately NOT here: it is silent *reasoning*, and same-round
+ * prose beside it is governed separately by same_round_think_text_policy.
  *
  * Scope: an explicit delivery suppresses prose from that round onward until
  * another external message is injected. The suppression prevents a
@@ -130,6 +133,9 @@ const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /** Maximum number of turn checkpoints to keep per agent. */
 const MAX_TURN_CHECKPOINTS = 20;
+const DEFAULT_DISCORD_AWARENESS_DEADLINE_MS = 10_000;
+const MIN_DISCORD_AWARENESS_DEADLINE_MS = 50;
+const MAX_DISCORD_AWARENESS_DEADLINE_MS = 60_000;
 
 interface TurnCheckpoint {
   agentName: string;
@@ -139,9 +145,41 @@ interface TurnCheckpoint {
   timestamp: number;
 }
 
+type DiscordAwarenessDrainOutcome =
+  | { status: 'delivered'; delivered: number; failed: number }
+  | { status: 'unavailable'; accounted: number };
+
+interface DiscordAwarenessBarrier {
+  generation: number;
+  requiresBarrier: boolean;
+  promise: Promise<DiscordAwarenessDrainOutcome>;
+}
+
+function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
+  }
+  return Math.max(
+    MIN_DISCORD_AWARENESS_DEADLINE_MS,
+    Math.min(MAX_DISCORD_AWARENESS_DEADLINE_MS, Math.floor(value)),
+  );
+}
+
+class DiscordAwarenessAccountingError extends Error {
+  constructor(operation: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Discord awareness accounting failed during ${operation}: ${detail}`, { cause });
+    this.name = 'DiscordAwarenessAccountingError';
+  }
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
+}
+
+interface InferenceToolSnapshot {
+  sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
 }
 
 /**
@@ -329,7 +367,7 @@ export class AgentFramework {
   private maintenanceRunId = 0;
   private currentMaintenanceRun: ContextMaintenanceRun | null = null;
   private maintenanceHistory: ContextMaintenanceRun[] = [];
-  /** Last time we console-warned about stale (busy-requeued) inference requests, per agent. */
+  /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
@@ -470,10 +508,12 @@ export class AgentFramework {
   /** Durable, non-Chronicle projection queue for messages removed by a branch. */
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
+  private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
-  private discordAwarenessDrains: Map<string, Promise<void>> = new Map();
-  /** Reconnect traffic waits for the marker reconciliation started by that reconnect. */
-  private discordAwarenessBarriers: Map<string, Promise<void>> = new Map();
+  private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
+  /** Framework-global inference gate; older generations cannot release it. */
+  private discordAwarenessBarrier: DiscordAwarenessBarrier | null = null;
+  private discordAwarenessBarrierGeneration = 0;
 
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
@@ -496,6 +536,7 @@ export class AgentFramework {
     timeZone: string,
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
+    discordAwarenessDeadlineMs: number,
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -509,6 +550,7 @@ export class AgentFramework {
     this.timeZone = timeZone;
     this.discordAwarenessOutbox = discordAwarenessOutbox;
     this.discordAwarenessEmoji = discordAwarenessEmoji;
+    this.discordAwarenessDeadlineMs = discordAwarenessDeadlineMs;
     this.queue = new ProcessQueueImpl();
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
@@ -609,6 +651,7 @@ export class AgentFramework {
       resolveTimeZone(config.timeZone),
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
+      normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
     );
 
     // If an offline recovery process crashed after switching Chronicle but
@@ -626,12 +669,10 @@ export class AgentFramework {
           );
         }
       } catch (error) {
-        // Recovery markers are important, but a malformed sidecar must not
-        // prevent the safe Chronicle branch itself from starting.
-        console.error(
-          '[discord-awareness] could not recover prepared marker batches:',
-          error instanceof Error ? error.message : error,
-        );
+        // The branch may be safe, but reporting the framework ready while its
+        // durable awareness projection is unreadable creates a half-ready
+        // host whose data plane can never be released safely.
+        throw new DiscordAwarenessAccountingError('startup reconciliation', error);
       }
     }
 
@@ -897,10 +938,9 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
-    const allTools = this.getAllTools();
     const queued = [...this.agents.values()].flatMap((agent) => {
       const cm = agent.getContextManager();
-      const tools = allTools.filter((tool) => agent.canUseTool(tool.name));
+      const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
       cm.setToolDefinitions(tools);
       if (cm.isReady()) return [];
       const pending = cm.getPendingWork()?.description;
@@ -1104,8 +1144,136 @@ export class AgentFramework {
       ...this.mcplTools,
       ...channelTools,
       ...gateTools,
-      AgentFramework.AGENT_SETTINGS_TOOL,
+      this.buildAgentSettingsTool(),
+      ...(this.getWorkspaceModule() ? [AgentFramework.SAVE_IMAGE_TOOL] : []),
     ];
+  }
+
+  /** The registered workspace module, if any (used by save_image). */
+  private getWorkspaceModule(): WorkspaceModule | undefined {
+    const module = this.moduleRegistry.getAllModules().find((m) => m.name === 'workspace');
+    return module && typeof (module as WorkspaceModule).writeBinary === 'function'
+      ? (module as WorkspaceModule)
+      : undefined;
+  }
+
+  /** Core agent_settings keys — extension keys must not collide with these. */
+  private static readonly AGENT_SETTINGS_CORE_KEYS = [
+    'context_budget_tokens',
+    'tail_tokens',
+    'transition_pace_tokens',
+    'same_round_think_text_policy',
+  ];
+
+  /**
+   * Collect module-declared agent_settings extensions (Module.getAgentSettingsExtension),
+   * keyed by owning module name. Extensions whose keys collide with the core
+   * settings or an earlier extension are skipped loudly — silent shadowing
+   * would make updates route to the wrong owner.
+   */
+  private collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension> {
+    const result = new Map<string, AgentSettingsExtension>();
+    const taken = new Set<string>(AgentFramework.AGENT_SETTINGS_CORE_KEYS);
+    for (const module of this.moduleRegistry.getAllModules()) {
+      const ext = module.getAgentSettingsExtension?.();
+      if (!ext) continue;
+      const collision = ext.keys.find((k) => taken.has(k));
+      if (collision) {
+        console.error(
+          `[agent-settings] extension from module '${module.name}' skipped: key '${collision}' already taken`,
+        );
+        continue;
+      }
+      ext.keys.forEach((k) => taken.add(k));
+      result.set(module.name, ext);
+    }
+    return result;
+  }
+
+  private captureInferenceToolSnapshot(agent: Agent): InferenceToolSnapshot {
+    return {
+      sameRoundThinkTextPolicy: agent.getEffectiveSameRoundThinkTextPolicy(),
+    };
+  }
+
+  private buildThinkTool(
+    policy: SameRoundThinkTextPolicy,
+  ): import('./types/index.js').ToolDefinition {
+    return {
+      name: 'think',
+      description:
+        'Reason privately. The think({content}) argument stays in your own context and is NOT sent ' +
+        'to channels or other surfaces. ' +
+        (policy === 'private'
+          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
+          : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
+        ) +
+        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy. To deliberately not reply this turn, call skip_reply instead.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          content: {
+            type: 'string',
+            description: 'Your private thought / reasoning (optional; not sent anywhere).',
+          },
+        },
+        required: [],
+      },
+    };
+  }
+
+  /** agent_settings tool definition with module extension fields merged in. */
+  private buildAgentSettingsTool(): import('./types/index.js').ToolDefinition {
+    const base = AgentFramework.AGENT_SETTINGS_TOOL;
+    const extensions = this.collectAgentSettingsExtensions();
+    if (extensions.size === 0) return base;
+    const baseSchema = base.inputSchema as {
+      type: string;
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+    const extProperties: Record<string, unknown> = {};
+    const extKeys: string[] = [];
+    for (const ext of extensions.values()) {
+      Object.assign(extProperties, ext.properties);
+      extKeys.push(...ext.keys);
+    }
+    const settingsProp = baseSchema.properties.settings as { items?: { enum?: string[] } };
+    return {
+      ...base,
+      description:
+        base.description +
+        ` Additional host-managed settings also live here: ${extKeys.join(', ')}.`,
+      inputSchema: {
+        ...baseSchema,
+        properties: {
+          ...baseSchema.properties,
+          ...extProperties,
+          settings: {
+            ...(baseSchema.properties.settings as Record<string, unknown>),
+            items: {
+              ...(settingsProp.items as Record<string, unknown>),
+              enum: [...(settingsProp.items?.enum ?? []), ...extKeys],
+            },
+          },
+        },
+      } as unknown as import('./types/index.js').ToolDefinition['inputSchema'],
+    };
+  }
+
+  private getToolsForAgent(
+    agentName: string,
+    snapshot?: InferenceToolSnapshot,
+  ): import('./types/index.js').ToolDefinition[] {
+    return this.getAllTools().map((tool) => {
+      if (tool.name === 'think') {
+        return this.buildThinkTool(
+          snapshot?.sameRoundThinkTextPolicy
+            ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+        );
+      }
+      return tool;
+    });
   }
 
   getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
@@ -1200,7 +1368,7 @@ export class AgentFramework {
       throw new Error(`Agent not found: ${agentName}`);
     }
 
-    const tools = this.getAllTools().filter((t) => agent.canUseTool(t.name));
+    const tools = this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name));
 
     // Default: no dynamic injection gathering → fully transparent (no
     // inference, no Chronicle writes, no external RPC). Opt in explicitly.
@@ -1353,6 +1521,22 @@ export class AgentFramework {
     } catch {
       return null;
     }
+  }
+
+  private validatePersistedAgentRuntimeSettings(
+    agentName: string,
+    overrides: AgentRuntimeSettingsOverrides,
+  ): AgentRuntimeSettingsOverrides {
+    if (
+      overrides.sameRoundThinkTextPolicy !== undefined &&
+      overrides.sameRoundThinkTextPolicy !== 'public' &&
+      overrides.sameRoundThinkTextPolicy !== 'private'
+    ) {
+      throw new Error(
+        `Invalid persisted sameRoundThinkTextPolicy for agent "${agentName}": ${JSON.stringify(overrides.sameRoundThinkTextPolicy)}`,
+      );
+    }
+    return overrides;
   }
 
   private persistAgentRuntimeSettings(
@@ -1709,11 +1893,44 @@ export class AgentFramework {
     inputSchema: { type: 'object' },
   };
 
+  /** Synthesized save_image tool — present when a workspace module is
+   *  registered. Lets the agent persist an image it has already seen in its
+   *  own context (Discord attachments arrive inlined as base64 and are
+   *  otherwise unreachable as files). */
+  private static readonly SAVE_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'save_recent_image',
+    description:
+      'Save one or more recent images from your own context to workspace files. ' +
+      'Images are counted back from the most recent (index 0). A single image is ' +
+      'written to `path` as given (e.g. "project/photos/cat.png"); when `count` > 1 ' +
+      'the range index..index+count-1 is saved with numeric suffixes ' +
+      '("cat-0.png", "cat-1.png", …; 0 = the newest of the range). Saved files are ' +
+      'visible via workspace tools and the /files/ endpoint.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Mount-prefixed destination path, e.g. "project/photos/name.png".',
+        },
+        index: {
+          type: 'number',
+          description: 'Which image, counting back from the most recent (0 = most recent). Default 0.',
+        },
+        count: {
+          type: 'number',
+          description: 'How many images to save, starting at `index` and going further back. Default 1.',
+        },
+      },
+      required: ['path'],
+    },
+  };
+
   private static readonly AGENT_SETTINGS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'agent_settings',
     description:
       'Read or change your hot runtime settings. This intentionally exposes only ' +
-      'context budget, recent raw tail size, and transition pace; model, prompts, ' +
+      'context budget, recent raw tail size, transition pace, and same-round think text routing; model, prompts, ' +
       'folding strategy, and other restart-bound configuration are not mutable here. ' +
       'Lower context budgets converge gradually under the transition pace before ' +
       'becoming the hard live limit; increases take effect immediately.',
@@ -1724,9 +1941,16 @@ export class AgentFramework {
         context_budget_tokens: { type: 'number', description: 'Total input context budget, including the reserved response allowance.' },
         tail_tokens: { type: 'number', description: 'Recent raw context retained verbatim.' },
         transition_pace_tokens: { type: 'number', description: 'Maximum ordinary KV re-read/perturbation per compile while converging.' },
+        same_round_think_text_policy: {
+          type: 'string',
+          enum: ['public', 'private'],
+          description:
+            'Routing policy for ordinary text emitted in the same native assistant round as think(). ' +
+            "Omitted in the recipe preserves the compatibility carry-forward: public.",
+        },
         settings: {
           type: 'array',
-          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens'] },
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy'] },
           description: 'For reset: settings to restore to recipe values. Omit to reset all.',
         },
       },
@@ -2827,7 +3051,11 @@ export class AgentFramework {
 
     const agent = new Agent(config, contextManager, this.membrane);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
-    if (restoredSettings) agent.restoreRuntimeSettings(restoredSettings);
+    if (restoredSettings) {
+      agent.restoreRuntimeSettings(
+        this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
+      );
+    }
     this.agents.set(config.name, agent);
     this.agentConfigs.set(config.name, config);
 
@@ -2863,12 +3091,21 @@ export class AgentFramework {
     // Check for inference requests
     await this.processInferenceRequests();
 
-    // Yield to the event loop between iterations.
-    // Full 10ms sleep when truly idle; minimal yield when streams are active
-    // (needed to let stream microtasks and tool-call callbacks execute).
-    if (!event && this.pendingRequests.length === 0) {
+    // Yield to the event loop between iterations. A pending inference request
+    // is not necessarily runnable: while its agent is streaming or waiting for
+    // tools, processInferenceRequests() deliberately requeues it. Treating that
+    // requeued request as "work made progress" creates a microtask-only polling
+    // loop. If activeStreams bookkeeping is absent/stale at the same time, the
+    // old code had no await at all and starved the tool-result and HTTP I/O that
+    // could make the agent runnable again (the Sol outage, 2026-07-15).
+    //
+    // No queue event means no foreground progress, so always take the normal
+    // polling backoff. After an event, retain the low-latency macrotask yield
+    // while background work remains. Both paths give Bun/Node a real event-loop
+    // turn; neither can recurse forever through already-resolved promises.
+    if (!event) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-    } else if (this.activeStreams.size > 0) {
+    } else if (this.pendingRequests.length > 0 || this.activeStreams.size > 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
@@ -3665,7 +3902,15 @@ export class AgentFramework {
       if (agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
-        if (now - oldest > STALE_REQUEST_MS) {
+        if (
+          now - oldest > STALE_REQUEST_MS &&
+          (this.staleWarnAt.get(agentName) ?? 0) < now - 60_000
+        ) {
+          // Trace and stderr share the throttle. The old code throttled only
+          // stderr, so a long-running tool call generated one trace per poll
+          // (up to 100/sec after the scheduler backoff), adding avoidable work
+          // precisely while the agent was already under pressure.
+          this.staleWarnAt.set(agentName, now);
           this.emitTrace({
             type: 'inference:request_stale',
             agentName,
@@ -3673,14 +3918,10 @@ export class AgentFramework {
             requestCount: requests.length,
             oldestRequestAge: now - oldest,
           });
-          // Loud (but throttled) note that requests are waiting on a busy agent.
-          if ((this.staleWarnAt.get(agentName) ?? 0) < now - 60_000) {
-            this.staleWarnAt.set(agentName, now);
-            console.error(
-              `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
-              `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
-            );
-          }
+          console.error(
+            `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
+            `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
+          );
         }
         this.pendingRequests.push(...requests);
         continue;
@@ -3741,7 +3982,8 @@ export class AgentFramework {
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
     try {
-      const allTools = this.getAllTools();
+      const requestSnapshot = this.captureInferenceToolSnapshot(agent);
+      const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
@@ -3783,7 +4025,14 @@ export class AgentFramework {
 
       const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
 
-      const handle = this.driveStream(agent, stream, trigger, attempt, compiledRequest);
+      const handle = this.driveStream(
+        agent,
+        stream,
+        requestSnapshot,
+        trigger,
+        attempt,
+        compiledRequest,
+      );
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -3829,6 +4078,7 @@ export class AgentFramework {
   private async driveStream(
     agent: Agent,
     stream: YieldingStream,
+    requestSnapshot: InferenceToolSnapshot,
     trigger?: InferenceRequest,
     attempt = 0,
     compiledRequest?: NormalizedRequest
@@ -4002,6 +4252,9 @@ export class AgentFramework {
             // note above — the fallback preamble is cumulative in XML mode).
             if (this.channelRegistry) {
               const roundToolNames = event.calls.map((c) => c.name);
+              const hasSameRoundPrivateThink =
+                roundToolNames.includes('think') &&
+                requestSnapshot.sameRoundThinkTextPolicy === 'private';
               if (roundToolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)))) {
                 turnSilenced = true;
               }
@@ -4012,6 +4265,10 @@ export class AgentFramework {
                   if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
+                    );
+                  } else if (hasSameRoundPrivateThink) {
+                    console.error(
+                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                     );
                   } else {
                     const locus = resolveTurnLocus();
@@ -4728,6 +4985,51 @@ export class AgentFramework {
     return undefined;
   }
 
+  private approximateDecodedBase64Bytes(base64: string): number {
+    const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+    return Math.max(0, Math.floor(base64.length * 3 / 4) - padding);
+  }
+
+  private sanitizeProcessLogValue(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+    if (value && typeof value === 'object') {
+      const seenValue = seen.get(value);
+      if (seenValue) return seenValue;
+    }
+    if (Array.isArray(value)) {
+      const clone: unknown[] = [];
+      seen.set(value, clone);
+      for (const item of value) {
+        clone.push(this.sanitizeProcessLogValue(item, seen));
+      }
+      return clone;
+    }
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+
+    const record = value as Record<string, unknown>;
+    if (record.type === 'image' && typeof record.data === 'string' && typeof record.mimeType === 'string') {
+      const clone: Record<string, unknown> = {};
+      seen.set(value, clone);
+      for (const [key, child] of Object.entries(record)) {
+        if (key === 'data' || key === 'mimeType') continue;
+        clone[key] = this.sanitizeProcessLogValue(child, seen);
+      }
+      clone.type = 'image';
+      clone.mimeType = record.mimeType;
+      clone.approxByteLength = this.approximateDecodedBase64Bytes(record.data);
+      clone.redacted = true;
+      return clone;
+    }
+
+    const clone: Record<string, unknown> = {};
+    seen.set(value, clone);
+    for (const [key, child] of Object.entries(record)) {
+      clone[key] = this.sanitizeProcessLogValue(child, seen);
+    }
+    return clone;
+  }
+
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
@@ -4761,15 +5063,15 @@ export class AgentFramework {
   private logProcessEvent(event: ProcessEvent, responses: ModuleProcessResponse[]): void {
     const entry: ProcessLogEntry = {
       timestamp: Date.now(),
-      processEvent: event,
-      responses,
+      processEvent: this.sanitizeProcessLogValue(event) as ProcessEvent,
+      responses: this.sanitizeProcessLogValue(responses) as ModuleProcessResponse[],
     };
 
     // Blob threshold: 10KB
     const BLOB_THRESHOLD = 10000;
 
     const entryToStore = { ...entry };
-    const responsesJson = JSON.stringify(responses);
+    const responsesJson = JSON.stringify(entry.responses);
     if (responsesJson.length > BLOB_THRESHOLD) {
       const blobId = this.store.storeBlob(Buffer.from(responsesJson), 'application/json');
       entryToStore.responses = { blobId };
@@ -4812,6 +5114,11 @@ export class AgentFramework {
     // Route the agent's typed, allowlisted hot-settings surface.
     if (enrichedCall.name === 'agent_settings') {
       this.dispatchAgentSettingsToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    if (enrichedCall.name === 'save_recent_image') {
+      this.dispatchSaveImageToolCall(agentName, enrichedCall);
       return;
     }
 
@@ -5524,8 +5831,16 @@ export class AgentFramework {
 
     for (const config of serverConfigs) {
       try {
-        await this.connectMcplServerInternal(config);
+        // Stage every startup connection with both planes closed. This removes
+        // server-order dependence: no early heartbeat/shell push can become
+        // model-visible before a later Discord connection has joined the same
+        // awareness generation.
+        await this.connectMcplServerInternal(config, true);
       } catch (error) {
+        if (error instanceof DiscordAwarenessAccountingError) {
+          await this.mcplServerRegistry.closeAll();
+          throw error;
+        }
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
         console.error(`Failed to connect MCPL server "${config.id}":`, err.message);
@@ -5543,21 +5858,38 @@ export class AgentFramework {
       }
     }
 
+    // Start the durable drain only after all startup connections are staged.
+    // The awareness tools/call is written before control-plane registration is
+    // flushed, preserving the server-side queue -> registration -> call order.
+    const startupBarrier = this.installMcplDataPlaneGate();
+    this.releaseMcplDataPlaneGate(startupBarrier);
+    try {
+      await startupBarrier.promise;
+      this.completeMcplDataPlaneGate(startupBarrier);
+    } catch (error) {
+      await this.mcplServerRegistry.closeAll();
+      throw error;
+    }
+
     // Discover tools from all connected servers
     await this.refreshMcplTools();
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
-  async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+  async syncDiscordAwarenessMarkers(_onlyServerId?: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
-    this.discordAwarenessOutbox.reconcileForBranch(
-      this.store.currentBranch().name,
-      this.store.listBranches(),
-    );
-    const serverIds = onlyServerId
-      ? [onlyServerId]
-      : [...new Set(this.discordAwarenessOutbox.pending().map((operation) => operation.ref.serverId))];
-    await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
+    // A targeted retry may discover pending work for other Discord servers
+    // during reconciliation. Safety is global, so one generation accounts for
+    // all pending operations before releasing any MCPL data plane.
+    const barrier = this.installMcplDataPlaneGate();
+    this.releaseMcplDataPlaneGate(barrier);
+    try {
+      await barrier.promise;
+      this.completeMcplDataPlaneGate(barrier);
+    } catch (error) {
+      await this.failMcplDataPlaneGate(barrier, 'explicit synchronization', error);
+      throw error;
+    }
   }
 
   private async resumePreparedDiscordSuppressions(): Promise<void> {
@@ -5597,20 +5929,42 @@ export class AgentFramework {
    * in the ledger for audit but do not block later operations; retryable
    * failures remain pending for the next reconnect/list-change attempt.
    */
-  private drainDiscordAwarenessOutbox(serverId: string): Promise<void> {
-    if (!this.discordAwarenessOutbox) return Promise.resolve();
+  private drainDiscordAwarenessOutbox(
+    serverId: string,
+  ): Promise<DiscordAwarenessDrainOutcome> {
+    if (!this.discordAwarenessOutbox) {
+      return Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 });
+    }
     const existing = this.discordAwarenessDrains.get(serverId);
     if (existing) return existing;
 
     const drain = (async () => {
       const connection = this.mcplServerRegistry?.getServer(serverId);
-      if (!connection?.isConnected) return;
+      if (!connection?.isConnected) {
+        const operations = this.readDiscordAwarenessPending(serverId);
+        for (const operation of operations) {
+          this.writeDiscordAwarenessFailure(
+            operation.batchId,
+            operation.ref,
+            operation.action,
+            'Awareness delivery not attempted: MCPL connection unavailable',
+            false,
+          );
+        }
+        if (operations.length > 0) {
+          console.error(
+            `[discord-awareness] ${serverId}: connection unavailable; ` +
+              `durably deferred=${operations.length}`,
+          );
+        }
+        return { status: 'unavailable' as const, accounted: operations.length };
+      }
 
       let delivered = 0;
       let failed = 0;
       const attempted = new Set<string>();
       while (true) {
-        const operations = this.discordAwarenessOutbox!.pending(serverId).filter((operation) => {
+        const operations = this.readDiscordAwarenessPending(serverId).filter((operation) => {
           const key = `${operation.batchId}\0${operation.ref.channelId}\0${operation.ref.messageId}\0${operation.action}`;
           if (attempted.has(key)) return false;
           attempted.add(key);
@@ -5622,40 +5976,41 @@ export class AgentFramework {
           const channelId = ref.channelId.startsWith('discord:')
             ? ref.channelId.split(':').at(-1)!
             : ref.channelId;
+          let deliveryError: string | undefined;
           try {
             const tool = operation.action === 'add' ? 'add_reaction' : 'remove_reaction';
-            const result = await connection.sendToolsCall(tool, {
+            const result = await connection.sendToolsCallWithDeadline(tool, {
               channelId,
               messageId: ref.messageId,
               emoji: operation.emoji,
-            });
+            }, this.discordAwarenessDeadlineMs);
             if (result.isError) {
-              throw new Error(
-                result.content.map((content) => content.text ?? '').filter(Boolean).join('; ')
-                  || `Discord ${tool} returned an error`,
-              );
+              deliveryError = result.content
+                .map((content) => content.text ?? '')
+                .filter(Boolean)
+                .join('; ') || `Discord ${tool} returned an error`;
             }
-            this.discordAwarenessOutbox!.recordSuccess(
-              operation.batchId,
-              ref,
-              operation.action,
-            );
-            delivered++;
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            const permanent = isPermanentDiscordReactionFailure(message);
-            this.discordAwarenessOutbox!.recordFailure(
+            deliveryError = error instanceof Error ? error.message : String(error);
+          }
+
+          if (deliveryError !== undefined) {
+            const permanent = isPermanentDiscordReactionFailure(deliveryError);
+            this.writeDiscordAwarenessFailure(
               operation.batchId,
               ref,
               operation.action,
-              message,
+              deliveryError,
               permanent,
             );
             failed++;
             console.error(
               `[discord-awareness] ${operation.action} failed for ${ref.channelId}/${ref.messageId}` +
-                ` (${permanent ? 'permanent' : 'retryable'}): ${message}`,
+                ` (${permanent ? 'permanent' : 'retryable'}): ${deliveryError}`,
             );
+          } else {
+            this.writeDiscordAwarenessSuccess(operation.batchId, ref, operation.action);
+            delivered++;
           }
         }
       }
@@ -5664,6 +6019,7 @@ export class AgentFramework {
           `[discord-awareness] ${serverId}: delivered=${delivered} failed=${failed}`,
         );
       }
+      return { status: 'delivered' as const, delivered, failed };
     })().finally(() => {
       this.discordAwarenessDrains.delete(serverId);
     });
@@ -5672,29 +6028,181 @@ export class AgentFramework {
     return drain;
   }
 
-  private beginDiscordAwarenessBarrier(serverId: string): Promise<void> {
-    if (!this.discordAwarenessOutbox) return Promise.resolve();
-    this.discordAwarenessOutbox.reconcileForBranch(
-      this.store.currentBranch().name,
-      this.store.listBranches(),
-    );
-    if (this.discordAwarenessOutbox.pending(serverId).length === 0) {
-      return Promise.resolve();
+  private readDiscordAwarenessPending(serverId?: string) {
+    try {
+      return this.discordAwarenessOutbox!.pending(serverId);
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError(
+        `ledger read${serverId ? ` for ${serverId}` : ''}`,
+        error,
+      );
     }
-    const barrier = this.drainDiscordAwarenessOutbox(serverId);
-    const barriers = this.discordAwarenessBarriers ??= new Map();
-    barriers.set(serverId, barrier);
-    const cleanup = () => {
-      if (barriers.get(serverId) === barrier) {
-        barriers.delete(serverId);
+  }
+
+  private writeDiscordAwarenessSuccess(
+    batchId: string,
+    ref: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessRef,
+    action: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessAction,
+  ): void {
+    try {
+      this.discordAwarenessOutbox!.recordSuccess(batchId, ref, action);
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('recordSuccess ledger write', error);
+    }
+  }
+
+  private writeDiscordAwarenessFailure(
+    batchId: string,
+    ref: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessRef,
+    action: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessAction,
+    errorMessage: string,
+    permanent: boolean,
+  ): void {
+    try {
+      this.discordAwarenessOutbox!.recordFailure(
+        batchId,
+        ref,
+        action,
+        errorMessage,
+        permanent,
+      );
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('recordFailure ledger write', error);
+    }
+  }
+
+  private beginDiscordAwarenessBarrier(): {
+    requiresBarrier: boolean;
+    promise: Promise<DiscordAwarenessDrainOutcome>;
+  } {
+    if (!this.discordAwarenessOutbox) {
+      return {
+        requiresBarrier: false,
+        promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
+      };
+    }
+    try {
+      this.discordAwarenessOutbox.reconcileForBranch(
+        this.store.currentBranch().name,
+        this.store.listBranches(),
+      );
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('branch reconciliation', error);
+    }
+    const pending = this.readDiscordAwarenessPending();
+    if (pending.length === 0) {
+      return {
+        requiresBarrier: false,
+        promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
+      };
+    }
+    const serverIds = [...new Set(pending.map((operation) => operation.ref.serverId))];
+    const promise = Promise.all(
+      serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)),
+    ).then((outcomes): DiscordAwarenessDrainOutcome => {
+      if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
+        return {
+          status: 'unavailable',
+          accounted: outcomes.reduce(
+            (count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0),
+            0,
+          ),
+        };
       }
-    };
-    void barrier.then(cleanup, cleanup);
+      return {
+        status: 'delivered',
+        delivered: outcomes.reduce(
+          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0),
+          0,
+        ),
+        failed: outcomes.reduce(
+          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0),
+          0,
+        ),
+      };
+    });
+    return { requiresBarrier: true, promise };
+  }
+
+  /**
+   * Install one framework-global Discord-awareness generation before releasing
+   * any inference-bearing event. With pending work, every MCPL data plane is
+   * paused while all control planes remain live. With no pending work, ready()
+   * runs synchronously so request responders preserve their historical
+   * same-stack behavior.
+   */
+  private installMcplDataPlaneGate(): DiscordAwarenessBarrier {
+    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+      connection.pauseDataPlane();
+    }
+    const generation = ++this.discordAwarenessBarrierGeneration;
+
+    let begun: ReturnType<AgentFramework['beginDiscordAwarenessBarrier']>;
+    try {
+      begun = this.beginDiscordAwarenessBarrier();
+    } catch (error) {
+      begun = {
+        requiresBarrier: true,
+        promise: Promise.reject(error),
+      };
+    }
+    const barrier: DiscordAwarenessBarrier = { generation, ...begun };
+    this.discordAwarenessBarrier = barrier;
     return barrier;
   }
 
-  private getDiscordAwarenessBarrier(serverId: string): Promise<void> | undefined {
-    return this.discordAwarenessBarriers?.get(serverId);
+  private releaseMcplDataPlaneGate(
+    barrier: DiscordAwarenessBarrier,
+  ): void {
+    if (this.discordAwarenessBarrier !== barrier) return;
+    if (barrier.requiresBarrier) {
+      for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+        connection.readyControlPlane();
+      }
+      return;
+    }
+    this.completeMcplDataPlaneGate(barrier);
+  }
+
+  private completeMcplDataPlaneGate(
+    barrier: DiscordAwarenessBarrier,
+  ): boolean {
+    if (this.discordAwarenessBarrier !== barrier) return false;
+    this.discordAwarenessBarrier = null;
+    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+      // ready() can synchronously flush a nested list-change notification that
+      // installs a newer global generation. Never let this older completion
+      // release any remaining server behind that newer gate.
+      if (this.discordAwarenessBarrier !== null) return false;
+      connection.ready();
+    }
+    return this.discordAwarenessBarrier === null;
+  }
+
+  private async failMcplDataPlaneGate(
+    barrier: DiscordAwarenessBarrier,
+    context: string,
+    error: unknown,
+  ): Promise<void> {
+    if (this.discordAwarenessBarrier !== barrier) return;
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`[discord-awareness] ${context} failed globally:`, err.message);
+    const connections = this.mcplServerRegistry?.getAllServers() ?? [];
+    for (const connection of connections) {
+      this.emitTrace({
+        type: 'mcpl:server-error',
+        serverId: connection.id,
+        error: `Discord awareness accounting unhealthy: ${err.message}`,
+      });
+    }
+    await Promise.all(connections.map(async (connection) => {
+      await connection.reconnectAfterFailure().catch((closeError) => {
+        console.error(
+          `[discord-awareness] could not recycle unhealthy connection ${connection.id}:`,
+          closeError instanceof Error ? closeError.message : closeError,
+        );
+      });
+    }));
   }
 
   /**
@@ -5705,6 +6213,7 @@ export class AgentFramework {
    */
   private async connectMcplServerInternal(
     config: import('./mcpl/types.js').McplServerConfig,
+    deferAwareness = false,
   ): Promise<void> {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
@@ -5727,15 +6236,30 @@ export class AgentFramework {
 
     const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
 
-    // Wire listeners, but do not release events buffered during the handshake
-    // until branch-awareness markers have been reconciled and attempted.
+    // Wire listeners before either startup staging or the runtime global gate
+    // releases control traffic needed for registration and marker service.
     this.wireMcplEvents(connection);
 
     // Initialize feature sets if server advertises MCPL capabilities
     this.registerMcplServerFeatures(config, connection);
 
-    await this.beginDiscordAwarenessBarrier(config.id);
-    connection.ready();
+    if (deferAwareness) {
+      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      return;
+    }
+
+    const awarenessBarrier = this.installMcplDataPlaneGate();
+    this.releaseMcplDataPlaneGate(awarenessBarrier);
+    try {
+      await awarenessBarrier.promise;
+      this.completeMcplDataPlaneGate(awarenessBarrier);
+    } catch (error) {
+      // Startup cannot fail open on a broken awareness ledger. Disable the
+      // reconnecting stub/connection before propagating the distinct error to
+      // initializeMcpl, which tears down any other servers and aborts create().
+      await connection.close().catch(() => {});
+      throw error;
+    }
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }
@@ -5954,8 +6478,8 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.getDiscordAwarenessBarrier(connection.id);
-      if (barrier) await barrier;
+      const barrier = this.discordAwarenessBarrier;
+      if (barrier) await barrier.promise;
       this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
@@ -5965,8 +6489,8 @@ export class AgentFramework {
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (this.inferenceRouter && responder) {
-        const barrier = this.getDiscordAwarenessBarrier(connection.id);
-        if (barrier) await barrier;
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
           respond: responder.respond,
           respondError: responder.respondError,
@@ -5993,8 +6517,8 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      const barrier = this.getDiscordAwarenessBarrier(connection.id);
-      if (barrier) await barrier;
+      const barrier = this.discordAwarenessBarrier;
+      if (barrier) await barrier.promise;
       this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
@@ -6005,8 +6529,8 @@ export class AgentFramework {
     ) => {
       if (!responder) return;
       try {
-        const barrier = this.getDiscordAwarenessBarrier(connection.id);
-        if (barrier) await barrier;
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
         const result = await this.handleHostCommand(connection.id, params ?? {});
         responder.respond(result);
       } catch (error) {
@@ -6017,13 +6541,19 @@ export class AgentFramework {
 
     // Handle dynamic tool list changes (notifications/tools/list_changed)
     connection.on('tools-list-changed', () => {
+      // Pause before starting any async refresh. This listener runs
+      // synchronously in the transport line callback, so a following inbound
+      // data event cannot pass before the new barrier exists.
+      const awarenessBarrier = this.installMcplDataPlaneGate();
+      this.releaseMcplDataPlaneGate(awarenessBarrier);
       this.handleToolsListChanged(connection.id);
-      void this.beginDiscordAwarenessBarrier(connection.id).catch((error) => {
-        console.error(
-          `[discord-awareness] tools-list reconciliation failed for ${connection.id}:`,
-          error instanceof Error ? error.message : error,
-        );
-      });
+      void awarenessBarrier.promise.then(() => {
+        this.completeMcplDataPlaneGate(awarenessBarrier);
+      }).catch((error) => this.failMcplDataPlaneGate(
+        awarenessBarrier,
+        'tools-list reconciliation',
+        error,
+      ));
     });
 
     // Re-establish full server registration on reconnect. The 'close' handler
@@ -6035,8 +6565,9 @@ export class AgentFramework {
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
       // Install the barrier synchronously so any inbound event emitted after
-      // reconnect observes it before doing work that could wake an agent.
-      const awarenessBarrier = this.beginDiscordAwarenessBarrier(connection.id);
+      // reconnect observes it before doing work that could wake an agent. The
+      // connection paused its data plane before wiring the fresh transport.
+      const awarenessBarrier = this.installMcplDataPlaneGate();
       try {
         const config = this.mcplServerConfigs.get(connection.id);
         if (config) {
@@ -6048,8 +6579,13 @@ export class AgentFramework {
           error instanceof Error ? error.message : error,
         );
       }
+      this.releaseMcplDataPlaneGate(awarenessBarrier);
       this.handleToolsListChanged(connection.id);
-      void awarenessBarrier.then(() => {
+      void awarenessBarrier.promise.then(() => {
+        if (
+          awarenessBarrier.requiresBarrier
+          && !this.completeMcplDataPlaneGate(awarenessBarrier)
+        ) return;
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -6058,12 +6594,11 @@ export class AgentFramework {
         // Mirror the module:removed emitted on 'close' so module-lifecycle
         // consumers see the server come back, not just vanish.
         this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
-      }).catch((error) => {
-        console.error(
-          `[discord-awareness] reconnect reconciliation failed for ${connection.id}:`,
-          error instanceof Error ? error.message : error,
-        );
-      });
+      }).catch((error) => this.failMcplDataPlaneGate(
+        awarenessBarrier,
+        'reconnect reconciliation',
+        error,
+      ));
     });
 
     // Surface connect/reconnect failures. Before these traces existed the
@@ -6105,6 +6640,7 @@ export class AgentFramework {
     // divergence greppable instead of a silent drift into stale state.
     connection.on('orphaned-response', (info: {
       id: string | number;
+      method?: string;
       hadState: boolean;
       hadCheckpoint: boolean;
     }) => {
@@ -6112,6 +6648,7 @@ export class AgentFramework {
         type: 'mcpl:orphaned-response',
         serverId: connection.id,
         responseId: info.id,
+        method: info.method,
         hadState: info.hadState,
         hadCheckpoint: info.hadCheckpoint,
       });
@@ -6573,6 +7110,153 @@ export class AgentFramework {
     });
   }
 
+  /**
+   * Handle the synthesized `save_recent_image` tool: locate the requested
+   * image blocks in the calling agent's context (blobs re-inlined, counted
+   * back from the most recent) and write their bytes to a workspace mount
+   * via WorkspaceModule.writeBinary.
+   */
+  private dispatchSaveImageToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    const finish = (result: ToolResult): void => {
+      this.emitTrace({
+        type: result.isError ? 'tool:failed' : 'tool:completed',
+        module: 'workspace',
+        tool: call.name,
+        callId: call.id,
+        durationMs: 0,
+        ...(result.isError ? { error: result.error } : {}),
+      });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+    };
+    void (async (): Promise<void> => {
+      try {
+        const workspace = this.getWorkspaceModule();
+        if (!workspace) throw new Error('save_recent_image requires a workspace module');
+        const agent = this.agents.get(agentName);
+        if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+        const input = (call.input ?? {}) as { path?: unknown; index?: unknown; count?: unknown };
+        if (typeof input.path !== 'string' || input.path.length === 0) {
+          throw new Error('save_recent_image: `path` (mount-prefixed) is required');
+        }
+        const index = input.index === undefined ? 0 : Number(input.index);
+        if (!Number.isInteger(index) || index < 0) {
+          throw new Error('save_recent_image: `index` must be a non-negative integer');
+        }
+        const count = input.count === undefined ? 1 : Number(input.count);
+        const MAX_COUNT = 20;
+        if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
+          throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
+        }
+        const lastWanted = index + count - 1;
+
+        // Walk the message store tail-first in bounded windows, re-inlining
+        // blob media, until we've collected the requested range. Scanning is
+        // capped so a pathological index can't drag the whole store through
+        // blob resolution.
+        const MAX_SCAN = 500;
+        const WINDOW = 25;
+        const cm = agent.getContextManager();
+        const total = cm.getMessageCount();
+        let seen = 0;
+        let scanned = 0;
+        const found: Array<{
+          rangeOffset: number;
+          data: string;
+          mediaType: string;
+          messagesBack: number;
+        }> = [];
+        for (let end = total; end > 0 && scanned < MAX_SCAN && found.length < count; end -= WINDOW) {
+          const start = Math.max(0, end - WINDOW);
+          const { messages } = cm.getMessageWindow(start, end - start, { resolveBlobs: true });
+          scanned += end - start;
+          for (let i = messages.length - 1; i >= 0 && found.length < count; i--) {
+            const content = messages[i]?.content;
+            if (!Array.isArray(content)) continue;
+            for (let b = content.length - 1; b >= 0 && found.length < count; b--) {
+              const block = content[b] as {
+                type?: string;
+                source?: { type?: string; data?: string; mediaType?: string };
+              };
+              if (block?.type !== 'image') continue;
+              if (seen >= index && seen <= lastWanted) {
+                if (block.source?.type !== 'base64' || typeof block.source.data !== 'string') {
+                  throw new Error(
+                    `save_recent_image: image at index ${seen} is not stored inline (base64) — cannot save it`,
+                  );
+                }
+                found.push({
+                  rangeOffset: seen - index,
+                  data: block.source.data,
+                  mediaType: block.source.mediaType ?? 'image/png',
+                  messagesBack: total - (start + i),
+                });
+              }
+              seen++;
+            }
+          }
+        }
+        if (found.length === 0) {
+          throw new Error(
+            seen === 0
+              ? `save_recent_image: no images found in the most recent ${Math.min(scanned, MAX_SCAN)} messages`
+              : `save_recent_image: only ${seen} image(s) found in the most recent ${Math.min(scanned, MAX_SCAN)} messages (asked for index ${index})`,
+          );
+        }
+
+        // Single image → path as given. Range → numeric suffix before the
+        // extension ("cat.png" → "cat-0.png"), 0 = newest of the range.
+        const pathFor = (rangeOffset: number): string => {
+          if (count === 1) return input.path as string;
+          const p = input.path as string;
+          const dot = p.lastIndexOf('.');
+          const slash = p.lastIndexOf('/');
+          return dot > slash
+            ? `${p.slice(0, dot)}-${rangeOffset}${p.slice(dot)}`
+            : `${p}-${rangeOffset}`;
+        };
+        const savedFiles: Array<Record<string, unknown>> = [];
+        for (const image of found) {
+          const destination = pathFor(image.rangeOffset);
+          const bytes = Buffer.from(image.data, 'base64');
+          const result = await workspace.writeBinary(destination, bytes, image.mediaType);
+          if (!result.success) {
+            finish({
+              success: false,
+              error:
+                `save_recent_image: failed writing "${destination}": ${result.error}` +
+                (savedFiles.length > 0
+                  ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
+                  : ''),
+              isError: true,
+            });
+            return;
+          }
+          savedFiles.push({
+            ...(result.data as Record<string, unknown>),
+            imageIndex: index + image.rangeOffset,
+            messagesBack: image.messagesBack,
+          });
+        }
+        finish({
+          success: true,
+          data: {
+            saved: savedFiles,
+            ...(found.length < count
+              ? { note: `only ${found.length} of ${count} requested images exist in the scanned window` }
+              : {}),
+          },
+        });
+      } catch (error) {
+        finish({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          isError: true,
+        });
+      }
+    })();
+  }
+
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({
       type: 'tool:started',
@@ -6588,11 +7272,22 @@ export class AgentFramework {
         context_budget_tokens?: unknown;
         tail_tokens?: unknown;
         transition_pace_tokens?: unknown;
+        same_round_think_text_policy?: unknown;
         settings?: unknown;
+      } & Record<string, unknown>;
+      const extensions = this.collectAgentSettingsExtensions();
+      /** Extension values merged flat alongside the core snapshot. */
+      const extGet = (): Record<string, unknown> => {
+        const out: Record<string, unknown> = {};
+        for (const ext of extensions.values()) Object.assign(out, ext.get(agentName));
+        return out;
       };
       switch (input.action) {
         case 'get':
-          result = { success: true, data: this.getAgentRuntimeSettings(agentName) };
+          result = {
+            success: true,
+            data: { ...this.getAgentRuntimeSettings(agentName), ...extGet() },
+          };
           break;
         case 'cancel':
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
@@ -6606,26 +7301,101 @@ export class AgentFramework {
           if (input.transition_pace_tokens !== undefined) {
             patch.transitionPaceTokens = Number(input.transition_pace_tokens);
           }
-          result = { success: true, data: this.updateAgentRuntimeSettings(agentName, patch) };
+          if (input.same_round_think_text_policy !== undefined) {
+            patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
+          }
+          // Route extension-owned keys to their modules; apply the core patch
+          // only when it touches core keys (an extension-only update must not
+          // disturb a converging budget transition).
+          const extResults: Record<string, unknown> = {};
+          for (const ext of extensions.values()) {
+            const slice: Record<string, unknown> = {};
+            for (const key of ext.keys) {
+              if (input[key] !== undefined) slice[key] = input[key];
+            }
+            if (Object.keys(slice).length > 0) {
+              Object.assign(extResults, ext.update(agentName, slice));
+            }
+          }
+          const coreTouched = Object.keys(patch).length > 0;
+          const core = coreTouched
+            ? this.updateAgentRuntimeSettings(agentName, patch)
+            : this.getAgentRuntimeSettings(agentName);
+          result = {
+            success: true,
+            data: {
+              ...core,
+              ...extGet(),
+              ...extResults,
+              ...(patch.sameRoundThinkTextPolicy !== undefined
+                ? {
+                    sameRoundThinkTextPolicyUpdateNote:
+                      'Stored now; applies to provider think routing and description beginning with the next inference.',
+                  }
+                : {}),
+            },
+          };
           break;
         }
         case 'reset': {
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
+          const extResetKeys = new Map<AgentSettingsExtension, string[]>();
+          const resetsAllSettings = input.settings === undefined;
           if (input.settings !== undefined) {
             if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
             const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
               context_budget_tokens: 'contextBudgetTokens',
               tail_tokens: 'tailTokens',
               transition_pace_tokens: 'transitionPaceTokens',
+              same_round_think_text_policy: 'sameRoundThinkTextPolicy',
             };
-            keys = input.settings.map((name) => {
-              if (typeof name !== 'string' || !names[name]) {
-                throw new Error(`Unknown reset setting: ${String(name)}`);
+            keys = [];
+            for (const name of input.settings) {
+              if (typeof name === 'string' && names[name]) {
+                keys.push(names[name]);
+                continue;
               }
-              return names[name];
-            });
+              const owner = [...extensions.values()].find(
+                (ext) => typeof name === 'string' && ext.keys.includes(name),
+              );
+              if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
+              const list = extResetKeys.get(owner) ?? [];
+              list.push(name as string);
+              extResetKeys.set(owner, list);
+            }
+            if (keys.length === 0) keys = undefined;
           }
-          result = { success: true, data: this.resetAgentRuntimeSettings(agentName, keys) };
+          const touchedSameRoundThinkTextPolicy =
+            resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
+          const extResults: Record<string, unknown> = {};
+          if (input.settings === undefined) {
+            // Reset-all covers extensions too.
+            for (const ext of extensions.values()) {
+              if (ext.reset) Object.assign(extResults, ext.reset(agentName));
+            }
+          } else {
+            for (const [ext, list] of extResetKeys) {
+              if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
+            }
+          }
+          const coreTouched = input.settings === undefined || keys !== undefined;
+          const core = coreTouched
+            ? this.resetAgentRuntimeSettings(agentName, keys)
+            : this.getAgentRuntimeSettings(agentName);
+          result = {
+            success: true,
+            data: {
+              ...core,
+              ...extGet(),
+              ...extResults,
+              ...(touchedSameRoundThinkTextPolicy
+                ? {
+                    sameRoundThinkTextPolicyUpdateNote:
+                      'Reset now; restored provider think routing and description apply beginning with the next inference.',
+                  }
+                : {}),
+            },
+          };
           break;
         }
         default:

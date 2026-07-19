@@ -29,6 +29,7 @@ class QueuedStrategy implements ContextStrategy {
   readonly name = 'queued-test';
   ticks = 0;
   toolCounts: number[] = [];
+  thinkDescriptions: string[] = [];
 
   checkReadiness(): ReadinessState {
     return { ready: this.ticks >= 2, description: 'test maintenance queued' };
@@ -36,6 +37,37 @@ class QueuedStrategy implements ContextStrategy {
 
   async tick(ctx: StrategyContext): Promise<void> {
     this.toolCounts.push(ctx.tools?.length ?? 0);
+    const think = ctx.tools?.find((tool) => tool.name === 'think');
+    if (think) this.thinkDescriptions.push(think.description);
+    this.ticks++;
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+class ProviderBoundMaintenanceStrategy implements ContextStrategy {
+  readonly name = 'provider-bound-maintenance-test';
+  ticks = 0;
+
+  checkReadiness(): ReadinessState {
+    return { ready: this.ticks >= 1, description: 'provider-bound maintenance queued' };
+  }
+
+  async tick(ctx: StrategyContext): Promise<void> {
+    await ctx.membrane?.complete({
+      model: 'test-model',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'maintenance request' }],
+      }],
+      tools: ctx.tools,
+    } as unknown as NormalizedRequest);
     this.ticks++;
   }
 
@@ -96,6 +128,27 @@ const membrane = {
     throw new Error('not expected');
   },
 } as unknown as import('@animalabs/membrane').Membrane;
+
+class CapturingMembrane {
+  calls: NormalizedRequest[] = [];
+
+  async complete(request: NormalizedRequest): Promise<NormalizedResponse> {
+    this.calls.push(request);
+    return {
+      content: [],
+      stopReason: 'end_turn',
+      rawAssistantText: '',
+      toolCalls: [],
+      toolResults: [],
+      usage: { inputTokens: 1, outputTokens: 1 },
+      details: { raw: {} },
+    } as unknown as NormalizedResponse;
+  }
+
+  asMembrane(): import('@animalabs/membrane').Membrane {
+    return this as unknown as import('@animalabs/membrane').Membrane;
+  }
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -166,6 +219,71 @@ describe('queued context maintenance timer', () => {
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes a policy-correct dynamic think definition into the provider-bound maintenance request', async () => {
+    const cases: Array<{
+      label: string;
+      sameRoundThinkTextPolicy?: 'public' | 'private';
+      expected: RegExp;
+    }> = [
+      {
+        label: 'private',
+        sameRoundThinkTextPolicy: 'private',
+        expected: /withheld from channel routing/,
+      },
+      {
+        label: 'compatibility-public',
+        expected: /may still be routed publicly as your speech/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const dir = mkdtempSync(join(tmpdir(), `af-maintenance-think-${testCase.label}-`));
+      const strategy = new ProviderBoundMaintenanceStrategy();
+      const capture = new CapturingMembrane();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane: capture.asMembrane(),
+        agents: [{
+          name: 'agent',
+          model: 'test-model',
+          systemPrompt: 'test',
+          strategy,
+          ...(testCase.sameRoundThinkTextPolicy !== undefined
+            ? { sameRoundThinkTextPolicy: testCase.sameRoundThinkTextPolicy }
+            : {}),
+          allowedTools: 'all',
+        }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 10,
+      });
+      (framework as unknown as {
+        channelRegistry: { getChannelTools: () => ToolDefinition[]; stopAll: () => void };
+      }).channelRegistry = {
+        getChannelTools: () => [
+          {
+            name: 'think',
+            description: 'static channel think',
+            inputSchema: { type: 'object', properties: { content: { type: 'string' } }, required: [] },
+          },
+        ],
+        stopAll: () => {},
+      };
+
+      try {
+        framework.start();
+        await waitFor(() => capture.calls.length === 1);
+        const think = capture.calls[0].tools?.find((tool) => tool.name === 'think');
+        assert.ok(think, 'think tool should be present on the maintenance request');
+        assert.match(think.description, testCase.expected);
+        assert.notEqual(think.description, 'static channel think');
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   });
 

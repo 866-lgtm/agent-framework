@@ -52,6 +52,13 @@ export interface FrameworkConfig {
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;
 
+  /**
+   * Mandatory deadline for each Discord awareness marker tools/call. This is
+   * independent of MCPL requestTimeoutMs and cannot be disabled with 0.
+   * Values are clamped to 50..60000ms; 0 selects the 10000ms default.
+   */
+  discordAwarenessDeadlineMs?: number;
+
   /** Or existing store (app-owned) */
   store?: JsStore;
 

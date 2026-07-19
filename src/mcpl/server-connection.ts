@@ -69,6 +69,13 @@ interface PendingRequest {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+interface RequestOptions {
+  /** Override the connection-wide timeout for this request only. */
+  timeoutMs?: number;
+  /** Surface a late response even when it carries no checkpoint state. */
+  surfaceOrphanedResponse?: boolean;
+}
+
 /**
  * McplServerConnection manages a single JSON-RPC 2.0 connection to an
  * MCPL server over stdio. Use the static `connect()` factory to create
@@ -107,13 +114,20 @@ export class McplServerConnection extends EventEmitter {
 
   private nextRequestId = 1;
   private pendingRequests = new Map<string | number, PendingRequest>();
+  /** Metadata retained after selected request deadlines so a late response is
+   * observable even though its original promise has already been rejected. */
+  private orphanedRequests = new Map<string | number, { method: string }>();
   private closed = false;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
-  // Event buffering: events emitted before ready() are queued, not lost
-  private readyFlag = false;
+  // Event buffering: control-plane traffic can be released independently from
+  // inference-bearing data-plane traffic. This lets a server finish its own
+  // registration (and answer host tools/call requests) while startup/reconnect
+  // reconciliation keeps agent wakes behind a durable barrier.
+  private controlPlaneReady = false;
+  private dataPlaneReady = false;
   private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
@@ -162,24 +176,85 @@ export class McplServerConnection extends EventEmitter {
    * the caller has attached listeners via wireMcplEvents).
    */
   ready(): void {
-    this.readyFlag = true;
-    for (const { event, args } of this.bufferedEvents) {
-      super.emit(event, ...args);
-    }
+    this.controlPlaneReady = true;
+    this.dataPlaneReady = true;
+    const pending = this.bufferedEvents;
     this.bufferedEvents = [];
+    for (const { event, args } of pending) {
+      // Re-enter the gate for every buffered item. A control handler (notably
+      // tools/list_changed) may install a newer data-plane barrier while this
+      // snapshot is being flushed; later data items must observe that pause.
+      this.emit(event, ...args);
+    }
   }
 
   /**
-   * Override emit to buffer server→host events until ready() is called.
-   * Lifecycle events ('close', 'error', 'reconnect') always pass through.
+   * Release only server-establishment and lifecycle/control traffic. Responses
+   * to host requests are never event-buffered, so tools/list and tools/call
+   * responses remain live as well. Inference-bearing requests stay queued in
+   * their original relative order until {@link ready} is called.
+   */
+  readyControlPlane(): void {
+    this.controlPlaneReady = true;
+    const pending = this.bufferedEvents;
+    const deferred: Array<{ event: string; args: unknown[] }> = [];
+    this.bufferedEvents = [];
+    for (const item of pending) {
+      if (McplServerConnection.isControlPlaneEvent(item.event)) {
+        super.emit(item.event, ...item.args);
+      } else {
+        deferred.push(item);
+      }
+    }
+    // Data events emitted by control handlers while the snapshot was flushing
+    // were appended to the new buffer. Preserve their order behind older data.
+    this.bufferedEvents = [...deferred, ...this.bufferedEvents];
+  }
+
+  /**
+   * Close the data plane synchronously while leaving an already-released
+   * control plane live. Used before reconnect adoption and list-change
+   * reconciliation so no new inference event can beat barrier installation.
+   */
+  pauseDataPlane(): void {
+    this.dataPlaneReady = false;
+  }
+
+  /**
+   * Override emit to buffer server→host events until the corresponding plane
+   * is ready. Lifecycle events always pass through so reconnect can install a
+   * new data-plane gate before the fresh transport is exposed.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
-    if (this.readyFlag || name === 'close' || name === 'error' || name === 'reconnect') {
+    if (
+      McplServerConnection.isLifecycleEvent(name)
+      || (McplServerConnection.isControlPlaneEvent(name)
+        ? this.controlPlaneReady
+        : this.dataPlaneReady)
+    ) {
       return super.emit(event, ...args);
     }
     this.bufferedEvents.push({ event: name, args });
     return true;
+  }
+
+  private static isControlPlaneEvent(event: string): boolean {
+    return event === 'stderr'
+      || event === 'scope-elevate'
+      || event === 'channels-register'
+      || event === 'channels-changed'
+      || event === 'feature-sets-changed'
+      || event === 'tools-list-changed'
+      || event === 'connect-failed'
+      || event === 'reconnect-failed'
+      || event === 'orphaned-response';
+  }
+
+  private static isLifecycleEvent(event: string): boolean {
+    return event === 'close'
+      || event === 'error'
+      || event === 'reconnect';
   }
 
   // ==========================================================================
@@ -473,6 +548,26 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest('tools/call', params) as Promise<McpToolCallResult>;
   }
 
+  /**
+   * Send a tools/call with a mandatory request-local deadline. This is used by
+   * durable external-side-effect accounting, whose safety bound must remain in
+   * force even when the server's general requestTimeoutMs is configured as 0.
+   */
+  sendToolsCallWithDeadline(
+    name: string,
+    args: Record<string, unknown>,
+    timeoutMs: number,
+  ): Promise<McpToolCallResult> {
+    const params: Record<string, unknown> = { name, arguments: args };
+    const mandatoryTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.max(1, Math.floor(timeoutMs))
+      : 1;
+    return this.sendRequest('tools/call', params, {
+      timeoutMs: mandatoryTimeoutMs,
+      surfaceOrphanedResponse: true,
+    }) as Promise<McpToolCallResult>;
+  }
+
   // ==========================================================================
   // Lifecycle
   // ==========================================================================
@@ -497,6 +592,7 @@ export class McplServerConnection extends EventEmitter {
       pending.reject(new Error(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`));
     }
     this.pendingRequests.clear();
+    this.orphanedRequests.clear();
 
     // Tear down the transport (kills the child / closes the socket). The
     // transport's own 'close' event is short-circuited by `this.closed` in
@@ -506,6 +602,27 @@ export class McplServerConnection extends EventEmitter {
     }
 
     this.emit('close');
+  }
+
+  /**
+   * Tear down a live transport after an awareness-accounting failure without
+   * disabling configured auto-reconnect. The normal transport close handler
+   * rejects requests, emits lifecycle state, and schedules the next bounded
+   * reconnect attempt. With reconnect disabled this leaves the server closed.
+   */
+  async reconnectAfterFailure(): Promise<void> {
+    this.pauseDataPlane();
+    if (this.closed) {
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.transport) {
+      await this.transport.close();
+      return;
+    }
+    this.closed = true;
+    this.emit('close');
+    this.scheduleReconnect();
   }
 
   /**
@@ -551,16 +668,17 @@ export class McplServerConnection extends EventEmitter {
         this.hostCapabilities,
       );
 
-      // Adopt the new transport. Listeners were attached to external consumers
-      // on the first wire, so mark ready immediately (re-wire re-binds the
-      // transport-level handlers below).
+      // Close the data plane before the new transport can emit. The reconnect
+      // lifecycle event bypasses buffering; its framework listener installs the
+      // awareness barrier synchronously, then releases control traffic needed
+      // to establish the server while data remains held.
+      this.pauseDataPlane();
       this.transport = transport;
       this.capabilities = capabilities;
       this.closed = false;
       this.nextRequestId = 1;
       this.pendingRequests.clear();
       this.wireTransport(transport);
-      this.readyFlag = true;
 
       console.error(`MCPL server "${this.id}" reconnected successfully`);
       this.reconnectAttempts = 0;
@@ -588,7 +706,11 @@ export class McplServerConnection extends EventEmitter {
    * the framework maps the rejection to an isError tool_result, so a hung tool
    * surfaces as a normal tool error and the turn completes.
    */
-  private sendRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private sendRequest(
+    method: string,
+    params: Record<string, unknown>,
+    options: RequestOptions = {},
+  ): Promise<unknown> {
     if (this.closed) {
       return Promise.reject(new Error(`Cannot send request: connection to "${this.id}" is closed`));
     }
@@ -603,18 +725,22 @@ export class McplServerConnection extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = { resolve, reject, method };
-      if (this.requestTimeoutMs > 0) {
+      const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
+      if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
           this.pendingRequests.delete(id);
+          if (options.surfaceOrphanedResponse) {
+            this.orphanedRequests.set(id, { method });
+          }
           reject(new Error(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
-            `within ${this.requestTimeoutMs}ms — the server may be hung. ` +
-            `The request was abandoned; the connection remains open. Note the ` +
-            `tool may still have completed server-side (this is only a response ` +
-            `timeout, not a cancellation) — verify state before retrying, as a ` +
-            `blind retry of a stateful/side-effecting tool may duplicate it.`,
+            `within ${timeoutMs}ms — the server may be hung. The response ` +
+            `outcome is unknown: the request was abandoned locally but was not ` +
+            `cancelled, so the tool may still have completed server-side; verify ` +
+            `state before retrying; a blind retry of a stateful/side-effecting ` +
+            `tool may duplicate it.`,
           ));
-        }, this.requestTimeoutMs);
+        }, timeoutMs);
         // Don't hold the event loop open for the watchdog alone.
         pending.timer.unref?.();
       }
@@ -722,23 +848,31 @@ export class McplServerConnection extends EventEmitter {
     const pending = this.pendingRequests.get(response.id);
     if (!pending) {
       // Orphaned response — the request already timed out (or was settled) and
-      // was removed from pendingRequests. Stateless late results are harmless to
-      // drop, but a late STATEFUL result carries a `state`/`checkpoint` the
-      // server has already advanced to: dropping it silently diverges the host's
-      // checkpoint tree from the server's, and every subsequent call then sends
-      // stale state. We can't safely re-inject it here (the dispatch context is
-      // gone), but we surface it so the divergence is greppable instead of
-      // invisible.
+      // was removed from pendingRequests. A late STATEFUL result must be
+      // surfaced because dropping it silently diverges the checkpoint tree.
+      // Selected side-effecting calls are also surfaced even without state so
+      // their outcome-unknown receipt remains visible. We cannot safely
+      // re-inject either result because the original dispatch context is gone.
+      const orphaned = this.orphanedRequests.get(response.id);
+      this.orphanedRequests.delete(response.id);
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };
-        if (r.state !== undefined || r.checkpoint !== undefined) {
+        if (orphaned || r.state !== undefined || r.checkpoint !== undefined) {
           this.emit('orphaned-response', {
             id: response.id,
+            method: orphaned?.method,
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
           });
         }
+      } else if (orphaned) {
+        this.emit('orphaned-response', {
+          id: response.id,
+          method: orphaned.method,
+          hadState: false,
+          hadCheckpoint: false,
+        });
       }
       return; // Orphaned response — ignore
     }
@@ -805,6 +939,7 @@ export class McplServerConnection extends EventEmitter {
           );
         }
         this.pendingRequests.clear();
+        this.orphanedRequests.clear();
 
         this.emit('close', info.code ?? null, info.signal ?? null);
 

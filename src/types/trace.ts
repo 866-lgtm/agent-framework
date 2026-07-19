@@ -319,6 +319,8 @@ export type TraceEvent =
       serverId: string;
       /** The JSON-RPC id of the late response whose pending request already timed out. */
       responseId: string | number;
+      /** Original request method when retained for mandatory-deadline visibility. */
+      method?: string;
       /** True when the dropped response carried host-managed `state`. */
       hadState: boolean;
       /** True when the dropped response carried a server-managed `checkpoint`. */

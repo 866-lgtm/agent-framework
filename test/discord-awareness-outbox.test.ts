@@ -164,7 +164,7 @@ test('framework drain records failures per ref and continues past permanent fail
     let retryableFailure = true;
     const connection = {
       isConnected: true,
-      sendToolsCall: async (name: string, args: Record<string, unknown>) => {
+      sendToolsCallWithDeadline: async (name: string, args: Record<string, unknown>) => {
         calls.push({ name, args });
         if (args.messageId === 'm2') {
           return { isError: true, content: [{ type: 'text', text: 'Unknown Message' }] };

@@ -5,8 +5,9 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { readFile, stat, access, writeFile, unlink, mkdir } from 'node:fs/promises';
-import { join, resolve, relative, dirname } from 'node:path';
+import { constants as fsConstants } from 'node:fs';
+import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
+import { join, resolve, relative, dirname, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -16,6 +17,7 @@ import type {
   MountState,
   WorkspaceModuleState,
   ReadInput,
+  ReadImageInput,
   WriteInput,
   EditInput,
   DeleteInput,
@@ -40,6 +42,7 @@ export type {
   MountState,
   WorkspaceModuleState,
   ReadInput,
+  ReadImageInput,
   WriteInput,
   EditInput,
   DeleteInput,
@@ -50,6 +53,469 @@ export type {
   MaterializeInput,
   SyncInput,
 } from './types.js';
+
+type SupportedImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+
+class WorkspaceImageReadError extends Error {
+  constructor(
+    readonly code:
+      | 'mount_unavailable'
+      | 'not_found'
+      | 'directory'
+      | 'symlink'
+      | 'escape'
+      | 'changed'
+      | 'empty'
+      | 'too_large'
+      | 'truncated'
+      | 'invalid'
+      | 'unsupported'
+      | 'blob_missing',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'WorkspaceImageReadError';
+  }
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
+const GIF87A_SIGNATURE = Buffer.from('GIF87a', 'ascii');
+const GIF89A_SIGNATURE = Buffer.from('GIF89a', 'ascii');
+const RIFF_SIGNATURE = Buffer.from('RIFF', 'ascii');
+const WEBP_SIGNATURE = Buffer.from('WEBP', 'ascii');
+const JPEG_SOF_MARKERS = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+const GIF_TRAILER = 0x3b;
+const GIF_EXTENSION = 0x21;
+const GIF_IMAGE_DESCRIPTOR = 0x2c;
+const JPEG_SOI = 0xd8;
+const JPEG_EOI = 0xd9;
+const JPEG_SOS = 0xda;
+const JPEG_TEM = 0x01;
+
+function isErrnoCode(err: unknown, code: string): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: unknown }).code === code;
+}
+
+function startsWithBytes(buffer: Buffer, prefix: Buffer): boolean {
+  return buffer.length >= prefix.length && buffer.subarray(0, prefix.length).equals(prefix);
+}
+
+function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
+  return buffer.length > 0 && prefix.subarray(0, buffer.length).equals(buffer);
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  if (candidate === root) return true;
+  const normalizedRoot = root.endsWith(sep) ? root : root + sep;
+  return candidate.startsWith(normalizedRoot);
+}
+
+function invalidImage(format: string, mountPrefixedPath: string): never {
+  throw new WorkspaceImageReadError('invalid', `Invalid ${format} image: ${mountPrefixedPath}`);
+}
+
+function requireBufferRange(bytes: Buffer, start: number, length: number, format: string, mountPrefixedPath: string): void {
+  if (start < 0 || length < 0 || start + length > bytes.length) {
+    invalidImage(format, mountPrefixedPath);
+  }
+}
+
+function readUInt24LE(bytes: Buffer, offset: number): number {
+  return bytes[offset]! + (bytes[offset + 1]! << 8) + (bytes[offset + 2]! << 16);
+}
+
+function parseGifSubBlocks(bytes: Buffer, offset: number, mountPrefixedPath: string): number {
+  while (true) {
+    requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
+    const blockLength = bytes[offset]!;
+    offset += 1;
+    if (blockLength === 0) return offset;
+    requireBufferRange(bytes, offset, blockLength, 'GIF', mountPrefixedPath);
+    offset += blockLength;
+  }
+}
+
+function validatePng(bytes: Buffer, mountPrefixedPath: string): void {
+  let offset = PNG_SIGNATURE.length;
+  let sawIend = false;
+  let sawNonEmptyIdat = false;
+
+  while (!sawIend) {
+    requireBufferRange(bytes, offset, 12, 'PNG', mountPrefixedPath);
+    const chunkLength = bytes.readUInt32BE(offset);
+    const chunkType = bytes.toString('ascii', offset + 4, offset + 8);
+    const chunkDataOffset = offset + 8;
+    const chunkEnd = chunkDataOffset + chunkLength;
+    const nextOffset = chunkEnd + 4;
+    requireBufferRange(bytes, chunkDataOffset, chunkLength + 4, 'PNG', mountPrefixedPath);
+
+    if (offset === PNG_SIGNATURE.length) {
+      if (chunkType !== 'IHDR' || chunkLength !== 13) {
+        invalidImage('PNG', mountPrefixedPath);
+      }
+      const width = bytes.readUInt32BE(chunkDataOffset);
+      const height = bytes.readUInt32BE(chunkDataOffset + 4);
+      if (width === 0 || height === 0) {
+        invalidImage('PNG', mountPrefixedPath);
+      }
+    }
+
+    if (chunkType === 'IDAT' && chunkLength > 0) {
+      sawNonEmptyIdat = true;
+    }
+
+    if (chunkType === 'IEND') {
+      if (chunkLength !== 0 || nextOffset !== bytes.length || !sawNonEmptyIdat) {
+        invalidImage('PNG', mountPrefixedPath);
+      }
+      sawIend = true;
+    }
+
+    offset = nextOffset;
+  }
+}
+
+function validateGif(bytes: Buffer, mountPrefixedPath: string): void {
+  requireBufferRange(bytes, 0, 13, 'GIF', mountPrefixedPath);
+  const width = bytes.readUInt16LE(6);
+  const height = bytes.readUInt16LE(8);
+  if (width === 0 || height === 0) {
+    invalidImage('GIF', mountPrefixedPath);
+  }
+
+  let offset = 13;
+  const packed = bytes[10]!;
+  if ((packed & 0x80) !== 0) {
+    const globalColorTableBytes = 3 * (1 << ((packed & 0x07) + 1));
+    requireBufferRange(bytes, offset, globalColorTableBytes, 'GIF', mountPrefixedPath);
+    offset += globalColorTableBytes;
+  }
+
+  let sawImage = false;
+  while (offset < bytes.length) {
+    const marker = bytes[offset]!;
+    offset += 1;
+
+    if (marker === GIF_TRAILER) {
+      if (!sawImage || offset !== bytes.length) {
+        invalidImage('GIF', mountPrefixedPath);
+      }
+      return;
+    }
+
+    if (marker === GIF_EXTENSION) {
+      requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
+      offset += 1; // extension label
+      offset = parseGifSubBlocks(bytes, offset, mountPrefixedPath);
+      continue;
+    }
+
+    if (marker !== GIF_IMAGE_DESCRIPTOR) {
+      invalidImage('GIF', mountPrefixedPath);
+    }
+
+    sawImage = true;
+    requireBufferRange(bytes, offset, 9, 'GIF', mountPrefixedPath);
+    const imageWidth = bytes.readUInt16LE(offset + 4);
+    const imageHeight = bytes.readUInt16LE(offset + 6);
+    if (imageWidth === 0 || imageHeight === 0) {
+      invalidImage('GIF', mountPrefixedPath);
+    }
+    const imagePacked = bytes[offset + 8]!;
+    offset += 9;
+    if ((imagePacked & 0x80) !== 0) {
+      const localColorTableBytes = 3 * (1 << ((imagePacked & 0x07) + 1));
+      requireBufferRange(bytes, offset, localColorTableBytes, 'GIF', mountPrefixedPath);
+      offset += localColorTableBytes;
+    }
+
+    requireBufferRange(bytes, offset, 1, 'GIF', mountPrefixedPath);
+    const lzwMinimumCodeSize = bytes[offset]!;
+    if (lzwMinimumCodeSize < 2 || lzwMinimumCodeSize > 8) {
+      invalidImage('GIF', mountPrefixedPath);
+    }
+    offset += 1;
+    offset = parseGifSubBlocks(bytes, offset, mountPrefixedPath);
+  }
+
+  invalidImage('GIF', mountPrefixedPath);
+}
+
+function scanJpegEntropyData(bytes: Buffer, offset: number, mountPrefixedPath: string): number {
+  // Scan data can contain 0xFF byte-stuffing and restart markers.
+  while (offset < bytes.length) {
+    const value = bytes[offset]!;
+    offset += 1;
+    if (value !== 0xff) continue;
+
+    while (offset < bytes.length && bytes[offset] === 0xff) {
+      offset += 1;
+    }
+    if (offset >= bytes.length) invalidImage('JPEG', mountPrefixedPath);
+
+    const marker = bytes[offset]!;
+    if (marker === 0x00) {
+      offset += 1;
+      continue;
+    }
+    if (marker >= 0xd0 && marker <= 0xd7) {
+      offset += 1;
+      continue;
+    }
+    return offset - 1;
+  }
+
+  invalidImage('JPEG', mountPrefixedPath);
+}
+
+function validateJpeg(bytes: Buffer, mountPrefixedPath: string): void {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== JPEG_SOI) {
+    invalidImage('JPEG', mountPrefixedPath);
+  }
+
+  let offset = 2;
+  let sawSof = false;
+  let sawSos = false;
+
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      invalidImage('JPEG', mountPrefixedPath);
+    }
+
+    while (offset < bytes.length && bytes[offset] === 0xff) {
+      offset += 1;
+    }
+    if (offset >= bytes.length) invalidImage('JPEG', mountPrefixedPath);
+
+    const marker = bytes[offset]!;
+    offset += 1;
+
+    if (marker === JPEG_EOI) {
+      if (!sawSof || !sawSos || offset !== bytes.length) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      return;
+    }
+    if (marker === JPEG_TEM || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+
+    requireBufferRange(bytes, offset, 2, 'JPEG', mountPrefixedPath);
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2) {
+      invalidImage('JPEG', mountPrefixedPath);
+    }
+    offset += 2;
+    const payloadOffset = offset;
+    const payloadLength = segmentLength - 2;
+    requireBufferRange(bytes, payloadOffset, payloadLength, 'JPEG', mountPrefixedPath);
+
+    if (JPEG_SOF_MARKERS.has(marker)) {
+      if (payloadLength < 6) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      const height = bytes.readUInt16BE(payloadOffset + 1);
+      const width = bytes.readUInt16BE(payloadOffset + 3);
+      const componentCount = bytes[payloadOffset + 5]!;
+      if (componentCount === 0 || payloadLength < 6 + (componentCount * 3)) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      if (width === 0 || height === 0) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      sawSof = true;
+    }
+
+    if (marker === JPEG_SOS) {
+      if (!sawSof) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      if (payloadLength < 6) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      const componentCount = bytes[payloadOffset]!;
+      if (componentCount === 0 || payloadLength < 1 + (componentCount * 2) + 3) {
+        invalidImage('JPEG', mountPrefixedPath);
+      }
+      sawSos = true;
+      offset = scanJpegEntropyData(bytes, payloadOffset + payloadLength, mountPrefixedPath);
+      continue;
+    }
+
+    offset = payloadOffset + payloadLength;
+  }
+
+  invalidImage('JPEG', mountPrefixedPath);
+}
+
+function validateWebpVp8Chunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength <= 10) invalidImage('WebP', mountPrefixedPath);
+  if (bytes[chunkDataOffset + 3] !== 0x9d || bytes[chunkDataOffset + 4] !== 0x01 || bytes[chunkDataOffset + 5] !== 0x2a) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+  const width = bytes.readUInt16LE(chunkDataOffset + 6) & 0x3fff;
+  const height = bytes.readUInt16LE(chunkDataOffset + 8) & 0x3fff;
+  if (width === 0 || height === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebpVp8lChunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength <= 5 || bytes[chunkDataOffset] !== 0x2f) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+  const packed = bytes.readUInt32LE(chunkDataOffset + 1);
+  const width = (packed & 0x3fff) + 1;
+  const height = ((packed >> 14) & 0x3fff) + 1;
+  if (width === 0 || height === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebpVp8xChunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength !== 10) invalidImage('WebP', mountPrefixedPath);
+  const width = 1 + readUInt24LE(bytes, chunkDataOffset + 4);
+  const height = 1 + readUInt24LE(bytes, chunkDataOffset + 7);
+  if (width === 0 || height === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebpAnmfChunk(bytes: Buffer, chunkDataOffset: number, chunkLength: number, mountPrefixedPath: string): void {
+  if (chunkLength <= 16) invalidImage('WebP', mountPrefixedPath);
+
+  const frameWidth = 1 + readUInt24LE(bytes, chunkDataOffset + 6);
+  const frameHeight = 1 + readUInt24LE(bytes, chunkDataOffset + 9);
+  if (frameWidth === 0 || frameHeight === 0) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+
+  const chunkDataEnd = chunkDataOffset + chunkLength;
+  let nestedOffset = chunkDataOffset + 16;
+  let sawFramePayload = false;
+
+  while (nestedOffset < chunkDataEnd) {
+    requireBufferRange(bytes, nestedOffset, 8, 'WebP', mountPrefixedPath);
+    const nestedChunkType = bytes.toString('ascii', nestedOffset, nestedOffset + 4);
+    const nestedChunkLength = bytes.readUInt32LE(nestedOffset + 4);
+    const nestedChunkDataOffset = nestedOffset + 8;
+    const nestedChunkEnd = nestedChunkDataOffset + nestedChunkLength;
+    const nestedPaddedChunkEnd = nestedChunkEnd + (nestedChunkLength % 2);
+    requireBufferRange(bytes, nestedChunkDataOffset, nestedChunkLength, 'WebP', mountPrefixedPath);
+    if (nestedPaddedChunkEnd > chunkDataEnd) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+
+    if (nestedChunkType === 'VP8 ') {
+      validateWebpVp8Chunk(bytes, nestedChunkDataOffset, nestedChunkLength, mountPrefixedPath);
+      sawFramePayload = true;
+    } else if (nestedChunkType === 'VP8L') {
+      validateWebpVp8lChunk(bytes, nestedChunkDataOffset, nestedChunkLength, mountPrefixedPath);
+      sawFramePayload = true;
+    }
+
+    nestedOffset = nestedPaddedChunkEnd;
+  }
+
+  if (!sawFramePayload || nestedOffset !== chunkDataEnd) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function validateWebp(bytes: Buffer, mountPrefixedPath: string): void {
+  requireBufferRange(bytes, 0, 12, 'WebP', mountPrefixedPath);
+
+  const declaredLength = bytes.readUInt32LE(4);
+  if (declaredLength + 8 !== bytes.length) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+  if (!bytes.subarray(8, 12).equals(WEBP_SIGNATURE)) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+
+  let offset = 12;
+  let sawVp8x = false;
+  let sawImagePayload = false;
+
+  while (offset < bytes.length) {
+    requireBufferRange(bytes, offset, 8, 'WebP', mountPrefixedPath);
+    const chunkType = bytes.toString('ascii', offset, offset + 4);
+    const chunkLength = bytes.readUInt32LE(offset + 4);
+    const chunkDataOffset = offset + 8;
+    const chunkDataEnd = chunkDataOffset + chunkLength;
+    const paddedChunkEnd = chunkDataEnd + (chunkLength % 2);
+    requireBufferRange(bytes, chunkDataOffset, chunkLength, 'WebP', mountPrefixedPath);
+    if (paddedChunkEnd > bytes.length) {
+      invalidImage('WebP', mountPrefixedPath);
+    }
+
+    if (chunkType === 'VP8 ') {
+      validateWebpVp8Chunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawImagePayload = true;
+    } else if (chunkType === 'VP8L') {
+      validateWebpVp8lChunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawImagePayload = true;
+    } else if (chunkType === 'VP8X') {
+      if (sawVp8x || offset !== 12) {
+        invalidImage('WebP', mountPrefixedPath);
+      }
+      validateWebpVp8xChunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawVp8x = true;
+    } else if (chunkType === 'ANMF') {
+      if (!sawVp8x) {
+        invalidImage('WebP', mountPrefixedPath);
+      }
+      validateWebpAnmfChunk(bytes, chunkDataOffset, chunkLength, mountPrefixedPath);
+      sawImagePayload = true;
+    }
+
+    offset = paddedChunkEnd;
+  }
+
+  if (!sawImagePayload) {
+    invalidImage('WebP', mountPrefixedPath);
+  }
+}
+
+function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): SupportedImageMimeType {
+  if (startsWithBytes(bytes, PNG_SIGNATURE)) {
+    validatePng(bytes, mountPrefixedPath);
+    return 'image/png';
+  }
+  if (matchesPartialPrefix(bytes, PNG_SIGNATURE)) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  if (startsWithBytes(bytes, JPEG_SIGNATURE)) {
+    validateJpeg(bytes, mountPrefixedPath);
+    return 'image/jpeg';
+  }
+  if (matchesPartialPrefix(bytes, JPEG_SIGNATURE)) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  if (startsWithBytes(bytes, GIF87A_SIGNATURE) || startsWithBytes(bytes, GIF89A_SIGNATURE)) {
+    validateGif(bytes, mountPrefixedPath);
+    return 'image/gif';
+  }
+  if (matchesPartialPrefix(bytes, GIF87A_SIGNATURE) || matchesPartialPrefix(bytes, GIF89A_SIGNATURE)) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  if (bytes.length >= 12 && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.subarray(8, 12).equals(WEBP_SIGNATURE)) {
+    validateWebp(bytes, mountPrefixedPath);
+    return 'image/webp';
+  }
+  if (
+    (bytes.length < RIFF_SIGNATURE.length && matchesPartialPrefix(bytes, RIFF_SIGNATURE))
+    || (bytes.length >= RIFF_SIGNATURE.length && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.length < 12)
+  ) {
+    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+  }
+
+  throw new WorkspaceImageReadError('unsupported', `Unsupported image format: ${mountPrefixedPath}`);
+}
 
 export class WorkspaceModule implements Module {
   readonly name = 'workspace';
@@ -270,6 +736,17 @@ export class WorkspaceModule implements Module {
         },
       },
       {
+        name: 'read_image',
+        description: 'Read an image file from the workspace and return native image content.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            path: { type: 'string', description: 'Image file path (mount-prefixed, e.g., "project/assets/logo.png")' },
+          },
+          required: ['path'],
+        },
+      },
+      {
         name: 'write',
         description: 'Create or overwrite a file in the workspace.',
         inputSchema: {
@@ -388,6 +865,7 @@ export class WorkspaceModule implements Module {
       const input = call.input as Record<string, unknown>;
       switch (call.name) {
         case 'read': return await this.handleRead(input as unknown as ReadInput);
+        case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
         case 'write': return await this.handleWrite(input as unknown as WriteInput);
         case 'edit': return await this.handleEdit(input as unknown as EditInput);
         case 'delete': return await this.handleDelete(input as unknown as DeleteInput);
@@ -491,6 +969,56 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * Write binary content (e.g. an image pulled from the agent's context) to a
+   * mount, through the same Chronicle-tree + auto-materialize path as the
+   * `write` tool. Public API for the framework's synthesized `save_image`
+   * tool and other peer callers that hold bytes rather than text.
+   */
+  async writeBinary(
+    mountPrefixedPath: string,
+    data: Buffer,
+    mimeType: string,
+  ): Promise<ToolResult> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+    if (mount.config.mode === 'read-only') {
+      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
+    }
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    if (data.byteLength > maxSize) {
+      return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
+    }
+    const store = this.getStore();
+    const blobHash = store.storeBlob(data, mimeType);
+    store.treeSet(mount.treeStateId, relativePath, {
+      blobHash,
+      size: data.byteLength,
+      mode: 0o644,
+    });
+    const materializeError = await this.autoMaterialize(mount, relativePath, 'write', data);
+    if (materializeError) {
+      return {
+        success: false,
+        error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
+        isError: true,
+      };
+    }
+    return {
+      success: true,
+      data: { path: mountPrefixedPath, size: data.byteLength, mimeType },
+    };
+  }
+
+  /**
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
   private parsePath(path: string): { mount: MountState; relativePath: string } {
@@ -516,6 +1044,163 @@ export class WorkspaceModule implements Module {
   private getStore(): JsStore {
     if (!this.store) throw new Error('WorkspaceModule: store not initialized. Call initStore() first.');
     return this.store;
+  }
+
+  private validateImageBytes(
+    bytes: Buffer,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): { bytes: Buffer; mimeType: SupportedImageMimeType } {
+    if (bytes.byteLength === 0) {
+      throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+    }
+    if (bytes.byteLength > maxSize) {
+      throw new WorkspaceImageReadError(
+        'too_large',
+        `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+      );
+    }
+    return {
+      bytes,
+      mimeType: detectImageMimeType(bytes, mountPrefixedPath),
+    };
+  }
+
+  private tryReadImageFromTree(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): { bytes: Buffer; mimeType: SupportedImageMimeType } | null {
+    const store = this.getStore();
+    const entry = store.treeGet(mount.treeStateId, relativePath);
+    if (!entry) return null;
+
+    const blob = store.getBlob(entry.blobHash);
+    if (!blob) {
+      throw new WorkspaceImageReadError('blob_missing', `Blob not found for: ${mountPrefixedPath}`);
+    }
+
+    return this.validateImageBytes(blob, mountPrefixedPath, maxSize);
+  }
+
+  private async readImageFromFilesystem(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
+    const lexicalPath = resolve(mount.config.path, relativePath);
+    const useNoFollow = !mount.config.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number';
+
+    let fileInfo: Awaited<ReturnType<typeof lstat>>;
+    try {
+      fileInfo = await lstat(lexicalPath);
+    } catch (err) {
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    }
+
+    if (fileInfo.isDirectory()) {
+      throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+    }
+    if (fileInfo.isSymbolicLink() && !mount.config.followSymlinks) {
+      throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+    }
+
+    let realMountRoot: string;
+    try {
+      realMountRoot = await realpath(mount.config.path);
+    } catch {
+      throw new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+    }
+
+    let handle: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      handle = await open(lexicalPath, fsConstants.O_RDONLY | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
+    } catch (err) {
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      if (!mount.config.followSymlinks && isErrnoCode(err, 'ELOOP')) {
+        throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    }
+
+    try {
+      const fileStat = await handle.stat();
+      if (fileStat.isDirectory()) {
+        throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+      }
+      if (!fileStat.isFile()) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      if (fileStat.size === 0) {
+        throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+      }
+      if (fileStat.size > maxSize) {
+        throw new WorkspaceImageReadError(
+          'too_large',
+          `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+        );
+      }
+
+      if (!mount.config.followSymlinks && !useNoFollow) {
+        let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
+        try {
+          postOpenInfo = await lstat(lexicalPath);
+        } catch (err) {
+          if (isErrnoCode(err, 'ENOENT')) {
+            throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+          }
+          throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+        }
+        if (postOpenInfo.isSymbolicLink()) {
+          throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+        }
+      }
+
+      let realFilePath: string;
+      try {
+        realFilePath = await realpath(lexicalPath);
+      } catch (err) {
+        if (isErrnoCode(err, 'ENOENT')) {
+          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        }
+        throw new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${mountPrefixedPath}`);
+      }
+
+      if (!isContainedPath(realMountRoot, realFilePath)) {
+        throw new WorkspaceImageReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`);
+      }
+
+      let pathStat: Awaited<ReturnType<typeof stat>>;
+      try {
+        pathStat = await stat(realFilePath);
+      } catch (err) {
+        if (isErrnoCode(err, 'ENOENT')) {
+          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        }
+        throw new WorkspaceImageReadError('not_found', `Unable to stat image file: ${mountPrefixedPath}`);
+      }
+      if (pathStat.dev !== fileStat.dev || pathStat.ino !== fileStat.ino) {
+        throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+      }
+
+      const bytes = await handle.readFile();
+      return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) throw err;
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    } finally {
+      await handle?.close();
+    }
   }
 
   /**
@@ -646,6 +1331,78 @@ export class WorkspaceModule implements Module {
         content: formatted,
       },
     };
+  }
+
+  private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(input.path));
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        isError: true,
+      };
+    }
+    if (!relativePath) {
+      return { success: false, error: `Path is a directory: ${input.path}`, isError: true };
+    }
+
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    let treeError: WorkspaceImageReadError | null = null;
+
+    try {
+      const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
+      if (image) {
+        return {
+          success: true,
+          data: [
+            {
+              type: 'text',
+              text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+            },
+            {
+              type: 'image',
+              data: image.bytes.toString('base64'),
+              mimeType: image.mimeType,
+            },
+          ],
+        };
+      }
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) {
+        treeError = err;
+      } else {
+        throw err;
+      }
+    }
+
+    try {
+      const image = await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize);
+      return {
+        success: true,
+        data: [
+          {
+            type: 'text',
+            text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+          },
+          {
+            type: 'image',
+            data: image.bytes.toString('base64'),
+            mimeType: image.mimeType,
+          },
+        ],
+      };
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) {
+        if (err.code === 'not_found' && treeError) {
+          return { success: false, error: treeError.message, isError: true };
+        }
+        return { success: false, error: err.message, isError: true };
+      }
+      throw err;
+    }
   }
 
   private async handleWrite(input: WriteInput): Promise<ToolResult> {
