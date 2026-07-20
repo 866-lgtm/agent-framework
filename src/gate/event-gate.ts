@@ -1298,6 +1298,18 @@ export class EventGate {
     }
   }
 
+  /**
+   * Is this author on the hot-reloaded privileged-users list? Reuses the same
+   * list that governs sleep-wake bypass. Used by the framework to let a
+   * privileged human interrupt (abort) a runaway in-flight turn. Reloads the
+   * file first so a freshly-edited list takes effect without a restart.
+   */
+  isPrivilegedUser(authorId: string | undefined | null): boolean {
+    if (!authorId) return false;
+    this.reloadPrivilegedIfChanged();
+    return this.privilegedUserIds.has(String(authorId));
+  }
+
   getToolDefinition(): ToolDefinition {
     return {
       name: 'gate_status',

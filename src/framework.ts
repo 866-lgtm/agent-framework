@@ -407,6 +407,14 @@ export class AgentFramework {
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
   private readonly inferenceFailureEscalationThreshold = 3;
+  /** Agents whose in-flight turn was just aborted by a privileged human
+   *  interrupt (interruptForPrivileged). The abort surfaces as an
+   *  `inference:exhausted` trace like any other cancel, but it is a DELIBERATE
+   *  turn-end, not a model failure — emitTrace consumes this marker to skip the
+   *  hard-down streak + the misleading "[inference-failed]" chronicle marker and
+   *  record an honest "[interrupted]" note instead. Keyed by agent name;
+   *  consumed by the first exhaustion that follows the abort. */
+  private pendingPrivilegedInterrupts: Set<string> = new Set();
   /** Per-(agent,kind) timestamp of the last ops webhook post. Throttles
    *  opsAlert() so a persistent failure re-posts once per cooldown window
    *  instead of on every occurrence. */
@@ -1101,6 +1109,48 @@ export class AgentFramework {
    */
   getConversationRouter(): ConversationRouter | null {
     return this.conversationRouter;
+  }
+
+  /**
+   * Privileged-message interrupt. When a message arrives from a privileged
+   * human (the sleep-wake privileged-users list) while an agent is mid-turn,
+   * abort the in-flight inference so the runaway turn ends and the human's
+   * message is processed on the next boundary — a reliable "brake pedal" that
+   * doesn't require killing the provider API. Independent of the wake gate: a
+   * privileged message always stops the current turn, whether or not it also
+   * triggers a fresh one.
+   *
+   * Only fires while the agent is actually busy (inferring / streaming /
+   * waiting_for_tools); an idle agent needs no interrupt. The abort resets the
+   * agent to idle and releases the gate. It DOES surface as an
+   * `inference:exhausted` trace (the generic cancel path), which would normally
+   * bump the hard-down streak and write a "your model call failed" marker — so
+   * `pendingPrivilegedInterrupts` tells emitTrace to treat this one exhaustion
+   * as a deliberate turn-end instead, keeping repeated brake taps from driving
+   * the agent hard-down.
+   */
+  private interruptForPrivileged(authorId: string | undefined | null, source: string): void {
+    if (!authorId || !this.eventGate) return;
+    if (!this.eventGate.isPrivilegedUser(authorId)) return;
+    for (const [agentName, agent] of this.agents) {
+      const status = agent.state.status;
+      if (status === 'inferring' || status === 'streaming' || status === 'waiting_for_tools') {
+        // Mark BEFORE aborting: the membrane's `aborted` event (→
+        // inference:exhausted trace) is asynchronous and fires after this
+        // returns, so the marker is in place when emitTrace consumes it.
+        this.pendingPrivilegedInterrupts.add(agentName);
+        const aborted = this.abortInference(agentName, 'privileged-interrupt');
+        if (aborted) {
+          console.error(
+            `[privileged-interrupt] agent=${agentName} turn aborted by privileged author ${authorId} (${source})`,
+          );
+        } else {
+          // Nothing was actually aborted — don't leave a stale marker that would
+          // swallow the next genuine failure.
+          this.pendingPrivilegedInterrupts.delete(agentName);
+        }
+      }
+    }
   }
 
   /**
@@ -3468,6 +3518,10 @@ export class AgentFramework {
     };
     if (event.threadId) metadata.threadId = event.threadId;
 
+    // Privileged human interrupt: a message from a privileged author aborts any
+    // runaway in-flight turn before this message is deferred/queued behind it.
+    this.interruptForPrivileged(event.author?.id, 'mcpl:channel-incoming');
+
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
     // to the primary conversation.
@@ -3773,6 +3827,14 @@ export class AgentFramework {
       eventId: event.eventId,
       triggered: event.triggerInference ?? false,
     };
+
+    // Privileged human interrupt: a push message (e.g. a DM or a mention in a
+    // closed channel) from a privileged author aborts any runaway in-flight
+    // turn before this message is deferred/queued behind it.
+    this.interruptForPrivileged(
+      typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined,
+      'mcpl:push-event',
+    );
 
     const content = [...event.content];
     const addressedWhileClosed = triggerChannel &&
@@ -5323,12 +5385,44 @@ export class AgentFramework {
     // without this the only durable record of a failed inference is a field in
     // llm-calls.jsonl — invisible to operator, agent, and monitoring.
     if (event.type === 'inference:exhausted') {
-      this.noteInferenceExhausted(
-        (event.agentName as string) ?? 'unknown',
-        (event.error as string) ?? 'unknown error',
-        event.retryable as boolean | undefined,
-        event.errorType as string | undefined,
-      );
+      const name = (event.agentName as string) ?? 'unknown';
+      if (this.pendingPrivilegedInterrupts.delete(name)) {
+        // Deliberate privileged-human interrupt, not a model failure: do NOT
+        // bump the hard-down streak, log [inference-failed], or write the
+        // "change approach rather than retrying" marker (all wrong here — the
+        // turn was cut short on purpose). Record an honest marker instead so
+        // the agent understands its turn was interrupted and to look for new
+        // input. addMessage() directly (no pendingRequest) → this never wakes
+        // the agent, matching the inference-failed marker's context-yes/wake-no
+        // intent. The agent was already reset() to idle on the abort path.
+        const agent = this.agents.get(name);
+        if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+          try {
+            agent.getContextManager().addMessage(
+              'user',
+              [{
+                type: 'text',
+                text:
+                  `[interrupted] A privileged user interrupted your in-progress ` +
+                  `turn before it finished, so it was cut short and anything you ` +
+                  `were part-way through was not completed. This is a deliberate ` +
+                  `signal, not an error — check the most recent messages for their ` +
+                  `new input and respond to that.`,
+              }],
+              { system: true, kind: 'privileged-interrupt' },
+            );
+          } catch (err) {
+            console.error(`[privileged-interrupt] could not record chronicle marker for ${name}:`, err);
+          }
+        }
+      } else {
+        this.noteInferenceExhausted(
+          name,
+          (event.error as string) ?? 'unknown error',
+          event.retryable as boolean | undefined,
+          event.errorType as string | undefined,
+        );
+      }
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
       // agent isn't hard-down; clear its consecutive-failure streak (and the
