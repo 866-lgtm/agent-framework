@@ -3276,9 +3276,20 @@ export class AgentFramework {
           // silence the reply, and the newest channel-bearing injection is
           // now the reply locus. Map presence matters even without a channel
           // (CLI/module input): it still clears the prior send suppression.
+          //
+          // Only a WAKING injection (`triggered`: the surface's gate said this
+          // message warrants a turn — a human addressing her, a DM, a mention)
+          // may move the locus. Ambient injections — bot chatter in an open
+          // channel, module notes, system markers — are heard mid-turn but must
+          // NOT steal the reply: on 2026-07-28 an unaddressed bot message in
+          // #residency-hall arrived while she was answering Helen in
+          // #the-apartment, and the whole reply was published to the wrong
+          // channel. Same hijack class the `activeTriggerChannels` pin exists to
+          // prevent (item-3 redux), leaking back in through the injection path.
           if (midTurnInjections.length > 0) {
             const injectedChannelId = midTurnInjections.reduce<string | null>(
               (latest, injection) => {
+                if (injection.metadata?.triggered !== true) return latest;
                 const candidate = injection.metadata?.channelId;
                 return typeof candidate === 'string' && candidate.length > 0
                   ? candidate

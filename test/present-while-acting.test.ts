@@ -48,6 +48,10 @@ class RobotModule implements Module {
   interjection: string | null = null;
   /** Optional routing locus attached to the interjected message. */
   interjectionChannelId: string | null = null;
+  /** Whether the interjection is a WAKING message (the surface's gate said it
+   *  warrants a turn) — only those may move the turn's reply locus. Ambient
+   *  chatter arrives with `triggered: false`. */
+  interjectionTriggered = false;
   /** Delay tool completion so live routing deterministically precedes it. */
   toolDelayMs = 0;
 
@@ -81,7 +85,7 @@ class RobotModule implements Module {
         source: 'test',
         content: text,
         metadata: this.interjectionChannelId
-          ? { channelId: this.interjectionChannelId }
+          ? { channelId: this.interjectionChannelId, triggered: this.interjectionTriggered }
           : {},
       } as unknown as ProcessEvent);
       // Give the run loop a beat to process the queued message while this
@@ -302,6 +306,7 @@ describe('present while acting', () => {
     const routed = stubChannelRegistry(framework);
     module.interjection = 'Want to try a VR space?';
     module.interjectionChannelId = 'discord:guild:fable';
+    module.interjectionTriggered = true;
 
     trigger(framework);
     await framework.runUntilIdle();
@@ -309,6 +314,41 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [
       { text: 'Yes, I want to try the VR space.', locus: 'discord:guild:fable' },
     ]);
+
+    await framework.stop();
+  });
+
+  it('an AMBIENT injected channel message does not move the reply locus', async () => {
+    // 2026-07-28: while answering the human in her private channel, an
+    // unaddressed bot message arrived in a busy open channel. It was injected
+    // mid-turn (correct — she should hear it) but also re-pinned the locus, so
+    // the whole reply to the human was published to the bot's channel. Only a
+    // waking message (`triggered: true`) may move the reply.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'up' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Life is good, here is how things are going.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.interjection = 'unrelated bot chatter in another channel';
+    module.interjectionChannelId = 'discord:guild:residency-hall';
+    module.interjectionTriggered = false;
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(
+      routed,
+      [{ text: 'Life is good, here is how things are going.', locus: 'chan-live-1' }],
+      'reply stays on the turn-start locus, not the ambient message\'s channel',
+    );
+
+    // Still HEARD: the ambient message is injected into the live stream.
+    const options = membrane.lastStream!.receivedToolResultOptions[0];
+    assert.equal(options?.injectedMessages?.length, 1);
 
     await framework.stop();
   });
