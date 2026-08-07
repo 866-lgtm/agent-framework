@@ -4474,6 +4474,18 @@ export class AgentFramework {
             const speechContent = hadToolCalls ? [] : allText;
             const thoughts = hadToolCalls ? allText : [];
 
+            // An empty completion (no tool calls, no routable text — e.g. a
+            // provider returning content:null, or a thinking-only response)
+            // is a valid terminal state but otherwise leaves no journal
+            // trace: the turn just vanishes from the channel's perspective.
+            // Surface it so a silently dropped turn is diagnosable.
+            if (!hadToolCalls && allText.every((b) => !b.text.trim())) {
+              console.error(
+                `[inference] ${agent.name}: empty completion — ` +
+                `${response.content.length} content block(s), no routable text, no tool calls`
+              );
+            }
+
             const du = response.details?.usage;
             const tokenUsage = du
               ? {
