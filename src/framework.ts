@@ -93,6 +93,19 @@ const SILENCING_TOOLS = new Set(
     ? ['skip_reply']
     : ['skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm'],
 );
+
+/**
+ * Think loop guard. think() carries no endTurn, so a model can in principle
+ * keep reasoning round after round without ever replying or acting — the same
+ * runaway class as the 40+round skip_reply loop that endTurn was added to fix.
+ * We count consecutive inference rounds whose ONLY tool call was think(): after
+ * THINK_SOFT_CAP such rounds we rewrite the think tool result with a firm steer
+ * to answer or use a concrete tool; at THINK_HARD_CAP we end the turn outright
+ * as a backstop. The counter resets on any non-think round and at each fresh
+ * inference start. Env-overridable; set a cap to 0 to disable just that tier.
+ */
+const THINK_SOFT_CAP = Number(process.env.THINK_SOFT_CAP ?? 3);
+const THINK_HARD_CAP = Number(process.env.THINK_HARD_CAP ?? 8);
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
@@ -389,6 +402,10 @@ export class AgentFramework {
    *  string also moves that round's reply locus to the newest injected
    *  channel. */
   private midTurnRoutingResets: Map<string, string | null> = new Map();
+  /** Per-agent count of consecutive think-only inference rounds in the current
+   *  turn — drives the think loop guard (see THINK_SOFT_CAP / THINK_HARD_CAP).
+   *  Reset at each fresh inference start and on any non-think round. */
+  private consecutiveThinkRounds: Map<string, number> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -3300,8 +3317,41 @@ export class AgentFramework {
             this.midTurnRoutingResets.set(agent.name, injectedChannelId);
           }
 
-          // Check if any tool result requested endTurn
-          const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
+          // Think loop guard: when this round's only tool call(s) were think(),
+          // count it and steer the model back toward acting. Any non-think tool
+          // call is real progress and clears the counter. See THINK_*_CAP.
+          const roundToolNames = currentState.toolResults.map(tc => tc.name);
+          const thinkOnlyRound =
+            roundToolNames.length > 0 && roundToolNames.every(n => n === 'think');
+          let thinkGuardEndTurn = false;
+          if (thinkOnlyRound) {
+            const n = (this.consecutiveThinkRounds.get(agent.name) ?? 0) + 1;
+            this.consecutiveThinkRounds.set(agent.name, n);
+            if (THINK_HARD_CAP > 0 && n >= THINK_HARD_CAP) {
+              // Backstop: break a runaway think loop by ending the turn. The
+              // shouldEndTurn branch below emits inference:turn_ended.
+              thinkGuardEndTurn = true;
+            } else if (THINK_SOFT_CAP > 0 && n >= THINK_SOFT_CAP) {
+              // Rewrite the think result the model is about to read with a firm
+              // steer toward replying or using a concrete (non-think) tool.
+              for (const tc of currentState.toolResults) {
+                if (tc.name === 'think' && tc.result.success
+                    && tc.result.data && typeof tc.result.data === 'object') {
+                  (tc.result.data as Record<string, unknown>).note =
+                    `You have used think ${n} times in a row without replying or acting. ` +
+                    `Stop reasoning now and either reply to the user in plain text or call a ` +
+                    `concrete (non-think) tool. Do not call think again this turn.`;
+                }
+              }
+            }
+          } else {
+            this.consecutiveThinkRounds.delete(agent.name);
+          }
+
+          // Check if any tool result requested endTurn (skip_reply etc.), or the
+          // think loop guard tripped its hard cap.
+          const shouldEndTurn = thinkGuardEndTurn
+            || currentState.toolResults.some(tc => tc.result.endTurn);
 
           // Check if accumulated input tokens exceed the agent's budget
           const overBudget = currentState.stream
@@ -4095,6 +4145,12 @@ export class AgentFramework {
           console.error('beforeInference hook error:', error);
         }
       }
+
+      // Fresh inference start clears the think loop guard's per-turn counter.
+      // Tool-round resumes continue inside driveStream and never re-enter here,
+      // so this resets once per turn (rare mid-turn restarts only make the
+      // guard more lenient, never falsely strict).
+      this.consecutiveThinkRounds.delete(agent.name);
 
       const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
 
