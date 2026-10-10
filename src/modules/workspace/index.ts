@@ -38,7 +38,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { filesystemTrustsCtime, locateRoot } from './observe.js';
+import { filesystemTrustsCtime, isIgnored, locateRoot } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -618,6 +618,20 @@ function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): Supporte
   }
 
   throw new WorkspaceImageReadError('unsupported', `Unsupported image format: ${mountPrefixedPath}`);
+}
+
+/**
+ * Whether the mount's ignore list covers a mount-relative path: the path
+ * itself or any directory above it, as the walk's own test reads each entry
+ * by its path and name.
+ */
+function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
+  if (patterns.length === 0) return false;
+  const segments = relativePath.split('/').filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
+  }
+  return false;
 }
 
 export class WorkspaceModule implements Module {
@@ -1208,7 +1222,10 @@ export class WorkspaceModule implements Module {
           + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
           + 'directory) is unavailable and listed under `incomplete`. Reconnect the drive; acceptRoot is for a '
           + 'directory replaced on purpose, or a drive back under a new device number, never for one still '
-          + 'unplugged, whose empty mountpoint would become the root.',
+          + 'unplugged, whose empty mountpoint would become the root. What the scan passed over by design is '
+          + 'counted under `passedOver`, by mount and reason (an ignored directory counts once), so a total of 0 '
+          + 'means only that nothing it looked at had changed. A path the mount ignores is still taken when you '
+          + 'name it, and listed under `ignored`: a sync without a path won\'t maintain it.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2717,6 +2734,8 @@ export class WorkspaceModule implements Module {
     }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
     const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
+    const allPassedOver: Array<{ mount: string; reason: string; count: number }> = [];
+    const allIgnored: Array<{ mount: string; path: string; note: string }> = [];
     const rootsAccepted: string[] = [];
     if (input.acceptRoot && input.path) {
       return { success: false, error: 'acceptRoot takes a whole mount\'s root: give mount, or nothing, not path', isError: true };
@@ -2778,6 +2797,17 @@ export class WorkspaceModule implements Module {
         }
       }
       for (const region of pass.incomplete) allIncomplete.push({ mount: name, ...region });
+      for (const [reason, count] of pass.passedOver) allPassedOver.push({ mount: name, reason, count });
+      // A path named explicitly is taken even where the mount's ignore list
+      // covers it, and the result says so: a sync without a path passes
+      // over it, so nothing else keeps it current (agent-framework #276).
+      if (relativePath && coveredByIgnore(relativePath, mount.config.ignore ?? [])) {
+        allIgnored.push({
+          mount: name,
+          path: relativePath,
+          note: 'this mount\'s ignore list covers it, so a sync without a path won\'t maintain it',
+        });
+      }
     }
 
     return {
@@ -2788,6 +2818,8 @@ export class WorkspaceModule implements Module {
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
         ...(allIncomplete.length > 0 ? { incomplete: allIncomplete } : {}),
+        ...(allPassedOver.length > 0 ? { passedOver: allPassedOver } : {}),
+        ...(allIgnored.length > 0 ? { ignored: allIgnored } : {}),
         ...(rootsAccepted.length > 0 ? { rootsAccepted } : {}),
       },
     };
