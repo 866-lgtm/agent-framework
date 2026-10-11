@@ -79,8 +79,9 @@ export type TraceEvent =
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
       /**
-       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length').
-       * The poison-history breaker fires only on 'invalid_request'.
+       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length'),
+       * at most 128 characters. The poison-history breaker fires only on
+       * 'invalid_request'.
        */
       errorType?: string;
       /** The provider's HTTP status, when the failure carried one. */
@@ -461,8 +462,10 @@ export type TraceEvent =
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
+      /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record). */
+      /** Kind-specific structured payload (mirrors the failures.log record),
+       *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 
