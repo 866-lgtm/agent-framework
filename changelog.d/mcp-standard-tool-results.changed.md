@@ -1,14 +1,22 @@
 - What the model sees of an MCP tool result from a server that isn't an
   MCPL peer (an MCP-only legacy server, or a modern server) now follows its
   content types:
-  - text stays text, and inline images stay native;
-  - audio and binary resources are saved to the workspace (`tool-results/`),
-    each under a unique name, with a bounded stub saying where. If a payload
-    can't be saved, the result is reported as incomplete (`isError`), noting
-    the tool may already have completed, never as a success with part of it
-    missing;
+  - text stays text;
+  - an inline image stays native when a provider can take it: png, jpeg,
+    gif or webp, within 5 MB decoded;
+  - audio, binary resources, other images, and media with inline data but
+    no type are saved to the workspace (`tool-results/`), each under a
+    unique name, with a bounded stub saying where. If a payload can't be
+    saved, the result is reported as incomplete (`isError`), noting the tool
+    may already have completed, never as a success with part of it missing,
+    and the host's log says why the save failed;
+  - a failed result is read as its text alone, so there an inline image is
+    saved and stubbed like any other payload;
   - a `resource_link` is shown as a reference and never fetched;
-  - an embedded text resource shows its text.
+  - an embedded text resource shows its text;
+  - an unknown block is shown as JSON, bounded, saying how much was left
+    out. A malformed entry is named and left out, and content that isn't a
+    list of blocks makes the result a failure.
 
   Before, any non-text block turned the whole result into raw JSON.
   `structuredContent` is kept by presence on the new `ToolResult.structured`

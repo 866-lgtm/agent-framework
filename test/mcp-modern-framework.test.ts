@@ -135,9 +135,12 @@ test('model path: a payload the host cannot retain is reported as an incomplete 
     await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: unknown; isError: boolean }>;
     // No workspace here: audio and the blob can be neither shown nor kept.
+    // That makes the result a failure, read as its text alone, so the inline
+    // image is a payload too, and can't be kept either.
     assert.equal(delivered!.isError, true);
     const text = JSON.stringify(delivered!.content);
-    assert.match(text, /result incomplete: 2 payload\(s\) could not be retained/);
+    assert.match(text, /result incomplete: 3 payload\(s\) could not be retained/);
+    assert.match(text, /\[image: image\/png, 8 B\. Not retained: a failed result is read as its text alone, and no workspace is mounted to save it\]/);
     assert.match(text, /resource link \\"report\.pdf\\": file:\/\/\/srv\/report\.pdf, application\/pdf; not fetched/);
     assert.match(text, /embedded note text/);
   });
@@ -290,6 +293,34 @@ test('saved payloads: call ids that sanitize to one label still get distinct fil
       ['first', 'second', 'third', 'fourth'],
       'each file keeps its own call\'s bytes',
     );
+  });
+});
+
+test("a payload whose workspace write rejects is lost from a completed call's result, with why logged, not a dispatch failure", async (t) => {
+  await withWorkspace(async ({ framework, workspace }) => {
+    const read = (framework as unknown as {
+      mcpToolResult: (result: unknown, callId: string, mcplPeer: boolean) => Promise<ToolResult>;
+    }).mcpToolResult.bind(framework);
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' '));
+    });
+    const clip = { content: [{ type: 'audio', data: Buffer.from('clip').toString('base64'), mimeType: 'audio/wav' }] };
+
+    workspace.writeBinary = async () => { throw new Error('disk gone'); };
+    const rejected = await read(clip, 'call-1', false);
+    assert.equal(rejected.success, false);
+    assert.match(rejected.error!, /saving it to the workspace failed\]/);
+
+    workspace.writeBinary = async () => ({ success: false, error: 'disk full', isError: true });
+    const refused = await read(clip, 'call-2', false);
+    assert.equal(refused.success, false);
+    assert.match(refused.error!, /saving it to the workspace failed\]/);
+
+    const saves = logged.filter((line) => line.startsWith('[mcp] saving tool payload'));
+    assert.equal(saves.length, 2, logged.join('\n'));
+    assert.match(saves[0]!, /^\[mcp\] saving tool payload board\/tool-results\/\S+\.wav \("audio\/wav"\) failed: disk gone$/);
+    assert.match(saves[1]!, /^\[mcp\] saving tool payload board\/tool-results\/\S+\.wav \("audio\/wav"\) failed: disk full$/);
   });
 });
 

@@ -15453,11 +15453,20 @@ export class AgentFramework {
       const label = `${new Date().toISOString().slice(0, 10)}-${callId}`.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) + `-${randomUUID()}`;
       const workspace = this.getWorkspaceModule();
       const mount = workspace ? this.firstWritableMountName(workspace) : null;
+      // A save that fails resolves null, never rejects: the payload is then a
+      // lost part of a completed call's result, not a dispatch failure. Why it
+      // failed goes to the host's log; the stub says only that it did.
       const save = workspace && mount
         ? async (fileName: string, bytes: Buffer, mimeType: string) => {
             const path = `${mount}/tool-results/${fileName}`;
-            const written = await workspace.writeBinary(path, bytes, mimeType);
-            return written.success ? path : null;
+            try {
+              const written = await workspace.writeBinary(path, bytes, mimeType);
+              if (written.success) return path;
+              console.error(`[mcp] saving tool payload ${path} (${JSON.stringify(mimeType)}) failed: ${written.error ?? 'the workspace refused the write'}`);
+            } catch (error) {
+              console.error(`[mcp] saving tool payload ${path} (${JSON.stringify(mimeType)}) failed:`, error);
+            }
+            return null;
           }
         : null;
       return normalizeStandardToolResult(result, label, save);
