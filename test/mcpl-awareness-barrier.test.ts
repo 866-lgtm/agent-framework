@@ -879,6 +879,26 @@ test('inbound handlers wait out a generation installed while they wait', async (
   assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
 });
 
+test('with no generation current, an inbound event is handled in the turn it arrives', () => {
+  // The push coalescer orders a push against its retraction by arrival, so a
+  // handler with no gate to wait out must not yield first.
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarrier = null;
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const responder = { id: 1, respond: () => {}, respondError: () => {} };
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, responder);
+  }
+  assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
+});
+
 test('synchronous zero-pending flush rechecks the gate after a nested list change', () => {
   const connection = new (McplServerConnection as any)(
     'discord', null, null,

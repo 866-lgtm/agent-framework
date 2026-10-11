@@ -14276,7 +14276,10 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      await this.awaitDiscordAwarenessBarriers();
+      // Only when a generation is current: with none, the event is handled in
+      // the turn it arrives, as it always was (the push coalescer's ordering of
+      // a push against its retraction depends on that).
+      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
       await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
@@ -14291,7 +14294,7 @@ export class AgentFramework {
         return;
       }
       if (this.inferenceRouter && responder) {
-        await this.awaitDiscordAwarenessBarriers();
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
           respond: responder.respond,
           respondError: responder.respondError,
@@ -14377,7 +14380,7 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      await this.awaitDiscordAwarenessBarriers();
+      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
@@ -14388,7 +14391,7 @@ export class AgentFramework {
     ) => {
       if (!responder) return;
       try {
-        await this.awaitDiscordAwarenessBarriers();
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         const result = await this.handleHostCommand(connection.id, params ?? {});
         responder.respond(result);
       } catch (error) {
