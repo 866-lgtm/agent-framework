@@ -477,7 +477,9 @@ export async function observePath(view: MountView, rootReal: string, relativePat
       return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errno(err) ?? String(err)})` };
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
-    if (!target.isFile()) return { kind: 'unobserved', reason: 'not a regular file' };
+    if (!target.isFile()) {
+      return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
+    }
     info = target;
   } else if (info.isDirectory()) {
     return { kind: 'unobserved', reason: 'a directory' };
@@ -655,10 +657,25 @@ export interface Walk {
   missing: Set<string>;
   /**
    * Where the walk didn't reach, and why. `error` and `cap` regions may hide
-   * files the listing would show; `ignored` and `symlink` ones matter only
-   * where tracked entries lie beneath them.
+   * files the listing would show. An `ignored` region is passed over by
+   * design: one that hides a tracked entry is reported as incomplete, and
+   * one that hides nothing is counted as passed over. A `symlink` region is
+   * never walked; the pass reports the link itself by path.
    */
   incomplete: Array<{ path: string; reason: string; kind: 'error' | 'cap' | 'ignored' | 'symlink' }>;
+}
+
+/**
+ * Whether a mount's ignore list covers a mount-relative path: the path itself
+ * or any directory above it, as the walk's own test reads each entry by its
+ * path and name.
+ */
+export function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
+  const segments = relativePath.split('/').filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
+  }
+  return false;
 }
 
 /** Simple ignore patterns, as the watcher and the old walk read them. */
@@ -702,7 +719,10 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
  * the directory at its path: a directory moved or replaced meanwhile is an
  * incomplete region, contributing no names and proving nothing absent.
  */
-export async function walkScope(view: MountView, rootReal: string, scope: string, recursive: boolean, cap: number): Promise<Walk> {
+export async function walkScope(
+  view: MountView, rootReal: string, scope: string, recursive: boolean, cap: number,
+  opts: { named?: boolean } = {},
+): Promise<Walk> {
   const walk: Walk = { files: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(), incomplete: [] };
   const top = await checkDir(view, rootReal, scope);
   if (top.kind === 'absent') {
@@ -714,6 +734,12 @@ export async function walkScope(view: MountView, rootReal: string, scope: string
     return walk;
   }
   let capped = false;
+  // A scope a path sync names is walked even where the ignore list covers
+  // it: a pattern covering the scope itself, or a directory above it, doesn't
+  // apply beneath it. So a named directory's contents are synced, as a named
+  // file is (agent-framework #276). A listing keeps the ignore: its pass
+  // would otherwise start tracking what it lists.
+  const ignore = opts.named ? view.ignore.filter((pattern) => !coveredByIgnore(scope, [pattern])) : view.ignore;
 
   const visit = async (dir: CheckedDir): Promise<void> => {
     const rel = dir.rel;
@@ -743,7 +769,7 @@ export async function walkScope(view: MountView, rootReal: string, scope: string
     let reachedCap = false;
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (isIgnored(childRel, entry.name, view.ignore)) {
+      if (isIgnored(childRel, entry.name, ignore)) {
         others.push([childRel, 'ignored by the mount']);
         regions.push({ path: childRel, reason: 'ignored by the mount', kind: 'ignored' });
         continue;

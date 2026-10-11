@@ -122,9 +122,11 @@ export interface PassResult {
   incomplete: Array<{ path: string; reason: string }>;
   /**
    * What the walk passed over by design and reported nowhere else, counted by
-   * reason: names the mount's ignore list covers, when nothing beneath them is
-   * tracked (a tracked one is reported under `incomplete`). An ignored
-   * directory counts once, everything in it included.
+   * reason: entries the mount's ignore list covers, when nothing beneath them
+   * is tracked (a tracked one is reported under `incomplete`). An ignored
+   * directory counts once, everything in it included. Only listings the walk
+   * kept count: a directory changed during the walk, or one past the file
+   * cap, is reported under `incomplete` instead.
    */
   passedOver: Map<string, number>;
   /** For a directory scope: the subdirectories disk shows directly beneath it. */
@@ -159,6 +161,11 @@ export interface PassOptions {
   adopt?: (path: string) => boolean;
   /** Walk cap for directory scopes. */
   cap?: number;
+  /**
+   * The scope was named by a path sync: ignore patterns that cover it don't
+   * apply beneath it (see walkScope). A listing's scope keeps them.
+   */
+  named?: boolean;
   /**
    * The branch the caller asked on (a path sync). If another is selected when
    * the pass gathers, it decides nothing: an adoption asked for on one branch
@@ -607,7 +614,7 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
     for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
     for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
     if (rootUnavailable === null) {
-      walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? WALK_CAP);
+      walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? WALK_CAP, { named: opts.named });
       for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
       // Ignored names are listed only when something tracks them (above).
       for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && inScope(p, scope)) candidates.add(p);
@@ -793,8 +800,10 @@ export async function reconcilePass(
       if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
       // An ignored name that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
-      // (agent-framework #276). A symlink region that hides nothing was read
-      // through the link (a mount that follows symlinks), so it isn't one.
+      // (agent-framework #276). A symlink region isn't counted: the link
+      // itself is a candidate the pass reports by path, taken through the
+      // link when it's a file on a mount that follows symlinks, and
+      // otherwise listed under `skipped`.
       else if (region.kind === 'ignored') result.passedOver.set(region.reason, (result.passedOver.get(region.reason) ?? 0) + 1);
     }
   }

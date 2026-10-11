@@ -602,6 +602,69 @@ describe('a sync says what it passed over (agent-framework #276)', () => {
     assert.equal(data.passedOver, undefined);
   });
 
+  test("a named directory the ignore list covers is synced, its contents included", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build/**'] });
+    env.writeDisk('build/out.txt', 'built');
+    env.writeDisk('build/sub/deep.txt', 'deeper');
+
+    const bare = await call(m, 'sync', {});
+    assert.equal(bare.totalSynced, 0);
+    assert.deepEqual(bare.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }]);
+
+    const named = await call(m, 'sync', { path: 'work/build' });
+    assert.equal(named.totalSynced, 2, 'both files beneath the named directory');
+    assert.equal(await contentOf(m, 'build/sub/deep.txt'), 'deeper');
+    assert.deepEqual(named.ignored, [{ mount: 'work', path: 'build',
+      note: "this mount's ignore list covers it, so a sync without a path won't maintain it" }]);
+    assert.equal(named.passedOver, undefined, 'nothing beneath the named directory was passed over');
+  });
+
+  test('a listing of a directory the ignore list covers keeps the ignore, and tracks nothing beneath it', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build/**'] });
+    env.writeDisk('build/sub/a.txt', 'ignored');
+    const listed = await call(m, 'ls', { path: 'work/build/sub', recursive: true });
+    assert.ok(!(listed.entries as Entry[]).some((e) => e.path === 'build/sub/a.txt' && e.state === 'synced'),
+      `the file isn't listed as tracked: ${JSON.stringify(listed.entries)}`);
+    assert.equal(env.store.treeGet(TREE, 'build/sub/a.txt'), null, 'nothing beneath the ignored directory is tracked');
+    const globbed = await call(m, 'glob', { pattern: 'work/build/**' });
+    assert.equal(env.store.treeGet(TREE, 'build/sub/a.txt'), null, `nor after a glob: ${JSON.stringify(globbed)}`);
+  });
+
+  test('a symlink is reported by path, not counted as passed over: not followed, or a link to a directory', async (t) => {
+    const env = new Env(t);
+    const plain = await env.open();
+    env.writeDisk('real.txt', 'the target');
+    symlinkSync(env.disk('real.txt'), env.disk('link.txt'));
+    const notFollowed = await call(plain, 'sync', {});
+    assert.equal(notFollowed.passedOver, undefined);
+    assert.ok((notFollowed.skipped as Array<{ path: string; reason: string }>).some((s) => s.path === 'link.txt'),
+      `the link is listed under skipped, got ${JSON.stringify(notFollowed.skipped)}`);
+
+    const env2 = new Env(t);
+    const following = await env2.open({ followSymlinks: true });
+    env2.writeDisk('dir/inside.txt', 'in a directory');
+    symlinkSync(env2.disk('dir'), env2.disk('dirlink'));
+    const followed = await call(following, 'sync', {});
+    assert.equal(followed.passedOver, undefined);
+    const skip = (followed.skipped as Array<{ path: string; reason: string }>).find((s) => s.path === 'dirlink');
+    assert.match(String(skip?.reason), /a symlink to a directory, not walked/);
+  });
+
+  test('an ignored region hides only what lies beneath it, not a sibling sharing its name prefix', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build', 'build2'] });
+    env.writeDisk('build2/kept.txt', 'tracked, beneath the ignored build2');
+    env.writeDisk('build/out.txt', 'ignored, and never tracked');
+    await call(m, 'sync', { path: 'work/build2/kept.txt' }); // named, so tracked
+    const bare = await call(m, 'sync', {});
+    assert.deepEqual((bare.incomplete as Array<{ path: string }>).map((r) => r.path), ['build2'],
+      'build2 hides a tracked path');
+    assert.deepEqual(bare.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }],
+      'build hides nothing tracked: build2/kept.txt is not beneath it, though it shares the name prefix');
+  });
+
   test('a path the mount ignores is taken when named, and the result says a bare sync will not maintain it', async (t) => {
     const env = new Env(t);
     const m = await env.open({ ignore: ['*.md', 'vendor'] });
