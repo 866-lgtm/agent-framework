@@ -37,6 +37,7 @@ import type {
   HotContextSettingsUpdate,
   MessageMetadata,
 } from '@animalabs/context-manager';
+import { OverBudgetError } from '@animalabs/context-manager';
 import type {
   AgentConfig,
   AgentState,
@@ -142,8 +143,10 @@ export class Agent {
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   private contextBudgetTargetTokens?: number;
   private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
-  /** Told when a paced descent settles at its target (the framework records it). */
-  private runtimeSettingsSettledListener?: () => void;
+  /** The live budget the last compile planned at, and whether it fit. */
+  private lastCompiledBudget?: { budget: number; fit: boolean };
+  /** Told when that changes (the framework records it beside the persisted budget). */
+  private compiledBudgetListener?: (budget: number, fit: boolean) => void;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -310,9 +313,42 @@ export class Agent {
     return { ...this.runtimeSettingsOverrides };
   }
 
-  /** Set (or clear) the one listener told when a paced descent settles at its target. */
-  onRuntimeSettingsSettled(listener: (() => void) | undefined): void {
-    this.runtimeSettingsSettledListener = listener;
+  /**
+   * Set (or clear) the one listener told when a compile at the live budget
+   * comes out differently from the last: it fit at a budget the last one
+   * didn't plan at (after a settle, the target), or the context manager
+   * refused a budget the last one fit at.
+   */
+  onContextBudgetCompiled(listener: ((budget: number, fit: boolean) => void) | undefined): void {
+    this.compiledBudgetListener = listener;
+  }
+
+  /** The live budget the last compile planned at and fit, if it fit. */
+  getProvenContextBudgetTokens(): number | undefined {
+    return this.lastCompiledBudget?.fit ? this.lastCompiledBudget.budget : undefined;
+  }
+
+  private noteCompiledBudget(budget: number, fit: boolean): void {
+    if (this.lastCompiledBudget?.budget === budget && this.lastCompiledBudget.fit === fit) return;
+    this.lastCompiledBudget = { budget, fit };
+    this.compiledBudgetListener?.(budget, fit);
+  }
+
+  /** Compile at the live budget (no explicit one), noting whether it fit. */
+  private async compileAtLiveBudget(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    let result: CompileResult;
+    try {
+      result = await compile();
+    } catch (error) {
+      const err = error as { name?: unknown } | null;
+      if (error instanceof OverBudgetError || err?.name === 'OverBudgetError') this.noteCompiledBudget(live, false);
+      throw error;
+    }
+    // A settle proves the target: the frontier fit the window prepared for it.
+    this.settleRuntimeSettingsTransition();
+    this.noteCompiledBudget(this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS, true);
+    return result;
   }
 
   /**
@@ -447,10 +483,10 @@ export class Agent {
     if (appliedDefaultPace) {
       this.runtimeSettingsOverrides.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
     }
-    for (const [key, value] of Object.entries(patch)) {
-      if (key === 'sameRoundThinkTextPolicy') continue;
-      if (key === 'immediate') continue; // a mode for this apply, never a persisted setting
-      if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, unknown>)[key] = value;
+    // Only settings reach the override map: `immediate` is a mode for this
+    // apply, and nothing else a caller passes is a setting.
+    for (const key of ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens'] as const) {
+      if (patch[key] !== undefined) this.runtimeSettingsOverrides[key] = patch[key];
     }
     if (patch.sameRoundThinkTextPolicy !== undefined) {
       this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
@@ -522,16 +558,19 @@ export class Agent {
     return this.getRuntimeSettings();
   }
 
-  restoreRuntimeSettings(overrides: AgentRuntimeSettingsOverrides): AgentRuntimeSettingsSnapshot {
-    const { contextBudgetReached, ...settings } = overrides;
-    // A lower budget the agent had reached before the stop comes back
-    // reached, through the immediate path: the store fit it then. Without
-    // the marker, a descent resumes paced from the recipe's budget.
-    return this.updateRuntimeSettings(
-      contextBudgetReached === true && settings.contextBudgetTokens !== undefined
-        ? { ...settings, immediate: true }
-        : settings,
-    );
+  /**
+   * Apply persisted settings at construction. `provenBudget` is a budget the
+   * caller has shown fits (the framework, from the record and a preflight):
+   * it stands as the last compile's until a compile here says otherwise.
+   */
+  restoreRuntimeSettings(
+    settings: AgentRuntimeSettingsPatch,
+    opts?: { provenBudget?: number },
+  ): AgentRuntimeSettingsSnapshot {
+    if (Object.keys(settings).length === 0) return this.getRuntimeSettings();
+    const snapshot = this.updateRuntimeSettings(settings);
+    if (opts?.provenBudget !== undefined) this.lastCompiledBudget = { budget: opts.provenBudget, fit: true };
+    return snapshot;
   }
 
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
@@ -567,7 +606,6 @@ export class Agent {
     this.contextBudgetTokens = this.contextBudgetTargetTokens;
     this.contextBudgetTargetTokens = undefined;
     this.updateHotContextSettings({ preparedWindowTokens: null });
-    this.runtimeSettingsSettledListener?.();
   }
 
   /**
@@ -612,9 +650,9 @@ export class Agent {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
-    const result = await this.contextManager.compile(this.compileBudget(budget));
+    const compile = () => this.contextManager.compile(this.compileBudget(budget));
+    const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
     if (watermark) this.consumedWatermark = watermark;
-    if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
 
@@ -629,11 +667,9 @@ export class Agent {
     opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
     const watermark = this.pendingWatermark();
-    const result = await this.contextManager.compile(
-      this.compileBudget(budget), injections, opts as never,
-    );
+    const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
     if (watermark) this.consumedWatermark = watermark;
-    if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
 

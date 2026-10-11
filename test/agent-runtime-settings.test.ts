@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 
-import { AutobiographicalStrategy } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, ContextManager } from '@animalabs/context-manager';
 import { AgentFramework, BudgetPreflightError } from '../src/index.js';
 
 const membrane = {} as any;
@@ -142,14 +142,19 @@ it('runtime overrides persist across framework restart', async () => {
 
 // context-manager #162: a lower budget the agent had reached comes back reached.
 describe('a reached budget across a restart', () => {
+  type Record = { [key: string]: unknown };
   const persisted = (framework: AgentFramework) =>
-    (framework.getStore().getStateJson('framework/state') as { agentRuntimeSettings?: Record<string, unknown> } | null)
+    (framework.getStore().getStateJson('framework/state') as { agentRuntimeSettings?: { [name: string]: Record } } | null)
       ?.agentRuntimeSettings?.agent;
+  const writeRecord = (framework: AgentFramework, record: Record) => {
+    const store = framework.getStore();
+    const state = (store.getStateJson('framework/state') ?? {}) as { agentRuntimeSettings?: { [name: string]: Record } };
+    store.setStateJson('framework/state', { ...state, agentRuntimeSettings: { ...state.agentRuntimeSettings, agent: record } });
+  };
   const setup = () => {
     const dir = mkdtempSync(join(tmpdir(), 'agent-settings-reached-'));
-    const storePath = join(dir, 'store');
     const config = () => ({
-      storePath,
+      storePath: join(dir, 'store'),
       membrane,
       agents: [{
         name: 'agent', model: 'test-model', systemPrompt: 'test',
@@ -157,120 +162,219 @@ describe('a reached budget across a restart', () => {
       }],
       modules: [],
     });
-    return { dir, storePath, config };
+    return { dir, config };
   };
   const budgets = (framework: AgentFramework) => {
     const s = framework.getAgentRuntimeSettings('agent');
     return { target: s.contextBudgetTokens, effective: s.effectiveContextBudgetTokens, transition: s.transition };
   };
-
-  it('a descent that settled comes back settled, before any compile', async () => {
-    const { dir, config } = setup();
-    let framework = await AgentFramework.create(config());
-    try {
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 100_000, transition: 'converging' });
-      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000 }, 'not reached yet');
-      // The store is empty, so the first compile's frontier fits and the descent settles.
-      await framework.getAgent('agent')!.compileContext();
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
-      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000, contextBudgetReached: true }, 'the settle is recorded');
-      await framework.stop();
-      framework = await AgentFramework.create(config());
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('an immediate decrease is recorded as reached, and comes back so', async () => {
-    const { dir, config } = setup();
-    let framework = await AgentFramework.create(config());
-    try {
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
-      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000, contextBudgetReached: true });
-      await framework.stop();
-      framework = await AgentFramework.create(config());
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('a record without the marker (an earlier release) restores paced, as before', async () => {
-    const { dir, config } = setup();
-    let framework = await AgentFramework.create(config());
-    try {
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
-      const store = framework.getStore();
-      const state = store.getStateJson('framework/state') as { agentRuntimeSettings: Record<string, Record<string, unknown>> };
-      delete state.agentRuntimeSettings.agent.contextBudgetReached;
-      store.setStateJson('framework/state', state);
-      await framework.stop();
-      framework = await AgentFramework.create(config());
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 100_000, transition: 'converging' });
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('an invalid marker is ignored, and the budget restores paced', async () => {
-    const { dir, config } = setup();
-    let framework = await AgentFramework.create(config());
-    const errors: string[] = [];
+  const compile = (framework: AgentFramework) => framework.getAgent('agent')!.compileContext();
+  /** Run `fn` with ContextManager.prototype[method] replaced. */
+  async function withPatched<T>(method: string, impl: unknown, fn: () => Promise<T>): Promise<T> {
+    const proto = ContextManager.prototype as unknown as { [key: string]: unknown };
+    const original = proto[method];
+    proto[method] = impl;
+    try { return await fn(); } finally { proto[method] = original; }
+  }
+  const quietErrors = () => {
+    const lines: string[] = [];
     const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    return { lines, restore: () => { console.error = original; } };
+  };
+  /** Each test's framework, stopped and removed afterwards. */
+  async function run(fn: (h: { config: ReturnType<typeof setup>['config']; framework: () => AgentFramework; restart: () => Promise<AgentFramework> }) => Promise<void>) {
+    const { dir, config } = setup();
+    let framework = await AgentFramework.create(config());
     try {
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
-      const store = framework.getStore();
-      const state = store.getStateJson('framework/state') as { agentRuntimeSettings: Record<string, Record<string, unknown>> };
-      state.agentRuntimeSettings.agent.contextBudgetReached = 'yes';
-      store.setStateJson('framework/state', state);
-      await framework.stop();
-      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-      framework = await AgentFramework.create(config());
-      console.error = original;
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 100_000, transition: 'converging' });
-      assert.ok(errors.some((line) => line.includes('ignoring an invalid persisted contextBudgetReached')), errors.join('\n'));
+      await fn({
+        config,
+        framework: () => framework,
+        restart: async () => { await framework.stop(); framework = await AgentFramework.create(config()); return framework; },
+      });
     } finally {
-      console.error = original;
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  it('a descent that settled comes back settled, and the first compile plans at it', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+      assert.deepEqual(budgets(framework()), { target: 60_000, effective: 100_000, transition: 'converging' });
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000 }, 'not reached yet');
+      // The store is empty, so the first compile's frontier fits and the descent settles.
+      await compile(framework());
+      assert.deepEqual(budgets(framework()), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the settle is recorded');
+      const restarted = await restart();
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 60_000, transition: 'stable' });
+      // The record's proof stands until a compile here says otherwise, so a
+      // persisting call before any compile keeps it.
+      restarted.updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
+      assert.equal(persisted(restarted)?.contextBudgetReachedTokens, 60_000);
+      const planned: number[] = [];
+      const cm = restarted.getAgent('agent')!.getContextManager() as unknown as { compile: (budget?: { maxTokens: number }) => Promise<unknown> };
+      const original = cm.compile.bind(cm);
+      cm.compile = (budget, ...rest) => { planned.push(budget?.maxTokens ?? -1); return (original as (...a: unknown[]) => Promise<unknown>)(budget, ...rest); };
+      await compile(restarted);
+      assert.deepEqual(planned, [60_000], 'the first compile after the restart plans at the reached budget');
+    });
+  });
+
+  it('a restored descent that settles after the restart is recorded then', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+      const restarted = await restart();
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 100_000, transition: 'converging' });
+      await compile(restarted);
+      assert.deepEqual(persisted(restarted), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
+    });
+  });
+
+  it('an immediate decrease is recorded once a compile fits at it, not before', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000 }, 'nothing has compiled at it yet');
+      await compile(framework());
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
+      assert.deepEqual(budgets(await restart()), { target: 60_000, effective: 60_000, transition: 'stable' });
+    });
+  });
+
+  it('an immediate decrease that never compiled comes back paced', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      assert.deepEqual(budgets(await restart()), { target: 60_000, effective: 100_000, transition: 'converging' });
+    });
+  });
+
+  it('a compile refused at the reached budget withdraws the record, and the restart paces', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(framework());
+      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      await withPatched('compile', async () => { throw refusal; }, async () => {
+        await assert.rejects(() => compile(framework()), /over budget/);
+      });
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000 });
+      assert.deepEqual(budgets(await restart()), { target: 60_000, effective: 100_000, transition: 'converging' });
+    });
+  });
+
+  it('a reached budget the preflight says no longer fits restores paced, with a line saying why', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(framework());
+      const log = quietErrors();
+      try {
+        // A new recipe (a longer system prompt, say) raised the folded floor.
+        const restarted = await withPatched('previewContext', (budget: { maxTokens: number }) => ({
+          finalTokens: 70_000, budgetTokens: budget.maxTokens, fits: 70_000 <= budget.maxTokens,
+        }), restart);
+        assert.deepEqual(budgets(restarted), { target: 60_000, effective: 100_000, transition: 'converging' });
+      } finally {
+        log.restore();
+      }
+      assert.ok(log.lines.some((line) => line.includes('folded floor renders 70000 tokens against it now')), log.lines.join('\n'));
+    });
+  });
+
+  it('a record without the field, or with one for another budget, restores paced', async () => {
+    await run(async ({ framework, restart }) => {
+      // An earlier release's record; then one an older release carried
+      // forward beside a budget it changed.
+      writeRecord(framework(), { contextBudgetTokens: 60_000 });
+      assert.equal(budgets(await restart()).transition, 'converging');
+      writeRecord(framework(), { contextBudgetTokens: 70_000, contextBudgetReachedTokens: 60_000 });
+      assert.deepEqual(budgets(await restart()), { target: 70_000, effective: 100_000, transition: 'converging' });
+    });
+  });
+
+  it('an invalid field is ignored with a bounded line, and a record holding only it still boots', async () => {
+    await run(async ({ framework, restart }) => {
+      writeRecord(framework(), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 'yes'.repeat(100) });
+      const log = quietErrors();
+      try {
+        assert.equal(budgets(await restart()).transition, 'converging');
+        writeRecord(framework(), { contextBudgetReachedTokens: -5 });
+        assert.deepEqual(budgets(await restart()), { target: 100_000, effective: 100_000, transition: 'stable' }, 'the recipe budget');
+      } finally {
+        log.restore();
+      }
+      const line = log.lines.find((l) => l.includes('ignoring an invalid persisted contextBudgetReachedTokens'));
+      assert.ok(line && line.length < 200, log.lines.join('\n'));
+    });
+  });
+
+  it('a patch cannot set the field', async () => {
+    await run(async ({ framework }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 } as never);
+      assert.deepEqual(framework().getAgent('agent')!.getRuntimeSettingsOverrides(), { contextBudgetTokens: 60_000 });
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000 });
+    });
+  });
+
+  it('every persisting call keeps the field true to the live state', async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(f);
+      f.updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, tailTokens: 20_000, contextBudgetReachedTokens: 60_000 }, 'another setting keeps it');
+      f.cancelAgentRuntimeSettingsTransition('agent');
+      assert.equal(persisted(f)?.contextBudgetReachedTokens, 60_000, 'a cancel with no descent keeps it');
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 50_000, tailTokens: 20_000 }, 'a new descent has reached nothing');
+      f.cancelAgentRuntimeSettingsTransition('agent');
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, tailTokens: 20_000, contextBudgetReachedTokens: 60_000 }, 'cancelled back to the reached budget');
+      f.resetAgentRuntimeSettings('agent', ['contextBudgetTokens']);
+      assert.deepEqual(persisted(f), { tailTokens: 20_000 }, 'reset to the recipe');
+    });
   });
 
   it('a settle marks only the persisted budget it reached', async () => {
-    const { dir, config } = setup();
-    const framework = await AgentFramework.create(config());
-    try {
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false });
-      await framework.getAgent('agent')!.compileContext();
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
-      assert.deepEqual(persisted(framework), { contextBudgetTokens: 80_000 }, 'the record\'s 80k was never the live budget');
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
+    await run(async ({ framework }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false });
+      await compile(framework());
+      assert.deepEqual(budgets(framework()), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 80_000 }, "the record's 80k was never compiled at");
+    });
   });
 
   it('a descent applied without persisting settles without writing anything', async () => {
-    const { dir, config } = setup();
-    let framework = await AgentFramework.create(config());
-    try {
-      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false });
-      await framework.getAgent('agent')!.compileContext();
-      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
-      assert.equal(persisted(framework), undefined, 'nothing written for an ephemeral descent');
-      await framework.stop();
-      framework = await AgentFramework.create(config());
-      assert.deepEqual(budgets(framework), { target: 100_000, effective: 100_000, transition: 'stable' }, 'the recipe budget');
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false });
+      const log = quietErrors();
+      try {
+        await compile(framework());
+      } finally {
+        log.restore();
+      }
+      assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [], 'no record is no error');
+      assert.deepEqual(budgets(framework()), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.equal(persisted(framework()), undefined, 'nothing written for an ephemeral descent');
+      assert.deepEqual(budgets(await restart()), { target: 100_000, effective: 100_000, transition: 'stable' }, 'the recipe budget');
+    });
+  });
+
+  it('a failed write of the field is logged, and the compile stands', async () => {
+    await run(async ({ framework }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      const store = framework().getStore() as unknown as { setStateJson: (...args: unknown[]) => void };
+      const original = store.setStateJson.bind(store);
+      store.setStateJson = () => { throw new Error('disk full'); };
+      const log = quietErrors();
+      try {
+        await compile(framework());
+      } finally {
+        store.setStateJson = original;
+        log.restore();
+      }
+      assert.ok(log.lines.some((l) => l.includes("couldn't record agent's compile at budget 60000")), log.lines.join('\n'));
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000 });
+    });
   });
 });
 

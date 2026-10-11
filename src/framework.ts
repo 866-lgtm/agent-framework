@@ -3980,13 +3980,14 @@ export class AgentFramework {
     agentName: string,
     overrides: AgentRuntimeSettingsOverrides,
   ): AgentRuntimeSettingsOverrides {
-    if (overrides.contextBudgetReached !== undefined && overrides.contextBudgetReached !== true) {
-      // Unreadable, so not trusted: the budget restores paced, as before the marker existed.
+    const reached = overrides.contextBudgetReachedTokens;
+    if (reached !== undefined && !(Number.isSafeInteger(reached) && reached > 0)) {
+      // Unreadable, so not trusted: the budget restores paced, as without it.
       console.error(
-        `[agent-settings] ignoring an invalid persisted contextBudgetReached for agent "${agentName}": ` +
-          `${JSON.stringify(overrides.contextBudgetReached)}`,
+        `[agent-settings] ignoring an invalid persisted contextBudgetReachedTokens for agent "${agentName}": ` +
+          `${String(JSON.stringify(reached)).slice(0, 80)}`,
       );
-      const { contextBudgetReached: _ignored, ...rest } = overrides;
+      const { contextBudgetReachedTokens: _ignored, ...rest } = overrides;
       overrides = rest;
     }
     if (
@@ -4040,38 +4041,74 @@ export class AgentFramework {
   }
 
   /**
-   * What persists for an agent: its overrides, and `contextBudgetReached`
-   * when its live budget is at the overridden budget with no descent
-   * running (context-manager #162).
+   * Apply an agent's persisted settings at boot. A lower budget restores
+   * paced, as a descent from the recipe's budget, and a boot restore is never
+   * refused: a persisted budget that no longer fits can't brick startup.
+   * When the record says the last compile before the stop fit at its budget
+   * (`contextBudgetReachedTokens`), that budget is applied at once instead,
+   * but only if the preflight says it fits now: the restart may bring a new
+   * system prompt, tools or maxTokens, and the agent may have run at another
+   * budget since the record was written (context-manager #162). Otherwise it
+   * restores paced, with a line saying why.
    */
-  private persistedRuntimeSettingsOf(agent: Agent): AgentRuntimeSettingsOverrides {
-    const overrides = agent.getRuntimeSettingsOverrides();
-    const snapshot = agent.getRuntimeSettings();
-    const reached = overrides.contextBudgetTokens !== undefined
-      && snapshot.transition === 'stable'
-      && snapshot.effectiveContextBudgetTokens === overrides.contextBudgetTokens;
-    return reached ? { ...overrides, contextBudgetReached: true } : overrides;
+  private restorePersistedRuntimeSettings(
+    agentName: string,
+    agent: Agent,
+    overrides: AgentRuntimeSettingsOverrides,
+  ): void {
+    const { contextBudgetReachedTokens: reached, ...settings } = overrides;
+    const budget = settings.contextBudgetTokens;
+    if (budget !== undefined && reached === budget) {
+      const patch: AgentRuntimeSettingsPatch = { ...settings, immediate: true };
+      const preview = this.previewAgentRuntimeSettings(agentName, patch);
+      if (preview.available && preview.effective?.fits) {
+        agent.restoreRuntimeSettings(patch, { provenBudget: budget });
+        return;
+      }
+      console.error(
+        `[agent-settings] ${agentName}: its last compile before the stop fit at contextBudgetTokens=${budget}, but ` +
+          (preview.available
+            ? `the folded floor renders ${preview.effective?.finalTokens} tokens against it now`
+            : `whether it fits now can't be checked (${preview.reason ?? 'no preview'})`) +
+          '; restoring it as a paced descent',
+      );
+    }
+    agent.restoreRuntimeSettings(settings);
   }
 
   /**
-   * A paced descent settled. When the persisted record holds the budget it
-   * settled at, mark that budget reached, so a restart applies it at once
-   * instead of pacing a descent again (context-manager #162). Only the
-   * marker is written: a descent applied with `persist: false` left no
-   * record of its target, so it stays unwritten, and other ephemeral changes
-   * aren't promoted.
+   * What persists for an agent: its overrides, and `contextBudgetReachedTokens`
+   * when the agent's last compile fit at the overridden budget
+   * (context-manager #162). An immediate change of budget carries none until
+   * a compile at it fits.
    */
-  private recordSettledRuntimeSettings(agentName: string, agent: Agent): void {
+  private persistedRuntimeSettingsOf(agent: Agent): AgentRuntimeSettingsOverrides {
+    const overrides = agent.getRuntimeSettingsOverrides();
+    const proven = agent.getProvenContextBudgetTokens();
+    return overrides.contextBudgetTokens !== undefined && proven === overrides.contextBudgetTokens
+      ? { ...overrides, contextBudgetReachedTokens: proven }
+      : overrides;
+  }
+
+  /**
+   * A compile at the agent's live budget came out differently from the last
+   * (Agent.onContextBudgetCompiled). Keep the persisted record's
+   * `contextBudgetReachedTokens` true to it: written when a compile fits at
+   * the record's own budget, withdrawn when the context manager refuses that
+   * budget. Nothing else in the record changes, and a budget other than the
+   * record's (one applied with `persist: false`, or a descent's starting
+   * budget) writes nothing. A failed write is logged; an unreadable record
+   * counts as none. Either way the restore then paces, as without the field.
+   */
+  private recordCompiledContextBudget(agentName: string, budget: number, fit: boolean): void {
     try {
       const persisted = this.readAgentRuntimeSettings(agentName);
-      if (!persisted) return;
-      // The record's own budget, and no other: a descent applied without
-      // persisting may have settled somewhere else.
-      if (persisted.contextBudgetTokens !== agent.getRuntimeSettings().effectiveContextBudgetTokens) return;
-      this.persistAgentRuntimeSettings(agentName, { ...persisted, contextBudgetReached: true });
+      if (!persisted || persisted.contextBudgetTokens !== budget) return;
+      if ((persisted.contextBudgetReachedTokens === budget) === fit) return;
+      const { contextBudgetReachedTokens: _previous, ...settings } = persisted;
+      this.persistAgentRuntimeSettings(agentName, fit ? { ...settings, contextBudgetReachedTokens: budget } : settings);
     } catch (error) {
-      // The settle itself stands; a restart then paces the descent again.
-      console.error(`[agent-settings] couldn't record that ${agentName}'s budget settled:`, error);
+      console.error(`[agent-settings] couldn't record ${agentName}'s compile at budget ${budget}:`, error);
     }
   }
 
@@ -6505,15 +6542,19 @@ export class AgentFramework {
     this.restoreToolResultGuardSetting(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
+    // Registered before its settings are restored: the restore's preflight
+    // previews the agent by name.
+    this.agents.set(config.name, agent);
+    this.agentConfigs.set(config.name, config);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
-      agent.restoreRuntimeSettings(
+      this.restorePersistedRuntimeSettings(
+        config.name,
+        agent,
         this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
       );
     }
-    agent.onRuntimeSettingsSettled(() => this.recordSettledRuntimeSettings(config.name, agent));
-    this.agents.set(config.name, agent);
-    this.agentConfigs.set(config.name, config);
+    agent.onContextBudgetCompiled((budget, fit) => this.recordCompiledContextBudget(config.name, budget, fit));
 
     // First non-ephemeral agent becomes the primary for message routing
     if (!this.primaryAgentName) {
