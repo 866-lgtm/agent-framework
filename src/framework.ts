@@ -1245,9 +1245,9 @@ export class AgentFramework {
    * The `[Continue]` prompt the current round of each turn follows, keyed by
    * the turn's trigger. Each stream start sets it from what the Agent read in
    * its request (`StartStreamResult.continuePrompt`), and a tool boundary
-   * that stores anything after the results clears it, since the next round
-   * follows those messages. `silentTurnRowMetadata` stamps the round's rows
-   * with it.
+   * that hands the live stream messages after the results clears it, since
+   * the next round follows those messages. `silentTurnRowMetadata` stamps the
+   * round's rows with it.
    */
   private readonly turnPrompts = new WeakMap<InferenceRequest, RequestOnlyPrompt>();
 
@@ -6708,10 +6708,6 @@ export class AgentFramework {
           {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
-              // The next round follows these messages, not the [Continue]
-              // the turn's earlier rounds followed: its rows carry no prompt.
-              const turnTrigger = this.activeTurnTriggers.get(agent.name);
-              if (turnTrigger) this.turnPrompts.delete(turnTrigger);
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
@@ -6748,6 +6744,15 @@ export class AgentFramework {
           // the send suppression: nothing new was said to the agent.
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
+          }
+
+          // The next round is handed these messages after the results, so it
+          // follows them, not the tool loop of a reply to [Continue]: its rows
+          // carry no prompt. (The routing notice below rides only an
+          // injection already here.)
+          if (midTurnInjections.length > 0) {
+            const turnTrigger = this.activeTurnTriggers.get(agent.name);
+            if (turnTrigger) this.turnPrompts.delete(turnTrigger);
           }
 
           // Check if any tool result requested endTurn
@@ -9401,20 +9406,20 @@ export class AgentFramework {
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
-      // The [Continue] prompt this stream's first round follows, if any, as
-      // the Agent read it from the request: the round's rows carry it
-      // (silentTurnRowMetadata), and so do later rounds' until a tool
-      // boundary stores something after the results.
-      if (trigger) {
-        if (continuePrompt) this.turnPrompts.set(trigger, continuePrompt);
-        else this.turnPrompts.delete(trigger);
-      }
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
+      }
+      // The [Continue] prompt this stream's first round follows, if any, as
+      // the Agent read it from the request: the round's rows carry it
+      // (silentTurnRowMetadata), and so do later rounds' until a tool
+      // boundary hands the stream messages after the results.
+      if (trigger) {
+        if (continuePrompt) this.turnPrompts.set(trigger, continuePrompt);
+        else this.turnPrompts.delete(trigger);
       }
 
       const handle = this.driveStream(

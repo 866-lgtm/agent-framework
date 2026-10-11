@@ -148,8 +148,6 @@ async function make(opts: {
   agents?: string[]; agent?: Partial<AgentConfig>;
   /** An earlier framework's directory, to open its store again. */
   dir?: string;
-  /** Where the agent's plain speech lands; null for no channel. */
-  locus?: string | null;
 } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'silent-hb-rows-'));
   const membrane = opts.membrane ?? new MockMembrane();
@@ -164,8 +162,7 @@ async function make(opts: {
     modules: [mod],
   });
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => (opts.locus === undefined ? 'world:commons' : opts.locus),
-    getDefaultPublishChannel: () => (opts.locus === undefined ? 'world:commons' : opts.locus),
+    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
     routeSpeech: async () => ({ delivered: opts.deliver ?? true, channelId: 'world:commons' }),
     startTyping: () => {}, stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,
@@ -863,7 +860,9 @@ describe('replies to a [Continue] turn', () => {
     // holds nothing in memory from that turn. The agent's plain speech has no
     // channel, so no turn announces one (a locus announced at the first turn
     // after boot would come last, and the reply would follow it instead).
-    const first = await make({ deliver: false, locus: null });
+    const noLocus = (x: { framework: AgentFramework }) => { (x.framework as any).channelRegistry.resolveLocus = () => null; };
+    const first = await make({ deliver: false });
+    noLocus(first);
     await wake(first, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
     first.mod.endTurn = true;
     await timerWake(first,
@@ -874,7 +873,8 @@ describe('replies to a [Continue] turn', () => {
 
     const strategy = new OmitToolExchange();
     strategy.omit = false;
-    const x = await make({ deliver: false, locus: null, dir: first.dir, agent: { strategy } });
+    const x = await make({ deliver: false, dir: first.dir, agent: { strategy } });
+    noLocus(x);
     try {
       await timerWake(x, signed('sig-c2', 'picked up'));
       assert.ok(x.membrane.calls[0]!.messages.at(-1)!.content.some((b) => b.type === 'tool_result'));
