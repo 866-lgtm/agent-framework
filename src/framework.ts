@@ -491,13 +491,15 @@ const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map l
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
 /** Why the framework ended a stream at a tool boundary: an endTurn tool
- *  result, or a context-budget restart (the `inference:stream_restarted`
- *  reasons). It is the stream's inference-log stop reason. */
+ *  result, or a context-budget or physical-window restart (the
+ *  `inference:stream_restarted` reasons). It is the stream's inference-log
+ *  stop reason. */
 type StreamBoundaryEnd = 'turn_ended' | 'context_budget' | 'physical_window';
 
 /** The request a boundary-ended stream's inference-log entry records in
  *  place of its body. A body is the whole compiled context, one blob per
- *  entry; these ends happen every tool-ended turn and budget restart. */
+ *  entry; these ends happen every tool-ended turn and every context-budget
+ *  or physical-window restart. */
 const BOUNDARY_END_REQUEST = { note: 'request body not kept for a stream ended at a tool boundary' };
 
 /** Maximum number of turn checkpoints to keep per agent. */
@@ -1026,12 +1028,12 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   // The framework ends a stream at a tool boundary from handleProcessEvent:
-  // an endTurn result, or a context-budget restart. Each live stream
-  // registers here how to record that end (its usage, its log entry and, for
-  // endTurn, the completed turn), so the record is made where the decision
-  // is taken, before the cancellation's asynchronous teardown or an
-  // ephemeral's disposal. Keyed by the physical stream, so a successor's
-  // record is never touched.
+  // an endTurn result, or a context-budget or physical-window restart. Each
+  // live stream registers here how to record that end (its usage, its log
+  // entry and, for endTurn, the completed turn), so the record is made where
+  // the decision is taken, before the cancellation's asynchronous teardown
+  // or an ephemeral's disposal. Keyed by the physical stream, so a
+  // successor's record is never touched.
   private streamBoundaryEnds = new WeakMap<YieldingStream, (end: StreamBoundaryEnd) => void>();
 
   /** Per-agent output locus FROZEN for the CURRENT logical turn. Resolved
@@ -9542,26 +9544,37 @@ export class AgentFramework {
     // response without usage, the boundary ends below, or `finally` for
     // every other end). Each caller passes the one value it also reports.
     let usageCounted = false;
+    let countedUsage: DetailedUsage | undefined;
     const countUsage = (usage: DetailedUsage | undefined): void => {
       if (usageCounted) return;
       usageCounted = true;
+      countedUsage = usage;
       if (!usage) return;
       this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
         ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
         : undefined);
       this.persistUsageState();
     };
-    // Every inference-log entry of this stream carries the usage of the
-    // rounds it finished, unless the entry names its own.
+    // ...and is carried by exactly one of its inference-log entries, so
+    // log-backed totals agree with the session's. The first entry carries
+    // it (the value the entry names, else the rounds finished so far); no
+    // later entry of this stream carries it again. An end that writes no
+    // entry of its own is logged in `finally`.
+    let usageLogged = false;
     const logStream = (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>): void => {
+      const tokenUsage = usageLogged ? undefined : (entry.tokenUsage ?? tokenUsageOf(latestUsage));
+      if (tokenUsage) usageLogged = true;
       this.logInference({
         timestamp: startTime,
         agentName: agent.name,
         requestId,
         ...entry,
-        tokenUsage: entry.tokenUsage ?? tokenUsageOf(latestUsage),
+        tokenUsage,
       });
     };
+    // What ended a stream whose end writes no log entry of its own, for the
+    // entry `finally` writes for it.
+    let unloggedEnd: string | undefined;
     // A turn that ended successfully: with its final response (natural
     // completion), or without one, when a tool result with endTurn ended it.
     const completeTurn = (usage: DetailedUsage | undefined, durationMs: number, response?: NormalizedResponse): void => {
@@ -10052,7 +10065,7 @@ export class AgentFramework {
                 // cumulative across this physical tool loop): count it before
                 // the retry opens a fresh stream with its own usage. One value
                 // for the count, the log entry and the refusal note.
-                const abandoned = response.details?.usage ?? latestUsage;
+                const abandoned: DetailedUsage | undefined = response.details?.usage ?? latestUsage ?? response.usage;
                 const tokenUsage = tokenUsageOf(abandoned);
                 this.noteRefusal(agent.name, category, tokenUsage);
                 countUsage(abandoned);
@@ -10675,6 +10688,7 @@ export class AgentFramework {
                   this.eventGate?.onInferenceEnded(agent.name);
                 }
                 if (cancelKind === 'quiesce_abandoned') {
+                  unloggedEnd = 'Turn abandoned by operator quiesce';
                   // Operator-initiated cancel during a quiesce drain. Settle
                   // the turn honestly — deliberately NO inference:exhausted:
                   // that trace centrally drives the consecutive-failure
@@ -10892,6 +10906,25 @@ export class AgentFramework {
       // Every end the cases above didn't count (a stream error or abort, a
       // throw, a superseded generation) still billed the rounds it finished.
       countUsage(latestUsage);
+      // An end that wrote no entry carrying them (a quiesce-abandoned turn,
+      // a stream superseded by a newer one, a disposed agent's stream) writes
+      // one now, as a failure naming what ended it, so the log carries what
+      // the totals count.
+      if (countedUsage && !usageLogged) {
+        const replaced = this.agents.get(agent.name) !== agent;
+        const superseded = generationLost || agent.streamId !== myStreamId;
+        logStream({
+          success: false,
+          error: unloggedEnd ?? (replaced
+            ? 'Stream abandoned: its agent was disposed or replaced'
+            : superseded
+              ? 'Stream superseded: a newer stream of the agent took over'
+              : 'Stream ended without a final response'),
+          request: compiledRequest ?? { note: 'streaming request' },
+          durationMs: Date.now() - startTime,
+          tokenUsage: tokenUsageOf(countedUsage),
+        });
+      }
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
         try {

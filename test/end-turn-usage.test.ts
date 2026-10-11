@@ -442,11 +442,17 @@ describe('a stream counts its usage once, however it ends', () => {
           name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'disabled',
         });
         contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-        await framework.runEphemeralToCompletion(agent, contextManager).catch(() => undefined);
+        // The run settles once the failure path has decided: it rejects with
+        // the stream's failure, or, had a retry been scheduled, it would wait
+        // for it and resolve on the default response.
+        const outcome = await Promise.race([
+          framework.runEphemeralToCompletion(agent, contextManager).then(() => 'resolved', (error: unknown) => error),
+          new Promise((resolve) => setTimeout(() => resolve('timed out'), 10_000)),
+        ]);
+        assert.ok(outcome instanceof Error, `the run failed with the stream: ${String(outcome)}`);
+        assert.equal(membrane.calls.length, 1, 'no retry was scheduled by the time the run failed');
         assert.ok(await pollUntil(() => traces.some((e) => e.type === 'usage:updated')), 'the finished round was counted');
-        await new Promise((r) => setTimeout(r, 50));
 
-        assert.equal(membrane.calls.length, 1, 'no retry');
         assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 0);
         assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 1);
         assert.deepEqual(framework.getSessionUsage().totals, expectedTotals(firstUsage));
@@ -537,9 +543,15 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
           internal[key].set('worker', 2);
         }
         internal.rewindEpisode.set('worker', { markerId: 'marker', count: 1, category: 'cyber' });
-        internal.forcedRewind.set('worker', { remaining: 1, removed: [], serverId: 'none', channelId: '' });
+        internal.forcedRewind.set('worker', { remaining: 1, removed: [], serverId: 'ops', channelId: 'ops-channel' });
+        const posted: Array<{ channelId: string; content: string }> = [];
+        (f.framework as unknown as { postToChannel: (s: string, c: string, content: string) => Promise<void> })
+          .postToChannel = async (_server, channelId, content) => { posted.push({ channelId, content }); };
         f.membrane.pushResponse(response());
         await run(f.framework, 'worker');
+        assert.equal(posted.length, 1, 'the /unstick outcome was posted');
+        assert.equal(posted[0].channelId, 'ops-channel');
+        assert.match(posted[0].content, /the model responded/);
         assert.equal(internal.consecutiveInferenceFailures.get('worker'), 0, 'the hard-down streak');
         assert.equal(internal.exhaustionRewinds.get('worker'), 0, 'the poison-history rewind budget');
         assert.equal(internal.refusalRewinds.get('worker'), 0);
@@ -563,8 +575,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
       r.framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} } as unknown as ProcessEvent);
       await r.framework.runUntilIdle();
       assert.equal(r.membrane.calls.length, 1, 'held for the cooldown');
-      await new Promise((resolve) => setTimeout(resolve, 1_100));
-      await r.framework.runUntilIdle();
+      assert.ok(await pollUntil(() => r.membrane.calls.length === 2, 10_000), 'the cooldown ended and the call was retried');
       assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'inference:turn_ended')), 'the retried turn ended by tool');
       assert.equal(r.membrane.calls.length, 2);
       assert.equal(r.internal.providerAccelerationLastRecovery.get('resident')?.stopReason, 'turn_ended');
@@ -587,6 +598,131 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage));
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);
+    } finally {
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/** A completion the stream would yield next; these tests end it before it's handled. */
+const unseenCompletion = (): StreamEvent =>
+  ({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'unseen' }]) }) as StreamEvent;
+
+/** A tool that returns only once released, so the stream waits on it. */
+class HeldTools implements Module {
+  readonly name = 'test';
+  release: () => void = () => {};
+  private readonly held = new Promise<void>((resolve) => { this.release = resolve; });
+  calledWith: string[] = [];
+  async start() {}
+  async stop() {}
+  async onProcess() { return {}; }
+  getTools() {
+    return [{ name: 'echo', description: 'echo', inputSchema: { type: 'object' as const, properties: {} } }];
+  }
+  async handleToolCall(call: ToolCall) {
+    this.calledWith.push(call.id);
+    await this.held;
+    return { success: true, data: {} };
+  }
+}
+
+describe('a stream that ends without writing its own entry is logged once, in finally', () => {
+  async function residentWith(stream: YieldingStream, tools: Module) {
+    const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
+    const membrane = new MockMembrane();
+    let made = false;
+    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+      membrane.calls.push(request);
+      if (made) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+      made = true;
+      return stream;
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all' }],
+      modules: [new InputModule(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    return { dir, membrane, framework, traces };
+  }
+
+  function loggedOnce(framework: AgentFramework, traces: TraceEvent[], error: RegExp) {
+    assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+    assert.deepEqual(framework.getSessionUsage().totals, expectedTotals(firstUsage));
+    const logs = framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+    assert.equal(logs.length, 1, 'one entry');
+    assert.equal(logs[0].success, false);
+    assert.match(String(logs[0].error), error);
+    assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the entry carries what was counted');
+  }
+
+  it('a turn abandoned by an operator quiesce after a finished round', async () => {
+    const tools = new HeldTools();
+    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    try {
+      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+      assert.ok(await pollUntil(() => r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'logged');
+      loggedOnce(r.framework, r.traces, /^Turn abandoned by operator quiesce$/);
+    } finally {
+      // Let the held tool finish while the framework's queue is still open.
+      tools.release();
+      await pollUntil(() => r.traces.some((e) =>
+        (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a failure after a completion is logged without carrying the usage again', async () => {
+    const r = await resident([() => new MockYieldingStream([finalResponse('Done.', totalUsage)])]);
+    // Something after the completion's entry throws: the stream's catch
+    // writes a failure entry too. (A resident: an ephemeral is deregistered
+    // once its completion settles it, so its catch treats the throw as a
+    // superseded stream's.)
+    const internal = r.framework as unknown as { endRefusalEpisode: (name: string) => void };
+    const end = internal.endRefusalEpisode.bind(r.framework);
+    internal.endRefusalEpisode = () => {
+      internal.endRefusalEpisode = end;
+      throw new Error('after the completion');
+    };
+    r.framework.start();
+    try {
+      r.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      assert.ok(await pollUntil(() => r.framework.queryInferenceLogs({ agentName: 'resident' }).total === 2), 'both entries');
+      // Both entries carry the stream's start time, so find each by outcome.
+      const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+      const completed = logs.find((e) => e.success);
+      const failed = logs.find((e) => !e.success);
+      assert.deepEqual(completed?.tokenUsage, expectedTokens(totalUsage), 'the completion carries the usage');
+      assert.equal(failed?.error, 'Stream threw: after the completion');
+      assert.equal(failed?.tokenUsage, undefined, 'the later failure does not carry it again');
+      assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(totalUsage));
+    } finally {
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stream superseded by a newer one after a finished round', async () => {
+    const stream = new RoundThenEnd(firstUsage, unseenCompletion());
+    let framework: AgentFramework | undefined;
+    const provide = stream.provideToolResults.bind(stream);
+    // A newer stream of the agent takes over while this one waits on its tool.
+    stream.provideToolResults = () => {
+      (framework!.getAgent('resident') as unknown as { _streamId: number })._streamId++;
+      provide();
+    };
+    const r = await residentWith(stream, new TurnTools());
+    framework = r.framework;
+    try {
+      assert.ok(await pollUntil(() => r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'logged');
+      loggedOnce(r.framework, r.traces, /^Stream superseded/);
     } finally {
       await r.framework.stop();
       rmSync(r.dir, { recursive: true, force: true });

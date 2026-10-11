@@ -411,7 +411,10 @@ export interface InferenceLogEntry {
   response?: unknown | { blobId: string };
   durationMs: number;
   /** The stream's usage: its final response's, or, for a stream that ended
-   *  without one, the provider rounds it finished before it ended. */
+   *  without one, the provider rounds it finished before it ended. Exactly
+   *  one entry of a stream carries it, the one its end wrote; a stream whose
+   *  end writes none (a quiesce-abandoned turn, a superseded stream, a
+   *  disposed agent's stream) gets a failure entry that carries it. */
   tokenUsage?: {
     input: number;
     output: number;
@@ -420,7 +423,8 @@ export interface InferenceLogEntry {
   };
   /** Stop reason from the model, or why the framework ended the stream at a
    *  tool boundary: 'turn_ended' (a tool result with endTurn), or
-   *  'context_budget' / 'physical_window' (a context-budget restart). */
+   *  'context_budget' / 'physical_window' (a context-budget or
+   *  physical-window restart). */
   stopReason?: string;
 }
 
