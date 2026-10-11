@@ -107,15 +107,17 @@ test('a deadline requests cancellation and reports no-response, outcome unknown'
   const dir = scratch();
   const connection = await connect(config(dir, { requestTimeoutMs: 300 }));
   await connection.callTool('echo', { text: 'warm' }); // the slow call is not the connection's first request
-  const started = Date.now();
-  await assert.rejects(connection.callTool('slow', { ms: 2000 }), (err: unknown) => {
+  // The tool would run far past the deadline, so the call rejecting while
+  // the tool hasn't finished shows it ended at the deadline, whatever the
+  // runner's load did to the wall clock.
+  await assert.rejects(connection.callTool('slow', { ms: 20_000 }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'no-response');
     assert.match(err.message, /did not answer tools\/call "slow" within 300ms/);
     assert.match(err.message, /Cancellation was requested; the outcome is unknown/);
     return true;
   });
-  assert.ok(Date.now() - started < 1500, 'rejected at the deadline, not at the tool\'s end');
+  assert.ok(!lines(join(dir, 'events.log')).includes('slow-finished'), 'rejected at the deadline, not at the tool\'s end');
   // The server saw the cancellation: the request was cancelled, not merely abandoned.
   await until(() => lines(join(dir, 'events.log')).includes('slow-aborted'));
 });

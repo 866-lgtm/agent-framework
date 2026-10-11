@@ -77,19 +77,22 @@ const UNSUPPORTED_PROTOCOL_VERSION_CODE = -32022;
 const MAX_TOOL_LIST_PAGES = 100;
 
 /**
- * The server and this legacy engine have no protocol revision in common, so
- * the connection was never established. This is a protocol-negotiation fact,
- * not a request outcome. Retrying cannot change it: the engine offers one
+ * The server and this engine have no protocol revision in common, so the
+ * connection was never established. This is a protocol-negotiation fact, not
+ * a request outcome. Retrying cannot change it: each engine offers one
  * revision, and only configuration can fix the mismatch. A connection that
- * gets this error does not schedule reconnects.
+ * gets this error does not schedule reconnects. The legacy engine and the
+ * modern one (ModernMcpConnection, whose pinned revision the server refused)
+ * both throw it, so its readers treat them alike.
  *
- * - `rejected`: the server answered `initialize` with error -32022.
- *   `supported` is the server's own list, when it gave one.
- * - `mismatch`: the server answered `initialize` with a revision other than
- *   2024-11-05, or with none.
+ * - `rejected`: the server refused the offered revision: the legacy engine's
+ *   `initialize` answered with error -32022, or a modern server's discovery
+ *   or error naming no common revision. `supported` is the server's own list,
+ *   when it gave one.
+ * - `mismatch`: the server answered the legacy engine's `initialize` with a
+ *   revision other than 2024-11-05, or with none.
  */
 export class McplProtocolVersionError extends Error {
-  readonly offered = MCP_PROTOCOL_VERSION;
   constructor(
     message: string,
     readonly kind: 'rejected' | 'mismatch',
@@ -100,6 +103,9 @@ export class McplProtocolVersionError extends Error {
     /** The JSON-RPC error's code and data, verbatim (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
+    /** The revision this client offered: the legacy engine's, unless a
+     *  modern connection's. */
+    readonly offered: string = MCP_PROTOCOL_VERSION,
   ) {
     super(message);
     this.name = 'McplProtocolVersionError';

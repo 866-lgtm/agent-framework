@@ -26,7 +26,9 @@
  *   `input_required` answer asks for another round, so a call that ends
  *   after one has no answer.
  * - **Lifetime.** On a lost transport the connection restarts with the same
- *   backoff settings as legacy, when `reconnect` is set. List-change
+ *   backoff settings as legacy, when `reconnect` is set. A server that shares
+ *   no revision with this client is a configuration verdict, as for legacy
+ *   (`McplProtocolVersionError`): it is never retried. List-change
  *   awareness is kept while the connection lives: a subscription the server
  *   advertises but that didn't open, or that ended, is reopened. Each connect
  *   is a generation, so a superseded client never touches a newer one.
@@ -45,6 +47,7 @@ import {
   SdkErrorCode,
   SdkHttpError,
   StreamableHTTPClientTransport,
+  UnsupportedProtocolVersionError,
   parseJSONRPCMessage,
   type AuthProvider,
   type CallToolResult,
@@ -56,8 +59,8 @@ import {
 } from '@modelcontextprotocol/client';
 
 import { StdioTransport, type McplTransport } from './transport.js';
-import { McplRequestError } from './server-connection.js';
-import { MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError } from './protocol-family.js';
+import { McplProtocolVersionError, McplRequestError } from './server-connection.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -91,8 +94,24 @@ interface WireRecord {
   readonly method: string;
   handedOff: boolean;
   currentId?: string | number;
+  /** The current leg's answer. */
   answer: 'none' | 'error' | 'complete' | 'input-required' | 'unrecognized';
   error?: { code: number; message: string; data?: unknown };
+  /** An earlier leg's answer asked for another round (or wasn't a complete
+   *  result): the server may have acted on the call, whatever a later leg
+   *  meets. A new leg's send never clears it. */
+  continued: boolean;
+}
+
+/**
+ * A send that Connectome's own transport refused before writing anything (its
+ * stdio line is closed): nothing of that request reached the server.
+ */
+class NotWrittenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NotWrittenError';
+  }
 }
 
 /** The logical request a send belongs to. The SDK hands each request to the
@@ -146,15 +165,30 @@ class ObservedTransport implements Transport {
 
   async send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
     const record = wireScope.getStore();
+    let undo: (() => void) | undefined;
     if (record && 'method' in message && 'id' in message && message.method === record.method) {
-      // Handed off from here on: past this point nothing proves it unsent.
+      const prior = { handedOff: record.handedOff, currentId: record.currentId, answer: record.answer, error: record.error };
+      // Handed off from here on: past this point nothing proves it unsent,
+      // unless the transport says it wrote nothing.
       record.handedOff = true;
       record.currentId = message.id;
       record.answer = 'none';
       record.error = undefined;
       this.awaiting.set(message.id, record);
+      undo = () => {
+        this.awaiting.delete(message.id);
+        Object.assign(record, prior);
+      };
     }
-    await this.inner.send(message, options);
+    try {
+      await this.inner.send(message, options);
+    } catch (error) {
+      // Refused before any write: this leg never reached the server, so the
+      // record is as it was before it. Any other throw (an HTTP send can fail
+      // after part of the request went out) leaves it handed off.
+      if (error instanceof NotWrittenError) undo?.();
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
@@ -183,6 +217,7 @@ class ObservedTransport implements Transport {
       const result = (message as { result?: unknown }).result;
       const type = typeof result === 'object' && result !== null ? (result as { resultType?: unknown }).resultType : undefined;
       record.answer = type === 'complete' ? 'complete' : type === 'input_required' ? 'input-required' : 'unrecognized';
+      if (record.answer !== 'complete') record.continued = true;
     }
     return record;
   }
@@ -239,7 +274,7 @@ class SpawnerStdioTransport implements Transport {
   }
 
   async send(message: JSONRPCMessage): Promise<void> {
-    if (!this.line || this.line.closed) throw new Error(`MCP server "${this.config.id}" stdio transport is closed`);
+    if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
     this.line.writeLine(JSON.stringify(message));
   }
 
@@ -297,7 +332,7 @@ export class ModernMcpConnection extends EventEmitter {
   private opening: { session: Session; done: Promise<void> } | null = null;
   private generation = 0;
   private closedByHost = false;
-  private readonly reconnectEnabled: boolean;
+  private reconnectEnabled: boolean;
   private readonly reconnectIntervalMs: number;
   private readonly reconnectMaxIntervalMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -416,6 +451,12 @@ export class ModernMcpConnection extends EventEmitter {
       await this.open();
     } catch (error) {
       if (this.closedByHost) return;
+      // No common revision is a configuration fact, not an outage: a retry
+      // would restart the server to hear the same answer.
+      if (error instanceof McplProtocolVersionError) {
+        this.reconnectEnabled = false;
+        throw error;
+      }
       if (!this.reconnectEnabled) throw error;
       const halted = this.unreapedFailure();
       if (halted) {
@@ -446,6 +487,10 @@ export class ModernMcpConnection extends EventEmitter {
     if (this.closedByHost) return;
     const generation = ++this.generation;
     this.cancelRelisten();
+    // A new generation's subscription has failed nothing yet: its first
+    // reopen backs off from the base interval, not from the previous
+    // generation's failures.
+    this.relistenAttempts = 0;
     const inner: Transport = this.transportKind === 'stdio'
       ? new SpawnerStdioTransport(this.config, (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); })
       : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
@@ -470,8 +515,10 @@ export class ModernMcpConnection extends EventEmitter {
     client.onerror = (error: Error) => {
       // The SDK reports late responses to deadline-abandoned calls here
       // ("unknown message ID"), and a list-change subscription it could not
-      // open at connect, among other out-of-band errors. They are logged,
-      // never delivered: the call's outcome was already reported.
+      // open at connect, among other out-of-band errors. They are emitted as
+      // this connection's 'error', so they reach the host's error listeners
+      // (and are logged when there are none). They never change a call's
+      // outcome, which was already reported.
       if (this.isCurrent(generation)) this.emit('error', error);
     };
     client.onclose = () => {
@@ -479,18 +526,29 @@ export class ModernMcpConnection extends EventEmitter {
     };
 
     const session: Session = { generation, client, wire };
-    const done = client.connect(wire, { timeout: CONNECT_TIMEOUT_MS });
-    this.opening = { session, done };
+    // `done` settles only once this connect's own cleanup has finished, on
+    // every path: close() waits on it, and must not resolve while that
+    // cleanup could still find a child it can't reap.
+    let settle!: () => void;
+    this.opening = { session, done: new Promise<void>((resolve) => { settle = resolve; }) };
     try {
-      await done;
+      await this.establish(session);
+    } finally {
+      if (this.opening?.session === session) this.opening = null;
+      settle();
+    }
+  }
+
+  /** Connect one generation's client, and adopt it if it's still current. */
+  private async establish(session: Session): Promise<void> {
+    try {
+      await session.client.connect(session.wire, { timeout: CONNECT_TIMEOUT_MS });
     } catch (error) {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
-      throw error;
-    } finally {
-      if (this.opening?.session === session) this.opening = null;
+      throw this.versionVerdict(error) ?? error;
     }
-    if (!this.isCurrent(generation)) {
+    if (!this.isCurrent(session.generation)) {
       // Superseded or closed while connecting: this generation never serves.
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
@@ -499,7 +557,40 @@ export class ModernMcpConnection extends EventEmitter {
     this.session = session;
     this.protocolVersion = MODERN_MCP_PROTOCOL_VERSION;
     this.reconnectAttempts = 0;
-    this.keepListening(session, client.autoOpenedSubscription);
+    this.keepListening(session, session.client.autoOpenedSubscription);
+  }
+
+  /**
+   * The server refused the pinned revision (no common one in its
+   * `server/discover` answer, or an unsupported-version error): a
+   * configuration verdict, as for the legacy engine, in the same type, so
+   * every reader treats both engines alike. Retrying can't change it.
+   */
+  private versionVerdict(error: unknown): McplProtocolVersionError | null {
+    if (!(error instanceof UnsupportedProtocolVersionError)) return null;
+    const data = (error as { data?: unknown }).data as { supported?: unknown } | undefined;
+    const supported = Array.isArray(data?.supported) && data.supported.every((v) => typeof v === 'string')
+      ? (data.supported as string[])
+      : null;
+    // Legacy MCP is reached over stdio or WebSocket. A stdio server's
+    // family is its configuration's choice; an http(s) url is modern by its
+    // scheme, so there is nothing to reconfigure on it.
+    const legacyHint = !supported?.includes(LEGACY_MCP_PROTOCOL_VERSION)
+      ? ''
+      : this.transportKind === 'stdio'
+        ? ` It speaks legacy MCP: configure it without protocol: 'modern'.`
+        : ` It speaks only legacy MCP, which this client reaches over stdio or WebSocket (ws://, wss://), not http(s).`;
+    return new McplProtocolVersionError(
+      `MCP server "${this.id}" does not support MCP ${MODERN_MCP_PROTOCOL_VERSION}` +
+        (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${error.message}).`) +
+        legacyHint,
+      'rejected',
+      null,
+      supported,
+      (error as { code?: unknown }).code === undefined ? undefined : Number((error as { code?: unknown }).code),
+      (error as { data?: unknown }).data,
+      MODERN_MCP_PROTOCOL_VERSION,
+    );
   }
 
   /**
@@ -570,11 +661,12 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /** The legacy engine's backoff: doubling from the base interval, capped,
-   *  with ±25% jitter. */
+   *  with ±25% jitter, and never past the timer limit (a longer delay would
+   *  fire at once, turning the backoff into a tight loop). */
   private backoffDelay(failures: number): number {
     const exponent = Math.max(0, Math.min(failures - 1, 30));
     const capped = Math.min(this.reconnectIntervalMs * 2 ** exponent, this.reconnectMaxIntervalMs);
-    return capped * (0.75 + Math.random() * 0.5);
+    return Math.min(capped * (0.75 + Math.random() * 0.5), MAX_TIMER_MS);
   }
 
   private scheduleReconnect(): void {
@@ -599,6 +691,13 @@ export class ModernMcpConnection extends EventEmitter {
       const halted = this.unreapedFailure();
       if (halted) {
         this.emit('reconnect-failed', { error: `${(error as Error).message}; ${halted}`, attempt, permanent: true });
+        return;
+      }
+      // No common revision: every further attempt would hear the same
+      // answer. Stop; only the configuration can fix it.
+      if (error instanceof McplProtocolVersionError) {
+        this.reconnectEnabled = false;
+        this.emit('reconnect-failed', { error: error.message, attempt, permanent: true });
         return;
       }
       this.emit('reconnect-failed', { error: (error as Error).message, attempt });
@@ -657,7 +756,7 @@ export class ModernMcpConnection extends EventEmitter {
       // Connectome refuses before anything reaches the SDK: provably not sent.
       throw new McplRequestError(`Cannot send ${what}: connection to "${this.id}" is not established`, 'not-sent');
     }
-    const record: WireRecord = { method, handedOff: false, answer: 'none' };
+    const record: WireRecord = { method, handedOff: false, answer: 'none', continued: false };
     try {
       return await wireScope.run(record, () => run(session.client));
     } catch (error) {
@@ -726,7 +825,13 @@ export class ModernMcpConnection extends EventEmitter {
         if (!this.unreaped.some((held) => held.session === target)) this.unreaped.push({ session: target, failure });
       }
     }
-    if (opening) await opening.done.catch(() => {});
+    if (opening) {
+      // The connect's own cleanup closes its generation again, after the
+      // close above; `done` settles once it has. A child that cleanup
+      // couldn't reap is this close's failure too.
+      await opening.done;
+      for (const held of this.unreaped) if (!failures.includes(held.failure)) failures.push(held.failure);
+    }
     if (session) this.emit('close', { reason: 'closed by host' });
     if (failures.length > 0) {
       throw new Error(`MCP server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
@@ -736,13 +841,12 @@ export class ModernMcpConnection extends EventEmitter {
   /**
    * Map a failure onto the request-outcome contract by what crossed the
    * transport boundary for this request, claiming no more than that shows.
-   * The call's answer is the server's final one: an error or a `complete`
-   * result.
-   * - nothing handed to the transport: `not-sent`, whatever the SDK raised
-   *   (a pre-dispatch validation, a signal already aborted, no transport);
-   * - an HTTP 401/403 refusal: `error-response`. The server answered, at the
-   *   HTTP layer, so the status is in `data.httpStatus` and `code` stays the
-   *   JSON-RPC code space's (absent);
+   * The rules apply in this order. The call's answer is the server's final
+   * one: an error or a `complete` result.
+   * - nothing handed to the transport: `not-sent`, whatever was raised (a
+   *   pre-dispatch validation, a signal already aborted, no transport, a send
+   *   Connectome's stdio line refused before writing, an HTTP refusal before
+   *   any request went out);
    * - the most recent leg answered with a JSON-RPC error: `error-response`
    *   with that error's code and data;
    * - the most recent leg answered with a complete result: the server
@@ -756,16 +860,22 @@ export class ModernMcpConnection extends EventEmitter {
    *   rounds cap). Nothing is in flight then, so nothing is cancelled. A
    *   result of a type this client doesn't recognize ends the call where it
    *   is;
+   * - an HTTP 401/403 refusal of the current leg: `error-response`, the
+   *   status in `data.httpStatus` with `code` absent (the server answered at
+   *   the HTTP layer, outside the JSON-RPC code space). After an earlier leg
+   *   asked for another round it is `no-response` instead: the server may
+   *   already have acted on the call;
    * - handed off and unanswered: `no-response`. At the deadline, cancellation
    *   was requested and the outcome is unknown.
+   * A `tools/list` failure says so: listing changes nothing on the server, so
+   * a retry is safe, where a tool call's retry may duplicate a side effect.
    */
   private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number): Error {
     const prefix = `MCP server "${this.id}"`;
     const message = error instanceof Error ? error.message : String(error);
-    if (error instanceof SdkHttpError && (error.code === SdkErrorCode.ClientHttpAuthentication || error.code === SdkErrorCode.ClientHttpForbidden)) {
-      const data = error.data && typeof error.data === 'object' ? error.data : {};
-      return new McplRequestError(`${prefix} refused ${what}: HTTP ${error.status} (${message})`, 'error-response', undefined, { ...data, httpStatus: error.status });
-    }
+    const advice = record.method === 'tools/list'
+      ? 'Listing changes nothing on the server, so it is safe to retry.'
+      : 'Verify state before retrying; a blind retry of a side-effecting tool may duplicate it.';
     if (!record.handedOff) {
       return new McplRequestError(`${prefix} ${what} was not sent: ${message}`, 'not-sent');
     }
@@ -787,16 +897,27 @@ export class ModernMcpConnection extends EventEmitter {
           : `it asked for another round (input_required), and the call ended before that round was sent: ${reason}`;
       return new McplRequestError(
         `${prefix} did not finish ${what}${within}: ${ending} ` +
-          `The outcome is unknown: the server may already have acted on the call. Verify state before retrying; ` +
-          `a blind retry of a side-effecting tool may duplicate it.`,
+          `The outcome is unknown: the server may already have acted on the call. ${advice}`,
         'no-response',
       );
     }
+    if (error instanceof SdkHttpError && (error.code === SdkErrorCode.ClientHttpAuthentication || error.code === SdkErrorCode.ClientHttpForbidden)) {
+      if (record.continued) {
+        return new McplRequestError(
+          `${prefix} did not finish ${what}: it asked for another round (input_required), and the server refused a later one: ` +
+            `HTTP ${error.status} (${message}). The outcome is unknown: the server may already have acted on the call. ${advice}`,
+          'no-response',
+        );
+      }
+      const data = error.data && typeof error.data === 'object' ? error.data : {};
+      return new McplRequestError(`${prefix} refused ${what}: HTTP ${error.status} (${message})`, 'error-response', undefined, { ...data, httpStatus: error.status });
+    }
     if (deadline) {
+      const outcome = record.method === 'tools/list'
+        ? 'the list did not arrive in time.'
+        : 'the outcome is unknown: the tool may still complete server-side.';
       return new McplRequestError(
-        `${prefix} did not answer ${what}${within}. Cancellation was requested; ` +
-          `the outcome is unknown: the tool may still complete server-side. Verify state before retrying; ` +
-          `a blind retry of a side-effecting tool may duplicate it.`,
+        `${prefix} did not answer ${what}${within}. Cancellation was requested; ${outcome} ${advice}`,
         'no-response',
       );
     }

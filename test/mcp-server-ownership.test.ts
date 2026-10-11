@@ -196,7 +196,8 @@ test('a disconnect during a modern connect ends it at once', async () => {
     const began = Date.now();
     await framework.disconnectMcplServer('m');
     await assert.rejects(pending, /MCP server "m" was not connected: it was disconnected while connecting/);
-    assert.ok(Date.now() - began < 5_000, 'not after the 30 s connect timeout');
+    // A generous bound, well below the 30 s connect timeout it rules out.
+    assert.ok(Date.now() - began < 20_000, 'not after the 30 s connect timeout');
     assert.equal(status(framework, 'm'), undefined);
     assert.equal(alive(launches(log)[0]!), false, 'its child was reaped');
   });

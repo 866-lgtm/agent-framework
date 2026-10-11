@@ -11,6 +11,8 @@
 //   reject-discover-later  launches after the first answer server/discover with an error
 //   reject-discover      every launch answers server/discover with an error
 //   ignore-sigterm       the process survives SIGTERM (only SIGKILL ends it)
+//   other-revision       every launch's server/discover lists only a revision the client doesn't speak
+//   other-revision-later  launches after the first do
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), err (a JSON-RPC error), touch (announces
 // a tool list change on the open subscription), nullframe (writes JSON lines
@@ -19,7 +21,8 @@
 // 'error', 'hang', 'ok', or 'again' for another state-only round every time.
 // arguments.leg1 'exit' exits just after the first leg's answer, and
 // 'elicit' asks for elicitation input instead), task (a result type this
-// revision doesn't define), bare (a result with no resultType), die (exits).
+// revision doesn't define), bare (a result with no resultType), die (exits),
+// vanish (exits without answering).
 import { createInterface } from 'node:readline';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
@@ -45,6 +48,15 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   note({ event: m.id === undefined ? 'notification' : 'request', method: m.method, id: m.id ?? null, ...(m.method === 'tools/call' ? { tool: m.params?.name } : {}) });
   switch (m.method) {
     case 'server/discover':
+      if (flags.has('other-revision') || (flags.has('other-revision-later') && launch > 1)) {
+        return result(m.id, {
+          supportedVersions: ['2099-01-01'],
+          capabilities: { tools: {} },
+          ttlMs: 60000,
+          cacheScope: 'private',
+          _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'raw-fixture', version: '1' } },
+        });
+      }
       if (flags.has('hang-discover-later') && launch > 1) return;
       if (flags.has('hang-discover')) return;
       if (flags.has('reject-discover-later') && launch > 1) return error(m.id, -32603, 'not today');
@@ -88,6 +100,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           { name: 'task', inputSchema: { type: 'object' } },
           { name: 'bare', inputSchema: { type: 'object' } },
           { name: 'die', inputSchema: { type: 'object' } },
+          { name: 'vanish', inputSchema: { type: 'object' } },
         ],
       });
     case 'tools/call': {
@@ -101,6 +114,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         return result(m.id, { content: [{ type: 'text', text: subscription === null ? 'no subscription' : 'touched' }] });
       }
       if (name === 'die') { setTimeout(() => process.exit(5), 10); return result(m.id, { content: [{ type: 'text', text: 'bye' }] }); }
+      if (name === 'vanish') process.exit(6);
       if (name === 'task') return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'task', taskId: 'task-1' } });
       if (name === 'bare') return send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'no resultType' }] } });
       if (name === 'nullframe') {

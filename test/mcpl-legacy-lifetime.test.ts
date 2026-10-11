@@ -200,7 +200,8 @@ test('close() during a reconnect handshake ends that launch before resolving, an
   const second = starts(log)[1]!;
   const began = Date.now();
   await connection.close();
-  assert.ok(Date.now() - began < 5_000, 'promptly: the handshake was ended, not waited out (30 s)');
+  // A generous bound, well below the 30 s handshake timeout it rules out.
+  assert.ok(Date.now() - began < 20_000, 'promptly: the handshake was ended, not waited out (30 s)');
   assert.equal(alive(second), false, 'the launch in flight was reaped before close() resolved');
   assert.equal(reconnected, false);
   assert.equal(connection.isConnected, false);
@@ -221,7 +222,7 @@ test('a recycle during a reconnect in flight starts no second attempt, and close
   assert.equal(starts(log).length, 2, 'no second attempt beside the one in flight');
   const began = Date.now();
   await connection.close();
-  assert.ok(Date.now() - began < 5_000, 'promptly');
+  assert.ok(Date.now() - began < 20_000, 'promptly: well before the 30 s handshake timeout');
   assert.deepEqual(starts(log).filter(alive), [], 'every launch reaped when close() resolved');
 });
 

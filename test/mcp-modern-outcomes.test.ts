@@ -22,9 +22,11 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { SdkError, SdkErrorCode, SdkHttpError, UnsupportedProtocolVersionError } from '@modelcontextprotocol/client';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
-import { McplRequestError } from '../src/mcpl/server-connection.js';
+import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
+import { MAX_TIMER_MS } from '../src/mcpl/protocol-family.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -123,15 +125,18 @@ test('a subscription refused at connect is reopened, and change awareness return
 test('awareness survives a reconnect whose first listen is refused again', async () => {
   const log = scratchLog();
   const connection = await connect('listen-fail-first', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
-  let reconnected = false;
-  connection.on('reconnect', () => { reconnected = true; });
-  await connection.callTool('die', {});
-  await until(() => reconnected, 'reconnect');
-  // Launch 2 refuses its first listen too; the newer generation reopens it.
-  await until(() => wire(log).filter((e) => e.method === 'subscriptions/listen' && e.launch === 2).length >= 2, 'a second listen on launch 2');
   let changes = 0;
   connection.on('tools-list-changed', () => changes++);
-  await new Promise((r) => setTimeout(r, 50));
+  let atReconnect: number | null = null;
+  connection.on('reconnect', () => { atReconnect = changes; });
+  await connection.callTool('die', {});
+  await until(() => atReconnect !== null, 'reconnect');
+  // Launch 2 refuses its first listen too; the newer generation reopens it.
+  // A reopened subscription is answered before the connection announces the
+  // refresh it makes for changes it may have missed, so that announcement
+  // marks the subscription accepted.
+  await until(() => changes > atReconnect!, 'the reopened subscription answered on launch 2');
+  assert.ok(wire(log).filter((e) => e.method === 'subscriptions/listen' && e.launch === 2).length >= 2, 'a second listen on launch 2');
   const before = changes;
   await connection.callTool('touch', {});
   await until(() => changes > before, 'the announced change on launch 2');
@@ -172,22 +177,41 @@ test('an input_required continuation keeps its evidence: the second leg decides 
 });
 
 test('a deadline between continuation rounds is no-response, and claims no cancellation', async () => {
-  // The SDK pauses 250 ms before a state-only round. With a shorter budget,
-  // the deadline passes inside that pause whenever leg 1 answers in time.
   const log = scratchLog();
-  const connection = await connect('', log, { requestTimeoutMs: 240 });
+  const connection = await connect('', log, { requestTimeoutMs: 1500 });
   await connection.listTools();
-  await assert.rejects(connection.callTool('cont', { leg2: 'ok' }), (err: unknown) => {
+  // Hold the round between leg 1's answer and leg 2 explicitly, so the
+  // deadline passes with nothing in flight by construction. Leg 1 asks for
+  // elicitation input, and an input handler registered on the session's
+  // client holds until the deadline aborts it, ending as the SDK's own pause
+  // does. Don't replace this with a deadline timed against the SDK's internal
+  // pause before a state-only round: that races leg 1 under load.
+  let held = false;
+  const client = (connection as unknown as { session: { client: { _requestHandlers: Map<string, unknown> } } }).session.client;
+  client._requestHandlers.set('elicitation/create', (_request: unknown, ctx: { mcpReq: { signal: AbortSignal } }) => {
+    held = true;
+    const signal = ctx.mcpReq.signal;
+    return new Promise((_, reject) => {
+      const stop = () => reject(signal.reason instanceof SdkError ? signal.reason : new SdkError(SdkErrorCode.RequestTimeout, String(signal.reason)));
+      if (signal.aborted) stop();
+      else signal.addEventListener('abort', stop, { once: true });
+    });
+  });
+  await assert.rejects(connection.callTool('cont', { leg1: 'elicit' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
     assert.match(
       err.message,
-      /did not finish tools\/call "cont" within 240ms: it asked for another round \(input_required\), and the deadline passed before that round was sent, so nothing was in flight to cancel\. The outcome is unknown/,
+      /did not finish tools\/call "cont" within 1500ms: it asked for another round \(input_required\), and the deadline passed before that round was sent, so nothing was in flight to cancel\. The outcome is unknown/,
     );
     assert.doesNotMatch(err.message, /Cancellation was requested|answered/);
     return true;
   });
-  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(held, 'the round was held');
+  // The wire is ordered: once a later call has reached the server, any
+  // second leg sent before it would have too.
+  await connection.callTool('plain', {});
+  assert.equal(calls(log, 'plain'), 1);
   assert.equal(calls(log, 'cont'), 1, 'only leg 1 reached the wire');
   assert.equal(wire(log).filter((e) => e.method === 'notifications/cancelled').length, 0, 'nothing was cancelled');
 });
@@ -346,11 +370,13 @@ test('concurrent close() calls share one teardown and its verdict; a later close
   const log = scratchLog();
   const realSpawn = StdioTransport.spawn;
   let stuck: { pid: number; kill: (signal?: string) => boolean } | null = null;
+  // Every signal teardown sends: one teardown escalates once, SIGTERM then SIGKILL.
+  const signals: Array<string | undefined> = [];
   (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (config) => {
     const transport = realSpawn.call(StdioTransport, config);
     const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
     const realKill = child.kill.bind(child);
-    child.kill = () => true; // teardown can't reap it
+    child.kill = (signal?: string) => { signals.push(signal); return true; }; // teardown can't reap it
     stuck = { pid: child.pid, kill: realKill };
     return transport;
   };
@@ -366,6 +392,7 @@ test('concurrent close() calls share one teardown and its verdict; a later close
   assert.deepEqual(settled, [], 'neither resolves while teardown is pending');
   await Promise.all([first, second]);
   assert.deepEqual(settled, ['first:failed', 'second:failed'], 'one verdict, in order');
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL'], 'one teardown, shared: the second close sent no signals of its own');
   // Once the child is gone, a later close re-checks and settles.
   stuck!.kill('SIGKILL');
   await until(() => { try { process.kill(stuck!.pid, 0); return false; } catch { return true; } }, 'the child gone');
@@ -387,4 +414,175 @@ test('start() runs once: a second call shares the first connect, and no second s
   await connection.close();
   const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
   assert.equal(alive(launches[0]!.pid!), false, 'close() reaped the only child');
+});
+
+test('a send the stdio line refused before writing anything is not-sent', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  // The line is closed, while the session still stands: the transport
+  // refuses the write, so nothing reached the server.
+  const line = (connection as unknown as { session: { wire: { inner: { line: { _closed: boolean } } } } }).session.wire.inner.line;
+  line._closed = true;
+  try {
+    await assert.rejects(connection.callTool('plain', {}), (err: unknown) => {
+      assert.ok(err instanceof McplRequestError, String(err));
+      assert.equal(err.outcome, 'not-sent');
+      assert.match(err.message, /tools\/call "plain" was not sent: .*stdio transport is closed/);
+      return true;
+    });
+  } finally {
+    line._closed = false;
+  }
+  assert.equal(calls(log, 'plain'), 0);
+});
+
+test('a plain call whose child dies before answering is no-response', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  connection.on('error', () => {});
+  await connection.listTools();
+  await assert.rejects(connection.callTool('vanish', {}), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /MCP server "raw" tools\/call "vanish" failed: /);
+    return true;
+  });
+  assert.equal(calls(log, 'vanish'), 1, 'the call reached the server');
+});
+
+test('failures are classified in order: nothing sent first, then the answers, then an HTTP refusal', () => {
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern' });
+  const classify = (record: Record<string, unknown>, error: unknown, method = 'tools/call') =>
+    (connection as unknown as {
+      requestFailure: (what: string, record: unknown, error: unknown, timeoutMs?: number) => Error;
+    }).requestFailure(method === 'tools/list' ? 'tools/list' : 'tools/call "op"', { method, handedOff: true, answer: 'none', continued: false, ...record }, error, 1000);
+  const refused = () => new SdkHttpError(SdkErrorCode.ClientHttpAuthentication, 'Unauthorized', { status: 401 } as never);
+  const outcome = (error: Error) => (error instanceof McplRequestError ? error.outcome : 'plain');
+
+  const unsent = classify({ handedOff: false }, refused());
+  assert.equal(outcome(unsent), 'not-sent', 'a refusal before anything was handed off');
+
+  const first = classify({}, refused());
+  assert.equal(outcome(first), 'error-response');
+  assert.equal(((first as McplRequestError).data as { httpStatus?: number }).httpStatus, 401);
+
+  const later = classify({ continued: true }, refused());
+  assert.equal(outcome(later), 'no-response', 'after an earlier leg asked for another round');
+  assert.match(later.message, /asked for another round \(input_required\), and the server refused a later one: HTTP 401/);
+
+  const listing = classify({}, new SdkError(SdkErrorCode.RequestTimeout, 'Request timed out'), 'tools/list');
+  assert.equal(outcome(listing), 'no-response');
+  assert.match(listing.message, /did not answer tools\/list within 1000ms\. Cancellation was requested; the list did not arrive in time\. Listing changes nothing on the server, so it is safe to retry\./);
+  assert.doesNotMatch(listing.message, /side-effecting/);
+});
+
+test('a reconnect backoff never exceeds the timer limit', () => {
+  const connection = ModernMcpConnection.create({
+    id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern',
+    reconnect: true, reconnectIntervalMs: MAX_TIMER_MS, reconnectMaxIntervalMs: MAX_TIMER_MS,
+  });
+  const backoff = (connection as unknown as { backoffDelay: (failures: number) => number }).backoffDelay.bind(connection);
+  const random = Math.random;
+  Math.random = () => 0.999; // the jitter's top end
+  try {
+    assert.equal(backoff(1), MAX_TIMER_MS);
+    assert.equal(backoff(30), MAX_TIMER_MS);
+  } finally {
+    Math.random = random;
+  }
+});
+
+test('a new generation backs off its first reopen from the base interval', async () => {
+  const log = scratchLog();
+  const connection = await connect('listen-fail-first', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60_000 });
+  const internals = connection as unknown as {
+    relistenAttempts: number;
+    generation: number;
+    scheduleRelisten: (generation: number) => void;
+  };
+  // The previous generation had failed to reopen many times.
+  internals.relistenAttempts = 9;
+  const seen: Array<{ generation: number; attempts: number }> = [];
+  const schedule = internals.scheduleRelisten.bind(connection);
+  internals.scheduleRelisten = (generation: number) => {
+    seen.push({ generation, attempts: internals.relistenAttempts });
+    schedule(generation);
+  };
+  let reconnected = false;
+  connection.on('reconnect', () => { reconnected = true; });
+  await connection.callTool('die', {});
+  await until(() => reconnected, 'reconnect');
+  // Launch 2 refuses its first listen, so the new generation schedules a reopen.
+  await until(() => seen.some((s) => s.generation === internals.generation), 'the new generation scheduling its reopen');
+  assert.equal(seen.find((s) => s.generation === internals.generation)!.attempts, 0);
+});
+
+test('a server that shares no revision with this client is a configuration verdict: no retry', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({
+    id: 'raw', command: process.execPath, args: [SERVER, 'other-revision', log], protocol: 'modern',
+    reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60,
+  });
+  cleanups.push(() => connection.close());
+  await assert.rejects(connection.start(), (err: unknown) => {
+    assert.ok(err instanceof McplProtocolVersionError, String(err));
+    assert.equal(err.kind, 'rejected');
+    assert.equal(err.offered, '2026-07-28');
+    assert.deepEqual(err.supported, ['2099-01-01']);
+    assert.match(err.message, /MCP server "raw" does not support MCP 2026-07-28 \(it supports: 2099-01-01\)\./);
+    return true;
+  });
+  assert.equal(connection.willReconnect, false, 'nothing will retry it');
+  assert.equal((connection as unknown as { reconnectTimer: unknown }).reconnectTimer, null);
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1);
+});
+
+test('a legacy-only server is pointed to what reaches it: its configuration over stdio, stdio or WebSocket for an http url', () => {
+  const refusal = new UnsupportedProtocolVersionError({ supported: ['2024-11-05'], requested: '2026-07-28' });
+  const verdictFor = (config: Parameters<typeof ModernMcpConnection.create>[0]) =>
+    (ModernMcpConnection.create(config) as unknown as { versionVerdict: (error: unknown) => McplProtocolVersionError | null }).versionVerdict(refusal)!;
+  const stdio = verdictFor({ id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern' });
+  assert.match(stdio.message, /\(it supports: 2024-11-05\)\. It speaks legacy MCP: configure it without protocol: 'modern'\.$/);
+  const http = verdictFor({ id: 'remote', url: 'http://127.0.0.1:1/mcp' });
+  assert.match(http.message, /\(it supports: 2024-11-05\)\. It speaks only legacy MCP, which this client reaches over stdio or WebSocket \(ws:\/\/, wss:\/\/\), not http\(s\)\.$/);
+  assert.doesNotMatch(http.message, /protocol: 'modern'/);
+});
+
+test('a reconnect that meets a revision the client does not share stops for good', async () => {
+  const log = scratchLog();
+  const connection = await connect('other-revision-later', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
+  const failures: Array<{ error: string; permanent?: boolean }> = [];
+  connection.on('reconnect-failed', (f) => failures.push(f));
+  await connection.callTool('die', {});
+  await until(() => failures.length > 0, 'the reconnect failing');
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0]!.permanent, true);
+  assert.match(failures[0]!.error, /does not support MCP 2026-07-28 \(it supports: 2099-01-01\)/);
+  assert.equal(connection.willReconnect, false);
+  assert.equal((connection as unknown as { reconnectTimer: unknown }).reconnectTimer, null, 'no further attempt scheduled');
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 2);
+});
+
+test('close() during a connect waits for that connect\'s own cleanup, and reports what it could not reap', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'hang-discover', log], protocol: 'modern' });
+  connection.on('error', () => {});
+  const statics = ModernMcpConnection as unknown as { closeSession: (session: unknown) => Promise<Error | null> };
+  const real = statics.closeSession;
+  let closes = 0;
+  // close() closes the generation first; the connect's own cleanup closes it
+  // again, and that second close is the one that can't confirm the exit.
+  statics.closeSession = async (session: unknown) => {
+    const verdict = await real.call(ModernMcpConnection, session);
+    return ++closes === 2 ? new Error('the child could not be confirmed gone (simulated)') : verdict;
+  };
+  cleanups.push(() => { statics.closeSession = real; });
+  const starting = connection.start();
+  await until(() => wire(log).some((e) => e.method === 'server/discover'), 'the launch waiting on discover');
+  await assert.rejects(connection.close(), /did not close cleanly: the child could not be confirmed gone \(simulated\)/);
+  assert.equal(closes, 2, 'close() resolved only after the connect\'s own cleanup');
+  await starting;
+  statics.closeSession = real;
+  await connection.close();
 });
