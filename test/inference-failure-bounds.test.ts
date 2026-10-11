@@ -665,9 +665,12 @@ function foreignMembraneError(message: string, type = 'invalid_request'): Error 
   });
 }
 
-test('a MembraneError from another copy of membrane is classified by its name', async () => {
+test('a MembraneError from another copy of membrane is recognised by its name', async () => {
   const quoted = `Bad request. Request: ... Context would exceed hard budget ... ${echo(10_000)}`;
-  const { markers, traces, errs, rawArgs } = await runFailingTurn('stream throws', () => foreignMembraneError(quoted), { errorPolicy: noRetry });
+  // The default error policy, which a stream's error event consults: a
+  // non-retryable error fails at once, not after three retries.
+  const { markers, traces, errs, rawArgs, calls } = await runFailingTurn('stream error event', () => foreignMembraneError(quoted));
+  assert.equal(calls, 1, 'not retried');
   assert.match((markers[0].content[0] as { text: string }).text, /model call failed \(invalid_request, HTTP 400\)/);
   assert.equal((markers[0].metadata as { errorType: string }).errorType, 'invalid_request');
   // Classified, so the quoted phrase is the provider's text, not a refused compile.
@@ -682,6 +685,23 @@ test('a MembraneError from another copy of membrane is classified by its name', 
   assert.ok((odd.markers[0].metadata as { errorType: string }).errorType.length <= 128);
   const line = odd.errs.find((e) => e.startsWith('[inference-failed] agent=resident'))!;
   assert.ok(line.length < 2_500, `stderr line is ${line.length} chars`);
+
+  // The organization acceleration limit is recognised too, and held.
+  const harness = makeHarness();
+  Object.assign(harness.fw, {
+    ephemeralRuns: new Map(), conversationAgentHomes: new Map(), providerGates: new Map(),
+    providerAccelerationCooldowns: new Map(), providerAccelerationRecoveries: new Map(),
+    providerAccelerationDefaultCooldownMs: 30_000, providerAccelerationJitterMs: 0,
+  });
+  const limited = Object.assign(new Error('Your organization has hit its acceleration limit.'), {
+    name: 'MembraneError', type: 'rate_limit', retryable: true, httpStatus: 429,
+  });
+  try {
+    assert.equal(harness.fw.holdProviderAcceleration(harness.fw.agents.get('cairn'), limited), true);
+  } finally {
+    harness.fw.cancelProviderAdmission();
+    harness.restore();
+  }
 });
 
 test('an ephemeral run rejects with the bounded failure text', async () => {

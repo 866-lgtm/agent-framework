@@ -751,11 +751,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
   maxRetries = 3;
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (error instanceof MembraneError && !error.retryable) {
+    if (isMembraneError(error) && error.retryable === false) {
       return { retry: false };
     }
     if (attempt < this.maxRetries) {
-      const delayMs = error instanceof MembraneError && error.retryAfterMs !== undefined
+      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
         ? error.retryAfterMs
         : Math.pow(2, attempt) * 1000;
       return { retry: true, delayMs };
@@ -816,8 +816,19 @@ interface ProviderAccelerationReceipt {
 const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
+/**
+ * A MembraneError, from this framework's copy of membrane or from another: the
+ * host supplies the Membrane instance (config.membrane), so with two copies
+ * installed its errors are instances of a class this framework's `instanceof`
+ * doesn't match. Recognised by name as well, as context-manager's errors are;
+ * its fields are the same, so callers still check each one's type.
+ */
+function isMembraneError(error: unknown): error is MembraneError {
+  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
+}
+
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
-  if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
+  if (!isMembraneError(error) || error.type !== 'rate_limit') return false;
   return (
     /organization(?:'s)?[^\n]{0,120}maximum(?:\s+usage)?\s+increase\s+rate/i.test(error.message) ||
     /organization(?:'s)?[^\n]{0,120}acceleration(?:\s+limit)?/i.test(error.message)
@@ -12895,12 +12906,10 @@ export class AgentFramework {
   private classifyInferenceError(err: Error): {
     retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
   } {
-    // By name too, as below: the host supplies the Membrane instance
-    // (config.membrane), so its errors can come from another copy of the
-    // package, whose class this instanceof doesn't match. The fields are read
-    // as data, and the type is bounded like describeFailure's, for every sink
-    // the classification reaches (the trace, the marker, the logs).
-    if (err instanceof MembraneError || err.name === 'MembraneError') {
+    // From either copy of membrane (isMembraneError). The fields are read as
+    // data, and the type is bounded like describeFailure's, for every sink the
+    // classification reaches (the trace, the marker, the logs).
+    if (isMembraneError(err)) {
       const fields = err as Error & {
         retryable?: unknown; type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown;
       };
