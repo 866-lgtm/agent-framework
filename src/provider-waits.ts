@@ -63,7 +63,10 @@ interface ProviderWaitSnapshot {
  * ends at `now`: it is already over, never indefinite.
  */
 export function waitDeadline(retryAfterMs: unknown, now: number): number | null {
-  if (typeof retryAfterMs !== 'number' || !Number.isFinite(retryAfterMs)) return null;
+  if (typeof retryAfterMs !== 'number' || Number.isNaN(retryAfterMs)) return null;
+  // Over before it can't be represented: -Infinity is as negative as any.
+  if (retryAfterMs <= 0) return Math.ceil(now);
+  if (!Number.isFinite(retryAfterMs)) return null;
   const until = Math.ceil(now + Math.max(0, retryAfterMs));
   if (!Number.isSafeInteger(until) || until > MAX_DATE_MS) return null;
   return until;
@@ -92,9 +95,11 @@ function reduce(waits: Map<string, ProviderWait>, entry: ProviderWaitEntry): voi
 }
 
 export interface ProviderWaitChange {
-  /** The binding wait after this call. */
+  /** The binding wait after this call; for a wait already over with nothing
+   *  binding, that wait as stated, which binds nothing and isn't recorded. */
   wait: ProviderWait;
-  /** False when an outstanding longer (or indefinite) wait already binds. */
+  /** False when an outstanding longer (or indefinite) wait already binds, or
+   *  when the wait is already over and nothing binds. */
   changed: boolean;
 }
 
@@ -268,6 +273,12 @@ export class ProviderWaits {
     this.reconcile();
     const entry: ProviderWaitEntry = { kind: 'set', agent, model, until: waitDeadline(retryAfterMs, at), reason, at };
     const before = live(this.view.get(keyOf(agent, model)), at);
+    // A wait already over (0, or a "retry now") binds nothing: with nothing
+    // binding either, there is nothing to record.
+    if (before === undefined && entry.until !== null && entry.until <= at) {
+      this.flush();
+      return { wait: { agent, model, until: entry.until, reason, setAt: at }, changed: false };
+    }
     const changed = before === undefined || outlasts(entry.until, before.until);
     if (changed) this.apply(entry);
     // An unchanged binding is not proof it was recorded: offer what is pending.

@@ -40,7 +40,7 @@ describe('waitDeadline', () => {
   });
 
   it('is null (held until released) for a wait it cannot represent', () => {
-    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1e20, '60', undefined]) {
+    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, 1e20, '60', undefined]) {
       assert.equal(waitDeadline(unusable, 1_000), null, String(unusable));
     }
     assert.equal(waitDeadline(8.64e15 - 1_000, 1_000), 8.64e15, 'the last representable instant');
@@ -48,7 +48,8 @@ describe('waitDeadline', () => {
   });
 
   it('is the moment it was stated for a negative wait: already over, never held (PR #251 review)', () => {
-    for (const negative of [-1, -1_000, -0.4, -0, -1e20, -Number.MAX_VALUE]) {
+    // -Infinity too: as negative as any, so over, never held (sw-af251 I18).
+    for (const negative of [-1, -1_000, -0.4, -0, -1e20, -Number.MAX_VALUE, Number.NEGATIVE_INFINITY]) {
       assert.equal(waitDeadline(negative, 1_000), 1_000, String(negative));
     }
   });
@@ -158,10 +159,12 @@ describe('ProviderWaits', () => {
     let store = JsStore.openOrCreate({ path });
     try {
       const waits = new ProviderWaits(store, { now: time.now, ...quiet });
-      for (const stated of [-1, -1_000]) {
-        waits.set('ada', 'zz-model', stated, `retry now (${stated})`);
+      for (const stated of [-1, -1_000, 0]) {
+        const set = waits.set('ada', 'zz-model', stated, `retry now (${stated})`);
+        assert.equal(set.changed, false, `${stated} records nothing (sw-af251 I32)`);
         assert.equal(waits.active('ada', 'zz-model'), undefined, `${stated} binds nothing`);
       }
+      assert.equal(store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length, 0, 'no record for a wait already over');
       waits.set('ada', 'zz-held', 600_000, 'long');
       const after = waits.set('ada', 'zz-held', -1, 'retry now');
       assert.equal(after.changed, false);
@@ -612,6 +615,57 @@ test('a stated wait past the framework cap is honoured in full, until an operato
   });
 });
 
+test("a non-retryable failure worded as organization acceleration keeps its terminal disposition (sw-af251 I40)", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 400);
+    const refuse = (request: NormalizedRequest) => new MembraneError({
+      type: 'rate_limit', retryable: false, httpStatus: 429, retryAfterMs: 400,
+      // Worded as framework.ts's isOrganizationAccelerationRateLimit reads one.
+      message: 'zz your organization acceleration limit was reached', rawError: { status: 429 }, rawRequest: request,
+    });
+    const stream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request: NormalizedRequest) => {
+      if (membrane.primary === 0) { membrane.calls.push(request); membrane.primary++; return new ErrorStream(refuse(request)); }
+      return stream(request);
+    };
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const markers = fw.getAgent('resident')!.getContextManager().queryMessages({}).messages
+        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
+      assert.equal(markers.length, 1, 'terminal: its marker is written');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'not retained for retry');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('a turn arriving at a recorded wait is held without counting a failure (sw-af251 I41)', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 60_000);
+    let opened = await framework(path, membrane);
+    const failures = (internal: typeof opened.internal) =>
+      (internal.providerAccelerationCooldowns.get('resident') as { failures?: number } | undefined)?.failures;
+    try {
+      opened.fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await opened.fw.runUntilIdle();
+      assert.equal(failures(opened.internal), 1, 'the failed call counts once');
+    } finally { await opened.fw.stop(); }
+
+    // After a restart, the recorded wait holds the next turn at admission:
+    // no call failed in this process.
+    opened = await framework(path, membrane);
+    try {
+      opened.fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-after restart', metadata: {} });
+      await opened.fw.runUntilIdle();
+      assert.equal(membrane.primary, 1, 'held, not called');
+      assert.equal(failures(opened.internal), 0, 'an arrival at the hold is not a failure');
+    } finally { await opened.fw.stop(); log.restore(); }
+  });
+});
+
 test('auxiliary admission: the same model is refused without a call; another model proceeds', async () => {
   await withStoreDir(async (path) => {
     const log = silence();
@@ -690,7 +744,8 @@ test('a restart honours the wait, even after a switch to a branch from before it
   });
 });
 
-test('a retry policy delay past one timer is waited in full, and stop() ends the wait', async () => {
+for (const [delay, label] of [[3_000_000_000, 'a 34-day delay'], [Number.POSITIVE_INFINITY, 'an infinite delay (sw-af251 I39)']] as const) {
+test(`a retry policy delay past one timer is waited in full, and stop() ends the wait: ${label}`, async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     // A non-membrane error keeps provider admission out of it: only the policy decides.
@@ -707,7 +762,7 @@ test('a retry policy delay past one timer is waited in full, and stop() ends the
       modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       errorPolicy: {
         maxRetries: 2,
-        onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 2 ? { retry: true, delayMs: 3_000_000_000 } : { retry: false }),
+        onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 2 ? { retry: true, delayMs: delay } : { retry: false }),
       },
     });
     let stopped = false;
@@ -719,7 +774,7 @@ test('a retry policy delay past one timer is waited in full, and stop() ends the
       const asleep = fw as unknown as { retryWaitWakers: Set<unknown> };
       for (let i = 0; i < 500 && asleep.retryWaitWakers.size === 0; i++) await sleep(10);
       assert.equal(asleep.retryWaitWakers.size, 1, 'asleep in the retry wait');
-      assert.equal(membrane.primary, 1, 'a 34-day delay does not fire almost at once');
+      assert.equal(membrane.primary, 1, `${label} does not fire almost at once`);
       const stopping = fw.stop();
       await Promise.race([stopping, sleep(5_000).then(() => { throw new Error('stop() did not end the wait'); })]);
       stopped = true;
@@ -731,6 +786,7 @@ test('a retry policy delay past one timer is waited in full, and stop() ends the
     }
   });
 });
+}
 
 /** The longest delay one setTimeout holds (2^31 - 1 ms, about 24.8 days). */
 const ONE_TIMER_MS = 2_147_483_647;
@@ -988,6 +1044,28 @@ test('a hold for unreadable records ends by itself once they read again: its own
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'the held turn runs once the records read again');
       assert.equal(internal.providerAccelerationCooldowns.size, 0);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('an auxiliary call naming no model is held by the unreadable-records hold, and only by it (sw-af251 I22)', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 60_000);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle(); // a wait is recorded for the primary model
+      const aux = internal.auxiliaryMembraneFor('resident');
+      const unnamed = { messages: auxRequest('x').messages, config: { maxTokens: 16 } };
+      await aux.complete(unnamed as never);
+      assert.equal(membrane.auxiliary.length, 1, "a recorded model's wait can't be matched to a call naming no model");
+
+      unreadableWaits(internal);
+      const refused = await aux.complete(unnamed as never).then(() => undefined, (e: unknown) => e);
+      assert.ok(refused instanceof MembraneError, 'the hold that stands for unreadable records binds it');
+      assert.match(refused.message, /\* is held for resident/);
+      assert.equal(membrane.auxiliary.length, 1, 'the provider was not called');
     } finally { await fw.stop(); log.restore(); }
   });
 });
