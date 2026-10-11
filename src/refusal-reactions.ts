@@ -1,17 +1,20 @@
 /**
  * Refusal-reaction markers — the single source of truth for the emoji the
  * framework places on a message when inference is refused (see
- * AgentFramework.reactToRefusal), exported so host composition can derive
- * a protective suppression baseline from the exact set the framework emits.
+ * AgentFramework.reactToRefusal).
  *
  * These annotations are placed by the framework on the resident's account
  * and must never re-enter a resident's context as reaction events — that is
  * the self-amplifying loop behind the 8/3 Mythos incident. The Discord
- * adapter suppresses them when its operator config or the host-injected
- * `DISCORD_SUPPRESSED_REACTIONS_BASELINE` names them; keeping the emitted
- * set and the exported baseline as one constant is what makes drift between
- * "what we stamp" and "what we suppress" structurally impossible, rather
- * than a promise kept in two files.
+ * adapter suppresses them when its operator config or
+ * `DISCORD_SUPPRESSED_REACTIONS_BASELINE` names them. That variable's
+ * protective default, which the framework injects into stdio children, is
+ * `framework.getPlacedReactionBaseline()` on an instance: these refusal
+ * markers plus the awareness markers. REFUSAL_REACTION_BASELINE below is the
+ * refusal set only. Keeping the emitted refusal set and the exported one as
+ * one constant is what makes drift between "what we stamp" and "what we
+ * suppress" structurally impossible, rather than a promise kept in two
+ * files.
  */
 
 /** Refusal category → Discord reaction emoji. Unknown categories get the
@@ -30,7 +33,7 @@ export const REFUSAL_REACTION_FALLBACK = '🛑';
 /** Every refusal marker the framework can emit: the category map plus the
  *  fallback, deduplicated in stable declaration order. For the deployment's
  *  complete protective default, including awareness markers, use
- *  AgentFramework.getPlacedReactionBaseline(). */
+ *  `framework.getPlacedReactionBaseline()` on an instance. */
 export const REFUSAL_REACTION_BASELINE: readonly string[] = [
   ...new Set([...Object.values(REFUSAL_REACTIONS), REFUSAL_REACTION_FALLBACK]),
 ];

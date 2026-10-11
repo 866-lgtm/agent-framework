@@ -15,6 +15,9 @@ rl.on('line', (line) => {
     });
   } else if (msg.method === 'tools/list') {
     reply(msg.id, { tools: [{ name: 'read_env', description: 'Read fixture environment', inputSchema: { type: 'object', properties: {} } }] });
+  } else if (msg.method === 'tools/call' && msg.params?.name === 'crash') {
+    // Stands in for a child that dies, so a reconnecting host respawns it.
+    process.exit(3);
   } else if (msg.method === 'tools/call') {
     reply(msg.id, { content: [{ type: 'text', text: JSON.stringify({
       baseline: process.env.DISCORD_SUPPRESSED_REACTIONS_BASELINE,

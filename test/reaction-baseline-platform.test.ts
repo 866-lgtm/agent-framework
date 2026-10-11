@@ -2,8 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
+import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 
 const KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
+/** The framework's protective default for the stub below (awareness emoji 🔕, no ledger). */
+const DEFAULT = [...REFUSAL_REACTION_BASELINE, '💤', '🔕'].join(',');
 
 /** Exercise the real default-injection boundary, intercepting immediately
  * before connection/spawn. Platform/env overrides are synchronous and restored
@@ -53,13 +56,15 @@ async function connectionEnv(
 
 for (const inheritEnv of [false, true]) {
   test('Windows reaction baseline honors declared case variants, inheritEnv=' + inheritEnv, async () => {
+    // A blank value counts as unset: where the spelling Node's spawn keeps is
+    // blank, the child gets the protective default.
     const cases: Array<{ env: Record<string, string>; expected: string }> = [
-      { env: { [KEY.toLowerCase()]: '' }, expected: '' },
+      { env: { [KEY.toLowerCase()]: '' }, expected: DEFAULT },
       { env: { Discord_Suppressed_Reactions_Baseline: '🟪' }, expected: '🟪' },
       { env: { [KEY]: 'upper', [KEY.toLowerCase()]: '' }, expected: 'upper' },
       { env: { [KEY.toLowerCase()]: '', [KEY]: 'upper' }, expected: 'upper' },
-      { env: { [KEY]: '', [KEY.toLowerCase()]: 'lower' }, expected: '' },
-      { env: { [KEY.toLowerCase()]: 'lower', [KEY]: '' }, expected: '' },
+      { env: { [KEY]: '', [KEY.toLowerCase()]: 'lower' }, expected: DEFAULT },
+      { env: { [KEY.toLowerCase()]: 'lower', [KEY]: '' }, expected: DEFAULT },
     ];
     for (const { env, expected } of cases) {
       const composed = await connectionEnv('win32', env, inheritEnv);
@@ -74,13 +79,15 @@ for (const inheritEnv of [false, true]) {
 
 test('Windows inherited-only baseline lookup handles case-sensitive worker env copies', async () => {
   for (const value of ['', '🟪']) {
+    // A blank inherited value counts as unset, like a blank declared one.
+    const kept = value === '' ? DEFAULT : value;
     const cases: Array<{ parent: NodeJS.ProcessEnv; expected: string }> = [
-      { parent: { [KEY.toLowerCase()]: value }, expected: value },
-      { parent: { Discord_Suppressed_Reactions_Baseline: value }, expected: value },
+      { parent: { [KEY.toLowerCase()]: value }, expected: kept },
+      { parent: { Discord_Suppressed_Reactions_Baseline: value }, expected: kept },
       { parent: { [KEY]: 'upper', [KEY.toLowerCase()]: value }, expected: 'upper' },
       { parent: { [KEY.toLowerCase()]: value, [KEY]: 'upper' }, expected: 'upper' },
-      { parent: { [KEY]: value, [KEY.toLowerCase()]: 'lower' }, expected: value },
-      { parent: { [KEY.toLowerCase()]: 'lower', [KEY]: value }, expected: value },
+      { parent: { [KEY]: value, [KEY.toLowerCase()]: 'lower' }, expected: kept },
+      { parent: { [KEY.toLowerCase()]: 'lower', [KEY]: value }, expected: kept },
     ];
     for (const { parent, expected } of cases) {
       const composed = await connectionEnv('win32', {}, true, parent);
@@ -94,7 +101,7 @@ test('Windows chooses duplicate spellings within each source, then declared over
   const composed = await connectionEnv('win32', { [KEY.toLowerCase()]: '', [KEY]: 'declared-upper' }, true, parent);
   assert.equal(composed[KEY], 'declared-upper');
   const singleDeclared = await connectionEnv('win32', { [KEY.toLowerCase()]: '' }, true, parent);
-  assert.equal(singleDeclared[KEY], '', 'declared lowercase empty defeats inherited uppercase');
+  assert.equal(singleDeclared[KEY], 'host-upper', 'a blank declared value is unset, so the inherited choice stands');
 });
 
 test('inherited-only baseline lookup remains opt-in and POSIX case-sensitive', async () => {
@@ -103,7 +110,7 @@ test('inherited-only baseline lookup remains opt-in and POSIX case-sensitive', a
     assert.ok(composed[KEY]!.split(',').includes('💤'));
   }
   const explicitPosix = await connectionEnv('linux', {}, true, { [KEY]: '' });
-  assert.equal(explicitPosix[KEY], '');
+  assert.equal(explicitPosix[KEY], DEFAULT, 'a blank inherited value is unset');
 });
 
 test('explicit WebSocket selection leaves its env alone even when a command is also present', async () => {

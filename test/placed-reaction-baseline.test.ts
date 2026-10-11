@@ -152,7 +152,7 @@ describe('placed-reaction baseline', () => {
     assert.ok((await childEnv(fw)).baseline?.split(',').includes('👁️'), 'restart recomputes a default rather than retaining it as an explicit override');
   });
 
-  for (const value of ['🟪', '', '<:operator_choice:123456789012345678>']) {
+  for (const value of ['🟪', '<:operator_choice:123456789012345678>']) {
     it('preserves an explicit server baseline ' + JSON.stringify(value), async () => {
       const fw = await create(undefined, [server({ env: { [ENV_KEY]: value } })]);
       assert.equal((await childEnv(fw)).baseline, value);
@@ -172,17 +172,101 @@ describe('placed-reaction baseline', () => {
 
   it('does not use an unrequested parent override; explicit server env wins over inheritance', async (t) => {
     const previous = process.env[ENV_KEY];
-    process.env[ENV_KEY] = '';
+    process.env[ENV_KEY] = '🟥';
     t.after(() => {
       if (previous === undefined) delete process.env[ENV_KEY];
       else process.env[ENV_KEY] = previous;
     });
     const fw = await create(undefined, [server()]);
-    assert.equal((await childEnv(fw)).baseline, baseline(fw).join(','));
+    // The literal default, not the function under test's own report.
+    assert.equal((await childEnv(fw)).baseline, [...REFUSAL_REACTION_BASELINE, '💤'].join(','));
     await fw.disconnectMcplServer('probe');
     await fw.connectMcplServer(server({ inheritEnv: true, env: { [ENV_KEY]: '🟪' } }));
     assert.equal((await childEnv(fw)).baseline, '🟪');
   });
+
+  for (const blank of ['', '  ']) {
+    it('a blank baseline, declared or inherited, counts as unset ' + JSON.stringify(blank), async (t) => {
+      // The adapter reads an empty value as "no tokens": a blank inherited
+      // variable would otherwise turn the protective default off.
+      const previous = process.env[ENV_KEY];
+      process.env[ENV_KEY] = blank;
+      t.after(() => {
+        if (previous === undefined) delete process.env[ENV_KEY];
+        else process.env[ENV_KEY] = previous;
+      });
+      const expected = [...REFUSAL_REACTION_BASELINE, '💤'].join(',');
+      const fw = await create(undefined, [server({ env: { [ENV_KEY]: blank } })]);
+      assert.equal((await childEnv(fw)).baseline, expected, 'declared');
+      await fw.disconnectMcplServer('probe');
+      await fw.connectMcplServer(server({ inheritEnv: true }));
+      assert.equal((await childEnv(fw)).baseline, expected, 'inherited');
+    });
+  }
+
+  it("says at connect when an operator's value replaces the protective default", async (t) => {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    t.after(() => { console.error = original; });
+    const fw = await create(undefined, [server({ env: { [ENV_KEY]: '🟪' } })]);
+    console.error = original;
+    assert.ok(lines.some((line) => line.includes('[mcpl] probe: DISCORD_SUPPRESSED_REACTIONS_BASELINE from its env replaces the framework') ), lines.join('\n'));
+    assert.equal((await childEnv(fw)).baseline, '🟪');
+  });
+
+  it('a reconnect respawns the child with a default derived at that spawn', async () => {
+    const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
+    assert.equal((await childEnv(fw)).baseline?.split(',').includes('🫥'), false);
+    retain('🫥');
+    const registry = (fw as unknown as {
+      mcplServerRegistry: { getServer(id: string): { sendToolsCall(name: string, args: {}): Promise<unknown> } };
+    }).mcplServerRegistry;
+    await registry.getServer('probe').sendToolsCall('crash', {}).catch(() => {});
+    let env: { baseline?: string } | undefined;
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      env = await childEnv(fw).catch(() => undefined);
+      if (env) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(env, 'the child came back');
+    assert.ok(env.baseline?.split(',').includes('🫥'), `the respawned child has the marker retained since: ${env.baseline}`);
+  });
+
+  it('a restart that needs the default refuses on a corrupt ledger and leaves the child up', async () => {
+    const fw = await create(undefined, [server()]);
+    writeFileSync(outboxPath, '{broken');
+    await assert.rejects(() => fw.restartMcplServer('probe'), /Discord awareness.*ledger/i);
+    assert.ok(await childEnv(fw), 'the running child still answers');
+  });
+
+  it('passes a URL-only WebSocket config through unchanged', async () => {
+    const fw = await create();
+    // Bring up the MCPL subsystem as a first runtime connect does.
+    await (fw as unknown as { initializeMcpl(servers: McplServerConfig[]): Promise<void> }).initializeMcpl([]);
+    let added: unknown;
+    const registry = (fw as unknown as { mcplServerRegistry: { addServer(config: unknown): Promise<unknown> } }).mcplServerRegistry;
+    registry.addServer = async (config: unknown) => { added = config; throw new Error('stop before connecting'); };
+    const config: McplServerConfig = { id: 'remote', url: 'ws://127.0.0.1:1' };
+    await assert.rejects(() => fw.connectMcplServer(config), /stop before connecting/);
+    assert.equal(added, config, 'the same object');
+    assert.equal(config.env, undefined, 'no env added');
+  });
+
+  for (const [marker, converted] of [
+    [`<:mark:${'1'.repeat(16)}>`, false],
+    [`<:mark:${'1'.repeat(17)}>`, true],
+    [`mark:${'2'.repeat(20)}`, true],
+    [`<:mark:${'3'.repeat(21)}>`, false],
+    ['a:b:1', false],
+  ] as const) {
+    it(`a custom marker ${marker} is ${converted ? '' : 'not '}reduced to its ID`, async () => {
+      const fw = await create(marker);
+      const id = /(\d+)>?$/.exec(marker)![1];
+      assert.equal(baseline(fw).at(-1), converted ? id : marker);
+    });
+  }
 
   it('fails explicitly on a corrupt retained ledger rather than deriving an incomplete default', async () => {
     const fw = await create(undefined, [server()]);
