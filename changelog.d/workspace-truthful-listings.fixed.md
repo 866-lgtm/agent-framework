@@ -53,8 +53,9 @@
   disk copy matching neither outcome is an `interrupted` conflict), and a workspace write or
   deletion that shows on disk without proof it is durable is completed only by the next
   `materialize`, which redoes it. This replaces #109's stop-time baselines and refused paths,
-  which an abrupt exit or a branch switch could lose or rewind; a store that saved them imports
-  its baselines once.
+  which an abrupt exit or a branch switch could lose or rewind. A store that saved them doesn't
+  import them, since they name no root: its first pass records each file disk agrees with, and
+  lists any other as a conflict or of unknown provenance.
 - **`watch: 'on-agent-action'` works as documented:** after each completed tool batch, before
   anything continues the agent's turn, the mount is scanned. A scan that outlasts
   `agentActionScanDeadlineMs` stops holding the round and continues in the background; the miss

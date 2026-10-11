@@ -816,20 +816,13 @@ export class WorkspaceModule implements Module {
       if (mount) {
         mount.lastMaterializedSeq = meta.lastMaterializedSeq;
         mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
-        // A store that ran the stop-time freshness baselines (#109): carry
-        // them over as disk-agreement evidence wherever the journal has none.
-        // Its refused paths need nothing — they are re-observed as conflicts.
-        if (this.agreement && meta.materializedHashes) {
-          let imported = false;
-          for (const [path, hash] of Object.entries(meta.materializedHashes)) {
-            if (this.agreement.get(name, path) === undefined) {
-              this.agreement.set(name, path, { kind: 'content', hash, size: -1 });
-              imported = true;
-            }
-          }
-          // The next stop() saves module state without them: durable first.
-          if (imported) this.agreement.barrier();
-        }
+        // A store that ran #169's stop-time baselines (#109) saved them here
+        // too. They aren't carried over as evidence: #169 recorded no root,
+        // so nothing binds them to the directory they describe, and an empty
+        // mountpoint at the next start would read as every file deleted.
+        // Such a store gains its evidence from its first pass instead: a
+        // file disk agrees with is recorded, and anything else is a conflict
+        // or unknown provenance, never an adoption.
         // watcherReadyAt intentionally not restored — each session must
         // observe its own watcher attach, otherwise a stale timestamp
         // would hide a new-session attach failure.

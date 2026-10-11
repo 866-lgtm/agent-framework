@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -70,6 +71,20 @@ class Env {
     await m.start({
       isRestart: false,
       getState: () => null,
+      setState: () => {},
+      pushEvent: (e: ProcessEvent) => this.events.push(e),
+    } as unknown as ModuleContext);
+    this.live.push(m);
+    return m;
+  }
+
+  /** Start a module as a restart that finds `state` saved as its module state. */
+  async openRestarted(state: unknown, mount: Partial<MountConfig> = {}): Promise<WorkspaceModule> {
+    const m = new WorkspaceModule({ mounts: [{ name: 'work', path: this.dir, mode: 'read-write', watch: 'never', ...mount }] });
+    m.initStore(this.store);
+    await m.start({
+      isRestart: true,
+      getState: () => state,
       setState: () => {},
       pushEvent: (e: ProcessEvent) => this.events.push(e),
     } as unknown as ModuleContext);
@@ -1240,6 +1255,34 @@ describe('restarts and faults', () => {
     assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending', 'and completed only by a push');
     await call(m, 'materialize', {});
     assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'content');
+  });
+
+  test("#169's saved baselines aren't evidence: an empty mountpoint at the next start deletes nothing, and agreement records what disk still holds", async (t) => {
+    // A store that ran #169: entries with no disk-agreement evidence, and the
+    // stop-time baselines it saved in module state, which name no root.
+    const env = new Env(t);
+    await env.shutdown(await env.open()); // the mount's tree state exists, as #169 left it
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    env.legacyEntry('a.txt', 'alpha');
+    env.legacyEntry('b.txt', 'beta');
+    const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+    const saved = { mounts: { work: { lastMaterializedSeq: 1, materializedHashes: { 'a.txt': sha('alpha'), 'b.txt': sha('beta') }, refusedPaths: [] } } };
+
+    // The drive isn't mounted yet: its mountpoint is an empty directory.
+    const m = await env.openRestarted(saved);
+    const listed = await listing(m);
+    for (const path of ['a.txt', 'b.txt']) {
+      assert.equal(listed.get(path)?.state, 'disk-missing-provenance-unknown', `${path} is kept, not adopted as a deletion`);
+    }
+    assert.equal(await contentOf(m, 'a.txt'), 'alpha');
+    assert.equal(await contentOf(m, 'b.txt'), 'beta');
+
+    // The drive comes back: what disk agrees with is recorded, root first.
+    env.writeDisk('a.txt', 'alpha');
+    env.writeDisk('b.txt', 'beta, edited in the shell');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced');
+    assert.equal((await entryOf(m, 'b.txt'))?.conflict?.kind, 'unknown-provenance', 'a differing copy is a conflict, never adopted from a baseline');
+    assert.equal(await contentOf(m, 'b.txt'), 'beta');
   });
 
   test('evidence checkpoints and replays; a moved mount root discards it', (t) => {

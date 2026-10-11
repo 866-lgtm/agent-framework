@@ -142,14 +142,6 @@ export interface WorkspaceModuleState {
   mounts: Record<string, {
     lastMaterializedSeq: number;
     lastMaterializedBranchId?: string;
-    /**
-     * Freshness-guard baselines as #169 persisted them at stop. Read once at
-     * start, for stores that ran it, and imported as disk-agreement evidence
-     * where the journal has none; never written.
-     */
-    materializedHashes?: Record<string, string>;
-    /** Read and ignored: conflicts are now branch-local intent records. */
-    refusedPaths?: string[];
     watcherReadyAt?: number | null;
     watcherError?: string | null;
   }>;
