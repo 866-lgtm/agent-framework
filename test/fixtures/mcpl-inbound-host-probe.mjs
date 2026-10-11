@@ -30,7 +30,7 @@ process.stdin.on('data', (chunk) => {
 });
 `;
 const connection = await McplServerConnection.connect({
-  id: 'probe', command: process.execPath, args: ['-e', server, mode], requestTimeoutMs: 1000,
+  id: 'probe', command: process.execPath, args: ['-e', server, mode], requestTimeoutMs: 60_000,
 }, { version: '0.5' });
 try {
   const received = [];

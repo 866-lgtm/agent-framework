@@ -40,10 +40,32 @@ export const CHANNEL_OPEN_FAILED = -32024;
 // Error Factories
 // ============================================================================
 
-/** Response encoding failed before the transport was given any bytes. */
+/** The text of anything thrown or rejected. Never throws, whatever it is: a
+ *  null-prototype object, or a message getter or toString that throws. */
+export function describeCause(cause: unknown): string {
+  try {
+    return cause instanceof Error ? String(cause.message) : String(cause);
+  } catch {
+    try {
+      return Object.prototype.toString.call(cause);
+    } catch {
+      return 'an error that could not be printed';
+    }
+  }
+}
+
+/** Text a server or a handler chose, made fit for one log or trace line:
+ *  control characters replaced, and cut to `max` code points. */
+export function boundedForLog(text: string, max = 200): string {
+  const points = [...text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?')];
+  return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');
+}
+
+/** Response encoding failed before the transport was given any bytes. Its
+ *  message says why (a BigInt, a circular structure, a throwing toJSON). */
 export class McplResponseSerializationError extends Error {
   constructor(cause: unknown) {
-    super('MCPL response could not be serialized', { cause });
+    super(`MCPL response could not be serialized: ${boundedForLog(describeCause(cause))}`, { cause });
     this.name = 'McplResponseSerializationError';
   }
 }

@@ -387,7 +387,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
-import { McplResponseSerializationError } from './mcpl/errors.js';
+import { McplResponseSerializationError, boundedForLog, describeCause } from './mcpl/errors.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -469,6 +469,13 @@ interface DeferredWrite {
   forAgent?: string;
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
+
+/** The reply helpers an MCPL connection hands an inbound request's handler. */
+type InboundResponder = {
+  id: string | number;
+  respond: (result: unknown) => void;
+  respondError: (code: number, message: string, data?: unknown) => void;
+};
 
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
@@ -13690,88 +13697,144 @@ export class AgentFramework {
   }
 
   /**
+   * An inbound MCPL handler, contained: EventEmitter doesn't consume the
+   * promise a listener returns, so this keeps each handler's throw or
+   * rejection at this boundary, including failures after channels/register or
+   * channels/changed has acknowledged the request. It's invoked at once, so
+   * control-plane replies keep their acknowledge-before-reconcile order.
+   */
+  private containedInboundHandler<T>(
+    serverId: string,
+    event: string,
+    handler: (params: T, responder?: InboundResponder) => void | Promise<void>,
+  ): (params: T, responder?: InboundResponder) => void {
+    return (params: T, responder?: InboundResponder) => {
+      // Whether a reply's bytes may have reached the transport. Only an
+      // encoding failure proves none did; a transport exception may have
+      // written part of one, so it can't be retried.
+      let responseAttempted = false;
+      // The first reply write that threw, if any, which a handler may have
+      // swallowed.
+      let writeFailure: unknown;
+      let writeFailed = false;
+      // A write the handler tried after a reply was attempted. It's refused
+      // without throwing, so a handler that answers again in its own catch
+      // and then rethrows reports its own error; what it tried to send is
+      // kept for the report.
+      let refused: { kind: 'result' } | { kind: 'error'; code: number; message: string } | undefined;
+      const writeResponse = (
+        write: () => void,
+        refusedAs: { kind: 'result' } | { kind: 'error'; code: number; message: string },
+      ): void => {
+        if (responseAttempted) {
+          refused ??= refusedAs;
+          return;
+        }
+        responseAttempted = true;
+        try {
+          write();
+        } catch (error) {
+          if (error instanceof McplResponseSerializationError) responseAttempted = false;
+          if (!writeFailed) {
+            writeFailed = true;
+            writeFailure = error;
+          }
+          throw error;
+        }
+      };
+      const tracked = responder && {
+        ...responder,
+        respond: (result: unknown) => writeResponse(() => responder.respond(result), { kind: 'result' }),
+        respondError: (code: number, message: string, data?: unknown) =>
+          writeResponse(() => responder.respondError(code, message, data), {
+            kind: 'error', code, message: boundedForLog(typeof message === 'string' ? message : describeCause(message), 500),
+          }),
+      };
+      // Report a failure: the handler's own error when it threw or
+      // rejected, else the reply write it swallowed, else the reply it
+      // tried to send twice. Nothing in here may throw: on the async path
+      // it runs as a rejection handler, and an exception there would be an
+      // unhandled rejection, which ends the host.
+      const report = (handlerError: { error: unknown } | undefined): void => {
+        try {
+          const primary = handlerError
+            ? handlerError.error
+            : writeFailed ? writeFailure : new Error('the handler tried to answer a second time after its reply');
+          const message = describeCause(primary);
+          // What the handler's own writes did, before any internal-error
+          // reply sent here.
+          const handlerResponseAttempted = responseAttempted;
+          let responseError: string | undefined;
+          if (tracked && !responseAttempted) {
+            // The server gets the standard message, not the handler's own
+            // text, which may name internal paths or errors; the trace and
+            // stderr carry the detail.
+            try {
+              tracked.respondError(-32603, 'Internal error');
+            } catch (sendError) {
+              responseError = describeCause(sendError);
+            }
+          }
+          const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
+            ? describeCause(writeFailure) : undefined;
+          // The trace first: it's built from strings alone, while printing
+          // hands the raw thrown value to util.inspect, which an exotic value
+          // (a Proxy whose traps throw) can make throw.
+          this.emitTrace({
+            type: 'mcpl:request-handler-error',
+            serverId,
+            event,
+            requestId: responder?.id,
+            responseAttempted: handlerResponseAttempted,
+            error: message,
+            ...(responseFailure === undefined ? {} : { responseFailure }),
+            ...(refused === undefined ? {} : { refusedResponse: refused }),
+            ...(responseError === undefined ? {} : { responseError }),
+          });
+          // Keep headless hosts diagnosable even without a trace subscriber.
+          console.error(
+            `[mcpl] ${serverId} ${event} handler failed:`, primary,
+            ...(responseFailure === undefined ? [] : ['| its reply write had failed:', writeFailure]),
+            ...(refused === undefined ? [] : ['| it then tried to answer again:', refused]),
+            ...(responseError === undefined ? [] : ['| the internal-error reply failed too:', responseError]),
+          );
+        } catch (reportError) {
+          try { console.error(`[mcpl] ${serverId} ${event} handler failed, and reporting it failed too:`, reportError); }
+          catch { /* stderr itself is gone */ }
+        }
+      };
+      const failed = (error: unknown): void => report({ error });
+      // A handler may swallow a write failure, or answer twice, and still
+      // resolve.
+      const succeeded = (): void => {
+        if (writeFailed || refused) report(undefined);
+      };
+      try {
+        // Invoke immediately: control-plane responses must retain their
+        // ACK-before-reconcile ordering and data-plane barrier semantics.
+        const result = handler(params, tracked);
+        if (result) void Promise.resolve(result).then(succeeded, failed);
+        else succeeded();
+      } catch (error) {
+        failed(error);
+      }
+    };
+  }
+
+  /**
    * Wire event listeners on an MCPL server connection.
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection): void {
-    type Responder = {
-      id: string | number;
-      respond: (result: unknown) => void;
-      respondError: (code: number, message: string, data?: unknown) => void;
-    };
+    type Responder = InboundResponder;
 
-    // EventEmitter does not consume promises returned by listeners. Keep
-    // each RPC handler's rejection at this boundary, including failures after
-    // channels/register or channels/changed has acknowledged the request.
+    // Every inbound handler, request or notification, is contained
+    // (containedInboundHandler).
     const onRequest = <T>(
       event: string,
       handler: (params: T, responder?: Responder) => void | Promise<void>,
     ): void => {
-      connection.on(event, (params: T, responder?: Responder) => {
-        let responseAttempted = false;
-        let responseFailure: { error: unknown; responseAttempted: boolean } | undefined;
-        const writeResponse = (write: () => void): void => {
-          if (responseAttempted) {
-            // Inner handler catches can try to answer a failed result with
-            // an error. Preserve the first failure and refuse the second write.
-            throw responseFailure ? responseFailure.error : new Error('MCPL response already attempted');
-          }
-          // A throwing transport write may have partially sent the reply.
-          responseAttempted = true;
-          try {
-            write();
-          } catch (error) {
-            // Only the encoder can establish that no write was attempted.
-            // Transport exceptions stay outcome-unknown and cannot be retried.
-            if (error instanceof McplResponseSerializationError) responseAttempted = false;
-            responseFailure = { error, responseAttempted };
-            throw error;
-          }
-        };
-        const tracked = responder && {
-          ...responder,
-          respond: (result: unknown) => writeResponse(() => responder.respond(result)),
-          respondError: (code: number, message: string, data?: unknown) =>
-            writeResponse(() => responder.respondError(code, message, data)),
-        };
-        const failed = (error: unknown): void => {
-          if (responseFailure) error = responseFailure.error;
-          const message = error instanceof Error ? error.message : String(error);
-          const attemptedBeforeFailure = responseFailure?.responseAttempted ?? responseAttempted;
-          let responseError: string | undefined;
-          if (tracked && !responseAttempted) {
-            try {
-              tracked.respondError(-32603, message);
-            } catch (sendError) {
-              responseError = sendError instanceof Error ? sendError.message : String(sendError);
-            }
-          }
-          // Keep headless hosts diagnosable even without a trace subscriber.
-          console.error(`[mcpl] ${connection.id} ${event} handler failed:`, error);
-          this.emitTrace({
-            type: 'mcpl:request-handler-error',
-            serverId: connection.id,
-            event,
-            requestId: responder?.id,
-            responseAttempted: attemptedBeforeFailure,
-            error: message,
-            ...(responseError === undefined ? {} : { responseError }),
-          });
-        };
-        try {
-          // Invoke immediately: control-plane responses must retain their
-          // ACK-before-reconcile ordering and data-plane barrier semantics.
-          const succeeded = (): void => {
-            // A handler may swallow an encoding/transport failure without rethrowing.
-            if (responseFailure) failed(responseFailure.error);
-          };
-          const result = handler(params, tracked);
-          if (result) void result.then(succeeded, failed);
-          else succeeded();
-        } catch (error) {
-          failed(error);
-        }
-      });
+      connection.on(event, this.containedInboundHandler(connection.id, event, handler));
     };
 
     // Forward subprocess stderr lines as trace events so consumers (conhost,
@@ -13845,11 +13908,10 @@ export class AgentFramework {
     // §17.3: a manifest-change announcement. Rate-limited re-fetch → diff
     // → §6.7 consequences → one receipt. The announcement itself carries no
     // payload and no authority; everything below acts on FETCHED content.
-    connection.on('manifest-changed', (params: { revision?: string; domains?: string[] }) => {
-      void this.handleManifestChanged(connection, params).catch((err) => {
-        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, err instanceof Error ? err.message : err);
-      });
-    });
+    // A notification, contained and reported like every inbound handler: a
+    // refresh that fails emits mcpl:request-handler-error.
+    onRequest('manifest-changed', (params: { revision?: string; domains?: string[] }) =>
+      this.handleManifestChanged(connection, params));
 
     onRequest('channels-list', (
       _params: unknown,
@@ -13915,8 +13977,12 @@ export class AgentFramework {
       responder.respond(result);
     });
 
-    // Handle dynamic tool list changes (notifications/tools/list_changed)
-    connection.on('tools-list-changed', () => {
+    // Handle dynamic tool list changes (notifications/tools/list_changed).
+    // Contained like every inbound handler: a synchronous failure here emits
+    // mcpl:request-handler-error. A failure of the awareness accounting its
+    // barrier waits on is global, and failMcplDataPlaneGate reports it for
+    // every connection (mcpl:server-error) as it recycles them.
+    onRequest('tools-list-changed', () => {
       // Pause before starting any async refresh. This listener runs
       // synchronously in the transport line callback, so a following inbound
       // data event cannot pass before the new barrier exists.

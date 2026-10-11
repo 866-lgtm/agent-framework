@@ -438,10 +438,24 @@ export type TraceEvent =
       event: string;
       /** Absent for notifications. */
       requestId?: string | number;
-      /** True if a response write was attempted before the handler failed. */
+      /** Whether the handler's own reply may have reached the server: true
+       *  once it attempted one, unless the attempt failed while encoding,
+       *  before any bytes were written. When it's false and a responder was
+       *  given, the host answered -32603 "Internal error" itself, unless
+       *  `responseError` says that reply failed. */
       responseAttempted: boolean;
+      /** The handler's own error when it threw or rejected; otherwise the
+       *  reply write that failed and that it swallowed, or that it tried to
+       *  answer a second time. */
       error: string;
-      /** Failure while trying to send an internal-error response. */
+      /** A reply write that failed, when the handler then failed with an
+       *  error of its own (which is `error`). */
+      responseFailure?: string;
+      /** What the handler tried to send after a reply was already attempted:
+       *  refused, never written. A result, or an error reply with its code
+       *  and (bounded) message. */
+      refusedResponse?: { kind: 'result' } | { kind: 'error'; code: number; message: string };
+      /** Failure while trying to send the internal-error response. */
       responseError?: string;
     })
   | (TraceEventBase & {

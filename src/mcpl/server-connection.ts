@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
-import { CAPABILITY_DISABLED, McplResponseSerializationError } from './errors.js';
+import { CAPABILITY_DISABLED, McplResponseSerializationError, boundedForLog, describeCause } from './errors.js';
 
 import type {
   McplServerConfig,
@@ -78,6 +78,13 @@ interface RequestOptions {
   timeoutMs?: number;
   /** Surface a late response even when it carries no checkpoint state. */
   surfaceOrphanedResponse?: boolean;
+}
+
+/** A request's method for a log line, whatever the server sent there. */
+function describeMethod(method: unknown): string {
+  return typeof method === 'string'
+    ? `method "${boundedForLog(method)}"`
+    : `a method of type ${method === null ? 'null' : typeof method}`;
 }
 
 /**
@@ -377,6 +384,14 @@ export class McplServerConnection extends EventEmitter {
         } else {
           console.error(`[mcpl] ${this.id}: discarded ${name} — "${requiredCap}" ${phase}`);
         }
+        return true;
+      }
+      // §6.6: a request that will never be answered MUST get an error. A
+      // request whose event nothing on this host listens for would never be.
+      const request = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+      if (typeof request?.respondError === 'function' && this.listenerCount(event) === 0) {
+        request.respondError(-32601, 'Method not found');
+        console.error(`[mcpl] ${this.id}: answered -32601 to ${name}, which nothing on this host handles`);
         return true;
       }
       return super.emit(event, ...args);
@@ -1098,7 +1113,9 @@ export class McplServerConnection extends EventEmitter {
     this.setupLifecycle(transport);
     // Surface transport diagnostics (stdio child stderr) as 'stderr' events,
     // preserving the `{ line }` payload existing consumers expect.
-    transport.on('stderr', (line: string) => this.emit('stderr', { line }));
+    // Through the same containment boundary as every inbound event, so a
+    // stderr listener that throws is reported, not thrown into the transport.
+    transport.on('stderr', (line: string) => this.dispatchInboundEvent('stderr', { line }));
   }
 
   /**
@@ -1120,7 +1137,11 @@ export class McplServerConnection extends EventEmitter {
       try {
         this.dispatchMessage(msg);
       } catch (error) {
-        this.reportInboundFailure(error);
+        const request = msg as { method?: unknown; id?: unknown };
+        this.reportInboundFailure(error, {
+          ...(typeof request.method === 'string' ? { event: request.method } : {}),
+          ...(typeof request.id === 'string' || typeof request.id === 'number' ? { requestId: request.id } : {}),
+        });
       }
     });
   }
@@ -1167,20 +1188,30 @@ export class McplServerConnection extends EventEmitter {
     // and staged-buffer flushes share. See the comment there for why
     // rejecting here, at line receipt, was wrong for staged connections.
 
-    if (eventName) {
-      // Emit the typed event with params and (for requests) a respond callback
+    if (!eventName) {
+      // §6.6: a request that will never be answered MUST get an error, so a
+      // request (it has an id) whose method isn't a string, or isn't one this
+      // host handles, is answered -32601. A notification nobody handles is
+      // ignored, as JSON-RPC asks.
       if (request.id != null) {
-        // Server expects a response — provide a respond helper
-        this.dispatchInboundEvent(eventName, request.params, {
-          id: request.id,
-          respond: (result: unknown) => this.sendResponse(request.id!, result),
-          respondError: (code: number, message: string, data?: unknown) =>
-            this.sendErrorResponse(request.id!, code, message, data),
-        });
-      } else {
-        // Notification — no response expected
-        this.dispatchInboundEvent(eventName, request.params);
+        this.sendErrorResponse(request.id, -32601, 'Method not found');
+        console.error(`[mcpl] ${this.id}: answered -32601 to a request for ${describeMethod(request.method)}, which this host doesn't handle`);
       }
+      return;
+    }
+
+    // Emit the typed event with params and (for requests) a respond callback
+    if (request.id != null) {
+      // Server expects a response — provide a respond helper
+      this.dispatchInboundEvent(eventName, request.params, {
+        id: request.id,
+        respond: (result: unknown) => this.sendResponse(request.id!, result),
+        respondError: (code: number, message: string, data?: unknown) =>
+          this.sendErrorResponse(request.id!, code, message, data),
+      });
+    } else {
+      // Notification — no response expected
+      this.dispatchInboundEvent(eventName, request.params);
     }
   }
 
@@ -1189,12 +1220,21 @@ export class McplServerConnection extends EventEmitter {
     try {
       this.emit(event, ...args);
     } catch (error) {
-      this.reportInboundFailure(error);
+      const requestId = (args[1] as { id?: unknown } | undefined)?.id;
+      this.reportInboundFailure(error, {
+        event,
+        ...(typeof requestId === 'string' || typeof requestId === 'number' ? { requestId } : {}),
+      });
     }
   }
 
-  private reportInboundFailure(cause: unknown): void {
-    const error = new Error(`MCPL server "${this.id}" inbound dispatch failed`, { cause });
+  /** Report a failure the containment boundary caught, naming the event (or
+   *  method) and request it was dispatching, and what failed. The message is
+   *  what the framework's 'error' listener traces. */
+  private reportInboundFailure(cause: unknown, context: { event?: string; requestId?: string | number } = {}): void {
+    const where = context.event === undefined ? '' : ` for ${boundedForLog(context.event)}` +
+      (context.requestId === undefined ? '' : ` (request ${boundedForLog(String(context.requestId))})`);
+    const error = new Error(`MCPL server "${this.id}" inbound dispatch failed${where}: ${boundedForLog(describeCause(cause))}`, { cause });
     console.error(error.message, cause);
     // EventEmitter's unhandled 'error' behavior would defeat containment before
     // framework wiring, so stderr remains the fallback when no listener exists.

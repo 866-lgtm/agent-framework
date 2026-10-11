@@ -156,6 +156,13 @@ export class StdioTransport extends McplTransport {
     });
 
     this.child.on('error', (err) => this.emit('error', err));
+    // A write to a child that has just exited fails asynchronously on its
+    // stdin (EPIPE). Unlistened, that 'error' would end the host; the exit
+    // itself closes the transport, so the write's failure is only reported.
+    this.child.stdin?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+      else console.error(`[mcpl] a write to the server's stdin failed: ${err.message}`);
+    });
     this.child.on('exit', (code, signal) =>
       this.markClosed({ code, signal, reason: 'child process exited' }),
     );
