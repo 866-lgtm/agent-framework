@@ -398,6 +398,13 @@ export class McplServerConnection extends EventEmitter {
     return this.reconnectEnabled;
   }
 
+  /** Whether a child this connection launched couldn't be confirmed exited.
+   *  While it's true the connection owns that child, so whatever registered
+   *  it keeps its id held; close() retries the reap. */
+  get holdsUnreapedChild(): boolean {
+    return this.unreaped.length > 0;
+  }
+
   /**
    * Private constructor. Use `McplServerConnection.connect()` instead.
    */
@@ -692,8 +699,8 @@ export class McplServerConnection extends EventEmitter {
    * open socket never leaks. If that close can't confirm the child exited,
    * the failure is a {@link HandshakeCleanupError} carrying the transport, so
    * the caller keeps owning it. `signal` ends a handshake whose connection is
-   * closed meanwhile: it is checked once the transport is open (a WebSocket
-   * dial isn't cut short) and races the initialize answer.
+   * closed meanwhile: it cuts a WebSocket dial short, is checked once the
+   * transport is open, and races the initialize answer.
    */
   private static async handshake(
     config: McplServerConfig,
@@ -702,7 +709,13 @@ export class McplServerConnection extends EventEmitter {
   ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string }> {
     const closedWhileConnecting = () => new Error(`MCPL server "${config.id}" was closed while connecting`);
     if (signal?.aborted) throw closedWhileConnecting();
-    const transport = await openTransport(config);
+    let transport: McplTransport;
+    try {
+      transport = await openTransport(config, signal);
+    } catch (error) {
+      if (signal?.aborted) throw closedWhileConnecting();
+      throw error;
+    }
 
     try {
       if (signal?.aborted) throw closedWhileConnecting();
@@ -1052,8 +1065,9 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send `tools/list` and return the server's complete tool inventory,
    * following `nextCursor` across pages (2024-11-05 pagination). Cursors are
-   * opaque strings, `''` included: only an absent `nextCursor` ends the
-   * inventory. A page that isn't well formed (no `tools` array, a cursor
+   * opaque strings, `''` included: only an absent or null `nextCursor` ends
+   * the inventory (a null one is how some servers say "no more", and main
+   * read it as a complete page). A page that isn't well formed (no `tools` array, a cursor
    * that isn't a string), or cursors that don't terminate (a repeat, or more
    * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
    * empty inventory published as complete.
@@ -1072,7 +1086,7 @@ export class McplServerConnection extends EventEmitter {
       }
       first ??= result;
       tools.push(...(result.tools as McpToolDefinition[]));
-      if (result.nextCursor === undefined) {
+      if (result.nextCursor === undefined || result.nextCursor === null) {
         // The first page's other fields are kept as they came, so a
         // single-page answer is returned exactly as before.
         const { nextCursor: _done, ...rest } = first as { nextCursor?: unknown };
@@ -1299,7 +1313,8 @@ export class McplServerConnection extends EventEmitter {
       // No common protocol revision: every further attempt would restart the
       // server to hear the same answer. Stop retrying; the configuration is
       // what has to change. A launch that couldn't be reaped halts retrying
-      // too, until close() confirms its exit. Every other failure keeps the
+      // for good: close() can confirm its exit, but close() is terminal, so
+      // nothing resumes this connection. Every other failure keeps the
       // backoff loop.
       if (error instanceof McplProtocolVersionError) this.reconnectEnabled = false;
       const permanent = unreaped || error instanceof McplProtocolVersionError;

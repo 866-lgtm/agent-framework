@@ -27,3 +27,9 @@
   `requestTimeoutMs` above 2^31−1 is refused too: Node ran it as a timer of
   about 1 ms, so every request timed out at once. Every value that worked,
   `0` included, passes.
+- **Hosts:** `stop()` now rejects, after its whole teardown, when an MCP
+  server's child couldn't be confirmed exited, naming each such child.
+  Before, closing a stdio server returned as soon as a signal was sent, so
+  `stop()` never failed for this. Code that chains work on `stop()`, such as
+  exiting a TUI or switching sessions, should catch that rejection: the
+  framework is stopped either way.

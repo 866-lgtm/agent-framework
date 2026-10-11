@@ -1,8 +1,7 @@
 /**
- * A modern-MCP server inside a real framework (room-284, shelf-487): tool
- * listing and status, both dispatch paths, the script view of structured
- * results, an MCP-only legacy peer read the same standard way, and the host
- * lifetime contract (Tessa #53152, Agnes/Kit #53184, Theo #53178):
+ * A modern-MCP server inside a real framework: tool listing and status, both
+ * dispatch paths, the script view of structured results, an MCP-only legacy
+ * peer read the same standard way, and the host lifetime contract:
  * - a modern call already in flight completes while the host quiesces;
  * - a list change while quiesced refreshes the inventory, and its wake parks
  *   until resume;
@@ -188,8 +187,8 @@ test('scripts get structured results whole, as one JSON object', async () => {
   });
 });
 
-// The script cap measures the serialized object's length (Iris-1827,
-// room-293): `sized` pads structuredContent so that length is exact.
+// The script cap measures the serialized object's length: `sized` pads
+// structuredContent so that length is exact.
 const SCRIPT_CAP = 5_000_000;
 const sizedObject = (pad: number, isError = false) => ({
   content: [],
@@ -398,18 +397,22 @@ test('quiesce: a modern call already in flight completes, and its result reaches
   await withModern(async ({ framework, membrane, dir }) => {
     framework.start();
     membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'toolu_01MODERNSLOW0000000000000', name: 'mcpl--modern--slow', input: { ms: 600 } },
+      { type: 'tool_use', id: 'toolu_01MODERNSLOW0000000000000', name: 'mcpl--modern--slow', input: { ms: 1500 } },
     ] as never, 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
     await waitFor('the slow call to start server-side', () => lines(join(dir, 'events.log')).includes('slow-start'));
 
-    const status = await framework.quiesce({ reason: 'maintenance', timeoutMs: 10_000 });
+    // Quiesce begins while the call is provably still running server-side,
+    // so its resolving after 'slow-finished' shows it waited for the call.
+    const quiescing = framework.quiesce({ reason: 'maintenance', timeoutMs: 10_000 });
+    assert.ok(!lines(join(dir, 'events.log')).includes('slow-finished'), 'the call is still in flight as quiesce begins');
+    const status = await quiescing;
     assert.equal(status.quiesced, true);
     assert.equal(status.drained, true, 'the turn drained: its modern call completed');
     assert.ok(lines(join(dir, 'events.log')).includes('slow-finished'));
     assert.ok(!lines(join(dir, 'events.log')).includes('slow-aborted'), 'quiesce did not cancel it');
-    assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults[0]), /slept 600/);
+    assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults[0]), /slept 1500/);
     await framework.resume();
   });
 });
@@ -484,4 +487,43 @@ test('the framework owns a modern connect in flight: stop() ends it, and a secon
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a lost modern child is relisted from the new launch: what only the old one listed is gone', async () => {
+  await withModern(async ({ framework, dir }) => {
+    framework.start();
+    // The first launch registers a tool at runtime; a fresh launch won't have it.
+    await framework.executeToolCall(call('mcpl--modern--add_tool'));
+    await waitFor('the first launch\'s added tool', () => framework.getAllTools().some((t) => t.name === 'mcpl--modern--added_1'));
+    await framework.executeToolCall(call('mcpl--modern--die'));
+    await waitFor('a second launch', () => lines(join(dir, 'starts.log')).length === 2);
+    await waitFor('the relist from the new launch', () =>
+      framework.listMcplServers()[0]!.connected
+      && framework.getAllTools().some((t) => t.name === 'mcpl--modern--echo')
+      && !framework.getAllTools().some((t) => t.name === 'mcpl--modern--added_1'));
+  });
+});
+
+test("a modern tool's error result is traced as tool:failed, not tool:completed", async () => {
+  const traces: Array<{ type: string; tool?: string; error?: string }> = [];
+  const watcher: Module = {
+    name: 'trace-watcher',
+    async start(ctx: ModuleContext) { ctx.onTrace((event) => traces.push(event as never)); },
+    async stop() {},
+    getTools: (): ToolDefinition[] => [],
+    handleToolCall: async (): Promise<ToolResult> => ({ success: false, error: 'no tools', isError: true }),
+    onProcess: async () => ({}),
+  };
+  await withModern(async ({ framework, membrane }) => {
+    framework.start();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'toolu_01MODERNFAIL0000000000000', name: 'mcpl--modern--fail', input: {} },
+    ] as never, 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted.' }]));
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+    await waitFor('the tool trace', () => traces.some((t) => (t.type === 'tool:failed' || t.type === 'tool:completed') && t.tool === 'fail'));
+    const outcome = traces.find((t) => (t.type === 'tool:failed' || t.type === 'tool:completed') && t.tool === 'fail')!;
+    assert.equal(outcome.type, 'tool:failed');
+    assert.match(outcome.error ?? '', /the tool failed on purpose/);
+  }, [], [watcher]);
 });

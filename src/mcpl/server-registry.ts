@@ -25,6 +25,10 @@ export type McplCapabilityQuery =
  */
 export class McplServerRegistry {
   private servers = new Map<string, McplServerConnection>();
+  /** Ids whose addServer is still connecting. A second add for one is
+   *  refused, so a failed launch's closed connection can always be registered
+   *  as the owner of a child it couldn't reap. */
+  private adding = new Set<string>();
 
   /**
    * Connect to an MCPL server and register it.
@@ -39,20 +43,21 @@ export class McplServerRegistry {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
   ): Promise<McplServerConnection> {
-    if (this.servers.has(config.id)) {
+    if (this.servers.has(config.id) || this.adding.has(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
     }
 
+    this.adding.add(config.id);
     let connection: McplServerConnection;
     try {
       connection = config.reconnect
         ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
         : await McplServerConnection.connect(config, hostCapabilities);
     } catch (error) {
-      if (error instanceof McplUnreapedLaunchError && !this.servers.has(config.id)) {
-        this.register(config, error.connection);
-      }
+      if (error instanceof McplUnreapedLaunchError) this.register(config, error.connection);
       throw error;
+    } finally {
+      this.adding.delete(config.id);
     }
     this.register(config, connection);
     return connection;
@@ -61,9 +66,11 @@ export class McplServerRegistry {
   private register(config: McplServerConfig, connection: McplServerConnection): void {
     this.servers.set(config.id, connection);
 
-    // Auto-remove on unexpected close (unless reconnect will re-add)
+    // Auto-remove on unexpected close (unless reconnect will re-add). A
+    // connection that still owns a child it couldn't reap keeps its id, so
+    // nothing launches beside that child; removeServer retries the reap.
     connection.on('close', () => {
-      if (!config.reconnect && this.servers.get(config.id) === connection) {
+      if (!config.reconnect && this.servers.get(config.id) === connection && !connection.holdsUnreapedChild) {
         this.servers.delete(config.id);
       }
     });
@@ -86,13 +93,10 @@ export class McplServerRegistry {
     if (!connection) {
       return;
     }
-    this.servers.delete(id);
-    try {
-      await connection.close();
-    } catch (error) {
-      if (!this.servers.has(id)) this.servers.set(id, connection);
-      throw error;
-    }
+    // The id stays held until the close settles, so nothing launches beside
+    // a child still being reaped; it's freed only once the exit is confirmed.
+    await connection.close();
+    if (this.servers.get(id) === connection) this.servers.delete(id);
   }
 
   /**
@@ -156,11 +160,23 @@ export class McplServerRegistry {
   }
 
   /**
-   * Close all server connections and clear the registry.
+   * Close every server connection. Each one whose close confirms its exit
+   * is removed. One whose child couldn't be confirmed exited stays
+   * registered, holding its id, and every such failure is thrown together;
+   * removeServer retries a reap.
    */
   async closeAll(): Promise<void> {
-    const connections = Array.from(this.servers.values());
-    this.servers.clear();
-    await Promise.all(connections.map((c) => c.close()));
+    const entries = Array.from(this.servers.entries());
+    const outcomes = await Promise.allSettled(entries.map(([, connection]) => connection.close()));
+    const failures: string[] = [];
+    outcomes.forEach((outcome, index) => {
+      const [id, connection] = entries[index]!;
+      if (outcome.status === 'fulfilled') {
+        if (this.servers.get(id) === connection) this.servers.delete(id);
+      } else {
+        failures.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+      }
+    });
+    if (failures.length > 0) throw new Error(failures.join('; '));
   }
 }

@@ -40,8 +40,9 @@
 - Closing a stdio MCP/MCPL server now waits for the child to exit, sending
   SIGKILL after 2 s. A child still alive 2 s after SIGKILL fails `close()`
   with an explicit error. Before, close returned as soon as a signal was
-  sent. `stop()` reports such a failure and still finishes shutting
-  everything else down. Concurrent `close()` calls share one teardown, and a
+  sent. `stop()` still finishes shutting everything else down after such a
+  failure, and then rejects (see the breaking notes). Concurrent `close()`
+  calls share one teardown, and a
   later call re-checks a child that couldn't be reaped. A launch whose exit
   can't be confirmed is never orphaned, and nothing launches beside it:
   - `McplServerConnection.connect()` throws the new `McplUnreapedLaunchError`,
@@ -52,7 +53,11 @@
     (`reconnect-failed`, `permanent: true`). Reconnect attempts run one at
     a time, and never start before the previous child has exited.
   - `close()` during a reconnect handshake ends that launch before it
-    resolves.
+    resolves, a WebSocket dial still opening included.
+  - `McplServerRegistry` holds an id until its child is confirmed exited:
+    `removeServer` frees it only once the close succeeds, a second
+    `addServer` for an id still connecting is refused, and `closeAll()`
+    keeps each connection it couldn't reap, naming every failure.
   - In the framework, a disconnect or failed connect whose cleanup can't
     reap the child keeps the server registered, closed and listed as
     disconnected, and its error says so. A connect for that id is refused

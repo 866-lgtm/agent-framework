@@ -477,6 +477,15 @@ interface DeferredWrite {
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
+/** A server configuration refused before anything was spawned or dialed:
+ *  only a corrected configuration helps, so nothing retries it. */
+class McpConfigurationRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'McpConfigurationRefusal';
+  }
+}
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
@@ -2045,9 +2054,13 @@ export class AgentFramework {
     shutdownPromises.push(this.closeModernMcpConnections());
     // Every part shuts down even if one fails (a child that could not be
     // reaped, say); each failure is reported, and the rest of stop() runs.
+    // stop() then rejects with them, once everything else is done, so its
+    // caller learns that a child may have outlived the framework.
+    const shutdownFailures: string[] = [];
     for (const outcome of await Promise.allSettled(shutdownPromises)) {
       if (outcome.status === 'rejected') {
         const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+        shutdownFailures.push(reason);
         console.error(`[shutdown] ${reason}`);
         this.emitTrace({ type: 'mcpl:server-error', serverId: 'shutdown', error: reason });
       }
@@ -2072,6 +2085,10 @@ export class AgentFramework {
 
     if (this.ownsStore) {
       this.store.close();
+    }
+
+    if (shutdownFailures.length > 0) {
+      throw new Error(`stop() finished, but not cleanly: ${shutdownFailures.join('; ')}`);
     }
   }
 
@@ -7653,7 +7670,14 @@ export class AgentFramework {
    */
   private coalescingBinding(serverId: string): string {
     const config = this.mcplServerConfigs.get(serverId);
-    return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
+    // A stdio server switched to the modern family is another peer, so its
+    // binding changes. The marker is added only for protocol: 'modern', so
+    // every binding stored for a legacy configuration stays the same. A
+    // network server's family follows its url's scheme, which is hashed.
+    const family = config?.protocol === 'modern' ? ['modern'] : [];
+    return createHash('sha256')
+      .update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null, ...family]))
+      .digest('hex').slice(0, 16);
   }
 
   private initializePushCoalescer(): void {
@@ -13368,8 +13392,7 @@ export class AgentFramework {
         await this.connectMcplServerInternal(config, true);
       } catch (error) {
         if (error instanceof DiscordAwarenessAccountingError) {
-          await this.mcplServerRegistry.closeAll();
-          await this.closeModernMcpConnections();
+          await this.closeMcpConnectionsAfterFailedStartup();
           throw error;
         }
         // Fail-open: log and continue with remaining servers
@@ -13385,8 +13408,10 @@ export class AgentFramework {
           error: err.message,
           attempt: 0,
           // A protocol-version verdict is never retried (no common revision;
-          // only configuration can fix it).
-          willRetry: config.reconnect === true && !(error instanceof McplProtocolVersionError),
+          // only configuration can fix it), and neither is a configuration
+          // refused before anything was launched.
+          willRetry: config.reconnect === true && !(error instanceof McplProtocolVersionError)
+            && !(error instanceof McpConfigurationRefusal),
         });
         // So the server doesn't vanish quietly: alert at once, as the
         // reconnect path does for the same verdict, since no attempt follows.
@@ -13405,8 +13430,7 @@ export class AgentFramework {
       await startupBarrier.promise;
       this.completeMcplDataPlaneGate(startupBarrier);
     } catch (error) {
-      await this.mcplServerRegistry.closeAll();
-      await this.closeModernMcpConnections();
+      await this.closeMcpConnectionsAfterFailedStartup();
       throw error;
     }
 
@@ -13465,14 +13489,39 @@ export class AgentFramework {
   }
 
   /** Close every modern-MCP connection, including any connect still in
-   *  flight, so none outlives a failed startup or stop(). */
+   *  flight, so none outlives a failed startup or stop(). One whose close
+   *  can't confirm its child exited stays registered, holding its id, as a
+   *  failed connect's does; every failure is thrown together. */
   private async closeModernMcpConnections(): Promise<void> {
-    const modern = [...this.modernServers().values()];
-    this.modernServers().clear();
-    const failures = (await Promise.allSettled(modern.map((connection) => connection.close())))
-      .filter((o): o is PromiseRejectedResult => o.status === 'rejected')
-      .map((o) => (o.reason instanceof Error ? o.reason.message : String(o.reason)));
+    const modern = [...this.modernServers().entries()];
+    const outcomes = await Promise.allSettled(modern.map(([, connection]) => connection.close()));
+    const failures: string[] = [];
+    outcomes.forEach((outcome, index) => {
+      const [id, connection] = modern[index]!;
+      if (outcome.status === 'fulfilled') {
+        if (this.modernServers().get(id) === connection) this.modernServers().delete(id);
+      } else {
+        failures.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+      }
+    });
     if (failures.length > 0) throw new Error(failures.join('; '));
+  }
+
+  /** After a failed startup: close both engines' connections, each whatever
+   *  the other's close did, and log what couldn't be closed. The caller then
+   *  rethrows the startup failure itself, so a cleanup failure never takes
+   *  its place. */
+  private async closeMcpConnectionsAfterFailedStartup(): Promise<void> {
+    const outcomes = await Promise.allSettled([
+      this.mcplServerRegistry?.closeAll() ?? Promise.resolve(),
+      this.closeModernMcpConnections(),
+    ]);
+    for (const outcome of outcomes) {
+      if (outcome.status === 'rejected') {
+        console.error('[mcpl] after a failed startup, some MCP connections could not be closed:',
+          outcome.reason instanceof Error ? outcome.reason.message : outcome.reason);
+      }
+    }
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
@@ -13840,16 +13889,7 @@ export class AgentFramework {
     // 'websocket', transport 'http' with a ws url or with no url at all),
     // protocol on a URL, a modern deadline of 0, MCPL policy on a modern
     // server. Every valid legacy shape resolves exactly as before.
-    let family: 'legacy' | 'modern';
-    try {
-      family = resolveServerBinding(config).family;
-    } catch (error) {
-      throw new Error(`MCP server "${config.id}" configuration: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const problems = serverConfigProblems(config);
-    if (problems.length > 0) {
-      throw new Error(`MCP server "${config.id}" configuration: ${problems.join('; ')}`);
-    }
+    const family = AgentFramework.usableConfigFamily(config);
     // One owner per id, across both engines (holdMcpServerId): a connect or
     // disconnect in flight holds it, and so does a registered connection,
     // including one kept because its launch couldn't be confirmed exited.
@@ -14453,8 +14493,27 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
+    // A configuration the connect would refuse is refused here, before the
+    // running server is torn down for it.
+    AgentFramework.usableConfigFamily(config);
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
+  }
+
+  /** The protocol family a configuration resolves to, or a refusal naming
+   *  every problem with it, before anything is spawned, dialed or torn down. */
+  private static usableConfigFamily(config: import('./mcpl/types.js').McplServerConfig): 'legacy' | 'modern' {
+    let family: 'legacy' | 'modern';
+    try {
+      family = resolveServerBinding(config).family;
+    } catch (error) {
+      throw new McpConfigurationRefusal(`MCP server "${config.id}" configuration: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const problems = serverConfigProblems(config);
+    if (problems.length > 0) {
+      throw new McpConfigurationRefusal(`MCP server "${config.id}" configuration: ${problems.join('; ')}`);
+    }
+    return family;
   }
 
   /**
@@ -14899,6 +14958,11 @@ export class AgentFramework {
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
+      // Lost for good (no reconnect, and the registry has dropped it): its
+      // tools leave the agents' list, as a disconnect's do.
+      if (!connection.willReconnect && this.mcplServerRegistry?.getServer(connection.id) !== connection) {
+        this.handleToolsListChanged(connection.id);
+      }
     });
   }
 
@@ -14959,8 +15023,21 @@ export class AgentFramework {
       // closes it removes it, so the id stays held meanwhile.
       if (!connection.isClosed && !connection.willReconnect && this.modernServers().get(connection.id) === connection) {
         this.modernServers().delete(connection.id);
+        // Gone for good: its tools leave the agents' list, as a disconnect's do.
+        this.handleToolsListChanged(connection.id);
       }
     });
+  }
+
+  /** An MCP tool call's trace: a result the server marked an error (or one
+   *  the reading couldn't complete) is tool:failed, as on the other tool
+   *  paths; anything else is tool:completed. */
+  private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
+    if (result.isError) {
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, error: result.error ?? 'tool returned an error' });
+    } else {
+      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool, callId, durationMs });
+    }
   }
 
   /**
@@ -15051,7 +15128,25 @@ export class AgentFramework {
       }
     }
 
-    this.mcplTools = tools;
+    // A server removed while this refresh awaited its lists (a disconnect,
+    // or a server lost for good) publishes nothing: whichever refresh
+    // finishes last must not bring back a removed server's tools.
+    // Asked of the same listing the refresh began from, now.
+    const live = new Set<string>([
+      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => server.id),
+      ...this.modernServers().keys(),
+    ]);
+    const gone = new Set([...new Set(toolServers.values())].filter((serverId) => !live.has(serverId)));
+    if (gone.size > 0) {
+      for (const [name, serverId] of [...toolServers]) {
+        if (!gone.has(serverId)) continue;
+        toolServers.delete(name);
+        toolFeatureSets.delete(name);
+        toolClasses.delete(name);
+      }
+      for (const serverId of gone) listedServers.delete(serverId);
+    }
+    this.mcplTools = gone.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
@@ -15269,7 +15364,7 @@ export class AgentFramework {
       modern.callTool(toolName, args)
         .then((result) => reading(result, false))
         .then((result) => {
-          this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs: Date.now() - startTime });
+          this.traceMcpToolOutcome(serverId, toolName, call.id, result, Date.now() - startTime);
           this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: `mcpl:${serverId}`, result });
         })
         .catch(failDispatch);
@@ -15340,7 +15435,7 @@ export class AgentFramework {
       })
       .then(({ result, toolResult }) => {
         const durationMs = Date.now() - startTime;
-        this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
+        this.traceMcpToolOutcome(serverId, toolName, call.id, toolResult, durationMs);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -15449,7 +15544,10 @@ export class AgentFramework {
    * payloads, and `structured` kept by presence. An MCPL peer keeps the
    * RFC-005 reading. Its content array passes through when it holds
    * non-text blocks, so references and images render natively. It gets
-   * `structured` too, with the JSON view when its content is empty.
+   * `structured` too, with the JSON view when its content is empty. The
+   * direct path (a module's callTool, a channel's tool call) doesn't come
+   * here: it returns the server's result itself (directToolResult), for
+   * either engine, as does a script's call whose result is structured.
    */
   private async mcpToolResult(
     result: { content?: unknown; isError?: boolean; structuredContent?: unknown },

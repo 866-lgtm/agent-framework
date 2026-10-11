@@ -1,6 +1,6 @@
 /**
- * The legacy engine's lifetime contract (room-293, greptile's review of
- * PR #262): one owner for every launch, the rule the modern engine keeps.
+ * The legacy engine's lifetime contract: one owner for every launch, the
+ * rule the modern engine keeps.
  * - a configuration it can't use is refused before anything is dialed, and
  *   never turned into a retry stub;
  * - concurrent close() calls share one teardown and its verdict;
@@ -20,7 +20,11 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
 import { McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
-import { StdioTransport } from '../src/mcpl/transport.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
+import { StdioTransport, openTransport } from '../src/mcpl/transport.js';
+import { createServer, type Socket } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { EventEmitter } from 'node:events';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -102,6 +106,8 @@ test('a configuration the engine cannot use is refused before anything is dialed
     McplServerConnection.connectWithReconnect({ id: 'ftp', url: 'ftp://127.0.0.1/x', ...RECONNECT }, HOST_CAPS),
     /url must be ws:\/\/ or wss:\/\//,
   );
+  // A refusal is synchronous with the connect call; 200 ms covers several
+  // reconnect intervals (20–40 ms) in which a stub would have dialed.
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(dials, 0, 'nothing was dialed');
 });
@@ -127,6 +133,8 @@ test('a close that cannot reap fails, and so do concurrent ones; a later close r
   const outcome = (name: string) => [() => settled.push(`${name}:ok`), (e: Error) => settled.push(`${name}:${e.message}`)] as const;
   const first = connection.close().then(...outcome('first'));
   const second = connection.close().then(...outcome('second'));
+  // The teardown sends SIGTERM, waits 2 s, sends SIGKILL and waits 2 s more
+  // before it gives up, so at 1 s it is still pending.
   await new Promise((r) => setTimeout(r, 1000));
   assert.deepEqual(settled, [], 'neither resolves while the teardown is pending');
   await Promise.all([first, second]);
@@ -164,6 +172,7 @@ test('with reconnect, a failed first launch that cannot be reaped halts instead 
   assert.equal(failures[0]!.permanent, true);
   assert.match(failures[0]!.error, /initialize failed on purpose; the previous launch could not be reaped .*reconnecting is halted/);
   assert.equal(connection.willReconnect, false);
+  // 300 ms is several reconnect intervals (20–40 ms): a retry would have launched.
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(starts(log).length, 1, 'no launch beside the unreaped one');
   await killAndWait(stuck[0]!);
@@ -182,6 +191,7 @@ test('a reconnect launch that cannot be reaped halts reconnecting; close() settl
   await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure');
   assert.match(failures.find((f) => f.permanent)!.error, /initialize failed on purpose; the previous launch could not be reaped .*reconnecting is halted/);
   assert.equal(connection.willReconnect, false);
+  // 300 ms is several reconnect intervals (20–40 ms): a retry would have launched.
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(starts(log).length, 2, 'no third launch while the second is unreaped');
   await assert.rejects(connection.close(), /could not be reaped/);
@@ -196,7 +206,7 @@ test('close() during a reconnect handshake ends that launch before resolving, an
   let reconnected = false;
   connection.on('reconnect', () => { reconnected = true; });
   await assert.rejects(connection.sendToolsCall('die', {}));
-  await until(() => starts(log).length === 2, 'the reconnect launch, waiting on initialize');
+  await until(() => starts(log).length === 2, 'the reconnect launch has started (its start line)');
   const second = starts(log)[1]!;
   const began = Date.now();
   await connection.close();
@@ -205,6 +215,7 @@ test('close() during a reconnect handshake ends that launch before resolving, an
   assert.equal(alive(second), false, 'the launch in flight was reaped before close() resolved');
   assert.equal(reconnected, false);
   assert.equal(connection.isConnected, false);
+  // Several reconnect intervals (20–40 ms) later, still nothing.
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(starts(log).length, 2, 'and no later launch');
 });
@@ -216,8 +227,9 @@ test('a recycle during a reconnect in flight starts no second attempt, and close
   const connection = await McplServerConnection.connectWithReconnect(config('ok-then-hang', log, RECONNECT), HOST_CAPS);
   connection.ready();
   await assert.rejects(connection.sendToolsCall('die', {}));
-  await until(() => starts(log).length === 2, 'the reconnect launch, waiting on initialize');
+  await until(() => starts(log).length === 2, 'the reconnect launch has started (its start line)');
   await connection.reconnectAfterFailure();
+  // Several reconnect intervals (20–40 ms) later, still only the one in flight.
   await new Promise((r) => setTimeout(r, 400));
   assert.equal(starts(log).length, 2, 'no second attempt beside the one in flight');
   const began = Date.now();
@@ -244,4 +256,147 @@ test('a reconnect never launches while the previous child may still be running',
   assert.equal(alive(first!), false, 'it started only once the first child was gone');
   await recycled;
   await until(() => reconnected, 'reconnected');
+});
+
+test('registry: an id stays held through its reap, and a second add is refused while one is connecting', async () => {
+  const log = scratchLog();
+  const registry = new McplServerRegistry();
+  // A child that ignores SIGTERM keeps its reap going for about 2 s.
+  const removing = (async () => {
+    await registry.addServer(config('ok', log, { env: { IGNORE_SIGTERM: '1' } }), HOST_CAPS);
+    return registry.removeServer('legacy');
+  })();
+  await until(() => registry.getServer('legacy') !== null, 'registered');
+  await until(() => starts(log).length === 1, 'launched');
+  await new Promise((r) => setTimeout(r, 100));
+  await assert.rejects(registry.addServer(config('ok', log), HOST_CAPS), /already registered/, 'held while its reap runs');
+  await removing;
+  assert.equal(registry.getServer('legacy'), null, 'freed once the exit is confirmed');
+  assert.equal(starts(log).length, 1, 'nothing launched beside it');
+
+  // Two adds at once: the second is refused while the first is connecting.
+  const slow = registry.addServer(config('slow', log, { env: { SLOW_INIT_MS: '300' } }), HOST_CAPS);
+  await assert.rejects(registry.addServer(config('ok', log), HOST_CAPS), /already registered/);
+  await slow;
+  await registry.removeServer('legacy');
+});
+
+test('registry: a connection whose reap fails stays registered, through close() and closeAll(), until a retry confirms the exit', async () => {
+  const log = scratchLog();
+  const registry = new McplServerRegistry();
+  const stuck = unreapableFrom(1);
+  const connection = await registry.addServer(config('ok', log), HOST_CAPS);
+  // Its own close() can't reap: the registry keeps it, holding the id.
+  await assert.rejects(connection.close(), /could not be reaped/);
+  assert.equal(registry.getServer('legacy'), connection, 'still registered after its own close');
+  // closeAll() reports it, and keeps it.
+  await assert.rejects(registry.closeAll(), /could not be reaped/);
+  assert.equal(registry.getServer('legacy'), connection, 'still registered after closeAll');
+  await assert.rejects(registry.addServer(config('ok', log), HOST_CAPS), /already registered/);
+  // removeServer retries the reap; once the child is gone it succeeds.
+  await assert.rejects(registry.removeServer('legacy'), /could not be reaped/);
+  assert.equal(registry.getServer('legacy'), connection);
+  await killAndWait(stuck[0]!);
+  await registry.removeServer('legacy');
+  assert.equal(registry.getServer('legacy'), null);
+});
+
+test('registry: closeAll closes every connection, removes the ones it reaped, and names each it could not', async () => {
+  const log = scratchLog();
+  const registry = new McplServerRegistry();
+  const stuck = unreapableFrom(2);
+  const fine = await registry.addServer({ ...config('ok', log), id: 'fine' }, HOST_CAPS);
+  const held = await registry.addServer({ ...config('ok', log), id: 'held' }, HOST_CAPS);
+  await assert.rejects(registry.closeAll(), /"held" did not close cleanly/);
+  assert.equal(registry.getServer('fine'), null, 'the one it reaped is removed');
+  assert.equal(fine.isConnected, false);
+  assert.equal(registry.getServer('held'), held, 'the one it could not reap stays');
+  await killAndWait(stuck[0]!);
+  await registry.removeServer('held');
+});
+
+test('a reconnect whose previous child cannot be reaped holds it and halts reconnecting', async () => {
+  const log = scratchLog();
+  const stuck = unreapableFrom(1);
+  const connection = await McplServerConnection.connectWithReconnect(config('ok', log, RECONNECT), HOST_CAPS);
+  cleanups.push(() => connection.close().catch(() => {}));
+  connection.ready();
+  const failures: Array<{ error: string; attempt: number; permanent?: boolean }> = [];
+  connection.on('reconnect-failed', (f) => failures.push(f));
+  // Recycle it as the framework does: the host closes the transport, whose
+  // child can't be reaped, and the loop then finds that child still held.
+  await connection.reconnectAfterFailure().catch(() => {});
+  await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure');
+  assert.match(failures.find((f) => f.permanent)!.error, /could not be reaped/);
+  assert.equal(connection.willReconnect, false);
+  // Several reconnect intervals (20–40 ms) later, nothing launched beside it.
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(starts(log).length, 1);
+  await killAndWait(stuck[0]!);
+  await connection.close();
+});
+
+test('a WebSocket dial whose connection is closed meanwhile ends at once, not at the open timeout', async () => {
+  // A listener that accepts and never answers the upgrade.
+  const sockets: Socket[] = [];
+  const server = createServer((socket) => { sockets.push(socket); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  cleanups.push(() => new Promise<void>((r) => { for (const s of sockets) s.destroy(); server.close(() => r()); }));
+  const url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}/mcpl`;
+  const abort = new AbortController();
+  const began = Date.now();
+  const dial = openTransport({ id: 'ws', url }, abort.signal);
+  await until(() => sockets.length === 1, 'the dial reached the listener');
+  abort.abort();
+  await assert.rejects(dial, /WebSocket connect abandoned: the connection was closed/);
+  assert.ok(Date.now() - began < 5_000, 'well before the 15 s open timeout');
+});
+
+test("a write to a stdio child that has just exited is reported, never thrown", (t) => {
+  const child = Object.assign(new EventEmitter(), { stdin: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null });
+  const rl = new EventEmitter();
+  const transport = new (StdioTransport as unknown as new (c: unknown, r: unknown) => StdioTransport)(child, rl);
+  const logged: unknown[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args); });
+  const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+  assert.doesNotThrow(() => child.stdin.emit('error', epipe), 'with nothing listening');
+  const reported: unknown[] = [];
+  transport.on('error', (error) => reported.push(error));
+  child.stdin.emit('error', epipe);
+  assert.deepEqual(reported, [epipe], "it's the transport's error once someone listens");
+});
+
+test('close() during a WebSocket reconnect dial returns promptly, ending the dial', async () => {
+  // The first upgrade gets a minimal MCPL server; every later one hangs, so
+  // the reconnect's dial would wait out its 15 s open timeout.
+  const http = createHttpServer();
+  const wss = new WebSocketServer({ noServer: true });
+  const hung: Socket[] = [];
+  let upgrades = 0;
+  http.on('upgrade', (request, socket, head) => {
+    if (++upgrades === 1) wss.handleUpgrade(request, socket as Socket, head, (ws) => wss.emit('connection', ws, request));
+    else hung.push(socket as Socket);
+  });
+  let first: import('ws').WebSocket | undefined;
+  wss.on('connection', (ws) => {
+    first = ws;
+    ws.on('message', (data) => {
+      const message = JSON.parse(String(data)) as { id?: number; method?: string };
+      if (message.id === undefined) return;
+      const result = message.method === 'initialize' ? { protocolVersion: '2024-11-05', capabilities: {} } : {};
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
+    });
+  });
+  await new Promise<void>((r) => http.listen(0, '127.0.0.1', () => r()));
+  cleanups.push(() => new Promise<void>((r) => { for (const s of hung) s.destroy(); wss.close(); http.close(() => r()); }));
+  const url = `ws://127.0.0.1:${(http.address() as AddressInfo).port}/mcpl`;
+
+  const connection = await McplServerConnection.connectWithReconnect({ id: 'ws', url, ...RECONNECT }, HOST_CAPS);
+  connection.ready();
+  first!.close();
+  await until(() => upgrades === 2, 'the reconnect is dialing');
+  const began = Date.now();
+  await connection.close();
+  assert.ok(Date.now() - began < 5_000, 'promptly: the dial was ended, not waited out (15 s)');
+  assert.equal(connection.isConnected, false);
 });

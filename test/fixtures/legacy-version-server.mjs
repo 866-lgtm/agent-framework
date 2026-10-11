@@ -4,6 +4,7 @@
 // Modes (how `initialize` is answered):
 //   ok            protocolVersion 2024-11-05
 //   reject        error -32022 with data { supported: ['2026-07-28'], requested }
+//   reject-old    error -32022 with data { supported: ['2025-03-26'], requested }
 //   reject-nodata error -32022 without data
 //   mismatch      protocolVersion 2025-06-18
 //   missing       no protocolVersion at all
@@ -17,7 +18,9 @@
 // tools/list pages: by default three pages (cursors p2, p3). MODE_LIST picks
 // an edge case: loop (always nextCursor "same"), empty (nextCursor "" then a
 // second page), notools (no tools array), badcursor (nextCursor 5),
-// nullcursor (nextCursor null). Tool `die` exits the process.
+// nullcursor (nextCursor null), endless (a new cursor on every page, so the
+// list never ends), badlater (a well-formed first page, then a page with no
+// tools array). Tool `die` exits the process.
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
 let mode = process.argv[2] ?? 'ok';
@@ -49,6 +52,7 @@ process.stdin.on('data', (chunk) => {
     if (m.method === 'initialize') {
       const requested = m.params?.protocolVersion;
       if (mode === 'reject') error(m.id, -32022, `Unsupported protocol version: ${requested}`, { supported: ['2026-07-28'], requested });
+      else if (mode === 'reject-old') error(m.id, -32022, `Unsupported protocol version: ${requested}`, { supported: ['2025-03-26'], requested });
       else if (mode === 'reject-nodata') error(m.id, -32022, `Unsupported protocol version: ${requested}`);
       else if (mode === 'mismatch') reply(m.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} } });
       else if (mode === 'missing') reply(m.id, { capabilities: { tools: {} } });
@@ -65,6 +69,12 @@ process.stdin.on('data', (chunk) => {
       else if (listMode === 'notools') reply(m.id, {});
       else if (listMode === 'badcursor') reply(m.id, { tools: [tool('x')], nextCursor: 5 });
       else if (listMode === 'nullcursor') reply(m.id, { tools: [tool('x')], nextCursor: null });
+      else if (listMode === 'endless') {
+        const n = cursor === undefined ? 1 : Number(String(cursor).slice(1)) + 1;
+        reply(m.id, { tools: [tool(`t${n}`)], nextCursor: `c${n}` });
+      }
+      else if (listMode === 'badlater' && cursor === undefined) reply(m.id, { tools: [tool('first')], nextCursor: 'p2' });
+      else if (listMode === 'badlater') reply(m.id, {});
       else if (cursor === undefined) reply(m.id, { tools: [tool('a1'), tool('a2')], nextCursor: 'p2' });
       else if (cursor === 'p2') reply(m.id, { tools: [tool('b1')], nextCursor: 'p3' });
       else if (cursor === 'p3') reply(m.id, { tools: [tool('c1'), tool('die')] });

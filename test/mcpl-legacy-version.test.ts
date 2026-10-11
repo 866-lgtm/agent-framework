@@ -1,5 +1,5 @@
 /**
- * The legacy engine's protocol boundary and inventory (room-284, shelf-487):
+ * The legacy engine's protocol boundary and inventory:
  * - it offers and accepts exactly MCP 2024-11-05; anything else is a typed
  *   McplProtocolVersionError carrying what each side said;
  * - such a verdict is never retried (no reconnect stub, no backoff loop), and
@@ -175,11 +175,16 @@ test('a malformed page is an error, never a partial or empty inventory', async (
   for (const [mode, pattern] of [
     ['notools', /malformed tools\/list page 1: no tools array/],
     ['badcursor', /malformed tools\/list page 1: nextCursor must be a string, got 5/],
-    ['nullcursor', /malformed tools\/list page 1: nextCursor must be a string, got null/],
   ] as const) {
     const connection = await connect(config('ok', { env: { MODE_LIST: mode } }));
     await assert.rejects(connection.sendToolsList(), pattern, mode);
   }
+});
+
+test('a null nextCursor ends the inventory, as an absent one does', async () => {
+  const connection = await connect(config('ok', { env: { MODE_LIST: 'nullcursor' } }));
+  const { tools } = await connection.sendToolsList();
+  assert.deepEqual(tools.map((t) => t.name), ['x']);
 });
 
 test('a repeating cursor is an error, not a silently partial inventory', async () => {
@@ -207,4 +212,116 @@ test('a modern configuration is refused by the legacy engine before anything is 
   // The same fixture, configured as legacy, does start: the log above can tell.
   await connect(config('ok', {}, startLog));
   assert.equal(readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length, 1);
+});
+
+test('a -32022 whose supported list lacks the modern revision names no modern remedy', async () => {
+  await assert.rejects(McplServerConnection.connect(config('reject-old'), HOST_CAPS), (err: unknown) => {
+    assert.ok(err instanceof McplProtocolVersionError);
+    assert.deepEqual(err.supported, ['2025-03-26']);
+    assert.match(err.message, /it supports: 2025-03-26/);
+    assert.doesNotMatch(err.message, /protocol: 'modern'/);
+    return true;
+  });
+});
+
+function startsIn(startLog: string): string[] {
+  return existsSync(startLog) ? readFileSync(startLog, 'utf8').split('\n').filter(Boolean) : [];
+}
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+test('a version verdict is never retried: one launch, and that child is reaped', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  for (const mode of ['reject', 'mismatch']) {
+    const startLog = join(dir, `${mode}.log`);
+    await assert.rejects(
+      McplServerConnection.connectWithReconnect(config(mode, { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 }, startLog), HOST_CAPS),
+      (err: unknown) => err instanceof McplProtocolVersionError,
+    );
+    const starts = startsIn(startLog);
+    assert.equal(starts.length, 1, `${mode}: launched once`);
+    // The rejection waits for the handshake's own cleanup, so its child is gone.
+    const pid = Number(starts[0]!.split(' ')[1]);
+    assert.equal(alive(pid), false, `${mode}: its child was reaped`);
+    // Past several reconnect intervals, nothing has launched again.
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(startsIn(startLog).length, 1, `${mode}: never retried`);
+  }
+});
+
+test('an initialize error that is not a version verdict stays a plain, retryable error', async () => {
+  await assert.rejects(McplServerConnection.connect(config('error'), HOST_CAPS), (err: unknown) => {
+    assert.ok(err instanceof Error);
+    assert.ok(!(err instanceof McplProtocolVersionError));
+    assert.match(err.message, /initialize failed on purpose/);
+    return true;
+  });
+  // With reconnect, it leaves a stub that keeps trying, as any transient failure does.
+  const stub = await McplServerConnection.connectWithReconnect(config('error', { reconnect: true, reconnectIntervalMs: 20 }), HOST_CAPS);
+  cleanups.push(() => stub.close());
+  assert.equal(stub.willReconnect, true);
+});
+
+test('a modern stdio configuration is refused before anything is spawned', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const startLog = join(dir, 'starts.log');
+  await assert.rejects(
+    McplServerConnection.connect(config('ok', { protocol: 'modern' }, startLog), HOST_CAPS),
+    /configured for modern MCP/,
+  );
+  assert.deepEqual(startsIn(startLog), [], 'nothing was spawned');
+});
+
+test('a list that never ends is refused after its page bound', async () => {
+  const connection = await connect(config('ok', { env: { MODE_LIST: 'endless' } }));
+  await assert.rejects(connection.sendToolsList(), /did not finish within 100 pages/);
+});
+
+test('a page after the first is checked as the first is', async () => {
+  const connection = await connect(config('ok', { env: { MODE_LIST: 'badlater' } }));
+  await assert.rejects(connection.sendToolsList(), /malformed tools\/list page 2: no tools array/);
+});
+
+async function startupTraces(dir: string, server: McplServerConfig): Promise<TraceEvent[]> {
+  const traces: TraceEvent[] = [];
+  const watcher: Module = {
+    name: 'trace-watcher',
+    async start(ctx: ModuleContext) { ctx.onTrace((event) => traces.push(event)); },
+    async stop() {},
+    getTools: (): ToolDefinition[] => [],
+    handleToolCall: async (): Promise<ToolResult> => ({ success: false, error: 'no tools', isError: true }),
+    onProcess: async () => ({}),
+  };
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: { complete: async () => { throw new Error('not used'); } } as unknown as import('@animalabs/membrane').Membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [watcher],
+    mcplServers: [server],
+  });
+  cleanups.push(() => framework.stop().catch(() => {}));
+  return traces;
+}
+
+test('at startup, willRetry follows reconnect and the verdict, and only a verdict raises the alert', async () => {
+  const cases: Array<[string, McplServerConfig, boolean, boolean]> = [
+    // [label, config, willRetry, alert]
+    ['verdict without reconnect', config('missing'), false, true],
+    ['failure with reconnect', config('error', { reconnect: true }), true, false],
+    ['failure without reconnect', config('error'), false, false],
+    // Refused before anything launches: nothing will retry it, reconnect or not.
+    ['configuration refused, with reconnect', { id: 'legacy', url: 'ftp://127.0.0.1/x', reconnect: true }, false, false],
+  ];
+  for (const [label, server, willRetry, alert] of cases) {
+    const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const traces = await startupTraces(dir, server);
+    const failed = traces.find((t) => t.type === 'mcpl:server-connect-failed') as { willRetry?: boolean } | undefined;
+    assert.equal(failed?.willRetry, willRetry, label);
+    assert.equal(traces.some((t) => t.type === 'ops:alert'), alert, `${label}: alert`);
+  }
 });

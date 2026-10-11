@@ -1,7 +1,6 @@
 /**
- * One owner per MCP server id across both engines (room-293, greptile's
- * review of PR #262 and Iris-1827's invariant): from a connect's admission
- * until its teardown is done, exactly one owner holds an id.
+ * One owner per MCP server id across both engines: from a connect's
+ * admission until its teardown is done, exactly one owner holds an id.
  * - a connect is refused while a connect or disconnect for the id is in
  *   flight, a legacy handshake included;
  * - a disconnect waits for what held the id before it, so nothing it removes
@@ -285,5 +284,134 @@ test('legacy: a failed connect whose cleanup cannot reap stays registered until 
     await framework.disconnectMcplServer('l');
     await framework.connectMcplServer(legacy('l', 'ok', log));
     assert.equal(status(framework, 'l')?.connected, true);
+  });
+});
+
+test('stop() closes every connection, keeps the ones it cannot reap registered, and then rejects naming them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  const reaping = unreapable();
+  await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+  await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
+  await assert.rejects(framework.stop(), /stop\(\) finished, but not cleanly: .*could not be reaped/);
+  const internals = framework as unknown as {
+    modernServers(): Map<string, unknown>;
+    mcplServerRegistry: { getServer(id: string): unknown };
+  };
+  assert.ok(internals.modernServers().has('m'), 'the modern one it could not reap keeps its id');
+  assert.ok(internals.mcplServerRegistry.getServer('l'), 'and so does the legacy one');
+  for (const stuck of reaping.stuck) await killAndWait(stuck);
+});
+
+test("a failed startup's cleanup closes both engines' connections, each whatever the other's close did", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  const reaping = unreapable();
+  try {
+    await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
+    reaping.active = false;
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    const errors: unknown[] = [];
+    const realError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args); };
+    try {
+      await (framework as unknown as { closeMcpConnectionsAfterFailedStartup(): Promise<void> }).closeMcpConnectionsAfterFailedStartup();
+    } finally {
+      console.error = realError;
+    }
+    const internals = framework as unknown as {
+      modernServers(): Map<string, unknown>;
+      mcplServerRegistry: { getServer(id: string): unknown };
+    };
+    assert.equal(internals.modernServers().has('m'), false, 'the modern connection was closed and let go, though the legacy close failed');
+    assert.equal(status(framework, 'm')?.connected, false);
+    assert.ok(internals.mcplServerRegistry.getServer('l'), 'the one it could not reap stays registered');
+    assert.equal(status(framework, 'l')?.connected, false, 'closed');
+    assert.match(JSON.stringify(errors), /could not be reaped/, 'and the failure is logged, not thrown');
+  } finally {
+    // Whatever the assertions found, end the stuck child so stop() can reap it.
+    for (const stuck of reaping.stuck) await killAndWait(stuck);
+    await framework.stop();
+  }
+});
+
+test('a restart whose new configuration is refused leaves the running server as it was', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'raw.jsonl');
+    await framework.connectMcplServer(modern('m', '', log));
+    await assert.rejects(
+      framework.restartMcplServer('m', { id: 'm', url: 'ftp://127.0.0.1/x' }),
+      /MCP server "m" configuration: .*url must be/,
+    );
+    assert.equal(status(framework, 'm')?.connected, true, 'still connected');
+    assert.equal(launches(log).length, 1, 'never torn down or relaunched');
+    assert.ok(toolsOf(framework, 'm').length > 0, 'its tools still listed');
+  });
+});
+
+test("a refresh in flight when a server is disconnected doesn't bring its tools back", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    assert.ok(toolsOf(framework, 'm').length > 0);
+    const internals = framework as unknown as {
+      modernServers(): Map<string, { listTools(): Promise<unknown[]> }>;
+      refreshMcplTools(): Promise<void>;
+    };
+    const connection = internals.modernServers().get('m')!;
+    const realList = connection.listTools.bind(connection);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let listed = false;
+    connection.listTools = async () => { const tools = await realList(); listed = true; await gate; return tools; };
+    const refreshing = internals.refreshMcplTools();
+    await until(() => listed, 'the refresh holds the server\'s list');
+    await framework.disconnectMcplServer('m');
+    release();
+    await refreshing;
+    assert.deepEqual(toolsOf(framework, 'm'), [], 'the earlier refresh, finishing last, published none of its tools');
+  });
+});
+
+test('a server lost for good, legacy or modern, leaves the tool list', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    assert.ok(toolsOf(framework, 'l').length > 0 && toolsOf(framework, 'm').length > 0);
+    await framework.executeToolCall(call('mcpl--l--die')).catch(() => {});
+    await framework.executeToolCall(call('mcpl--m--die')).catch(() => {});
+    await until(() => toolsOf(framework, 'l').length === 0, 'the legacy server\'s tools gone');
+    await until(() => toolsOf(framework, 'm').length === 0, 'the modern server\'s tools gone');
+  });
+});
+
+test("a stdio server switched to the modern family is a new coalescing binding; a legacy configuration's binding is unchanged", async () => {
+  await withFramework(async ({ framework }) => {
+    const internals = framework as unknown as {
+      mcplServerConfigs: Map<string, McplServerConfig>;
+      coalescingBinding(id: string): string;
+    };
+    internals.mcplServerConfigs.set('s', { id: 's', command: 'srv', args: ['a'] });
+    const legacyBinding = internals.coalescingBinding('s');
+    const { createHash } = await import('node:crypto');
+    assert.equal(
+      legacyBinding,
+      createHash('sha256').update(JSON.stringify(['s', null, 'srv', ['a']])).digest('hex').slice(0, 16),
+      'the hash a stored legacy binding was made with',
+    );
+    internals.mcplServerConfigs.set('s', { id: 's', command: 'srv', args: ['a'], protocol: 'modern' });
+    assert.notEqual(internals.coalescingBinding('s'), legacyBinding);
+    internals.mcplServerConfigs.delete('s');
   });
 });

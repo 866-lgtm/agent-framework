@@ -32,3 +32,6 @@
     call's promise.
   - **Status:** `listMcplServers()` entries gain `family`, `protocolVersion`
     and `transport`.
+- A server lost for good (it closed and won't reconnect), MCPL or modern,
+  now leaves the agents' tool list, as a disconnected one does. An MCP tool
+  result marked as an error is traced as `tool:failed`, on both engines.

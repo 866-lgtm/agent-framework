@@ -305,9 +305,11 @@ export class WebSocketTransport extends McplTransport {
   /**
    * Dial `config.url` and resolve once the socket is OPEN. Appends `?token=`
    * when `config.token` is set. Rejects on connect error / timeout (and tears
-   * the socket down) so a failed dial never leaks an open handle.
+   * the socket down) so a failed dial never leaks an open handle. `signal`
+   * ends a dial whose connection is closed meanwhile, at once, rather than
+   * at the open timeout.
    */
-  static async open(config: McplServerConfig): Promise<WebSocketTransport> {
+  static async open(config: McplServerConfig, signal?: AbortSignal): Promise<WebSocketTransport> {
     // Resolve the per-dial credential first: the provider runs on every
     // connect AND reconnect, so rotation happens at the transport layer and
     // nothing above it ever holds a credential.
@@ -341,31 +343,36 @@ export class WebSocketTransport extends McplTransport {
 
     return new Promise<WebSocketTransport>((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => {
+      const abandon = (error: Error): void => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         ws.removeAllListeners();
         ws.on('error', swallowLateErrors);
         try { ws.terminate(); } catch { /* already gone */ }
-        reject(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${redacted})`));
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${redacted})`));
       }, WS_OPEN_TIMEOUT_MS);
+      const onAbort = (): void => {
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect abandoned: the connection was closed (${redacted})`));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
 
       ws.once('open', () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         ws.removeAllListeners('error'); // the instance re-attaches its own handlers
         resolve(new WebSocketTransport(ws));
       });
 
       ws.once('error', (err: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        ws.removeAllListeners();
-        ws.on('error', swallowLateErrors);
-        try { ws.terminate(); } catch { /* already gone */ }
-        reject(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
       });
     });
   }
@@ -444,10 +451,10 @@ export function isWebSocketTransport(config: McplServerConfig): boolean {
  * The returned transport is connected at the byte level but has NOT
  * performed the MCPL handshake.
  */
-export async function openTransport(config: McplServerConfig): Promise<McplTransport> {
+export async function openTransport(config: McplServerConfig, signal?: AbortSignal): Promise<McplTransport> {
   const binding = resolveServerBinding(config);
   if (binding.family !== 'legacy') {
     throw new Error(`MCP server "${config.id}" is configured for modern MCP; the legacy transports can't open it`);
   }
-  return binding.transport === 'websocket' ? WebSocketTransport.open(config) : StdioTransport.spawn(config);
+  return binding.transport === 'websocket' ? WebSocketTransport.open(config, signal) : StdioTransport.spawn(config);
 }
