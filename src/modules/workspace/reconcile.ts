@@ -12,7 +12,9 @@
  *  - P unknown: a tombstone, then store origin, then legacy entries decide;
  *    otherwise a new disk file is ingested or listed disk-only.
  *  - P pending (an intent whose effect may or may not have landed) resolves
- *    first; P interrupted is a sticky conflict.
+ *    first; P interrupted is a sticky conflict until it's resolved explicitly
+ *    or disk and the store agree. Another branch's pending adoption is left
+ *    for its own branch to resolve, even where this branch agrees with disk.
  *
  * Only a push completes a push. A pending disk intent is the module's own
  * write or unlink, and its completion releases the protection a draft has
@@ -29,7 +31,11 @@
  * Each pass observes disk first (the only async step), then reads S, P and
  * intent and applies every decision in one synchronous step, in the agreed
  * order: intents (durable) → tree commits and intent records → completions
- * (after `store.sync()`). The caller serializes passes per mount.
+ * (after `store.sync()`). The caller serializes passes per mount. A drop (S
+ * removed for a disk copy the workspace can't hold) is the one tree adoption
+ * without an intent: it forgets P first, which is conservative, since a crash
+ * before the removal leaves P unknown with S present, a conflict, and never
+ * a wrong adoption.
  */
 
 import type { JsStore } from '@animalabs/chronicle';
@@ -104,7 +110,10 @@ export interface PassResult {
    * A path sync's adoptions that gave up a change of the workspace's own,
    * each with the state the rule would otherwise have kept (`was`).
    */
-  discarded: Array<{ path: string; was: EntryState; op: TreeOp }>;
+  /** What a path sync gave up of the workspace's own; `op` is what it did to the
+   *  workspace copy, absent when it changed none (a deletion or conflict given
+   *  up for a disk copy the workspace can't hold). */
+  discarded: Array<{ path: string; was: EntryState; op?: TreeOp }>;
   /** Conflicts recorded by this pass, with the disk change behind each. */
   newConflicts: Array<{ path: string; op: TreeOp }>;
   /** Every path the pass decided, by path. */
@@ -242,6 +251,12 @@ interface Verdict {
   unconfirmed?: true;
   /** A path sync's adoption gives up this workspace state (see decide). */
   discards?: EntryState;
+  /**
+   * The last confirmed evidence decide resolved for the path, which an
+   * adoption's intent carries as its prior: a settled same-branch adoption's
+   * outcome, where the recorded P is still that adoption's pending record.
+   */
+  prior?: Agreed;
 }
 
 /** States in which the rule keeps a change of the workspace's own over disk. */
@@ -398,9 +413,13 @@ function decide(
     // have kept of the workspace's own (a draft, a deletion, a conflict's
     // workspace side), and the verdict says which.
     const taken = adoptDisk(d, s);
-    if (taken.adopt) {
-      const kept = decide(d, s, pIn, bi, branchId, false).state;
-      if (WORKSPACE_KEPT.has(kept)) taken.discards = kept;
+    // A give-up is an adoption, or the intent it clears: a deletion or a
+    // conflict given up for a disk copy the workspace can't hold changes no
+    // tree entry, and is listed all the same.
+    if (taken.adopt || (bi && taken.intent !== undefined)) {
+      const kept = decide(d, s, pIn, bi, branchId, false);
+      if (WORKSPACE_KEPT.has(kept.state)) taken.discards = kept.state;
+      if (taken.adopt && kept.prior) taken.prior = kept.prior;
     }
     return taken;
   }
@@ -428,6 +447,10 @@ function decide(
   // Agreement settles everything, a recorded conflict included.
   if (sameCandidate(dc, sc)) {
     const settles = bi?.tombstone || bi?.conflict || bi?.origin ? { intent: {} } : {};
+    // Another branch's pending adoption is still pending here (resolvePending
+    // leaves it): that branch resolves it, by its own tree. Recording this
+    // branch's agreement over it would lose the adoption there.
+    if (p?.kind === 'pending') return verdict({ state: 'synced', ...settles });
     if (dc.kind === 'absent') {
       return verdict({ state: 'synced', ...(p && p.kind !== 'absent' ? { p: { kind: 'absent' } as Agreed } : {}), ...settles });
     }
@@ -454,11 +477,19 @@ function decide(
     const pc = candidateOf(p);
     if (sameCandidate(dc, pc)) return verdict({ state: keepStoreSide(s !== null, bi) });
     if (sameCandidate(sc, pc)) {
-      // Only disk changed since it last agreed: adopt it.
+      // Only disk changed since it last agreed: adopt it. P is global, so
+      // S = P means the workspace holds what disk last agreed with, whichever
+      // branch that agreement came from, and a branch's intent doesn't
+      // outrank it. A known P of absent means disk did lose the file, which
+      // settles a tombstone here: a file disk shows now is a new one, and
+      // adopting it gives up nothing of the workspace's own. A tombstone
+      // guards a deletion only while P is unknown (below).
       const settles = bi ? { intent: {} } : {};
-      if (d.kind === 'absent') return { state: 'synced', adopt: 'remove', op: 'deleted', p: { kind: 'absent' }, ...settles };
+      // The adoption's intent carries this resolved evidence as its prior.
+      const prior = p.kind === 'absent' || p.kind === 'content' ? { prior: p } : {};
+      if (d.kind === 'absent') return { state: 'synced', adopt: 'remove', op: 'deleted', p: { kind: 'absent' }, ...prior, ...settles };
       if (d.ingestible) {
-        return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), ...settles };
+        return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), ...prior, ...settles };
       }
       return { state: 'disk-only', ...(s ? { adopt: 'drop' as const, op: 'deleted' as const } : {}), p: 'forget', ...settles };
     }
@@ -649,7 +680,7 @@ export async function reconcilePass(
   // 1. Intents for adoptions, durable before any tree commit.
   const adoptions = planned.filter((x) => x.verdict.adopt === 'ingest' || x.verdict.adopt === 'remove');
   adoptions.forEach((x, i) => {
-    const prior = x.p && (x.p.kind === 'absent' || x.p.kind === 'content') ? x.p : null;
+    const prior = x.verdict.prior ?? (x.p && (x.p.kind === 'absent' || x.p.kind === 'content') ? x.p : null);
     agreement.intend(mount.name, x.path, {
       effect: 'adopt',
       prior,
@@ -683,7 +714,7 @@ export async function reconcilePass(
       committed = true;
     }
     if (v.op && v.adopt) result.ops.push({ path: x.path, op: v.op });
-    if (v.op && v.adopt && v.discards) result.discarded.push({ path: x.path, was: v.discards, op: v.op });
+    if (v.discards) result.discarded.push({ path: x.path, was: v.discards, ...(v.op && v.adopt ? { op: v.op } : {}) });
   }
 
   // 4. Completions and agreements, after the commits they assert are synced —

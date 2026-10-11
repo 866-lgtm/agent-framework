@@ -1195,7 +1195,9 @@ export class WorkspaceModule implements Module {
           + 'rechecked in full and nothing pending in the workspace is discarded. With a path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
-          + 'Each workspace change it gives up is listed under `discarded`, with the state it had. '
+          + 'Each workspace change it gives up is listed under `discarded`, with the state it had and, as `op`, '
+          + 'what that did to the workspace copy (absent when it changed none: a deletion or conflict given up for '
+          + 'a disk copy the workspace can\'t hold). '
           + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
           + 'directory) is unavailable and listed under `incomplete`: reconnect it, or take the root as it is '
           + 'now with acceptRoot.',
@@ -2699,8 +2701,9 @@ export class WorkspaceModule implements Module {
       mount: string;
       synced: string[];
       conflicts: Array<{ path: string; kind: string; diskCopy: string }>;
-      /** A path sync's workspace changes given up for disk's state, each with the state it had. */
-      discarded?: Array<{ path: string; was: string; op: string }>;
+      /** A path sync's workspace changes given up for disk's state, each with the state it had,
+       *  and what that did to the workspace copy (absent when nothing). */
+      discarded?: Array<{ path: string; was: string; op?: string }>;
     }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
     const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
@@ -2747,7 +2750,7 @@ export class WorkspaceModule implements Module {
       const conflicts = [...pass.reports.values()]
         .filter((r) => r.state === 'conflict')
         .map((r) => ({ path: r.path, kind: r.conflict?.kind ?? 'both-changed', diskCopy: r.conflict?.diskCopy ?? 'referenced' }));
-      if (pass.ops.length > 0 || conflicts.length > 0) {
+      if (pass.ops.length > 0 || conflicts.length > 0 || pass.discarded.length > 0) {
         allResults.push({
           mount: name,
           synced: pass.ops.map((o) => o.path),

@@ -184,6 +184,9 @@ async function seedSynced(env: Env, m: WorkspaceModule, path: string, content: s
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** The hash evidence and disk facts carry for this text. */
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+
 /** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
 async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
   const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
@@ -376,6 +379,33 @@ describe('branches', () => {
   });
 });
 
+describe('a deletion another branch put on disk', () => {
+  for (const how of ['a sync', 'a path sync'] as const) {
+    test(`settles this branch's tombstone, and ${how} adopts a new disk file there as new, giving up nothing`, async (t) => {
+      // P is global: this branch's S (absent) equals P (absent, from the other
+      // branch's unlink), so the new file is only a disk change. The rule
+      // decides by P whenever it's known; a tombstone guards only without it.
+      const env = new Env(t);
+      const m = await env.open();
+      await seedSynced(env, m, 'a.txt', 'v1');
+      const main = env.store.currentBranch().name;
+      env.store.createBranch('other', main);
+      await call(m, 'delete', { path: 'work/a.txt' }); // main's own deletion, never pushed
+      env.store.switchBranch('other');
+      await call(m, 'delete', { path: 'work/a.txt' });
+      await call(m, 'materialize', { applyDeletions: true }); // other removes it from disk: P is absent
+      assert.equal(existsSync(env.disk('a.txt')), false);
+      env.writeDisk('a.txt', 'new, from the shell');
+      env.store.switchBranch(main);
+
+      const data = await call(m, 'sync', how === 'a sync' ? {} : { path: 'work/a.txt' });
+      assert.deepEqual(data.results, [{ mount: 'work', synced: ['a.txt'], conflicts: [] }], 'taken in, with nothing discarded');
+      assert.equal(await stateOf(m, 'a.txt'), 'synced');
+      assert.equal(await contentOf(m, 'a.txt'), 'new, from the shell');
+    });
+  }
+});
+
 describe('workspace deletes', () => {
   test('a delete without autoMaterialize is never resurrected, reaches disk only with applyDeletions', async (t) => {
     const env = new Env(t);
@@ -469,6 +499,18 @@ describe('a path sync', () => {
     ], 'a shell edit taken in discards nothing; the rest were the workspace\'s own changes');
     assert.equal(await contentOf(m, 'src/existing.txt'), 'v1');
     assert.equal(await stateOf(m, 'src/new.txt'), 'not listed', 'disk has no such file, so neither does the workspace');
+  });
+
+  test("lists a deletion it gives up for a disk copy the workspace can't hold, though no workspace entry changes", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'text');
+    await call(m, 'delete', { path: 'work/a.txt' });
+    env.writeDisk('a.txt', ONE_PX_PNG); // binary: never stored
+    const data = await call(m, 'sync', { path: 'work/a.txt' });
+    assert.deepEqual(data.results, [{ mount: 'work', synced: [], conflicts: [], discarded: [{ path: 'a.txt', was: 'conflict' }] }],
+      'the workspace deletion (a conflict once disk changed) is given up, with no op: the workspace copy was already gone');
+    assert.equal(await stateOf(m, 'a.txt'), 'disk-only');
   });
 });
 
@@ -735,6 +777,39 @@ describe('restarts and faults', () => {
     assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending');
     return m;
   }
+
+  test("this branch agreeing with disk leaves another branch's pending adoption for that branch to resolve", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.writeDisk('a.txt', 'B');
+    m = await env.fault(m, 'sync', 'after-intent'); // main's adoption of B, pending
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending');
+
+    env.store.switchBranch('other');
+    await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'other agrees with disk');
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending', "and leaves main's adoption pending");
+
+    env.store.switchBranch(main);
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'main resolves its own adoption');
+    assert.equal(await contentOf(m, 'a.txt'), 'B');
+  });
+
+  test('an adoption intended over a pending one carries the evidence that settled it, so a crash before it lands redoes it', async (t) => {
+    const env = new Env(t);
+    let m = await pendingAdoption(env); // S = A, an adoption of B pending
+    env.writeDisk('a.txt', 'C');
+    m = await env.fault(m, 'sync', 'after-intent'); // settles B's (S is A) and intends C
+    const p = (m as any).agreement.get('work', 'a.txt');
+    assert.equal(p.kind, 'pending');
+    assert.deepEqual(p.prior && { kind: p.prior.kind, hash: p.prior.hash }, { kind: 'content', hash: sha('A') },
+      "its prior is A, as the settled adoption left it, not the pending record's");
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'from A, the adoption of C is redone');
+    assert.equal(await contentOf(m, 'a.txt'), 'C');
+  });
 
   test('a write of the pending adoption\'s content is not taken for the old adoption landing', async (t) => {
     const env = new Env(t);
@@ -1265,7 +1340,6 @@ describe('restarts and faults', () => {
     env.store = JsStore.openOrCreate({ path: env.storePath });
     env.legacyEntry('a.txt', 'alpha');
     env.legacyEntry('b.txt', 'beta');
-    const sha = (text: string) => createHash('sha256').update(text).digest('hex');
     const saved = { mounts: { work: { lastMaterializedSeq: 1, materializedHashes: { 'a.txt': sha('alpha'), 'b.txt': sha('beta') }, refusedPaths: [] } } };
 
     // The drive isn't mounted yet: its mountpoint is an empty directory.
