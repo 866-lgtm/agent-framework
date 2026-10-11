@@ -25,7 +25,7 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 type Publish = (params: { channelId: string }) => Promise<unknown>;
 
 function registryWith(
-  servers: Record<string, { publish: Publish; grant?: boolean; open?: () => Promise<unknown> }>,
+  servers: Record<string, { publish: Publish; grant?: boolean | { without: string[] }; open?: () => Promise<unknown> }>,
   failures: unknown[] = [],
 ) {
   const published: Array<{ serverId: string; channelId: string }> = [];
@@ -34,7 +34,9 @@ function registryWith(
   for (const [id, s] of Object.entries(servers)) {
     mocks.set(id, {
       id,
-      grant: new CapabilityGrant(new Set(s.grant === false ? [] : ALL_CAPABILITY_PATHS), []),
+      grant: new CapabilityGrant(new Set(
+        s.grant === false ? [] : ALL_CAPABILITY_PATHS.filter((p) => !(typeof s.grant === 'object' && s.grant.without.includes(p))),
+      ), []),
       sendChannelsPublish: async (params: { channelId: string }) => {
         published.push({ serverId: id, channelId: params.channelId });
         return s.publish(params);
@@ -90,7 +92,8 @@ describe('ChannelRegistry.publish outcomes', () => {
   });
 
   it('refuses a send the grant forbids before opening anything', async () => {
-    const { registry, seed, opened, published } = registryWith({ discord: { publish: ok, grant: false } });
+    // The grant could open the channel (channels.lifecycle), but not publish into it.
+    const { registry, seed, opened, published } = registryWith({ discord: { publish: ok, grant: { without: ['channels.publish'] } } });
     seed('discord', 'c', '#c', false);
     const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
     assert.equal(outcome.status, 'failed');
