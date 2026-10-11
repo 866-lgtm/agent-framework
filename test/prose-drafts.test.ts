@@ -333,14 +333,17 @@ async function harness(opts: {
       : [],
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
-    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' = 'incoming') => {
+    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' = 'incoming') => {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
       if (via === 'incoming') {
         h.command({ op: 'incoming', channelId: ROOM, messageId: `in-${++incoming}`, mode: 'addressed', text: `message ${incoming}` });
       } else {
+        // 'silent': a control-plane wake whose plain prose stays private, as
+        // a silent heartbeat's does.
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
           agentName, reason: 'test', source: 'test', timestamp: Date.now(),
+          ...(via === 'silent' ? { suppressProse: true } : {}),
         });
       }
       await until(() => membrane.calls.length > before, 'turn start');
@@ -589,6 +592,21 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().length, 0);
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
       assert.match(marker, /was not confirmed \(MCPL server "discord" did not respond to channels\/publish .*within 1000ms.*\(delivery uncertain\)\)\. It may or may not have been posted/);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a silent turn's prose stays private beside a send: counted, never held or named", async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('private narration'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('more private words')]),
+      ], 'scout', 'silent');
+      assert.deepEqual(h.drafts(), [], 'nothing was held as a draft');
+      assert.ok(!h.texts().some((t) => t.includes('held as draft')), 'and no notice names one');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
     } finally {
       await h.close();
     }

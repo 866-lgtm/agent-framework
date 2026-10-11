@@ -1056,8 +1056,9 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
-  /** Told once per inbound acceptance (mcpl/inbound-source.ts); unset unless
-   *  a receipt consumer installs one. */
+  /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
+   *  seam, unset here: the receipt work (shelf-354) assigns it inside the
+   *  framework, and tests set it by cast. */
   private inboundAcceptanceObserver?: InboundAcceptanceObserver;
 
   /** Per-agent output locus FROZEN for the CURRENT logical turn. Resolved
@@ -7129,10 +7130,17 @@ export class AgentFramework {
     /** The event's surface envelope, when it is console/API input. */
     surface?: InboundSource,
   ): Promise<void> {
-    // Add messages
+    // Add messages. Only the framework writes the inbound envelope: one a
+    // module's metadata carries (echoed from a server's event, say) is
+    // dropped, and a surface event's messages carry the framework's own.
     if (response.addMessages) {
       for (const msg of response.addMessages) {
-        const metadata = surface ? { ...msg.metadata, [INBOUND_SOURCE_KEY]: surface } : msg.metadata;
+        let metadata = msg.metadata;
+        if (metadata && INBOUND_SOURCE_KEY in metadata) {
+          const { [INBOUND_SOURCE_KEY]: _dropped, ...rest } = metadata;
+          metadata = rest;
+        }
+        if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
         const id = this.addMessage(msg.participant, msg.content, metadata);
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
