@@ -9,6 +9,8 @@ import {
   indexRequestOnlyRows,
   renderRequestOnlyRows,
   silentHeartbeatSeparatorTurn,
+  tickKey,
+  toolLoopPrompt,
   type RequestOnlyPrompt,
   type RequestOnlyRowIndex,
   type SilentHeartbeatTick,
@@ -22,9 +24,6 @@ import {
 } from './tool-result-history.js';
 
 export interface ActivationRequestOptions {
-  /** The `[Continue]` prompt this turn's earlier streams replied to, if any:
-   *  kept for this request's reply only while this request renders it. */
-  continuePrompt?: RequestOnlyPrompt;
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
 }
@@ -33,10 +32,11 @@ export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
   /** The request-only `[Continue]` prompt this request's reply follows, if
-   *  any: a new one when the request ends on `[Continue]`, else the turn's
-   *  prompt (`ActivationRequestOptions.continuePrompt`) only if this request
-   *  renders it. The framework stamps the reply's rows with it
-   *  (`metadata.promptedBy`), for later compiles to render it before them. */
+   *  any, read from the request: a new one when it ends on `[Continue]`;
+   *  else, when it ends on tool results, the prompt of the reply that called
+   *  those tools (`toolLoopPrompt`); else none. The framework stamps the
+   *  reply's rows with it (`metadata.promptedBy`), for later compiles to
+   *  render it before them. */
   continuePrompt?: RequestOnlyPrompt;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
@@ -876,19 +876,22 @@ export class Agent {
     // that same turn, so the prefix it caches is the one every later compile
     // renders. "First" is per agent: a broadcast tick shares its eventId with
     // every resident.
-    const rendered = renderRequestOnlyRows(messages, this.indexRequestOnlyRows(), this.name);
+    const index = this.indexRequestOnlyRows();
+    const rendered = renderRequestOnlyRows(messages, index, this.name);
     messages = rendered.messages;
     // A tick opens wherever its separator isn't already rendered: on its first
     // request, and on a restart whose compile left none of the tick's rows,
     // so the restart's reply follows the separator, where every later compile
     // renders it.
     const openingTick = options.silentHeartbeat !== undefined
-      && !rendered.separatedTicks.has(options.silentHeartbeat.eventId);
+      && !rendered.separatedTicks.has(tickKey(options.silentHeartbeat));
 
-    // The [Continue] prompt this request's reply follows: a new one when it
-    // ends on [Continue]; else the turn's prompt only where this request
-    // renders it (a stream resumed after a cooldown, say, whose compile now
-    // ends on a message that arrived meanwhile, renders none); else none.
+    // The [Continue] prompt this request's reply follows, read from the
+    // request itself: a new one when it ends on [Continue]; else, when it
+    // ends on tool results, the prompt of the reply that called those tools,
+    // whose tool loop this reply continues; else none. A request that ends
+    // on anything else (a message that arrived during a cooldown, say)
+    // prompts a reply that follows that.
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
@@ -898,9 +901,8 @@ export class Agent {
       // and after context compression a stale assistant turn can end up last.
       messages = [...messages, continueTurn()];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
-    }
-    if (!continuePrompt && options.continuePrompt && rendered.promptedTurns.has(options.continuePrompt.turn)) {
-      continuePrompt = options.continuePrompt;
+    } else {
+      continuePrompt = toolLoopPrompt(messages.at(-1), index, this.name);
     }
 
     const request: NormalizedRequest = {

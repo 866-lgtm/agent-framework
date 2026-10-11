@@ -16,24 +16,38 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentFramework, SILENT_HEARTBEAT_SEPARATOR } from '../src/index.js';
-import { indexRequestOnlyRows, renderRequestOnlyRows } from '../src/silent-heartbeat.js';
+import { indexRequestOnlyRows, renderRequestOnlyRows, tickKey } from '../src/silent-heartbeat.js';
 import type { AgentConfig, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
 import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { NativeFormatter } from '@animalabs/membrane';
-import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
+import { MembraneError, NativeFormatter } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
 class ToolModule implements Module {
   readonly name = 'tools';
   calls: ToolCall[] = [];
+  /** A message someone sends while the next call runs: the agent's turn is
+   * alive, so it is deferred to the tool boundary. */
+  arrive: string | null = null;
+  /** The next call's result ends the turn. */
+  endTurn = false;
   private ctx: ModuleContext | null = null;
   async start(ctx: ModuleContext) { this.ctx = ctx; ctx.registerSpeechHandler('*'); }
   async stop() { this.ctx?.unregisterSpeechHandler(); this.ctx = null; }
   async onProcess() { return {}; }
   async onAgentSpeech() {}
   getTools(): ToolDefinition[] { return [{ name: 'ping', description: 'explicit action', inputSchema: { type: 'object', properties: {} } }]; }
-  async handleToolCall(call: ToolCall): Promise<ToolResult> { this.calls.push(call); return { success: true, data: { ok: true } }; }
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    this.calls.push(call);
+    if (this.arrive !== null) {
+      this.ctx!.addMessage('nissa', [{ type: 'text', text: this.arrive }] as ContentBlock[]);
+      this.arrive = null;
+    }
+    const endTurn = this.endTurn;
+    this.endTurn = false;
+    return { success: true, data: { ok: true }, ...(endTurn ? { endTurn } : {}) };
+  }
 }
 
 let seq = 0;
@@ -65,15 +79,53 @@ function signed(signature: string, text: string, extra: ContentBlock[] = []): Co
   ];
 }
 
-/** One explicit response queue per stream, so a restart opens a fresh one. */
+/** A stream the provider fails at once. */
+class ErrorStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  constructor(private readonly error: Error) {}
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void {}
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+/** One explicit queue per stream, so a restart opens a fresh one: the
+ * responses of its tool rounds, or an error the stream fails with. */
 class QueuedStreamsMembrane extends MockMembrane {
-  queues: NormalizedResponse[][] = [];
+  queues: Array<NormalizedResponse[] | Error> = [];
   override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
     this.calls.push(request);
-    const stream = new MockYieldingStream(this.queues.shift() ?? []);
+    const next = this.queues.shift() ?? [];
+    if (next instanceof Error) return new ErrorStream(next);
+    const stream = new MockYieldingStream(next);
     this.lastStream = stream;
     return stream;
   }
+}
+
+/** A 429 that holds the turn for a provider cooldown. */
+const accelerationLimit = () => new MembraneError({
+  type: 'rate_limit', retryable: true, httpStatus: 429,
+  message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+  rawError: { status: 429 },
+});
+
+/** A failure the default error policy retries at once. */
+const transientFailure = () => new MembraneError({
+  type: 'server', retryable: true, httpStatus: 500, retryAfterMs: 1,
+  message: 'internal server error', rawError: { status: 500 },
+});
+
+/** A tool round whose usage puts the next round past the physical window, so
+ * the stream restarts at its boundary. */
+function nearCapToolRound(signature: string, text: string, id: string): NormalizedResponse {
+  const response = createMockResponse(
+    signed(signature, text, [{ type: 'tool_use', id, name: 'tools--ping', input: {} } as ContentBlock]), 'tool_use');
+  (response as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
+  return response;
 }
 
 /** A strategy that leaves every tool exchange out of the compiled window
@@ -94,8 +146,12 @@ const refused = () => ({
 async function make(opts: {
   deliver?: boolean; membrane?: MockMembrane; physicalWindowTokens?: number;
   agents?: string[]; agent?: Partial<AgentConfig>;
+  /** An earlier framework's directory, to open its store again. */
+  dir?: string;
+  /** Where the agent's plain speech lands; null for no channel. */
+  locus?: string | null;
 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'silent-hb-rows-'));
+  const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'silent-hb-rows-'));
   const membrane = opts.membrane ?? new MockMembrane();
   const mod = new ToolModule();
   const framework = await AgentFramework.create({
@@ -108,7 +164,8 @@ async function make(opts: {
     modules: [mod],
   });
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
+    resolveLocus: () => (opts.locus === undefined ? 'world:commons' : opts.locus),
+    getDefaultPublishChannel: () => (opts.locus === undefined ? 'world:commons' : opts.locus),
     routeSpeech: async () => ({ delivered: opts.deliver ?? true, channelId: 'world:commons' }),
     startTyping: () => {}, stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,
@@ -151,6 +208,14 @@ function stored(framework: AgentFramework, agent = 'assistant') {
     participant: string; content: ContentBlock[]; metadata?: Record<string, any>;
   }>;
 }
+
+function rowWith(framework: AgentFramework, text: string) {
+  const row = stored(framework).find((m) => m.content.some((b) => (b as { text?: string }).text === text));
+  assert.ok(row, `a stored row reads ${JSON.stringify(text)}`);
+  return row;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 describe('silent heartbeat stored rows', () => {
   it('keeps a tick reply out of the previous assistant message on the wire', async () => {
@@ -567,7 +632,26 @@ describe('replies to a [Continue] turn', () => {
     assert.deepEqual(rendered.messages.map(textOf), [
       '[heartbeat tick]', 'old tick reply', 'recorded separator', 'new tick reply', 'recorded prompt', 'continued reply',
     ]);
-    assert.deepEqual([...rendered.separatedTicks].sort(), ['hb-new', 'hb-old']);
+    assert.deepEqual([...rendered.separatedTicks].sort(), [
+      tickKey({ serverId: 'heartbeat', eventId: 'hb-new' }), tickKey({ serverId: 'heartbeat', eventId: 'hb-old' }),
+    ].sort());
+  });
+
+  it('keys a tick by its server and its event id together', () => {
+    // Two servers' events can share an id: each tick still gets its own
+    // separator, before its own first row.
+    const a = { eventId: 'hb-1', serverId: 'heartbeat-a', agentName: 'assistant', separator: 'separator a' };
+    const b = { eventId: 'hb-1', serverId: 'heartbeat-b', agentName: 'assistant', separator: 'separator b' };
+    const stored = [
+      { participant: 'assistant', content: signed('sig-a', 'tick a reply'), metadata: { silentHeartbeat: a } },
+      { participant: 'nissa', content: [{ type: 'text', text: 'between the ticks' }] as ContentBlock[] },
+      { participant: 'assistant', content: signed('sig-b', 'tick b reply'), metadata: { silentHeartbeat: b } },
+    ];
+    const index = indexRequestOnlyRows(stored, 'assistant');
+    const rendered = renderRequestOnlyRows(stored.map(({ participant, content }) => ({ participant, content })), index, 'assistant');
+    assert.deepEqual(rendered.messages.map(textOf),
+      ['separator a', 'tick a reply', 'between the ticks', 'separator b', 'tick b reply']);
+    assert.deepEqual([...rendered.separatedTicks].sort(), [tickKey(a), tickKey(b)].sort());
   });
 
   it('marks every row the reply\'s turn stores, and renders one [Continue] before the first', async () => {
@@ -594,7 +678,7 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it('carries the prompt into the reply\'s budget restart, for a window that later folds the first round', async () => {
+  it('a budget restart that ends on the round\'s tool results reads its prompt, for a window that later folds the round', async () => {
     const membrane = new QueuedStreamsMembrane();
     const strategy = new OmitToolExchange();
     strategy.omit = false;
@@ -602,13 +686,10 @@ describe('replies to a [Continue] turn', () => {
     try {
       membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
       await wake(x, ordinaryEvent('hello'));
-      // The reply to [Continue] restarts at its tool boundary; the restart's
-      // compile ends on the tool_result, so it opens on no prompt of its own.
-      const nearCap = createMockResponse(
-        signed('sig-c', 'checking', [{ type: 'tool_use', id: 'c-t1', name: 'tools--ping', input: {} } as ContentBlock]),
-        'tool_use');
-      (nearCap as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
-      membrane.queues.push([nearCap], [createMockResponse(signed('sig-c2', 'all done'))]);
+      // The reply to [Continue] restarts at its tool boundary. The restart's
+      // compile ends on the round's tool_result, so its reply continues that
+      // round's tool loop and follows the same prompt.
+      membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], [createMockResponse(signed('sig-c2', 'all done'))]);
       (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
       await x.framework.runUntilIdle();
       assert.equal(membrane.calls.length, 3, 'first, the continued reply, its restart');
@@ -630,31 +711,179 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it('drops a carried prompt its request doesn\'t render (a stream resumed after a cooldown)', async () => {
-    // The shape a provider cooldown leaves (Basil-1007's probe): the held
-    // trigger carries the prompt its first stream start set, and a message
-    // lands meanwhile, so the resumed compile ends on that message and
-    // renders no [Continue].
+  it('a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue]', async () => {
+    // A reply to [Continue] stores a tool round and restarts at its boundary,
+    // and the restart meets a 429 that holds the turn. A message arrives
+    // during the cooldown, so the resumed compile ends on it, while the
+    // round, still in the window, renders [Continue] earlier.
+    const membrane = new QueuedStreamsMembrane();
+    const strategy = new OmitToolExchange();
+    strategy.omit = false;
+    const x = await make({ membrane, physicalWindowTokens: 200_000, deliver: false, agent: { strategy } });
+    const internal = x.framework as unknown as {
+      providerAccelerationDefaultCooldownMs: number; providerAccelerationJitterMs: number;
+      providerAccelerationCooldowns: Map<string, unknown>;
+    };
+    internal.providerAccelerationDefaultCooldownMs = 1_000; // the shortest hold there is
+    internal.providerAccelerationJitterMs = 0;
+    try {
+      membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
+      await wake(x, ordinaryEvent('hello'));
+      membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], accelerationLimit(),
+        [createMockResponse(signed('sig-r', 'resumed reply'))]);
+      (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
+      await x.framework.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
+      await wake(x, ordinaryEvent('arrived during the cooldown'));
+      await sleep(1_100);
+      await x.framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 4, 'first, the continued reply, its held restart, the resumed attempt');
+
+      const resumed = membrane.calls[3]!.messages;
+      assert.equal(textOf(resumed.at(-1)!), 'arrived during the cooldown');
+      assert.ok(resumed.some((m) => textOf(m) === '[Continue]'), 'the round renders its [Continue]');
+      assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy, undefined);
+
+      // Later, the window folds the round: no [Continue] is left to render.
+      strategy.omit = true;
+      membrane.queues.push([createMockResponse(signed('sig-later', 'later reply'))]);
+      await wake(x, ordinaryEvent('later'));
+      const later = membrane.calls[4]!.messages;
+      const replyAt = later.findIndex((m) => textOf(m) === 'resumed reply');
+      assert.equal(textOf(later[replyAt - 1]!), 'arrived during the cooldown');
+      assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('a later round that follows a message injected at its tool boundary follows the message, not [Continue]', async () => {
+    // Hear-while-acting: a message that arrives while the round's tool runs
+    // is stored after the tool results and handed to the live stream with
+    // them, so the stream's next round follows it.
+    const strategy = new OmitToolExchange();
+    strategy.omit = false;
+    const x = await make({ deliver: false, agent: { strategy } });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+      x.mod.arrive = 'arrived mid-turn';
+      await timerWake(x,
+        signed('sig-c', 'checking', [{ type: 'tool_use', id: 'c-t1', name: 'tools--ping', input: {} } as ContentBlock]),
+        signed('sig-c2', 'all done'));
+      const injected = x.membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+      assert.deepEqual(injected.map((m) => textOf(m as NormalizedMessage)), ['arrived mid-turn']);
+
+      const marked = stored(x.framework).filter((m) => m.metadata?.promptedBy !== undefined);
+      assert.deepEqual(marked.map((m) => m.participant), ['assistant', 'user'],
+        'the round that followed [Continue], and its tool_result row');
+      assert.equal(rowWith(x.framework, 'all done').metadata?.promptedBy, undefined);
+
+      // Later, the window folds the round: the reply follows the message.
+      strategy.omit = true;
+      await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
+      const later = x.membrane.calls[2]!.messages;
+      const doneAt = later.findIndex((m) => textOf(m) === 'all done');
+      assert.equal(textOf(later[doneAt - 1]!), 'arrived mid-turn');
+      assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('a reply retried after a failure past its first round keeps following the prompt', async () => {
+    const membrane = new QueuedStreamsMembrane();
+    const strategy = new OmitToolExchange();
+    strategy.omit = false;
+    const x = await make({ membrane, physicalWindowTokens: 200_000, deliver: false, agent: { strategy } });
+    try {
+      membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
+      await wake(x, ordinaryEvent('hello'));
+      // The round is stored, its restart fails, and the error policy retries:
+      // the retry's compile ends on the round's tool results.
+      membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], transientFailure(),
+        [createMockResponse(signed('sig-c2', 'all done'))]);
+      (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
+      await x.framework.runUntilIdle();
+      await sleep(50);
+      await x.framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 4, 'first, the continued reply, its failed restart, the retry');
+      assert.ok(membrane.calls[3]!.messages.at(-1)!.content.some((b) => b.type === 'tool_result'));
+
+      const marked = stored(x.framework).filter((m) => m.metadata?.promptedBy !== undefined);
+      assert.equal(marked.length, 3, 'the round, its result and the retry\'s reply');
+      assert.equal(new Set(marked.map((m) => m.metadata!.promptedBy.turn)).size, 1);
+
+      strategy.omit = true;
+      membrane.queues.push([createMockResponse(signed('sig-later', 'later reply'))]);
+      await wake(x, ordinaryEvent('later'));
+      const later = membrane.calls[4]!.messages;
+      assert.equal(textOf(later[later.findIndex((m) => textOf(m) === 'all done') - 1]!), '[Continue]');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('a request that ends on the agent\'s own message mints a new [Continue], with an older one rendered before it', async () => {
     const x = await make({ deliver: false });
     try {
       await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
-      x.framework.getAgent('assistant')!.getContextManager()
-        .addMessage('nissa', [{ type: 'text', text: 'arrived during the cooldown' }] as ContentBlock[]);
-      x.membrane.pushResponse(createMockResponse(signed('sig-r', 'resumed reply'), 'end_turn'));
-      (x.framework as any).pendingRequests.push({
-        agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now(),
-        continuePrompt: { turn: 'stale-p1', text: '[Continue]' },
-      });
-      await x.framework.runUntilIdle();
+      await timerWake(x, signed('sig-c1', 'continued once'));
+      await timerWake(x, signed('sig-c2', 'continued twice'));
       await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
 
-      const minting = x.membrane.calls[1]!.messages;
-      assert.equal(textOf(minting.at(-1)!), 'arrived during the cooldown');
-      const reply = stored(x.framework).find((m) => m.content.some((b) => (b as { text?: string }).text === 'resumed reply'))!;
-      assert.equal(reply.metadata?.promptedBy, undefined);
+      const second = x.membrane.calls[2]!.messages;
+      assert.equal(textOf(second.at(-1)!), '[Continue]');
+      assert.equal(second.filter((m) => textOf(m) === '[Continue]').length, 2, 'the first prompt renders before its reply');
+      const once = rowWith(x.framework, 'continued once').metadata?.promptedBy;
+      const twice = rowWith(x.framework, 'continued twice').metadata?.promptedBy;
+      assert.ok(once && twice);
+      assert.notEqual(twice.turn, once.turn);
+
+      const later = x.membrane.calls[3]!.messages;
+      for (const text of ['continued once', 'continued twice']) {
+        assert.equal(textOf(later[later.findIndex((m) => textOf(m) === text) - 1]!), '[Continue]', text);
+      }
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('finds a reply whose only identity is a redacted_thinking block', async () => {
+    const x = await make({ deliver: false });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+      await timerWake(x, [
+        { type: 'redacted_thinking', data: 'opaque-reasoning' } as ContentBlock,
+        { type: 'text', text: 'redacted reply' } as ContentBlock,
+      ]);
+      await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
+
+      const continued = x.membrane.calls[1]!.messages;
       const later = x.membrane.calls[2]!.messages;
-      const replyAt = later.findIndex((m) => textOf(m) === 'resumed reply');
-      assert.deepEqual(later.slice(0, replyAt), minting, 'what precedes the reply is what its request held');
+      assert.equal(textOf(later[later.findIndex((m) => textOf(m) === 'redacted reply') - 1]!), '[Continue]');
+      assert.deepEqual(later.slice(0, continued.length), continued);
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('a reply after the process restarts reads its prompt from the stored rows', async () => {
+    // The first process ends the turn at the round's tool boundary, so its
+    // store ends on the tool results. A new framework over the same store
+    // holds nothing in memory from that turn. The agent's plain speech has no
+    // channel, so no turn announces one (a locus announced at the first turn
+    // after boot would come last, and the reply would follow it instead).
+    const first = await make({ deliver: false, locus: null });
+    await wake(first, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+    first.mod.endTurn = true;
+    await timerWake(first,
+      signed('sig-c', 'checking', [{ type: 'tool_use', id: 'c-t1', name: 'tools--ping', input: {} } as ContentBlock]));
+    const prompt = rowWith(first.framework, 'checking').metadata?.promptedBy;
+    assert.ok(prompt);
+    await first.framework.stop();
+
+    const strategy = new OmitToolExchange();
+    strategy.omit = false;
+    const x = await make({ deliver: false, locus: null, dir: first.dir, agent: { strategy } });
+    try {
+      await timerWake(x, signed('sig-c2', 'picked up'));
+      assert.ok(x.membrane.calls[0]!.messages.at(-1)!.content.some((b) => b.type === 'tool_result'));
+      assert.deepEqual(rowWith(x.framework, 'picked up').metadata?.promptedBy, prompt);
+
+      strategy.omit = true;
+      await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
+      const later = x.membrane.calls[1]!.messages;
+      assert.equal(textOf(later[later.findIndex((m) => textOf(m) === 'picked up') - 1]!), '[Continue]');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

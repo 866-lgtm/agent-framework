@@ -19,16 +19,22 @@
   `[Continue]`, and later compiles put the separator before a reply whose
   request never held it.
 - When a compile ends on the agent's own message and the request gets a
-  trailing `[Continue]` turn, every row the reply's turn stores now records
-  that prompt (`metadata.promptedBy`, a `{ turn, text }` pair), and every
-  later request renders `[Continue]` again just before the first of them
-  that survives, the way a silent tick's separator is rendered. A restart or
-  retry of the turn keeps the prompt only while its own request renders it.
-  Without it, later requests merged the reply into the previous assistant
-  message (one message carrying signed thinking from two responses, a 400
-  when it is the latest), and dropped a turn the reply's request held, which
-  a provider that binds thinking refuses. A reply with neither a tool call
-  nor signed thinking can't be found in a compiled window and merges as
-  before. `StartStreamResult.continuePrompt` and
-  `InferenceRequest.continuePrompt` carry it (new, optional); the agent and
-  the framework set them.
+  trailing `[Continue]` turn, the reply's rows (its assistant responses and
+  tool results) now record that prompt (`metadata.promptedBy`, a
+  `{ turn, text }` pair), and every later request renders `[Continue]`
+  again just before the first of its assistant rows that survives, the way a
+  silent tick's separator is rendered. A later reply follows the same prompt
+  when what it is sent ends on the tool results of a reply that did: a next
+  round of the stream, a budget restart, an error retry, or a new process
+  reading the stored rows. A reply sent anything else after those results,
+  such as a message that arrived at the tool boundary or during a provider
+  cooldown, follows that instead and records no prompt. Without the turn,
+  later requests merged the reply into the previous assistant message (one
+  message carrying signed thinking from two responses, a 400 when it is the
+  latest), and dropped a turn the reply's request held, which a provider
+  that binds thinking refuses. A reply with neither a tool call nor signed or
+  redacted thinking can't be found in a compiled window and merges as
+  before. `StartStreamResult.continuePrompt` carries the prompt a stream's
+  request ends on (new, optional); the agent sets it. The direct
+  `runInference` paths compile without these request-only turns, as they
+  did without the tick separator, so their replies render none.

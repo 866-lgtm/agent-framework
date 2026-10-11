@@ -12,9 +12,14 @@
  *   first of the tick's rows that survives compilation.
  * - A compile that ends on the agent's own message gets a trailing
  *   `[Continue]` turn (some models reject a trailing assistant message). The
- *   reply it prompts is stored straight after that message, so every row the
- *   reply's turn stores is stamped `metadata.promptedBy` (`RequestOnlyPrompt`),
- *   and the turn is rendered before the first of them that survives.
+ *   reply it prompts is stored straight after that message, so the reply's
+ *   rows are stamped `metadata.promptedBy` (`RequestOnlyPrompt`), and the turn
+ *   is rendered before the first of them that survives. A reply follows the
+ *   prompt when what it was sent ends on that `[Continue]`, or on the tool
+ *   results of a reply that followed it (`toolLoopPrompt`): a stream start
+ *   and each round of a stream alike. A reply sent anything else after the
+ *   results (a message that arrived meanwhile) follows that, and carries no
+ *   prompt.
  *
  * Without the row, the wire formatter merges consecutive same-role messages:
  * the reply would read as an unprompted continuation of the earlier response,
@@ -81,6 +86,12 @@ export interface SilentHeartbeatStamp extends SilentHeartbeatTick {
   separator?: string;
 }
 
+/** One tick's key in an index or a rendered window: the server and its event
+ * id together, since two servers' events can share an id. */
+export function tickKey(tick: SilentHeartbeatTick): string {
+  return JSON.stringify([tick.serverId, tick.eventId]);
+}
+
 /** The tick stamp on a stored row's metadata, if any. */
 export function silentHeartbeatOf(metadata: unknown): SilentHeartbeatStamp | undefined {
   const stamp = (metadata as { silentHeartbeat?: unknown } | undefined)?.silentHeartbeat;
@@ -92,12 +103,21 @@ export function silentHeartbeatOf(metadata: unknown): SilentHeartbeatStamp | und
 }
 
 /** A request-only turn a request ended on before the agent's reply, as
- * `metadata.promptedBy` on every row the reply's turn stores: `turn` names
- * the one prompt, and `text` is what the request rendered. */
+ * `metadata.promptedBy` on the rows of each reply that follows it: `turn`
+ * names the one prompt, and `text` is what the request rendered. */
 export interface RequestOnlyPrompt {
   turn: string;
   text: string;
 }
+
+/** The stamps on a row a turn stores after a request-only turn
+ * (`silentHeartbeatOf`, `promptedByOf` read them back). A type alias, so a
+ * value fits `MessageMetadata`'s index signature without a cast, and a
+ * misspelled key fails to compile. */
+export type RequestOnlyStamps = {
+  silentHeartbeat?: SilentHeartbeatStamp;
+  promptedBy?: RequestOnlyPrompt;
+};
 
 /** The request-only prompt a stored row replies to, if any. */
 export function promptedByOf(metadata: unknown): RequestOnlyPrompt | undefined {
@@ -129,7 +149,7 @@ function requestOnlyTurn(text: string): NormalizedMessage {
 function identityKeys(content: ContentBlock[]): string[] {
   const keys: string[] = [];
   for (const block of content) {
-    if (block.type === 'tool_use' && typeof block.id === 'string' && block.id) keys.push(`tool_use:${block.id}`);
+    if (block.type === 'tool_use' && typeof block.id === 'string' && block.id) keys.push(toolUseKey(block.id));
     else if (block.type === 'thinking' && typeof block.signature === 'string' && block.signature) {
       keys.push(`thinking:${block.signature}`);
     } else if (block.type === 'redacted_thinking' && typeof block.data === 'string' && block.data) {
@@ -137,6 +157,10 @@ function identityKeys(content: ContentBlock[]): string[] {
     }
   }
   return keys;
+}
+
+function toolUseKey(id: string): string {
+  return `tool_use:${id}`;
 }
 
 export interface StoredRowLike {
@@ -147,9 +171,9 @@ export interface StoredRowLike {
 
 export interface RequestOnlyRowIndex {
   /** Identity key of every assistant row this agent stored during a silent
-   *  tick → the tick, and the separator text to render before its first
-   *  surviving row. */
-  ticks: Map<string, { eventId: string; text: string }>;
+   *  tick → the tick (`tickKey`), and the separator text to render before
+   *  its first surviving row. */
+  ticks: Map<string, { tick: string; text: string }>;
   /** Identity key of every assistant row this agent stored in reply to a
    *  request-only prompt → that prompt. */
   prompts: Map<string, RequestOnlyPrompt>;
@@ -157,33 +181,53 @@ export interface RequestOnlyRowIndex {
 
 /** Index the agent's own rows that follow request-only turns: the rows of its
  * silent ticks, and the rows of each reply to a `[Continue]`. The two are
- * independent, so a row can be both. */
+ * independent, so a row can be both. Only stamped rows are keyed, so an
+ * agent's history walk costs a metadata read per row. */
 export function indexRequestOnlyRows(stored: readonly StoredRowLike[], agentName: string): RequestOnlyRowIndex {
-  const ticks = new Map<string, { eventId: string; text: string }>();
+  const ticks = new Map<string, { tick: string; text: string }>();
   const prompts = new Map<string, RequestOnlyPrompt>();
   for (const row of stored) {
     if (row.participant !== agentName) continue;
-    const keys = identityKeys(row.content);
-    if (keys.length === 0) continue;
     const stamp = silentHeartbeatOf(row.metadata);
-    if (stamp && stamp.agentName === agentName) {
-      const tick = { eventId: stamp.eventId, text: stamp.separator ?? LEGACY_SILENT_HEARTBEAT_SEPARATOR };
+    const ownTick = stamp !== undefined && stamp.agentName === agentName;
+    const prompt = promptedByOf(row.metadata);
+    if (!ownTick && !prompt) continue;
+    const keys = identityKeys(row.content);
+    if (ownTick) {
+      const tick = { tick: tickKey(stamp), text: stamp.separator ?? LEGACY_SILENT_HEARTBEAT_SEPARATOR };
       for (const key of keys) ticks.set(key, tick);
     }
-    const prompt = promptedByOf(row.metadata);
     if (prompt) for (const key of keys) prompts.set(key, prompt);
   }
   return { ticks, prompts };
 }
 
+/**
+ * The prompt a reply continues when what it is sent ends on `last`: if
+ * `last` holds tool results, the prompt of the reply that called those tools
+ * (this reply continues that reply's tool loop); otherwise none. Read from
+ * the stored stamps, so it doesn't depend on anything held in memory. A
+ * request that ends on its own `[Continue]` mints a new prompt instead.
+ */
+export function toolLoopPrompt(
+  last: NormalizedMessage | undefined,
+  index: RequestOnlyRowIndex,
+  agentName: string,
+): RequestOnlyPrompt | undefined {
+  if (!last || last.participant === agentName) return undefined;
+  for (const block of last.content) {
+    if (block.type !== 'tool_result') continue;
+    const prompt = index.prompts.get(toolUseKey(block.toolUseId));
+    if (prompt) return prompt;
+  }
+  return undefined;
+}
+
 export interface RenderedRequestOnlyRows {
   messages: NormalizedMessage[];
-  /** The ticks whose separator this window renders. A tick none of whose
-   *  rows survive compilation renders none. */
+  /** The ticks (`tickKey`) whose separator this window renders. A tick none
+   *  of whose rows survive compilation renders none. */
   separatedTicks: Set<string>;
-  /** The prompts (`RequestOnlyPrompt.turn`) this window renders, the same
-   *  way. */
-  promptedTurns: Set<string>;
 }
 
 /**
@@ -201,14 +245,14 @@ export function renderRequestOnlyRows(
 ): RenderedRequestOnlyRows {
   const separatedTicks = new Set<string>();
   const promptedTurns = new Set<string>();
-  if (index.ticks.size === 0 && index.prompts.size === 0) return { messages, separatedTicks, promptedTurns };
+  if (index.ticks.size === 0 && index.prompts.size === 0) return { messages, separatedTicks };
   const out: NormalizedMessage[] = [];
   for (const message of messages) {
     if (message.participant === agentName) {
       const keys = identityKeys(message.content);
       const tick = keys.map((key) => index.ticks.get(key)).find((t) => t !== undefined);
-      if (tick !== undefined && !separatedTicks.has(tick.eventId)) {
-        separatedTicks.add(tick.eventId);
+      if (tick !== undefined && !separatedTicks.has(tick.tick)) {
+        separatedTicks.add(tick.tick);
         out.push(requestOnlyTurn(tick.text));
       }
       const prompt = keys.map((key) => index.prompts.get(key)).find((p) => p !== undefined);
@@ -219,5 +263,5 @@ export function renderRequestOnlyRows(
     }
     out.push(message);
   }
-  return { messages: out, separatedTicks, promptedTurns };
+  return { messages: out, separatedTicks };
 }

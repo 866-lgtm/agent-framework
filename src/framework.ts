@@ -8,7 +8,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolRes
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
-import { SILENT_HEARTBEAT_SEPARATOR, type SilentHeartbeatStamp } from './silent-heartbeat.js';
+import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
@@ -1240,6 +1240,16 @@ export class AgentFramework {
    * guessing from the newest message in the window.
    */
   private activeTurnTriggers: Map<string, InferenceRequest | undefined> = new Map();
+
+  /**
+   * The `[Continue]` prompt the current round of each turn follows, keyed by
+   * the turn's trigger. Each stream start sets it from what the Agent read in
+   * its request (`StartStreamResult.continuePrompt`), and a tool boundary
+   * that stores anything after the results clears it, since the next round
+   * follows those messages. `silentTurnRowMetadata` stamps the round's rows
+   * with it.
+   */
+  private readonly turnPrompts = new WeakMap<InferenceRequest, RequestOnlyPrompt>();
 
   /** The trigger of `agentName`'s turn in progress, if a turn is running. */
   getActiveTurnTrigger(agentName: string): InferenceRequest | undefined {
@@ -6698,6 +6708,10 @@ export class AgentFramework {
           {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
+              // The next round follows these messages, not the [Continue]
+              // the turn's earlier rounds followed: its rows carry no prompt.
+              const turnTrigger = this.activeTurnTriggers.get(agent.name);
+              if (turnTrigger) this.turnPrompts.delete(turnTrigger);
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
@@ -6905,7 +6919,6 @@ export class AgentFramework {
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
-              continuePrompt: this.activeTurnTriggers.get(agent.name)?.continuePrompt,
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
@@ -6925,12 +6938,16 @@ export class AgentFramework {
               ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
             });
           } else {
-            // Non-streaming fallback: schedule re-inference
+            // Non-streaming fallback: schedule re-inference. It continues the
+            // same turn, so it carries the turn's properties, as the budget
+            // restart does.
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
               source: 'framework',
               timestamp: Date.now(),
+              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
+              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           }
         }
@@ -8515,32 +8532,39 @@ export class AgentFramework {
   }
 
   /**
-   * Metadata for rows the agent's current turn stores (assistant responses,
-   * tool_result rows), for the request-only turns that came before them:
-   * - a silent heartbeat tick stamps each row, with the separator text its
-   *   request rendered, so they stay identifiable after the turn — request
-   *   builds render the separator before the first that survives, and a later
-   *   retention policy can find or collapse them. The stamp names the agent:
-   *   residents share one message slot and a broadcast tick reaches each of
-   *   them with the same eventId;
-   * - a turn whose stream opened on `[Continue]` stamps each row from then on
-   *   with that prompt (`promptedBy`), so request builds render it before the
-   *   first that survives.
+   * Stamps for the rows the agent's reply stores in its current turn: its
+   * assistant responses, its tool_result rows (through `storeResults`), and
+   * the contained-wrapper row that stands in for a response. The turn's other
+   * stores (a delivery receipt, a routing notice, a deferred flush) aren't the
+   * reply's, and carry none.
+   * - A silent heartbeat tick stamps each of them for the whole turn, with the
+   *   separator text its request rendered. Request builds render the
+   *   separator before the first of the tick's assistant rows that survives,
+   *   and the stamps keep every row of the tick identifiable after the turn,
+   *   for a later retention policy to find or collapse. The stamp names the
+   *   agent: residents share one message slot, and a broadcast tick reaches
+   *   each of them with the same eventId.
+   * - A `[Continue]` prompt stamps the rows of each round that follows it
+   *   (`turnPrompts`). Request builds render it before the first of its
+   *   assistant rows that survives. On the round's tool_result rows it marks
+   *   them as the reply's, as the tick stamp does.
    * Undefined for ordinary turns, whose rows are stored exactly as before.
    * (Named for its first use, the silent tick.)
    */
-  private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
+  private silentTurnRowMetadata(agentName: string): RequestOnlyStamps | undefined {
     const trigger = this.activeTurnTriggers.get(agentName);
-    const tick = trigger?.silentHeartbeat;
-    const stamp: SilentHeartbeatStamp | undefined = tick
-      ? { eventId: tick.eventId, serverId: tick.serverId, agentName, separator: SILENT_HEARTBEAT_SEPARATOR }
-      : undefined;
-    const prompt = trigger?.continuePrompt;
-    if (!stamp && !prompt) return undefined;
-    return {
-      ...(stamp ? { silentHeartbeat: stamp } : {}),
-      ...(prompt ? { promptedBy: prompt } : {}),
-    } as MessageMetadata;
+    if (!trigger) return undefined;
+    const tick = trigger.silentHeartbeat;
+    const prompt = this.turnPrompts.get(trigger);
+    if (!tick && !prompt) return undefined;
+    const stamps: RequestOnlyStamps = {};
+    if (tick) {
+      stamps.silentHeartbeat = {
+        eventId: tick.eventId, serverId: tick.serverId, agentName, separator: SILENT_HEARTBEAT_SEPARATOR,
+      };
+    }
+    if (prompt) stamps.promptedBy = prompt;
+    return stamps;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
@@ -9376,13 +9400,15 @@ export class AgentFramework {
         continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
-        continuePrompt: trigger?.continuePrompt,
       });
-      // The [Continue] prompt this stream's reply follows, if any: every row
-      // the turn stores from here on carries it (silentTurnRowMetadata), and the
-      // turn's restarts and retries carry it in the trigger to the next
-      // stream start, which keeps it only if its request renders it.
-      if (trigger) trigger.continuePrompt = continuePrompt;
+      // The [Continue] prompt this stream's first round follows, if any, as
+      // the Agent read it from the request: the round's rows carry it
+      // (silentTurnRowMetadata), and so do later rounds' until a tool
+      // boundary stores something after the results.
+      if (trigger) {
+        if (continuePrompt) this.turnPrompts.set(trigger, continuePrompt);
+        else this.turnPrompts.delete(trigger);
+      }
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();
