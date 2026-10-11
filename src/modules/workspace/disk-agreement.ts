@@ -28,6 +28,7 @@
  * releases a draft's protection.
  */
 
+import { resolve } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import { RecordJournal } from '../../record-journal.js';
 
@@ -71,6 +72,12 @@ export type Physical = Agreed | Pending | Interrupted;
 export interface RootIdentity {
   dev: string;
   ino: string;
+}
+
+/** Whether two configured roots name the same path, whatever their spelling
+ *  (a trailing slash, a relative form). A symlinked alias is another path. */
+function sameRootPath(a: string, b: string): boolean {
+  return resolve(a) === resolve(b);
 }
 
 export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
@@ -164,7 +171,7 @@ export class DiskAgreement {
     for (const { entry } of entries) {
       if (entry.t === 'mount') {
         const existing = replayed.get(entry.mount);
-        if (!existing || existing.root !== entry.root) replayed.set(entry.mount, { root: entry.root, paths: new Map() });
+        if (!existing || !sameRootPath(existing.root, entry.root)) replayed.set(entry.mount, { root: entry.root, paths: new Map() });
         continue;
       }
       const mount = replayed.get(entry.mount);
@@ -176,7 +183,7 @@ export class DiskAgreement {
     this.mounts.clear();
     for (const { name, root } of this.configured) {
       const found = replayed.get(name);
-      if (found && found.root === root) {
+      if (found && sameRootPath(found.root, root)) {
         this.mounts.set(name, found);
       } else {
         this.mounts.set(name, { root, paths: new Map() });

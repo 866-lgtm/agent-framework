@@ -2699,6 +2699,8 @@ export class WorkspaceModule implements Module {
 
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
+    // A path sync adopts on the branch it was asked on, read before any await.
+    const askedOn = store.currentBranch().id;
     const allResults: Array<{
       mount: string;
       synced: string[];
@@ -2746,7 +2748,7 @@ export class WorkspaceModule implements Module {
         const scope: Scope = isDir
           ? { kind: 'dir', dir: relativePath, recursive: true }
           : { kind: 'paths', paths: [relativePath] };
-        return this.passUnlocked(mount, scope, { rehash: true, adopt: () => true });
+        return this.passUnlocked(mount, scope, { rehash: true, adopt: () => true, branchId: askedOn });
       });
 
       const conflicts = [...pass.reports.values()]

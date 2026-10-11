@@ -53,10 +53,30 @@ export interface BranchIntent {
   tombstone?: { hash: string };
   origin?: 'store';
   conflict?: ConflictRecord;
+  /**
+   * Why a recorded intent can't be read (its blob missing from the store, or
+   * not an intent): a tombstone or conflict it held is unknown, never absent.
+   * Never written; a put replaces the damaged record.
+   */
+  unreadable?: string;
 }
 
 function isEmpty(intent: BranchIntent): boolean {
-  return intent.tombstone === undefined && intent.origin === undefined && intent.conflict === undefined;
+  return intent.tombstone === undefined && intent.origin === undefined && intent.conflict === undefined &&
+    intent.unreadable === undefined;
+}
+
+/** A recorded intent's blob, read; a damaged one says why it can't be. */
+function readIntent(store: JsStore, blobHash: string): BranchIntent {
+  const blob = store.getBlob(blobHash);
+  if (!blob) return { unreadable: "its record's blob is missing from the store" };
+  try {
+    const parsed = JSON.parse(blob.toString('utf-8')) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as BranchIntent;
+  } catch {
+    // reported below
+  }
+  return { unreadable: 'its record is not a branch intent' };
 }
 
 export class BranchIntents {
@@ -65,13 +85,15 @@ export class BranchIntents {
   get(path: string): BranchIntent | null {
     const entry = this.store.treeGet(this.treeStateId, path);
     if (!entry) return null;
-    const blob = this.store.getBlob(entry.blobHash);
-    if (!blob) return null;
-    return JSON.parse(blob.toString('utf-8')) as BranchIntent;
+    return readIntent(this.store, entry.blobHash);
   }
 
   /** Replace a path's intent; an empty intent removes the record. */
   put(path: string, intent: BranchIntent | null): void {
+    if (intent?.unreadable !== undefined) {
+      const { unreadable: _damaged, ...rest } = intent;
+      intent = rest;
+    }
     if (!intent || isEmpty(intent)) {
       if (this.store.treeGet(this.treeStateId, path)) this.store.treeRemove(this.treeStateId, path);
       return;
@@ -90,8 +112,7 @@ export class BranchIntents {
   list(prefix = ''): Array<[string, BranchIntent]> {
     const out: Array<[string, BranchIntent]> = [];
     for (const entry of this.store.treeList(this.treeStateId, prefix ? prefix + '/' : undefined)) {
-      const blob = this.store.getBlob(entry.blobHash);
-      if (blob) out.push([entry.path, JSON.parse(blob.toString('utf-8')) as BranchIntent]);
+      out.push([entry.path, readIntent(this.store, entry.blobHash)]);
     }
     if (prefix) {
       const exact = this.get(prefix);

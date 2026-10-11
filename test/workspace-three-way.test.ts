@@ -448,6 +448,30 @@ describe('workspace deletes', () => {
     assert.equal(await contentOf(m, 'a.txt'), 'v1');
   });
 
+  test("a deletion whose record can't be read is unverified, never resurrected, until a path sync replaces it", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    env.legacyEntry('legacy.txt', 'old');
+    env.writeDisk('legacy.txt', 'old');
+    await call(m, 'delete', { path: 'work/legacy.txt' }); // the tombstone is all that keeps it deleted: no evidence
+    const record = env.store.treeGet('workspace/work/intent', 'legacy.txt');
+    assert.ok(record, 'the tombstone is recorded');
+    await env.shutdown(m);
+    rmSync(join(env.storePath, 'blobs', record.blobHash.slice(0, 2), record.blobHash)); // and its blob is lost
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open();
+
+    const e = await entryOf(m, 'legacy.txt');
+    assert.equal(e?.state, 'unverified');
+    assert.match(String(e?.note), /branch intent can't be read/);
+    await call(m, 'sync', {});
+    assert.equal(env.store.treeGet(TREE, 'legacy.txt'), null, 'not taken back in from disk');
+
+    await call(m, 'sync', { path: 'work/legacy.txt' }); // the operator's word: take disk's state
+    assert.equal(await stateOf(m, 'legacy.txt'), 'synced');
+    assert.equal(await contentOf(m, 'legacy.txt'), 'old');
+  });
+
   test('a legacy entry with no baseline, deleted in the workspace, stays deleted', async (t) => {
     const env = new Env(t);
     const m = await env.open();
@@ -500,6 +524,36 @@ describe('a path sync', () => {
     ], 'a shell edit taken in discards nothing; the rest were the workspace\'s own changes');
     assert.equal(await contentOf(m, 'src/existing.txt'), 'v1');
     assert.equal(await stateOf(m, 'src/new.txt'), 'not listed', 'disk has no such file, so neither does the workspace');
+  });
+
+  test('asked on one branch, adopts nothing on another selected before its turn', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.store.switchBranch('other');
+    await call(m, 'write', { path: 'work/a.txt', content: "other's draft" });
+    env.store.switchBranch(main);
+    env.writeDisk('a.txt', 'from the shell');
+
+    // Asked on main, queued behind a turn the mount is busy with.
+    const mount = (m as any).mounts.get('work');
+    let release!: () => void;
+    let busy!: Promise<void>;
+    await new Promise<void>((started) => {
+      busy = (m as any).withMount(mount, () => new Promise<void>((r) => { release = r; started(); }));
+    });
+    const syncing = call(m, 'sync', { path: 'work/a.txt' });
+    env.store.switchBranch('other');
+    release();
+    await busy;
+    const data = await syncing;
+    assert.match(JSON.stringify(data.incomplete), /the selected branch changed before this sync ran/);
+    assert.deepEqual(data.results, []);
+    assert.equal(await contentOf(m, 'a.txt'), "other's draft", "other's draft is untouched");
+    env.store.switchBranch(main);
+    assert.equal(await contentOf(m, 'a.txt'), 'v1', 'and main took nothing either');
   });
 
   test("lists a deletion it gives up for a disk copy the workspace can't hold, though no workspace entry changes", async (t) => {
@@ -1372,6 +1426,10 @@ describe('restarts and faults', () => {
     replayed.open([{ name: 'work', root: '/srv/work' }]);
     assert.deepEqual(replayed.get('work', 'f1099.txt'), { kind: 'content', hash: 'h1099', size: 1099 });
     assert.deepEqual(replayed.get('work', 'after.txt'), { kind: 'absent' });
+
+    const respelled = new DiskAgreement(env.store);
+    respelled.open([{ name: 'work', root: '/srv/work/' }]);
+    assert.deepEqual(respelled.get('work', 'f1.txt'), { kind: 'content', hash: 'h1', size: 1 }, 'the same path spelled with a trailing slash keeps its evidence');
 
     const moved = new DiskAgreement(env.store);
     moved.open([{ name: 'work', root: '/srv/elsewhere' }]);

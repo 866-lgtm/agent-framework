@@ -152,6 +152,12 @@ export interface PassOptions {
   adopt?: (path: string) => boolean;
   /** Walk cap for directory scopes. */
   cap?: number;
+  /**
+   * The branch the caller asked on (a path sync). If another is selected when
+   * the pass gathers, it decides nothing: an adoption asked for on one branch
+   * would give up another branch's drafts.
+   */
+  branchId?: string;
 }
 
 const ABSENT: Candidate = { kind: 'absent' };
@@ -398,6 +404,9 @@ function decide(
   branchId: string,
   adopt: boolean,
 ): Verdict {
+  // A branch intent that can't be read may have held a tombstone or a
+  // conflict: nothing is decided over it, until a path sync replaces it.
+  if (bi?.unreadable !== undefined && !adopt) return { state: 'unverified', note: `its branch intent can't be read: ${bi.unreadable}` };
   if (d.kind === 'unobserved') {
     // Disk proves nothing, but an adoption on this branch settles by the tree.
     if (pIn?.kind === 'pending' && pIn.effect === 'adopt' && pIn.branchId === branchId && !adopt) {
@@ -660,6 +669,13 @@ export async function reconcilePass(
   }
   if (gathered === null) {
     result.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: 'the selected branch kept changing while the scan ran' });
+    return result;
+  }
+  if (opts.branchId !== undefined && gathered.branchId !== opts.branchId) {
+    result.incomplete.push({
+      path: scope.kind === 'dir' ? scope.dir : scope.paths.join(', '),
+      reason: 'the selected branch changed before this sync ran; nothing was taken from disk — sync again on this branch to take it',
+    });
     return result;
   }
   const { walk, facts } = gathered;
