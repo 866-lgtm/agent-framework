@@ -395,6 +395,23 @@ describe('a reached budget across a restart', () => {
       assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
     });
   });
+
+  it('a descent ended by an immediate change to its own target is not credited to the compile that ran meanwhile', async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+      assert.equal(budgets(f).transition, 'converging');
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      // The compile plans at the live 100k; the same 60k is applied at once
+      // while it runs, ending the descent without a settle.
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+        return original.apply(this, args);
+      }, () => compile(f));
+      assert.deepEqual(budgets(f), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'nothing settled, and the compile planned at 100k');
+    });
+  });
 });
 
 it('reset-all skips tail controls unsupported by the active strategy', async () => {

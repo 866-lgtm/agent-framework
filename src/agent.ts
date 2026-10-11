@@ -353,13 +353,11 @@ export class Agent {
       if (error instanceof OverBudgetError || err?.name === 'OverBudgetError') this.noteCompiledBudget(live, false);
       throw error;
     }
-    this.settleRuntimeSettingsTransition();
-    // A settle of the descent this compile began under proves its target:
-    // the frontier fits the window prepared for it. Otherwise the compile
-    // proves the budget it planned at.
-    const settled = target !== undefined && this.contextBudgetTargetTokens === undefined
-      && this.contextBudgetTokens === target;
-    this.noteCompiledBudget(settled ? target : live, true);
+    // A settle, here, of the descent this compile began under proves its
+    // target: the frontier fits the window prepared for it. Otherwise the
+    // compile proves the budget it planned at, whatever changed meanwhile.
+    const settled = this.settleRuntimeSettingsTransition() && target !== undefined && this.contextBudgetTokens === target;
+    this.noteCompiledBudget(settled ? target! : live, true);
     return result;
   }
 
@@ -611,13 +609,15 @@ export class Agent {
     }
   }
 
-  private settleRuntimeSettingsTransition(): void {
-    if (this.contextBudgetTargetTokens === undefined) return;
+  /** Settle a converging budget once the window is prepared; true if it settled. */
+  private settleRuntimeSettingsTransition(): boolean {
+    if (this.contextBudgetTargetTokens === undefined) return false;
     const hot = this.getHotContextSettings();
-    if (!hot?.prepared) return;
+    if (!hot?.prepared) return false;
     this.contextBudgetTokens = this.contextBudgetTargetTokens;
     this.contextBudgetTargetTokens = undefined;
     this.updateHotContextSettings({ preparedWindowTokens: null });
+    return true;
   }
 
   /**
