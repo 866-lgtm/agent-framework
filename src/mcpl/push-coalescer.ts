@@ -244,16 +244,19 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  * Validate wire content before it is stored, rendered or converted.
  *
  * Its shape and its visible emptiness, nothing else. An incoming coalesced
- * occurrence is delivered into context exactly as an uncoalesced message is
- * (the coalescer only remembers where it landed), so it meets the same rules:
- * an array of objects, which the converters turn into blocks, a block they
- * can't render (a video, an unknown type, an image with neither uri nor data)
- * becoming a placeholder there as here. Nor does the uncoalesced path set a
- * byte budget on content: an inline image is admitted here as it is there
- * (agent-framework#266: a 1 MiB serialized-content budget here dropped every
- * coalesced message carrying a screenshot). A render result, which the host
- * delivers in the occurrence's place, also gets each block's shape checked
- * (`checkBlockShapes`), as RFC-006 §5.2 asks.
+ * occurrence meets the rules an uncoalesced message meets, since it reaches
+ * context through the same converters: a plain occurrence the moment it is
+ * admitted (the coalescer only remembers where it landed), a deferred one
+ * when its render settles or falls back to it. So: an array of objects, which
+ * the converters turn into blocks, a block they can't render (a video, an
+ * unknown type, an image with neither uri nor data) becoming a placeholder
+ * there as here. Nor does the uncoalesced path set a byte budget on content:
+ * an inline image is admitted here as it is there (agent-framework#266: a
+ * 1 MiB serialized-content budget here dropped every coalesced message
+ * carrying a screenshot). A deferred occurrence's content is held, until then,
+ * in the coalescer's state and its persisted snapshot and receipts. A render
+ * result, which the host delivers in the occurrence's place, also gets each
+ * block's shape checked (`checkBlockShapes`), as RFC-006 §5.2 asks.
  *
  * Visibly-empty content is refused unless `allowEmpty`: an admitted
  * occurrence with nothing to show would wake the model with no visible cause.
