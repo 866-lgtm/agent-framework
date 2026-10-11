@@ -2944,7 +2944,7 @@ export class AgentFramework {
     }
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
-      this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+      this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     }
     this.recordOperatorAction({
       kind: 'settings-update',
@@ -2965,7 +2965,7 @@ export class AgentFramework {
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.resetRuntimeSettings(keys);
     if (opts?.persist !== false) {
-      this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+      this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     }
     this.recordOperatorAction({
       kind: 'settings-reset',
@@ -2984,7 +2984,7 @@ export class AgentFramework {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.cancelRuntimeSettingsTransition();
-    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     this.recordOperatorAction({
       kind: 'settings-cancel-transition',
       agent: agentName,
@@ -3980,6 +3980,15 @@ export class AgentFramework {
     agentName: string,
     overrides: AgentRuntimeSettingsOverrides,
   ): AgentRuntimeSettingsOverrides {
+    if (overrides.contextBudgetReached !== undefined && overrides.contextBudgetReached !== true) {
+      // Unreadable, so not trusted: the budget restores paced, as before the marker existed.
+      console.error(
+        `[agent-settings] ignoring an invalid persisted contextBudgetReached for agent "${agentName}": ` +
+          `${JSON.stringify(overrides.contextBudgetReached)}`,
+      );
+      const { contextBudgetReached: _ignored, ...rest } = overrides;
+      overrides = rest;
+    }
     if (
       overrides.sameRoundThinkTextPolicy !== undefined &&
       overrides.sameRoundThinkTextPolicy !== 'public' &&
@@ -4028,6 +4037,42 @@ export class AgentFramework {
     if (Object.keys(all).length === 0) delete state.toolResultInlineCaps;
     else state.toolResultInlineCaps = all;
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+  }
+
+  /**
+   * What persists for an agent: its overrides, and `contextBudgetReached`
+   * when its live budget is at the overridden budget with no descent
+   * running (context-manager #162).
+   */
+  private persistedRuntimeSettingsOf(agent: Agent): AgentRuntimeSettingsOverrides {
+    const overrides = agent.getRuntimeSettingsOverrides();
+    const snapshot = agent.getRuntimeSettings();
+    const reached = overrides.contextBudgetTokens !== undefined
+      && snapshot.transition === 'stable'
+      && snapshot.effectiveContextBudgetTokens === overrides.contextBudgetTokens;
+    return reached ? { ...overrides, contextBudgetReached: true } : overrides;
+  }
+
+  /**
+   * A paced descent settled. When the persisted record holds the budget it
+   * settled at, mark that budget reached, so a restart applies it at once
+   * instead of pacing a descent again (context-manager #162). Only the
+   * marker is written: a descent applied with `persist: false` left no
+   * record of its target, so it stays unwritten, and other ephemeral changes
+   * aren't promoted.
+   */
+  private recordSettledRuntimeSettings(agentName: string, agent: Agent): void {
+    try {
+      const persisted = this.readAgentRuntimeSettings(agentName);
+      if (!persisted) return;
+      // The record's own budget, and no other: a descent applied without
+      // persisting may have settled somewhere else.
+      if (persisted.contextBudgetTokens !== agent.getRuntimeSettings().effectiveContextBudgetTokens) return;
+      this.persistAgentRuntimeSettings(agentName, { ...persisted, contextBudgetReached: true });
+    } catch (error) {
+      // The settle itself stands; a restart then paces the descent again.
+      console.error(`[agent-settings] couldn't record that ${agentName}'s budget settled:`, error);
+    }
   }
 
   private persistAgentRuntimeSettings(
@@ -6466,6 +6511,7 @@ export class AgentFramework {
         this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
       );
     }
+    agent.onRuntimeSettingsSettled(() => this.recordSettledRuntimeSettings(config.name, agent));
     this.agents.set(config.name, agent);
     this.agentConfigs.set(config.name, config);
 

@@ -50,6 +50,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
     );
     assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
+      effectiveContextBudgetTokens: 100_000,
       tailTokens: 30_000,
       transitionPaceTokens: 8_000,
       sameRoundThinkTextPolicy: 'public',
@@ -66,6 +67,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       }),
       {
         contextBudgetTokens: 60_000,
+        effectiveContextBudgetTokens: 100_000,
         tailTokens: 20_000,
         transitionPaceTokens: 4_000,
         sameRoundThinkTextPolicy: 'private',
@@ -79,6 +81,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
     );
     assert.deepEqual(framework.resetAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
+      effectiveContextBudgetTokens: 100_000,
       tailTokens: 30_000,
       transitionPaceTokens: 8_000,
       sameRoundThinkTextPolicy: 'public',
@@ -120,8 +123,11 @@ it('runtime overrides persist across framework restart', async () => {
 
   try {
     framework = await AgentFramework.create(config());
+    // The descent was still running at the stop, so it resumes paced from the
+    // recipe's budget.
     assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 70_000,
+      effectiveContextBudgetTokens: 100_000,
       tailTokens: 18_000,
       transitionPaceTokens: 5_000,
       sameRoundThinkTextPolicy: 'private',
@@ -132,6 +138,140 @@ it('runtime overrides persist across framework restart', async () => {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// context-manager #162: a lower budget the agent had reached comes back reached.
+describe('a reached budget across a restart', () => {
+  const persisted = (framework: AgentFramework) =>
+    (framework.getStore().getStateJson('framework/state') as { agentRuntimeSettings?: Record<string, unknown> } | null)
+      ?.agentRuntimeSettings?.agent;
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-settings-reached-'));
+    const storePath = join(dir, 'store');
+    const config = () => ({
+      storePath,
+      membrane,
+      agents: [{
+        name: 'agent', model: 'test-model', systemPrompt: 'test',
+        strategy: strategy(), contextBudgetTokens: 100_000, maxTokens: 10_000,
+      }],
+      modules: [],
+    });
+    return { dir, storePath, config };
+  };
+  const budgets = (framework: AgentFramework) => {
+    const s = framework.getAgentRuntimeSettings('agent');
+    return { target: s.contextBudgetTokens, effective: s.effectiveContextBudgetTokens, transition: s.transition };
+  };
+
+  it('a descent that settled comes back settled, before any compile', async () => {
+    const { dir, config } = setup();
+    let framework = await AgentFramework.create(config());
+    try {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 100_000, transition: 'converging' });
+      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000 }, 'not reached yet');
+      // The store is empty, so the first compile's frontier fits and the descent settles.
+      await framework.getAgent('agent')!.compileContext();
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000, contextBudgetReached: true }, 'the settle is recorded');
+      await framework.stop();
+      framework = await AgentFramework.create(config());
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an immediate decrease is recorded as reached, and comes back so', async () => {
+    const { dir, config } = setup();
+    let framework = await AgentFramework.create(config());
+    try {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000, contextBudgetReached: true });
+      await framework.stop();
+      framework = await AgentFramework.create(config());
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a record without the marker (an earlier release) restores paced, as before', async () => {
+    const { dir, config } = setup();
+    let framework = await AgentFramework.create(config());
+    try {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      const store = framework.getStore();
+      const state = store.getStateJson('framework/state') as { agentRuntimeSettings: Record<string, Record<string, unknown>> };
+      delete state.agentRuntimeSettings.agent.contextBudgetReached;
+      store.setStateJson('framework/state', state);
+      await framework.stop();
+      framework = await AgentFramework.create(config());
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 100_000, transition: 'converging' });
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an invalid marker is ignored, and the budget restores paced', async () => {
+    const { dir, config } = setup();
+    let framework = await AgentFramework.create(config());
+    const errors: string[] = [];
+    const original = console.error;
+    try {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      const store = framework.getStore();
+      const state = store.getStateJson('framework/state') as { agentRuntimeSettings: Record<string, Record<string, unknown>> };
+      state.agentRuntimeSettings.agent.contextBudgetReached = 'yes';
+      store.setStateJson('framework/state', state);
+      await framework.stop();
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      framework = await AgentFramework.create(config());
+      console.error = original;
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 100_000, transition: 'converging' });
+      assert.ok(errors.some((line) => line.includes('ignoring an invalid persisted contextBudgetReached')), errors.join('\n'));
+    } finally {
+      console.error = original;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a settle marks only the persisted budget it reached', async () => {
+    const { dir, config } = setup();
+    const framework = await AgentFramework.create(config());
+    try {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false });
+      await framework.getAgent('agent')!.compileContext();
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.deepEqual(persisted(framework), { contextBudgetTokens: 80_000 }, 'the record\'s 80k was never the live budget');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a descent applied without persisting settles without writing anything', async () => {
+    const { dir, config } = setup();
+    let framework = await AgentFramework.create(config());
+    try {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false });
+      await framework.getAgent('agent')!.compileContext();
+      assert.deepEqual(budgets(framework), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.equal(persisted(framework), undefined, 'nothing written for an ephemeral descent');
+      await framework.stop();
+      framework = await AgentFramework.create(config());
+      assert.deepEqual(budgets(framework), { target: 100_000, effective: 100_000, transition: 'stable' }, 'the recipe budget');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 it('reset-all skips tail controls unsupported by the active strategy', async () => {
@@ -145,6 +285,7 @@ it('reset-all skips tail controls unsupported by the active strategy', async () 
   try {
     assert.deepEqual(framework.resetAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
+      effectiveContextBudgetTokens: 100_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
       transition: 'stable',
@@ -171,6 +312,7 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
   try {
     assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
+      effectiveContextBudgetTokens: 100_000,
       sameRoundThinkTextPolicy: 'private',
       sameRoundThinkTextPolicySource: 'recipe',
       transition: 'stable',
@@ -180,6 +322,7 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
       framework.updateAgentRuntimeSettings('agent', { sameRoundThinkTextPolicy: 'public' }),
       {
         contextBudgetTokens: 100_000,
+        effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'public',
         sameRoundThinkTextPolicySource: 'runtime_override',
         transition: 'stable',
@@ -190,6 +333,7 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
       framework.resetAgentRuntimeSettings('agent', ['sameRoundThinkTextPolicy']),
       {
         contextBudgetTokens: 100_000,
+        effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'private',
         sameRoundThinkTextPolicySource: 'recipe',
         transition: 'stable',

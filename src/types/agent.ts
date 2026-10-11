@@ -223,7 +223,14 @@ export interface AgentRuntimeSettingsPatch {
 }
 
 export interface AgentRuntimeSettingsSnapshot {
+  /** The budget the agent is set to: while a lower one converges, its target. */
   contextBudgetTokens: number;
+  /**
+   * The budget compiles plan at now. It equals `contextBudgetTokens` except
+   * while a lower budget converges, when it is still the budget the descent
+   * started from (context-manager #162).
+   */
+  effectiveContextBudgetTokens: number;
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
@@ -233,7 +240,19 @@ export interface AgentRuntimeSettingsSnapshot {
 }
 
 /** Persisted values differ from recipe defaults; omitted keys inherit config. */
-export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch;
+export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch & {
+  /**
+   * Written beside `contextBudgetTokens` once the agent's live budget has
+   * reached it: by an immediate apply, or when a paced descent settles. A
+   * restore then applies that budget at once, rather than pacing a descent
+   * again from the recipe's budget (context-manager #162). The store fit
+   * that budget when it was reached, so the planner can fold to it at once
+   * even if its carried frontier was lost. Without it (a descent still
+   * running at the stop, or a record from an earlier release) the restore
+   * paces a descent, as before. Never part of a patch.
+   */
+  contextBudgetReached?: true;
+};
 
 /**
  * Result of running inference.

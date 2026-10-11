@@ -141,7 +141,9 @@ export class Agent {
   private readonly configuredTransitionPaceTokens?: number;
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   private contextBudgetTargetTokens?: number;
-  private runtimeSettingsOverrides: AgentRuntimeSettingsOverrides = {};
+  private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
+  /** Told when a paced descent settles at its target (the framework records it). */
+  private runtimeSettingsSettledListener?: () => void;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -284,6 +286,7 @@ export class Agent {
         this.contextBudgetTargetTokens ??
         this.contextBudgetTokens ??
         DEFAULT_CONTEXT_BUDGET_TOKENS,
+      effectiveContextBudgetTokens: this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS,
       ...(hot ? { tailTokens: hot.tailTokens } : {}),
       ...(hot?.transitionPaceTokens !== undefined
         ? { transitionPaceTokens: hot.transitionPaceTokens }
@@ -305,6 +308,11 @@ export class Agent {
 
   getRuntimeSettingsOverrides(): AgentRuntimeSettingsOverrides {
     return { ...this.runtimeSettingsOverrides };
+  }
+
+  /** Set (or clear) the one listener told when a paced descent settles at its target. */
+  onRuntimeSettingsSettled(listener: (() => void) | undefined): void {
+    this.runtimeSettingsSettledListener = listener;
   }
 
   /**
@@ -515,7 +523,15 @@ export class Agent {
   }
 
   restoreRuntimeSettings(overrides: AgentRuntimeSettingsOverrides): AgentRuntimeSettingsSnapshot {
-    return this.updateRuntimeSettings(overrides);
+    const { contextBudgetReached, ...settings } = overrides;
+    // A lower budget the agent had reached before the stop comes back
+    // reached, through the immediate path: the store fit it then. Without
+    // the marker, a descent resumes paced from the recipe's budget.
+    return this.updateRuntimeSettings(
+      contextBudgetReached === true && settings.contextBudgetTokens !== undefined
+        ? { ...settings, immediate: true }
+        : settings,
+    );
   }
 
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
@@ -551,6 +567,7 @@ export class Agent {
     this.contextBudgetTokens = this.contextBudgetTargetTokens;
     this.contextBudgetTargetTokens = undefined;
     this.updateHotContextSettings({ preparedWindowTokens: null });
+    this.runtimeSettingsSettledListener?.();
   }
 
   /**
