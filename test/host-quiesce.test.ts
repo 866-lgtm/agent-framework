@@ -683,7 +683,7 @@ test('a batch carrying a budget restart re-parks its sibling wakes instead of co
   });
 });
 
-test('resume flushes deferred writes per message: one poison write neither drops the rest nor skips the reopen', async () => {
+test('resume flushes deferred writes per message: one poison write neither drops the rest nor skips the reopen, and stays queued', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
     const traces: TraceEvent[] = [];
@@ -709,7 +709,9 @@ test('resume flushes deferred writes per message: one poison write neither drops
 
     const status = await framework.resume();
     assert.equal(status.quiesced, false);
-    assert.equal(status.deferredWrites, 0, 'the queue is drained even though one write failed');
+    // A drained write whose store throws is never dropped: it goes back into
+    // the queue under its id, for the next flush.
+    assert.equal(status.deferredWrites, 1, 'only the write that failed is still queued');
     assert.deepEqual(
       cm.getAllMessages().slice(before).map((m) => (m.content[0] as { text: string }).text),
       ['first', 'third'],

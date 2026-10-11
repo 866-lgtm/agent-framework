@@ -65,9 +65,17 @@ class InterjectingModule implements Module {
     for (const interjection of pending) {
       this.framework!.pushEvent({ type: 'interjection', source: 'test', interjection } as unknown as ProcessEvent);
     }
-    // Let the run loop handle them while this round's tools are pending, so
-    // they land in the deferred queue before the tool-result boundary.
-    if (pending.length > 0) await new Promise((r) => setTimeout(r, 30));
+    // Let the run loop handle them while this round's tools are pending, and
+    // return only once each is in the deferred queue, so the tool-result
+    // boundary meets them there (bounded: a run that never queues them fails).
+    if (pending.length > 0) {
+      const queue = () => (this.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
+      const end = Date.now() + 5000;
+      while (queue() < pending.length) {
+        if (Date.now() > end) throw new Error(`only ${queue()} of ${pending.length} interjection(s) were queued`);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
     const during = this.duringTool;
     this.duringTool = null;
     during?.();
@@ -129,6 +137,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   }
 
   /** A turn of two rounds: `tool` with the interjections, then a reply. */
+  let drains: Array<{ atBoundary: boolean; queued: string[] }> = [];
   async function runTurn(tool: 'move' | 'halt', interjections: Interjection[]): Promise<AgentFramework> {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Moving.' },
@@ -136,10 +145,35 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse(text('Done.')));
     const framework = await createFramework();
+    drains = recordDrains(framework);
     module.interjections = interjections;
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     return framework;
+  }
+
+  /** What the tool boundary's drain found queued. */
+  const atBoundary = () => drains.find((d) => d.atBoundary)?.queued;
+
+  /** What each drain for the agent found queued, in order, and whether it
+   *  stopped at a held message (the tool boundary's drain does). */
+  function recordDrains(framework: AgentFramework): Array<{ atBoundary: boolean; queued: string[] }> {
+    const drains: Array<{ atBoundary: boolean; queued: string[] }> = [];
+    const internals = framework as unknown as {
+      deferredMessages: Array<{ participant: string; content: ContentBlock[] }>;
+      drainDeferredFor: (name: string, stopAt?: unknown) => unknown[];
+    };
+    const drain = internals.drainDeferredFor.bind(framework);
+    internals.drainDeferredFor = (name: string, stopAt?: unknown) => {
+      if (name === 'assistant' && internals.deferredMessages.length > 0) {
+        drains.push({
+          atBoundary: stopAt !== undefined,
+          queued: internals.deferredMessages.map((m) => `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`),
+        });
+      }
+      return drain(name, stopAt);
+    };
+    return drains;
   }
 
   function injected(): string[] {
@@ -150,6 +184,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
 
   it('a message named as the agent waits for the turn to end, after its last round', async () => {
     const framework = await runTurn('move', [{ participant: 'assistant', content: text('my own words') }]);
+    assert.deepEqual(atBoundary(), ['assistant: my own words'], 'it was queued when the boundary drained');
     assert.deepEqual(injected(), []);
     assert.deepEqual(windowOf(framework), [
       'Antra: go',
@@ -176,6 +211,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { participant: 'assistant', content: text('my own words') },
       { participant: 'Antra', content: text('look left') },
     ]);
+    assert.deepEqual(atBoundary(), ['assistant: my own words', 'Antra: look left'], 'both were queued when the boundary drained');
     assert.deepEqual(injected(), []);
     assert.deepEqual(windowOf(framework).slice(2), [
       'user: <tool_result>',
@@ -191,6 +227,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { participant: 'Antra', content: text('look left') },
       { participant: 'assistant', content: text('my own words') },
     ]);
+    assert.deepEqual(atBoundary(), ['Antra: look left', 'assistant: my own words'], 'both were queued when the boundary drained');
     assert.deepEqual(injected(), ['Antra: look left']);
     assert.deepEqual(windowOf(framework).slice(2), [
       'user: <tool_result>',
@@ -226,14 +263,19 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  /** The framework's own queue and its record of pending tool cycles. */
+  /** The framework's own queue and its record of turns and tool cycles. */
   function internalsOf(framework: AgentFramework) {
     return framework as unknown as {
       pendingAssistantBlocks: Map<string, ContentBlock[]>;
-      deferredMessages: Array<{ id: string }>;
-      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+      activeTurnTokens: Map<string, number>;
+      activeStreams: Map<string, unknown>;
+      deferredMessages: Array<{ id: string; participant: string }>;
+      deferredWritesPersisted: boolean;
+      drainDeferredFor: (name: string, stopAt?: unknown) => unknown[];
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string; deferredWriteId?: string }): string;
     };
   }
+  const otherCycle = (): ContentBlock[] => [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock];
 
   it('a message held for the turn\'s end lands then, while another agent\'s tool cycle is pending', async () => {
     membrane.pushResponse(createMockResponse([
@@ -243,43 +285,256 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     membrane.pushResponse(createMockResponse(text('Done.')));
     const framework = await createFramework();
     const internals = internalsOf(framework);
+    // Whether the other cycle was pending at the turn-end flush itself.
+    const pendingAtFlush: boolean[] = [];
+    const drain = internals.drainDeferredFor.bind(framework);
+    internals.drainDeferredFor = (name: string, stopAt?: unknown) => {
+      if (name === 'assistant' && stopAt === undefined && internals.deferredMessages.length > 0) {
+        pendingAtFlush.push(internals.pendingAssistantBlocks.has('builder'));
+      }
+      return drain(name, stopAt);
+    };
     module.duringTool = () => {
       // Another agent is mid tool cycle when this turn ends, and a write
       // named as this agent (held: it can't join the live stream) waits.
-      internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock]);
+      internals.pendingAssistantBlocks.set('builder', otherCycle());
       assert.equal(internals.addMessage('assistant', text('my own words'), undefined, { forAgent: 'assistant' }), '', 'deferred');
     };
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await framework.runUntilIdle();
-    assert.ok(internals.pendingAssistantBlocks.has('builder'), 'the other cycle was still pending at the flush');
+    assert.deepEqual(pendingAtFlush, [true], 'the other cycle was pending at the turn-end flush');
     assert.deepEqual(windowOf(framework).slice(-2), ['assistant: Done.', 'assistant: my own words']);
     internals.pendingAssistantBlocks.delete('builder');
     await framework.stop();
   });
 
-  it('a message still deferred when the framework stops lands before the store closes', async () => {
+  it("a write waits on its target's own turn and tool cycle, not another agent's, primary-bound or targeted", async () => {
     const framework = await createFramework();
     const internals = internalsOf(framework);
-    // A primary-bound write waits out any agent's tool cycle, even with this
-    // agent idle; that cycle's stream then ends without delivering it.
-    internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock]);
-    assert.equal(internals.addMessage('Antra', text('late word')), '', 'deferred');
-    internals.pendingAssistantBlocks.delete('builder');
-    assert.equal(internals.deferredMessages.length, 1);
+    internals.pendingAssistantBlocks.set('builder', otherCycle());
+    try {
+      assert.notEqual(internals.addMessage('Antra', text('primary-bound')), '', 'stored: the primary is idle');
+      assert.notEqual(internals.addMessage('Antra', text('targeted'), undefined, { forAgent: 'assistant' }), '', 'stored too');
+      internals.pendingAssistantBlocks.set('assistant', otherCycle());
+      assert.equal(internals.addMessage('Antra', text('in its own cycle')), '', "deferred: the primary's own cycle is pending");
+    } finally {
+      internals.pendingAssistantBlocks.delete('builder');
+      internals.pendingAssistantBlocks.delete('assistant');
+    }
     await framework.stop();
+  });
+
+  it("the puppet's flush lands what was deferred behind it while another agent's tool cycle is pending", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    module.duringTool = () => {
+      internals.pendingAssistantBlocks.set('builder', otherCycle());
+      assert.equal(internals.addMessage('Antra', text('while puppeted')), '', 'deferred behind the puppet');
+    };
+    try {
+      await framework.puppetToolCall('assistant', 'robot--move', {});
+      assert.equal(internals.deferredMessages.length, 0);
+      assert.deepEqual(windowOf(framework).slice(-3), ['assistant: <tool_use>', 'user: <tool_result>', 'Antra: while puppeted']);
+    } finally {
+      internals.pendingAssistantBlocks.delete('builder');
+    }
+    await framework.stop();
+  });
+
+  it('a turn mid-compile when the framework stops never starts a stream, and what was deferred for it is stored', async () => {
+    membrane.pushResponse(createMockResponse(text('too late')));
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    const agent = framework.getAgent('assistant')!;
+    let compiling!: () => void;
+    const inCompile = new Promise<void>((resolve) => { compiling = resolve; });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const start = agent.startStreamWithInjections.bind(agent);
+    (agent as unknown as { startStreamWithInjections: typeof start }).startStreamWithInjections = async (...args) => {
+      compiling();
+      await released;
+      return start(...args);
+    };
+    // The event loop starts the turn, as in a host (stop() awaits the loop).
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+    await inCompile;
+    assert.equal(internals.addMessage('Antra', text('late word')), '', 'deferred: the turn is alive');
+    const stopped = framework.stop();
+    release();
+    await stopped;
+    assert.equal(internals.activeStreams.size, 0, 'no stream outlived stop()');
 
     const reopened = await createFramework();
     assert.ok(windowOf(reopened).includes('Antra: late word'), 'stored before the store closed');
+    assert.ok(!windowOf(reopened).includes('assistant: too late'), 'the refused turn produced nothing');
+    await reopened.stop();
+  });
+
+  it('a drained write whose store throws stays in the persisted queue, and is stored on the next boot', async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.deferredWritesPersisted = true;
+    internals.activeTurnTokens.set('assistant', 1);
+    assert.equal(internals.addMessage('Antra', text('kept')), '', 'deferred');
+    internals.activeTurnTokens.delete('assistant');
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+      if ((args[1] as Array<{ text?: string }>).some((b) => b.text === 'kept')) throw new Error('disk full');
+      return add(...args);
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try { await framework.stop(); } finally { console.error = error; }
+    assert.ok(errors.some((e) => e.includes('could not be stored; it stays queued') && e.includes('disk full')), errors.join('\n'));
+    assert.equal(internals.deferredMessages.length, 1, 'still queued');
+
+    const reopened = await createFramework();
+    assert.ok(windowOf(reopened).includes('Antra: kept'), 'boot recovery stored it');
+    await reopened.stop();
+  });
+
+  it('at a tool boundary, a write whose store throws stays queued and is not injected; the rest are', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    let failOnce = true;
+    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+      if (failOnce && (args[1] as Array<{ text?: string }>).some((b) => b.text === 'look left')) {
+        failOnce = false;
+        throw new Error('transient');
+      }
+      return add(...args);
+    };
+    module.interjections = [
+      { participant: 'Antra', content: text('look left') },
+      { participant: 'Antra', content: text('look right') },
+    ];
+    const error = console.error;
+    console.error = () => {};
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.deepEqual(injected(), ['Antra: look right']);
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: look right',
+      'assistant: Done.',
+      'Antra: look left',
+    ], 'the one that failed was kept, and stored at the turn end');
+    await framework.stop();
+  });
+
+  it('a message stored straight into the context during a round, with nothing injected at the boundary, stays unread', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    const agent = framework.getAgent('assistant')!;
+    let bypassed = '';
+    module.duringTool = () => {
+      // A writer that bypasses deferral (an older route): the stream never carried it.
+      bypassed = agent.getContextManager().addMessage('Antra', text('bypassed'));
+    };
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.deepEqual(injected(), []);
+    const isUnread = (framework as unknown as {
+      isUnreadStoredMessage: (a: typeof agent, id: string) => boolean;
+    }).isUnreadStoredMessage.bind(framework);
+    assert.equal(isUnread(agent, bypassed), true, 'a boundary that injected nothing marks nothing read');
+    await framework.stop();
+  });
+
+  it("a compile's watermark never rolls back a mark made while it ran", async () => {
+    const framework = await createFramework();
+    const agent = framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    cm.addMessage('Antra', text('before'));
+    const compile = cm.compile.bind(cm);
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    (cm as unknown as { compile: typeof compile }).compile = async (...args) => {
+      await released;
+      return compile(...args);
+    };
+    const compiling = agent.compileContext();
+    cm.addMessage('Antra', text('heard at a boundary'));
+    agent.markContextConsumed();
+    const marked = agent.getConsumedWatermark();
+    release();
+    await compiling;
+    assert.deepEqual(agent.getConsumedWatermark(), marked, "the boundary's mark stands");
+    (cm as unknown as { compile: typeof compile }).compile = compile;
+    await agent.compileContext();
+    assert.ok(agent.getConsumedWatermark()!.sequence >= marked!.sequence, 'a later compile still advances it');
+    await framework.stop();
+  });
+
+  it("a held message waits out a successor turn's tool cycle, and lands once it is over", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    const internals = internalsOf(framework) as ReturnType<typeof internalsOf> & { releasePrimaryProviderGate: (name: string) => void };
+    const agent = framework.getAgent('assistant')!;
+    module.duringTool = () => {
+      assert.equal(internals.addMessage('assistant', text('my own words'), undefined, { forAgent: 'assistant' }), '', 'held');
+    };
+    // As the turn's stream completes, a successor turn takes the agent and is
+    // mid tool cycle (the 2026-07-31 interleave): the stream generation, the
+    // turn token and the cycle are the successor's when the first turn's
+    // teardown flushes.
+    let completed = false;
+    const off = framework.onTrace((event) => {
+      if ((event as { type: string }).type !== 'inference:completed') return;
+      off();
+      completed = true;
+      (agent as unknown as { _streamId: number })._streamId++;
+      internals.activeTurnTokens.set('assistant', 1_000_000);
+      internals.pendingAssistantBlocks.set('assistant', otherCycle());
+    });
+    // The first turn's teardown releases its provider gate, then flushes,
+    // synchronously: once the release is seen, the flush has run.
+    let tornDown!: () => void;
+    const teardown = new Promise<void>((resolve) => { tornDown = resolve; });
+    const release = internals.releasePrimaryProviderGate.bind(framework);
+    internals.releasePrimaryProviderGate = (name: string) => {
+      release(name);
+      if (completed && name === 'assistant') tornDown();
+    };
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+    await teardown;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(!windowOf(framework).includes('assistant: my own words'), "not stored inside the successor's cycle");
+    assert.ok(internals.deferredMessages.some((m) => m.participant === 'assistant'), 'still queued');
+    // The successor's cycle and turn end; what is still queued lands (here at stop's drain).
+    internals.pendingAssistantBlocks.delete('assistant');
+    internals.activeTurnTokens.delete('assistant');
+    internals.activeStreams.delete('assistant');
+    await framework.stop();
+    const reopened = await createFramework();
+    assert.equal(windowOf(reopened).at(-1), 'assistant: my own words');
     await reopened.stop();
   });
 
   it('a write coming back from the deferred queue re-defers while a turn is alive, tool_result or not', async () => {
     const framework = await createFramework();
-    const internals = framework as unknown as {
-      activeTurnTokens: Map<string, number>;
-      deferredMessages: Array<{ id: string }>;
-      addMessage: (p: string, c: ContentBlock[], m?: unknown, o?: { deferredWriteId?: string }) => string;
-    };
+    const internals = internalsOf(framework);
     internals.activeTurnTokens.set('assistant', 1);
     try {
       // A queued pair's tool_result must follow its tool_use back into the
@@ -290,6 +545,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       ], undefined, { deferredWriteId: 'w1' });
       assert.equal(requeued, '');
       assert.ok(internals.deferredMessages.some((m) => m.id === 'w1'));
+      // So does plain text.
+      assert.equal(internals.addMessage('Antra', text('plain'), undefined, { deferredWriteId: 'w2' }), '');
+      assert.ok(internals.deferredMessages.some((m) => m.id === 'w2'));
       // A fresh tool_result write keeps landing as before.
       const fresh = internals.addMessage('user', [
         { type: 'tool_result', toolUseId: 'p2', content: 'ok' } as ContentBlock,
