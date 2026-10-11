@@ -1,6 +1,6 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@animalabs/context-manager';
@@ -15,9 +15,13 @@ import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { JsStore } from '@animalabs/chronicle';
 
 // What a withheld result settles to with no writable workspace (#277): the
-// neutral notice, then where the original is kept.
-const AUDIT_STUB = withheldResultNotice(null, true);
-const UNSAVED_STUB = withheldResultNotice(null, false);
+// neutral notice, then where the original is kept. Written out, not computed
+// by withheldResultNotice, so a change of its wording fails here (#281 I26).
+const AUDIT_STUB = 'Tool result withheld by the guard. The tool has already executed. Its full result is kept in ' +
+  "the guard's audit record (framework/tool-result-guard), for an operator.";
+const UNSAVED_STUB = 'Tool result withheld by the guard. The tool has already executed. Its full result went to ' +
+  "the guard's audit record (framework/tool-result-guard), for an operator, though saving that record had failed " +
+  'when the result arrived.';
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
@@ -160,7 +164,7 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     const audit = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     assert.match(JSON.stringify(audit[0]), /original-text-payload|original-error-payload/);
     assert.ok(JSON.stringify(audit[0]).includes(image));
-    assert.deepEqual(audit.slice(-2).map((r) => r.type), ['withheld', 'annotated']);
+    assert.deepEqual(audit.slice(-3).map((r) => r.type), ['withheld', 'annotated', 'stub_updated']);
     const historical = store.getStateJsonAt(TOOL_RESULT_GUARD_AUDIT_STATE, stagedSequence) as unknown[];
     assert.deepEqual(audit[0], historical[0], 'redaction only appends; original Chronicle record is unchanged');
     const original = structuredClone(audit[0]);
@@ -805,7 +809,7 @@ for (const failedType of ['staged', 'linked']) {
       failing = false;
       await h.run(); // A normal activation, with no new tool call, retries the audit.
       const records = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
-      assert.deepEqual(records.map((r) => r.type), ['staged', 'linked', 'withheld', 'annotated']);
+      assert.deepEqual(records.map((r) => r.type), ['staged', 'linked', 'withheld', 'annotated', 'stub_updated']);
       assert.match(JSON.stringify(records[0]), /payload-one/, 'the original is recoverable after storage returns');
       assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
       assert.deepEqual(h.module.calls, ['one']);
@@ -905,7 +909,7 @@ test('storage recovery: endTurn never admits a batch whose audit sync failed', a
     await h.run();
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
     const records = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
-    assert.deepEqual(records.slice(-2).map((r) => r.type), ['withheld', 'annotated']);
+    assert.deepEqual(records.slice(-3).map((r) => r.type), ['withheld', 'annotated', 'stub_updated']);
     assert.match(JSON.stringify(records[0]), /payload-one/, 'the original is still archived');
   } finally { store.sync = sync; await h.framework.stop(); }
 });
@@ -984,7 +988,7 @@ test('storage recovery: shutdown retries edits queued by its terminating stream'
 // file when a writable mount takes it, else the guard's audit record.
 // ---------------------------------------------------------------------------
 
-async function workspaceHarness(scripts: NormalizedResponse[][], mount: { maxFileSize?: number } = {}) {
+async function workspaceHarness(scripts: NormalizedResponse[][], mount: { maxFileSize?: number; autoMaterialize?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-tool-result-guard-ws-')); dirs.push(dir);
   const mountDir = join(dir, 'mount');
   mkdirSync(mountDir, { recursive: true });
@@ -993,6 +997,7 @@ async function workspaceHarness(scripts: NormalizedResponse[][], mount: { maxFil
   const workspace = new WorkspaceModule({ mounts: [{
     name: 'work', path: mountDir, mode: 'read-write', watch: 'never',
     ...(mount.maxFileSize !== undefined ? { maxFileSize: mount.maxFileSize } : {}),
+    ...(mount.autoMaterialize !== undefined ? { autoMaterialize: mount.autoMaterialize } : {}),
   }] });
   const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
@@ -1002,16 +1007,46 @@ async function workspaceHarness(scripts: NormalizedResponse[][], mount: { maxFil
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
     await framework.runUntilIdle();
   };
-  return { framework, membrane, module, workspace, run };
+  return { framework, membrane, module, workspace, run, mountDir, storePath: join(dir, 'store') };
 }
 
-/** Delay the framework's tool-results writer (no workspace: it then reports
- *  none), keeping the framework's own wiring and tracking in place. */
+/** Delay the framework's spill of withheld originals (it then reports no
+ *  workspace), keeping the framework's own wiring and tracking in place. */
 function slowSpill(framework: AgentFramework, wait: () => Promise<unknown>) {
-  (framework as unknown as { writeToolResultFile: () => Promise<null> }).writeToolResultFile = async () => {
+  (framework as unknown as { spillWithheld: () => Promise<null> }).spillWithheld = async () => {
     await wait();
     return null;
   };
+}
+
+/** A gate a test opens itself, and a wait for a condition the code under test
+ *  makes true (#281 I5: no fixed timers standing in for events). */
+function gate() {
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => { open = resolve; });
+  return { opened, open };
+}
+async function until(check: () => boolean, what: string) {
+  for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(check(), `timed out waiting until ${what}`);
+}
+
+/** Calls of a guard's afterAnnotations, the compile's wait for its stubs. */
+function watchCompiles(framework: AgentFramework, agentName = 'assistant') {
+  const guard = framework.getAgent(agentName)!.toolResultGuard;
+  const watched = { calls: 0 };
+  const original = guard.afterAnnotations.bind(guard);
+  guard.afterAnnotations = (read) => { watched.calls++; return original(read); };
+  return watched;
+}
+
+/** Whether stop() has reached its wait for the guards' annotations. */
+function watchStopDrain(framework: AgentFramework) {
+  const annotations = (framework as unknown as { guardAnnotations: Set<Promise<void>> }).guardAnnotations;
+  const watched = { reached: false };
+  const iterate = annotations[Symbol.iterator].bind(annotations);
+  annotations[Symbol.iterator] = () => { watched.reached = true; return iterate(); };
+  return watched;
 }
 
 const SPILLED_STUB = /^Tool result withheld by the guard\. The tool has already executed\. Its full result is in workspace file (work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt)\.$/;
@@ -1034,7 +1069,9 @@ test('#277: a withheld original is written to the workspace, and its stub names 
     const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
     assert.deepEqual(retried.map((b) => b.content), [stub], 'the retry already says where the original is');
     assert.doesNotMatch(stub, /refus|test-category/, "#159's line: no refusal or category in the context");
-    assert.deepEqual(audit.at(-1), { ...audit.at(-1), type: 'annotated', results: [{ toolUseId: 'one', path }] });
+    assert.deepEqual(audit.at(-2), { ...audit.at(-2), type: 'annotated', results: [{ toolUseId: 'one', path }] });
+    assert.equal(audit.at(-1)?.type, 'stub_updated');
+    assert.equal(audit.at(-1)?.historyUpdate, undefined, 'the stub was edited to name the file');
   } finally { await h.framework.stop(); }
 });
 
@@ -1043,9 +1080,10 @@ test('#277: a failed workspace write says so, and the audit record still keeps t
   try {
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
-    assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Writing its full result to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt failed \(.+\), so it is kept only in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
+    // The write's own error stays in the audit record and the logs (#281 I20).
+    assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Writing its full result to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt failed, so it is kept only in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
-    const annotated = audit.at(-1) as { type: string; results: Array<{ toolUseId: string; path?: string; error?: string }> };
+    const annotated = audit.at(-2) as { type: string; results: Array<{ toolUseId: string; path?: string; error?: string }> };
     assert.equal(annotated.type, 'annotated');
     assert.equal(annotated.results[0].toolUseId, 'one');
     assert.equal(typeof annotated.results[0].error, 'string');
@@ -1054,13 +1092,22 @@ test('#277: a failed workspace write says so, and the audit record still keeps t
 });
 
 test('#277: the refusal retry is compiled only once the stub says where the original is', async () => {
+  // The framework's retry is a new activation (startStreamWithInjections), so
+  // this also pins that path's wait (#281 I12).
   const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
-  slowSpill(h.framework, () => new Promise((resolve) => setTimeout(resolve, 100)));
+  const write = gate();
+  let spills = 0;
+  slowSpill(h.framework, () => { spills++; return write.opened; });
+  const compiles = watchCompiles(h.framework);
   try {
-    await h.run();
+    const running = h.run();
+    await until(() => spills === 1 && compiles.calls >= 2, 'the retry is being compiled while the stub is written');
+    assert.equal(h.membrane.requests.length, 1, 'the retry waits for the stub');
+    write.open();
+    await running;
     const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
     assert.deepEqual(retried.map((b) => b.content), [AUDIT_STUB]);
-  } finally { await h.framework.stop(); }
+  } finally { write.open(); await h.framework.stop(); }
 });
 
 test("#277: an operator's edit made before the stub is annotated stands, and the hold waits for it", async () => {
@@ -1081,17 +1128,21 @@ test("#277: an operator's edit made before the stub is annotated stands, and the
     assert.equal((r.cm.getMessage(r.messageId)!.content[0] as { content: unknown }).content, 'operator replacement');
     assert.equal(r.cm.getCompressionHolds().size, 0);
     const audit = r.cm.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
-    assert.equal(audit.at(-1)?.type, 'annotated');
+    assert.equal(audit.at(-2)?.type, 'annotated');
+    assert.equal(audit.at(-1)?.type, 'stub_updated');
     assert.equal(audit.at(-1)?.historyUpdate, 'superseded');
   } finally { r.cm.close(); }
 });
 
 test('#277: stop lets an aborted batch\'s stub be annotated before the store closes', async () => {
   const h = await harness([[calls('one')]], { toolResultGuard: true });
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const write = gate();
   let spills = 0;
-  slowSpill(h.framework, () => { spills++; return gate; });
+  slowSpill(h.framework, () => { spills++; return write.opened; });
+  const drain = watchStopDrain(h.framework);
+  let modulesStopped = false;
+  const stopModule = h.module.stop.bind(h.module);
+  h.module.stop = async () => { modulesStopped = true; await stopModule(); };
   h.membrane.onSubmit = () => {
     const stream = h.membrane.streams.at(-1)!;
     queueMicrotask(() => stream.cancel());
@@ -1099,30 +1150,46 @@ test('#277: stop lets an aborted batch\'s stub be annotated before the store clo
   let stopped = false;
   try {
     await h.run().catch(() => {});
-    for (let i = 0; i < 100 && spills === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(spills, 1, 'the aborted batch is being annotated');
+    await until(() => spills === 1, 'the aborted batch is being annotated');
     const stopping = h.framework.stop().then(() => { stopped = true; });
-    setTimeout(release, 50);
+    await until(() => drain.reached, 'stop waits for the annotation');
+    assert.equal(modulesStopped, false, 'modules and the store wait for the annotation');
+    assert.equal(stopped, false);
+    write.open();
     await stopping;
+    assert.equal(modulesStopped, true);
     const restarted = await AgentFramework.create(h.base);
     try {
       assert.equal(toolResults(restarted)[0].content, AUDIT_STUB, 'the annotated stub was saved before close');
     } finally { await restarted.stop(); }
-  } finally { release(); if (!stopped) await h.framework.stop(); }
+  } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
 test('#277: the stub has the same text for each place the original can be', () => {
   const notice = 'Tool result withheld by the guard. The tool has already executed.';
+  const audit = "the guard's audit record (framework/tool-result-guard), for an operator";
+  const unsaved = `${audit}, though saving that record had failed when the result arrived`;
   assert.equal(withheldResultNotice({ path: 'work/tool-results/2026-10-10-withheld-a.txt' }, true),
     `${notice} Its full result is in workspace file work/tool-results/2026-10-10-withheld-a.txt.`);
-  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, true),
-    `${notice} Writing its full result to workspace file work/tool-results/x.txt failed (disk full), ` +
-    "so it is kept only in the guard's audit record (framework/tool-result-guard), for an operator.");
-  assert.equal(withheldResultNotice(null, true),
-    `${notice} Its full result is kept in the guard's audit record (framework/tool-result-guard), for an operator.`);
-  assert.equal(withheldResultNotice(null, false),
-    `${notice} Its full result is kept in the guard's audit record (framework/tool-result-guard), for an operator, ` +
-    'though saving that record had failed when this was written.');
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/2026-10-10-withheld-a.txt' }, false),
+    `${notice} Its full result is in workspace file work/tool-results/2026-10-10-withheld-a.txt.`);
+  // A failed write's own error text isn't the model's to read (#281 I20).
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'EACCES: /srv/host/secret' }, true),
+    `${notice} Writing its full result to workspace file work/tool-results/x.txt failed, so it is kept only in ${audit}.`);
+  // The audit record is said to keep it only when that record was saved (#281 I21).
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, false),
+    `${notice} Writing its full result to workspace file work/tool-results/x.txt failed, so it went only to ${unsaved}.`);
+  // A write still under way when the host stopped waiting (#281 I2).
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/y.txt', unfinished: true }, true),
+    `${notice} Its full result was still being written to workspace file work/tool-results/y.txt when this note ` +
+    `was made; if that file is missing, it is kept in ${audit}.`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/y.txt', unfinished: true }, false),
+    `${notice} Its full result was still being written to workspace file work/tool-results/y.txt when this note ` +
+    `was made; if that file is missing, it went to ${unsaved}.`);
+  assert.equal(withheldResultNotice(null, true), `${notice} Its full result is kept in ${audit}.`);
+  assert.equal(withheldResultNotice(null, false), `${notice} Its full result went to ${unsaved}.`);
+  assert.equal(withheldResultNotice(null, true), AUDIT_STUB);
+  assert.equal(withheldResultNotice(null, false), UNSAVED_STUB);
 });
 
 test('#277: direct API: a request after an aborted batch is compiled once its stub is annotated', async () => {
@@ -1135,26 +1202,38 @@ test('#277: direct API: a request after an aborted batch is compiled once its st
     assert.ok(response);
     return response;
   };
+  const write = gate();
+  let spills = 0;
   try {
     const agent = h.framework.getAgent('assistant')!;
-    slowSpill(h.framework, () => new Promise((resolve) => setTimeout(resolve, 100)));
+    slowSpill(h.framework, () => { spills++; return write.opened; });
+    const compiles = watchCompiles(h.framework);
     agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
     await agent.runInference(h.framework.getAllTools());
     agent.provideToolResult('one', { success: true, data: 'direct-original' });
     const aborted = await agent.runInference(h.framework.getAllTools());
     assert.equal(aborted.aborted, true);
-    await agent.runInference(h.framework.getAllTools());
-    const next = requests[2].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
-    assert.deepEqual(next.map((b) => b.content), [AUDIT_STUB]);
-  } finally { await h.framework.stop(); }
+    await until(() => spills === 1, 'the aborted batch is being annotated');
+    const before = compiles.calls;
+    const next = agent.runInference(h.framework.getAllTools());
+    await until(() => compiles.calls > before, 'the next request is being compiled while the stub is written');
+    assert.equal(requests.length, 2, 'the next request waits for the stub');
+    write.open();
+    await next;
+    const results = requests[2].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(results.map((b) => b.content), [AUDIT_STUB]);
+  } finally { write.open(); await h.framework.stop(); }
 });
 
 test('#277: stop waits for an annotation started by an ephemeral run it has already disposed', async () => {
   const h = await harness([[calls('one')]]);
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const write = gate();
   let spills = 0;
-  slowSpill(h.framework, () => { spills++; return gate; });
+  slowSpill(h.framework, () => { spills++; return write.opened; });
+  const drain = watchStopDrain(h.framework);
+  let modulesStopped = false;
+  const stopModule = h.module.stop.bind(h.module);
+  h.module.stop = async () => { modulesStopped = true; await stopModule(); };
   h.membrane.onSubmit = () => {
     const stream = h.membrane.streams.at(-1)!;
     queueMicrotask(() => stream.cancel());
@@ -1168,11 +1247,12 @@ test('#277: stop waits for an annotation started by an ephemeral run it has alre
     const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
     h.framework.start();
     await completion.catch(() => {});
-    for (let i = 0; i < 100 && spills === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(spills, 1, "the ephemeral's aborted batch is being annotated");
+    await until(() => spills === 1, "the ephemeral's aborted batch is being annotated");
     assert.equal(h.framework.getAgent('ephemeral') ?? null, null, 'the run was disposed');
     const stopping = h.framework.stop().then(() => { stopped = true; });
-    setTimeout(release, 50);
+    await until(() => drain.reached, 'stop waits for the annotation');
+    assert.equal(modulesStopped, false, 'modules and the store wait for the annotation');
+    write.open();
     await stopping;
     const restarted = await AgentFramework.create(h.base);
     try {
@@ -1180,7 +1260,7 @@ test('#277: stop waits for an annotation started by an ephemeral run it has alre
       assert.ok(audit.some((r) => r.type === 'annotated' && r.agentName === 'ephemeral'),
         'the annotation finished before the store closed');
     } finally { await restarted.stop(); }
-  } finally { release(); if (!stopped) await h.framework.stop(); }
+  } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
 // ---------------------------------------------------------------------------
@@ -1235,7 +1315,7 @@ test('#277: a rollback while an aborted batch is being annotated gets none of it
   const labels: string[] = [];
   // The annotation is held after its first write, where a rollback can land
   // between two writes. (A rollback during a write: the next test.)
-  (h.framework as unknown as { writeToolResultFile: (label: string) => Promise<null> }).writeToolResultFile = async (label) => {
+  (h.framework as unknown as { spillWithheld: (label: string) => Promise<null> }).spillWithheld = async (label) => {
     labels.push(label);
     if (labels.length === 1) await gate;
     return null;
@@ -1261,7 +1341,7 @@ test('#277: a rollback while an aborted batch is being annotated gets none of it
     const annotated = audit.find((record) => record.type === 'annotated');
     assert.ok(annotated, `the annotation is recorded on ${rolled.targetBranch}: ${JSON.stringify(audit)}`);
     assert.deepEqual(annotated.results, [{ toolUseId: 'one' }, { toolUseId: 'two', skipped: 'branch_changed' }]);
-    assert.equal(annotated.historyUpdate, 'superseded');
+    assert.equal(audit.find((record) => record.type === 'stub_updated')?.historyUpdate, 'superseded');
     await cm.switchBranch(source);
     const kept = cm.getMessage(batch.id)!.content.filter((b) => b.type === 'tool_result');
     assert.deepEqual(kept.map((b) => (b as { content: unknown }).content), [TOOL_RESULT_GUARD_NOTICE, TOOL_RESULT_GUARD_NOTICE],
@@ -1378,4 +1458,196 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
     store.switchBranch(source);
     assert.equal(store.treeGet(tree, 'tool-results/there.txt'), null, 'nor on the branch the write named');
   } finally { store.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// sw-af281's review: the annotation's waits are bounded and cover every
+// compile, its record survives a failed stub edit, and the stub says only
+// what is so.
+// ---------------------------------------------------------------------------
+
+test('#281 I2: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async () => {
+  const h = await workspaceHarness([[calls('one', 'two'), refused()], [answer()]]);
+  (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
+  const stalled = gate();
+  let writes = 0;
+  (h.framework as unknown as { writeToolResultFile: () => Promise<null> }).writeToolResultFile = async () => {
+    writes++;
+    await stalled.opened;
+    return null;
+  };
+  let stopped = false;
+  try {
+    await h.run();
+    assert.equal(writes, 1, "once the workspace stopped answering, the batch's next result isn't written");
+    assert.equal(h.membrane.requests.length, 2, 'the retry went out without the write');
+    const [one, two] = toolResults(h.framework).map((block) => String(block.content));
+    assert.match(one, /^Tool result withheld by the guard\. The tool has already executed\. Its full result was still being written to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt when this note was made; if that file is missing, it is kept in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
+    assert.equal(two, AUDIT_STUB);
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const annotated = audit.find((record) => record.type === 'annotated') as { results: Array<Record<string, unknown>> };
+    assert.equal(annotated.results[0].unfinished, true);
+    assert.deepEqual(annotated.results[1], { toolUseId: 'two', skipped: 'workspace_unanswered' });
+    await h.framework.stop();
+    stopped = true;
+    assert.equal(writes, 1, 'stop finished with the write still stalled');
+  } finally { stalled.open(); if (!stopped) await h.framework.stop(); }
+});
+
+test('#281 I3: a failed stub edit leaves the record of the written file, and the edit is retried before the next activation', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()], [answer()]]);
+  const cm = h.framework.getAgent('assistant')!.getContextManager() as unknown as {
+    editMessage: (id: unknown, content: ContentBlock[]) => unknown;
+  };
+  const edit = cm.editMessage.bind(cm);
+  let failures = 0;
+  cm.editMessage = (id, content) => {
+    if (failures === 0 && JSON.stringify(content).includes('Its full result is in workspace file')) {
+      failures++;
+      throw new Error('injected stub edit failure');
+    }
+    return edit(id, content);
+  };
+  const audit = () => h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+  try {
+    await h.run();
+    assert.equal(failures, 1);
+    const annotated = audit().find((record) => record.type === 'annotated') as { results: Array<{ path?: string }> };
+    const path = annotated.results[0].path;
+    assert.ok(path && SPILLED_STUB.test(`${TOOL_RESULT_GUARD_NOTICE} Its full result is in workspace file ${path}.`),
+      `the record names the written file though the edit failed: ${JSON.stringify(annotated)}`);
+    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE, 'the stub is still the bare notice');
+    assert.equal(audit().some((record) => record.type === 'stub_updated'), false, 'the edit is still queued');
+    await h.run();
+    assert.equal(toolResults(h.framework)[0].content, `${TOOL_RESULT_GUARD_NOTICE} Its full result is in workspace file ${path}.`);
+    assert.equal(audit().at(-1)?.type, 'stub_updated');
+    assert.equal(audit().at(-1)?.historyUpdate, undefined);
+    assert.equal(h.framework.getAgent('assistant')!.getContextManager().getCompressionHolds().size, 0);
+  } finally { await h.framework.stop(); }
+});
+
+test("#281 I4: a file whose copy on disk fails is still in the workspace's tree, and the stub names it", async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]], { autoMaterialize: true });
+  // A file where the directory should be: the copy on disk fails for anyone, root included.
+  writeFileSync(join(h.mountDir, 'tool-results'), 'not a directory');
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    const path = SPILLED_STUB.exec(stub)?.[1];
+    assert.ok(path, `the stub names the file: ${stub}`);
+    const file = await h.workspace.readBinary(path);
+    assert.ok('data' in file, `the workspace reads it: ${JSON.stringify(file)}`);
+    assert.match((file as { data: Buffer }).data.toString('utf8'), /payload-one/);
+    assert.equal(existsSync(join(h.mountDir, path.replace(/^work\//, ''))), false, 'its copy on disk failed');
+    const annotated = (h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>)
+      .find((record) => record.type === 'annotated') as { results: Array<Record<string, unknown>> };
+    assert.deepEqual(annotated.results, [{ toolUseId: 'one', path }]);
+  } finally { await h.framework.stop(); }
+});
+
+test("#281 I6: a conversation fork seeded while its template's stub is written copies the stub that names the original", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-guard-fork-')); dirs.push(dir);
+  const membrane = new ScriptMembrane([[calls('one')]]);
+  const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
+    modules: [new ReadModule()], syncIntervalMs: 0,
+    conversations: { templateAgent: 'assistant', bind: { channel: 'mention' } } });
+  const write = gate();
+  let spills = 0;
+  slowSpill(framework, () => { spills++; return write.opened; });
+  membrane.onSubmit = () => {
+    const stream = membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    await framework.runUntilIdle().catch(() => {});
+    await until(() => spills === 1, "the template's aborted batch is being annotated");
+    const compiles = watchCompiles(framework);
+    const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<{
+      getContextManager(): { getAllMessages(): Array<{ content: ContentBlock[] }> } }> };
+    const forking = internals.createConversationAgent('assistant-chan-g1', 'world:chan');
+    await until(() => compiles.calls > 0, "the fork's seed waits for the template's stub");
+    write.open();
+    const fork = await forking;
+    const seeded = fork.getContextManager().getAllMessages()
+      .flatMap((message) => message.content.filter((block) => block.type === 'tool_result'));
+    assert.deepEqual(seeded.map((block) => (block as { content: unknown }).content), [AUDIT_STUB]);
+  } finally { write.open(); await framework.stop(); }
+});
+
+test('#281 I7: a compile during which an annotation began is compiled again once it is done', async () => {
+  const r = await compressionRig();
+  try {
+    const write = gate();
+    let entered = false;
+    r.guard.setHost({ spill: async () => { entered = true; await write.opened; return null; }, track: () => {} });
+    r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
+    let reads = 0;
+    const stub = () => (r.cm.getMessage(r.messageId)!.content[0] as { content: unknown }).content;
+    const compiled = r.guard.afterAnnotations(async () => {
+      reads++;
+      // A settlement lands during the compile, as a previous frame's teardown can.
+      if (reads === 1) assert.ok(r.guard.withhold('test-category'));
+      return stub();
+    });
+    await until(() => entered, 'the annotation is writing');
+    write.open();
+    assert.equal(await compiled, AUDIT_STUB);
+    assert.equal(reads, 2, 'compiled again once the annotation was done');
+  } finally { r.cm.close(); }
+});
+
+test('#281 I13: a request preview never waits on a workspace write, though the next request does', async () => {
+  const h = await harness([[calls('one')], [answer()]], { toolResultGuard: true });
+  const write = gate();
+  let spills = 0;
+  slowSpill(h.framework, () => { spills++; return write.opened; });
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  try {
+    await h.run().catch(() => {});
+    await until(() => spills === 1, 'the aborted batch is being annotated');
+    // Rollback, undo and redo report a preview: it must not wait on the write.
+    const preview = await h.framework.previewActivation('assistant');
+    const previewed = preview.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(previewed.map((b) => b.content), [TOOL_RESULT_GUARD_NOTICE], 'the preview shows the stub as it stands');
+    const compiles = watchCompiles(h.framework);
+    const running = h.run();
+    await until(() => compiles.calls > 0, 'the next request is being compiled');
+    assert.equal(h.membrane.requests.length, 1, 'the next request waits for the stub');
+    write.open();
+    await running;
+    const sent = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(sent.map((b) => b.content), [AUDIT_STUB]);
+  } finally { write.open(); await h.framework.stop(); }
+});
+
+test('#281 I23: an annotation that starts while modules stop writes no file, and is saved before the store closes', async () => {
+  const h = await workspaceHarness([]);
+  const agent = h.framework.getAgent('assistant')!;
+  const framework = h.framework as unknown as { writeToolResultFile: (...args: unknown[]) => Promise<unknown> };
+  const writeFile = framework.writeToolResultFile.bind(h.framework);
+  let writes = 0;
+  framework.writeToolResultFile = async (...args) => { writes++; return writeFile(...args); };
+  const stopModule = h.module.stop.bind(h.module);
+  h.module.stop = async () => {
+    // A settlement during shutdown, as a direct-API call that stop doesn't cancel can make.
+    agent.toolResultGuard.storeResults([{ type: 'tool_result', toolUseId: 'late', content: 'late-original' }],
+      [{ toolUseId: 'late', content: 'late-original' }], []);
+    agent.toolResultGuard.abandon('stopping');
+    await stopModule();
+  };
+  await h.framework.stop();
+  assert.equal(writes, 0, 'nothing is written to the stopping workspace');
+  const restarted = await AgentFramework.create({ storePath: h.storePath, membrane: new ScriptMembrane([]).asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }], modules: [], syncIntervalMs: 0 });
+  try {
+    assert.deepEqual(toolResults(restarted).map((block) => block.content), [AUDIT_STUB]);
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    assert.deepEqual(audit.slice(-3).map((record) => record.type), ['withheld', 'annotated', 'stub_updated']);
+    assert.deepEqual(audit.at(-2)?.results, [{ toolUseId: 'late' }]);
+  } finally { await restarted.stop(); }
 });

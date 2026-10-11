@@ -88,6 +88,7 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
+import type { WithheldSpill } from './tool-result-guard.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -769,6 +770,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
+/** How long the tool-result guard waits for a withheld original's workspace
+ *  write before its stub says the write was still under way (#281 I2). A local
+ *  write takes milliseconds; this bounds a stalled mount, which would otherwise
+ *  hold every later request of the agent and the framework's stop. */
+const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 /** Poll pending context-strategy maintenance independently of user activity. */
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
@@ -2023,6 +2029,10 @@ export class AgentFramework {
     // Tracked here rather than per agent, since an ephemeral run or a closed
     // fork leaves the agent map while its annotation can still be running.
     while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+    // An annotation that starts after this point, such as one from a direct
+    // Agent API call stop doesn't cancel, writes no file to the stopping
+    // workspace: its stub names the audit record (#281 I23).
+    this.guardSpillsClosed = true;
 
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll()];
@@ -2030,6 +2040,10 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll());
     }
     await Promise.all(shutdownPromises);
+
+    // Those later annotations write nothing, so they finish at once; let them
+    // record and edit their stubs before the store closes (#281 I23).
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -2702,6 +2716,12 @@ export class AgentFramework {
 
   /** Every guard's annotation still running, for stop() (agent-framework #277). */
   private readonly guardAnnotations = new Set<Promise<void>>();
+  /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
+  private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
+  /** Set once stop() has let the running annotations finish: a withheld
+   *  original is then no longer written to a workspace that is stopping, and
+   *  its stub names the audit record (#281 I23). */
+  private guardSpillsClosed = false;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
    *  withheld originals are written to, and the set stop() waits on
@@ -2715,7 +2735,7 @@ export class AgentFramework {
     }
     agent.toolResultGuard.setOverride(enabled);
     agent.toolResultGuard.setHost({
-      spill: (label, text, branch) => this.writeToolResultFile(label, text, branch),
+      spill: (label, text, branch) => this.spillWithheld(label, text, branch),
       track: (annotation) => {
         this.guardAnnotations.add(annotation);
         void annotation.finally(() => this.guardAnnotations.delete(annotation));
@@ -7396,7 +7416,11 @@ export class AgentFramework {
       // seeding again would stack another template copy on top of it.
       const { messages: existing } = await contextManager.compile();
       if (existing.length === 0) {
-        const { messages: compiled } = await template.getContextManager().compile();
+        // The copy is the fork's own, and the template's annotation edits only
+        // the template's message: seed only from stubs that already say where
+        // their originals went (#281 I6).
+        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+          () => template.getContextManager().compile());
         for (const msg of compiled) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -11723,27 +11747,67 @@ export class AgentFramework {
     return { blocks, spilled };
   }
 
+  /** Where a tool result labelled `label` is written: `<first writable
+   *  mount>/tool-results/<label>.txt`, or null when there is no writable
+   *  workspace. */
+  private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
+    const workspace = this.getWorkspaceModule();
+    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
+    if (!workspace || !mountName) return null;
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+    return { workspace, path: `${mountName}/tool-results/${safeLabel}.txt`, safeLabel };
+  }
+
   /**
-   * Write one tool result's text to `<first writable mount>/tool-results/
-   * <label>.txt`: the one place both the inline cap's spill and the guard's
-   * withheld originals go. null when there is no writable workspace. A failed
-   * write is reported, traced and logged here, never thrown. With a branch,
-   * the file lands on that branch or isn't written (see writeBinary).
+   * The guard's spill of a withheld original (agent-framework #277): the
+   * tool-results file, waited for at most withheldSpillDeadlineMs. A write
+   * still under way then is reported as unfinished at its path, and goes on
+   * by itself (#281 I2). Once stop() has let the running annotations finish,
+   * nothing more is written (#281 I23).
+   */
+  private async spillWithheld(label: string, text: string, branch: string): Promise<WithheldSpill> {
+    if (this.guardSpillsClosed) return null;
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<WithheldSpill>((resolve) => {
+      timer = setTimeout(() => resolve({ path: place.path, unfinished: true }), this.withheldSpillDeadlineMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([this.writeToolResultFile(label, text, branch), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Write one tool result's text to its tool-results file (see
+   * toolResultFilePlace): the one place both the inline cap's spill and the
+   * guard's withheld originals go. null when there is no writable workspace.
+   * A failed write is reported, traced and logged here, never thrown. With a
+   * branch, the file lands on that branch or isn't written (see writeBinary).
    */
   private async writeToolResultFile(
     label: string,
     content: string,
     branch?: string,
   ): Promise<{ path: string; error?: string } | null> {
-    const workspace = this.getWorkspaceModule();
-    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
-    if (!workspace || !mountName) return null;
-    const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
-    const path = `${mountName}/tool-results/${safeLabel}.txt`;
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    const { workspace, path, safeLabel } = place;
     let failure: string;
     try {
       const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain', { branch });
       if (result.success) return { path };
+      // The file is in the workspace's Chronicle tree, where its tools read
+      // it, and only its copy on disk failed: it is written for every reader
+      // the stub or the truncation note sends there (#281 I4). The workspace
+      // reports the disk failure itself (workspace:materialize-failed).
+      if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${result.error}`);
+        return { path };
+      }
       failure = result.error ?? 'write refused';
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);

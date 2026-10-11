@@ -655,8 +655,6 @@ export class Agent {
     }
 
     this.toolResultGuard.flushUnrecorded();
-    // A withheld stub is compiled only once it says where its original went.
-    await this.toolResultGuard.whenAnnotated();
 
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
@@ -677,9 +675,12 @@ export class Agent {
       ? this.buildToolResultMessages(this._state.toolResults) : [];
 
     // Compile the context (with optional injections) into a request. The
-    // guard's refusal retry is assembled the same way, afresh.
+    // guard's refusal retry is assembled the same way, afresh. A withheld
+    // stub is compiled only once it says where its original went, including
+    // one whose annotation began during the compile (#281 I7).
     const assemble = async (): Promise<NormalizedRequest> => {
-      const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+      const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
+        () => this.compileWithInjections(budget, injections));
       messages.push(...unguardedResults);
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
@@ -797,6 +798,10 @@ export class Agent {
    * it does not touch agent state and does not call the membrane, and
    * `ContextManager.compile` is itself side-effect-free (compression runs in
    * the background). Safe to call regardless of the agent's current status.
+   * It doesn't wait for the tool-result guard's annotations, so a preview
+   * never waits on a workspace write (rollback, undo and redo report one), and
+   * may show a withheld stub before its place is added; the activation waits
+   * for them around its call (#281 I13).
    */
   async buildActivationRequest(
     availableTools: ToolDefinition[],
@@ -939,8 +944,6 @@ export class Agent {
     // Retry accepted history edits before assembling a real request. Pure
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
-    // A withheld stub is compiled only once it says where its original went.
-    await this.toolResultGuard.whenAnnotated();
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -967,7 +970,10 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
+    // A withheld stub is compiled only once it says where its original went,
+    // including one whose annotation began during the compile (#281 I7).
+    const request = await this.toolResultGuard.afterAnnotations(
+      () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -1203,7 +1209,6 @@ export class Agent {
         // says where its original went (agent-framework #277), and against the
         // budget without the batch's reservation, so a stub longer than its
         // original can't carry the request past the budget.
-        await this.toolResultGuard.whenAnnotated();
         response = await this.membrane.stream(await reassemble(), { signal });
       }
     }
