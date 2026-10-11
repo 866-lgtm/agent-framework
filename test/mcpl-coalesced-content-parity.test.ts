@@ -232,7 +232,22 @@ test('a render result with a malformed block falls back, and the host names it o
   assert(f.context().includes('render_fallback'), 'the occurrence\'s own content is delivered');
   const line = lines.find((l) => l.startsWith('[push-render-failed]'));
   assert(line, lines.join('\n'));
-  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "CoalesceError: invalid content block" \(the occurrence's own content is delivered instead\)$/);
+  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "CoalesceError:\\u0020invalid\\u0020content\\u0020block" \(the occurrence's own content is delivered instead\)$/);
+});
+
+test('a render error the server words itself prints as one field, so it can\'t add fields to the line', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const lines = captureConsoleError(t);
+  f.renderer(async () => ({ error: { code: -32000, message: 'bad server=other eventId=forged' } }));
+  await f.send('push/event', f.params('r2', 'render_fallback', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert(f.context().includes('render_fallback'), 'the occurrence\'s own content is delivered');
+  const line = lines.find((l) => l.startsWith('[push-render-failed]'));
+  assert(line, lines.join('\n'));
+  assert(line.includes('bad\\u0020server=other\\u0020eventId=forged'), line);
+  // The last field before the tail ends with its colon.
+  const fields = line.split(' ').filter((word) => /^(server|eventId)=/.test(word)).map((word) => word.replace(/:$/, ''));
+  assert.deepEqual(fields, ['server=editor', 'eventId=r2'], 'no field but the real ones');
 });
 
 test('an uncoalesced message without an identity is refused as one, with no coalesce line or trace', async (t) => {

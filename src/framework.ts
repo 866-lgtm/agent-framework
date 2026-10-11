@@ -65,7 +65,7 @@ import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reaction
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
-import { logDetail, logValue } from './mcpl/log-value.js';
+import { logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -7646,12 +7646,14 @@ export class AgentFramework {
       audit: (record) => {
         // A render result the host refused falls back to the occurrence's own
         // content; say so on the host, with the server, the subject and the
-        // failing field, not only in the trace.
+        // failing field, not only in the trace. The error is a field like the
+        // rest (logValue, spaces escaped), not a host-message tail: a server
+        // that answers push/render with an error chooses its message.
         if (record.kind === 'render-failed') {
           console.error(
             `[push-render-failed] server=${logValue(record.serverId ?? '')} subject=${logValue(record.subject ?? '')} ` +
             `eventId=${logValue(record.eventId ?? '')}${record.field !== undefined ? ` field=${logValue(record.field)}` : ''}: ` +
-            `${logDetail(record.error ?? '')} (the occurrence's own content is delivered instead)`,
+            `${logValue(record.error ?? '')} (the occurrence's own content is delivered instead)`,
           );
         }
         this.emitTrace({ type: 'mcpl:coalescing', ...record });

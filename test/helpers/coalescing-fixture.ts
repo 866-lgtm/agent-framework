@@ -47,7 +47,13 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
       else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
       else if (m.method === 'channels/close') reply({ closed: true });
       else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
-      else if (m.method === 'push/render') { renders.push(m.params); reply(await renderer(m.params)); }
+      else if (m.method === 'push/render') {
+        renders.push(m.params);
+        const out = await renderer(m.params) as { error?: unknown } | undefined;
+        // A renderer may answer with a JSON-RPC error: { error: { code, message } }.
+        if (out && typeof out === 'object' && 'error' in out) ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: out.error }));
+        else reply(out);
+      }
       else if (m.id !== undefined) reply({});
     });
   });
