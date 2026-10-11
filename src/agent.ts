@@ -124,19 +124,30 @@ export class Agent {
    *  reports it (cumulative across the tool loop): what the maxStreamTokens
    *  budget checks. */
   lastStreamInputTokens = 0;
-  /** Real prefix size of the stream's latest provider call that reported
-   *  one: fresh + cache creation + cache read. Membrane's usage events are
-   *  cumulative, so this is the call's share of its event (cumulativeDelta):
-   *  the whole event for a stream's first call, and the event's own value
-   *  where a counter went back. THE window-shaped number —
-   *  `lastStreamInputTokens` alone omits cached tokens, which are most of a
-   *  warm stream's window. */
+  /** Real prompt size of the stream's latest provider call that reported a
+   *  prompt, which is what the provider billed it: fresh + cache creation +
+   *  cache read. A call that reports none leaves it as it was (see
+   *  lastStreamUnreportedTokens). Membrane's usage events are cumulative, so
+   *  this is the call's share of its event (cumulativeDelta): the whole event
+   *  for a stream's first call, and the event's own value where a counter
+   *  went back. THE window-shaped number — `lastStreamInputTokens` alone
+   *  omits cached tokens, which are most of a warm stream's window. 0 until a
+   *  call on this stream reports a prompt, and the physical-window
+   *  projection runs only once one has. */
   lastStreamRealInputTokens = 0;
   /** Output tokens of the same call as lastStreamRealInputTokens — the
    *  prior round's generated thinking/text/tool_use, which becomes part of
    *  the NEXT round's input and so belongs in the physical-window
    *  projection. */
   lastStreamOutputTokens = 0;
+  /** What the stream has grown by since the call lastStreamRealInputTokens
+   *  describes, for the physical-window projection: the blocks appended at
+   *  each boundary the stream continued past, and the output of each call
+   *  that reported no prompt (its reported output, or maxTokens, the bound
+   *  on it, when it reported none either). After calls that report no
+   *  prompt, the next request is that call's prompt and output plus this.
+   *  0 at stream start and whenever a call reports a prompt. */
+  lastStreamUnreportedTokens = 0;
   maxStreamTokens: number;
   /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
   readonly physicalWindowTokens?: number;
@@ -966,9 +977,11 @@ export class Agent {
     // and projecting on it before this stream's first usage event would
     // restart again (loop). The `> 0` guard downstream means "no call on
     // THIS stream has reported a prompt yet" only because of this reset (a
-    // call that reports none keeps the previous call's numbers).
+    // call that reports none leaves these as they were, and adds to
+    // lastStreamUnreportedTokens instead).
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
+    this.lastStreamUnreportedTokens = 0;
 
     const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);

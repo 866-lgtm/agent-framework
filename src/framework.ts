@@ -6756,13 +6756,18 @@ export class AgentFramework {
           // under budget instead of dispatching a doomed request.
           // Projection terms: prior round's real input + prior round's
           // OUTPUT (the just-generated thinking/text/tool_use joins the next
-          // round's input — omitting it is a systematic underestimate) +
-          // blocks about to be appended + reserve for the next response.
+          // round's input — omitting it is a systematic underestimate) + the
+          // growth since that round, when calls after it reported no prompt
+          // (lastStreamUnreportedTokens) + blocks about to be appended +
+          // reserve for the next response. It runs once a call on this
+          // stream has reported a prompt: before then there is no figure to
+          // project from.
           const projectedRealTokens = currentState.stream
             && agent.physicalWindowTokens !== undefined
             && agent.lastStreamRealInputTokens > 0
             ? agent.lastStreamRealInputTokens
               + agent.lastStreamOutputTokens
+              + agent.lastStreamUnreportedTokens
               + estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections)
               + agent.maxTokens
             : 0;
@@ -6910,6 +6915,12 @@ export class AgentFramework {
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
+            // What this round appends is in the next call's prompt. If that
+            // call reports no prompt, the next boundary projects it from the
+            // growth since the last call that did.
+            if (agent.physicalWindowTokens !== undefined) {
+              agent.lastStreamUnreportedTokens += estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections);
+            }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
             // messages (membrane ≥0.5.72) — appended after the tool_result
@@ -9483,9 +9494,9 @@ export class AgentFramework {
     const myStreamId = agent.streamId;
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the
-    // physical provider-call boundary (estimator calibration, kv receipt
-    // acceptance and the physical-window projection) see this call only, not
-    // an ever-growing turn total.
+    // physical provider-call boundary (estimator calibration and the
+    // physical-window projection) see this call only, not an ever-growing
+    // turn total.
     let previousUsage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -10718,13 +10729,21 @@ export class AgentFramework {
             // prior round's real input and output, so they take this call's
             // share, never the event's own figures: the event is the stream's
             // running total, which after k calls holds k prompts and would
-            // restart a stream whose next request still fits. A call that
-            // reported no prompt (an adapter that left its counts at 0) keeps
-            // the last call's numbers: every real call has a prompt, and 0
-            // would switch the projection off at the next boundary.
+            // restart a stream whose next request still fits. Every real call
+            // has a prompt, so a call that reported none (an adapter that left
+            // its counts at 0) is unreported, not empty: the fields stay the
+            // last call that reported one, which is what the provider billed,
+            // and its own output joins the growth since that call, or, when it
+            // reported no output either, maxTokens, the bound on it, so the
+            // projection fails safe (lastStreamUnreportedTokens).
             if (realTotal > 0) {
               agent.lastStreamRealInputTokens = realTotal;
               agent.lastStreamOutputTokens = perCallUsage.outputTokens;
+              agent.lastStreamUnreportedTokens = 0;
+            } else {
+              agent.lastStreamUnreportedTokens += perCallUsage.outputTokens > 0
+                ? perCallUsage.outputTokens
+                : agent.maxTokens;
             }
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };

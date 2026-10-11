@@ -5,10 +5,12 @@
  * without recompiling, so a turn that starts near the compile target can
  * walk past the provider's HARD context cap mid-turn and take a wire 400.
  * When AgentConfig.physicalWindowTokens is set, the framework projects each
- * continuation round's real size (cache-INCLUSIVE prior input + blocks about
- * to be appended + reserve for response) and breaks the stream through the
- * budget-restart path — fresh compile — instead of dispatching a doomed
- * request. Unset → behavior unchanged.
+ * continuation round's real size (the cache-INCLUSIVE prompt of the latest
+ * call that reported one + that call's output + what the stream grew by
+ * since, when later calls reported no prompt + blocks about to be appended +
+ * reserve for response) and breaks the stream through the budget-restart
+ * path — fresh compile — instead of dispatching a doomed request. Unset →
+ * behavior unchanged.
  */
 
 import { describe, it } from 'node:test';
@@ -177,17 +179,20 @@ describe('physical-window mid-turn restart (issue #92)', () => {
 
   it('does not inherit the pre-restart window size into the new stream', async () => {
     // Regression pin for the reset (opus-rev review finding #1): after a
-    // physical-window restart, the fresh stream runs a tool round that emits
-    // NO usage event before reaching the tool-result boundary. Without the
-    // stream-start reset, the projection would run on the inherited 200k
-    // figure — the very number that caused the restart — and restart again
-    // into an empty queue (loop; this test would then time out).
+    // physical-window restart, the fresh stream runs a tool round whose
+    // usage reports nothing (membrane still emits the event: the stream's
+    // running total, all 0) before reaching the tool-result boundary.
+    // Without the stream-start reset, the projection would run on the
+    // inherited 200k figure — the very number that caused the restart — and
+    // restart again into an empty queue (loop; this test would then time
+    // out). With it, no call on the new stream has reported a prompt yet, so
+    // the projection doesn't run.
     const tempDir = mkdtempSync(join(tmpdir(), 'phys-window-'));
     const noUsageToolResponse = createMockResponse([
       { type: 'text', text: 'Continuing…' },
       { type: 'tool_use', id: 'call_2', name: 'canned--fetch', input: {} },
     ], 'tool_use');
-    (noUsageToolResponse as { usage: unknown }).usage = undefined;
+    (noUsageToolResponse as { usage: unknown }).usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
     const membrane = new QueuedStreamsMembrane([
       [nearCapToolResponse()],
       [noUsageToolResponse, createMockResponse([{ type: 'text', text: 'Recovered final answer' }])],
@@ -353,11 +358,85 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     }
   });
 
-  it("keeps the last call's numbers when a call reports no prompt", async () => {
-    // After the first call, the usage events repeat its running total (an
-    // adapter that left its counts at 0). Every real call has a prompt, so
-    // the first call's figures stay the latest known: a per-call 0 would
-    // switch the projection off at each later boundary (its `> 0` gate).
+  // Each blob tool round appends 6,043 tokens by the framework's estimate
+  // (estimateAppendedRoundTokens: the 24,000-character inline cap at chars/4,
+  // plus its per-block overhead). The restart trace's inputTokens is the
+  // projection, so the tests below pin it whole.
+  const APPENDED = 6_043;
+
+  it('counts a cache-write prompt term toward a restart', async () => {
+    // 10k fresh + 30k cache write + 120k cache read = a 160k prompt; with 2k
+    // output, the appended round and the 32k reserve it projects to 200,043.
+    // Without the cache-write term it would project 170,043 and fit.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 10_000, cacheCreationTokens: 30_000, cacheReadTokens: 120_000, outputTokens: 2_000 }),
+        round(null, { inputTokens: 11_000, cacheCreationTokens: 30_000, cacheReadTokens: 280_000, outputTokens: 2_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1);
+      assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
+      assert.strictEqual(t.restarts[0]!.inputTokens, 160_000 + 2_000 + APPENDED + 32_000);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('projects the growth since the last call that reported a prompt: the rounds appended since count', async () => {
+    // Call 1 reports a 155k prompt and 2k output: 195,043 projected, it fits.
+    // Call 2 reports 2k of output but no prompt (its input counts repeat the
+    // running total). Its request was call 1's prompt and output plus the
+    // round appended after call 1, so the next boundary adds that round and
+    // call 2's output to call 1's figures: 203,086, past the window. Keeping
+    // call 1's figures alone would project 195,043 again and dispatch.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 15_000, cacheReadTokens: 140_000, outputTokens: 2_000 }),
+        round('call_2', { inputTokens: 15_000, cacheReadTokens: 140_000, outputTokens: 4_000 }),
+        round(null, { inputTokens: 16_000, cacheReadTokens: 300_000, outputTokens: 4_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1, 'the second boundary must restart');
+      assert.strictEqual(t.restarts[0]!.inputTokens, 155_000 + 2_000 + (APPENDED + 2_000) + APPENDED + 32_000);
+      assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("counts the output of a call that reports output but no prompt", async () => {
+    // Call 1: a 150k prompt and 2k output, 190,043 projected. Call 2 reports
+    // 5k of output and no prompt: with it the next boundary projects 201,086
+    // and restarts; dropping it would project 196,086 and dispatch.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 10_000, cacheReadTokens: 140_000, outputTokens: 2_000 }),
+        round('call_2', { inputTokens: 10_000, cacheReadTokens: 140_000, outputTokens: 7_000 }),
+        round(null, { inputTokens: 11_000, cacheReadTokens: 300_000, outputTokens: 7_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1);
+      assert.strictEqual(t.restarts[0]!.inputTokens, 150_000 + 2_000 + (APPENDED + 5_000) + APPENDED + 32_000);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('bounds the output of a call that reports nothing by maxTokens, so the projection fails safe', async () => {
+    // Call 2's usage event repeats the running total: no prompt and no
+    // output reported. Its output is unknown, so the projection counts the
+    // 32k it could have been: 120k + 5k + (the appended round + 32k) + the
+    // next appended round + the 32k reserve = 201,086, a restart. Counting
+    // it as 0 would project 169,086 and dispatch.
     const first = { inputTokens: 20_000, cacheReadTokens: 100_000, outputTokens: 5_000 };
     const t = await windowTurn([
       [round('call_1', first), round('call_2', first), round(null, first)],
@@ -365,10 +444,32 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     ]);
     try {
       assert.ok(t.done, 'the turn should finish');
-      assert.deepStrictEqual(t.restarts, [], '158k projected each time: it fits');
-      const agent = t.framework.getAgent('prime')!;
-      assert.strictEqual(agent.lastStreamRealInputTokens, 120_000, "the first call's prompt, not 0");
-      assert.strictEqual(agent.lastStreamOutputTokens, 5_000);
+      assert.strictEqual(t.restarts.length, 1);
+      assert.strictEqual(t.restarts[0]!.inputTokens, 120_000 + 5_000 + (APPENDED + 32_000) + APPENDED + 32_000);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('starts the growth again when a later call reports a prompt', async () => {
+    // Call 1 reports a 100k prompt; call 2 reports nothing, so the second
+    // boundary projects 100k + 2k + (6,043 + 32k) + 6,043 + 32k = 178,086,
+    // which fits. Call 3 reports a 140k prompt and 2k output: the third
+    // boundary projects from it alone, 180,043, and fits. Carrying call 2's
+    // growth past call 3 would project 218,086 and restart.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 10_000, cacheReadTokens: 90_000, outputTokens: 2_000 }),
+        round('call_2', { inputTokens: 10_000, cacheReadTokens: 90_000, outputTokens: 2_000 }),
+        round('call_3', { inputTokens: 30_000, cacheReadTokens: 210_000, outputTokens: 4_000 }),
+        round(null, { inputTokens: 31_000, cacheReadTokens: 360_000, outputTokens: 4_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.deepStrictEqual(t.restarts, [], 'every boundary fits');
+      assert.strictEqual(t.membrane.calls.length, 1);
     } finally {
       await t.close();
     }
