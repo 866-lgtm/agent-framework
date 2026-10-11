@@ -723,6 +723,14 @@ function describeRequester(r: OperatorRequester | undefined): string {
   return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
 }
 
+/** Who asked for an operator act, as a durable record and a log line carry
+ *  it. The name comes from a caller, so a control character (a forged log
+ *  line) becomes a space, and it is bounded. */
+function operatorLabel(by: string): string {
+  const label = safeSlice(by.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ').trim(), 0, 120);
+  return label === '' ? 'operator' : label;
+}
+
 function hostCommandRequester(serverId: string, params: HostCommandParams): OperatorRequester {
   return {
     via: `host-command:${serverId}`,
@@ -2485,6 +2493,16 @@ export class AgentFramework {
   releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
     model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
   }> {
+    // A release names one of this framework's agents. Any other name (a typo,
+    // or '*' and 'framework', which stand for the hold on unreadable records
+    // in its listing and its alert) is refused before anything is recorded:
+    // it would lift nothing and still read as a success. That hold is lifted
+    // one agent at a time.
+    if (!this.agents.has(agentName)) {
+      throw new Error(`Unknown agent: ${safeSlice(JSON.stringify(agentName), 0, 120)}. A release names one of this ` +
+        "framework's agents, and the hold on unreadable provider waits is lifted one agent at a time");
+    }
+    by = operatorLabel(String(by));
     // '*' (EVERY_MODEL, as providerWaits lists the unreadable-records hold)
     // names every model, the same as omitting it, everywhere below.
     if (model === EVERY_MODEL) model = undefined;
@@ -2499,9 +2517,11 @@ export class AgentFramework {
     // this framework's own wait is gone (the records read again, the wait
     // passed, or it was released in another process). The strategy's own
     // backoff stays, and the receipt still lists only waits released here.
-    const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
-      { releaseCompressionPause?: (model?: string) => boolean } | undefined;
+    // Read inside the try: the release is already recorded, so a strategy
+    // that throws must not keep the hold below from being released.
     try {
+      const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
+        { releaseCompressionPause?: (model?: string) => boolean } | undefined;
       if (strategy?.releaseCompressionPause?.(model)) {
         console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
       }
@@ -5500,8 +5520,9 @@ export class AgentFramework {
       if (!isReleaseModel(params.model)) {
         return { ok: false, error: "release-provider-wait: model must be a model name, or '*' (or omitted) for every model" };
       }
-      console.error(`[host-command] release-provider-wait agent=${agentName} model=${params.model ?? '*'} by=${requester} (server=${serverId})`);
-      const released = this.releaseProviderWait(agentName, params.model, requester);
+      const by = operatorLabel(String(requester));
+      console.error(`[host-command] release-provider-wait agent=${agentName} model=${params.model ?? '*'} by=${by} (server=${serverId})`);
+      const released = this.releaseProviderWait(agentName, params.model, by);
       return { ok: true, released };
     }
 

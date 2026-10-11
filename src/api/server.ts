@@ -431,16 +431,27 @@ export class ApiServer {
         // is refused before anything changes, never widened.
         const model = p.model;
         if (!isReleaseModel(model)) throw new Error("model must be a model name, or '*' (or omitted) for every model");
+        // A requester over this surface names itself, so the record says
+        // where the name came from ('api:<name>'), and it can't pass for a
+        // host command's requester.
         return {
           released: this.framework.releaseProviderWait(
             p.agentName,
             model,
-            typeof p.requester === 'string' && p.requester !== '' ? p.requester : 'api',
+            typeof p.requester === 'string' && p.requester !== '' ? `api:${p.requester}` : 'api',
           ),
         };
       }
-      case 'host.providerWaits':
-        return { waits: this.framework.providerWaitSnapshot(typeof params?.agentName === 'string' ? params.agentName : undefined) };
+      // A read, like host.status: the admin token gates the verbs that change
+      // something. (The HTTP /hostmode read takes it because that response is
+      // readable cross-origin; this surface checks the origin.)
+      case 'host.providerWaits': {
+        const agentName = params?.agentName;
+        if (agentName !== undefined && typeof agentName !== 'string') {
+          throw new Error('agentName must be an agent name, or omitted for every agent');
+        }
+        return { waits: this.framework.providerWaitSnapshot(agentName) };
+      }
 
       default:
         throw new Error(`Unknown command: ${command}`);

@@ -280,7 +280,10 @@ export class ProviderWaits {
    * omitted; recorded. While the recorded waits cannot be read, it also lifts
    * the hold that stands for them, exactly as far as the release names (that
    * model, or every model), in this process only. Each lifted wait says how
-   * far its release reaches (ProviderWaitRelease).
+   * far its release reaches (ProviderWaitRelease). A release that finds
+   * nothing binding lifts and records nothing, and lists nothing. That
+   * includes a replay of an earlier release. It still offers this process's
+   * unrecorded acts to the journal again.
    */
   release(agent: string, model: string | undefined, by: string): ProviderWaitRelease[] {
     // EVERY_MODEL, as list() shows it, names every model: the same release
@@ -297,7 +300,13 @@ export class ProviderWaits {
       override = this.unreadableWait(agent, target);
       this.unreadable.waived.add(keyOf(agent, target));
     }
-    if (released.length === 0 && !override) return [];
+    if (released.length === 0 && !override) {
+      // Nothing binds to lift, so this release lists nothing. It may be a
+      // replay of one whose record hasn't landed ('pending'): offer this
+      // process's unrecorded acts to the journal again now.
+      this.flush();
+      return [];
+    }
     const entry: ProviderWaitEntry = { kind: 'released', agent, model: model ?? null, by, at: now };
     this.apply(entry);
     this.flush();
@@ -371,11 +380,12 @@ export class ProviderWaits {
       }
       return false;
     }
-    if (this.unreadable) {
-      this.log(`[provider-wait] recorded provider waits are readable again; ${loaded(this.durable, now)} bind`);
-      this.unreadable = null;
-    }
+    const wasUnreadable = this.unreadable !== null;
+    this.unreadable = null;
     this.rebuildView();
+    // What binds is the journal's reduction with this process's unrecorded
+    // acts applied after it: a release made meanwhile lifts what it names.
+    if (wasUnreadable) this.log(`[provider-wait] recorded provider waits are readable again; ${loaded(this.view, now)} bind`);
     return true;
   }
 
