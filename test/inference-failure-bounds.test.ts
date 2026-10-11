@@ -459,6 +459,8 @@ test('alert data is bounded field by field, on the trace and the failures.log re
   try {
     fw.notifyOpsAlert('zz-detector', 'cairn', 'short message', {
       text: echo(), error: hugeProviderError(), nested, count: 3, small: { a: 1 },
+      // Small JSON, large value: the listener gets the JSON's data, not the value.
+      held: new Map([['zz', echo()]]), at: new Date(0),
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
@@ -470,9 +472,11 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     // A value whose JSON is too long becomes its JSON, bounded.
     assert.equal(typeof fields.nested, 'string', `${sink}: nested`);
     assert.ok(fields.nested.length <= 2_000 && fields.nested.startsWith('{"items":[{"i":0,'), `${sink}: nested`);
-    // Small values are kept as they are.
+    // Small values are what their JSON describes.
     assert.equal(fields.count, 3);
     assert.deepEqual(fields.small, { a: 1 });
+    assert.deepEqual(fields.held, {}, `${sink}: a Map is its JSON's data`);
+    assert.equal(fields.at, '1970-01-01T00:00:00.000Z', `${sink}: a Date is its JSON's data`);
   }
 });
 

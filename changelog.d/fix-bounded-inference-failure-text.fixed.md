@@ -4,7 +4,7 @@
   - The rewind marker keeps 160 characters of the reason; an agent's `lastInference.lastError` and the compile-refused ops alert keep 300; the ops webhook posts 500 characters of the alert's message.
   - These sinks carry at most 2,000 characters:
     - the reason excerpt in the exhaustion stderr line (the line also carries the agent, the streak and `type=… status=… code=…` labels when known);
-    - every field of a `logs/failures.log` record: a string to 2,000 characters, an `Error` as its projection (below), and any other value as it is when its JSON fits, otherwise its JSON, bounded;
+    - every field of a `logs/failures.log` record: a string to 2,000 characters, an `Error` as its projection (below), and any other value as its JSON, kept as data when it fits and as bounded text when it doesn't. A record with a value JSON can't write is no longer lost;
     - ops alert messages, and an alert's `data` on its `ops:alert` trace, bounded field by field as a failures.log record is;
     - the inference log's `error`;
     - every trace event's `error` and `stack` strings;

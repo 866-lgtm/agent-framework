@@ -1069,8 +1069,11 @@ function describeFailureWithFrames(error: unknown): string {
  * A failure record's fields, each bounded, for logs/failures.log and the
  * ops:alert trace: a string to FAILURE_TEXT_MAX_CHARS; an Error to its
  * projection, since serialising one writes its own fields, a MembraneError's
- * whole `rawRequest` among them; any other value as it is when its JSON fits
- * FAILURE_TEXT_MAX_CHARS, and otherwise its JSON, bounded.
+ * whole `rawRequest` among them; any other value to its JSON, as the plain
+ * data that JSON describes when it fits FAILURE_TEXT_MAX_CHARS and as the
+ * JSON text, bounded, when it doesn't. So the trace's data is what
+ * failures.log writes: a Map or an object with toJSON whose JSON is small
+ * never hands a listener the value itself.
  */
 function boundFailureFields(record: Record<string, unknown>): Record<string, unknown> {
   const bounded: Record<string, unknown> = {};
@@ -1080,7 +1083,8 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
     else {
       let json: string | undefined;
       try { json = JSON.stringify(value); } catch { bounded[key] = describeFailure(value); continue; }
-      bounded[key] = json === undefined || json.length <= FAILURE_TEXT_MAX_CHARS ? value : boundFailureText(json);
+      bounded[key] = json === undefined ? undefined
+        : json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
     }
   }
   return bounded;
