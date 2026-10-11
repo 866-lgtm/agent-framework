@@ -39,6 +39,7 @@ import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
 import { filesystemTrustsCtime, locateRoot } from './observe.js';
+import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -55,6 +56,8 @@ import {
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
+/** The workspace's own deadline must end before the framework's hook bound. */
+const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
 
 export type {
   WorkspaceConfig,
@@ -631,6 +634,8 @@ export class WorkspaceModule implements Module {
   private intents = new Map<string, BranchIntents>();
   /** Each mount's turn: the tail of its serialized passes and writes. */
   private mountTurns = new Map<string, Promise<void>>();
+  /** Whether an over-bound agentActionScanDeadlineMs has been warned about. */
+  private warnedScanDeadline = false;
   /** Whether a mount root's filesystem maintains ctime, by canonical root. */
   /** Per canonical root: the device of its filesystem when that maintains ctime, else null. */
   private ctimeTrust = new Map<string, string | null>();
@@ -1201,8 +1206,9 @@ export class WorkspaceModule implements Module {
           + 'what that did to the workspace copy (absent when it changed none: a deletion or conflict given up for '
           + 'a disk copy the workspace can\'t hold). '
           + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
-          + 'directory) is unavailable and listed under `incomplete`: reconnect it, or take the root as it is '
-          + 'now with acceptRoot.',
+          + 'directory) is unavailable and listed under `incomplete`. Reconnect the drive; acceptRoot is for a '
+          + 'directory replaced on purpose, or a drive back under a new device number, never for one still '
+          + 'unplugged, whose empty mountpoint would become the root.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2834,48 +2840,91 @@ export class WorkspaceModule implements Module {
    * deciding on the branch selected when it applies.
    */
   async onToolBatchComplete(_agentName?: string): Promise<void> {
+    // Every agent's workspace is the store's current branch, so the agent
+    // that ran the batch doesn't choose what is scanned.
     const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
     if (mounts.length === 0 || !this.store) return;
-    const deadlineMs = this.config.agentActionScanDeadlineMs ?? AGENT_ACTION_SCAN_DEADLINE_MS;
+    const deadlineMs = this.agentActionScanDeadlineMs();
     await Promise.all(mounts.map(async (mount) => {
+      const missed = (reason: string): void => {
+        mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
+        this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+      };
+      const runningLate = mount.agentActionScanLate !== undefined;
+      const scan = this.agentActionScan(mount);
+      if (runningLate) {
+        // An earlier batch's scan outlasted its deadline and still runs: this
+        // round isn't held as well. Its own scan is queued after that one.
+        missed('an earlier scan is still running past its deadline; this batch is scanned after it');
+        return;
+      }
       let late = false;
-      const scan = this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true })).then(
+      const recorded = scan.then(
         (pass) => {
-          // Finished — but a scan that couldn't see everything (the file cap,
-          // an unreadable or changing region, a branch that kept changing)
-          // says where, on status and as an event, like a missed deadline.
           const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
           mount.lastAgentActionScan = late
             ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
             : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
-          if (pass.incomplete.length > 0) {
-            this.ctx?.pushEvent({
-              type: 'workspace:agent-action-scan-incomplete',
-              mount: mount.config.name,
-              reason: 'the scan finished, but some regions could not be observed',
-              incomplete: pass.incomplete,
-            } as ProcessEvent);
-          }
         },
         (err: unknown) => {
-          const reason = `scan failed: ${err instanceof Error ? err.message : String(err)}`;
-          mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
-          this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+          missed(`scan failed: ${err instanceof Error ? err.message : String(err)}`);
         },
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<'late'>((resolveDeadline) => {
         timer = setTimeout(() => resolveDeadline('late'), deadlineMs);
       });
-      const outcome = await Promise.race([scan.then(() => 'done' as const), deadline]);
+      const outcome = await Promise.race([recorded.then(() => 'done' as const), deadline]);
       clearTimeout(timer);
       if (outcome === 'late') {
         late = true;
-        const reason = `deadline exceeded (${deadlineMs} ms); the scan continues`;
-        mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
-        this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+        if (mount.agentActionScanLate === undefined) {
+          mount.agentActionScanLate = recorded;
+          void recorded.then(() => { if (mount.agentActionScanLate === recorded) mount.agentActionScanLate = undefined; });
+        }
+        missed(`deadline exceeded (${deadlineMs} ms); the scan continues`);
       }
     }));
+  }
+
+  /**
+   * The mount's after-batch scan: one may run and one wait behind it. A batch
+   * that comes while one waits shares it, since it starts after the batch's
+   * tools ran. A scan that finished without seeing everything (the file cap,
+   * an unreadable or changing region, a branch that kept changing) says
+   * where, as an event.
+   */
+  private agentActionScan(mount: MountState): Promise<{ incomplete: Array<{ path: string; reason: string }> }> {
+    if (mount.agentActionScanWaiting) return mount.agentActionScanWaiting;
+    const waiting = this.withMount(mount, () => {
+      if (mount.agentActionScanWaiting === waiting) mount.agentActionScanWaiting = undefined;
+      return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
+    });
+    mount.agentActionScanWaiting = waiting;
+    void waiting.then((pass) => {
+      if (pass.incomplete.length === 0) return;
+      this.ctx?.pushEvent({
+        type: 'workspace:agent-action-scan-incomplete',
+        mount: mount.config.name,
+        reason: 'the scan finished, but some regions could not be observed',
+        incomplete: pass.incomplete,
+      } as ProcessEvent);
+    }, () => {});
+    return waiting;
+  }
+
+  /** The scan deadline, kept below the framework's hook bound (warned once). */
+  private agentActionScanDeadlineMs(): number {
+    const configured = this.config.agentActionScanDeadlineMs ?? AGENT_ACTION_SCAN_DEADLINE_MS;
+    if (configured <= AGENT_ACTION_SCAN_DEADLINE_MAX_MS) return configured;
+    if (!this.warnedScanDeadline) {
+      this.warnedScanDeadline = true;
+      console.warn(
+        `[workspace] agentActionScanDeadlineMs ${configured} leaves less than 1 s before the framework's ` +
+          `${TOOL_BATCH_HOOK_TIMEOUT_MS} ms bound on a tool-batch hook; using ${AGENT_ACTION_SCAN_DEADLINE_MAX_MS} ms`,
+      );
+    }
+    return AGENT_ACTION_SCAN_DEADLINE_MAX_MS;
   }
 
   /**

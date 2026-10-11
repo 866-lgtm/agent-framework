@@ -187,6 +187,79 @@ describe('Module.onToolBatchComplete', () => {
     await framework.stop();
   });
 
+  it('a result whose call the turn no longer waits on after the hook is dropped and traced, not thrown', async () => {
+    scriptTwoCallRound();
+    const framework = await createFramework();
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    tools.onHook = async (agentName) => {
+      // The round is replaced while modules catch up: the agent waits again,
+      // now on a call of a new batch.
+      const agent = framework.getAgent(agentName) as unknown as { _state: { status: string; pending: Map<string, unknown> } };
+      agent._state = {
+        ...agent._state,
+        status: 'waiting_for_tools',
+        pending: new Map([['c-new', { id: 'c-new', name: 'robot--act', input: {}, startedAt: Date.now() }]]),
+      };
+      setTimeout(() => framework.abortInference(agentName, 'end the replaced round'), 50);
+    };
+    try {
+      trigger(framework);
+      await framework.runUntilIdle();
+    } finally {
+      console.error = originalError;
+    }
+    const dropped = traces.find((e) => e.type === 'tool:result_dropped') as { callId: string } | undefined;
+    assert.ok(dropped, 'the stale result is traced as dropped');
+    assert.ok(!errors.some((line) => line.includes('Unknown tool call')), errors.join('\n'));
+    assert.equal(membrane.lastStream!.receivedToolResults.length, 0, 'nothing was provided to the replaced round');
+    await framework.stop();
+  });
+
+  it("a result for a call that isn't pending doesn't run the hook early", async () => {
+    // One call: while it runs, a stray result for another call arrives.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--act', input: { n: 1 } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]));
+    const framework = await createFramework();
+    const originalError = console.error;
+    console.error = () => {};
+    tools.onTool = () => {
+      framework.pushEvent({ type: 'tool-result', callId: 'stray', agentName: 'assistant', moduleName: 'robot', result: { success: true } } as unknown as ProcessEvent);
+    };
+    try {
+      trigger(framework);
+      // The stray result throws where it's provided, as on main; the round
+      // then goes on with its own result.
+      await assert.rejects(() => framework.runUntilIdle(), /Unknown tool call: stray/);
+      await framework.runUntilIdle();
+    } finally {
+      console.error = originalError;
+    }
+    assert.equal(tools.hookCalls.length, 1, 'only the round\'s own last result runs the hook');
+    assert.equal(membrane.lastStream!.receivedToolResults.length, 1);
+    await framework.stop();
+  });
+
+  it('a hook still running from an earlier batch is skipped, not called and waited for again', async () => {
+    const framework = await createFramework();
+    const registry = (framework as unknown as { moduleRegistry: { notifyToolBatchComplete: (a: string, t?: number) => Promise<Array<{ module: string; error: string }>> } }).moduleRegistry;
+    let calls = 0;
+    tools.onHook = () => { calls++; return new Promise<void>(() => {}); }; // never settles
+    const first = await registry.notifyToolBatchComplete('assistant', 50);
+    assert.match(first[0]!.error, /timed out after 50ms/);
+    const started = Date.now();
+    const second = await registry.notifyToolBatchComplete('assistant', 5_000);
+    assert.ok(Date.now() - started < 1_000, 'the second batch was not held');
+    assert.deepEqual(second, [{ module: 'robot', error: 'still running from an earlier batch' }]);
+    assert.equal(calls, 1, 'the wedged hook was called once');
+    await framework.stop();
+  });
+
   it("an on-agent-action workspace has the batch's disk changes before the stream resumes", async () => {
     const dir = join(tempDir, 'files');
     mkdirSync(dir, { recursive: true });

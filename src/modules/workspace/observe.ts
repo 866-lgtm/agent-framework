@@ -409,11 +409,15 @@ const CTIME_TRUSTED_FS_TYPES = new Set<number>([
   0x794c7630, // overlayfs
 ]);
 
+/** Whether a statfs f_type is one of those filesystems. */
+export function fsTypeTrustsCtime(type: number | bigint): boolean {
+  return CTIME_TRUSTED_FS_TYPES.has(Number(type) >>> 0);
+}
+
 export async function filesystemTrustsCtime(root: string): Promise<boolean> {
   if (process.platform !== 'linux') return false;
   try {
-    const info = await statfs(root);
-    return CTIME_TRUSTED_FS_TYPES.has(Number(info.type) >>> 0);
+    return fsTypeTrustsCtime((await statfs(root)).type);
   } catch {
     return false;
   }

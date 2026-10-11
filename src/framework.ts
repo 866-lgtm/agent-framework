@@ -6623,7 +6623,18 @@ export class AgentFramework {
         for (const failure of failures) {
           this.emitTrace({ type: 'module:batch_hook_failed', agentName: event.agentName, module: failure.module, error: failure.error });
         }
-        if ((agent.state as AgentState).status !== 'waiting_for_tools') {
+        // The turn may have been reset, cancelled or replaced while the hook
+        // ran, even back to waiting on a new batch: this result is still owed
+        // only if this agent still waits on this call.
+        const after = agent.state as AgentState;
+        if (
+          this.agents.get(event.agentName) !== agent
+          || after.status !== 'waiting_for_tools' || !after.pending.has(event.callId)
+        ) {
+          console.warn(
+            `[framework] Dropping tool-result for agent '${event.agentName}' (callId=${event.callId}): ` +
+            `its turn changed while modules caught up with the batch (status '${after.status}').`,
+          );
           this.emitTrace({
             type: 'tool:result_dropped',
             agentName: event.agentName,

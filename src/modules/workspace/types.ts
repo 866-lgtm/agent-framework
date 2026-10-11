@@ -20,7 +20,9 @@ export interface MountConfig {
    * Watch mode for filesystem changes:
    * - 'always': chokidar watches continuously; each event re-observes its paths
    * - 'on-agent-action': after each completed agent tool batch, the mount is
-   *   scanned before the agent's next inference
+   *   scanned, and the agent's next inference waits for that scan up to
+   *   `agentActionScanDeadlineMs`; a scan that takes longer finishes while
+   *   the round goes on
    * - 'never': no background reads; listings and lazy reads still observe
    *   the paths they show
    */
@@ -80,7 +82,11 @@ export interface WorkspaceConfig {
    * takes longer finishes in the background; the miss is recorded on the
    * mount's status and pushed as a `workspace:agent-action-scan-incomplete`
    * event. So is a scan that finished without observing everything, with the
-   * regions it couldn't (`incomplete`).
+   * regions it couldn't (`incomplete`). While a scan that outlasted its
+   * deadline still runs, later batches aren't held: their scan is queued
+   * after it, and the miss is recorded at once. The framework bounds every
+   * module's batch hook at 30 s, so a deadline above 29 s is lowered to 29 s,
+   * with a warning, for the workspace's own miss to come first.
    */
   agentActionScanDeadlineMs?: number;
 }
@@ -123,6 +129,13 @@ export interface MountState {
     reason?: string;
     incomplete?: Array<{ path: string; reason: string }>;
   };
+  /**
+   * The after-batch scan queued behind the mount's running work, not yet
+   * started: later batches share it, since it starts after their tools ran.
+   */
+  agentActionScanWaiting?: Promise<{ incomplete: Array<{ path: string; reason: string }> }>;
+  /** A scan that outlasted a batch's deadline, while it still runs. */
+  agentActionScanLate?: Promise<unknown>;
   /**
    * Wall-clock time chokidar emitted `ready` for this mount, or null if the
    * watcher hasn't finished its initial scan. null after session start =

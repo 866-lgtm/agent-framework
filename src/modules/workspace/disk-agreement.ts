@@ -279,6 +279,8 @@ export class DiskAgreement {
 
   /** Checkpoint when the tail has outgrown the live evidence. */
   maybeCheckpoint(): void {
+    // Like every entry point: an ambiguous write is read back first.
+    this.ensureReconciled();
     let live = 0;
     for (const mount of this.mounts.values()) live += mount.paths.size;
     if (this.journal.entriesSinceCheckpoint < Math.max(MIN_CHECKPOINT_TAIL, live)) return;

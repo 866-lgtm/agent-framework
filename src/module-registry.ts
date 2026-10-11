@@ -53,7 +53,7 @@ const MAX_CONTEXT_TIMEOUT_MS = 30_000;
  * it. A module with its own semantic deadline (the workspace scan's) sets it
  * below this one, so it can record the miss itself.
  */
-const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
+export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
 
 /**
  * Registered speech handler.
@@ -69,6 +69,9 @@ interface SpeechHandler {
  * Registry for managing modules.
  */
 export class ModuleRegistry {
+  /** Each module's tool-batch hook still running, past its bound or not. */
+  private batchHooksRunning = new Map<string, Promise<unknown>>();
+
   private modules: Map<string, Module> = new Map();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
@@ -421,13 +424,26 @@ export class ModuleRegistry {
     const promises: Promise<void>[] = [];
     for (const module of this.modules.values()) {
       if (!module.onToolBatchComplete) continue;
+      // A hook still running from an earlier batch (it outlasted its bound)
+      // isn't called again or waited for: a wedged module costs one bound,
+      // not one per batch.
+      if (this.batchHooksRunning.has(module.name)) {
+        failures.push({ module: module.name, error: 'still running from an earlier batch' });
+        continue;
+      }
+      // Called from a promise, so a hook that throws synchronously, before
+      // returning its promise, is caught below like any other failure
+      // instead of escaping the round (the result would never be provided).
+      const call = Promise.resolve().then(() => module.onToolBatchComplete!(agentName));
+      this.batchHooksRunning.set(module.name, call);
+      const settled = (): void => {
+        if (this.batchHooksRunning.get(module.name) === call) this.batchHooksRunning.delete(module.name);
+      };
+      call.then(settled, settled);
       let timer: ReturnType<typeof setTimeout> | undefined;
       promises.push(
         Promise.race([
-          // Called from a promise, so a hook that throws synchronously, before
-          // returning its promise, is caught below like any other failure
-          // instead of escaping the round (the result would never be provided).
-          Promise.resolve().then(() => module.onToolBatchComplete!(agentName)),
+          call,
           new Promise<void>((_, rej) => {
             timer = setTimeout(() => rej(new Error(`onToolBatchComplete timed out after ${timeoutMs}ms`)), timeoutMs);
           }),

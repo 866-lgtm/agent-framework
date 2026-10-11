@@ -60,7 +60,10 @@
   anything continues the agent's turn, the mount is scanned. A scan that outlasts
   `agentActionScanDeadlineMs` stops holding the round and continues in the background; the miss
   is reported on `status` (`lastAgentActionScan`) and as a `workspace:agent-action-scan-incomplete`
-  event, as are the regions a finished scan couldn't observe (`incomplete`).
+  event, as are the regions a finished scan couldn't observe (`incomplete`). Batches that come
+  while a scan waits share it, and while a scan that outlasted its deadline still runs, a later
+  batch isn't held: its miss is recorded at once, and its scan comes after. The hold is in the
+  framework's event loop, so while it lasts every agent's events wait.
 - Disk text is stored as its raw bytes rather than through a UTF-8 round trip, so a file in
   another encoding no longer differs from its own stored copy.
 - `materialize` and `autoMaterialize` check each write and unlink where it happens, not only when

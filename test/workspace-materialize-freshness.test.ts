@@ -6,15 +6,16 @@
  * single-file occurrence in the issue thread, stopped only by an incidental
  * branch-guard refusal).
  *
- * The guard compares the disk content's hash against `materializedHashes`
- * (what the layer last wrote): a mismatch means another writer changed the
- * file, and the path is refused LOUDLY — listed in the result, not resolved
- * silently in either direction — unless `force: true`.
+ * The guard compares disk with the evidence of what disk last agreed with
+ * (workspace/disk-agreement, recorded as the layer writes and syncs): a
+ * mismatch means another writer changed the file, and the path is refused
+ * LOUDLY — listed in the result, not resolved silently in either direction —
+ * unless `force: true`.
  */
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -108,6 +109,8 @@ test('a refused path stays pending: the next materialize reports it again instea
 
   const first = await call(module, 'materialize', {});
   assert.ok(((first.data as MaterializeData).skipped ?? []).length > 0);
+  const pendingAfter = ((await call(module, 'status', {})).data as Record<string, { pendingChanges: number }>).work.pendingChanges;
+  assert.ok(pendingAfter >= 1, `the refused path still counts as pending, got ${pendingAfter}`);
 
   // If the watermark advanced past the refusal, this second call would diff
   // to nothing and the divergence would vanish from view — a loud refusal
@@ -249,9 +252,12 @@ test('a first materialize that finds every file in place still pins the branch',
   // Disk already holds the same bytes (e.g. restored from a backup).
   writeFileSync(join(dir, 'a.txt'), 'a');
   writeFileSync(join(dir, 'b.txt'), 'b');
+  const untouched = (name: string) => { const st = statSync(join(dir, name)); return { ino: st.ino, mtimeMs: st.mtimeMs }; };
+  const before = { a: untouched('a.txt'), b: untouched('b.txt') };
 
   const first = await call(module, 'materialize', {});
   assert.equal((first.data as MaterializeData).materialized.length, 0, 'nothing needed writing');
+  assert.deepEqual({ a: untouched('a.txt'), b: untouched('b.txt') }, before, 'neither file was rewritten');
   const status = (await call(module, 'status', {})).data as Record<string, { lastMaterializedBranch: string | null }>;
   assert.equal(status.work.lastMaterializedBranch, store.currentBranch().id, 'the branch is pinned');
 

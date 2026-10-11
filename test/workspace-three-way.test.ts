@@ -10,10 +10,11 @@
  */
 
 import { describe, test, type TestContext } from 'node:test';
+import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -21,7 +22,7 @@ import { basename, dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
-import { fingerprintVouches, filesystemTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
+import { fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
@@ -1017,6 +1018,36 @@ describe('restarts and faults', () => {
     assert.equal(agreement.needsBarrier, true);
   });
 
+  test('a checkpoint check after an ambiguous append reconciles first, like every entry point', (t) => {
+    const env = new Env(t);
+    let failSync = false;
+    const flaky = new Proxy(env.store, {
+      get(target, prop) {
+        if (prop === 'sync') {
+          return () => {
+            if (failSync) {
+              failSync = false;
+              throw Object.assign(new Error('injected EIO after the append'), { code: 'EIO' });
+            }
+            target.sync();
+          };
+        }
+        const value = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const agreement = new DiskAgreement(flaky as JsStore);
+    agreement.open([{ name: 'work', root: '/srv/work' }]);
+    failSync = true;
+    assert.throws(() => agreement.intend('work', 'a.txt', {
+      effect: 'adopt', prior: null, expect: { kind: 'content', hash: 'h' }, branchId: 'b',
+    }, { durable: true }), /injected EIO/);
+    const journal = (agreement as unknown as { journal: { needsReconcile: boolean } }).journal;
+    assert.equal(journal.needsReconcile, true);
+    agreement.maybeCheckpoint();
+    assert.equal(journal.needsReconcile, false, 'read back before deciding whether to checkpoint');
+  });
+
   test('with disk unreadable at the write, the pending adoption settles by the tree', { skip: IS_ROOT ? 'root reads every file' : false }, async (t) => {
     const env = new Env(t);
     const m = await pendingAdoption(env);
@@ -1448,10 +1479,26 @@ describe('fingerprints', () => {
     assert.equal(fingerprintVouches(undefined, fp, true), false);
   });
 
-  test('no restored timestamp hides a change: utimes, cp -p, and a write in the racy window', async (t) => {
+  test('the ctime trust gate takes exactly the listed filesystems, and only on Linux', async (t) => {
+    for (const trusted of [0xef53, 0x58465342, 0x9123683e, 0x01021994, 0xf2f52010, 0x2fc12fc1, 0x794c7630]) {
+      assert.equal(fsTypeTrustsCtime(trusted), true, trusted.toString(16));
+    }
+    // NFS, FUSE, SMB2 and 9p maintain no ctime it can trust.
+    for (const untrusted of [0x6969, 0x65735546, 0xfe534d42, 0x01021997]) {
+      assert.equal(fsTypeTrustsCtime(untrusted), false, untrusted.toString(16));
+    }
+    assert.equal(fsTypeTrustsCtime(BigInt(0xef53)), true, 'a bigint f_type reads the same');
+    const env = new Env(t);
+    const expected = process.platform === 'linux' && fsTypeTrustsCtime((await statfs(env.dir)).type);
+    assert.equal(await filesystemTrustsCtime(env.dir), expected);
+  });
+
+  // The racy window itself is pinned by fingerprintVouches' unit assertions
+  // above: reaching it here would take a write that leaves mtime and ctime
+  // unchanged, which no restore can do, since ctime can't be set.
+  test('no restored timestamp hides a change: utimes, cp -p, and a write right after a hash', async (t) => {
     const env = new Env(t);
     const m = await env.open();
-    assert.equal(typeof (await filesystemTrustsCtime(env.dir)), 'boolean');
     await seedSynced(env, m, 'f.txt', 'aaaa');
     await sleep(2100);
     await call(m, 'ls', { path: 'work' }); // records a fingerprint old enough to vouch
@@ -1472,7 +1519,7 @@ describe('fingerprints', () => {
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
     assert.equal(await contentOf(m, 'f.txt'), 'cccc', 'cp -p: rehashed and adopted');
 
-    env.writeDisk('f.txt', 'dddd'); // inside the racy window of the last hash
+    env.writeDisk('f.txt', 'dddd'); // just after the last hash
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
     assert.equal(await contentOf(m, 'f.txt'), 'dddd');
   });
@@ -1776,7 +1823,7 @@ describe('the mount boundary', () => {
 
     const pushed = await pushWith(env, m, ['new.txt'], { beforeEffect: () => writeFileSync(env.disk('new.txt'), 'from the shell') });
     assert.equal(env.readDisk('new.txt'), 'from the shell');
-    assert.match(pushed.skipped[0]!.reason, /^not written: a file appeared at this path since it was checked$/);
+    assert.match(pushed.skipped[0]!.reason, /^not written: something appeared at this path since it was checked$/);
     assert.equal((m as any).agreement.get('work', 'new.txt'), undefined, 'still unknown, as before the intent');
     assert.equal(await stateOf(m, 'new.txt'), 'conflict');
   });
@@ -2175,6 +2222,69 @@ describe('on-agent-action', () => {
       { complete: status.work.lastAgentActionScan.complete, withinDeadline: status.work.lastAgentActionScan.withinDeadline, reason: status.work.lastAgentActionScan.reason },
       { complete: true, withinDeadline: false, reason: 'finished after the deadline' },
     );
+  });
+
+  test('batches that come while a scan waits share it: one runs, at most one waits', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 5_000 });
+    const mod = m as any;
+    const mount = mod.mounts.get('work');
+    let passes = 0;
+    const pass = mod.passUnlocked.bind(mod);
+    mod.passUnlocked = (...args: unknown[]) => { passes++; return pass(...args); };
+    const held = mod.withMount(mount, () => sleep(200)); // another pass holds the mount
+    env.writeDisk('a.txt', 'from the batches');
+    await Promise.all([m.onToolBatchComplete('agent'), m.onToolBatchComplete('agent'), m.onToolBatchComplete('agent')]);
+    await held;
+    assert.equal(passes, 1, 'three batches, one scan');
+    assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null);
+    assert.equal((await call(m, 'status', {})).work.lastAgentActionScan.withinDeadline, true);
+  });
+
+  test("while a scan runs past its deadline, a later batch isn't held, and its scan comes after", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 50 });
+    const mod = m as any;
+    const mount = mod.mounts.get('work');
+    let passes = 0;
+    const pass = mod.passUnlocked.bind(mod);
+    mod.passUnlocked = (...args: unknown[]) => { passes++; return pass(...args); };
+    const held = mod.withMount(mount, () => sleep(400));
+
+    await m.onToolBatchComplete('agent'); // held to its deadline
+    env.writeDisk('later.txt', 'from the second batch');
+    const started = Date.now();
+    await m.onToolBatchComplete('agent');
+    assert.ok(Date.now() - started < 40, 'the second batch was not held');
+    let scan = (await call(m, 'status', {})).work.lastAgentActionScan;
+    assert.match(scan.reason, /an earlier scan is still running past its deadline/);
+
+    await held;
+    await mod.mountTurns.get('work');
+    assert.equal(passes, 1, 'the second batch shared the scan still waiting');
+    assert.notEqual(env.store.treeGet(TREE, 'later.txt'), null, "the second batch's change was scanned");
+    // The late scan is over (its bookkeeping settles a few ticks after the
+    // mount's turn), so the next batch is held for its own scan again, which
+    // may itself miss 50 ms on a loaded machine: that's its own miss.
+    await new Promise((resolve) => setImmediate(resolve));
+    await m.onToolBatchComplete('agent');
+    scan = (await call(m, 'status', {})).work.lastAgentActionScan;
+    assert.doesNotMatch(scan.reason ?? '', /an earlier scan is still running/);
+  });
+
+  test("a scan deadline within 1 s of the framework's hook bound is lowered below it, with a warning", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 60_000 });
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+    try {
+      assert.equal((m as any).agentActionScanDeadlineMs(), TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000);
+      assert.equal((m as any).agentActionScanDeadlineMs(), TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000);
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(warnings.filter((w) => w.includes('agentActionScanDeadlineMs 60000')).length, 1, 'warned once');
   });
 
   test('a branch switch while a pass reads disk makes it gather again, on the branch it then decides on', async (t) => {

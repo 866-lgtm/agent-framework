@@ -148,7 +148,8 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
       touched = true;
       return handle;
     } catch (err) {
-      if (errno(err) === 'EEXIST') throw new EffectFailed('a file appeared at this path since it was checked', false);
+      // O_EXCL refuses any entry: a file, a directory or a link.
+      if (errno(err) === 'EEXIST') throw new EffectFailed('something appeared at this path since it was checked', false);
       throw new EffectFailed(`cannot create the file (${errno(err) ?? message(err)})`, false);
     }
   };
@@ -223,7 +224,10 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
   }
   // Confirming an unlink that already happened never removes a file that
   // appeared since.
-  if (expect.kind === 'absent') throw new EffectFailed('a file appeared at this path since it was checked', false);
+  if (expect.kind === 'absent') {
+    const kind = info.isDirectory() ? 'a directory' : info.isSymbolicLink() ? 'a symlink' : 'a file';
+    throw new EffectFailed(`${kind} appeared at this path since it was checked`, false);
+  }
   let id = { dev: info.dev, ino: info.ino };
   if (info.isSymbolicLink()) {
     // The link itself is what is removed; a followed one must still lie inside.
