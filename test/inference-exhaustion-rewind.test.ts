@@ -176,13 +176,17 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   assert.ok(errs.some((e) => e.includes('nothing left to shed')));
 });
 
-// Anarchid's review of membrane #56 (M3): from #56 on, membrane's boundary
-// classifies every status, so `invalid_request` also reaches agent-framework
-// for a 404 (a model that doesn't exist), which no shed can fix. The breaker
-// runs only for a 400 or 422, the statuses membrane reads as rejected
-// content; an error without a status keeps the type-only rule.
+// Anarchid's review of membrane #56 (M3): from #56 (unreleased) one status
+// table serves every adapter, so `invalid_request` also reaches
+// agent-framework for an Anthropic 404 (a model that doesn't exist), which
+// no shed can fix. With 0.5.86 the raw-fetch Responses adapter already files
+// every status it doesn't list as invalid_request. The breaker runs only for
+// a 400 or 422, the statuses that reject a request's content; an error
+// without a status keeps the type-only rule.
 test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', () => {
   const missingModel = makeHarness();
+  const alerts: any[] = [];
+  missingModel.fw.traceListeners.push((e: any) => { if (e.type === 'ops:alert') alerts.push(e); });
   try {
     for (let i = 0; i < 5; i++) {
       missingModel.fw.noteInferenceExhausted('cairn', '404 model: claude-typo not found', false, 'invalid_request',
@@ -193,6 +197,7 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
   assert.ok(!missingModel.added.some((m) => m.meta.kind === 'refusal-rewind'));
   assert.equal(missingModel.fw.pendingRequests.length, 0);
   assert.ok(missingModel.errs.some((e) => e.includes('[inference-hard-down]')), 'it is still reported hard-down');
+  assert.ok(alerts.some((a) => a.kind === 'hard-down' && a.agentName === 'cairn'), 'and raises the hard-down ops alert');
 
   const rejected = makeHarness();
   try {
@@ -217,13 +222,15 @@ test('the status reaches the breaker from the inference:exhausted trace', () => 
 });
 
 test('rejectsHistory: an invalid_request at 400 or 422, or with no status, and nothing else', () => {
-  assert.equal(rejectsHistory('invalid_request', 400), true);
-  assert.equal(rejectsHistory('invalid_request', 422), true, 'a validation server rejects content with 422');
-  assert.equal(rejectsHistory('invalid_request', undefined), true, 'an older membrane reports no status');
-  for (const status of [401, 403, 404, 405, 409, 410, 413, 429, 500]) {
-    assert.equal(rejectsHistory('invalid_request', status), false, `status ${status}`);
-  }
-  for (const type of ['auth', 'context_length', 'rate_limit', 'server', 'abort', undefined]) {
-    assert.equal(rejectsHistory(type, 400), false, `type ${String(type)}`);
+  // Every membrane error type (0.5.86), the framework's own two, and none.
+  const types = ['invalid_request', 'rate_limit', 'context_length', 'auth', 'server', 'network', 'timeout', 'abort',
+    'safety', 'unsupported', 'unknown', 'over_budget', 'context_refusal', undefined];
+  const statuses: Array<number | undefined> = [undefined];
+  for (let status = 100; status <= 599; status++) statuses.push(status);
+  for (const type of types) {
+    for (const status of statuses) {
+      const expected = type === 'invalid_request' && (status === undefined || status === 400 || status === 422);
+      assert.equal(rejectsHistory(type, status), expected, `${String(type)} at ${String(status)}`);
+    }
   }
 });

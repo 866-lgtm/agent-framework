@@ -1025,6 +1025,20 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
   }
 });
 
+test('the breaker reads the status a real failure carries: a 404 never sheds, a 400 does', async () => {
+  // Through classifyInferenceError, the inference:exhausted trace and
+  // noteInferenceExhausted to the gate, three failed turns each: the
+  // escalation threshold.
+  for (const [status, sheds] of [[404, false], [400, true]] as const) {
+    const { errs, traces } = await runFailingTurn('stream error event', () => new MembraneError({
+      type: 'invalid_request', retryable: false, httpStatus: status, message: `zz-${status}`, rawError: { status },
+    }), { turns: 3 });
+    assert.ok(traces.some((t) => t.type === 'inference:exhausted' && t.httpStatus === status), `HTTP ${status} reached the trace`);
+    assert.ok(errs.some((e) => e.startsWith('[inference-hard-down] agent=resident')), `HTTP ${status} is reported hard-down`);
+    assert.equal(errs.some((e) => e.startsWith('[inference-rewind]')), sheds, `HTTP ${status} ${sheds ? 'sheds' : 'sheds nothing'}`);
+  }
+});
+
 test('an ephemeral run rejects with the bounded failure text', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-failure-bounds-'));
   const cwd = process.cwd();

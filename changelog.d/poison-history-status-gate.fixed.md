@@ -1,8 +1,5 @@
-- The poison-history breaker sheds history only for an `invalid_request`
-  that came back as HTTP 400 or 422, the statuses membrane reads as rejected
-  content. From membrane #56, its error boundary classifies every status, so
-  an `invalid_request` can also be a 404 for a model that doesn't exist, and
-  three of those would shed the agent's newest exchanges. An error that
-  reports no status, from an older membrane, keeps the breaker's earlier
-  rule, the type alone. The failure is still counted, logged and reported
-  hard-down either way.
+- The poison-history breaker sheds history only for an `invalid_request` that came back as HTTP 400 or 422, or that carries no status. Those are the statuses that reject a request's content. Another status says something no shed fixes, such as a 404 (a model that doesn't exist) or a 413 (the request's size), and history shed for it can't be got back. The failure is still counted, logged and reported hard-down either way.
+  - With membrane 0.5.86, Anthropic files only a 400 as `invalid_request`, and the chat adapters file other 4xx as `unknown`, so their behaviour is unchanged. The raw-fetch Responses adapter files every status it doesn't list as `invalid_request`: a 404, 405, 409, 410, 413 or 415 from it no longer sheds history, and a 422 still does.
+  - From membrane #56 (unreleased), one status table serves every adapter, and `invalid_request` also arrives for an Anthropic 404. That is the case this change is for: three failures for a misspelled model would otherwise shed the agent's newest exchanges, with a false "the API kept rejecting your history" marker.
+  - An error with no status, from a membrane that reports none, keeps the breaker's earlier rule, the type alone.
+  - Anthropic's "credit balance is too low" 400 still arrives as `invalid_request` at 400 and still sheds, until antra-tess/membrane#107, which classifies it as `auth`, is released and in agent-framework's membrane floor.
