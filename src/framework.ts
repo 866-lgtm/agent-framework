@@ -11808,6 +11808,11 @@ export class AgentFramework {
         console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${result.error}`);
         return { path };
       }
+      // Declined, not failed: the store left the branch the file is for, so
+      // it isn't written anywhere, as the caller asked (#281 I17).
+      if ((result.data as { branchLeft?: boolean } | undefined)?.branchLeft === true) {
+        return { path, error: result.error ?? 'the workspace had left the branch this file is for' };
+      }
       failure = result.error ?? 'write refused';
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);

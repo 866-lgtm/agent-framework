@@ -413,7 +413,7 @@ describe('silent heartbeat stored rows', () => {
       for (const row of tickRows) assert.equal(row.metadata?.silentHeartbeat?.eventId, tick.eventId);
       // Written out, not computed by the code under test (#281 I26).
       assert.equal((tickRows[1]!.content[0] as { content?: unknown }).content, 'Tool result withheld by the guard. ' +
-        "The tool has already executed. Its full result is kept in the guard's audit record (framework/tool-result-guard), " +
+        "The tool has already executed. Its result is kept in the guard's audit record (framework/tool-result-guard), " +
         'for an operator.');
       assert.doesNotMatch(JSON.stringify(tickRows), /discard-this-partial-output/);
 

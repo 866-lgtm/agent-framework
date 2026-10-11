@@ -1239,9 +1239,12 @@ export class WorkspaceModule implements Module {
    *
    * `branch`, when given, ties the write to that branch: the store's current
    * branch is checked where the tree entry is set, nothing yielding between
-   * the check and the entry, so the file lands on that branch or the write is
-   * refused. The tool-result guard writes a withheld original this way, for
-   * the branch its stub is on (agent-framework #277).
+   * the check and the entry, so the file's tree entry lands on that branch or
+   * the write is refused, with `data: { branchLeft: true }`. A mount has one
+   * directory on disk, so with autoMaterialize the file's copy there is
+   * written like any other write's (#281 I1). The tool-result guard writes a
+   * withheld original this way, for the branch its stub is on
+   * (agent-framework #277).
    *
    * A write whose tree entry is set but whose copy on disk fails returns
    * success false with `data: { inChronicle: true }`: the workspace's tools
@@ -1273,7 +1276,7 @@ export class WorkspaceModule implements Module {
     }
     const store = this.getStore();
     if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
-      return { success: false, error: 'the workspace had left the branch this file is for', isError: true };
+      return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
     }
     const blobHash = store.storeBlob(data, mimeType);
     store.treeSet(mount.treeStateId, relativePath, {

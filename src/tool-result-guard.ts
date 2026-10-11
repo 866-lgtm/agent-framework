@@ -35,7 +35,10 @@ export interface WithheldHost {
  * The stub a withheld result settles to: #159's neutral notice, then where
  * the original is. It names no refusal and no category (#159 keeps those in
  * operational logs), only the place, so reading it back is the agent's
- * deliberate choice (agent-framework #277). A failed write's own error text
+ * deliberate choice (agent-framework #277). The place holds the result as
+ * stored, which for one over the inline cap is its capped text, whose own
+ * note names the file with the whole output; so the stub says "its result",
+ * not its full result (#281 I9). A failed write's own error text
  * stays in the audit record and the logs, not here (#281 I20). The audit
  * record is said to keep the original only when it was saved: a staged
  * record whose save failed is still queued in memory, and a restart before
@@ -47,16 +50,16 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
     ? `is kept ${only}in ${audit}`
     : `went ${only}to ${audit}, though saving that record had failed when the result arrived`;
   if (spill?.unfinished) {
-    return `${TOOL_RESULT_GUARD_NOTICE} Its full result was still being written to workspace file ${spill.path} ` +
+    return `${TOOL_RESULT_GUARD_NOTICE} Its result was still being written to workspace file ${spill.path} ` +
       `when this note was made; if that file is missing, it ${kept('')}.`;
   }
   if (spill && spill.error === undefined) {
-    return `${TOOL_RESULT_GUARD_NOTICE} Its full result is in workspace file ${spill.path}.`;
+    return `${TOOL_RESULT_GUARD_NOTICE} Its result is in workspace file ${spill.path}.`;
   }
   if (spill) {
-    return `${TOOL_RESULT_GUARD_NOTICE} Writing its full result to workspace file ${spill.path} failed, so it ${kept('only ')}.`;
+    return `${TOOL_RESULT_GUARD_NOTICE} Writing its result to workspace file ${spill.path} failed, so it ${kept('only ')}.`;
   }
-  return `${TOOL_RESULT_GUARD_NOTICE} Its full result ${kept('')}.`;
+  return `${TOOL_RESULT_GUARD_NOTICE} Its result ${kept('')}.`;
 }
 
 interface PendingBatch {
@@ -429,6 +432,8 @@ export class ToolResultGuard {
         // waiting a deadline for each would hold every request and stop that
         // much longer (#281 I2). Their stubs name the audit record.
         const unanswered = new Set<number>();
+        // A spill that threw, by index: its error, for the record.
+        const thrown = new Map<number, string>();
         for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
           // Once the store has left the batch's branch (a rollback, an undo, a
@@ -449,6 +454,9 @@ export class ToolResultGuard {
             try {
               spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original, pending.branch);
             } catch (error) {
+              // The host reports a failed write rather than throwing; a throw
+              // is recorded all the same, without a path (#281 I18).
+              thrown.set(index, (error instanceof Error ? error.message : String(error)).slice(0, 200));
               console.error(`[tool-result-guard] agent=${this.agentName} could not spill withheld result ` +
                 `${block.toolUseId}:`, error);
             }
@@ -466,7 +474,11 @@ export class ToolResultGuard {
               if (block.type !== 'tool_result') return [];
               if (!spills.has(index)) return [{ toolUseId: block.toolUseId, skipped: 'branch_changed' }];
               if (unanswered.has(index)) return [{ toolUseId: block.toolUseId, skipped: 'workspace_unanswered' }];
+              if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
               const spill = spills.get(index);
+              // No file was written: no writable workspace, or the framework
+              // was stopping (#281 I22).
+              if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               return [{ toolUseId: block.toolUseId, ...(spill ? { path: spill.path } : {}),
                 ...(spill?.error !== undefined ? { error: spill.error } : {}),
                 ...(spill?.unfinished ? { unfinished: true as const } : {}) }];
