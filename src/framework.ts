@@ -2145,14 +2145,38 @@ export class AgentFramework {
     }
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
+  }
+  /**
+   * A conversation agent's auxiliary calls (its context manager's
+   * compression). A conversation agent takes no provider gate: admission
+   * belongs to the persistent resident, and a generation-unique fork must not
+   * leave a gate behind. But its stated waits are recorded for (agent, model)
+   * as a resident's are, so they bind its auxiliary calls too: a held model
+   * is refused without a call, and an auxiliary call's own stated wait is
+   * recorded for it. (An ephemeral run records nothing, its name being
+   * single-use, so its context manager keeps the plain membrane.)
+   */
+  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting(async (run, model) => {
+      this.refuseHeldProviderModel(agentName, model);
+      try { return await run(); }
+      catch (error) {
+        if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
+        throw error;
+      }
+    });
+  }
+  /** The framework's membrane, with each complete() call passed through
+   *  `admit` along with the model it names. */
+  private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
       const value = Reflect.get(obj, prop, receiver);
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
-          return this.withAuxiliaryAdmission(
-            agentName, () => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
@@ -7667,10 +7691,10 @@ export class AgentFramework {
         isolate: true,
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
-        // Dynamic conversation forks retain the established provider policy in
-        // this bounded first slice. Provider cooldown ownership belongs to the
-        // persistent resident only; generation-unique forks must not leak gates.
-        membrane: this.membrane,
+        // Provider cooldown ownership belongs to the persistent resident only;
+        // generation-unique forks must not leak gates. A fork's own recorded
+        // provider waits still bind its compression calls.
+        membrane: this.conversationAuxiliaryMembraneFor(name),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -9334,10 +9358,21 @@ export class AgentFramework {
     // the gate). But one may have been recorded since the scheduler's check:
     // an auxiliary call this wake parked behind can fail with a stated wait
     // on the primary model. That wait binds this wake too: hold it, don't call.
-    if (ownsProviderGate) {
+    // A conversation agent's waits are recorded and held as a resident's are
+    // (nonOwningProviderWait), and its retries and in-turn restarts reach this
+    // boundary without the scheduler: a wait recorded meanwhile, by its own
+    // auxiliary call or a non-retryable failure, binds them here too. An
+    // ephemeral run records nothing, so nothing binds it here.
+    if (!this.ephemeralRuns.has(agent.name)) {
       const wait = this.providerWaits?.active(agent.name, agent.model);
       if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
-        this.releasePrimaryProviderGate(agent.name);
+        if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+        // A retry or an in-turn restart arrives with its turn still open at
+        // the event gate: the failed attempt, or the predecessor that kept
+        // liveness for it, leaves closing it to this frame. Held here, no
+        // frame would close it, and while it is open every gate event
+        // buffers, for every agent, until the wait ends.
+        this.eventGate?.onInferenceEnded(agent.name);
         console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds at admission ` +
           `(recorded after the wake was scheduled); wake held, not started`);
         return;
@@ -11079,6 +11114,20 @@ export class AgentFramework {
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
+      // The same rule for a turn that doesn't own provider admission as at
+      // the other two failure sites: a conversation agent's stated wait is
+      // recorded and its turn held; an ephemeral run whose wait it won't sleep
+      // says why it ends.
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (statedWait === 'held') {
+        this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+          error: `Provider wait: ${err.message}`,
+          request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
+        this.abortAgentScript(agent.name, 'provider wait');
+        lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+        return;
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -11088,7 +11137,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        error: err.message,
+        error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
       });
       this.emitTrace({
         type: 'inference:exhausted',
