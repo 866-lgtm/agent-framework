@@ -957,19 +957,37 @@ const THROWN_TEXT_LIMIT = 500;
 
 /**
  * What a thrown value says, safely and briefly: an Error's message, or any
- * other value as a string. Reading it can't throw (a value with no string
- * form, a hostile getter or a revoked Proxy reads as unreadable), and the
- * text is bounded, since a provider or handler error can carry a whole
+ * other value, as a string. Every inspection and coercion of the value is
+ * inside the try, so reading it can't throw: a revoked Proxy (whose
+ * instanceof throws), a hostile getter, an Error whose message isn't a
+ * string, or a value with no string form reads as text or as unreadable.
+ * The text is bounded, since a provider or handler error can carry a whole
  * request body.
  */
 function thrownText(error: unknown): string {
   let text: string;
   try {
-    text = error instanceof Error ? error.message : String(error);
+    text = String(error instanceof Error ? error.message : error);
   } catch {
     text = '(a value that could not be read)';
   }
   return text.length <= THROWN_TEXT_LIMIT ? text : `${text.slice(0, THROWN_TEXT_LIMIT)}… (${text.length} characters)`;
+}
+
+/**
+ * A failed handler's reason, never throwing: an Error's message, else "the
+ * handler failed" and what it threw (nothing, for `undefined`). Telling an
+ * Error apart is itself guarded, since instanceof throws on a revoked Proxy.
+ */
+function handlerFailureText(error: unknown): string {
+  let isError = false;
+  try {
+    isError = error instanceof Error;
+  } catch {
+    // Not an Error that can be read; thrownText says so.
+  }
+  if (isError) return thrownText(error);
+  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error)}`;
 }
 
 /** A server's responder, and whether the request it belongs to has been answered yet. */
@@ -2427,11 +2445,7 @@ export class AgentFramework {
   ): void {
     // Optional chaining: prototype-built harnesses leave the queue unset.
     const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
-    const what = outcome.kind === 'refused'
-      ? ''
-      : outcome.error instanceof Error
-        ? thrownText(outcome.error)
-        : `the handler failed${outcome.error === undefined ? '' : `: ${thrownText(outcome.error)}`}`;
+    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error);
     const reason = outcome.kind === 'refused'
       ? 'the host is stopping'
       : stopping
@@ -14425,7 +14439,11 @@ export class AgentFramework {
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
       if (this.pushCoalescer?.isRendering(connection.id)) {
-        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        try {
+          responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        } catch {
+          // The connection is going; there is no one left to tell.
+        }
         return;
       }
       if (this.inferenceRouter && responder) {

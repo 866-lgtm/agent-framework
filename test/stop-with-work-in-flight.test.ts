@@ -464,7 +464,14 @@ describe('stop() with work still in flight', () => {
       const { framework, connection } = await wiredFramework();
       try {
         const fw = framework as unknown as { pushHandler: unknown; channelRegistry: unknown };
-        const thrown: Record<string, unknown> = { e5: undefined, e7: 'a plain string', e8: Object.create(null) };
+        // A revoked Proxy throws on instanceof itself; an Error whose message is a number has no slice.
+        const revoked = Proxy.revocable({}, {});
+        revoked.revoke();
+        const numbered = new Error('placeholder');
+        Object.defineProperty(numbered, 'message', { value: 42 });
+        const thrown: Record<string, unknown> = {
+          e5: undefined, e7: 'a plain string', e8: Object.create(null), e12: revoked.proxy, e13: numbered,
+        };
         fw.pushHandler = {
           // eslint-disable-next-line prefer-promise-reject-errors
           handlePushEvent: (_s: string, params: { eventId: string }) => Promise.reject(thrown[params.eventId]),
@@ -479,13 +486,17 @@ describe('stop() with work still in flight', () => {
         const e5 = answersFor('e5');
         const e7 = answersFor('e7');
         const e8 = answersFor('e8');
+        const e12 = answersFor('e12');
+        const e13 = answersFor('e13');
         const incoming = responder();
         connection.emit('channels-incoming', { messages: [{ channelId: 'c', messageId: 'm', content: [] }] }, incoming);
-        await answered(e5, e7, e8, incoming);
+        await answered(e5, e7, e8, e12, e13, incoming);
 
         assert.deepEqual(e5.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
         assert.deepEqual(e7.answers, [{ error: { code: -32603, message: 'the handler failed: a plain string' } }]);
         assert.deepEqual(e8.answers, [{ error: { code: -32603, message: 'the handler failed: (a value that could not be read)' } }]);
+        assert.deepEqual(e12.answers, [{ error: { code: -32603, message: 'the handler failed: (a value that could not be read)' } }]);
+        assert.deepEqual(e13.answers, [{ error: { code: -32603, message: '42' } }]);
         assert.deepEqual(incoming.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
         assert.ok(!logged.some((line) => line.includes('refused')), 'a live host refuses nothing');
         assert.deepEqual(rejections, []);
@@ -528,6 +539,24 @@ describe('stop() with work still in flight', () => {
         assert.deepEqual(push.answers, [{ result: { accepted: true } }]);
         assert.ok(logged.some((line) => line.includes('push/event from srv failed after it was answered: the trace emit broke')), logged.join('\n'));
         assert.deepEqual(rejections, []);
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('an inference request during a render is refused -32600, and a throwing responder there is not rejected into the listener', async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        const fw = framework as unknown as { pushCoalescer: unknown };
+        const coalescer = fw.pushCoalescer;
+        fw.pushCoalescer = { isRendering: () => true, suspend: () => {}, flush: () => {} };
+        const inference = responder({ throws: true });
+        connection.emit('inference-request', { messages: [] }, inference);
+        await answered(inference);
+
+        assert.deepEqual(inference.answers, [{ error: { code: -32600, message: 'Cannot request inference while push/render is in progress' } }]);
+        assert.deepEqual(rejections, []);
+        fw.pushCoalescer = coalescer;
       } finally {
         await framework.stop();
       }
