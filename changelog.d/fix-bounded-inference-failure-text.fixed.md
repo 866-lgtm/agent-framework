@@ -16,4 +16,4 @@
   - The OverBudget drain breaker's message-text fallback now applies only to unclassified failures, and it is decided on the whole reason, never the excerpt. A classified provider error that quotes "exceed hard budget" or "no summary covers" (the agent's own context, echoed back) no longer kicks the compression drain.
   - A `MembraneError` from another copy of membrane is classified by its name as well as by its class, since the host supplies the `Membrane` instance. Its failure is classified as one from the framework's own copy is, rather than left unclassified.
 - This bound doesn't depend on membrane bounding its own errors.
-- Not covered by this change: Discord-awareness log sites, the speech-route failure reason and `[discord-send-failed]` marker (out of scope here, by agreement), and other module or hook logs that print error objects.
+- Not covered by this change: Discord-awareness log sites, the speech-route failure reason and `[discord-send-failed]` marker (kept whole as the delivery evidence a resident reads before resending), and other module or hook logs that print error objects.
