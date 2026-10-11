@@ -7,7 +7,8 @@ import { AgentFramework } from '../src/index.js';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
-import type { ProcessEvent } from '../src/index.js';
+import type { ProcessEvent, Module, ModuleContext, ToolDefinition, ToolCall, ToolResult, EventResponse } from '../src/index.js';
+import type { ContentBlock } from '@animalabs/membrane';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -27,7 +28,37 @@ function internals(framework: AgentFramework) {
     unackedDeferredWrites: unknown[];
     flushDeferredWrites(label: string): Promise<void>;
     injectScriptWake(record: { id: string; agentName: string }, envelope: string): void;
+    closingConversationAgents: Set<string>;
+    activeStreams: Map<string, Promise<void>>;
+    recordChannelAutoOpenNotice(agentName: string | undefined, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply'): void;
+    addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
   };
+}
+
+/** A tool whose call makes `speaker`'s reply fail to reach a channel while its
+ *  turn is alive, and a tool that does nothing; either can quiesce the host
+ *  from inside the turn. */
+class SenderModule implements Module {
+  readonly name = 'sender';
+  framework: AgentFramework | null = null;
+  speaker = 'worker';
+  quiesceOnCall = false;
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [
+      { name: 'post', description: 'Post a reply', inputSchema: { type: 'object', properties: {} } },
+      { name: 'noop', description: 'Do nothing', inputSchema: { type: 'object', properties: {} } },
+    ];
+  }
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    if (call.name.endsWith('post')) {
+      await internals(this.framework!).channelRegistry.routeSpeech(this.speaker, 'mid-turn reply', 'missing-channel');
+    }
+    if (this.quiesceOnCall) internals(this.framework!).quiesced = true;
+    return { success: true, data: { ok: true } };
+  }
+  async onProcess(): Promise<EventResponse> { return {}; }
 }
 
 const SEND_FAILED = '[discord-send-failed]';
@@ -103,24 +134,25 @@ describe('notices about an agent\'s own action', () => {
   }
 
   describe('residents share one message slot', () => {
-    it('keeps a secondary resident\'s notice on the default path, where it reads it', async (t) => {
+    it('addresses a secondary resident\'s notice to it, in the slot every resident reads', async (t) => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const secondary = t.mock.method(framework.getAgent('secondary')!.getContextManager(), 'addMessage');
       const result = await internals(framework).channelRegistry.routeSpeech('secondary', 'hello', 'missing-channel');
 
       assert.equal(result, null);
-      assert.equal(primary.mock.callCount(), 1, 'the default path writes the shared slot');
-      assert.equal(secondary.mock.callCount(), 0);
-      const [participant, content, metadata] = primary.mock.calls[0]!.arguments;
+      assert.equal(primary.mock.callCount(), 0);
+      assert.equal(secondary.mock.callCount(), 1, 'written through the speaker\'s own window');
+      const [participant, content, metadata] = secondary.mock.calls[0]!.arguments;
       assert.equal(participant, 'user');
-      assert.match(JSON.stringify(content), /\[discord-send-failed\].*5 chars.*missing-channel/);
+      assert.match(JSON.stringify(content), /\[discord-send-failed\] Your previous reply \(5 chars\) could not be delivered to missing-channel/);
       assert.equal(metadata?.system, true);
       assert.equal(metadata?.kind, 'discord-send-failed');
       assert.equal(metadata?.channelId, 'missing-channel');
       assert.match(String(metadata?.reason), /no registered channel/);
+      assert.equal(metadata?.textLen, 5);
       t.mock.restoreAll();
       const { messages } = await framework.getAgent('secondary')!.getContextManager().compile();
-      assert.equal(count(messages, SEND_FAILED), 1, 'the speaking resident reads the shared slot');
+      assert.equal(count(messages, SEND_FAILED), 1, 'the speaking resident reads it');
       assert.equal(internals(framework).pendingRequests.length, 0, 'a failure notice must not request inference');
       assert.equal(membrane.calls.length, 0);
     });
@@ -134,30 +166,32 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       assert.equal(secondary.mock.callCount(), 0);
       assert.equal(primary.mock.calls[0]!.arguments[2]?.kind, 'discord-send-failed');
+      assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /Your previous reply \(5 chars\) could not be delivered to the channel/);
       assert.equal(internals(framework).pendingRequests.length, 0);
     });
 
-    it('waits for the primary\'s live turn before writing a secondary resident\'s notice', async () => {
+    it('waits for the speaking resident\'s own live turn', async () => {
       const state = internals(framework);
-      state.activeTurnTokens.set('primary', 1);
+      state.activeTurnTokens.set('secondary', 1);
 
       await state.channelRegistry.routeSpeech('secondary', 'hello', null);
 
-      assert.equal(state.deferredMessages.length, 1, 'the shared slot is mid-turn for the primary');
-      assert.equal(state.deferredMessages[0]!.forAgent, undefined);
-      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(state.deferredMessages.length, 1, 'the speaker is mid-turn');
+      assert.equal(state.deferredMessages[0]!.forAgent, 'secondary');
+      const { messages } = await framework.getAgent('secondary')!.getContextManager().compile();
       assert.equal(count(messages, SEND_FAILED), 0);
     });
 
-    for (const [speaker, cycling] of [['secondary', 'primary'], ['primary', 'secondary']] as const) {
-      it(`waits for ${cycling}'s tool cycle before writing ${speaker}'s notice`, async () => {
+    for (const speaker of ['secondary', 'primary'] as const) {
+      it(`waits for ${speaker}'s own tool cycle before writing its notice`, async () => {
         const state = internals(framework);
-        state.pendingAssistantBlocks.set(cycling, []);
+        state.pendingAssistantBlocks.set(speaker, []);
 
         await state.channelRegistry.routeSpeech(speaker, 'hello', null);
 
-        assert.equal(state.deferredMessages.length, 1, 'a write now would split a tool_use from its result');
-        const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+        assert.equal(state.deferredMessages.length, 1, 'a write now would split its tool_use from its result');
+        assert.equal(state.deferredMessages[0]!.forAgent, speaker);
+        const { messages } = await framework.getAgent(speaker)!.getContextManager().compile();
         assert.equal(count(messages, SEND_FAILED), 0);
       });
     }
@@ -322,15 +356,20 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
-    it('drops, logged, a background-script wake for an agent no longer registered', async (t) => {
+    it('drops, logged once, a background-script wake for an agent no longer registered: no write, trace or wake', async (t) => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      const traces: string[] = [];
+      framework.onTrace((event) => { if (event.type === 'message:added') traces.push(JSON.stringify(event)); });
 
       internals(framework).injectScriptWake({ id: 's-2', agentName: 'released-run' }, '[background script s-2] Your background script DIED.');
 
       assert.equal(primary.mock.callCount(), 0, 'the primary started no such script');
-      assert.ok(errors.some((e) => /"released-run" is not a registered agent — message dropped/.test(e)));
+      assert.deepEqual(errors, ['[notice] released-run is no longer registered, so its background-script s-2 wake notice is dropped']);
+      assert.deepEqual(traces, [], 'nothing was queued or stored');
+      assert.equal(internals(framework).deferredMessages.length, 0);
+      assert.equal(internals(framework).pendingRequests.length, 0, 'no wake for an agent that is gone');
     });
 
     it('wakes a fork\'s background script into the fork\'s own window', async () => {
@@ -343,6 +382,187 @@ describe('notices about an agent\'s own action', () => {
       const { messages: primaryMessages } = await framework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(forkMessages, envelope), 1);
       assert.equal(count(primaryMessages, envelope), 0);
+    });
+
+    /** Run the fallback reaper over a closing fork, as a minute's sweep would. */
+    function reap(forkName: string) {
+      const state = internals(framework);
+      state.closingConversationAgents.add(forkName);
+      state.lastConversationSweep = 0;
+      state.sweepExpiredConversations();
+    }
+
+    it('tells the primary, once, of a failure notice a fork stored but never read, when the fork is released', async () => {
+      const reply = 'Reply from the fork.';
+      const fork = await spawnFork(reply);
+      // The notice landed in the fork's window after its turn: no compile has read it.
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null, 'released with no closure turn');
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
+      assert.equal(told.length, 1);
+      assert.match(JSON.stringify(told[0]!.content),
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no registered channel[^)]*\\)\\. ${fork.name} has ended, and the human did not receive it\\.`));
+    });
+
+    it('passes on only what a fork never read: a notice its later turn compiled stays its own', async () => {
+      const fork = await spawnFork('Reply from the fork.');
+      const second = 'A second reply, which fails as well.';
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: second }]));
+      framework.pushEvent({
+        type: 'mcpl:channel-incoming',
+        serverId: 'srv',
+        channelId: 'missing-channel',
+        messageId: 'incoming-2',
+        author: { id: 'user-1', name: 'User' },
+        content: [{ type: 'text', text: 'Hello again.' }],
+        timestamp: new Date().toISOString(),
+        metadata: { channel_type: 'im' },
+        triggerInference: true,
+      } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 2, 'the fork\'s second turn compiled its first notice');
+
+      reap(fork.name);
+
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
+      assert.equal(told.length, 1);
+      assert.match(JSON.stringify(told[0]!.content), new RegExp(`A reply by ${fork.name} \\(${second.length} chars\\)`));
+    });
+
+    it('does not reap a closing fork whose turn holds its token before its stream registers', async () => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      state.activeTurnTokens.set(fork.name, 7);
+
+      reap(fork.name);
+      assert.equal(framework.getAgent(fork.name), fork, 'a turn mid-compile is busy');
+
+      state.activeTurnTokens.delete(fork.name);
+      reap(fork.name);
+      assert.equal(framework.getAgent(fork.name), null);
+    });
+
+    it('lands a queued ordinary write in a released fork\'s window, with its durable id, and acks it', async () => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      state.deferredWritesPersisted = true;
+      state.activeTurnTokens.set(fork.name, 3);
+      state.addMessage('user', [{ type: 'text', text: 'queued for the fork' }], { kind: 'test-note' }, { forAgent: fork.name });
+      assert.equal(state.deferredMessages.length, 1);
+      state.activeTurnTokens.delete(fork.name);
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null);
+      assert.equal(state.deferredMessages.length, 0);
+      assert.equal(state.unackedDeferredWrites.length, 0, 'acked out of the recovery queue');
+      const archive = await ContextManager.open({
+        store: framework.getStore(), namespace: 'conversations/' + fork.name, isolate: true, strategy: new PassthroughStrategy(),
+      });
+      const stored = archive.getAllMessages().find((m) => JSON.stringify(m.content).includes('queued for the fork'));
+      assert.ok(stored, 'it landed in the fork\'s own window');
+      assert.equal(typeof (stored.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId, 'string');
+    });
+
+    for (const [what, hold] of [
+      ['its own tool cycle', (state: ReturnType<typeof internals>, fork: string) => { state.pendingAssistantBlocks.set(fork, []); }],
+      ['its own stream', (state: ReturnType<typeof internals>, fork: string) => { state.activeStreams.set(fork, new Promise<void>(() => {})); }],
+    ] as const) {
+      it(`defers a fork's notice while only ${what} is alive`, async (t) => {
+        const fork = await spawnFork();
+        const state = internals(framework);
+        const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
+        hold(state, fork.name);
+        try {
+          await state.channelRegistry.routeSpeech(fork.name, 'hello', null);
+
+          assert.equal(forkCm.mock.callCount(), 0);
+          assert.equal(state.deferredMessages.length, 1);
+          assert.equal(state.deferredMessages[0]!.forAgent, fork.name);
+        } finally {
+          // A stream that never settles would hold stop() in afterEach.
+          state.activeStreams.delete(fork.name);
+        }
+      });
+    }
+
+    it('lands a fork\'s notice while only another agent\'s tool cycle is pending', async (t) => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
+      state.pendingAssistantBlocks.set('primary', []);
+
+      await state.channelRegistry.routeSpeech(fork.name, 'hello', null);
+
+      assert.equal(forkCm.mock.callCount(), 1, 'the fork\'s window has no cycle in flight');
+      assert.equal(state.deferredMessages.length, 0);
+    });
+
+    it('tells the agent whose send opened a channel, in its own window; a policy open tells the primary', async (t) => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+      const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
+
+      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
+      assert.equal(forkCm.mock.callCount(), 1);
+      assert.equal(primary.mock.callCount(), 0);
+      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), /Now open: #one \(c-1\) — your own message into the closed channel engaged it/);
+
+      state.recordChannelAutoOpenNotice(undefined, [{ channelId: 'c-2' }], 'subscription-policy');
+      assert.equal(primary.mock.callCount(), 1, 'no agent caused a policy open');
+      assert.equal(forkCm.mock.callCount(), 1);
+    });
+
+    it('drops, logged once, an auto-open notice for an agent no longer registered', async (t) => {
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+
+      internals(framework).recordChannelAutoOpenNotice('released-conversation', [{ channelId: 'c-1' }], 'opened-by-delivery');
+
+      assert.equal(primary.mock.callCount(), 0);
+      assert.equal(internals(framework).deferredMessages.length, 0);
+      assert.deepEqual(errors, ['[notice] released-conversation is no longer registered, so its channel auto-open notice is dropped']);
+    });
+
+    it('passes a restored failure notice whose agent is gone to the primary, by name, and drops its other writes, logged', async (t) => {
+      const state = internals(framework);
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      (state.deferredMessages as unknown as Array<Record<string, unknown>>).push(
+        {
+          id: 'w-1', seq: 1, participant: 'user', forAgent: 'conversation-gone',
+          content: [{ type: 'text', text: '[discord-send-failed] Your previous reply (12 chars) could not be delivered.' }],
+          metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 12 },
+        },
+        {
+          // Queued by an earlier build: no textLen, and no reason either.
+          id: 'w-2', seq: 2, participant: 'user', forAgent: 'conversation-older',
+          content: [{ type: 'text', text: '[discord-send-failed] Your previous reply could not be delivered.' }],
+          metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel' },
+        },
+        {
+          id: 'w-3', seq: 3, participant: 'user', forAgent: 'conversation-gone',
+          content: [{ type: 'text', text: 'an ordinary write' }],
+        },
+      );
+
+      await state.flushDeferredWrites('boot-recovery');
+
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      const told = messages.filter((m) => JSON.stringify(m.content).includes('has ended')).map((m) => JSON.stringify(m.content));
+      assert.equal(told.length, 2);
+      assert.match(told[0]!, /A reply by conversation-gone \(12 chars\) could not be delivered to missing-channel \(no registered channel\)\. conversation-gone has ended/);
+      assert.match(told[1]!, /A reply by conversation-older could not be delivered to missing-channel\. conversation-older has ended/);
+      assert.ok(!told.some((t) => t.includes('undefined')));
+      assert.equal(count(messages, 'an ordinary write'), 0);
+      assert.ok(errors.some((e) => /"conversation-gone" is not a registered agent — message dropped \(participant=user\)/.test(e)));
+      assert.equal(state.deferredMessages.length, 0);
     });
 
     for (const condition of ['ordinary', 'other-tool-cycle', 'quiesced', 'write-fails'] as const) {
@@ -398,15 +618,18 @@ describe('notices about an agent\'s own action', () => {
         await framework.runUntilIdle();
         state.pendingAssistantBlocks.clear();
 
-        assert.equal(framework.getAgent(fork.name), null, 'the fork is disposed when its closure turn ends');
         if (condition === 'quiesced') {
-          // A write while quiesced could land mid-surgery: the archive write
-          // is dropped, logged, and the primary's notice waits for resume.
-          assert.ok(errors.some((e) => e.includes(`[deferred-flush] ${fork.name}: released while quiesced, so a queued write for its window is dropped`)));
+          // A write while quiesced could land mid-surgery, so the release
+          // waits: the fork stays registered with its notice queued, and the
+          // primary hasn't been told.
+          assert.equal(framework.getAgent(fork.name), fork, 'released only once the host resumes');
           assert.equal(state.deferredMessages.length, 1);
-          state.quiesced = false;
-          await state.flushDeferredWrites('closure test resume');
+          assert.equal(state.deferredMessages[0]!.forAgent, fork.name);
+          const waiting = await framework.getAgent('primary')!.getContextManager().compile();
+          assert.equal(count(waiting.messages, SEND_FAILED), 0);
+          await framework.resume({ force: true });
         }
+        assert.equal(framework.getAgent(fork.name), null, 'the fork is disposed when its closure turn ends');
         if (condition === 'other-tool-cycle') {
           // The primary's notice waits for the shared slot's tool cycle.
           assert.equal(state.deferredMessages.length, 1);
@@ -423,9 +646,7 @@ describe('notices about an agent\'s own action', () => {
         const { messages } = await archive.compile();
         const replyIndex = messages.findIndex((m) => m.participant === fork.name && JSON.stringify(m.content).includes(finalReply));
         assert.ok(replyIndex >= 0, 'the failed closure reply remains archived');
-        if (condition === 'quiesced') {
-          assert.equal(count(messages, SEND_FAILED), 0);
-        } else if (condition === 'write-fails') {
+        if (condition === 'write-fails') {
           // A write the store refuses is logged; disposal still completes.
           assert.equal(count(messages, SEND_FAILED), 0);
           assert.ok(errors.some((e) => e.includes(`[deferred-flush] ${fork.name}: failed to store a queued write before release`)));
@@ -448,5 +669,104 @@ describe('notices about an agent\'s own action', () => {
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });
     }
+  });
+
+  describe('a run\'s notices at its tool boundaries, and its release', () => {
+    let runDir: string;
+    let runFramework: AgentFramework;
+    let runMembrane: MockMembrane;
+    let sender: SenderModule;
+
+    beforeEach(async () => {
+      runDir = mkdtempSync(join(tmpdir(), 'route-failure-runs-'));
+      runMembrane = new MockMembrane();
+      sender = new SenderModule();
+      runFramework = await AgentFramework.create({
+        storePath: join(runDir, 'test.chronicle'),
+        membrane: runMembrane.asMembrane(),
+        agents: [{ name: 'primary', model: 'test-model', systemPrompt: 'Primary.', proseRouting: 'locus' }],
+        modules: [sender],
+      });
+      sender.framework = runFramework;
+      await internals(runFramework).initializeMcpl([]);
+    });
+
+    afterEach(async () => {
+      internals(runFramework).quiesced = false;
+      await runFramework.stop();
+      rmSync(runDir, { recursive: true, force: true });
+    });
+
+    /** Run 'worker' once through these rounds; every round but the last ends on its tool call. */
+    async function run(rounds: ContentBlock[][]) {
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      rounds.forEach((blocks, i) => runMembrane.pushResponse(createMockResponse(blocks, i < rounds.length - 1 ? 'tool_use' : undefined)));
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager);
+      runFramework.start();
+      await done;
+      await runFramework.runUntilIdle();
+    }
+
+    async function archived() {
+      const archive = await ContextManager.open({
+        store: runFramework.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),
+      });
+      return (await archive.compile()).messages;
+    }
+
+    const injected = () => runMembrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .map((m) => JSON.stringify(m.content));
+
+    it('passes on nothing a run read live at a tool boundary', async () => {
+      await run([
+        [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
+        [{ type: 'text', text: '>>skip_reply done' }],
+      ]);
+
+      assert.ok(injected().some((c) => c.includes(SEND_FAILED)), 'the notice reached the run\'s live stream');
+      assert.equal(count(await archived(), SEND_FAILED), 1, 'and its window');
+      const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(messages, 'A reply by worker'), 0, 'it read it, so no one else is told');
+    });
+
+    it('injects a bounced prose notice at the next tool boundary, after the prose it bounced', async () => {
+      const prose = 'Worker prose with no destination.';
+      await run([
+        [{ type: 'text', text: prose }, { type: 'tool_use', id: 'n1', name: 'sender--noop', input: {} }],
+        [{ type: 'text', text: '>>skip_reply done' }],
+      ]);
+
+      assert.ok(injected().some((c) => c.includes(BOUNCED)), 'the speaker hears it within the turn');
+      const messages = await archived();
+      const proseIndex = messages.findIndex((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(prose));
+      const noticeIndex = messages.findIndex((m) => JSON.stringify(m.content).includes(BOUNCED));
+      assert.ok(proseIndex >= 0, 'the bounced prose is in its window');
+      assert.ok(noticeIndex > proseIndex, 'the notice follows it there');
+      assert.match(JSON.stringify(messages[noticeIndex]!.content), /\{\{unsent\}\}/, 'naming the clipboard that holds it');
+      const { messages: primary } = await runFramework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(primary, BOUNCED), 0);
+    });
+
+    it('releases a run that ends while the host is quiesced only at resume, landing what it left queued', async () => {
+      sender.quiesceOnCall = true;
+      await run([
+        [{ type: 'tool_use', id: 'n1', name: 'sender--noop', input: {} }],
+        [{ type: 'text', text: 'Worker prose that bounces at the end.' }],
+      ]);
+      const state = internals(runFramework);
+      assert.equal(state.quiesced, true);
+      assert.ok(runFramework.getAgent('worker'), 'still registered while quiesced');
+      assert.ok(state.deferredMessages.some((m) => m.forAgent === 'worker'), 'its last notice is still queued');
+
+      await runFramework.resume({ force: true });
+
+      assert.equal(runFramework.getAgent('worker'), null, 'released at resume');
+      assert.equal(state.deferredMessages.length, 0);
+      assert.equal(count(await archived(), BOUNCED), 1, 'what it left queued landed in its window');
+    });
   });
 });
