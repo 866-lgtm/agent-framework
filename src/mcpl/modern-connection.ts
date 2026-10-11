@@ -57,7 +57,7 @@ import {
 
 import { StdioTransport, type McplTransport } from './transport.js';
 import { McplRequestError } from './server-connection.js';
-import { MODERN_MCP_PROTOCOL_VERSION, checkServerConfig } from './protocol-family.js';
+import { MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -261,9 +261,10 @@ function bearerAuth(config: McplServerConfig): AuthProvider | undefined {
         if (fresh) return fresh;
       } catch (error) {
         // Same fallback as the WebSocket dial: use the static token, and let
-        // the server refuse a stale credential loudly.
+        // the server refuse a stale credential loudly. The provider's own
+        // text may quote the credential, so it isn't logged.
         console.error(
-          `[mcp] server "${config.id}": access provider failed (${error instanceof Error ? error.message : error}) — using configured fallback`,
+          `[mcp] server "${config.id}": access provider failed (${describeCredentialError(error)}) — using configured fallback`,
         );
       }
     }

@@ -68,7 +68,21 @@
 - A server configuration naming no usable transport is now an error before
   anything is spawned or dialed. That covers a `transport` that doesn't
   match the url's scheme, `transport: 'http'` without a url, and an
-  unrecognized scheme. Every valid configuration resolves as before.
-  `McplServerConnection.connect()` and `connectWithReconnect()` apply the
-  framework's whole check (so `protocol` on a WebSocket url is refused too),
-  and a configuration error is never turned into a retry stub.
+  unrecognized scheme. `McplServerConnection.connect()` and
+  `connectWithReconnect()` apply the framework's whole check (so `protocol`
+  on a WebSocket url is refused too), and a configuration error is never
+  turned into a retry stub. `openTransport()` and `isWebSocketTransport()`
+  decide by the same rule, so an http(s) url is never dialed as a WebSocket.
+- A configuration error, a WebSocket dial failure and `listMcplServers()`
+  show a server's url redacted, since a credential may ride in it: no
+  userinfo, each query parameter's value replaced, and so is a path
+  segment that looks like a credential (16 or more characters with a
+  digit, as a token or uuid has, or 32 or more of anything), such as the
+  per-user secret some hosted servers put in the path. A url that doesn't
+  parse isn't shown. An `accessProvider` that throws is logged by
+  its error's class and its message's length, not its text, which may quote
+  the credential.
+- `listMcplServers()` lists a configuration that connecting would refuse
+  with `refused` (why), and `family` and `transport` null, where it guessed
+  a legacy binding before. Its `policyEstablished` is null for a modern
+  server, which has no MCPL policy.

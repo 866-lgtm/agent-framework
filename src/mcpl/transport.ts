@@ -22,6 +22,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { describeCredentialError, redactUrl, resolveServerBinding } from './protocol-family.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -317,15 +318,16 @@ export class WebSocketTransport extends McplTransport {
       } catch (err) {
         // Fall back to the static token (if any) rather than failing the dial
         // outright — the server will refuse a stale credential loudly anyway.
+        // The provider's own text may quote the credential, so it isn't logged.
         console.error(
-          `[mcpl] server "${config.id}": access provider failed (${err instanceof Error ? err.message : err}) — dialing with configured fallback`,
+          `[mcpl] server "${config.id}": access provider failed (${describeCredentialError(err)}) — dialing with configured fallback`,
         );
       }
     }
     const url = buildWebSocketUrl(config, token);
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
-    const redacted = buildWebSocketUrl({ ...config, token: undefined }, null);
+    const redacted = redactUrl(config.url);
     const ws = new WebSocket(url);
 
     // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
@@ -404,7 +406,8 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
   try {
     parsed = new URL(config.url);
   } catch {
-    throw new Error(`MCPL server "${config.id}": invalid WebSocket url "${config.url}"`);
+    // Not echoed: a url that doesn't parse can't be redacted.
+    throw new Error(`MCPL server "${config.id}": invalid WebSocket url (it isn't shown, since it may carry a credential)`);
   }
   if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
     throw new Error(
@@ -422,22 +425,29 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
 // Factory
 // ---------------------------------------------------------------------------
 
-/** True when the config selects the WebSocket transport (explicit `transport`,
- *  or a `url` with no `command`). */
+/** True when the config selects the WebSocket transport, as
+ *  {@link resolveServerBinding} decides it; false for any other transport and
+ *  for a configuration it refuses. */
 export function isWebSocketTransport(config: McplServerConfig): boolean {
-  if (config.transport === 'websocket') return true;
-  if (config.transport === 'stdio') return false;
-  return Boolean(config.url) && !config.command;
+  try {
+    return resolveServerBinding(config).transport === 'websocket';
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Open the transport selected by `config` (WebSocket when `transport` is
- * 'websocket' or a bare `url` is given; stdio otherwise). The returned transport
- * is connected at the byte level but has NOT performed the MCPL handshake.
+ * Open the legacy transport `config` selects, as {@link resolveServerBinding}
+ * decides it: stdio for a `command`, MCPL's WebSocket binding for a ws(s)://
+ * url. A configuration it refuses, or one for the modern family (an http(s)
+ * url, or `protocol: 'modern'`), throws before anything is spawned or dialed.
+ * The returned transport is connected at the byte level but has NOT
+ * performed the MCPL handshake.
  */
 export async function openTransport(config: McplServerConfig): Promise<McplTransport> {
-  if (isWebSocketTransport(config)) {
-    return WebSocketTransport.open(config);
+  const binding = resolveServerBinding(config);
+  if (binding.family !== 'legacy') {
+    throw new Error(`MCP server "${config.id}" is configured for modern MCP; the legacy transports can't open it`);
   }
-  return StdioTransport.spawn(config);
+  return binding.transport === 'websocket' ? WebSocketTransport.open(config) : StdioTransport.spawn(config);
 }

@@ -182,7 +182,21 @@ test('a first connect that fails keeps retrying with reconnect, and close stops 
 });
 
 test('configuration mistakes throw before anything is launched', async () => {
+  // x.invalid never resolves, so a dial would fail with a connect error instead.
   await assert.rejects(ModernMcpConnection.connect({ id: 'x', url: 'https://x.invalid/mcp', protocol: 'modern' }), /applies only to stdio/);
-  await assert.rejects(ModernMcpConnection.connect({ id: 'x', command: 'srv', protocol: 'modern', requestTimeoutMs: 0 }), /requestTimeoutMs must be an integer/);
-  await assert.rejects(ModernMcpConnection.connect({ id: 'x', command: 'srv' }), /not configured for modern MCP/);
+  // Stdio refusals use the real fixture, whose start log records any launch.
+  const dir = scratch();
+  const refused: Array<[Partial<McplServerConfig>, RegExp]> = [
+    [{ requestTimeoutMs: 0 }, /requestTimeoutMs must be an integer/],
+    [{ protocol: undefined }, /not configured for modern MCP/],
+    [{ token: 't' }, /"token" applies only to a network \(url\) server/],
+    [{ url: 'https://x.invalid/mcp' }, /"command" and "url" are both set/],
+  ];
+  for (const [extra, pattern] of refused) {
+    await assert.rejects(ModernMcpConnection.connect(config(dir, extra)), pattern, JSON.stringify(extra));
+  }
+  assert.deepEqual(lines(join(dir, 'starts.log')), [], 'nothing was launched');
+  // The same fixture, configured right, does launch: the log above can tell.
+  await connect(config(dir));
+  assert.equal(lines(join(dir, 'starts.log')).length, 1);
 });

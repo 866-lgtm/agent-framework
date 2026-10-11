@@ -393,7 +393,7 @@ import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
+import { redactUrl, resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
 import { normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import type {
   McplServerConfig,
@@ -14466,16 +14466,21 @@ export class AgentFramework {
     connected: boolean;
     retrying: boolean;
     /** Which engine serves it: `legacy` (MCP 2024-11-05 + MCPL) or `modern`
-     *  (MCP 2026-07-28), as its configuration selects. */
-    family: 'legacy' | 'modern';
+     *  (MCP 2026-07-28), as its configuration selects; null when the
+     *  configuration names no usable transport (see `refused`). */
+    family: 'legacy' | 'modern' | null;
     /** The MCP revision its last handshake established; null until one has. */
     protocolVersion: string | null;
-    /** How it is reached. */
-    transport: 'stdio' | 'websocket' | 'http';
+    /** How it is reached; null when the configuration names no usable transport. */
+    transport: 'stdio' | 'websocket' | 'http' | null;
+    /** Why connecting refuses this configuration, before anything is spawned
+     *  or dialed; null when it is usable. */
+    refused: string | null;
     toolPrefix: string;
     toolCount: number;
-    /** True only after the §5.3 policy receipt activated the grant. */
-    policyEstablished: boolean;
+    /** True only after the §5.3 policy receipt activated the grant. Null for
+     *  a modern server, which has no MCPL policy. */
+    policyEstablished: boolean | null;
     /** Sole normative authorization allowlist for the connection (§5.4). */
     effectiveGrant: string[];
     /** Advertised paths removed by host enabled/disabled capability config. */
@@ -14509,13 +14514,16 @@ export class AgentFramework {
       lastNegotiatedAt: number | null;
     };
     command?: string;
+    /** The url as {@link redactUrl} shows it, since a credential may ride in
+     *  it: no userinfo, each query parameter's value replaced, and any path
+     *  segment that looks like a credential replaced. */
     url?: string;
   }> {
     const result: Array<{
       id: string; connected: boolean; retrying: boolean;
-      family: 'legacy' | 'modern'; protocolVersion: string | null;
-      transport: 'stdio' | 'websocket' | 'http';
-      toolPrefix: string; toolCount: number; policyEstablished: boolean;
+      family: 'legacy' | 'modern' | null; protocolVersion: string | null;
+      transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
+      toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
       toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
@@ -14532,12 +14540,15 @@ export class AgentFramework {
       const modern = this.modernServers().get(id) ?? null;
       const connection = modern ? null : this.mcplServerRegistry?.getServer(id) ?? null;
       const connected = modern?.isConnected ?? connection?.isConnected ?? false;
-      let binding: { family: 'legacy' | 'modern'; transport: 'stdio' | 'websocket' | 'http' };
+      // What connecting would decide, before anything is spawned or dialed: a
+      // configuration it refuses is listed as refused, not as a guessed binding.
+      let binding: { family: 'legacy' | 'modern'; transport: 'stdio' | 'websocket' | 'http' } | null;
       try {
         binding = resolveServerBinding(config);
       } catch {
-        binding = { family: 'legacy', transport: config.url ? 'websocket' : 'stdio' };
+        binding = null;
       }
+      const problems = serverConfigProblems(config);
       // Attribute through the dispatch resolver: a bare prefix match would
       // also count a nested prefix's tools (`foo` vs `foo--bar`) as ours.
       const ownTools = (this.mcplTools ?? []).flatMap((t) => {
@@ -14548,12 +14559,13 @@ export class AgentFramework {
         id,
         connected,
         retrying: !connected && (modern?.willReconnect ?? connection?.willReconnect ?? false),
-        family: binding.family,
+        family: binding?.family ?? null,
         protocolVersion: modern?.protocolVersion ?? connection?.protocolVersion ?? null,
-        transport: binding.transport,
+        transport: binding?.transport ?? null,
+        refused: problems.length > 0 ? problems.join('; ') : null,
         toolPrefix: prefix,
         toolCount: ownTools.length,
-        policyEstablished: connection?.policyEstablished ?? false,
+        policyEstablished: binding?.family === 'modern' ? null : connection?.policyEstablished ?? false,
         effectiveGrant: connection?.grant.effectiveList() ?? [],
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
@@ -14567,7 +14579,7 @@ export class AgentFramework {
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
         command: config.command,
-        url: config.url,
+        url: config.url === undefined ? undefined : redactUrl(config.url),
       });
     }
     return result;

@@ -288,14 +288,19 @@ configuration chooses the family, and nothing is probed:
 }
 ```
 
+A configuration with both `command` and `url` needs `transport` to say which
+one is used; without it, it is refused rather than silently ignoring one.
+
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
 shows its `family`, `protocolVersion` and `transport`. Its config differs in
-two ways:
+three ways:
 - It has no MCPL surface (grant, push, channels, inference requests, feature
   sets), so setting MCPL-only fields on one is a configuration error.
 - `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
   0 is refused, where MCPL reads it as no watchdog.
+- Over stdio it takes no credential: `token` or `accessProvider` on one is
+  refused.
 
 At the deadline, cancellation is requested for a leg still in flight;
 between the rounds of an `input_required` continuation nothing is in flight
@@ -304,7 +309,10 @@ and the call is never retried. A call that ends for any other reason after
 the server asked for another round, before its final answer, is reported
 the same way, since the server may already have acted. An MCPL server that
 refuses `2024-11-05` with `-32022` fails with `McplProtocolVersionError`,
-which names the fix, and is not retried.
+and is not retried. The error names the revisions the server says it
+supports, or its error text when it lists none, and when the list includes
+`2026-07-28` it says to configure the server with `protocol: 'modern'` (stdio)
+or reach it over http(s).
 
 #### Feature sets
 

@@ -217,9 +217,10 @@ export interface McplServerConfig {
   id: string;
 
   /**
-   * Command to spawn the server process (stdio transport). Mutually exclusive
-   * with `url`. Required for the stdio transport; omit it (and set `url`) for
-   * the WebSocket transport.
+   * Command to spawn the server process (stdio transport). Required for the
+   * stdio transport; omit it (and set `url`) for a network server, over
+   * WebSocket or HTTP. A configuration with both needs `transport` to say
+   * which one is used, and is refused without it.
    */
   command?: string;
 
@@ -243,8 +244,9 @@ export interface McplServerConfig {
   inheritEnv?: boolean;
 
   /**
-   * URL for a network server, used instead of `command`. Its scheme decides
-   * the protocol family:
+   * URL for a network server, used instead of `command`. A configuration
+   * with both needs `transport` to say which one is used, and is refused
+   * without it. Its scheme decides the protocol family:
    * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
    *   binding. The host dials it and runs the same newline-delimited JSON-RPC
    *   as over stdio.
@@ -254,9 +256,11 @@ export interface McplServerConfig {
   url?: string;
 
   /**
-   * Transport selector. When it is absent, a `command` means stdio and a bare
-   * `url` means the transport its scheme names. Set it explicitly to
-   * disambiguate; it must agree with the url's scheme.
+   * Transport selector. When it is absent, a `command` means stdio and a
+   * `url` means the transport its scheme names; with both, it is required.
+   * When it is set, it decides which of the two is used and must agree with
+   * it: `'stdio'` needs a `command`, `'websocket'` a ws(s):// url and
+   * `'http'` an http(s):// url.
    */
   transport?: 'stdio' | 'websocket' | 'http';
 
@@ -270,8 +274,11 @@ export interface McplServerConfig {
   protocol?: 'legacy' | 'modern';
 
   /**
-   * Bearer token for WebSocket auth. Appended to `url` as a `token` query
-   * parameter (`?token=…`) on connect. Ignored by the stdio transport.
+   * Bearer token for a network server. Where it travels depends on the
+   * transport: on a ws(s):// url it is appended as a `token` query parameter
+   * (`?token=…`) on connect; to an http(s):// server it is sent as an
+   * `Authorization: Bearer` header and never put in the url. A legacy stdio
+   * server ignores it, and a modern stdio server refuses it.
    */
   token?: string;
 
@@ -387,7 +394,9 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Set 0 to disable. Default: 60000 (60 seconds). A value above
+   * 2^31−1 is refused: Node runs a longer timer after about 1 ms, so every
+   * request would time out at once.
    *
    * For a modern server it is one deadline per tool call, across every leg
    * of the call, and must be an integer from 1 to 2^31−1. It can't be

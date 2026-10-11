@@ -12,10 +12,13 @@ import {
   serverConfigProblems,
   serverConfigWarnings,
   checkServerConfig,
+  redactUrl,
+  describeCredentialError,
   MCPL_ONLY_POLICY_FIELDS,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
+import { WebSocketTransport } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const cfg = (c: Partial<McplServerConfig>): McplServerConfig => ({ id: 's', ...c });
@@ -28,11 +31,19 @@ test('family and transport follow the configuration', () => {
   assert.deepEqual(resolveServerBinding(cfg({ url: 'wss://example.com/mcpl' })), { family: 'legacy', transport: 'websocket' });
   assert.deepEqual(resolveServerBinding(cfg({ url: 'http://localhost:8080/mcp' })), { family: 'modern', transport: 'http' });
   assert.deepEqual(resolveServerBinding(cfg({ url: 'https://example.com/mcp' })), { family: 'modern', transport: 'http' });
-  // Existing semantics: a command wins over a url unless transport says otherwise.
-  assert.deepEqual(resolveServerBinding(cfg({ command: 'srv', url: 'ws://x/mcpl' })), { family: 'legacy', transport: 'stdio' });
+  // With both a command and a url, an explicit transport says which is used
+  // (a host layers a recipe's url and transport over a file's command).
   assert.deepEqual(
     resolveServerBinding(cfg({ command: 'srv', url: 'ws://x/mcpl', transport: 'websocket' })),
     { family: 'legacy', transport: 'websocket' },
+  );
+  assert.deepEqual(
+    resolveServerBinding(cfg({ command: 'srv', url: 'ws://x/mcpl', transport: 'stdio' })),
+    { family: 'legacy', transport: 'stdio' },
+  );
+  assert.deepEqual(
+    resolveServerBinding(cfg({ command: 'srv', url: 'https://x/mcp', transport: 'http' })),
+    { family: 'modern', transport: 'http' },
   );
   assert.deepEqual(
     resolveServerBinding(cfg({ url: 'https://x/mcp', transport: 'http' })),
@@ -48,6 +59,39 @@ test('a configuration that names no usable transport throws', () => {
   assert.throws(() => resolveServerBinding(cfg({ url: 'https://x', transport: 'websocket' })), /does not match url/);
   assert.throws(() => resolveServerBinding(cfg({ url: 'ws://x', transport: 'stdio' })), /requires "command"/);
   assert.throws(() => resolveServerBinding(cfg({ command: 'srv', transport: 'http' })), /transport "http" requires "url"/);
+});
+
+test('command and url without a transport are refused, rather than one of them silently ignored', () => {
+  for (const url of ['ws://x/mcpl', 'https://x/mcp']) {
+    for (const extra of [{}, { protocol: 'legacy' as const }, { protocol: 'modern' as const }]) {
+      const c = cfg({ command: 'srv', url, ...extra });
+      assert.throws(() => resolveServerBinding(c), /"command" and "url" are both set, and no "transport" says which one to use/, JSON.stringify(c));
+      assert.match(serverConfigProblems(c).join(), /"command" and "url" are both set/, JSON.stringify(c));
+    }
+  }
+  // A transport that disagrees with the url it would use is still refused.
+  assert.throws(() => resolveServerBinding(cfg({ command: 'srv', url: 'https://x/mcp', transport: 'websocket' })), /does not match url/);
+  assert.throws(() => resolveServerBinding(cfg({ command: 'srv', url: 'ws://x/mcpl', transport: 'http' })), /does not match url/);
+});
+
+test('errors and the status view show a url redacted: no userinfo, no query values', () => {
+  assert.equal(redactUrl('https://user:pw@mcp.example:8443/v1/mcp?token=abc&region=eu&token=def#frag'),
+    'https://mcp.example:8443/v1/mcp?token=redacted&region=redacted&token=redacted');
+  assert.equal(redactUrl('wss://example.test/mcpl'), 'wss://example.test/mcpl');
+  // A path segment that looks like a credential goes too: a hosted server's
+  // per-user secret, a uuid, anything very long. Short and plain-word ones stay.
+  assert.equal(redactUrl('https://mcp.zapier.com/api/mcp/s/Zt4kQ9xW2vLm8pRs7YbN/mcp'), 'https://mcp.zapier.com/api/mcp/s/redacted/mcp');
+  assert.equal(redactUrl('https://mcp.example/server/123e4567-e89b-12d3-a456-426614174000/mcp'), 'https://mcp.example/server/redacted/mcp');
+  assert.equal(redactUrl(`https://mcp.example/${'a'.repeat(32)}/mcp`), 'https://mcp.example/redacted/mcp');
+  assert.equal(redactUrl('https://mcp.example/v2/2026-07-28/organization-settings/mcp'), 'https://mcp.example/v2/2026-07-28/organization-settings/mcp');
+  assert.equal(redactUrl('not a url ?token=abc'), '(an invalid url, not shown)');
+  assert.equal(redactUrl(undefined), '(an invalid url, not shown)');
+  // The configuration errors that name a url give it redacted, or not at all.
+  const mismatch = serverConfigProblems(cfg({ url: 'https://u:pw@x/mcp?key=sekret', transport: 'websocket' })).join();
+  assert.match(mismatch, /does not match url https:\/\/x\/mcp\?key=redacted/);
+  const invalid = serverConfigProblems(cfg({ url: 'sekret token not a url' })).join();
+  assert.match(invalid, /invalid url/);
+  for (const text of [mismatch, invalid]) assert.ok(!/sekret|pw@/.test(text), text);
 });
 
 test('every legacy configuration shape passes validation unchanged', () => {
@@ -73,6 +117,17 @@ test('a modern server needs a real deadline', () => {
   }
   for (const good of [undefined, 1, 60_000, MAX_TIMER_MS]) {
     assert.deepEqual(serverConfigProblems(cfg({ url: 'https://x/mcp', requestTimeoutMs: good })), [], String(good));
+  }
+});
+
+test('a legacy deadline above the timer limit is refused; every value that worked passes', () => {
+  for (const bad of [MAX_TIMER_MS + 1, Number.POSITIVE_INFINITY]) {
+    for (const c of [cfg({ command: 'srv', requestTimeoutMs: bad }), cfg({ url: 'wss://x/mcpl', requestTimeoutMs: bad })]) {
+      assert.match(serverConfigProblems(c).join(), /requestTimeoutMs must be at most 2147483647/, String(bad));
+    }
+  }
+  for (const good of [undefined, 0, 1, 60_000, MAX_TIMER_MS]) {
+    assert.deepEqual(serverConfigProblems(cfg({ command: 'srv', requestTimeoutMs: good })), [], String(good));
   }
 });
 
@@ -106,6 +161,14 @@ test('MCPL policy on a modern server is rejected, empty values are not', () => {
   assert.deepEqual(serverConfigProblems(empty), []);
 });
 
+test('a credential on a modern stdio server is refused; a legacy stdio server still ignores it', () => {
+  const provider = async () => 'fresh';
+  assert.match(serverConfigProblems(cfg({ command: 'srv', protocol: 'modern', token: 't' })).join(), /"token" applies only to a network \(url\) server/);
+  assert.match(serverConfigProblems(cfg({ command: 'srv', protocol: 'modern', accessProvider: provider })).join(), /"accessProvider" applies only to a network/);
+  assert.deepEqual(serverConfigProblems(cfg({ command: 'srv', token: 't', accessProvider: provider })), []);
+  assert.deepEqual(serverConfigProblems(cfg({ url: 'https://x/mcp', token: 't', accessProvider: provider })), []);
+});
+
 test('a credential sent in cleartext to a host that is not loopback is warned about, never refused', () => {
   const provider = async () => 'fresh';
   const warned = (c: Partial<McplServerConfig>) => serverConfigWarnings(cfg(c));
@@ -123,10 +186,67 @@ test('a credential sent in cleartext to a host that is not loopback is warned ab
     { url: 'ws://0.0.0.0:8080/mcpl', token: 't' },
     { url: 'http://[::1]:8080/mcp', token: 't' },
     { url: 'ws://app.localhost/mcpl', token: 't' },
+    { url: 'http://[::]:8080/mcp', token: 't' },
+    { url: 'http://[::ffff:127.0.0.1]:8080/mcp', token: 't' },
+    { url: 'http://[::ffff:127.9.8.7]/mcp', token: 't' },
+    { url: 'http://localhost.:8080/mcp', token: 't' },
+    { url: 'ws://app.localhost./mcpl', token: 't' },
+    { url: 'http://localhost:8080/mcp?token=abc' },
     { url: 'http://10.0.0.5:8080/mcp' },
+    { url: 'http://10.0.0.5:8080/mcp?region=eu&page=2' },
     { command: 'srv', url: 'http://10.0.0.5/mcp', token: 't' },
     { url: 'ftp://10.0.0.5/mcp', token: 't' },
   ]) assert.deepEqual(warned(quiet), [], JSON.stringify(quiet));
+  // Not loopback: a mapped address outside 127/8, and a name that only ends in "localhost".
+  for (const loud of ['http://[::ffff:10.0.0.5]/mcp', 'http://notlocalhost/mcp']) {
+    assert.equal(warned({ url: loud, token: 't' }).length, 1, loud);
+  }
+});
+
+test('a secret the url carries itself is warned about too, and the warning never quotes it', () => {
+  const warned = (url: string, extra: Partial<McplServerConfig> = {}) => serverConfigWarnings(cfg({ url, ...extra }));
+  assert.match(warned('http://user:pw@10.0.0.5/mcp')[0]!, /its url's userinfo goes to 10\.0\.0\.5 unencrypted \(http:\/\/\).*read it;/);
+  assert.match(warned('ws://mcp.lan/mcpl?api_key=k1')[0]!, /its url's query parameter "api_key" goes to mcp\.lan unencrypted.*use wss:\/\//);
+  for (const name of ['token', 'Access_Token', 'apikey', 'client_secret', 'password', 'auth', 'X-Amz-Signature']) {
+    assert.equal(warned(`http://10.0.0.5/mcp?${name}=v`).length, 1, name);
+  }
+  const both = warned('http://u:p@10.0.0.5/mcp?token=a&sig_key=b&region=eu', { token: 't' })[0]!;
+  assert.match(both, /its credential, its url's userinfo and its url's query parameters "token", "sig_key" go to 10\.0\.0\.5 unencrypted.*read them;/);
+  for (const text of [both, ...warned('http://user:pw@10.0.0.5/mcp?token=sekret')]) assert.ok(!/sekret|pw|u:p/.test(text), text);
+  const path = warned('http://10.0.0.5/api/mcp/s/Zt4kQ9xW2vLm8pRs7YbN/mcp')[0]!;
+  assert.match(path, /a credential-like segment of its url's path goes to 10\.0\.0\.5 unencrypted.*read it;/);
+  assert.ok(!path.includes('Zt4kQ9xW2vLm8pRs7YbN'), path);
+  assert.deepEqual(warned('http://10.0.0.5/v2/2026-07-28/mcp'), [], 'a short segment with digits is a name');
+  // Encrypted or loopback: nothing.
+  assert.deepEqual(warned('https://user:pw@10.0.0.5/mcp?token=a'), []);
+  assert.deepEqual(warned('http://user:pw@127.0.0.1/mcp?token=a'), []);
+});
+
+test('an access provider that throws is never quoted in the log, on either dial', async () => {
+  const message = 'refresh token sekret-123 expired';
+  const accessProvider = async (): Promise<string | null> => { throw new Error(message); };
+  const logged: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    // Nothing listens on port 1: each dial fails after asking the provider.
+    await assert.rejects(WebSocketTransport.open(cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl', accessProvider })));
+    await assert.rejects(ModernMcpConnection.connect(cfg({ id: 'http', url: 'http://127.0.0.1:1/mcp', accessProvider })));
+  } finally {
+    console.error = realError;
+  }
+  const fallbacks = logged.filter((line) => line.includes('access provider failed'));
+  assert.equal(fallbacks.length, 2, logged.join('\n'));
+  for (const line of fallbacks) assert.ok(line.includes(`access provider failed (Error, ${message.length} characters)`), line);
+  assert.ok(!logged.some((line) => line.includes('sekret')), logged.join('\n'));
+});
+
+test('an access provider that throws is logged by its error class and length, not its text', () => {
+  assert.equal(describeCredentialError(new TypeError('refresh failed for sekret-abc')), 'TypeError, 29 characters');
+  class ProviderError extends Error {}
+  assert.equal(describeCredentialError(new ProviderError('x')), 'ProviderError, 1 character');
+  assert.equal(describeCredentialError('sekret'), 'a thrown string');
+  assert.equal(describeCredentialError(undefined), 'a thrown undefined');
 });
 
 test('both engines admit a configuration through checkServerConfig, which logs its warnings', () => {

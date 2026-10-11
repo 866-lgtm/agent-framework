@@ -187,13 +187,24 @@ test('a repeating cursor is an error, not a silently partial inventory', async (
   await assert.rejects(connection.sendToolsList(), /repeated tools\/list cursor "same"/);
 });
 
-test('a modern configuration is refused by the legacy engine before anything is dialed', async () => {
+test('a modern configuration is refused by the legacy engine before anything is dialed or spawned', async () => {
   await assert.rejects(
     McplServerConnection.connect({ id: 'modern', url: 'https://example.invalid/mcp' }, HOST_CAPS),
     /configured for modern MCP \(2026-07-28\); McplServerConnection speaks the legacy family/,
   );
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const startLog = join(dir, 'starts.log');
   await assert.rejects(
-    McplServerConnection.connect({ id: 'modern', command: process.execPath, protocol: 'modern' }, HOST_CAPS),
+    McplServerConnection.connect(config('ok', { protocol: 'modern' }, startLog), HOST_CAPS),
     /configured for modern MCP/,
   );
+  await assert.rejects(
+    McplServerConnection.connectWithReconnect(config('ok', { protocol: 'modern', reconnect: true }, startLog), HOST_CAPS),
+    /configured for modern MCP/,
+  );
+  assert.equal(existsSync(startLog), false, 'the fixture was never spawned');
+  // The same fixture, configured as legacy, does start: the log above can tell.
+  await connect(config('ok', {}, startLog));
+  assert.equal(readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length, 1);
 });

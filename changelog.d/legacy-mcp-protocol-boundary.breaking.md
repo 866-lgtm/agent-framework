@@ -17,3 +17,13 @@
   whole inventory reaches the agent; before, every page after the first was
   silently dropped. A repeated cursor, or more than 100 pages, is an error
   rather than a partial inventory.
+- **Hosts and operators:** a server configuration with both `command` and
+  `url` and no `transport` is now refused before anything is spawned or
+  dialed. Before, it was launched as stdio and the url was silently
+  ignored. Migration: drop the field you don't use, or set `transport` to
+  say which one is used. Unchanged: a configuration with only one of them,
+  or with both and a `transport`, resolves as before (a host can still
+  layer a url and `transport: 'websocket'` over a file's command). A legacy
+  `requestTimeoutMs` above 2^31−1 is refused too: Node ran it as a timer of
+  about 1 ms, so every request timed out at once. Every value that worked,
+  `0` included, passes.

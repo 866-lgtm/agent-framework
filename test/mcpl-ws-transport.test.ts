@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
-import { buildWebSocketUrl, isWebSocketTransport } from '../src/mcpl/transport.js';
+import { buildWebSocketUrl, isWebSocketTransport, openTransport } from '../src/mcpl/transport.js';
 import type { McplHostCapabilities } from '../src/mcpl/types.js';
 
 const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, featureSets: true };
@@ -73,15 +73,32 @@ test('buildWebSocketUrl validates protocol and appends the token as a query para
   );
   assert.throws(() => buildWebSocketUrl({ id: 's', url: 'http://example.com' }), /ws:\/\/ or wss:\/\//);
   assert.throws(() => buildWebSocketUrl({ id: 's', command: 'x' }), /requires "url"/);
+  // A url that doesn't parse can't be redacted, so the error doesn't echo it.
+  assert.throws(() => buildWebSocketUrl({ id: 's', url: 'not a url ?token=sekret' }),
+    (error: Error) => /invalid WebSocket url/.test(error.message) && !error.message.includes('sekret'));
 });
 
 test('isWebSocketTransport selects the transport from config shape', () => {
   assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x/y' }), true);
   assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x/y', transport: 'websocket' }), true);
   assert.equal(isWebSocketTransport({ id: 's', command: 'node' }), false);
-  // Explicit transport wins over shape.
   assert.equal(isWebSocketTransport({ id: 's', command: 'node', transport: 'stdio' }), false);
-  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node' }), false); // url+command → stdio unless transport says otherwise
+  // The scheme decides, as resolveServerBinding does: an http(s) url is modern MCP, never a WebSocket.
+  assert.equal(isWebSocketTransport({ id: 's', url: 'https://x/mcp' }), false);
+  assert.equal(isWebSocketTransport({ id: 's', url: 'http://x/mcp', transport: 'http' }), false);
+  // With both a command and a url, the explicit transport decides.
+  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node', transport: 'websocket' }), true);
+  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node', transport: 'stdio' }), false);
+  // A configuration resolveServerBinding refuses selects nothing.
+  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node' }), false);
+  assert.equal(isWebSocketTransport({ id: 's', url: 'https://x/mcp', transport: 'websocket' }), false);
+});
+
+test('openTransport refuses a modern or refused configuration before dialing or spawning anything', async () => {
+  // x.invalid never resolves, so a dial would fail with a connect error, not these.
+  await assert.rejects(openTransport({ id: 'm', url: 'https://x.invalid/mcp' }), /configured for modern MCP; the legacy transports can't open it/);
+  await assert.rejects(openTransport({ id: 'm', command: 'srv', protocol: 'modern' }), /configured for modern MCP; the legacy transports can't open it/);
+  await assert.rejects(openTransport({ id: 'b', command: 'srv', url: 'wss://x.invalid/mcpl' }), /"command" and "url" are both set/);
 });
 
 test('connects over WebSocket, negotiates capabilities, lists tools, and round-trips a call', async () => {
@@ -115,6 +132,17 @@ test('a failed WebSocket dial rejects with a clear error (no reconnect)', async 
   await assert.rejects(
     McplServerConnection.connect({ id: 'dead', url: 'ws://127.0.0.1:1/mcpl' }, HOST_CAPS),
     /WebSocket connect (failed|timed out)/,
+  );
+});
+
+test("a failed dial's error names the endpoint, never a credential the url or the token carries", async () => {
+  await assert.rejects(
+    McplServerConnection.connect({ id: 'dead', url: 'ws://u:pw@127.0.0.1:1/mcpl/s/sekret4kQ9xW2vLm8pRs/x?api_key=sekret&v=2', token: 'tok-sekret' }, HOST_CAPS),
+    (error: Error) => {
+      assert.match(error.message, /WebSocket connect (failed|timed out).*\(ws:\/\/127\.0\.0\.1:1\/mcpl\/s\/redacted\/x\?api_key=redacted&v=redacted\)/);
+      assert.ok(!/sekret|pw@/.test(error.message), error.message);
+      return true;
+    },
   );
 });
 
