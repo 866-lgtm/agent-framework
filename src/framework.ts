@@ -85,7 +85,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
-import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
+import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
@@ -9117,7 +9117,7 @@ export class AgentFramework {
     const risky = uncertainAttempt(draft);
     if (risky) {
       return `${draft.id}'s attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
-        `${this.draftTime(risky.at)} may already have been posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}`;
+        `${this.draftTime(risky.at)} may already have been posted: ${risky.outcome?.reason ?? this.noOutcomeText(draft, risky)}`;
     }
     const inherited = draft.inheritedRisk!;
     const owner = inherited.sourceDraftId ?? inherited.draftId;
@@ -9127,6 +9127,18 @@ export class AgentFramework {
         (inherited.at !== undefined ? ` at ${this.draftTime(inherited.at)}` : '')
       : owner;
     return `${draft.id} includes the words of ${inherited.draftId}${via}, and ${where} may already have been posted: ${inherited.reason}`;
+  }
+
+  /** Whether an attempt with no outcome is still out: its draft's latest,
+   *  while that draft is being sent. Otherwise it never got one (a crash). */
+  private attemptIsOut(draft: Draft, attempt: DraftAttempt): boolean {
+    return !attempt.outcome && this.draftsSending.has(`${draft.agent}\u0000${draft.id}`) &&
+      draft.attempts.at(-1)?.attemptId === attempt.attemptId;
+  }
+
+  /** Why an attempt has no outcome, in a risk's words. */
+  private noOutcomeText(draft: Draft, attempt: DraftAttempt): string {
+    return this.attemptIsOut(draft, attempt) ? "it is being sent right now, so its outcome isn't known yet" : 'its outcome was never recorded';
   }
 
   /** A delivered draft's historical receipt. */
@@ -9323,7 +9335,7 @@ export class AgentFramework {
           ...d.attempts.map((a) => {
             const o = a.outcome;
             const status = !o
-              ? 'outcome never recorded — it may have been posted'
+              ? (this.attemptIsOut(d, a) ? 'being sent right now — no outcome yet' : 'outcome never recorded — it may have been posted')
               : o.status === 'delivered'
                 ? `delivered${o.messageId ? `, message ${o.messageId}` : ''}`
                 : o.status === 'unknown'
@@ -9360,6 +9372,9 @@ export class AgentFramework {
           lines.push(`${d.id}: already dismissed.`);
           continue;
         }
+        // A dismissal sets the words aside; it can't take back an attempt
+        // that may already have been posted, so that is said with it.
+        const risk = state === 'unconfirmed' ? ` Note that ${this.riskText(d)}.` : '';
         try {
           this.proseDrafts.dismiss(agentName, d.id);
         } catch (err) {
@@ -9368,7 +9383,7 @@ export class AgentFramework {
             `${err instanceof Error ? err.message : String(err)}. It is still open.`,
           );
         }
-        lines.push(`${d.id}: dismissed (your history keeps the words).`);
+        lines.push(`${d.id}: dismissed (your history keeps the words).${risk}`);
       }
       this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: drafts.map((d) => d.id) });
       return ok(lines.join('\n'));
@@ -9424,11 +9439,13 @@ export class AgentFramework {
     const claims = drafts.map((d) => `${agentName}\u0000${d.id}`);
     for (const claim of claims) this.draftsInFlight.add(claim);
     const lines: string[] = [];
-    let stopped = false;
+    // Why the batch stopped, said for each draft after it: the resend sends
+    // in order, so one that can't go stops the rest.
+    let stopped: string | undefined;
     try {
       for (const queued of drafts) {
         if (stopped) {
-          lines.push(`${queued.id}: not attempted (an earlier draft was not confirmed delivered).`);
+          lines.push(`${queued.id}: not attempted (${stopped}).`);
           continue;
         }
         // The current projection, not the batch's snapshot (it may have been
@@ -9436,7 +9453,7 @@ export class AgentFramework {
         const d = this.proseDrafts.get(agentName, queued.id);
         if (!d) {
           lines.push(`${queued.id}: no longer found among your drafts — not sent.`);
-          stopped = true;
+          stopped = `${queued.id} was no longer found`;
           continue;
         }
         if (draftState(d) === 'delivered') {
@@ -9446,7 +9463,7 @@ export class AgentFramework {
         const refusal = this.resendRefusal(d, confirmDuplicate);
         if (refusal) {
           lines.push(`${refusal} It changed while this resend was waiting — not sent.`);
-          stopped = true;
+          stopped = draftState(d) === 'dismissed' ? `${d.id} was dismissed while it waited` : `${d.id} changed while it waited`;
           continue;
         }
         let attemptId: string;
@@ -9454,7 +9471,7 @@ export class AgentFramework {
           attemptId = this.proseDrafts.beginAttempt(agentName, d.id, destination, 'resend', draftState(d) === 'unconfirmed');
         } catch (err) {
           lines.push(`${d.id}: not sent — the attempt could not be recorded durably (${err instanceof Error ? err.message : String(err)}).`);
-          stopped = true;
+          stopped = `${d.id}'s attempt could not be recorded`;
           continue;
         }
         const sendingKey = `${agentName}\u0000${d.id}`;
@@ -9491,7 +9508,7 @@ export class AgentFramework {
           engaged.add(destination.channelId);
           continue;
         }
-        stopped = true;
+        stopped = `${d.id} was not confirmed delivered`;
         const after = this.proseDrafts.get(agentName, d.id);
         const stillAtRisk = after !== undefined && draftState(after) === 'unconfirmed';
         lines.push(outcome.status === 'unknown'
@@ -9775,31 +9792,60 @@ export class AgentFramework {
   }
 
   /**
-   * `{{unsent}}` in an envelope body: the latest bounce draft's words. An
-   * unconfirmed one (its last attempt may have been posted) is never
-   * substituted silently — the resident gets the facts and the explicit
-   * route (drafts resend with confirmDuplicate) instead.
+   * `{{unsent}}` in an envelope body: the latest bounce draft's words. One
+   * that is out (being sent, or queued in a resend) or unconfirmed (its last
+   * attempt may have been posted) is never substituted — nothing is sent,
+   * and the resident gets the facts and the explicit route (drafts resend
+   * with confirmDuplicate) instead. The envelope's own words are held, as a
+   * bounced envelope's would be (unsentWords): one bounce draft with the
+   * whole text, `{{unsent}}` written out and its risk carried, so nothing
+   * the resident wrote has to be typed again. A bare `{{unsent}}` holds
+   * nothing new: its words already are that draft.
    */
-  private takeUnsent(agent: Agent, prefix: '>>' | '>>>'): { draft?: Draft; refused?: true } {
+  private takeUnsent(
+    agent: Agent,
+    body: string,
+    hold: { round?: number; notice: 'now' | 'later' },
+  ): { draft?: Draft; refused?: true } {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return {};
-    if (this.draftsInFlight.has(`${agent.name}\u0000${draft.id}`)) {
-      const busy = `[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. Nothing was sent; wait for that result.`;
-      try {
-        this.addMessage('user', [{ type: 'text', text: busy }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
-      } catch (err) {
-        console.error('[drafts] in-flight-unsent notice failed:', err);
-      }
-      return { draft, refused: true };
+    const key = `${agent.name}\u0000${draft.id}`;
+    let why: string;
+    let next: string;
+    if (this.draftsInFlight.has(key)) {
+      why = this.draftsSending.has(key) ? 'which is being sent right now' : 'which is queued in a resend in progress';
+      next = 'wait for that result';
+    } else if (draftState(draft) === 'unconfirmed') {
+      why = this.riskText(draft);
+      next = 'check that channel; to send that draft again anyway use ' +
+        `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel", confirmDuplicate: true)`;
+    } else {
+      return { draft };
     }
-    if (draftState(draft) !== 'unconfirmed') return { draft };
-    const text =
-      `[prose-routing] {{unsent}} is draft ${draft.id}: ${this.riskText(draft)}. Nothing was sent. Check that channel; ` +
-      `to send it again anyway use drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel", confirmDuplicate: true).`;
+    const words = this.unsentWords(agent, body);
+    const held = 'draft' in words
+      ? undefined
+      : this.holdProseDrafts(
+        agent,
+        [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
+        'bounced',
+        { round: hold.round, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
+      )[0];
+    const kept = held
+      ? ` Your message is held as draft ${held.id}, with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
+        'can be resent only with confirmDuplicate: true, after that.'
+      : '';
+    const text = `[prose-routing] {{unsent}} is draft ${draft.id}, ${why.startsWith('which') ? why : `and ${why}`}. ` +
+      `Nothing was sent; ${next}.${kept}`;
     try {
-      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+      this.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'prose-bounce', ...(held ? { draftOwner: agent.name, draftIds: [held.id] } : {}) } as MessageMetadata,
+        { forAgent: agent.name },
+      );
     } catch (err) {
-      console.error('[drafts] unconfirmed-unsent notice failed:', err);
+      console.error('[drafts] refused-unsent notice failed:', err);
     }
     return { draft, refused: true };
   }
@@ -9899,7 +9945,7 @@ export class AgentFramework {
         }
         let body = parsed.body;
         const usedClipboard = body.includes('{{unsent}}');
-        const unsent = usedClipboard ? this.takeUnsent(agent, '>>>') : {};
+        const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
         if (unsent.refused) {
           this.proseTargetPins.delete(agent.name);
           this.proseHybridSuppressed.set(agent.name, 'failed');
@@ -9966,26 +10012,35 @@ export class AgentFramework {
 
   /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce
    *  draft aside — unless it is being sent right now, which a dismissal
-   *  can't call back: the resident is told instead. */
+   *  can't call back: the resident is told instead. So are a dismissal that
+   *  can't be recorded (the draft stays, and `{{unsent}}` still names it)
+   *  and one whose draft may already have been posted. */
   private dismissLatestBounce(agent: Agent): void {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return;
-    if (this.draftsSending.has(`${agent.name}\u0000${draft.id}`)) {
-      const busy = `[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. It was not set aside, ` +
-        'since that can\'t call back words already on their way; wait for that result.';
+    const tell = (text: string, what: string): void => {
       try {
-        this.addMessage('user', [{ type: 'text', text: busy }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+        this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
       } catch (err) {
-        console.error('[drafts] in-flight-dismiss notice failed:', err);
+        console.error(`[drafts] ${what} notice failed:`, err);
       }
+    };
+    if (this.draftsSending.has(`${agent.name}\u0000${draft.id}`)) {
+      tell(`[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. It was not set aside, ` +
+        'since that can\'t call back words already on their way; wait for that result.', 'in-flight-dismiss');
       return;
     }
+    const risk = draftState(draft) === 'unconfirmed' ? this.riskText(draft) : undefined;
     try {
       this.proseDrafts.dismiss(agent.name, draft.id);
       this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
     } catch (err) {
       console.error(`[drafts] ${agent.name}: could not dismiss ${draft.id}:`, err);
+      tell(`[prose-routing] {{unsent}} is draft ${draft.id}, which could not be set aside ` +
+        `(${err instanceof Error ? err.message : String(err)}): it is still held, and {{unsent}} still names it.`, 'failed-dismiss');
+      return;
     }
+    if (risk) tell(`[prose-routing] Draft ${draft.id} is set aside. Note that ${risk}.`, 'at-risk-dismiss');
   }
 
   private async deliverProseEnvelope(agent: Agent, rawText: string, hold: { round?: number; notice: 'now' | 'later' }): Promise<void> {
@@ -10025,7 +10080,7 @@ export class AgentFramework {
     }
 
     const usedClipboard = body.includes('{{unsent}}');
-    const unsent = usedClipboard ? this.takeUnsent(agent, '>>') : {};
+    const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
     if (unsent.refused) return;
     if (usedClipboard) {
       body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
@@ -10074,7 +10129,9 @@ export class AgentFramework {
           draftId: previous.id,
           destination: risky.destination,
           at: risky.at,
-          reason: risky.outcome?.reason ?? 'its outcome was never recorded',
+          reason: risky.outcome?.reason ?? (this.attemptIsOut(previous, risky)
+            ? "it was being sent when these words were held, so its outcome wasn't known yet"
+            : 'its outcome was never recorded'),
         }
       : previous.inheritedRisk
         ? {
@@ -10084,7 +10141,12 @@ export class AgentFramework {
             ...(previous.inheritedRisk.at !== undefined ? { at: previous.inheritedRisk.at } : {}),
             reason: previous.inheritedRisk.reason,
           }
-        : { draftId: previous.id, reason: 'it was being sent when these words were held' };
+        : {
+            draftId: previous.id,
+            reason: this.draftsSending.has(`${name}\u0000${previous.id}`)
+              ? 'it was being sent when these words were held'
+              : 'it was queued in a resend when these words were held',
+          };
     return { text: expanded, inheritedRisk };
   }
 

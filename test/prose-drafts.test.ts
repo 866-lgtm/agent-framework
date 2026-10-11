@@ -841,7 +841,7 @@ describe('held prose drafts, end to end', () => {
       const before = h.publishes().length;
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
       assert.equal(h.publishes().length, before, 'neither draft goes out without confirmation');
-      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}: ${fresh.id} includes the words of ${risky!.id}`)));
+      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}, and ${fresh.id} includes the words of ${risky!.id}`)));
       await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [fresh.id], destination: ROOM, confirmDuplicate: true })], 'tool_use'), createMockResponse([])]);
       assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['risky words and a postscript']);
       assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'the original still needs its own confirmation');
@@ -1091,10 +1091,18 @@ describe('drafts resend ownership', () => {
     };
     const say = (r: { success: boolean; data?: Array<{ text: string }>; error?: string }) =>
       r.success ? r.data!.map((b) => b.text).join('') : r.error!;
-    const tick = () => new Promise((r) => setTimeout(r, 5));
+    /** Until a publish is waiting on the test, bounded: what the next step
+     *  needs, rather than a fixed pause that a loaded machine can outrun. */
+    const untilPublishing = async () => {
+      const deadline = Date.now() + 10_000;
+      while (pending.length === 0) {
+        if (Date.now() > deadline) throw new Error('no publish reached the stub within 10 s');
+        await new Promise((r) => setTimeout(r, 2));
+      }
+    };
     const [a, b] = internals.proseDrafts.hold('scout', [{ text: 'A words', source }, { text: 'B words', source }], 'explicit-send').held;
     return {
-      dir, framework, internals, pending, say, tick, a: a!, b: b!,
+      dir, framework, internals, pending, say, untilPublishing, a: a!, b: b!,
       close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
     };
   };
@@ -1103,7 +1111,7 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     try {
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
-      await t.tick();
+      await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
       assert.match(t.say(await sending), /delivered to \(chan\), message m-a/);
       // The channel is gone: destination resolution would now fail.
@@ -1125,12 +1133,12 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     try {
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
-      await t.tick();
+      await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['A words'], 'the batch is waiting on A');
       const concurrent = t.say(await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.b.id], destination: 'chan' }));
       assert.match(concurrent, new RegExp(`${t.b.id} is being sent right now \\(or is queued in a resend in progress\\)`));
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
-      await t.tick();
+      await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['B words']);
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
       const result = t.say(await batch);
@@ -1146,7 +1154,7 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     try {
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
-      await t.tick();
+      await t.untilPublishing();
       const dismissed = t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] }));
       assert.match(dismissed, new RegExp(`${t.b.id}: dismissed`));
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
@@ -1163,7 +1171,7 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     try {
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
-      await t.tick();
+      await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['A words'], 'A is out; B is queued');
       const refused = t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id, t.a.id] }));
       assert.match(refused, new RegExp(`${t.a.id} is being sent right now, and dismissing it can't call those words back; .*Nothing was dismissed\\.`));
@@ -1183,9 +1191,9 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     try {
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
-      await t.tick();
+      await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
-      await t.tick();
+      await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['B words'], 'A is in; B is out');
       assert.match(t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] })),
         new RegExp(`${t.a.id}: already delivered — nothing to dismiss`));
@@ -1200,10 +1208,108 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     try {
       const registry = (t.framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
-      registry.publish = async () => { throw new Error('transport gone'); };
-      await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' }).catch(() => undefined);
+      let entered = 0;
+      registry.publish = async () => {
+        entered++;
+        throw new Error('transport gone');
+      };
+      await assert.rejects(
+        t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' }),
+        /transport gone/,
+      );
+      assert.equal(entered, 1, 'the resend reached publish');
+      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.a.id)!), 'unconfirmed', 'its attempt has no outcome: it may have been posted');
       assert.match(t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] })),
-        new RegExp(`${t.a.id}: dismissed`));
+        new RegExp(`${t.a.id}: dismissed \\(your history keeps the words\\)\\. Note that ${t.a.id}'s attempt to .* may already have been posted: its outcome was never recorded\\.`));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a batch that stops says why for each draft after the stop', async () => {
+    const t = await setup();
+    try {
+      const [c] = t.internals.proseDrafts.hold('scout', [{ text: 'C words', source }], 'explicit-send').held;
+      const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id, c!.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] }));
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      const result = t.say(await batch);
+      assert.match(result, new RegExp(`${c!.id}: not attempted \\(${t.b.id} was dismissed while it waited\\)\\.`));
+
+      const [d] = t.internals.proseDrafts.hold('scout', [{ text: 'D words', source }], 'explicit-send').held;
+      const again = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [c!.id, d!.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
+      assert.match(t.say(await again), new RegExp(`${d!.id}: not attempted \\(${c!.id} was not confirmed delivered\\)\\.`));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('an attempt still out reads as being sent, not as one whose outcome was never recorded', async () => {
+    const t = await setup();
+    try {
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      const read = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.a.id] }));
+      assert.match(read, /attempt .* → \(chan\): being sent right now — no outcome yet/);
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      await sending;
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('{{unsent}} of a bounce queued in a resend says so, and holds the envelope\'s words with the risk', async () => {
+    const t = await setup();
+    try {
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, bounce!.id], destination: 'chan' });
+      await t.untilPublishing();
+      const agent = t.framework.getAgent('scout')!;
+      await t.internals.deliverProseEnvelope(agent, '>>chan {{unsent}} and a postscript', { notice: 'later' });
+      assert.deepEqual(t.pending.map((p) => p.text), ['A words'], 'nothing more was sent');
+      const fresh = t.internals.proseDrafts.latestBounce('scout')!;
+      assert.notEqual(fresh.id, bounce!.id);
+      assert.equal(fresh.text, 'bounced words and a postscript');
+      assert.equal(fresh.inheritedRisk?.draftId, bounce!.id);
+      assert.match(fresh.inheritedRisk!.reason, /queued in a resend when these words were held/);
+      const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      assert.ok(words.includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which is queued in a resend in progress. Nothing was sent; ` +
+        `wait for that result. Your message is held as draft ${fresh.id}, with {{unsent}} written out; since it includes ` +
+        `${bounce!.id}'s words, it can be resent only with confirmDuplicate: true, after that.`), words.join('\n'));
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
+      await batch;
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('>>skip_reply {{unsent}} says when the bounce may already have been posted, or could not be set aside', async () => {
+    const t = await setup();
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
+      await sending;
+      // The journal refuses the dismissal: the bounce stays, and the resident is told.
+      const dismiss = t.internals.proseDrafts.dismiss.bind(t.internals.proseDrafts);
+      t.internals.proseDrafts.dismiss = () => { throw new Error('EIO'); };
+      await t.internals.deliverProseEnvelope(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      assert.ok(words().includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which could not be set aside (EIO): ` +
+        'it is still held, and {{unsent}} still names it.'), words().join('\n'));
+      assert.equal(t.internals.proseDrafts.latestBounce('scout')?.id, bounce!.id);
+      t.internals.proseDrafts.dismiss = dismiss;
+      await t.internals.deliverProseEnvelope(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      assert.equal(draftState(t.internals.proseDrafts.get('scout', bounce!.id)!), 'dismissed');
+      assert.ok(words().some((w) => w.startsWith(`[prose-routing] Draft ${bounce!.id} is set aside. Note that ${bounce!.id}'s attempt to (chan) at `) &&
+        w.endsWith('may already have been posted: no receipt.')), words().join('\n'));
     } finally {
       await t.close();
     }
@@ -1214,7 +1320,7 @@ describe('drafts resend ownership', () => {
     try {
       const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
-      await t.tick();
+      await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
       const envelope = (text: string) => t.internals.deliverProseEnvelope(agent, text, { notice: 'later' });
       await envelope('>>skip_reply {{unsent}}');
@@ -1237,7 +1343,7 @@ describe('drafts resend ownership', () => {
       const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
       const agent = t.framework.getAgent('scout')!;
       const delivering = t.internals.deliverProseEnvelope(agent, '>>chan {{unsent}}', { notice: 'later' });
-      await t.tick();
+      await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['bounced words'], 'the bounce is out through {{unsent}}');
       const refused = t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [bounce!.id] }));
       assert.match(refused, new RegExp(`${bounce!.id} is being sent right now, and dismissing it can't call those words back; .*Nothing was dismissed\\.`));
