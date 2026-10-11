@@ -85,7 +85,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
-import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
+import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
@@ -4676,10 +4676,13 @@ export class AgentFramework {
     inputSchema: { type: 'object' },
   };
 
+  /** How long, in days, a draft beyond a resident's newest is kept (KEEP_IDLE_MS). */
+  private static readonly DRAFT_KEEP_DAYS = Math.round(KEEP_IDLE_MS / 86_400_000);
+
   /** Synthesized drafts tool — present whenever MCPL channels are
    *  configured. A resident's held drafts (src/prose-drafts.ts): plain speech
-   *  that was not sent, never published except by its resident's resend and
-   *  kept until resent or dismissed. Nullable
+   *  that was not sent, never published except by its resident's resend, and
+   *  kept as that module's retention says. Nullable
    *  fields, cast like save_recent_image's: a caller whose provider presents
    *  every property as required can still say "not in use". */
   private static readonly DRAFTS_TOOL = {
@@ -4687,8 +4690,9 @@ export class AgentFramework {
     description:
       'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in the ' +
       'same round holds plain speech back, because a routing prefix bounced, or because it had no destination. ' +
-      'Drafts are never published except by your own resend, only you can list or act on them, and they stay ' +
-      'until you resend or dismiss them. list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
+      `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
+      `drafts are always kept; an older one is let go after ${AgentFramework.DRAFT_KEEP_DAYS} days in which nothing happened to it. ` +
+      'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
       'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
       'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
       'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
@@ -9136,38 +9140,51 @@ export class AgentFramework {
   }
 
   /**
-   * Turn start (or after a crash): name any open drafts no notice has named
-   * yet, privately, before the turn's compile.
+   * Turn start (or after a crash): name, privately and before the turn's
+   * compile, any open drafts no notice on the current branch names: none
+   * reached the history (a crash, an aborted turn), or a rollback or branch
+   * move took the notices away. Every draft it marks is named by id, newest
+   * first: the newest eight with their state and a preview, the rest by id.
    */
   private noticeUnnoticedDrafts(agent: Agent): void {
-    const pending = this.proseDrafts.unnoticed(agent.name);
+    const cm = agent.getContextManager();
+    const pending = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null);
     if (pending.length === 0) return;
     const shown = pending.slice(0, 8).map((d) =>
       `${d.id} (${this.draftStateText(d)}; held ${this.draftTime(d.heldAt)}, ` +
       `${AgentFramework.DRAFT_REASON_SHORT[d.reason]}, ${d.text.length} chars: ${AgentFramework.draftPreview(d.text, 60)})`);
-    const more = pending.length > shown.length ? ` · and ${pending.length - shown.length} more` : '';
+    const rest = pending.slice(shown.length).map((d) => d.id);
+    const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
     const text =
       `[drafts] ${agent.name}: ${pending.length === 1 ? 'a held draft' : `${pending.length} held drafts`} of yours ` +
-      `${pending.length === 1 ? 'has' : 'have'} not been named to you yet: ${shown.join(' · ')}${more}. ` +
+      `${pending.length === 1 ? 'is' : 'are'} unnamed on this branch of your history: ${shown.join(' · ')}${more}. ` +
       'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
+    let mid: string;
     try {
-      const mid = agent.getContextManager().addMessage(
+      mid = cm.addMessage(
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: pending.map((d) => d.id) } as MessageMetadata,
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'prose-drafts' });
-      this.proseDrafts.markNoticed(agent.name, pending.map((d) => d.id));
     } catch (err) {
       console.error('[drafts] catch-up notice failed:', err);
+      return;
+    }
+    try {
+      this.proseDrafts.markNoticed(agent.name, pending.map((d) => d.id), mid);
+    } catch (err) {
+      // Named again by the next turn's catch-up.
+      console.error('[drafts] could not record the catch-up notice:', err);
     }
   }
 
   /**
    * Logical turn end, after the turn's deferred notices are flushed: record
    * as noticed exactly the drafts a stored message names (the receipt, a
-   * held-draft notice, a bounce notice). One whose notice never reached the
-   * history stays unnoticed, for the next turn's catch-up.
+   * held-draft notice, a bounce notice), each with the message that names
+   * it. One whose notice never reached the history stays unnoticed, for the
+   * next turn's catch-up.
    */
   private settleTurnDrafts(agent: Agent): void {
     const held = this.turnDrafts.get(agent.name);
@@ -9175,29 +9192,43 @@ export class AgentFramework {
     this.turnDraftFailures.delete(agent.name);
     this.turnProsePrivate.delete(agent.name);
     if (!held?.length) return;
-    const named = this.draftsNamedInHistory(agent, held.map((d) => d.id));
-    if (named.length === 0) return;
-    try {
-      this.proseDrafts.markNoticed(agent.name, named);
-    } catch (err) {
-      // Unmarked drafts are named again by the next turn's catch-up.
-      console.error('[drafts] could not record notice:', err);
+    const byMessage = new Map<string, string[]>();
+    for (const [draftId, messageId] of this.draftsNamedInHistory(agent, held.map((d) => d.id))) {
+      byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), draftId]);
+    }
+    for (const [messageId, ids] of byMessage) {
+      try {
+        this.proseDrafts.markNoticed(agent.name, ids, messageId);
+      } catch (err) {
+        // Unmarked drafts are named again by the next turn's catch-up.
+        console.error('[drafts] could not record notice:', err);
+      }
     }
   }
 
+  /** How far back draftsNamedInHistory looks: this turn's notices are near
+   *  the end. One beyond it leaves its draft for the next turn's catch-up. */
+  private static readonly DRAFT_NOTICE_SCAN = 500;
+
   /** Which of these drafts a stored notice or receipt OF THIS RESIDENT names
    *  (draft ids are unique only per resident, and residents can share one
-   *  history), scanning the recent history, where this turn's notices are. */
-  private draftsNamedInHistory(agent: Agent, ids: string[]): string[] {
+   *  history), each with the newest message that names it, reading only the
+   *  recent history, where this turn's notices are. */
+  private draftsNamedInHistory(agent: Agent, ids: string[]): Map<string, string> {
     const wanted = new Set(ids);
-    const named = new Set<string>();
-    const messages = agent.getContextManager().getAllMessages();
-    for (let i = messages.length - 1, scanned = 0; i >= 0 && scanned < 500 && named.size < wanted.size; i--, scanned++) {
+    const named = new Map<string, string>();
+    const cm = agent.getContextManager();
+    const total = cm.getMessageCount();
+    const start = Math.max(0, total - AgentFramework.DRAFT_NOTICE_SCAN);
+    const { messages } = cm.getMessageWindow(start, total - start, { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0 && named.size < wanted.size; i--) {
       const meta = messages[i]!.metadata as { draftIds?: unknown; draftOwner?: unknown } | undefined;
       if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
-      for (const id of meta.draftIds) if (typeof id === 'string' && wanted.has(id)) named.add(id);
+      for (const id of meta.draftIds) {
+        if (typeof id === 'string' && wanted.has(id) && !named.has(id)) named.set(id, String(messages[i]!.id));
+      }
     }
-    return ids.filter((id) => named.has(id));
+    return new Map(ids.filter((id) => named.has(id)).map((id) => [id, named.get(id)!]));
   }
 
   /** Page size for drafts(action: "list"). */
@@ -9277,7 +9308,10 @@ export class AgentFramework {
       else missing.push(id);
     }
     if (missing.length > 0) {
-      return refuse(`No draft of yours with id ${missing.join(', ')}. drafts(action: "list") shows your open drafts.`);
+      return refuse(
+        `No draft of yours with id ${missing.join(', ')}: there was none, or it was let go (a draft beyond your ${KEEP_NEWEST} newest ` +
+        `is kept for ${AgentFramework.DRAFT_KEEP_DAYS} days after anything last happened to it). drafts(action: "list") shows your open drafts.`,
+      );
     }
 
     if (action === 'read') {

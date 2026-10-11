@@ -90,22 +90,92 @@ describe('ProseDraftStore', () => {
     }
   });
 
-  it('reports words it could not hold, and stays consistent with its journal', () => {
+  it('reports words it could not hold, and stays consistent with its journal', (t) => {
     const { dir, store, drafts } = open();
     try {
       const real = store.sync.bind(store);
       let fail = true;
       (store as unknown as { sync: () => void }).sync = () => { if (fail) throw new Error('EIO'); real(); };
+      t.mock.method(console, 'error', () => {});
       const result = drafts.hold('a', [{ text: 'x', source }, { text: 'y', source }], 'explicit-send');
-      assert.equal(result.held.length, 0);
-      assert.deepEqual(result.notHeld, { count: 2, error: 'EIO' });
       // The first record reached the store before its barrier failed: the
-      // journal was reconciled, so the projection shows what it holds.
+      // journal was reconciled, so the projection holds it, and so does the
+      // answer. Only the second is reported not held.
+      assert.deepEqual(result.held.map((d) => d.text), ['x']);
+      assert.deepEqual(result.notHeld, { count: 1, error: 'EIO' });
       assert.deepEqual(drafts.open('a').map((d) => d.text), ['x']);
       fail = false;
       assert.equal(drafts.hold('a', [{ text: 'z', source }], 'explicit-send').held.length, 1);
     } finally {
       store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a draft counts as named while a message that named it is on the branch, newest first', () => {
+    const { dir, store, drafts } = open();
+    try {
+      const { held } = drafts.hold('a', [{ text: 'one', source }, { text: 'two', source }, { text: 'three', source }], 'explicit-send');
+      const [one, two, three] = held;
+      drafts.markNoticed('a', [one!.id, two!.id], 'm-1');
+      drafts.markNoticed('a', [two!.id], 'm-2');
+      const unnamed = (present: string[]) => drafts.unnoticed('a', (id) => present.includes(id)).map((d) => d.text);
+      assert.deepEqual(unnamed(['m-1', 'm-2']), ['three'], 'only the draft no notice named');
+      assert.deepEqual(unnamed(['m-2']), ['three', 'one'], 'm-1 rolled away: one is unnamed, two is still named by m-2; newest first');
+      assert.deepEqual(unnamed([]), ['three', 'two', 'one']);
+      assert.deepEqual(drafts.get('a', three!.id)!.noticedIn, undefined);
+      // The record outlives a reopen; one written without a message id (an
+      // older build's) names nothing, so its draft is named once more.
+      store.appendJson(PROSE_DRAFT_RECORD_TYPE, { op: 'noticed', agent: 'a', ids: [three!.id], at: 1 });
+      const again = new ProseDraftStore(store);
+      assert.deepEqual(again.unnoticed('a', (id) => id === 'm-2').map((d) => d.text), ['three', 'one']);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('checkpoints what it keeps: the newest drafts, recent ones, and the latest bounce as {{unsent}} means it', (t) => {
+    const { dir, store } = open();
+    const path = join(dir, 'store');
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+    const hour = 60 * 60 * 1000;
+    const retention = { keepNewest: 2, keepIdleMs: hour, checkpointEvery: 9 };
+    let drafts = new ProseDraftStore(store, retention);
+    try {
+      const [older] = drafts.hold('a', [{ text: 'an older bounce', source }], 'bounced').held;
+      const [latest] = drafts.hold('a', [{ text: 'the latest bounce', source }], 'bounced').held;
+      const [settled] = drafts.hold('a', [{ text: 'resent long ago', source }], 'explicit-send').held;
+      const attempt = drafts.beginAttempt('a', settled!.id, dest(), 'resend', false);
+      drafts.recordOutcome('a', settled!.id, attempt, { status: 'delivered', messageId: 'm-1', at: Date.now(), destination: dest() });
+      drafts.hold('b', [{ text: "another resident's", source }], 'explicit-send');
+      t.mock.timers.tick(2 * hour);
+      // Something happens to the older bounce now: it isn't idle.
+      drafts.beginAttempt('a', older!.id, dest(), 'resend', false);
+      const newest = drafts.hold('a', [{ text: 'new one', source }, { text: 'new two', source }], 'explicit-send').held;
+      // That was the ninth entry: the checkpoint let go of 'a''s idle
+      // drafts outside its two newest, the latest bounce among them.
+      const kept = () => drafts.open('a').map((d) => d.text);
+      assert.deepEqual(kept(), ['new two', 'new one', 'an older bounce']);
+      assert.equal(drafts.get('a', settled!.id), undefined, 'a settled, idle draft is let go');
+      assert.equal(drafts.get('a', latest!.id), undefined);
+      assert.equal(drafts.latestBounce('a'), undefined, 'the latest bounce was let go: {{unsent}} has nothing, though an older bounce is kept');
+      assert.deepEqual(drafts.open('b').map((d) => d.text), ["another resident's"], 'within its resident\'s newest');
+      assert.equal(store.getRecordIdsByType(`${PROSE_DRAFT_RECORD_TYPE}/checkpoint`).length, 1);
+      // A reopen reads the checkpoint and the entries after it, and gets the same.
+      drafts.markNoticed('a', [newest[0]!.id], 'm-9');
+      store.close();
+      const reopened = JsStore.openOrCreate({ path });
+      try {
+        drafts = new ProseDraftStore(reopened, retention);
+        assert.deepEqual(kept(), ['new two', 'new one', 'an older bounce']);
+        assert.equal(drafts.latestBounce('a'), undefined);
+        assert.deepEqual(drafts.get('a', newest[0]!.id)!.noticedIn, ['m-9']);
+        assert.equal(draftState(drafts.get('a', older!.id)!), 'unconfirmed', 'its attempt survives the checkpoint');
+      } finally {
+        reopened.close();
+      }
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -118,9 +188,9 @@ describe('ProseDraftStore', () => {
       const real = { sync: store.sync.bind(store), appendJson: store.appendJson.bind(store) };
       (store as unknown as { sync: () => void }).sync = () => { calls.push('sync'); real.sync(); };
       (store as unknown as { appendJson: (t: string, p: unknown) => unknown }).appendJson = (t, p) => { calls.push(`append:${t}`); return real.appendJson(t, p); };
-      drafts.markNoticed('a', [held[0]!.id]);
+      drafts.markNoticed('a', [held[0]!.id], 'm-1');
       assert.deepEqual(calls, ['sync', `append:${PROSE_DRAFT_RECORD_TYPE}`, 'sync']);
-      assert.ok(drafts.get('a', held[0]!.id)!.noticedAt);
+      assert.deepEqual(drafts.get('a', held[0]!.id)!.noticedIn, ['m-1']);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
@@ -570,12 +640,58 @@ describe('held prose drafts, end to end', () => {
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours have not been named to you yet: /);
+      assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours are unnamed on this branch of your history: /);
       assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); held .*"orphaned words"\)/);
       assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*"half-sent words"`));
       assert.doesNotMatch(notice, /They were not sent/);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'named once');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the catch-up names every draft it marks: the newest eight with previews, the rest by id', async () => {
+    const h = await harness();
+    try {
+      const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}`, source }], 'explicit-send').held[0]!);
+      await h.turn([createMockResponse([])]);
+      const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
+      assert.match(notice, /^\[drafts\] scout: 10 held drafts of yours are unnamed on this branch of your history: /);
+      // Newest first: orphan 9 down to orphan 2 with their previews, then the
+      // two oldest by id alone.
+      const previews = [...notice.matchAll(/"(orphan \d)"/g)].map((m) => m[1]);
+      assert.deepEqual(previews, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => `orphan ${i}`));
+      assert.ok(notice.includes(` · and 2 more: ${held[1]!.id}, ${held[0]!.id}.`), notice);
+      await h.turn([createMockResponse([])]);
+      assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'all ten named, so none is named again');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a rollback past the notice that named a draft names it again at the next turn, once', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('hello')])]);
+      const anchor = h.messages().at(-1)!.id;
+      await h.turn([
+        createMockResponse([text('words a send held back'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      assert.ok(h.texts().some((t) => t.includes(`held as draft ${draft!.id}`)), 'the turn-end receipt names it');
+      const catchUps = () => h.texts().filter((t) => t.includes('unnamed on this branch of your history'));
+      assert.deepEqual(catchUps(), []);
+      // The rollback takes the turn, and its notices, off the branch; the
+      // draft stays, as drafts do.
+      await h.framework.rollbackToMessage('scout', { messageId: anchor });
+      assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUps().length, 1);
+      assert.match(catchUps()[0]!, new RegExp(`a held draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\);.*"words a send held back"`));
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUps().length, 1, 'named once on this branch');
     } finally {
       await h.close();
     }
@@ -762,12 +878,14 @@ describe('draft notices and turn-end settlement', () => {
       const agent = framework.getAgent('scout')!;
       const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named', source }, { text: 'lost', source }], 'explicit-send').held;
       // Only the first draft's notice reached the history.
-      agent.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
+      const cm = agent.getContextManager();
+      const notice = cm.addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
       internals.turnDrafts.set('scout', [named, lost]);
       internals.settleTurnDrafts(agent);
-      assert.ok(internals.proseDrafts.get('scout', named!.id)!.noticedAt);
-      assert.equal(internals.proseDrafts.get('scout', lost!.id)!.noticedAt, undefined, 'left for the catch-up');
-      assert.deepEqual(internals.proseDrafts.unnoticed('scout').map((d) => d.id), [lost!.id]);
+      assert.deepEqual(internals.proseDrafts.get('scout', named!.id)!.noticedIn, [String(notice)], 'recorded with the message that names it');
+      assert.equal(internals.proseDrafts.get('scout', lost!.id)!.noticedIn, undefined, 'left for the catch-up');
+      const onBranch = (id: string) => cm.getMessage(id as never) !== null;
+      assert.deepEqual(internals.proseDrafts.unnoticed('scout', onBranch).map((d) => d.id), [lost!.id]);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -805,7 +923,7 @@ describe('draft identity and risk evidence', () => {
         { system: true, kind: 'prose-drafts', draftOwner: 'other', draftIds: ['d-same2'] } as never);
       t.internals.turnDrafts.set('scout', [mine]);
       t.internals.settleTurnDrafts(t.framework.getAgent('scout')!);
-      assert.equal(t.internals.proseDrafts.get('scout', 'd-same2')!.noticedAt, undefined);
+      assert.equal(t.internals.proseDrafts.get('scout', 'd-same2')!.noticedIn, undefined);
     } finally {
       await t.close();
     }
