@@ -632,7 +632,8 @@ export class WorkspaceModule implements Module {
   /** Each mount's turn: the tail of its serialized passes and writes. */
   private mountTurns = new Map<string, Promise<void>>();
   /** Whether a mount root's filesystem maintains ctime, by canonical root. */
-  private ctimeTrust = new Map<string, boolean>();
+  /** Per canonical root: the device of its filesystem when that maintains ctime, else null. */
+  private ctimeTrust = new Map<string, string | null>();
   /** Persisted state decoded in start(), held until mounts exist to apply it
    *  to — in the Host ordering start() runs before initStore() creates the
    *  mounts, so restoration must be second-callback-safe like watcher
@@ -748,10 +749,11 @@ export class WorkspaceModule implements Module {
   private async runtime(mount: MountState): Promise<MountRuntime> {
     const root = resolve(mount.config.path);
     const rootReal = await realpath(root).catch(() => root);
-    let trusts = this.ctimeTrust.get(rootReal);
-    if (trusts === undefined) {
-      trusts = await filesystemTrustsCtime(rootReal);
-      this.ctimeTrust.set(rootReal, trusts);
+    let trustedDev = this.ctimeTrust.get(rootReal);
+    if (trustedDev === undefined) {
+      const dev = (await stat(rootReal, { bigint: true }).catch(() => null))?.dev;
+      trustedDev = dev !== undefined && (await filesystemTrustsCtime(rootReal)) ? dev.toString() : null;
+      this.ctimeTrust.set(rootReal, trustedDev);
     }
     return {
       name: mount.config.name,
@@ -763,7 +765,7 @@ export class WorkspaceModule implements Module {
         ignore: mount.config.ignore ?? [],
       },
       rootReal,
-      trustsCtime: trusts,
+      ctimeTrustedDev: trustedDev,
       treeStateId: mount.treeStateId,
       intents: this.intents.get(mount.config.name)!,
       readOnly: mount.config.mode === 'read-only',

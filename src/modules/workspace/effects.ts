@@ -24,10 +24,12 @@
  * Node has no openat, so a create, mkdir or unlink still resolves its path by
  * name after the parent was checked: a parent replaced concurrently in that
  * window can redirect that one operation, leaving an empty file or directory
- * outside the mount or unlinking a same-named file there. Content writes stay
- * bound to the descriptor verified before modification: inside the mount,
- * with no other hard links (a link another process makes to it after that
- * check shares the write).
+ * outside the mount or unlinking a same-named file there. Nor is there an
+ * unlink bound to an inode: an unlink checks the entry's identity again just
+ * before it, and a file replaced at its path after that check is the one
+ * unlinked. Content writes stay bound to the descriptor verified before
+ * modification: inside the mount, with no other hard links (a link another
+ * process makes to it after that check shares the write).
  */
 
 import { createHash } from 'node:crypto';
@@ -36,11 +38,13 @@ import { lstat, open, realpath, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import {
   type MountView,
+  NONBLOCK,
   NOT_FOLLOWED,
   OUTSIDE_PARENT,
   contained,
   errno,
   checkDir,
+  locateRoot,
   nameOf,
   parentOf,
 } from './observe.js';
@@ -52,6 +56,9 @@ export type Expect =
   | { kind: 'content'; hash: string }
   /** Anything (force): freshness is overridden, the boundary is not. */
   | { kind: 'any' };
+
+/** Errors with which an unlink refuses outright, leaving the entry as it was. */
+const UNLINK_REFUSALS = new Set(['EACCES', 'EPERM', 'EROFS', 'EBUSY']);
 
 export class EffectFailed extends Error {
   /** Whether the path's entry was touched before the failure. */
@@ -77,8 +84,15 @@ function noFollowFlag(view: MountView): number {
   return !view.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
 }
 
-/** The parent of a path, checked for an effect; proven absent; or why neither. */
+/**
+ * The parent of a path, checked for an effect; proven absent; or why neither.
+ * The root comes first: still a directory, and still the one disk last agreed
+ * under, as any observation of it checks. An effect under a replaced root
+ * acts on nothing, whatever its caller checked before.
+ */
 async function parentFor(view: MountView, rootReal: string, rel: string, create: boolean) {
+  const root = await locateRoot(view, rootReal);
+  if ('reason' in root) throw new EffectFailed(root.reason, false);
   const checked = await checkDir(view, rootReal, parentOf(rel), { create });
   if (checked.kind === 'unobserved') throw new EffectFailed(checked.outside ? OUTSIDE_PARENT : checked.reason, false);
   return checked;
@@ -88,7 +102,7 @@ async function parentFor(view: MountView, rootReal: string, rel: string, create:
 async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: number): Promise<string> {
   let handle: FileHandle;
   try {
-    handle = await open(target, fsConstants.O_RDONLY | flags);
+    handle = await open(target, fsConstants.O_RDONLY | NONBLOCK | flags);
   } catch (err) {
     throw new EffectFailed(`cannot verify the disk copy (${errno(err) ?? message(err)})`, false);
   }
@@ -144,13 +158,14 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
   } else {
     try {
       // Opened without truncating: nothing changes until it is located.
-      handle = await open(target, fsConstants.O_WRONLY | noFollow);
+      handle = await open(target, fsConstants.O_WRONLY | NONBLOCK | noFollow);
     } catch (err) {
       const code = errno(err);
       if (code === 'ENOENT' && expect.kind === 'any') handle = await create();
       else if (code === 'ENOENT') throw new EffectFailed('the file was removed since it was checked', false);
       else if (code === 'ELOOP' && !view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
       else if (code === 'EISDIR') throw new EffectFailed('a directory', false);
+      else if (code === 'ENXIO') throw new EffectFailed('not a regular file', false); // a FIFO with no reader
       else throw new EffectFailed(`cannot open the file (${code ?? message(err)})`, false);
     }
   }
@@ -223,10 +238,19 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
   }
   if (expect.kind === 'content' && (await hashAt(target, id, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
   if (!(await parent.stillHere())) throw new EffectFailed(MOVED, false);
+  // The entry checked is still the one at the path, as close to the unlink as
+  // Node allows (see the header): a file replaced while it was hashed isn't.
+  const again = await lstat(target, { bigint: true }).catch(() => null);
+  const named = again?.isSymbolicLink() ? await stat(target, { bigint: true }).catch(() => null) : again;
+  if (named === null || named.dev !== id.dev || named.ino !== id.ino) throw new EffectFailed(CHANGED, false);
   try {
     await unlink(target);
   } catch (err) {
-    if (errno(err) !== 'ENOENT') throw new EffectFailed(`could not unlink the file: ${message(err)}`, true);
+    const code = errno(err);
+    // An unlink is all or nothing: one refused outright changed nothing, so
+    // the path's evidence can go back as it was. Anything else may have
+    // landed (a network filesystem's EIO, say): the next observation resolves it.
+    if (code !== 'ENOENT') throw new EffectFailed(`could not unlink the file: ${message(err)}`, !UNLINK_REFUSALS.has(code ?? ''));
   }
   return parent.rel;
 }

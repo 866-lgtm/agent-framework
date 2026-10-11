@@ -60,6 +60,14 @@ export interface MountView {
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
 
+/**
+ * Opened with every read or write of a workspace path, where the platform has
+ * it: for a regular file it changes nothing, and a FIFO or other special file
+ * swapped in at the path neither blocks the open nor passes the regular-file
+ * check that follows.
+ */
+export const NONBLOCK = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0;
+
 export type Observation =
   | { kind: 'absent' }
   | { kind: 'file'; size: number; mtimeMs: number; fp: StatFingerprint }
@@ -495,7 +503,9 @@ async function openContained(
   }
   let handle;
   try {
-    handle = await open(lexical, fsConstants.O_RDONLY | (noFollow ? fsConstants.O_NOFOLLOW : 0));
+    // O_NONBLOCK: a FIFO swapped in since any lstat opens at once instead of
+    // waiting for a writer, and the regular-file check below refuses it.
+    handle = await open(lexical, fsConstants.O_RDONLY | NONBLOCK | (noFollow ? fsConstants.O_NOFOLLOW : 0));
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return absence(view, rootReal, relativePath);

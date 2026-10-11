@@ -129,7 +129,13 @@ export interface MountRuntime {
   view: MountView;
   /** Canonical mount root, for symlink containment. */
   rootReal: string;
-  trustsCtime: boolean;
+  /**
+   * The device of the mount root's filesystem when that filesystem maintains
+   * ctime, else null. A fingerprint vouches, and is recorded, only for a file
+   * on that device: a file on another filesystem mounted beneath the root
+   * (which wasn't checked) is rehashed at every observation.
+   */
+  ctimeTrustedDev: string | null;
   treeStateId: string;
   intents: BranchIntents;
   readOnly: boolean;
@@ -205,7 +211,8 @@ async function learnDisk(
   const seen = await observePath(mount.view, mount.rootReal, path);
   if (seen.kind !== 'file') return seen;
   const p = tracked.p;
-  if (!opts.rehash && p?.kind === 'content' && fingerprintVouches(p.fp, seen.fp, mount.trustsCtime)) {
+  const trusted = (fp: { dev: string }) => mount.ctimeTrustedDev !== null && fp.dev === mount.ctimeTrustedDev;
+  if (!opts.rehash && p?.kind === 'content' && fingerprintVouches(p.fp, seen.fp, trusted(seen.fp))) {
     return { kind: 'file', hash: p.hash, size: seen.size, mtimeMs: seen.mtimeMs, fp: p.fp ?? null, ingestible: null };
   }
   const nothingTracked = p === undefined && !tracked.hasStore && !tracked.hasIntent;
@@ -225,7 +232,7 @@ async function learnDisk(
     size: read.size,
     mtimeMs: read.mtimeMs,
     // A fingerprint is recorded only where it can later vouch for the bytes.
-    fp: mount.trustsCtime ? read.fp : null,
+    fp: trusted(read.fp) ? read.fp : null,
     ingestible,
     ...(ingestible ? {} : { mimeType: sniffImageMime(read.head) }),
   };
@@ -457,9 +464,11 @@ function decide(
     const agreed = agreedFromDisk(d) as Extract<Agreed, { kind: 'content' }>;
     const recorded = p?.kind === 'content' ? p : null;
     // Re-record only when P says something else, or a fresh fingerprint can
-    // replace one that no longer vouches.
+    // replace one that no longer vouches. A fresh one exists only where it's
+    // trusted, so both are judged as trusted here.
     const stale = !recorded || recorded.hash !== agreed.hash || recorded.size !== agreed.size ||
-      (agreed.fp !== undefined && agreed.fp !== recorded.fp);
+      (agreed.fp !== undefined && fingerprintVouches(agreed.fp, agreed.fp, true) &&
+        !fingerprintVouches(recorded.fp, agreed.fp, true));
     return verdict({ state: 'synced', ...(stale ? { p: agreed } : {}), ...settles });
   }
 

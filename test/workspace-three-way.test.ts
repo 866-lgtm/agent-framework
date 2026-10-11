@@ -21,7 +21,8 @@ import { basename, dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
-import { fingerprintVouches, filesystemTrustsCtime, observePath } from '../src/modules/workspace/observe.js';
+import { fingerprintVouches, filesystemTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
+import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -1416,6 +1417,133 @@ describe('fingerprints', () => {
     env.writeDisk('f.txt', 'dddd'); // inside the racy window of the last hash
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
     assert.equal(await contentOf(m, 'f.txt'), 'dddd');
+  });
+});
+
+describe('trust and identity at the point of use', () => {
+  /** A view of `dir` as the effects and reads take one. */
+  const viewOf = (dir: string, extra: Partial<MountView> = {}): MountView =>
+    ({ root: dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [], ...extra }) as MountView;
+
+  test('a fingerprint vouches only for a file on the filesystem whose ctime was checked', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'f.txt', 'aaaa');
+    env.writeDisk('f.txt', 'bbbb'); // same size: only a read tells
+    const st = statSync(env.disk('f.txt'), { bigint: true });
+    const fp = { size: 4, mtimeNs: st.mtimeNs.toString(), ctimeNs: st.ctimeNs.toString(), ino: st.ino.toString(), dev: st.dev.toString() };
+    const newest = Number((st.mtimeNs > st.ctimeNs ? st.mtimeNs : st.ctimeNs) / 1_000_000n);
+    // Evidence whose fingerprint matches the file as it is now, with the old
+    // bytes' hash: only a fingerprint that vouches would keep it.
+    (m as any).agreement.set('work', 'f.txt', { kind: 'content', hash: sha('aaaa'), size: 4, fp: { ...fp, hashedAt: newest + 5_000 } });
+    const rootReal = realpathSync(env.dir);
+    (m as any).ctimeTrust.set(rootReal, st.dev.toString()); // the file's own filesystem was checked
+    assert.equal(await stateOf(m, 'f.txt'), 'synced');
+    assert.equal(await contentOf(m, 'f.txt'), 'aaaa', 'vouched for, so not read');
+    (m as any).ctimeTrust.set(rootReal, (st.dev + 1n).toString()); // another device's filesystem was
+    assert.equal(await stateOf(m, 'f.txt'), 'synced');
+    assert.equal(await contentOf(m, 'f.txt'), 'bbbb', 'a file on a filesystem never checked is read, and the change adopted');
+  });
+
+  test('a recheck of an unchanged file records nothing', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'f.txt', 'aaaa');
+    (m as any).ctimeTrust.set(realpathSync(env.dir), statSync(env.disk('f.txt'), { bigint: true }).dev.toString());
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(env.disk('f.txt'), old, old);
+    await sleep(2100); // past the racy window of the ctime that utimes set
+    await call(m, 'sync', {}); // a full recheck rehashes, and records the fingerprint the stamps changed
+    const agreement = (m as any).agreement;
+    const set = agreement.set.bind(agreement);
+    let appended = 0;
+    agreement.set = (...args: unknown[]) => { appended++; return set(...args); };
+    try {
+      await call(m, 'sync', {});
+      await call(m, 'sync', {});
+    } finally {
+      agreement.set = set;
+    }
+    assert.equal(appended, 0, 'the same file, the same stamps: nothing to re-record');
+  });
+
+  test('an unlink never removes a file put at its path after the one it hashed', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a.txt', 'old');
+    const target = env.disk('a.txt');
+    const rootReal = realpathSync(env.dir);
+    let replaced = false;
+    const err = await withFsPromises('open', (original) => async (...args: any[]) => {
+      const handle = await original(...args);
+      if (!replaced && args[0] === join(rootReal, 'a.txt')) {
+        replaced = true; // after the hash's descriptor opened: a new file takes the name
+        writeFileSync(join(env.root, 'swap'), 'new');
+        renameSync(join(env.root, 'swap'), target);
+      }
+      return handle;
+    }, () => unlinkContained(viewOf(env.dir), rootReal, 'a.txt', { kind: 'content', hash: sha('old') }).then(() => null, (e) => e));
+    assert.ok(replaced, 'the swap ran');
+    assert.ok(err instanceof EffectFailed, `refused: ${err}`);
+    assert.equal(readFileSync(target, 'utf8'), 'new', 'the file now at the path is untouched');
+  });
+
+  test('an unlink refused outright touched nothing, so its evidence goes back at once', { skip: IS_ROOT ? 'root unlinks anywhere' : false }, async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'locked/a.txt', 'v1');
+    await call(m, 'delete', { path: 'work/locked/a.txt' });
+    chmodSync(env.disk('locked'), 0o555);
+    let data;
+    try {
+      data = await call(m, 'materialize', { applyDeletions: true });
+    } finally {
+      chmodSync(env.disk('locked'), 0o755);
+    }
+    assert.match(JSON.stringify(data), /not unlinked: could not unlink the file/, `reported as untouched: ${JSON.stringify(data)}`);
+    assert.equal((m as any).agreement.get('work', 'locked/a.txt').kind, 'content', 'the evidence is as it was, not pending');
+    assert.equal(env.readDisk('locked/a.txt'), 'v1');
+  });
+
+  test('a FIFO swapped in at a path neither blocks a read nor a write', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    const swapIn = (path: string) => {
+      rmSync(path);
+      assert.equal(spawnSync('mkfifo', [path]).status, 0, 'mkfifo');
+    };
+    const bounded = <T>(what: string, run: Promise<T>) => Promise.race([
+      run,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} blocked on the FIFO`)), 3000)),
+    ]);
+    for (const how of ['read', 'write'] as const) {
+      env.writeDisk(`${how}.txt`, 'regular');
+      const path = join(rootReal, `${how}.txt`);
+      let swapped = false;
+      const outcome = await withFsPromises('open', (original) => async (...args: any[]) => {
+        if (!swapped && args[0] === path) {
+          swapped = true; // between any lstat and this open
+          swapIn(path);
+        }
+        return original(...args);
+      }, () => bounded(how, how === 'read'
+        ? readPath(viewOf(env.dir), rootReal, 'read.txt', 1 << 20)
+        : writeContained(viewOf(env.dir), rootReal, 'write.txt', Buffer.from('x'), { kind: 'any' }).then(() => 'written', (e) => e)));
+      assert.ok(swapped, `${how}: the swap ran`);
+      if (how === 'read') assert.deepEqual(outcome, { kind: 'unobserved', reason: 'not a regular file' });
+      else assert.ok(outcome instanceof EffectFailed && /not a regular file/.test(outcome.message), `write refused: ${outcome}`);
+    }
+  });
+
+  test("an effect under a replaced root acts on nothing, whatever its caller checked", async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    const st = statSync(env.dir, { bigint: true });
+    const view = viewOf(env.dir, { rootIdentity: { dev: st.dev.toString(), ino: st.ino.toString() } });
+    renameSync(env.dir, join(env.root, 'unmounted'));
+    mkdirSync(join(env.dir, 'sub'), { recursive: true }); // another directory where the drive was, with a same-named subdirectory
+    const err = await writeContained(view, rootReal, 'sub/a.txt', Buffer.from('x'), { kind: 'absent' }).then(() => null, (e) => e);
+    assert.ok(err instanceof EffectFailed, `refused: ${err}`);
+    assert.equal(existsSync(join(env.dir, 'sub', 'a.txt')), false, 'nothing written in the replacement');
   });
 });
 

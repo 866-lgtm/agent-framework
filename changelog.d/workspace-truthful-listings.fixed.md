@@ -76,6 +76,8 @@
   happens, against what is there at that moment. Node has no `openat`, so a parent directory
   replaced concurrently in the window between a check and a create, `mkdir`, unlink or listing
   can still redirect that one operation: an empty file or directory can appear outside the
-  mount, or a same-named file there can be unlinked. Content writes stay bound to the
+  mount, or a same-named file there can be unlinked. Nor can an unlink be bound to the file it
+  checked: a file put at the path after its last check, just before the unlink, is the one
+  removed. Content writes stay bound to the
   descriptor verified, inside the mount and with no other hard links, before modification; a
   hard link made to the file after that check shares the write.
