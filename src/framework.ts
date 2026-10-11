@@ -9478,7 +9478,9 @@ export class AgentFramework {
           ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
         });
         const where = AgentFramework.destinationText(outcome.destination ?? destination);
-        const unrecorded = recorded ? '' : ' (this outcome could not be recorded; the draft will read as unconfirmed)';
+        // A record that failed after reaching the journal was reconciled into
+        // it, so say what the draft reads as now rather than guess.
+        const unrecorded = recorded ? '' : ` (recording this outcome failed; the draft reads as ${this.draftStateNow(agentName, d.id)} now)`;
         if (outcome.status === 'delivered') {
           lines.push(`${d.id}: delivered to ${where}${outcome.messageId ? `, message ${outcome.messageId}` : ''}${unrecorded}.`);
           let engaged = this.turnEngagedChannels.get(agentName);
@@ -9846,9 +9848,24 @@ export class AgentFramework {
         this.proseDrafts.recordOutcome(agent.name, unsent.id, attemptId, outcome);
       } catch (err) {
         console.error(`[drafts] ${agent.name}: outcome of ${unsent.id} not recorded:`, err);
+        const text =
+          `[prose-routing] {{unsent}} was draft ${unsent.id}; its send came back ${outcome.status}, but recording that ` +
+          `failed, so the draft reads as ${this.draftStateNow(agent.name, unsent.id)} now. drafts(action: "read") shows it.`;
+        try {
+          this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+        } catch (noticeErr) {
+          console.error('[drafts] unrecorded-outcome notice failed:', noticeErr);
+        }
       }
     }
     return outcome;
+  }
+
+  /** A draft's state as the journal reads it now: after a write that failed
+   *  and was reconciled, whatever reached the journal counts. */
+  private draftStateNow(agentName: string, id: string): DraftState | 'let go' {
+    const draft = this.proseDrafts.get(agentName, id);
+    return draft ? draftState(draft) : 'let go';
   }
 
   /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */

@@ -272,6 +272,8 @@ function xmlMode(inner: MockMembrane): MockMembrane {
 async function harness(opts: {
   agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private' }>;
   xml?: boolean;
+  /** The fixture server's requestTimeoutMs (the framework's default when unset). */
+  requestTimeoutMs?: number;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -301,6 +303,7 @@ async function harness(opts: {
         command: process.execPath,
         args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
         env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath },
+        ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
       }],
       modules: [],
     });
@@ -549,6 +552,48 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it('through the real connection, an error response is unconfirmed, with the connector\'s words', async () => {
+    const h = await harness();
+    try {
+      h.command({ op: 'publish-mode', mode: 'error' });
+      await h.turn([createMockResponse([text('words into a failing connector')])]);
+      assert.equal(h.publishes().filter((p) => p.event === 'publish-error').length, 1, 'the request reached the server');
+      await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
+      const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
+      assert.match(marker, /was not confirmed \(.*connector exploded.*\(delivery uncertain\)\)\. It may or may not have been posted; check the channel/);
+      // A resend of a held draft records the same outcome.
+      await h.turn([
+        createMockResponse([text('held beside a send'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [attempt] = h.store().get('scout', draft!.id)!.attempts;
+      assert.equal(attempt!.outcome?.status, 'unknown');
+      assert.match(attempt!.outcome!.reason!, /connector exploded/);
+      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('through the real connection, a server that never answers is unconfirmed once the request times out', async () => {
+    const h = await harness({ requestTimeoutMs: 1_000 });
+    try {
+      h.command({ op: 'publish-mode', mode: 'hang' });
+      await h.turn([createMockResponse([text('words into silence')])]);
+      await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
+      assert.equal(h.publishes().length, 0);
+      const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
+      assert.match(marker, /was not confirmed \(MCPL server "discord" did not respond to channels\/publish .*within 1000ms.*\(delivery uncertain\)\)\. It may or may not have been posted/);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('an unknown outcome is not cleared by a later failure: the draft stays unconfirmed', async () => {
     const h = await harness();
     try {
@@ -692,6 +737,66 @@ describe('held prose drafts, end to end', () => {
       assert.match(catchUps()[0]!, new RegExp(`a held draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\);.*"words a send held back"`));
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
+    } finally {
+      await h.close();
+    }
+  });
+
+  /** Make the store's sync fail once, right after a draft outcome record
+   *  reaches it: the record lands, its write fails, and the journal is
+   *  reconciled with it in. */
+  const failOutcomeSyncOnce = (h: Awaited<ReturnType<typeof harness>>) => {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const real = { appendJson: store.appendJson.bind(store), sync: store.sync.bind(store) };
+    let armed = false;
+    let spent = false;
+    (store as unknown as { appendJson: (t: string, p: unknown) => unknown }).appendJson = (t, p) => {
+      const ref = real.appendJson(t, p);
+      if (!spent && t === PROSE_DRAFT_RECORD_TYPE && (p as { op?: string }).op === 'outcome') armed = true;
+      return ref;
+    };
+    (store as unknown as { sync: () => void }).sync = () => {
+      if (armed && !spent) {
+        spent = true;
+        throw new Error('EIO after the outcome landed');
+      }
+      real.sync();
+    };
+  };
+
+  it('a resend whose outcome record fails after landing reports what the draft reads as now', async (t) => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('words to resend'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      failOutcomeSyncOnce(h);
+      t.mock.method(console, 'error', () => {});
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.match(h.toolResults()[0]!, new RegExp(`${draft!.id}: delivered to .*\\(recording this outcome failed; the draft reads as delivered now\\)\\.`));
+      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'delivered');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('an {{unsent}} delivery whose outcome record fails tells the resident what the draft reads as now', async (t) => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await h.turn([createMockResponse([text('words with nowhere to go')])]);
+      const [bounced] = h.drafts();
+      failOutcomeSyncOnce(h);
+      t.mock.method(console, 'error', () => {});
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['words with nowhere to go']);
+      await h.until(() => h.texts().some((x) => x.includes('but recording that failed')), 'the notice');
+      assert.ok(h.texts().some((x) => x === `[prose-routing] {{unsent}} was draft ${bounced!.id}; its send came back delivered, but recording that ` +
+        'failed, so the draft reads as delivered now. drafts(action: "read") shows it.'), JSON.stringify(h.texts().filter((x) => x.startsWith('[prose-routing]'))));
     } finally {
       await h.close();
     }
