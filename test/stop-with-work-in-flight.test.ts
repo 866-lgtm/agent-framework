@@ -7,7 +7,8 @@
  * stream test, where a robot--move outlived the framework; the race itself
  * is older than #256):
  *   - a tool's result that arrives after stop() is logged and dropped: the
- *     stream that asked is gone, and the tool has already run. Before, its
+ *     queue that would carry it to its stream is closed, stop() is ending
+ *     the streams, and the tool has already run. Before, its
  *     push threw "Queue is closed", the throw was misreported as the tool's
  *     failure, and that failure's push threw again, unhandled;
  *   - a server's push, incoming message or other request the host can't
@@ -25,6 +26,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import ts from 'typescript';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
   Module,
@@ -289,7 +291,9 @@ describe('stop() with work still in flight', () => {
   it('every tool result the framework produces names its tool', () => {
     // The drop's log line names the tool from the event's toolName, so a
     // producer that leaves it out logs a drop nobody can reconcile. Every
-    // object literal in src with type: 'tool-result' carries toolName.
+    // object literal in src whose `type` is the string 'tool-result' (in any
+    // quoting) carries toolName. Read as TypeScript's syntax tree, not as
+    // text, so no spelling of the literal escapes the check.
     const src = new URL('../../src/', import.meta.url).pathname;
     const files: string[] = [];
     const walk = (dir: string): void => {
@@ -300,27 +304,29 @@ describe('stop() with work still in flight', () => {
       }
     };
     walk(src);
+    const nameOf = (n: ts.PropertyName): string | undefined =>
+      ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) ? n.text : undefined;
+    const isToolResult = (e: ts.Expression): boolean => {
+      while (ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
+      return (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) && e.text === 'tool-result';
+    };
     const missing: string[] = [];
     let literals = 0;
     for (const file of files) {
-      const text = readFileSync(file, 'utf8');
-      for (const m of text.matchAll(/type:\s*'tool-result',/g)) {
-        literals++;
-        let start = m.index!;
-        for (let depth = 0; start > 0; start--) {
-          const c = text[start - 1];
-          if (c === '}') depth++;
-          else if (c === '{') { if (depth === 0) { start--; break; } depth--; }
+      const sf = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+      const visit = (node: ts.Node): void => {
+        if (ts.isObjectLiteralExpression(node)) {
+          const type = node.properties.find((p) => ts.isPropertyAssignment(p) && nameOf(p.name) === 'type');
+          if (type && ts.isPropertyAssignment(type) && isToolResult(type.initializer)) {
+            literals++;
+            const named = node.properties.some((p) =>
+              (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && nameOf(p.name) === 'toolName');
+            if (!named) missing.push(`${file.slice(src.length)}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`);
+          }
         }
-        let end = start;
-        for (let depth = 0; end < text.length; end++) {
-          if (text[end] === '{') depth++;
-          else if (text[end] === '}' && --depth === 0) break;
-        }
-        if (!/\btoolName\b/.test(text.slice(start, end + 1))) {
-          missing.push(`${file.slice(src.length)}:${text.slice(0, m.index).split('\n').length}`);
-        }
-      }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
     }
     assert.ok(literals > 20, `found ${literals} tool-result literals; the scan has lost them`);
     assert.deepEqual(missing, [], 'tool-result events without toolName');
