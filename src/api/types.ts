@@ -147,7 +147,9 @@ export interface BranchDeleteParams {
 export interface AgentContextParams {
   /** Agent name */
   agentName: string;
-  /** Maximum tokens to include (optional) */
+  /** A hypothetical budget to compile the context at (optional). The compile
+   *  is a dry run: if the context can't be folded to fit, it comes back as
+   *  rendered, larger than the budget. */
   maxTokens?: number;
 }
 

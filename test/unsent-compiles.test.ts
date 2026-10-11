@@ -4,10 +4,10 @@
  * A committing compile commits fold resolutions and queues compression work.
  * Agent-framework also moves the agent's consumed watermark (RFC-006) and
  * settles a prepared budget change at a full compile. With context-manager's
- * thinking binding (#155), a committing compile also commits stamps and joins
- * the branch's compiles awaiting acceptance, where one never sent can fence
- * the replies of a live stream. Previews and the API's message list and
- * context are never sent, so each compiles as a dry run.
+ * thinking binding (context-manager#160), a committing compile also commits
+ * stamps and joins the branch's compiles awaiting acceptance, where one never
+ * sent can fence the replies of a live stream. Previews and the API's message
+ * list and context are never sent, so each compiles as a dry run.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +15,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, type ContextManager } from '@animalabs/context-manager';
+import type { Membrane } from '@animalabs/membrane';
 import { AgentFramework, ApiServer } from '../src/index.js';
+import { Agent } from '../src/agent.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 async function make(agent: Record<string, unknown> = {}) {
@@ -44,14 +46,18 @@ function recordCompiles(cm: ContextManager): boolean[] {
 }
 
 describe('compiles that are never sent', () => {
-  it('a preview is a dry run, with or without gathered injections', async () => {
+  it('a preview is a dry run, with or without gathered injections; a request that is sent is not', async () => {
     const x = await make();
     try {
-      const dry = recordCompiles(x.framework.getAgent('agent')!.getContextManager());
+      const agent = x.framework.getAgent('agent')!;
+      const dry = recordCompiles(agent.getContextManager());
       await x.framework.previewActivation('agent');
       await x.framework.previewActivation('agent', { injections: true });
       await x.framework.previewActivation('agent', { budget: { maxTokens: 50_000, reserveForResponse: 4_000 } });
-      assert.deepEqual(dry, [true, true, true]);
+      // The control: the assembly a sent request goes through (as
+      // startStreamWithInjections calls it) commits.
+      await agent.buildActivationRequest([]);
+      assert.deepEqual(dry, [true, true, true, false]);
     } finally { await x.close(); }
   });
 
@@ -60,9 +66,13 @@ describe('compiles that are never sent', () => {
     try {
       const agent = x.framework.getAgent('agent')!;
       const before = agent.getConsumedWatermark();
-      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'not yet read' }]);
+      const id = agent.getContextManager().addMessage('user', [{ type: 'text', text: 'not yet read' }]);
       await x.framework.previewActivation('agent');
       assert.deepEqual(agent.getConsumedWatermark(), before);
+      // The control: a request that is sent assembled it, so it's read.
+      await agent.buildActivationRequest([]);
+      const sequence = agent.getContextManager().getMessage(id)!.sequence;
+      assert.ok((agent.getConsumedWatermark()?.sequence ?? -1) >= sequence, 'a sent request moves the watermark past what it assembled');
     } finally { await x.close(); }
   });
 
@@ -78,8 +88,8 @@ describe('compiles that are never sent', () => {
       assert.equal(x.framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }).transition, 'converging');
       await x.framework.previewActivation('agent');
       assert.equal(x.framework.getAgentRuntimeSettings('agent').transition, 'converging', 'a preview settles nothing');
-      // The control: a compile that is sent does settle it.
-      await x.framework.getAgent('agent')!.compileWithInjections();
+      // The control: the assembly a sent request goes through settles it.
+      await x.framework.getAgent('agent')!.buildActivationRequest([]);
       assert.equal(x.framework.getAgentRuntimeSettings('agent').transition, 'stable');
     } finally { await x.close(); }
   });
@@ -97,5 +107,25 @@ describe('compiles that are never sent', () => {
       await server.cmdAgentContext({ agentName: 'agent', maxTokens: 50_000 });
       assert.deepEqual(dry, [true, true, true]);
     } finally { await x.close(); }
+  });
+
+  it("a kv-unified preview carries the immutable prefix hash and the dry run together; a sent request carries the hash alone", async () => {
+    const options: unknown[] = [];
+    const cm = {
+      getStrategy: () => ({ isKvUnifiedEnabled: () => true }),
+      setToolDefinitions: () => {},
+      compile: async (_budget: unknown, _injections: unknown, opts: unknown) => {
+        options.push(opts);
+        return { messages: [{ participant: 'user', content: [{ type: 'text', text: 'hello' }] }], systemInjections: [] };
+      },
+    } as unknown as ContextManager;
+    const agent = new Agent({ name: 'resident', model: 'test', systemPrompt: 'system' }, cm, {} as Membrane);
+    await agent.buildActivationRequest([], undefined, undefined, [], { dryRun: true });
+    await agent.buildActivationRequest([]);
+    const [preview, sent] = options as Array<{ kvUnifiedImmutablePrefixHash?: unknown; dryRun?: unknown }>;
+    assert.equal(typeof preview.kvUnifiedImmutablePrefixHash, 'string');
+    assert.equal(preview.dryRun, true);
+    assert.equal(sent.kvUnifiedImmutablePrefixHash, preview.kvUnifiedImmutablePrefixHash, 'both compile against the same prefix');
+    assert.equal(sent.dryRun, undefined);
   });
 });

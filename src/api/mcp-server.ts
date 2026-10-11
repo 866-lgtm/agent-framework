@@ -391,7 +391,9 @@ export class McpServer {
             },
             maxTokens: {
               type: 'number',
-              description: 'Maximum tokens to include (optional)',
+              description:
+                'A hypothetical budget to compile the context at (optional). ' +
+                'If the context cannot be folded to fit it, it comes back as rendered, larger than the budget.',
             },
           },
           required: ['agentName'],

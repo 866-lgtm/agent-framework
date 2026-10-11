@@ -21,7 +21,7 @@ export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
   /** A request that will never be sent (a preview): compile it as a dry
-   *  run, which commits nothing (see `compileWithInjections`). */
+   *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
 }
 
@@ -610,21 +610,28 @@ export class Agent {
   }
 
   /**
-   * Compile the context with injections.
-   * Same as compileContext but forwards injections (e.g. from MCPL servers)
-   * to the context manager so they are merged into the compiled messages.
+   * Compile the context with injections (e.g. from MCPL servers), which the
+   * context manager merges into the compiled messages. Without
+   * `opts.dryRun` it commits as `compileContext` does: the consumed
+   * watermark moves, and a compile at the live window settles a prepared
+   * budget change. With `opts.dryRun`, for a compile that will never be
+   * sent, it does neither (see below).
    */
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
     opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean },
   ): Promise<CompileResult> {
-    // A dry run is a compile that will never be sent: the context manager
-    // commits nothing for it (no fold resolutions, no compression work, and
-    // with thinking binding no stamps and no compile awaiting acceptance),
-    // and nothing here moves either. Nobody read what it assembled, so the
-    // consumed watermark stays, and a prepared budget change waits for the
-    // compile that is sent.
+    // A dry run is a compile that will never be sent. The context manager
+    // persists no fold resolutions for it and queues no compression or merge
+    // work, and with its thinking binding (context-manager#160) it commits no
+    // stamps and adds no compile awaiting acceptance. Context-manager 0.13's
+    // adaptive select still writes its in-memory bookkeeping on a dry run:
+    // it replaces the compile estimate a usage report is calibrated against,
+    // re-arms that calibration sample, and overwrites its transition and
+    // render bookkeeping until the next compile. Here nothing moves: nobody
+    // read what a dry run assembled, so the consumed watermark stays, and a
+    // prepared budget change waits for the compile that is sent.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
     const result = await this.contextManager.compile(
       this.compileBudget(budget), injections, opts as never,

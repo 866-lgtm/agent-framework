@@ -465,8 +465,9 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    // A dry run: listed, never sent, so it commits nothing (fold
-    // resolutions, compression work, thinking-binding stamps).
+    // A dry run: listed, never sent, so it persists no fold resolutions,
+    // queues no compression work and commits no thinking-binding stamps
+    // (see Agent.compileWithInjections for what a dry run still writes).
     const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
@@ -668,9 +669,13 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    // A dry run: shown, never sent, so it commits nothing (fold resolutions,
-    // compression work, thinking-binding stamps), at a hypothetical budget
-    // least of all.
+    // A dry run: shown, never sent, so it persists no fold resolutions,
+    // queues no compression work and commits no thinking-binding stamps, at
+    // a hypothetical budget least of all (see Agent.compileWithInjections
+    // for what a dry run still writes). When the fold plan doesn't fit
+    // `maxTokens`, it returns the context as rendered, larger than asked,
+    // where a committing compile threw: context-manager 0.13 hands back no
+    // over-budget signal with a dry run.
     const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }
