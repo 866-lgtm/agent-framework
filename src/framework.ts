@@ -952,6 +952,50 @@ function truncateReason(reason: string, max = 160): string {
   return reason.length <= max ? reason : reason.slice(0, max) + '…';
 }
 
+/** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
+const THROWN_TEXT_LIMIT = 500;
+
+/**
+ * What a thrown value says, safely and briefly: an Error's message, or any
+ * other value as a string. Reading it can't throw (a value with no string
+ * form, a hostile getter or a revoked Proxy reads as unreadable), and the
+ * text is bounded, since a provider or handler error can carry a whole
+ * request body.
+ */
+function thrownText(error: unknown): string {
+  let text: string;
+  try {
+    text = error instanceof Error ? error.message : String(error);
+  } catch {
+    text = '(a value that could not be read)';
+  }
+  return text.length <= THROWN_TEXT_LIMIT ? text : `${text.slice(0, THROWN_TEXT_LIMIT)}… (${text.length} characters)`;
+}
+
+/** A server's responder, and whether the request it belongs to has been answered yet. */
+type AnswerOnce = {
+  responder: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+  answered: () => boolean;
+};
+
+/**
+ * Wrap a server request's responder so a later failure can tell whether the
+ * handler already answered: a request is answered once, and a handler that
+ * answered and then threw is logged, not answered a second time.
+ */
+function answerOnce<R extends { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void }>(
+  responder: R | undefined,
+): AnswerOnce & { responder: R | undefined } {
+  if (!responder) return { responder: undefined, answered: () => false };
+  let done = false;
+  const wrapped = {
+    ...responder,
+    respond: (result: unknown) => { done = true; responder.respond?.(result); },
+    respondError: (code: number, message: string, data?: unknown) => { done = true; responder.respondError?.(code, message, data); },
+  } as R;
+  return { responder: wrapped, answered: () => done };
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -2357,37 +2401,51 @@ export class AgentFramework {
   }
 
   /**
-   * A server's push or incoming message the host couldn't handle, answered
+   * A server's request or notification the host couldn't handle, answered
    * with a JSON-RPC error when it is a request (a notification has no one to
    * answer, and is logged), rather than thrown out of the connection's
    * listener, where it was an unhandled rejection and the server's request
    * waited for its timeout.
    * - `refused`: the listener turned it away before its handler ran; the
-   *   host is stopping, and none of it was taken.
-   * - `failed`: the handler threw (the host stopped while it ran, or a
-   *   fault; whatever it threw, `undefined` included). The request failed,
-   *   but the handler may have admitted part of it first (an earlier message
-   *   of a batch), so nothing here claims that none of it was taken.
+   *   host is stopping, and none of it was taken. Answered -32000, "the host
+   *   is stopping", the code the push coalescer already gives a stopping
+   *   host: the server can send it again to the host's next run.
+   * - `failed`: the handler threw, whatever it threw, `undefined` included.
+   *   While the host stops (its queue closed), that's answered -32000 too,
+   *   with the handler's own message after the stop wording; on a live host
+   *   it's a fault, answered -32603 with the handler's message. The handler
+   *   may have admitted part of the request first (an earlier message of a
+   *   batch), so nothing here claims that none of it was taken.
+   * A request the handler already answered before it threw isn't answered
+   * again: the failure is logged.
    */
   private refuseServerItem(
     method: string,
     serverId: string,
-    responder: { respondError?: (code: number, message: string) => void } | undefined,
+    answer: AnswerOnce,
     outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
   ): void {
     // Optional chaining: prototype-built harnesses leave the queue unset.
+    const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
+    const what = outcome.kind === 'refused'
+      ? ''
+      : outcome.error instanceof Error
+        ? thrownText(outcome.error)
+        : `the handler failed${outcome.error === undefined ? '' : `: ${thrownText(outcome.error)}`}`;
     const reason = outcome.kind === 'refused'
       ? 'the host is stopping'
-      : this.queue?.isClosed
-        ? 'the host stopped while handling this request'
-        : outcome.error instanceof Error
-          ? outcome.error.message
-          : `the handler failed${outcome.error === undefined ? '' : `: ${String(outcome.error)}`}`;
+      : stopping
+        ? `the host stopped while handling this request (${what})`
+        : what;
+    if (outcome.kind === 'failed' && answer.answered()) {
+      console.error(`[mcpl] ${method} from ${serverId} failed after it was answered: ${reason}`);
+      return;
+    }
     console.error(outcome.kind === 'refused'
       ? `[mcpl] ${method} from ${serverId} refused: ${reason}`
       : `[mcpl] ${method} from ${serverId} failed: ${reason} (part of it may already have been admitted)`);
     try {
-      responder?.respondError?.(-32603, reason);
+      answer.responder?.respondError?.(stopping ? -32000 : -32603, reason);
     } catch {
       // The connection is going too; there is no one left to tell.
     }
@@ -2400,8 +2458,9 @@ export class AgentFramework {
    * learns the framework is stopped — except for a tool's result. A call
    * still running at stop() completes later, into a callback with nothing
    * to catch the throw (an unhandled rejection), and nothing could take its
-   * result anyway: the stream that asked is gone, and the tool has already
-   * run. That result is dropped, and the drop is logged.
+   * result anyway: the queue that would carry it to its stream is closed,
+   * stop() is ending the streams, and the tool has already run. That
+   * result is dropped, and the drop is logged.
    */
   pushEvent(event: ProcessEvent): void {
     if (event.type === 'tool-result' && this.queue?.isClosed) {
@@ -2409,7 +2468,7 @@ export class AgentFramework {
       // may run the tool again): which tool, and whether it succeeded.
       const outcome = event.result.success && !event.result.isError
         ? 'succeeded'
-        : `failed${event.result.error ? `: ${event.result.error}` : ''}`;
+        : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
       console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
       return;
     }
@@ -12380,6 +12439,9 @@ export class AgentFramework {
     ) {
       void this.tuneOutCoordinator
         .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
+        // A rejection is answered with a failed result, as a framework tool's
+        // dispatch failure is (dispatchUtilsToolCall), never left unhandled.
+        .catch((err): ToolResult => ({ success: false, error: thrownText(err), isError: true }))
         .then((result) => {
           // Through pushEvent, like every other tool's result, so one that
           // arrives after stop() is dropped rather than rejected unhandled.
@@ -14340,18 +14402,19 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
+      const answer = answerOnce(responder);
       try {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
         // Checked here, after the barrier and before anything records the
         // push as accepted: a stopped host refuses it.
         if (this.queue?.isClosed) {
-          this.refuseServerItem('push/event', connection.id, responder, { kind: 'refused' });
+          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' });
           return;
         }
-        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+        await this.pushHandler?.handlePushEvent(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('push/event', connection.id, responder, { kind: 'failed', error });
+        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error });
       }
     });
 
@@ -14366,22 +14429,42 @@ export class AgentFramework {
         return;
       }
       if (this.inferenceRouter && responder) {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
-        await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
-          respond: responder.respond,
-          respondError: responder.respondError,
-          requestId: responder.id,
-        });
+        const answer = answerOnce(responder);
+        try {
+          const barrier = this.discordAwarenessBarrier;
+          if (barrier) await barrier.promise;
+          // A stopping host starts no inference for a server: refused, like a
+          // push, before the router runs.
+          if (this.queue?.isClosed) {
+            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' });
+            return;
+          }
+          await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+            respond: answer.responder!.respond,
+            respondError: answer.responder!.respondError,
+            requestId: responder.id,
+          });
+        } catch (error) {
+          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error });
+        }
       }
     });
 
     // Handle channel registration (Step 7)
     connection.on('channels-register', async (
       params: ChannelsRegisterParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+      const answer = answerOnce(responder);
+      try {
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleRegister(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
@@ -14390,9 +14473,18 @@ export class AgentFramework {
     // filtering plus a diagnostic trace.
     connection.on('channels-changed', async (
       params: ChannelsChangedParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
+      const answer = answerOnce(responder);
+      try {
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleChanged(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever
@@ -14453,16 +14545,17 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
+      const answer = answerOnce(responder);
       try {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/incoming', connection.id, responder, { kind: 'refused' });
+          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
           return;
         }
-        await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+        await this.channelRegistry?.handleIncoming(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/incoming', connection.id, responder, { kind: 'failed', error });
+        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error });
       }
     });
 
