@@ -13756,10 +13756,10 @@ export class AgentFramework {
       // it runs as a rejection handler, and an exception there would be an
       // unhandled rejection, which ends the host.
       const report = (handlerError: { error: unknown } | undefined): void => {
+        const primary = handlerError
+          ? handlerError.error
+          : writeFailed ? writeFailure : new Error('the handler tried to answer a second time after its reply');
         try {
-          const primary = handlerError
-            ? handlerError.error
-            : writeFailed ? writeFailure : new Error('the handler tried to answer a second time after its reply');
           const message = describeCause(primary);
           // What the handler's own writes did, before any internal-error
           // reply sent here.
@@ -13799,8 +13799,13 @@ export class AgentFramework {
             ...(responseError === undefined ? [] : ['| the internal-error reply failed too:', responseError]),
           );
         } catch (reportError) {
-          try { console.error(`[mcpl] ${serverId} ${event} handler failed, and reporting it failed too:`, reportError); }
-          catch { /* stderr itself is gone */ }
+          // Strings only: the raw values may be what failed to print.
+          try {
+            console.error(
+              `[mcpl] ${serverId} ${event} handler failed: ${describeCause(primary)}` +
+                ` (and reporting it failed too: ${describeCause(reportError)})`,
+            );
+          } catch { /* stderr itself is gone */ }
         }
       };
       const failed = (error: unknown): void => report({ error });

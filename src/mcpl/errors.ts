@@ -55,9 +55,11 @@ export function describeCause(cause: unknown): string {
 }
 
 /** Text a server or a handler chose, made fit for one log or trace line:
- *  control characters replaced, and cut to `max` code points. */
+ *  control and format characters replaced (C0 and C1 controls, bidi and other
+ *  \p{Cf} characters, and the line and paragraph separators some log readers
+ *  break lines on), and cut to `max` code points. */
 export function boundedForLog(text: string, max = 200): string {
-  const points = [...text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?')];
+  const points = [...text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '?')];
   return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');
 }
 

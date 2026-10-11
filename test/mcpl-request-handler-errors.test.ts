@@ -736,3 +736,30 @@ test('a request for an event nothing on the host listens for is answered -32601'
   const replies = transport.lines.map((line) => JSON.parse(line));
   assert.deepEqual(replies.map((r) => [r.id, r.error?.code, r.error?.message]), [[71, -32601, 'Method not found']]);
 });
+
+test('a value printing cannot handle still leaves a stderr line naming the failure', async (t) => {
+  const { framework, connection } = harness();
+  framework.traceListeners = [];
+  const lines: string[] = [];
+  // Print as console.error does, and keep what it printed.
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map((a) => typeof a === 'string' ? a : inspect(a)).join(' ')); });
+  const hostile = {
+    [inspect.custom]() { throw new Error('inspect refused'); },
+    toString() { return 'the hostile failure'; },
+  };
+  framework.channelRegistry = { async handleRegister() { throw hostile; } };
+  connection.emit('channels-register', {}, responder());
+  await settle();
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /channels-register handler failed: the hostile failure \(and reporting it failed too: inspect refused\)/);
+});
+
+test('log text from a server has control, format and separator characters replaced', (t) => {
+  const { connection, transport, traces } = wireHarness();
+  t.mock.method(console, 'error', () => {});
+  connection.prependListener('channels-list', () => { throw new Error('a\u2028b\u202ec\u0007d'); });
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 81, method: 'channels/list' }));
+  const errors = traces.filter((e) => e.type === 'mcpl:server-error');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].error, /: a\?b\?c\?d$/);
+});
