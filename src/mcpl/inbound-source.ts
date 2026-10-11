@@ -156,13 +156,16 @@ export function conversationKey(source: InboundSource): string | undefined {
 }
 
 /**
- * JSON with object keys sorted at every level, written as the store keeps a
- * value: `undefined` values are dropped, a string is well-formed (the store
- * writes UTF-8, so each lone surrogate comes back as U+FFFD), and an entry
- * whose key isn't well-formed is dropped (the store doesn't keep it). So a
- * value hashes alike however its keys were ordered (content read back from
- * the store has them in a different order than it was written), and alike
- * before and after the store.
+ * JSON with object keys sorted at every level, written as the store's append
+ * keeps a value (its native UTF-8 write, which the real-store digest table
+ * checks): an `undefined` object entry is dropped and an `undefined` array
+ * element is written as `null`, as JSON writes them; a string is
+ * well-formed (each lone surrogate comes back as U+FFFD); and an entry whose
+ * key isn't well-formed is dropped (the store doesn't keep it). So a value
+ * hashes alike however its keys were ordered (content read back from the
+ * store has them in a different order than it was written), and alike
+ * before and after the store. editMessage writes JSON instead, so an edited
+ * copy can keep what an append wouldn't; it has changed anyway.
  *
  * It expects JSON-shaped values, as the MCPL lanes deliver them (parsed from
  * JSON). Any other object is written by its own enumerable entries, unlike
@@ -191,7 +194,10 @@ export function canonicalJson(value: unknown): string {
  * document, audio or video block, comes back as `{ type, source: { type:
  * 'base64', data, mediaType } }` and nothing else, its data re-encoded from
  * the decoded bytes, and an image's media type taken from its bytes'
- * signature where they have one. Any other block comes back as it was given.
+ * signature where they have one. Any other block comes back as it was given,
+ * except a `blob_ref`, which the store resolves to its inline media on read:
+ * it is digested as given here, so a copy holding one doesn't match its
+ * digest (the MCPL lanes never store one).
  */
 function storedBlock(block: unknown): unknown {
   const media = block as { type?: unknown; source?: { type?: unknown; data?: unknown; mediaType?: unknown } } | null;
@@ -252,21 +258,22 @@ function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
  * ContentBlock[] the framework stores for the body — after MCPL conversion,
  * before any host decoration is added and before storage shards it — with
  * each block as the store keeps it (storedBlock, canonicalJson). So a body
- * hashes alike as delivered, as handed to storage, as injected into a live
- * turn, and as read back from the store. The one-element array keeps the
- * framing an undecorated, unsharded stored copy has always hashed to, so a
- * stamped copy and an older copy of the same body share a version.
+ * hashes alike as delivered, as handed to storage, and as read back from
+ * the store. The one-element array keeps the framing an undecorated,
+ * unsharded stored copy has always hashed to, so a stamped copy and an
+ * older copy of the same body share a version.
  *
  * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
  * over exactly the blocks handed to storage (decorations included) as
  * `metadata.storedBodyDigest`, on both MCPL lanes. Both live outside the
  * frozen admission envelope: they describe the body actually delivered (a
  * materialization, a correction), not the admission. Neither proves later
- * presence or completeness; a stored copy that no longer hashes to its
- * storedBodyDigest was changed after delivery (editMessage keeps metadata).
- * Check a copy read back with its blobs resolved (getAllMessages, getMessage,
- * or getMessageWindow without `resolveBlobs: false`): a blob reference never
- * matches.
+ * presence or completeness; an unsharded stored copy that no longer hashes
+ * to its storedBodyDigest was changed after delivery (editMessage keeps
+ * metadata). A body the store shards carries the whole body's two digests
+ * on every shard, and no shard hashes to them. Check a copy read back with
+ * its blobs resolved (getAllMessages, getMessage, or getMessageWindow
+ * without `resolveBlobs: false`): a blob reference never matches.
  *
  * Exported from the package root, so a consumer checks a copy against either
  * field with this same function rather than a copy of it.

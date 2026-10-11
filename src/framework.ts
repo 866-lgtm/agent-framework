@@ -7838,8 +7838,10 @@ export class AgentFramework {
    * (`storedBodyDigest`): the delivered-body digest's function over exactly
    * the blocks handed to storage here — every decoration included, before
    * storage shards them. That function hashes blocks as the store keeps them
-   * (inline media re-encoded and relabeled from its bytes), so the copy read
-   * back hashes to this too. Taken at each storage site, never earlier, because
+   * (inline media re-encoded and relabeled from its bytes), so an unsharded
+   * copy read back hashes to this too. A body the store shards (adaptive
+   * ingress chunking) carries this on every shard, with its metadata, and no
+   * shard hashes to it. Taken at each storage site, never earlier, because
    * a path can still decorate the body after ingestion stamped it (the
    * closed-channel invitation; room-220 #48282). An edit through
    * editMessage keeps metadata but not this hash.
