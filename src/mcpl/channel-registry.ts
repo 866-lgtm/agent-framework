@@ -37,9 +37,9 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
-import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
-import { logValue } from './log-value.js';
+import { logDetail, logValue } from './log-value.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -850,26 +850,32 @@ export class ChannelRegistry {
   }
 
   /**
-   * A coalesced message the host refused. Its sender gets `coalesce_invalid`
-   * in its per-message result, and until now the host said nothing, so a
-   * dropped message (agent-framework#266: every Discord message with a
-   * screenshot) left no trace where operators look. `coalesce-invalid` for a
-   * malformed item (-32602, with the failing field), `coalesce-failed` for
-   * any other error, as the wire answers it: the coalescer itself failed.
+   * A coalesced message the host refused. Until now the host said nothing, so
+   * a dropped message (agent-framework#266: every Discord message with a
+   * screenshot) left no trace where operators look. The sender gets the
+   * per-message result this lane gives: `coalesce_invalid` for a malformed
+   * item, or the thrown error's message for anything else. `answered` is the
+   * code that result stands for (-32602 for `coalesce_invalid`), and the
+   * reason follows it (coalesceRejectionReason): `coalesce-failed` when the
+   * host itself failed, `coalesce-invalid` when the sender's item was
+   * refused, with the failing `field` and the error's message as `detail`.
+   * The line prints the ids the sender sent, whatever their type; the trace
+   * carries them when they are strings.
    */
   private traceCoalesceRejection(
     serverId: string,
     message: { channelId?: unknown; messageId?: unknown } | null | undefined,
-    error: { code?: number; field?: string; message: string },
+    error: { field?: unknown; message: string },
+    answered: number,
   ): void {
-    // As the wire answers it: only a -32602 is the sender's malformed item;
-    // anything else (a plain Error the coalescer threw) is the host's failure.
-    const reason = error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
+    const reason = coalesceRejectionReason(answered);
+    const field = typeof error.field === 'string' && error.field ? error.field : undefined;
     const channelId = typeof message?.channelId === 'string' ? message.channelId : '';
     const messageId = typeof message?.messageId === 'string' && message.messageId ? message.messageId : undefined;
     console.error(
-      `[channel-incoming-rejected] server=${serverId} channel=${logValue(channelId)} messageId=${logValue(messageId ?? '')} ` +
-      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${logValue(error.message)}`,
+      `[channel-incoming-rejected] server=${serverId} channel=${logValue(message?.channelId ?? '')} ` +
+      `messageId=${logValue(message?.messageId ?? '')} ` +
+      `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}`,
     );
     this.emitTraceFn({
       type: 'mcpl:channel-incoming-rejected',
@@ -877,7 +883,7 @@ export class ChannelRegistry {
       channelId,
       ...(messageId ? { messageId } : {}),
       reason,
-      ...(error.field ? { field: error.field } : {}),
+      ...(field ? { field } : {}),
       detail: error.message,
     });
   }
@@ -898,17 +904,20 @@ export class ChannelRegistry {
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
         || typeof message.messageId !== 'string' || !message.messageId) {
-        if (message?.coalesce !== undefined) {
+        // The same gate as admission below: with no coalescer wired, a
+        // message carrying `coalesce` is handled uncoalesced, and refused as
+        // any uncoalesced message without an identity is.
+        const coalescedItem = message?.coalesce !== undefined && !!this.handleCoalescedIncoming;
+        if (coalescedItem) {
           this.traceCoalesceRejection(serverId, message, {
-            code: -32602,
             field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
             message: 'a coalesced message needs a channelId and a messageId',
-          });
+          }, -32602);
         }
         results.push({
           messageId: typeof message?.messageId === 'string' ? message.messageId : '',
           accepted: false,
-          reason: message?.coalesce !== undefined ? 'coalesce_invalid' : 'invalid channel/message identity',
+          reason: coalescedItem ? 'coalesce_invalid' : 'invalid channel/message identity',
         });
         continue;
       }
@@ -940,10 +949,16 @@ export class ChannelRegistry {
       // routable entry rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
+        // Loud, coalesced or not, like every other refusal of a message.
+        console.error(
+          `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
+          `messageId=${logValue(message.messageId)} reason=unknown-channel (not registered, §14.5)`,
+        );
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',
           serverId,
           channelId: message.channelId,
+          messageId: message.messageId,
           reason: 'unknown channel — not registered (§14.5)',
         });
         results.push({
@@ -980,7 +995,8 @@ export class ChannelRegistry {
         } catch (error) {
           if (error instanceof EmptyContentError) rejectEmpty();
           else {
-            this.traceCoalesceRejection(serverId, message, error as Error & { code?: number; field?: string });
+            // Answered coalesce_invalid whatever the error's code: -32602.
+            this.traceCoalesceRejection(serverId, message, error as Error & { field?: string }, -32602);
             results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
           }
           continue;
@@ -1059,7 +1075,9 @@ export class ChannelRegistry {
           results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number; field?: string };
-          this.traceCoalesceRejection(serverId, message, err);
+          // -32602 is answered coalesce_invalid; anything else as its message,
+          // a plain Error standing for an internal error (-32603).
+          this.traceCoalesceRejection(serverId, message, err, typeof err.code === 'number' ? err.code : -32603);
           results.push({
             messageId: message.messageId,
             accepted: false,
@@ -3116,7 +3134,7 @@ export class ChannelRegistry {
       return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
     }
 
-    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
+    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({
       type: 'mcpl:speech-routed',
       conversationId,

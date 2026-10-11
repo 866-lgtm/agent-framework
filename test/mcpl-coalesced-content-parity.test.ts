@@ -90,7 +90,7 @@ test('#266: a malformed coalesced channel item is refused on the wire and named 
   const lines = captureConsoleError(t);
   const rejected: Rejection[] = [];
   f.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
-  const badBlock = { ...f.channel('e1', '', { initial: true }, 'chat', 'bad'), content: [{ type: 'image', mimeType: 'image/png' }] };
+  const badBlock = { ...f.channel('e1', '', { initial: true }, 'chat', 'bad'), content: ['not-a-block'] };
   const noEventId = { ...f.channel('e2', 'no_event_id', { initial: true }, 'chat', 'noid'), eventId: undefined };
   const noMessageId = { ...f.channel('e3', 'no_message_id', { initial: true }, 'chat', 'x'), messageId: undefined };
   const r = await f.send('channels/incoming', { messages: [badBlock, noEventId, noMessageId] });
@@ -113,7 +113,7 @@ test('#266: a malformed coalesced push is a -32602 on the wire and named on the 
   const lines = captureConsoleError(t);
   const rejected: Rejection[] = [];
   f.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
-  const badBlock = { ...f.params('b1', ''), payload: { content: [{ type: 'text' }] } };
+  const badBlock = { ...f.params('b1', ''), payload: { content: ['not-a-block'] } };
   const badKey = f.params('b2', 'text', { key: 'k'.repeat(257) });
   const first = await f.send('push/event', badBlock);
   const second = await f.send('push/event', badKey);
@@ -151,6 +151,162 @@ test('#266: a coalescer failure is traced as the host\'s (coalesce-failed), as t
       { type: 'mcpl:push-event-rejected', reason: 'coalesce-failed', detail: 'coalescer_broke' },
     ],
   );
+  const [channelTrace, pushTrace] = rejected as Array<Rejection & { channelId?: string; featureSet?: string }>;
+  assert.equal(channelTrace.channelId, 'chat', 'the channel trace names its channel');
+  assert.equal(pushTrace.featureSet, 'doc', 'the push trace names its feature set');
+  assert(rejected.every((e) => !('field' in e)), 'a plain Error has no field');
   assert(lines.some((l) => l.includes('[channel-incoming-rejected]') && l.includes('reason=coalesce-failed')));
   assert(lines.some((l) => l.includes('[push-event-rejected]') && l.includes('reason=coalesce-failed')));
+});
+
+test('a push the coalescer can\'t take (-32000, coalescing unavailable) is the host\'s failure on both lanes', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const lines = captureConsoleError(t);
+  const rejected: Array<Rejection & { type: string }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:channel-incoming-rejected' || e.type === 'mcpl:push-event-rejected') rejected.push(e);
+  });
+  (f.framework as unknown as { pushCoalescer: unknown }).pushCoalescer = null;
+  const channel = await f.send('channels/incoming', { messages: [f.channel('c1', 'fine_text', { initial: true }, 'chat', 'fine')] });
+  assert.deepEqual(channel.result.results[0], { messageId: 'fine', accepted: false, reason: 'coalescing unavailable' });
+  const push = await f.send('push/event', f.params('p1', 'fine_push', { initial: true }));
+  assert.equal(push.error?.code, -32000);
+  assert.deepEqual(
+    rejected.map(({ type, reason, field }) => ({ type, reason, field })),
+    [
+      { type: 'mcpl:channel-incoming-rejected', reason: 'coalesce-failed', field: 'coalesce' },
+      { type: 'mcpl:push-event-rejected', reason: 'coalesce-failed', field: 'coalesce' },
+    ],
+  );
+  assert(lines.some((l) => l.startsWith('[push-event-rejected]') && l.includes('reason=coalesce-failed field=coalesce: "coalescing unavailable"')));
+});
+
+test('a channel-scoped push the sender may not make is the sender\'s refusal (coalesce-invalid), as the wire answers it', async (t) => {
+  // -32023: the channel isn't one the server declared.
+  const f = await fixture(); t.after(f.close);
+  const rejected: Rejection[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
+  const unknown = await f.send('push/event', f.params('u1', 'to_nowhere', { initial: true, channelId: 'nope' }));
+  assert.equal(unknown.error?.code, -32023);
+  // -32017: the server has no channels.incoming grant.
+  const g = await fixture({ server: { disabledCapabilities: ['channels.incoming'] } }); t.after(g.close);
+  g.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
+  const denied = await g.send('push/event', g.params('d1', 'not_permitted', { initial: true, channelId: 'chat' }));
+  assert.equal(denied.error?.code, -32017);
+  assert.deepEqual(
+    rejected.map(({ reason, field, eventId }) => ({ reason, field, eventId })),
+    [
+      { reason: 'coalesce-invalid', field: 'coalesce.channelId', eventId: 'u1' },
+      { reason: 'coalesce-invalid', field: 'coalesce.channelId', eventId: 'd1' },
+    ],
+  );
+});
+
+test('a block the converters can\'t render is admitted coalesced exactly as uncoalesced: a placeholder, not a refusal', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const odd = [
+    [{ type: 'video', uri: 'https://example.invalid/v.mp4' }],
+    [{ type: 'mystery' }],
+    [{ type: 'image', mimeType: 'image/png' }],
+  ];
+  const messages = odd.flatMap((content, i) => [
+    { ...f.channel(`e${i}`, '', { initial: true }, 'chat', `coalesced${i}`), content },
+    { channelId: 'chat', messageId: `plain${i}`, timestamp: TS, author: { id: 'u', name: 'User' }, content },
+  ]);
+  const r = await f.send('channels/incoming', { messages });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), messages.map(() => true));
+  for (const [i, content] of odd.entries()) {
+    const push = await f.send('push/event', { ...f.params(`p${i}`, '', { initial: true, key: `doc${i}` }), payload: { content } });
+    assert.equal(push.error, undefined, JSON.stringify(content));
+    assert.equal(push.result.accepted, true);
+  }
+});
+
+test('a render result with a malformed block falls back, and the host names it on a console line', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const lines = captureConsoleError(t);
+  f.renderer(async () => ({ content: [{ type: 'text' }] }));
+  await f.send('push/event', f.params('r1', 'render_fallback', { deferred: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1);
+  assert(f.context().includes('render_fallback'), 'the occurrence\'s own content is delivered');
+  const line = lines.find((l) => l.startsWith('[push-render-failed]'));
+  assert(line, lines.join('\n'));
+  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "CoalesceError: invalid content block" \(the occurrence's own content is delivered instead\)$/);
+});
+
+test('an uncoalesced message without an identity is refused as one, with no coalesce line or trace', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const lines = captureConsoleError(t);
+  const rejected: Rejection[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
+  const plain = { channelId: 'chat', messageId: 'm1', timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'hi' }] };
+  // With no coalescer wired, a message carrying coalesce is handled uncoalesced too.
+  const withoutCoalescer = await fixture(); t.after(withoutCoalescer.close); await withoutCoalescer.register();
+  (withoutCoalescer.framework as unknown as { channelRegistry: { handleCoalescedIncoming: unknown } }).channelRegistry.handleCoalescedIncoming = undefined;
+  withoutCoalescer.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
+
+  const r = await f.send('channels/incoming', { messages: [{ ...plain, channelId: undefined }, { ...plain, messageId: undefined }] });
+  const w = await withoutCoalescer.send('channels/incoming', { messages: [{ ...withoutCoalescer.channel('e1', 'hi', { initial: true }), messageId: undefined }] });
+  assert.deepEqual(
+    [...r.result.results, ...w.result.results].map((x: { reason?: string }) => x.reason),
+    ['invalid channel/message identity', 'invalid channel/message identity', 'invalid channel/message identity'],
+  );
+  assert.deepEqual(rejected, [], 'no coalesce trace');
+  assert(!lines.some((l) => l.includes('coalesce')), lines.join('\n'));
+});
+
+test('a coalesced push without an eventId, or with one that is not a string, is answered and named without throwing', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const lines = captureConsoleError(t);
+  const rejected: Rejection[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
+  const missing = await f.send('push/event', { ...f.params('x', 'no_id', { initial: true }), eventId: undefined });
+  assert.equal(missing.error?.code, -32602);
+  // An object eventId whose toString isn't callable, on the malformed-content
+  // path, where the line is written before the answer.
+  const odd = await f.send('push/event', { ...f.params('x', ''), eventId: { toString: 1 }, payload: { content: ['not-a-block'] } });
+  assert.equal(odd.error?.code, -32602, 'answered');
+  assert.deepEqual(rejected.map(({ eventId, field }) => ({ eventId, field })), [
+    { eventId: '', field: 'eventId' },
+    { eventId: '', field: 'payload.content' },
+  ]);
+  assert(lines.some((l) => l.startsWith('[push-event-rejected] server=editor featureSet=doc eventId="" reason=coalesce-invalid field=eventId:')), lines.join('\n'));
+  assert(lines.some((l) => l.startsWith('[push-event-rejected] server=editor featureSet=doc eventId="{\\"toString\\":1}" reason=coalesce-invalid field=payload.content:')), lines.join('\n'));
+});
+
+test('a message for an unregistered channel is named on the host, coalesced or not, and its trace carries the message id', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const lines = captureConsoleError(t);
+  const rejected: Rejection[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
+  const plain = { channelId: 'nowhere', messageId: 'p1', timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'hi' }] };
+  const r = await f.send('channels/incoming', { messages: [plain, f.channel('e1', 'hi', { initial: true }, 'nowhere', 'c1')] });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [false, false]);
+  assert.deepEqual(rejected.map(({ messageId }) => messageId), ['p1', 'c1']);
+  assert.deepEqual(lines.filter((l) => l.startsWith('[channel-incoming-rejected]')), [
+    '[channel-incoming-rejected] server=editor channel=nowhere messageId=p1 reason=unknown-channel (not registered, §14.5)',
+    '[channel-incoming-rejected] server=editor channel=nowhere messageId=c1 reason=unknown-channel (not registered, §14.5)',
+  ]);
+});
+
+test('the framework\'s empty-content backstops name a module-emitted event\'s ids as one field each', async (t) => {
+  // Events that never crossed the MCPL boundary (here, emitted straight onto
+  // the queue) meet the store/wake backstop instead of the ingress refusal.
+  const f = await fixture(); t.after(f.close);
+  const lines = captureConsoleError(t);
+  const forged = 'x\n[forged] y';
+  f.framework.pushEvent({
+    type: 'mcpl:push-event', serverId: 'editor', featureSet: 'doc', eventId: forged, content: [], timestamp: TS, triggerInference: false,
+  } as never);
+  f.framework.pushEvent({
+    type: 'mcpl:channel-incoming', serverId: 'editor', channelId: forged, messageId: forged,
+    author: { id: 'u', name: 'User' }, content: [], timestamp: TS, triggerInference: false,
+  } as never);
+  await f.framework.runUntilIdle();
+  const shown = '"x\\n[forged]\\u0020y"';
+  assert.deepEqual(lines.filter((l) => l.includes('-dropped]')).sort(), [
+    `[channel-incoming-dropped] server=editor channel=${shown} messageId=${shown} reason=empty-content`,
+    `[push-event-dropped] server=editor eventId=${shown} reason=empty-content`,
+  ], lines.join('\n'));
 });

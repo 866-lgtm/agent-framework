@@ -218,9 +218,12 @@ export type TraceEvent =
       source: string;
     })
   /** A push/event refused at the MCPL boundary: visibly-empty content, or a
-   *  coalesced occurrence the host refused (`coalesce-invalid`, with the
-   *  failing `field` and why in `detail`; `coalesce-failed` when the
-   *  coalescer itself failed). */
+   *  coalesced occurrence the host refused. Its reason follows the code the
+   *  producer was answered with: `coalesce-invalid` when the occurrence was
+   *  the producer's to fix (-32602 malformed; -32017 or -32023 for a channel
+   *  not permitted or not registered), `coalesce-failed` when the host itself
+   *  failed (-32000, -32603), each with the failing `field` and the error's
+   *  message in `detail`. A missing `eventId` is traced as `''`. */
   | (TraceEventBase & {
       type: 'mcpl:push-event-rejected';
       serverId: string;
@@ -233,7 +236,9 @@ export type TraceEvent =
   /** A channels/incoming message refused at the MCPL boundary: unregistered
    *  channel (§14.5), visibly-empty content, or a coalesced item the host
    *  refused (`coalesce-invalid` / `coalesce-failed`, with `field` and
-   *  `detail` as for a push). `messageId` is set once the message has one. */
+   *  `detail` as for a push; `coalesce-invalid` is the per-message
+   *  `coalesce_invalid` result). `messageId` is set whenever the message
+   *  carries one. */
   | (TraceEventBase & {
       type: 'mcpl:channel-incoming-rejected';
       serverId: string;

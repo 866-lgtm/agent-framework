@@ -18,9 +18,9 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
-import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './visible-content.js';
-import { logValue } from './log-value.js';
+import { logDetail, logValue } from './log-value.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -244,9 +244,10 @@ export class PushHandler {
         validateCoalescedContent(params.payload?.content, { allowEmpty: emptyAllowed });
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
+        const code = err.code ?? -32602;
         if (err instanceof EmptyContentError) this.traceEmptyRejection(serverId, params);
-        else this.traceCoalesceRejection(serverId, params, err);
-        if (responder?.respondError) responder.respondError(err.code ?? -32602, err.message, { field: err.field });
+        else this.traceCoalesceRejection(serverId, params, err, code);
+        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
         else responder?.respond({ accepted: false, reason: err instanceof EmptyContentError ? err.reason : err.message });
         return;
       }
@@ -316,8 +317,9 @@ export class PushHandler {
         responder?.respond(result);
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
-        this.traceCoalesceRejection(serverId, params, err);
-        if (responder?.respondError) responder.respondError(typeof err.code === 'number' ? err.code : -32603, err.message, { field: err.field });
+        const code = typeof err.code === 'number' ? err.code : -32603;
+        this.traceCoalesceRejection(serverId, params, err, code);
+        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
         else responder?.respond({ accepted: false, reason: err.message });
       }
       return;
@@ -340,25 +342,33 @@ export class PushHandler {
    * A coalesced occurrence the host refused, as loud as every other push
    * rejection: its producer is told on the wire, and until now the host said
    * nothing, so a dropped message left no trace where operators look
-   * (agent-framework#266). `coalesce-invalid` for a malformed occurrence
-   * (-32602, with the failing field), `coalesce-failed` for any other error,
-   * as the wire answers it: the coalescer itself failed.
+   * (agent-framework#266). The producer gets the wire answer this lane gives
+   * (`answered`): the thrown error's code and message, or -32602 for a
+   * malformed occurrence without one. The reason follows that answer
+   * (coalesceRejectionReason): `coalesce-failed` when the host itself failed,
+   * `coalesce-invalid` when the producer's occurrence was refused, with the
+   * failing `field` and the error's message as `detail`. A missing eventId
+   * prints as `""` and traces as `''`, as the channel lane's missing id does.
    */
-  private traceCoalesceRejection(serverId: string, params: PushEventParams, error: { code?: number; field?: string; message: string }): void {
-    // As the wire answers it: only a -32602 is the producer's malformed
-    // occurrence; anything else (-32603 for a plain Error) is the host's.
-    const reason = error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
+  private traceCoalesceRejection(
+    serverId: string,
+    params: PushEventParams,
+    error: { field?: unknown; message: string },
+    answered: number,
+  ): void {
+    const reason = coalesceRejectionReason(answered);
+    const field = typeof error.field === 'string' && error.field ? error.field : undefined;
     console.error(
-      `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet)} eventId=${logValue(params.eventId)} ` +
-      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${logValue(error.message)}`,
+      `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet ?? '')} eventId=${logValue(params.eventId ?? '')} ` +
+      `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}`,
     );
     this.emitTraceFn({
       type: 'mcpl:push-event-rejected',
       serverId,
-      eventId: params.eventId,
+      eventId: typeof params.eventId === 'string' ? params.eventId : '',
       featureSet: params.featureSet,
       reason,
-      ...(error.field ? { field: error.field } : {}),
+      ...(field ? { field } : {}),
       detail: error.message,
     });
   }

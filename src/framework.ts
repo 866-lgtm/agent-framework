@@ -65,6 +65,7 @@ import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reaction
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
+import { logDetail, logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -7100,7 +7101,7 @@ export class AgentFramework {
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
     if (isVisiblyEmptyContent(event.content)) {
-      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${event.channelId} messageId=${event.messageId} reason=empty-content`);
+      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${logValue(event.channelId)} messageId=${logValue(event.messageId)} reason=empty-content`);
       this.emitTrace({
         type: 'mcpl:empty-content-dropped', lane: 'channel', serverId: event.serverId,
         channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
@@ -7642,7 +7643,19 @@ export class AgentFramework {
         if (!server?.isConnected) throw new Error('server disconnected');
         return server.sendPushRender(params);
       },
-      audit: (record) => this.emitTrace({ type: 'mcpl:coalescing', ...record }),
+      audit: (record) => {
+        // A render result the host refused falls back to the occurrence's own
+        // content; say so on the host, with the server, the subject and the
+        // failing field, not only in the trace.
+        if (record.kind === 'render-failed') {
+          console.error(
+            `[push-render-failed] server=${logValue(record.serverId ?? '')} subject=${logValue(record.subject ?? '')} ` +
+            `eventId=${logValue(record.eventId ?? '')}${record.field !== undefined ? ` field=${logValue(record.field)}` : ''}: ` +
+            `${logDetail(record.error ?? '')} (the occurrence's own content is delivered instead)`,
+          );
+        }
+        this.emitTrace({ type: 'mcpl:coalescing', ...record });
+      },
       save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
       recordReceipt: (record) => {
         // Written now, not at the throttled flush: an acknowledged acceptance
@@ -8058,7 +8071,7 @@ export class AgentFramework {
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
       return true;
     } catch (err) {
-      console.error(`[coalescing] could not remove unread message ${p.messageId} for ${agent.name}:`, err);
+      console.error(`[coalescing] could not remove unread message ${logValue(p.messageId)} for ${agent.name}:`, err);
       return false;
     }
   }
@@ -8073,7 +8086,7 @@ export class AgentFramework {
     // model would wake to `[Continue]` or an older message re-presented as
     // the newest, a wake with no visible cause.
     if (isVisiblyEmptyContent(event.content) && !isSilentHeartbeatMarker(event)) {
-      console.error(`[push-event-dropped] server=${event.serverId} eventId=${event.eventId} reason=empty-content`);
+      console.error(`[push-event-dropped] server=${event.serverId} eventId=${logValue(event.eventId ?? '')} reason=empty-content`);
       this.emitTrace({ type: 'mcpl:empty-content-dropped', lane: 'push', serverId: event.serverId, eventId: event.eventId });
       return undefined;
     }

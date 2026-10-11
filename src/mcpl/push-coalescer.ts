@@ -37,6 +37,18 @@ export class CoalesceError extends Error {
   }
 }
 
+/**
+ * How the host names a coalesce rejection, from the code the wire answered
+ * with. `coalesce-failed` is the host's own failure: -32000 (coalescing
+ * unavailable, the host stopping, or an acceptance it couldn't make durable)
+ * and -32603 (an internal error). `coalesce-invalid` is every other answer,
+ * the sender's: -32602 for a malformed item, -32017 or -32023 for a channel
+ * that isn't permitted or isn't registered.
+ */
+export function coalesceRejectionReason(answered: number): 'coalesce-failed' | 'coalesce-invalid' {
+  return answered === -32000 || answered === -32603 ? 'coalesce-failed' : 'coalesce-invalid';
+}
+
 /** Content with nothing model-visible (see visible-content.ts): -32602. */
 export class EmptyContentError extends CoalesceError {
   readonly reason = 'empty-content';
@@ -231,13 +243,17 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
 /**
  * Validate wire content before it is stored, rendered or converted.
  *
- * Its shape only: an array of well-formed blocks. A coalesced occurrence is
- * delivered into context exactly as an uncoalesced message is (the coalescer
- * only remembers where it landed), so it meets the same rules, and the
- * uncoalesced path sets no byte budget on content. An inline image is admitted
- * here as it is there (agent-framework#266: a 1 MiB serialized-content budget
- * here dropped every coalesced message carrying a screenshot). A render result
- * gets the same checks, as RFC-006 §5.2 asks.
+ * Its shape and its visible emptiness, nothing else. An incoming coalesced
+ * occurrence is delivered into context exactly as an uncoalesced message is
+ * (the coalescer only remembers where it landed), so it meets the same rules:
+ * an array of objects, which the converters turn into blocks, a block they
+ * can't render (a video, an unknown type, an image with neither uri nor data)
+ * becoming a placeholder there as here. Nor does the uncoalesced path set a
+ * byte budget on content: an inline image is admitted here as it is there
+ * (agent-framework#266: a 1 MiB serialized-content budget here dropped every
+ * coalesced message carrying a screenshot). A render result, which the host
+ * delivers in the occurrence's place, also gets each block's shape checked
+ * (`checkBlockShapes`), as RFC-006 §5.2 asks.
  *
  * Visibly-empty content is refused unless `allowEmpty`: an admitted
  * occurrence with nothing to show would wake the model with no visible cause.
@@ -247,11 +263,12 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  */
 export function validateCoalescedContent(
   content: unknown,
-  options: { allowEmpty?: boolean } = {},
+  options: { allowEmpty?: boolean; checkBlockShapes?: boolean } = {},
 ): asserts content is McplContentBlock[] {
   if (!Array.isArray(content)) throw new CoalesceError('payload.content', 'content must be an array');
   for (const b of content as Array<Record<string, unknown>>) {
     if (!b || typeof b !== 'object' || Array.isArray(b)) throw new CoalesceError('payload.content', 'invalid content block');
+    if (!options.checkBlockShapes) continue;
     if (b.type === 'text' && typeof b.text === 'string') continue;
     if (b.type === 'resource' && typeof b.uri === 'string') continue;
     if ((b.type === 'image' || b.type === 'audio')
@@ -705,14 +722,24 @@ export class PushCoalescer<E = unknown> {
       try {
         const result = await this.host.render(occurrence, params);
         if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); }
-        // §5.2: an empty result is legitimate ("nothing happened").
-        else validateCoalescedContent(result?.content, { allowEmpty: true });
+        // §5.2: an empty result is legitimate ("nothing happened"); each
+        // block must be well formed.
+        else validateCoalescedContent(result?.content, { allowEmpty: true, checkBlockShapes: true });
         if (rendering.cancelled) throw new CancelledRender();
         content = result.content;
         timestamp = typeof result.timestamp === 'string' ? result.timestamp : new Date().toISOString();
         source = 'render';
       } catch (error) {
-        if (!(error instanceof CancelledRender)) this.host.audit({ kind: 'render-failed', subject, eventId: occurrence.eventId, error: String(error) });
+        if (!(error instanceof CancelledRender)) {
+          // The occurrence's own content is delivered instead; the host names
+          // the failure where operators look (a console line, not only this
+          // audit record).
+          this.host.audit({
+            kind: 'render-failed', subject, serverId: occurrence.serverId, eventId: occurrence.eventId,
+            ...(error instanceof CoalesceError ? { field: error.field } : {}),
+            error: String(error),
+          });
+        }
       } finally {
         const left = (this.rendersInFlight.get(occurrence.serverId) ?? 1) - 1;
         if (left > 0) this.rendersInFlight.set(occurrence.serverId, left); else this.rendersInFlight.delete(occurrence.serverId);
