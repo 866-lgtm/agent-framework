@@ -903,6 +903,7 @@ export async function pushPaths(
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
       const blob = store.getBlob(s.hash);
       if (blob) plans.push({ path, kind: 'write', blob, hash: s.hash, prior: priorP, before: p, expect });
+      else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
       continue;
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
@@ -949,8 +950,12 @@ export async function pushPaths(
         reason: noEvidence
           ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
             'sync this path to adopt the disk version, or materialize this path with force to overwrite it'
-          : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
-            'sync this path to adopt the disk version, or pass force to overwrite it',
+          : kind === 'interrupted'
+            ? 'disk holds bytes that match neither what was being written there nor what disk last agreed with ' +
+              '(conflict: interrupted), as a write that failed or was cut off partway leaves — check the file, then ' +
+              'pass force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
+            : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
+              'sync this path to adopt the disk version, or pass force to overwrite it',
       });
       continue;
     }

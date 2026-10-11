@@ -1632,6 +1632,37 @@ describe('the mount boundary', () => {
     assert.equal(env.readDisk('a.txt'), 'a new disk edit', 'and so is the file now at the path');
   });
 
+  test("a forced push of a stale path whose workspace copy is missing from the store says so", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    env.writeDisk('a.txt', 'v2, from the shell'); // S = P, D changed: a forced push would overwrite it
+    await env.shutdown(m);
+    rmSync(join(env.storePath, 'blobs', sha('v1').slice(0, 2), sha('v1'))); // the store lost the workspace copy
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open();
+    const data = await call(m, 'materialize', { path: 'work/a.txt', force: true });
+    assert.match(JSON.stringify(data), /the workspace copy is missing from the store/, `reported, not dropped: ${JSON.stringify(data)}`);
+    assert.equal(env.readDisk('a.txt'), 'v2, from the shell');
+  });
+
+  test("an interrupted path's refusal says what disk may hold, and that force writes the workspace copy", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    await call(m, 'write', { path: 'work/a.txt', content: 'v2' });
+    m = await env.fault(m, 'materialize', 'after-intent');
+    env.writeDisk('a.txt', 'v2, cut off'); // neither what was being written nor what disk agreed with
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.kind, 'interrupted');
+    const data = await call(m, 'materialize', {});
+    const skip = JSON.stringify(data);
+    assert.match(skip, /match neither what was being written there nor what disk last agreed with/);
+    assert.match(skip, /pass force to write the workspace copy over it/);
+    assert.equal(env.readDisk('a.txt'), 'v2, cut off');
+    await call(m, 'materialize', { force: true });
+    assert.equal(env.readDisk('a.txt'), 'v2');
+  });
+
   test('a refused write puts back whatever evidence the path had, an interrupted one included', async (t) => {
     const env = new Env(t);
     const m = await env.open();
