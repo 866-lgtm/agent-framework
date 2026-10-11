@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent, ConversationRouterConfig, TraceEvent } from '../src/index.js';
+import { OpenAIResponsesFormatter } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function incomingEvent(overrides: {
@@ -279,6 +280,96 @@ describe('Conversation routing', () => {
       && JSON.stringify(m.content).includes('Checked the logs.')), "the reply keeps its text, under the fork's name");
     assert.ok(seeded.every((m) => m.content.length > 0), 'the thinking-only message is left out, not stored empty');
 
+    await framework.stop();
+  });
+
+  /** Spawn the fork for `slack:D3` and return what its namespace was seeded with. */
+  async function seedOf(framework: AgentFramework) {
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    return framework.getAgent('conversation-slack-D3-g1')!.getContextManager().getAllMessages();
+  }
+
+  it("a seed that ends on a completed tool round keeps the round, without its thinking", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'check the logs' }]);
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'the logs first', signature: 'sig-round' },
+      { type: 'tool_use', id: 'toolu_logs', name: 'read_logs', input: {} },
+    ] as never);
+    trunk.addMessage('user', [{ type: 'tool_result', toolUseId: 'toolu_logs', content: 'all quiet' }] as never);
+
+    const seeded = await seedOf(framework);
+    const contents = seeded.map((m) => m.content);
+    const round = contents.findIndex((c) => c.some((b) => b.type === 'tool_use'));
+    assert.ok(round >= 0, 'the round is in the seed');
+    assert.deepEqual(contents[round]!.map((b) => b.type), ['tool_use'], 'its call stays, its thinking goes');
+    assert.equal(seeded[round]!.participant, 'conversation-slack-D3-g1');
+    assert.deepEqual(contents[round + 1]!.map((b) => b.type), ['tool_result'], 'its result follows it');
+    await framework.stop();
+  });
+
+  it("a seed never ends on a call whose result hasn't been stored", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'check the logs' }]);
+    trunk.addMessage('trunk', [{ type: 'text', text: 'Looking.' }]);
+    // A tool round's assistant row, stored before its results (the spawn can
+    // land between the two when the coalescer spawns outside the event loop).
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'mid-round', signature: 'sig-mid' },
+      { type: 'tool_use', id: 'toolu_pending', name: 'read_logs', input: {} },
+    ] as never);
+
+    const seeded = await seedOf(framework);
+    const types = seeded.flatMap((m) => m.content.map((b) => b.type));
+    assert.ok(!types.includes('tool_use'), `no unanswered call in the seed: ${types}`);
+    // The seed is everything before the fork's own first message ('hi').
+    const firstOwn = seeded.findIndex((m) => JSON.stringify(m.content).includes('"hi"'));
+    assert.ok(firstOwn > 0, 'the incoming message follows the seed');
+    assert.ok(JSON.stringify(seeded[firstOwn - 1]!.content).includes('Looking.'), 'the seed ends on the last complete exchange');
+    await framework.stop();
+  });
+
+  it("a Responses seed replays no item paired with the reasoning it left out; opaque carriers stay whole", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    const reasoning = { type: 'reasoning', id: 'rs_1', encrypted_content: 'enc', summary: [] };
+    const compaction = { type: 'compaction', id: 'cmp_1', encrypted_content: 'earlier history' };
+    trunk.addMessage('user', [{ type: 'text', text: 'what changed?' }]);
+    trunk.addMessage('trunk', [
+      { type: 'text', text: '', rawItem: compaction },
+      { type: 'redacted_thinking', data: 'enc', rawItem: reasoning },
+      { type: 'text', text: 'The config.', rawItem: { type: 'message', id: 'msg_1', role: 'assistant', content: [{ type: 'output_text', text: 'The config.' }] } },
+      { type: 'tool_use', id: 'call_1', name: 'read_config', input: {}, rawItem: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'read_config', arguments: '{}' } },
+    ] as never);
+    trunk.addMessage('user', [{ type: 'tool_result', toolUseId: 'call_1', content: 'ok' }] as never);
+    // A Responses reply with no reasoning item: nothing it was paired with is
+    // left out, so it replays as it was.
+    trunk.addMessage('trunk', [
+      { type: 'text', text: 'Read it.', rawItem: { type: 'message', id: 'msg_2', role: 'assistant', content: [{ type: 'output_text', text: 'Read it.' }] } },
+    ] as never);
+    // An Anthropic reply in the same history: its thinking carries no raw item.
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'plain', signature: 'sig-plain' },
+      { type: 'text', text: 'Done.' },
+    ] as never);
+
+    const seeded = await seedOf(framework);
+    const items = new OpenAIResponsesFormatter().buildMessages(
+      seeded.map((m) => ({ participant: m.participant, content: m.content })),
+      { participantMode: 'simple', assistantParticipant: 'conversation-slack-D3-g1', humanParticipant: 'user', systemPrompt: 'fork' } as never,
+    ).messages as unknown as Array<Record<string, unknown>>;
+    const ids = items.map((item) => item.id).filter((id) => id !== undefined);
+    assert.deepEqual(ids, ['cmp_1', 'msg_2'], `only the opaque carrier and the unpaired reply replay by id: ${JSON.stringify(items)}`);
+    assert.ok(items.some((item) => item.type === 'function_call' && item.call_id === 'call_1'), 'the call renders from its fields');
+    assert.ok(items.some((item) => item.type === 'message' && JSON.stringify(item.content).includes('The config.')), 'the text renders from its fields');
+    const plain = seeded.find((m) => JSON.stringify(m.content).includes('Done.'))!;
+    assert.deepEqual(plain.content.map((b) => b.type), ['text'], "an Anthropic reply loses only its thinking");
     await framework.stop();
   });
 

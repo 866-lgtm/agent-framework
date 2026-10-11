@@ -528,16 +528,57 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  *  `thinking` and `redacted_thinking` blocks: a fork inherits the template's
  *  conversation, not its reasoning. A signed block was minted under the
  *  template's prefix, which the fork's doesn't promise to match; unsigned
- *  reasoning (text-only providers, XML mode) goes by the same rule. A
- *  message with no content left, whether the filter emptied it or it was
- *  already empty, is left out, since a request can't carry an empty message;
- *  any other message is kept as it was. */
+ *  reasoning (text-only providers, XML mode) goes by the same rule. On the
+ *  OpenAI Responses path a removed block also carried the reasoning item
+ *  (`rawItem`) the message's other items were paired with by id, so those
+ *  lose their `rawItem` and render from their fields, without ids; an opaque
+ *  carrier (a text block whose raw item isn't a `message`, such as a
+ *  compaction) keeps it, since the raw item is its whole content. A message
+ *  with no content left, whether the filter emptied it or it was already
+ *  empty, is left out, since a request can't carry an empty message; any
+ *  other message is kept as it was. */
 function withoutThinking<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
   const out: M[] = [];
   for (const message of messages) {
-    const content = message.content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+    const isThinking = (b: ContentBlock) => b.type === 'thinking' || b.type === 'redacted_thinking';
+    let content: ContentBlock[] = message.content.filter((b) => !isThinking(b));
+    const pairedReasoningRemoved = message.content.some((b) => isThinking(b) && rawItemOf(b) !== undefined);
+    if (pairedReasoningRemoved) content = content.map(releasePairedRawItem);
     if (content.length === 0) continue;
-    out.push(content.length === message.content.length ? message : { ...message, content });
+    out.push(content.length === message.content.length && !pairedReasoningRemoved ? message : { ...message, content });
+  }
+  return out;
+}
+
+function rawItemOf(block: ContentBlock): unknown {
+  return (block as { rawItem?: unknown }).rawItem;
+}
+
+/** A block without the provider-native item it was parsed from, unless that
+ *  item is the block's whole content: an opaque carrier, a text block whose
+ *  raw item isn't a `message` item (membrane keeps compaction and other items
+ *  it has no block for that way). */
+function releasePairedRawItem(block: ContentBlock): ContentBlock {
+  const raw = rawItemOf(block);
+  if (raw === undefined) return block;
+  const rawType = typeof raw === 'object' && raw !== null ? (raw as { type?: unknown }).type : undefined;
+  if (block.type === 'text' && rawType !== 'message') return block;
+  const { rawItem: _released, ...rest } = block as ContentBlock & { rawItem?: unknown };
+  return rest as ContentBlock;
+}
+
+/** A seed without a trailing message that calls a tool whose result never
+ *  follows it: one spawned while the template is between a round's
+ *  `tool_use` row and its results (the coalescer can spawn a fork outside
+ *  the event loop) would otherwise give the fork's first request an
+ *  unanswered call. The adaptive strategy already drops such a row from its
+ *  compile; the passthrough strategies don't. */
+function withoutUnansweredToolUse<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
+  const out = [...messages];
+  while (out.length > 0) {
+    const last = out[out.length - 1]!.content;
+    if (!last.some((b) => b.type === 'tool_use') || last.some((b) => b.type === 'tool_result')) break;
+    out.pop();
   }
   return out;
 }
@@ -7421,14 +7462,19 @@ export class AgentFramework {
       // throwing, so a template whose context doesn't fit the budget compiled
       // here (context-manager's default: none is passed) seeds the fork
       // instead of failing the spawn; the fork's own compiles meet its window.
-      // The seed leaves out the template's thinking: a signed block verifies
-      // only while everything before it is what it was minted under, and a
-      // fork's system, tools and scoped injections don't promise that, while
-      // its own namespace holds no stamps that could vouch for the copies.
+      // The seed leaves out the template's thinking (withoutThinking): a
+      // signed block verifies only while everything before it is what it was
+      // minted under, and a fork's system, tools and scoped injections don't
+      // promise that, while its own namespace holds no stamps that could
+      // vouch for the copies. Models that don't bind thinking to its prefix
+      // would have kept it, so there the fork loses the template's reasoning,
+      // as context-manager#160 renders no unstamped thinking. Nor does the
+      // seed end on a call whose result never follows it
+      // (withoutUnansweredToolUse).
       const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
       if (existing.length === 0) {
         const { messages: compiled } = await template.getContextManager().compile(undefined, undefined, { dryRun: true });
-        for (const msg of withoutThinking(compiled)) {
+        for (const msg of withoutUnansweredToolUse(withoutThinking(compiled))) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
         }

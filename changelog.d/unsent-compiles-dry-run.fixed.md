@@ -30,4 +30,15 @@
   account that enforces thinking binding the fork's first request could be
   refused (inferred from probes of other requests, not observed on a fork).
   Unsigned reasoning, from text-only providers or XML mode, goes by the same
-  rule.
+  rule. On models that don't bind thinking to its prefix (by probes, Fable 5
+  and Sonnet 5), the fork loses the template's reasoning, as
+  context-manager#160 renders no unstamped thinking.
+- On the OpenAI Responses path, the seed's items that were paired with a
+  reasoning item it left out (the message's text, a function call) lose
+  their provider-native raw item and render from their fields, so the fork
+  replays no item id whose reasoning is gone. Opaque items, such as a
+  compaction, keep theirs.
+- A fork's seed no longer ends on a call whose result was never stored. A
+  fork spawned while the template was between a tool round's call and its
+  results (the coalescer can spawn one outside the event loop) gave the
+  fork's first request an unanswered call under the passthrough strategies.
