@@ -721,7 +721,7 @@ async function compressionRig() {
   const guard = new ToolResultGuard('Claude', cm, true);
   const REAL = 'REAL-ACCEPTED-TOOL-OUTPUT';
   const content: ContentBlock[] = [{ type: 'tool_result', toolUseId: 'tu-1', content: REAL }];
-  const messageId = guard.storeResults(content, [{ toolUseId: 'tu-1', content: REAL }], []);
+  const messageId = guard.storeResults(content, [{ toolUseId: 'tu-1', content: REAL }], [], undefined, undefined);
   // Deferred messages flushed right behind the staged batch push it out of
   // the protected tail.
   for (let i = 0; i < 6; i++) cm.addMessage(i % 2 === 0 ? 'Claude' : 'User', [{ type: 'text', text: filler(30) }]);
@@ -2041,7 +2041,7 @@ test('#281: an annotation that starts while modules stop writes no file, and is 
   h.module.stop = async () => {
     // A settlement during shutdown, as a direct-API call that stop doesn't cancel can make.
     agent.toolResultGuard.storeResults([{ type: 'tool_result', toolUseId: 'late', content: 'late-original' }],
-      [{ toolUseId: 'late', content: 'late-original' }], []);
+      [{ toolUseId: 'late', content: 'late-original' }], [], undefined, undefined);
     agent.toolResultGuard.abandon('stopping');
     await stopModule();
   };
@@ -2132,12 +2132,26 @@ test('#277: a result keeps the fields its tool marked, in the order marked, cut 
     { success: true, data: 'text', keepWhenWithheld: ['length'] },
     { success: true, data: [{ path: 'a' }], keepWhenWithheld: ['0'] },
     { success: false, isError: true, error: 'failed', data: { path: 'work/a.txt' }, keepWhenWithheld: ['path'] },
-  ]) assert.equal(keptWhenWithheld(result, undefined), undefined, `keeps nothing: ${JSON.stringify(result)}`);
+    // A failure is success false, whatever isError says.
+    { success: false, isError: false, error: 'failed', data: { path: 'work/a.txt' }, keepWhenWithheld: ['path'] },
+    // No data at all, with marks.
+    { success: true, data: null, keepWhenWithheld: ['path'] },
+    { success: true, keepWhenWithheld: ['path'] },
+  ]) assert.equal(keptWhenWithheld(result as never, undefined), undefined, `keeps nothing: ${JSON.stringify(result)}`);
   const long = { written: Array.from({ length: 200 }, (_, i) => `file-${i}.txt`) };
   const cut = keptWhenWithheld({ success: true, data: long, keepWhenWithheld: ['written'] }, 1000)!;
   const whole = JSON.stringify(long);
   assert.ok(whole.length > 1000);
-  assert.equal(cut, `${whole.slice(0, 1000)}\n\n[truncated — original was ${whole.length} chars]`);
+  // The note says what was cut and where the rest is, not "original was N",
+  // which would read as the whole result's size.
+  assert.equal(cut, `${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ${whole.length} characters; ` +
+    'the whole result is where this note says]');
+  // A cut never leaves half a surrogate pair.
+  // '{"name":"' is 9 characters and each emoji 2, so a cap of 14 falls inside the third.
+  const emoji = keptWhenWithheld({ success: true, data: { name: '\u{1F600}'.repeat(10) }, keepWhenWithheld: ['name'] }, 14)!;
+  const loneSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+  assert.doesNotMatch(emoji, loneSurrogate, `well-formed: ${JSON.stringify(emoji)}`);
+  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut at the inline cap: 13 of these fields' 31 characters;/u);
 });
 
 test('#277: a withheld batch keeps what each marked result listed; an unmarked one keeps nothing, and its file has everything', async () => {
@@ -2171,7 +2185,8 @@ test('#277: with no writable workspace the stub still keeps the file lists, cut 
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)}\n\n[truncated — original was ${whole.length} chars]`);
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
   } finally { await h.framework.stop(); }
 });
 
@@ -2194,7 +2209,25 @@ test('#277: direct API: a withheld result keeps its file lists, cut at the house
     const whole = JSON.stringify({ written });
     assert.ok(whole.length > DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)}` +
-      `\n\n[truncated — original was ${whole.length} chars]`);
+      ` [cut at the inline cap: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
+      'the whole result is where this note says]');
+  } finally { await h.framework.stop(); }
+});
+
+test('#283: a withheld materialize keeps the deletions it made; sync keeps a root it accepted ahead of its results', async () => {
+  const h = await workspaceHarness([[toolUse('m', 'workspace--materialize', { applyDeletions: true }), refused()], [answer()]]);
+  const call = (name: string, input: Record<string, unknown> = {}) => h.workspace.handleToolCall({ id: name, name, input } as never);
+  try {
+    // A file on disk that the workspace then deletes: the agent's materialize removes it.
+    assert.equal((await h.workspace.writeBinary('work/old.txt', Buffer.from('old'), 'text/plain')).success, true);
+    assert.equal((await call('materialize')).success, true);
+    assert.equal((await call('delete', { path: 'work/old.txt' })).success, true);
+    await h.run();
+    const [materialize] = toolResults(h.framework).map((block) => String(block.content));
+    assert.deepEqual(keptLists(materialize), { deleted: [{ mount: 'work', path: 'old.txt' }], materialized: [] }, materialize);
+    // sync marks a root it accepted first, so a long results list can't cut it away.
+    const synced = await call('sync');
+    assert.deepEqual(synced.keepWhenWithheld, ['rootsAccepted', 'results']);
   } finally { await h.framework.stop(); }
 });
 

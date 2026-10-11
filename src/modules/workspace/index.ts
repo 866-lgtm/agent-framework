@@ -2824,7 +2824,9 @@ export class WorkspaceModule implements Module {
       // conflict, per mount, and any root it accepted: kept in the stub if
       // the guard withholds the result (agent-framework #277). What the scan
       // skipped or couldn't see is in the full result.
-      keepWhenWithheld: ['results', 'rootsAccepted'],
+      // A root it accepted is short and telling: first, so a long results
+      // list can't cut it away.
+      keepWhenWithheld: ['rootsAccepted', 'results'],
     };
   }
 

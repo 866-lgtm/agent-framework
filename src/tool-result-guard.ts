@@ -5,6 +5,7 @@ import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/mem
 import type { CompletedToolCall } from './types/index.js';
 import { isStateExistsError } from './module-registry.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
 export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
@@ -82,18 +83,29 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
 
 /**
  * What a withheld result's stub keeps of it: the fields of its data that its
- * tool marked as listing the files it acted on (ToolResult.keepWhenWithheld),
- * in the order marked, serialized as a stored result is and cut at the
- * inline cap. Undefined when it keeps nothing (agent-framework #277). A
- * write's file list is evidence of what it did, rarely what drew a refusal,
- * and keeping it is what shows a clobbered file when the receipt is withheld.
+ * tool marked as saying what it acted on (ToolResult.keepWhenWithheld), in
+ * the order marked, serialized as a stored result is. Past the inline cap
+ * they're cut, with a note that says so and where the whole result is, since
+ * a later field can then be cut away entirely. Undefined when it keeps
+ * nothing, as for a failed result (agent-framework #277). A write's file
+ * list is evidence of what it did, rarely what drew a refusal, and keeping it
+ * is what shows a clobbered file when the receipt is withheld.
  */
 export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: number | undefined): string | undefined {
   const { data, keepWhenWithheld: keys } = result;
-  if (result.isError || !keys?.length || !data || typeof data !== 'object' || Array.isArray(data)) return undefined;
+  if (!result.success || result.isError || !keys?.length || !data || typeof data !== 'object' || Array.isArray(data)) {
+    return undefined;
+  }
   const fields = data as Record<string, unknown>;
   const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
-  return Object.keys(kept).length > 0 ? toolResultDataToHistoryString(kept, maxChars) : undefined;
+  if (Object.keys(kept).length === 0) return undefined;
+  const whole = toolResultDataToHistoryString(kept);
+  if (!maxChars || whole.length <= maxChars) return whole;
+  // Never half a surrogate pair: the stub goes to the provider as text, so
+  // the cut can be one character short of the cap.
+  const head = safeSlice(whole, 0, maxChars);
+  return `${head} [cut at the inline cap: ${head.length} of these fields' ${whole.length} ` +
+    'characters; the whole result is where this note says]';
 }
 
 interface PendingBatch {
@@ -304,8 +316,9 @@ export class ToolResultGuard {
     content: ContentBlock[],
     wireResults: ToolResult[],
     originals: CompletedToolCall[],
-    metadata?: MessageMetadata,
-    inlineCap?: number,
+    metadata: MessageMetadata | undefined,
+    /** The cap the results were stored under: what a stub keeps is cut there too. */
+    inlineCap: number | undefined,
   ): MessageId {
     if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {

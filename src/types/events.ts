@@ -196,13 +196,15 @@ export interface ToolResult {
    */
   endTurn?: boolean;
   /**
-   * Fields of `data` that list the files the tool acted on, such as the paths
-   * a write wrote, removed or took from disk, in the order they should be
-   * kept. When the tool-result guard withholds this result, these fields stay
-   * in its stub, so the agent still sees what the tool did; the full result
-   * goes where every withheld original goes (agent-framework #277). They are
-   * cut at the inline cap, as any tool result is. Only data's own fields can
-   * be kept: an error result keeps nothing.
+   * Fields of `data` that say what the tool acted on, such as the paths a
+   * write wrote, removed or took from disk, the path it deleted, or a mount
+   * whose root it accepted, in the order they should be kept. When the
+   * tool-result guard withholds this result, these fields stay in its stub,
+   * so the agent still sees what the tool did; the result as stored goes
+   * where every withheld original goes (agent-framework #277). Past the
+   * inline cap they're cut, in this order, so a later field can be cut away
+   * entirely; put the short, telling ones first. Only data's own fields can
+   * be kept, and a failed result (success false) keeps nothing.
    */
   keepWhenWithheld?: string[];
 }
