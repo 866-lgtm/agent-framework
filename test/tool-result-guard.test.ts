@@ -16,7 +16,7 @@ import { JsStore } from '@animalabs/chronicle';
 
 // What a withheld result settles to with no writable workspace (#277): the
 // neutral notice, then where the original is kept. Written out, not computed
-// by withheldResultNotice, so a change of its wording fails here (#281 I26).
+// by withheldResultNotice, so a change of its wording fails here.
 const AUDIT_STUB = 'Tool result withheld by the guard. The tool has already executed. Its result is kept in ' +
   "the guard's audit record (framework/tool-result-guard), for an operator.";
 const UNSAVED_STUB = 'Tool result withheld by the guard. The tool has already executed. Its result went to ' +
@@ -1020,7 +1020,7 @@ function slowSpill(framework: AgentFramework, wait: () => Promise<unknown>) {
 }
 
 /** A gate a test opens itself, and a wait for a condition the code under test
- *  makes true (#281 I5: no fixed timers standing in for events). */
+ *  makes true (no fixed timers standing in for events). */
 function gate() {
   let open!: () => void;
   const opened = new Promise<void>((resolve) => { open = resolve; });
@@ -1075,7 +1075,7 @@ test('#277: a withheld original is written to the workspace, and its stub names 
   } finally { await h.framework.stop(); }
 });
 
-test('#281 I9: a withheld result over the inline cap is written as stored, and its own note names the whole output', async () => {
+test('#281: a withheld result over the inline cap is written as stored, and its own note names the whole output', async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
   (h.module.results as Record<string, ToolResult>).one = { success: true, data: `long-${'x'.repeat(400)}` };
   (h.framework as unknown as { toolResultInlineMaxCharsConfig: number }).toolResultInlineMaxCharsConfig = 100;
@@ -1099,7 +1099,7 @@ test('#281 I9: a withheld result over the inline cap is written as stored, and i
   } finally { await h.framework.stop(); }
 });
 
-test('#281 I18: a spill that throws is recorded with its error, and the stub names the audit record', async () => {
+test('#281: a spill that throws is recorded with its error, and the stub names the audit record', async () => {
   const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
   (h.framework as unknown as { spillWithheld: () => Promise<never> }).spillWithheld = async () => {
     throw new Error('the host broke its promise');
@@ -1120,7 +1120,7 @@ test('#277: a failed workspace write says so, and the audit record still keeps t
   try {
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
-    // The write's own error stays in the audit record and the logs (#281 I20).
+    // The write's own error stays in the audit record and the logs.
     assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Writing its result to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt failed, so it is kept only in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     const annotated = audit.at(-2) as { type: string; results: Array<{ toolUseId: string; path?: string; error?: string }> };
@@ -1133,7 +1133,7 @@ test('#277: a failed workspace write says so, and the audit record still keeps t
 
 test('#277: the refusal retry is compiled only once the stub says where the original is', async () => {
   // The framework's retry is a new activation (startStreamWithInjections), so
-  // this also pins that path's wait (#281 I12).
+  // this also pins that path's wait.
   const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
   const write = gate();
   let spills = 0;
@@ -1213,13 +1213,13 @@ test('#277: the stub has the same text for each place the original can be', () =
     `${notice} Its result is in workspace file work/tool-results/2026-10-10-withheld-a.txt.`);
   assert.equal(withheldResultNotice({ path: 'work/tool-results/2026-10-10-withheld-a.txt' }, false),
     `${notice} Its result is in workspace file work/tool-results/2026-10-10-withheld-a.txt.`);
-  // A failed write's own error text isn't the model's to read (#281 I20).
+  // A failed write's own error text isn't the model's to read.
   assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'EACCES: /srv/host/secret' }, true),
     `${notice} Writing its result to workspace file work/tool-results/x.txt failed, so it is kept only in ${audit}.`);
-  // The audit record is said to keep it only when that record was saved (#281 I21).
+  // The audit record is said to keep it only when that record was saved.
   assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, false),
     `${notice} Writing its result to workspace file work/tool-results/x.txt failed, so it went only to ${unsaved}.`);
-  // A write still under way when the host stopped waiting (#281 I2).
+  // A write still under way when the host stopped waiting.
   assert.equal(withheldResultNotice({ path: 'work/tool-results/y.txt', unfinished: true }, true),
     `${notice} Its result was still being written to workspace file work/tool-results/y.txt when this note ` +
     `was made; if that file is missing, it is kept in ${audit}.`);
@@ -1380,7 +1380,7 @@ test('#277: a rollback while an aborted batch is being annotated gets none of it
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     const annotated = audit.find((record) => record.type === 'annotated');
     assert.ok(annotated, `the annotation is recorded on ${rolled.targetBranch}: ${JSON.stringify(audit)}`);
-    // The first write went to the slowed spill, which wrote nothing (#281 I22).
+    // The first write went to the slowed spill, which wrote nothing.
     assert.deepEqual(annotated.results, [{ toolUseId: 'one', skipped: 'no_workspace_file' }, { toolUseId: 'two', skipped: 'branch_changed' }]);
     assert.equal(audit.find((record) => record.type === 'stub_updated')?.historyUpdate, 'superseded');
     await cm.switchBranch(source);
@@ -1432,7 +1432,7 @@ test('#277: a write under way when a rollback lands is refused where it commits,
     assert.equal(one.toolUseId, 'one');
     assert.equal(one.error, 'the workspace had left the branch this file is for');
     assert.deepEqual(two, { toolUseId: 'two', skipped: 'branch_changed' });
-    assert.ok(!traces.some((event) => event.type === 'tool:spill_failed'), 'a declined write is not traced as a failed spill (#281 I17)');
+    assert.ok(!traces.some((event) => event.type === 'tool:spill_failed'), 'a declined write is not traced as a failed spill');
     const relative = one.path!.replace(/^work\//, '');
     const store = h.framework.getStore();
     assert.equal(store.treeGet('workspace/work/tree', relative), null, 'the branch rolled back to has no file');
@@ -1498,7 +1498,7 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
     store.switchBranch('elsewhere');
     const there = await workspace.writeBinary('work/tool-results/there.txt', Buffer.from('there'), 'text/plain', { branch: source });
     assert.deepEqual(there, { success: false, error: 'the workspace had left the branch this file is for', isError: true,
-      data: { branchLeft: true } }, 'declined, and marked so, not a failed write (#281 I17)');
+      data: { branchLeft: true } }, 'declined, and marked so, not a failed write');
     assert.equal(store.treeGet(tree, 'tool-results/there.txt'), null, 'nothing lands on the branch the workspace is on');
     store.switchBranch(source);
     assert.equal(store.treeGet(tree, 'tool-results/there.txt'), null, 'nor on the branch the write named');
@@ -1511,7 +1511,7 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
 // what is so.
 // ---------------------------------------------------------------------------
 
-test('#281 I2: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async () => {
+test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async () => {
   const h = await workspaceHarness([[calls('one', 'two'), refused()], [answer()]]);
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const stalled = gate();
@@ -1539,7 +1539,7 @@ test('#281 I2: a write still under way at the deadline is named as unfinished, a
   } finally { stalled.open(); if (!stopped) await h.framework.stop(); }
 });
 
-test('#281 I3: a failed stub edit leaves the record of the written file, and the edit is retried before the next activation', async () => {
+test('#281: a failed stub edit leaves the record of the written file, and the edit is retried before the next activation', async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()], [answer()]]);
   const cm = h.framework.getAgent('assistant')!.getContextManager() as unknown as {
     editMessage: (id: unknown, content: ContentBlock[]) => unknown;
@@ -1571,7 +1571,7 @@ test('#281 I3: a failed stub edit leaves the record of the written file, and the
   } finally { await h.framework.stop(); }
 });
 
-test("#281 I4: a file whose copy on disk fails is still in the workspace's tree, and the stub names it", async () => {
+test("#281: a file whose copy on disk fails is still in the workspace's tree, and the stub names it", async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()]], { autoMaterialize: true });
   // A file where the directory should be: the copy on disk fails for anyone, root included.
   writeFileSync(join(h.mountDir, 'tool-results'), 'not a directory');
@@ -1590,7 +1590,7 @@ test("#281 I4: a file whose copy on disk fails is still in the workspace's tree,
   } finally { await h.framework.stop(); }
 });
 
-test("#281 I6: a conversation fork seeded while its template's stub is written copies the stub that names the original", async () => {
+test("#281: a conversation fork seeded while its template's stub is written copies the stub that names the original", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-guard-fork-')); dirs.push(dir);
   const membrane = new ScriptMembrane([[calls('one')]]);
   const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
@@ -1621,7 +1621,7 @@ test("#281 I6: a conversation fork seeded while its template's stub is written c
   } finally { write.open(); await framework.stop(); }
 });
 
-test('#281 I7: a compile during which an annotation began is compiled again once it is done', async () => {
+test('#281: a compile during which an annotation began is compiled again once it is done', async () => {
   const r = await compressionRig();
   try {
     const write = gate();
@@ -1643,7 +1643,7 @@ test('#281 I7: a compile during which an annotation began is compiled again once
   } finally { r.cm.close(); }
 });
 
-test('#281 I13: a request preview never waits on a workspace write, though the next request does', async () => {
+test('#281: a request preview never waits on a workspace write, though the next request does', async () => {
   const h = await harness([[calls('one')], [answer()]], { toolResultGuard: true });
   const write = gate();
   let spills = 0;
@@ -1670,7 +1670,7 @@ test('#281 I13: a request preview never waits on a workspace write, though the n
   } finally { write.open(); await h.framework.stop(); }
 });
 
-test('#281 I23: an annotation that starts while modules stop writes no file, and is saved before the store closes', async () => {
+test('#281: an annotation that starts while modules stop writes no file, and is saved before the store closes', async () => {
   const h = await workspaceHarness([]);
   const agent = h.framework.getAgent('assistant')!;
   const framework = h.framework as unknown as { writeToolResultFile: (...args: unknown[]) => Promise<unknown> };

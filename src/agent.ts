@@ -677,7 +677,7 @@ export class Agent {
     // Compile the context (with optional injections) into a request. The
     // guard's refusal retry is assembled the same way, afresh. A withheld
     // stub is compiled only once it says where its original went, including
-    // one whose annotation began during the compile (#281 I7).
+    // one whose annotation began during the compile.
     const assemble = async (): Promise<NormalizedRequest> => {
       const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections));
@@ -801,7 +801,7 @@ export class Agent {
    * It doesn't wait for the tool-result guard's annotations, so a preview
    * never waits on a workspace write (rollback, undo and redo report one), and
    * may show a withheld stub before its place is added; the activation waits
-   * for them around its call (#281 I13).
+   * for them around its call.
    */
   async buildActivationRequest(
     availableTools: ToolDefinition[],
@@ -971,7 +971,7 @@ export class Agent {
     this.lastStreamOutputTokens = 0;
 
     // A withheld stub is compiled only once it says where its original went,
-    // including one whose annotation began during the compile (#281 I7).
+    // including one whose annotation began during the compile.
     const request = await this.toolResultGuard.afterAnnotations(
       () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);

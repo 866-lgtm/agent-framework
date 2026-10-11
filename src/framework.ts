@@ -771,7 +771,7 @@ class DefaultErrorPolicy implements ErrorPolicy {
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
 /** How long the tool-result guard waits for a withheld original's workspace
- *  write before its stub says the write was still under way (#281 I2). A local
+ *  write before its stub says the write was still under way. A local
  *  write takes milliseconds; this bounds a stalled mount, which would otherwise
  *  hold every later request of the agent and the framework's stop. */
 const WITHHELD_SPILL_DEADLINE_MS = 30_000;
@@ -2031,7 +2031,7 @@ export class AgentFramework {
     while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
     // An annotation that starts after this point, such as one from a direct
     // Agent API call stop doesn't cancel, writes no file to the stopping
-    // workspace: its stub names the audit record (#281 I23).
+    // workspace: its stub names the audit record.
     this.guardSpillsClosed = true;
 
     // Stop modules and MCPL servers in parallel
@@ -2042,7 +2042,7 @@ export class AgentFramework {
     await Promise.all(shutdownPromises);
 
     // Those later annotations write nothing, so they finish at once; let them
-    // record and edit their stubs before the store closes (#281 I23).
+    // record and edit their stubs before the store closes.
     while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
 
     // Streams may queue storage repairs while being cancelled above. Retry
@@ -2720,7 +2720,7 @@ export class AgentFramework {
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
   /** Set once stop() has let the running annotations finish: a withheld
    *  original is then no longer written to a workspace that is stopping, and
-   *  its stub names the audit record (#281 I23). */
+   *  its stub names the audit record. */
   private guardSpillsClosed = false;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
@@ -7418,7 +7418,7 @@ export class AgentFramework {
       if (existing.length === 0) {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only from stubs that already say where
-        // their originals went (#281 I6).
+        // their originals went.
         const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile());
         for (const msg of compiled) {
@@ -11762,8 +11762,8 @@ export class AgentFramework {
    * The guard's spill of a withheld original (agent-framework #277): the
    * tool-results file, waited for at most withheldSpillDeadlineMs. A write
    * still under way then is reported as unfinished at its path, and goes on
-   * by itself (#281 I2). Once stop() has let the running annotations finish,
-   * nothing more is written (#281 I23).
+   * by itself. Once stop() has let the running annotations finish,
+   * nothing more is written.
    */
   private async spillWithheld(label: string, text: string, branch: string): Promise<WithheldSpill> {
     if (this.guardSpillsClosed) return null;
@@ -11802,14 +11802,14 @@ export class AgentFramework {
       if (result.success) return { path };
       // The file is in the workspace's Chronicle tree, where its tools read
       // it, and only its copy on disk failed: it is written for every reader
-      // the stub or the truncation note sends there (#281 I4). The workspace
+      // the stub or the truncation note sends there. The workspace
       // reports the disk failure itself (workspace:materialize-failed).
       if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
         console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${result.error}`);
         return { path };
       }
       // Declined, not failed: the store left the branch the file is for, so
-      // it isn't written anywhere, as the caller asked (#281 I17).
+      // it isn't written anywhere, as the caller asked.
       if ((result.data as { branchLeft?: boolean } | undefined)?.branchLeft === true) {
         return { path, error: result.error ?? 'the workspace had left the branch this file is for' };
       }

@@ -18,7 +18,7 @@ export type WithheldSpill = { path: string; error?: string; unfinished?: true } 
  *  tool-results spill). It reports a failed write rather than throwing, and
  *  it settles within a bounded time: a write still under way at the host's
  *  deadline is reported as unfinished, so one stalled write can't hold every
- *  later request and the host's stop (#281 I2). The file lands on `branch`,
+ *  later request and the host's stop. The file lands on `branch`,
  *  the branch the stub is on, or isn't written: the workspace checks the
  *  branch where it commits the file (WorkspaceModule.writeBinary). */
 export type WithheldSpiller = (label: string, text: string, branch: string) => Promise<WithheldSpill>;
@@ -38,11 +38,11 @@ export interface WithheldHost {
  * deliberate choice (agent-framework #277). The place holds the result as
  * stored, which for one over the inline cap is its capped text, whose own
  * note names the file with the whole output; so the stub says "its result",
- * not its full result (#281 I9). A failed write's own error text
- * stays in the audit record and the logs, not here (#281 I20). The audit
+ * not its full result. A failed write's own error text
+ * stays in the audit record and the logs, not here. The audit
  * record is said to keep the original only when it was saved: a staged
  * record whose save failed is still queued in memory, and a restart before
- * its retry loses it (#281 I21).
+ * its retry loses it.
  */
 export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean): string {
   const audit = `the guard's audit record (${TOOL_RESULT_GUARD_AUDIT_STATE}), for an operator`;
@@ -116,18 +116,18 @@ export class ToolResultGuard {
   /** Settles once every withheld stub settled so far names where its
    *  original is (or that edit was given up). It never rejects, and it is
    *  bounded: the host reports a write still under way at its deadline as
-   *  unfinished (#281 I2). */
+   *  unfinished. */
   whenAnnotated(): Promise<void> { return this.annotating ?? Promise.resolve(); }
 
   /**
    * Runs `read` (a compile of the context) once no withheld stub is still
    * being annotated, and again if an annotation began while it ran, since a
    * settlement can land during the compile's own awaits, such as a previous
-   * frame's teardown abandoning its batch (#281 I7). Every compile of a
+   * frame's teardown abandoning its batch. Every compile of a
    * request that is sent goes through it: the agent's activations, its direct
    * API calls and their refusal retry, and a conversation fork's seed from its
-   * template (#281 I6). A request preview doesn't, so it never waits on a
-   * workspace write (#281 I13).
+   * template. A request preview doesn't, so it never waits on a
+   * workspace write.
    */
   async afterAnnotations<T>(read: () => Promise<T>): Promise<T> {
     for (;;) {
@@ -410,7 +410,7 @@ export class ToolResultGuard {
    * The edit then goes through the ordered storage queue like an admission's:
    * retried before the next activation, maintenance pass or stop until it
    * lands or an operator's change supersedes it ('stub_updated'), so a failed
-   * edit no longer leaves a written file named nowhere (#281 I3).
+   * edit no longer leaves a written file named nowhere.
    */
   private annotate(pending: PendingBatch): void {
     const previous = this.annotating ?? Promise.resolve();
@@ -430,7 +430,7 @@ export class ToolResultGuard {
         // Results not written because an earlier write of the batch was still
         // under way at the host's deadline: the workspace isn't answering, and
         // waiting a deadline for each would hold every request and stop that
-        // much longer (#281 I2). Their stubs name the audit record.
+        // much longer. Their stubs name the audit record.
         const unanswered = new Set<number>();
         // A spill that threw, by index: its error, for the record.
         const thrown = new Map<number, string>();
@@ -455,7 +455,7 @@ export class ToolResultGuard {
               spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original, pending.branch);
             } catch (error) {
               // The host reports a failed write rather than throwing; a throw
-              // is recorded all the same, without a path (#281 I18).
+              // is recorded all the same, without a path.
               thrown.set(index, (error instanceof Error ? error.message : String(error)).slice(0, 200));
               console.error(`[tool-result-guard] agent=${this.agentName} could not spill withheld result ` +
                 `${block.toolUseId}:`, error);
@@ -477,7 +477,7 @@ export class ToolResultGuard {
               if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
               const spill = spills.get(index);
               // No file was written: no writable workspace, or the framework
-              // was stopping (#281 I22).
+              // was stopping.
               if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               return [{ toolUseId: block.toolUseId, ...(spill ? { path: spill.path } : {}),
                 ...(spill?.error !== undefined ? { error: spill.error } : {}),

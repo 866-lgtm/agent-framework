@@ -1242,13 +1242,13 @@ export class WorkspaceModule implements Module {
    * the check and the entry, so the file's tree entry lands on that branch or
    * the write is refused, with `data: { branchLeft: true }`. A mount has one
    * directory on disk, so with autoMaterialize the file's copy there is
-   * written like any other write's (#281 I1). The tool-result guard writes a
+   * written like any other write's. The tool-result guard writes a
    * withheld original this way, for the branch its stub is on
    * (agent-framework #277).
    *
    * A write whose tree entry is set but whose copy on disk fails returns
    * success false with `data: { inChronicle: true }`: the workspace's tools
-   * read the file from the tree, so it is there for them (#281 I4).
+   * read the file from the tree, so it is there for them.
    */
   async writeBinary(
     mountPrefixedPath: string,
@@ -1289,7 +1289,7 @@ export class WorkspaceModule implements Module {
       // The file is in the Chronicle tree, where the workspace's tools read
       // it; only its copy on disk failed. `inChronicle` lets a caller that
       // needs the file readable tell this from a write that never happened
-      // (agent-framework #281 I4).
+      // (agent-framework #281).
       return {
         success: false,
         error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
