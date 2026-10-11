@@ -52,6 +52,8 @@ const MAX_CHANNEL_LIFECYCLE_ATTEMPTS = 5;
 class ChannelLifecycleConvergenceError extends Error {}
 /** A channels/open answered for a channel other than the one it named. */
 class ChannelOpenSubstitutionError extends Error {}
+/** An operation queued for a server's registrations that were removed. */
+class ChannelLifecycleCancelledError extends Error {}
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
 /**
@@ -62,23 +64,32 @@ const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 function plainIdForLog(id: unknown): string {
   if (typeof id === 'string' && /^[\x21-\x7e]{1,200}$/.test(id)) return id;
   return typeof id === 'string'
-    ? `(not a plain id: a ${id.length}-character string)`
+    ? `(not a plain id: a ${[...id].length}-character string)`
     : `(not a plain id: ${id === null ? 'null' : typeof id})`;
 }
 
 /**
- * The other channel a channels/open answer names, if it names one: its
- * `channel.id`, or else the `channelId` of a history item. Each is evidence of
- * which channel the server opened. An answer that names no channel at all
- * can't be checked, and gives undefined.
+ * What a channels/open answer says about which channel the server opened:
+ * its `channel.id`, or else the `channelId` of a history item. Each is
+ * evidence. A string other than the requested id names another channel (ids
+ * compare exactly, as the server's traffic is matched). Null or absence names
+ * no channel, and gives undefined, as does an answer that names none at all.
+ * Any other value is malformed: it names nothing the host could register.
  */
-function substitutedChannel(result: ChannelsOpenResult | undefined, requested: string): unknown {
-  const answered = result?.channel?.id;
-  if (answered !== undefined && answered !== requested) return answered;
+function substitutedChannel(
+  result: ChannelsOpenResult | undefined,
+  requested: string,
+): { kind: 'other'; id: string } | { kind: 'malformed'; value: unknown } | undefined {
+  const named = (value: unknown) => {
+    if (value === undefined || value === null || value === requested) return undefined;
+    return typeof value === 'string' ? { kind: 'other' as const, id: value } : { kind: 'malformed' as const, value };
+  };
+  const answered = named(result?.channel?.id);
+  if (answered) return answered;
   const history: unknown[] = Array.isArray(result?.history) ? result.history : [];
   for (const item of history) {
-    const from = (item as { channelId?: unknown } | null)?.channelId;
-    if (from !== undefined && from !== requested) return from;
+    const from = named((item as { channelId?: unknown } | null)?.channelId);
+    if (from) return from;
   }
   return undefined;
 }
@@ -703,12 +714,35 @@ export class ChannelRegistry {
   // across descriptor replacement. Settled tails release themselves; a
   // failed operation must not poison later decisions.
   private channelLifecycleTails = new Map<string, Promise<void>>();
+  // Bumped when a server's registrations are removed: an operation queued
+  // before that is cancelled when it would run, rather than acting on a
+  // closing connection or on a later re-registration's entries.
+  private serverRemovals = new Map<string, number>();
+  // Operations queued or running per channel that will still read its
+  // target before confirming anything. Unlike the tail, which settles a few
+  // microtasks after its operation's last check, this drops at that check.
+  private lifecycleOutstanding = new Map<string, number>();
   // Losing an open receipt does not confirm closure. Keep that distinction
   // private while preserving the public open:boolean availability projection.
   private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
 
   private invalidateTransportConfirmation(entry: ChannelEntry): void {
     entry.open = false;
+    this.unconfirmedChannelTargets.add(entry);
+  }
+
+  /** Whether the host directs this server's channel lifecycle (§14.1: its
+   *  `channels.lifecycle` grant). Where it doesn't, the server opens and
+   *  closes its own channels, and sends no receipt the host could wait for. */
+  private directsLifecycle(serverId: string): boolean {
+    return CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.lifecycle');
+  }
+
+  /** A registration's entry: nothing about its transport is known until a
+   *  receipt for its target confirms it open or closed. */
+  private registerEntry(key: string, serverId: string, descriptor: ChannelDescriptor): void {
+    const entry: ChannelEntry = { serverId, descriptor, open: false };
+    this.channels.set(key, entry);
     this.unconfirmedChannelTargets.add(entry);
   }
 
@@ -785,11 +819,7 @@ export class ChannelRegistry {
         continue;
       }
       const key = `${serverId}:${channel.id}`;
-      this.channels.set(key, {
-        serverId,
-        descriptor: channel,
-        open: false,
-      });
+      this.registerEntry(key, serverId, channel);
       this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
       registeredIds.push(channel.id);
       results.push({ id: channel.id, accepted: true });
@@ -830,6 +860,7 @@ export class ChannelRegistry {
     // channels/register — a changed-set cannot smuggle in what register
     // would have rejected (PR #79 review blocker 5).
     const addedResults: Array<{ id: string; accepted: boolean; reason?: string }> = [];
+    const retargeted: ChannelDescriptor[] = [];
     // Process removed channels — itemized truthfully: removal of a channel
     // we never had is reported, not silently accepted.
     if (params.removed) {
@@ -860,8 +891,19 @@ export class ChannelRegistry {
           continue;
         }
         // A live subscription to the old target does not confirm the new
-        // type/address. Label-only updates preserve that confirmation.
-        if (!sameChannelTarget(existing.descriptor, channel)) this.invalidateTransportConfirmation(existing);
+        // type/address. Label-only updates preserve that confirmation. A
+        // channel decided open (or tuned out) is opened at its new target.
+        if (!sameChannelTarget(existing.descriptor, channel)) {
+          this.invalidateTransportConfirmation(existing);
+          // An operation queued or running for this channel reads its target
+          // again before it confirms anything, so it opens the new one. With
+          // none, a channel decided open (or tuned out) is reconciled here.
+          const desired = this.getDesiredState(serverId, channel.id);
+          if ((desired === 'open' || desired === 'tuned-out') &&
+              !this.lifecycleOutstanding.has(this.lifecycleKey(serverId, channel.id))) {
+            retargeted.push(channel);
+          }
+        }
         existing.descriptor = channel;
         this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
@@ -879,11 +921,7 @@ export class ChannelRegistry {
           continue;
         }
         const key = `${serverId}:${channel.id}`;
-        this.channels.set(key, {
-          serverId,
-          descriptor: channel,
-          open: false,
-        });
+        this.registerEntry(key, serverId, channel);
         this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
         accepted.push(channel);
@@ -898,7 +936,8 @@ export class ChannelRegistry {
     // settled above, so nothing in the response depends on reconciling.
     responder?.respond({ results: addedResults });
 
-    if (accepted.length > 0) await this.reconcileChannels(serverId, accepted);
+    const reconcile = [...accepted, ...retargeted];
+    if (reconcile.length > 0) await this.reconcileChannels(serverId, reconcile);
 
     this.emitTraceFn({
       type: 'mcpl:channels-changed',
@@ -996,17 +1035,31 @@ export class ChannelRegistry {
       // exactly the authority a self-attested channel would be stealing).
       // A coalesced item is "accepted" only once the coalescer admits it, so
       // for those this runs after the hook (below).
+      const incomingEntry = this.channels.get(incomingKey)!;
       const markAccepted = () => {
         this.defaultPublishChannel = message.channelId;
         this.defaultPublishMessageId = message.messageId;
         this.defaultPublishThreadId = message.threadId;
-        // A server sending channels/incoming is authoritative evidence that
-        // the transport is actually open. This repairs transient status only;
-        // durable desired state still changes exclusively through lifecycle
-        // operations.
-        const incomingEntry = this.channels.get(incomingKey)!;
+        // Where the host directs this server's lifecycle, only a receipt for
+        // the current target confirms it: traffic shows the transport open
+        // only for a confirmed target, and only for a channel still decided
+        // open or tuned out. After a retarget, traffic for this id may still
+        // come from the old subscription, and a close receipt that landed
+        // first (or during the coalescer's await) stands. Where the host
+        // doesn't direct it, the server opens its own channels and its
+        // traffic is the only evidence the host gets, so it marks the
+        // channel open, as it always has. The entry is the one the message
+        // was accepted for: one a re-registration put in its place meanwhile
+        // waits for its own evidence. Durable desired state still changes
+        // exclusively through lifecycle operations.
+        if (this.directsLifecycle(serverId)) {
+          if (this.unconfirmedChannelTargets.has(incomingEntry)) return;
+          const desired = this.getDesiredState(serverId, message.channelId);
+          if (desired !== 'open' && desired !== 'tuned-out') return;
+        } else {
+          this.unconfirmedChannelTargets.delete(incomingEntry);
+        }
         incomingEntry.open = true;
-        this.unconfirmedChannelTargets.delete(incomingEntry);
       };
       if (!coalesced) markAccepted();
 
@@ -1454,6 +1507,10 @@ export class ChannelRegistry {
    * server's channels don't linger and route speech into the void.
    */
   removeServer(serverId: string): void {
+    // Every lifecycle operation queued for this server is cancelled when it
+    // would run (ChannelLifecycleCancelledError), so none acts on a closing
+    // connection or on a later re-registration's entries.
+    this.serverRemovals.set(serverId, (this.serverRemovals.get(serverId) ?? 0) + 1);
     for (const [key, entry] of this.channels) {
       if (entry.serverId !== serverId) continue;
       this.channels.delete(key);
@@ -2140,11 +2197,42 @@ export class ChannelRegistry {
     options?: { history?: ChannelHistoryRequest },
   ): Promise<{ open: boolean; result?: ChannelsOpenResult }> {
     const lifecycleKey = this.lifecycleKey(serverId, channelId);
-    const channelKey = `${serverId}:${channelId}`;
+    const removals = this.serverRemovals.get(serverId) ?? 0;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
-    const operation = previous.catch(() => {}).then(async () => {
+    this.lifecycleOutstanding.set(lifecycleKey, (this.lifecycleOutstanding.get(lifecycleKey) ?? 0) + 1);
+    const operation = previous.catch(() => {}).then(
+      () => this.runLifecycleOperation(serverId, channelId, removals, options),
+    );
+    // Keep the rejection visible to existing joiners, while observing it
+    // immediately and letting each queued successor start after either result.
+    const tail = operation.then(() => {});
+    this.channelLifecycleTails.set(lifecycleKey, tail);
+    const cleanup = () => {
+      if (this.channelLifecycleTails.get(lifecycleKey) === tail) {
+        this.channelLifecycleTails.delete(lifecycleKey);
+      }
+    };
+    void tail.then(cleanup, cleanup);
+    return operation;
+  }
+
+  /** One queued lifecycle operation, run when its turn in the queue comes. */
+  private async runLifecycleOperation(
+    serverId: string,
+    channelId: string,
+    removals: number,
+    options?: { history?: ChannelHistoryRequest },
+  ): Promise<{ open: boolean; result?: ChannelsOpenResult }> {
+    const channelKey = `${serverId}:${channelId}`;
+    const lifecycleKey = this.lifecycleKey(serverId, channelId);
+    try {
       let attempts = 0;
       for (;;) {
+        if ((this.serverRemovals.get(serverId) ?? 0) !== removals) {
+          throw new ChannelLifecycleCancelledError(
+            `Channel ${channelId}: its server's registrations were removed while this operation was queued`,
+          );
+        }
         const entry = this.channels.get(channelKey);
         if (!entry) throw new Error(`Channel is no longer registered: ${channelId}`);
         const server = this.serverRegistry.getServer(serverId);
@@ -2185,9 +2273,16 @@ export class ChannelRegistry {
             await server.sendChannelsClose({ channelId });
           }
         } catch (error) {
-          // A failed same-target backscroll can retain its known-open state.
-          // A receipt/failure from an older connection or target cannot.
-          if (this.channels.get(channelKey) === entry && !sameTarget()) this.invalidateTransportConfirmation(entry);
+          // An RPC can fail after the server acted, so a failure for the
+          // current target leaves its outcome unknown: it is marked
+          // unconfirmed with open unchanged, which keeps a confirmed-open
+          // channel usable after a failed backscroll (the mark is read only
+          // while not open). A failure from an older connection or target
+          // also withdraws the open flag.
+          if (this.channels.get(channelKey) === entry) {
+            if (sameTarget()) this.unconfirmedChannelTargets.add(entry);
+            else this.invalidateTransportConfirmation(entry);
+          }
           throw error;
         }
         // A server can answer for a channel other than the one named: one
@@ -2197,11 +2292,14 @@ export class ChannelRegistry {
         // open it made if the host wants that channel closed.
         const substitute = open ? substitutedChannel(result, channelId) : undefined;
         if (substitute !== undefined) {
+          const answered = plainIdForLog(substitute.kind === 'other' ? substitute.id : substitute.value);
           console.error(
-            `[channel-open-substituted] server=${serverId} requested=${plainIdForLog(channelId)} answered=${plainIdForLog(substitute)}`,
+            `[channel-open-substituted] server=${serverId} requested=${plainIdForLog(channelId)} answered=${answered}`,
           );
-          this.emitTraceFn({ type: 'mcpl:channel-open-substituted', serverId, channelId, answeredFor: substitute });
-          if (typeof substitute === 'string') this.closeSubstitutedChannel(serverId, substitute);
+          this.emitTraceFn({ type: 'mcpl:channel-open-substituted', serverId, channelId, answeredFor: answered });
+          // A malformed id names nothing registered here, so there is
+          // nothing to close.
+          if (substitute.kind === 'other') this.closeSubstitutedChannel(serverId, substitute.id);
         }
         // Never apply an old receipt to the current target, even transiently:
         // a corrective open might fail before that stale bit is replaced.
@@ -2218,8 +2316,9 @@ export class ChannelRegistry {
         if (substitute !== undefined) {
           this.invalidateTransportConfirmation(entry);
           throw new ChannelOpenSubstitutionError(
-            `Server "${serverId}" answered channels/open for ${channelId} with a different channel; ` +
-            `${channelId} is not marked open, and nothing in the answer is used`,
+            `Server "${serverId}" answered channels/open for ${channelId} with ` +
+            (substitute.kind === 'other' ? 'a different channel' : 'a channel id that is not a string') +
+            `; ${channelId} is not marked open, and nothing in the answer is used`,
           );
         }
         entry.open = open;
@@ -2228,18 +2327,13 @@ export class ChannelRegistry {
         if (open !== (now === 'open' || now === 'tuned-out')) continue;
         return { open, result };
       }
-    });
-    // Keep the rejection visible to existing joiners, while observing it
-    // immediately and letting each queued successor start after either result.
-    const tail = operation.then(() => {});
-    this.channelLifecycleTails.set(lifecycleKey, tail);
-    const cleanup = () => {
-      if (this.channelLifecycleTails.get(lifecycleKey) === tail) {
-        this.channelLifecycleTails.delete(lifecycleKey);
-      }
-    };
-    void tail.then(cleanup, cleanup);
-    return operation;
+    } finally {
+      // Synchronous with the operation's last look at its target: from here
+      // on, nothing it does will open a new target.
+      const left = (this.lifecycleOutstanding.get(lifecycleKey) ?? 1) - 1;
+      if (left > 0) this.lifecycleOutstanding.set(lifecycleKey, left);
+      else this.lifecycleOutstanding.delete(lifecycleKey);
+    }
   }
 
   /**
@@ -2255,7 +2349,11 @@ export class ChannelRegistry {
     if (!this.channels.has(`${serverId}:${channelId}`)) return;
     if (this.getDesiredState(serverId, channelId) !== 'closed') return;
     this.applyDesiredChannelState(serverId, channelId).catch((err) => {
-      if (err instanceof ChannelLifecycleConvergenceError) return;
+      // Removal while queued is cancellation, as in reconcileChannels, and
+      // exhausted convergence emitted its own diagnostic.
+      if (!this.channels.has(`${serverId}:${channelId}`) ||
+          err instanceof ChannelLifecycleCancelledError ||
+          err instanceof ChannelLifecycleConvergenceError) return;
       this.emitTraceFn({
         type: 'mcpl:channel-reconcile-failed',
         serverId, channelId, desired: 'closed', error: (err as Error).message,
@@ -2282,6 +2380,10 @@ export class ChannelRegistry {
         // the current target, so joined delivery must fail visibly.
         if (error instanceof ChannelLifecycleConvergenceError) throw error;
       }
+      // A settled tail releases its own key. One still current after it
+      // settled would be awaited again without ever yielding to the event
+      // loop, so stop waiting rather than spin.
+      if (this.channelLifecycleTails.get(lifecycleKey) === pending) break;
     }
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) throw new Error('Channel registration was removed while delivery waited');
@@ -2340,8 +2442,10 @@ export class ChannelRegistry {
       }
     }
 
-    for (const channel of channels) {
-      if (!this.channels.has(`${serverId}:${channel.id}`)) continue;
+    // Each channel has its own lifecycle queue, so a held RPC for one (up to
+    // its timeout, times its attempts) doesn't delay its siblings.
+    await Promise.allSettled(channels.map(async (channel) => {
+      if (!this.channels.has(`${serverId}:${channel.id}`)) return;
       try {
         await this.applyDesiredChannelState(serverId, channel.id);
       } catch (err) {
@@ -2349,8 +2453,9 @@ export class ChannelRegistry {
         // Exhausted convergence and a substituted answer already emitted
         // their own diagnostics.
         if (!this.channels.has(`${serverId}:${channel.id}`) ||
+            err instanceof ChannelLifecycleCancelledError ||
             err instanceof ChannelLifecycleConvergenceError ||
-            err instanceof ChannelOpenSubstitutionError) continue;
+            err instanceof ChannelOpenSubstitutionError) return;
         this.emitTraceFn({
           type: 'mcpl:channel-reconcile-failed',
           serverId,
@@ -2359,7 +2464,7 @@ export class ChannelRegistry {
           error: (err as Error).message,
         });
       }
-    }
+    }));
   }
 
   // ==========================================================================
@@ -2960,6 +3065,23 @@ export class ChannelRegistry {
       }
     }
 
+    // Where the host directs the lifecycle, a decline goes through the
+    // lifecycle queue like any closed decision, unless a receipt confirmed
+    // the transport closed with nothing pending: an unconfirmed transport may
+    // be open, and pending work must settle on this decision. A failed close
+    // is reported; the decision stands.
+    let closeError: string | undefined;
+    const current = this.channels.get(`${entry.serverId}:${input.channelId}`);
+    if (current && this.directsLifecycle(entry.serverId) &&
+        (this.unconfirmedChannelTargets.has(current) || this.hasPendingLifecycle(current))) {
+      try {
+        const applied = await this.applyDesiredChannelState(entry.serverId, input.channelId);
+        if (applied.open) closeError = 'the close was superseded by a newer lifecycle decision';
+      } catch (error) {
+        closeError = (error as Error).message;
+      }
+    }
+
     this.appendLifecycleEvent({
       kind: 'invitation-declined',
       serverId: entry.serverId,
@@ -2976,6 +3098,7 @@ export class ChannelRegistry {
         acknowledged,
         ...(representation ? { representation } : {}),
         ...(acknowledgmentError ? { acknowledgmentError } : {}),
+        ...(closeError ? { closeError: `Failed to close the channel's transport: ${closeError}` } : {}),
       },
     };
   }

@@ -10,16 +10,27 @@ import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
-import type { ChannelDescriptor, ChannelsOpenResult } from '../src/mcpl/types.js';
+import type { ChannelDescriptor, ChannelIncomingMessage, ChannelsOpenResult } from '../src/mcpl/types.js';
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 function descriptor(id = 'x', initiallyOpen = false, address = 'original'): ChannelDescriptor {
   return { id, type: 'test', label: id, direction: 'bidirectional', initiallyOpen, address: { value: address } };
 }
 
-type NoticeHandler = NonNullable<NonNullable<ConstructorParameters<typeof ChannelRegistry>[4]>['onChannelAutoOpened']>;
+type RegistryOptions = NonNullable<ConstructorParameters<typeof ChannelRegistry>[4]>;
+type NoticeHandler = NonNullable<RegistryOptions['onChannelAutoOpened']>;
 
-function fixture(onNotice?: NoticeHandler, store?: JsStore) {
+/** A tool result's data, as the channel tools shape it. */
+const dataOf = (result: { data?: unknown }) => (result.data ?? {}) as { status?: string; closeError?: string };
+
+function message(channelId = 'x', messageId = 'm1'): ChannelIncomingMessage {
+  return {
+    channelId, messageId, author: { id: 'u1', name: 'someone' },
+    timestamp: '2026-10-11T00:00:00Z', content: [{ type: 'text', text: 'hello' }],
+  };
+}
+
+function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryOptions['handleCoalescedIncoming']) {
   const actual = new Map<string, boolean>();
   const calls: Array<{ kind: 'open' | 'close'; id: string; address?: unknown }> = [];
   const pending: Array<{ finish: () => void; fail: () => void }> = [];
@@ -59,7 +70,8 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
     { getServer: () => currentServer } as unknown as McplServerRegistry,
     {} as FeatureSetManager, () => {}, (event) => traces.push(event),
     { store, onRouteFailure: (info) => routeFailures.push(info),
-      onChannelAutoOpened: (info) => { notices.push(info); onNotice?.(info); } },
+      onChannelAutoOpened: (info) => { notices.push(info); onNotice?.(info); },
+      ...(coalesce ? { handleCoalescedIncoming: coalesce } : {}) },
   );
   const isOpen = (id = 'x') => registry.getOpenChannels().some((e) => e.descriptor.id === id);
   const tool = (kind: 'open' | 'close') => registry.handleChannelToolCall('channel_' + kind, { serverId: 'test', channelId: 'x' });
@@ -213,17 +225,22 @@ for (const delivery of ['speech', 'reply'] as const) {
     // turn a delivery into a decision to cancel attention diversion.
     const f = fixture();
     await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+    f.calls.length = 0;
     f.held.add('x');
     const close = f.tool('close');
     await tick();
     f.registry.enterTuneOut('test', 'x', {
       epochId: 'new-epoch', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
     }, 'agent-tool');
+    // The close in flight converges on the tune-out by opening again, and the
+    // delivery joins it: the channel was already decided open, so a reply
+    // reports it already open, and nothing sends a third RPC.
     const sent = delivery === 'speech'
       ? f.registry.routeSpeech('resident', 'hello', 'x').then((result) => result?.delivered === true)
-      : f.registry.openIfClosedForSend('x', 'test').then((result) => result.status === 'opened' || result.status === 'already-open');
+      : f.registry.openIfClosedForSend('x', 'test').then((result) => result.status === 'already-open');
     await f.drain(close, sent);
     assert.equal(await sent, true);
+    assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open']);
     assert.equal(f.registry.getTuneOutState('test', 'x')?.params.epochId, 'new-epoch');
     assert.equal(f.actual.get('x'), true);
     if (delivery === 'speech') assert.deepEqual(f.publishedWhileOpen, [true]);
@@ -723,8 +740,15 @@ for (const delivery of ['speech', 'reply'] as const) {
   test(delivery + ' into a channel decided open whose transport lost confirmation is not announced as opening it', async () => {
     const f = fixture();
     await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
-    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
-    assert.equal(f.isOpen(), false, 'retargeting leaves the new target unconfirmed');
+    // A retarget opens the new target; that open fails, so the channel stays
+    // decided open with its transport unconfirmed.
+    f.held.add('x');
+    const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    await tick();
+    f.pending.shift()!.fail();
+    await retarget;
+    f.held.delete('x');
+    assert.equal(f.isOpen(), false, 'a failed open leaves the new target unconfirmed');
     f.calls.length = 0;
     if (delivery === 'speech') {
       assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
@@ -744,7 +768,12 @@ for (const delivery of ['speech', 'reply'] as const) {
     f.registry.enterTuneOut('test', 'x', {
       epochId: 'kept-epoch', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
     }, 'agent-tool');
-    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    f.held.add('x');
+    const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    await tick();
+    f.pending.shift()!.fail();
+    await retarget;
+    f.held.delete('x');
     assert.equal(f.isOpen(), false);
     if (delivery === 'speech') {
       assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
@@ -829,24 +858,34 @@ test('a failed reply open reports the label of the registration that replaced it
   await f.drain(replacement);
 });
 
-test('a channel removed earlier in its batch does not hold up the rest of the batch', async () => {
+test('a channel removed from its batch holds up none of its siblings, and fails nothing', async () => {
   const f = fixture();
   f.held.add('x');
   const first = f.registry.handleChanged('test', { added: [descriptor('x')] });
   await tick();
   assert.equal(f.pending.length, 1, "x's first operation is in flight");
   f.held.add('y');
-  let batchSettled = false;
-  const batch = f.registry.handleChanged('test', { added: [descriptor('y'), descriptor('x')] })
-    .then(() => { batchSettled = true; });
+  const batch = f.registry.handleChanged('test', { added: [descriptor('y', true), descriptor('x')] });
   await tick();
   assert.equal(f.pending.length, 2, "y's operation is in flight too");
   await f.registry.handleChanged('test', { removed: ['x'] });
   f.pending.pop()!.finish(); // y's receipt; x's first operation stays in flight
   for (let i = 0; i < 5; i++) await tick();
-  assert.equal(batchSettled, true, "the batch skips x rather than queueing behind x's operation in flight");
+  assert.equal(f.isOpen('y'), true, "y opened while x's operation was still in flight");
   await f.drain(first, batch);
-  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0,
+    'the removed channel is cancelled, not failed');
+});
+
+test("a batch's channels reconcile side by side: one held RPC delays none of its siblings", async () => {
+  const f = fixture();
+  f.held.add('x');
+  const batch = f.registry.handleChanged('test', { added: [descriptor('x', true), descriptor('y', true)] });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.isOpen('y'), true, "y's open didn't wait for x's");
+  assert.equal(f.isOpen('x'), false);
+  await f.drain(batch);
+  assert.equal(f.isOpen('x'), true);
 });
 
 test('a descriptor the registration rejected is neither admitted nor announced', async () => {
@@ -857,4 +896,247 @@ test('a descriptor the registration rejected is neither admitted nor announced',
   await f.registry.handleRegister('test', { channels: [descriptor('y'), { ...descriptor('rejected'), id: '' }] });
   assert.deepEqual(f.notices.map((n) => n.channels.map((c) => c.channelId)), [['y']]);
   assert.equal(f.registry.getDesiredState('test', ''), undefined);
+});
+
+test('a failed initial close leaves the channel unconfirmed, so channel_close closes it for real', async () => {
+  const f = fixture();
+  f.held.add('x');
+  const registration = f.registry.handleChanged('test', { added: [descriptor()] });
+  await tick();
+  f.pending.shift()!.fail();
+  await registration;
+  f.held.delete('x');
+  f.calls.length = 0;
+  assert.equal(dataOf(await f.tool('close')).status, 'closed');
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close'], 'a failed close may have closed nothing');
+  assert.equal(dataOf(await f.tool('close')).status, 'already closed', 'its receipt confirms the close');
+  assert.equal(f.calls.length, 1);
+});
+
+test("a re-registration's entry is unconfirmed until a receipt, so channel_close never answers already closed for it", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  assert.equal(dataOf(await f.tool('close')).status, 'already closed', 'its initial close was confirmed');
+  // The server registers again, without the lifecycle grant this time: the
+  // host sends nothing, and nothing confirms the new entry closed.
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  f.calls.length = 0;
+  await f.registry.handleRegister('test', { channels: [descriptor()] });
+  assert.equal(f.calls.length, 0);
+  const result = await f.tool('close');
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /channels\.lifecycle not in/, 'refused for the grant, not answered already closed');
+});
+
+test('traffic after a retarget confirms nothing: only a receipt for the new target does', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.held.add('x');
+  const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  await tick();
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false, "the old subscription's traffic doesn't confirm the new target");
+  f.pending.shift()!.fail();
+  await retarget;
+  assert.equal(f.isOpen(), false, 'and a failed open for the new target leaves it unconfirmed');
+});
+
+test('traffic for a channel decided closed leaves its confirmed close standing', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  assert.equal((await f.tool('close')).success, true);
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false);
+});
+
+test('a close that lands while the coalescer holds a message stands', async () => {
+  let admit!: () => void;
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admit = resolve; });
+    return { messageId: held.messageId, accepted: true };
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  const incoming = f.registry.handleIncoming('test', { messages: [{ ...message(), coalesce: { key: 'subject' } }] });
+  await tick();
+  assert.equal((await f.tool('close')).success, true);
+  admit();
+  await incoming;
+  assert.equal(f.isOpen(), false, 'the close receipt stands');
+});
+
+test('a retarget of a channel decided open opens the new target; one decided closed sends nothing', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A'), descriptor('y', false, 'A')] });
+  f.calls.length = 0;
+  await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B'), descriptor('y', false, 'B')] });
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.id, c.address]), [['open', 'x', { value: 'B' }]]);
+  assert.equal(f.isOpen('x'), true);
+  const closeY = await f.registry.handleChannelToolCall('channel_close', { serverId: 'test', channelId: 'y' });
+  assert.equal(dataOf(closeY).status, 'closed', "y's new target is unconfirmed, so its close is sent");
+  assert.deepEqual(f.calls.at(-1), { kind: 'close', id: 'y', address: undefined });
+});
+
+test("removing a server cancels its queued lifecycle work, even across a re-registration", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.calls.length = 0;
+  f.held.add('x');
+  const closing = f.tool('close');
+  await tick();
+  const reopening = f.tool('open');
+  f.registry.removeServer('test');
+  const reregistration = f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await f.drain(closing, reopening, reregistration);
+  assert.equal((await reopening).success, false, 'the open queued before the removal never runs');
+  assert.match(String((await reopening).error), /removed while this operation was queued/);
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open'], "the close in flight, then the re-registration's own open");
+  assert.equal(f.isOpen(), true);
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
+});
+
+test('a substitute removed while its corrective close is queued is cancelled, not traced as failed', async () => {
+  const f = fixture();
+  f.held.add('y');
+  const registration = f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('y')] });
+  await tick();
+  assert.equal(f.pending.length, 1, "y's initial close is in flight");
+  f.answeredFor.set('x', 'y');
+  const opening = f.tool('open');
+  for (let i = 0; i < 3; i++) await tick();
+  await f.registry.handleChanged('test', { removed: ['y'] });
+  await f.drain(registration, opening);
+  assert.equal((await opening).success, false);
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
+});
+
+test('declining an invitation closes an unconfirmed transport for real, and waits for pending work', async () => {
+  const f = fixture();
+  const decline = () => f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+  f.held.add('x');
+  const registration = f.registry.handleChanged('test', { added: [descriptor()] });
+  await tick();
+  f.pending.shift()!.fail();
+  await registration;
+  f.held.delete('x');
+  f.calls.length = 0;
+  const unconfirmed = await decline();
+  assert.equal(unconfirmed.success, true);
+  assert.equal(dataOf(unconfirmed).status, 'remained closed');
+  assert.equal(dataOf(unconfirmed).closeError, undefined);
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close'], 'the unconfirmed transport is closed for real');
+  f.calls.length = 0;
+  assert.equal((await decline()).success, true);
+  assert.equal(f.calls.length, 0, 'a confirmed close with nothing pending needs no RPC');
+
+  // A re-registration's close in flight: the decline queues behind it.
+  f.held.add('x');
+  const reregistration = f.registry.handleChanged('test', { removed: ['x'], added: [descriptor()] });
+  await tick();
+  assert.equal(f.pending.length, 1);
+  const pending = decline();
+  await f.drain(reregistration, pending);
+  assert.equal((await pending).success, true);
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'close'], 'the decline went through the queue behind the close');
+});
+
+test("a settled operation releases its channel's queue key", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  const internals = f.registry as unknown as { channelLifecycleTails: Map<string, unknown>; lifecycleOutstanding: Map<string, number> };
+  for (let i = 0; i < 3; i++) await tick();
+  assert.equal(internals.channelLifecycleTails.size, 0);
+  assert.equal(internals.lifecycleOutstanding.size, 0);
+});
+
+test('the notices say what happened, name the opt-out, and state no rule about later sends', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'channel-notice-text-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'Test.' }],
+    modules: [], syncIntervalMs: 0,
+  });
+  try {
+    const recordNotice = (framework as unknown as {
+      recordChannelAutoOpenNotice(
+        agent: undefined,
+        channels: Array<{ channelId: string; label?: string }>,
+        cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
+      ): void;
+    }).recordChannelAutoOpenNotice.bind(framework);
+    recordNotice(undefined, [{ channelId: 'discord:g1:c1', label: '#general' }], 'opened-by-reply');
+    recordNotice(undefined, [{ channelId: 'c2' }], 'opened-by-delivery');
+    recordNotice(undefined, [{ channelId: 'c3' }, { channelId: 'c4', label: 'ops' }], 'subscription-policy');
+    const texts = framework.getAgent('resident')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content)
+      .filter((b) => b.type === 'text' && b.text.startsWith('[channels]'))
+      .map((b) => (b as { text: string }).text);
+    assert.deepEqual(texts, [
+      "[channels] Now open: #general (discord:g1:c1): your own message into the closed channel opened it. " +
+        "Ongoing traffic from this channel will reach you. If you don't want it, use channel_close; your choice outranks policy.",
+      "[channels] Now open: c2: your own message into the closed channel opened it. " +
+        "Ongoing traffic from this channel will reach you. If you don't want it, use channel_close; your choice outranks policy.",
+      '[channels] Selected for opening by subscription policy: c3, ops (c4). ' +
+        'This records the admission decision; channel_list shows current transport state. ' +
+        "When open, their ongoing traffic will reach you. If you don't want one of them, use channel_close; your choice outranks policy.",
+    ]);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a server the host doesn't direct opens its own channels: its traffic marks them open, and a decline sends nothing", async () => {
+  const f = fixture();
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), true, 'traffic is the only evidence such a server gives');
+  await f.registry.handleChanged('test', { updated: [descriptor('x', false, 'B')] });
+  assert.equal(f.isOpen(), false);
+  await f.registry.handleIncoming('test', { messages: [message('x', 'm2')] });
+  assert.equal(f.isOpen(), true);
+  await f.registry.handleChanged('test', { added: [descriptor('y')] });
+  const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'y', messageId: 'm3' });
+  assert.equal(declined.success, true);
+  assert.equal(dataOf(declined).closeError, undefined);
+  assert.equal(f.calls.length, 0, 'the host sends no lifecycle RPC to a server it does not direct');
+});
+
+test('a failed open leaves the channel unconfirmed: traffic afterwards marks nothing open', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  f.held.add('x');
+  const opening = f.tool('open');
+  await tick();
+  f.pending.shift()!.fail();
+  assert.equal((await opening).success, false);
+  f.held.delete('x');
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false, 'an RPC can fail after the server acted, and traffic does not settle which');
+});
+
+test('disconnecting a server removes its channel entries before its connection closes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'disconnect-order-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'Test.' }],
+    modules: [], syncIntervalMs: 0,
+  });
+  try {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+    let channelsAtClose: number | undefined;
+    const internals = framework as unknown as { channelRegistry: ChannelRegistry | null; mcplServerRegistry: unknown };
+    internals.channelRegistry = f.registry;
+    internals.mcplServerRegistry = {
+      removeServer: async () => { channelsAtClose = f.registry.listChannelsRaw().length; },
+      getAllServers: () => [],
+      closeAll: async () => {},
+    };
+    await framework.disconnectMcplServer('test');
+    assert.equal(channelsAtClose, 0, 'nothing queued for its channels can run against the closing connection');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

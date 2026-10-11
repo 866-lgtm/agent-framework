@@ -202,6 +202,34 @@ test('odd ids are described in the log line, never printed raw', async () => {
   assert.deepEqual(logged, [
     `[channel-open-substituted] server=test requested=x answered=(not a plain id: a ${forged.length}-character string)`,
   ]);
+  assert.equal(f.substituted()[0]?.answeredFor, `(not a plain id: a ${forged.length}-character string)`,
+    'the trace records the same bounded form, not the raw value');
+});
+
+test('an odd id is measured in characters, not UTF-16 units', async () => {
+  const f = fixture(() => ({ channel: { ...descriptor('y'), id: 'y\u{1F600}' } }));
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const { lines } = await capturingErrors(() => f.openX());
+  assert.deepEqual(lines.filter((l) => l.includes('channel-open-substituted')),
+    ['[channel-open-substituted] server=test requested=x answered=(not a plain id: a 2-character string)']);
+});
+
+test('an answer whose channel id is not a string fails the open, and closes nothing', async () => {
+  for (const answer of [
+    () => ({ channel: { ...descriptor('y'), id: 5 } }) as unknown as ChannelsOpenResult,
+    () => ({ history: [{ ...historyOf('y')[0]!, channelId: false }] }) as unknown as ChannelsOpenResult,
+  ]) {
+    const f = fixture(answer);
+    await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('y')] });
+    f.calls.length = 0;
+    const { value: result } = await capturingErrors(() => f.openX());
+    await tick();
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /with a channel id that is not a string/);
+    assert.equal(f.isOpen('x'), false);
+    assert.match(String(f.substituted()[0]?.answeredFor), /^\(not a plain id: (number|boolean)\)$/);
+    assert.deepEqual(f.calls, [{ kind: 'open', id: 'x' }], 'nothing registered by that id to close');
+  }
 });
 
 test('an answer for the requested channel, with or without its history, or one naming no channel, opens it as before', async () => {
@@ -209,6 +237,9 @@ test('an answer for the requested channel, with or without its history, or one n
     (requested: string) => ({ channel: descriptor(requested), history: historyOf(requested) }),
     (requested: string) => ({ channel: descriptor(requested) }),
     () => ({}) as ChannelsOpenResult,
+    // A null id names no channel, in the answer or in a history item.
+    (requested: string) => ({ channel: { ...descriptor(requested), id: null } }) as unknown as ChannelsOpenResult,
+    (requested: string) => ({ history: [{ ...historyOf(requested)[0]!, channelId: null }] }) as unknown as ChannelsOpenResult,
   ]) {
     const f = fixture(answer);
     await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('y')] });
