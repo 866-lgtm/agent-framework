@@ -1,19 +1,35 @@
 - Live `rollbackToMessage` and `suppressMessages` (and message-granular
   `host/command` undo, which rides on rollback) return once the body change
-  has landed, with a marker-scheduling receipt, instead of after every 💤
-  reaction has been delivered. Previously the store stayed reserved, and the
-  operator got no answer, for the whole serial drain. At the reported pace
-  of about one reaction per second, 918 queued marks would take roughly 15
-  minutes; the household's client timed out after 60 seconds. Delivery now
-  continues in the background, behind the same MCPL data-plane gate as
-  before. A gate installed while a drain is still running (restoring the
-  source branch mid-delivery, say) now waits for that drain even when the
-  switch leaves nothing pending, so traffic stays held through the drain's
-  remaining reactions and the removals they need. The result's new
-  `markers` field (`none` | `queued` | `not-scheduled` | `unresolved`) says
-  whether marks were scheduled, never that Discord accepted them. If the
-  ledger write after the switch fails, the rollback that already applied is
-  no longer reported as failed: the batch is retired (`not-scheduled`), or,
-  if even that write fails, the result says the batch may still be delivered
-  (`unresolved`). A suppression whose redactions all committed is no longer
-  undone by that failure.
+  has landed, with a marker-scheduling receipt, instead of after every
+  awareness reaction (💤 by default) has been delivered. Previously the store
+  stayed reserved, and the operator got no answer, for the whole serial
+  drain. At the reported pace of about one reaction per second, 918 queued
+  marks would take roughly 15 minutes; the household's client timed out
+  after 60 seconds. Delivery now continues in the background, behind the
+  same MCPL data-plane gate as before, which holds channel traffic until the
+  marks are attempted. A turn that carries no channel traffic, such as a
+  scheduler timer or a provider admission, may run during delivery.
+- The other branch moves no longer wait for Discord either: the web API's
+  `branch.switch`, `undo` and `redo`, and `host/command` turn undo, return
+  once the branch has moved, and their marks follow behind the same gate. A
+  delivery that fails to start raises a `discord-awareness-delivery` ops
+  alert instead of failing the command, and the next sync, reconnect or
+  start delivers what is still pending. (The web switch used to be
+  acknowledged only after its marks were attempted.)
+- A gate installed while a drain is still running (restoring the source
+  branch mid-delivery, say) waits for that drain and then drains again from
+  the ledger, so every mark pending when the gate was armed is attempted
+  before traffic is released: the drain's remaining reactions, the removals
+  they need, and an add re-pended during the drain (a rollback, its undo,
+  then a redo). Inbound MCPL handlers wait out a generation installed while
+  they wait, not only the one they first saw, and a reconnect's gate opens
+  only once both its drain and the server's re-registration have finished.
+- The result's new `markers` field (`none` | `queued` | `not-scheduled` |
+  `unresolved`) says whether marks were scheduled, never that Discord
+  accepted them. The `[operator]` stderr line gains `marks=…` and the
+  operator-actions log entry gains `markers`. If the ledger write after the
+  switch fails, the rollback that already applied is no longer reported as
+  failed: the batch is retired (`not-scheduled`), or, if even that write
+  fails, the result says the batch may still be delivered (`unresolved`). A
+  suppression whose redactions all committed is no longer undone by that
+  failure.

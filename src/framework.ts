@@ -513,6 +513,21 @@ interface DiscordAwarenessBarrier {
   promise: Promise<DiscordAwarenessDrainOutcome>;
 }
 
+/** Several drains' outcomes as one: unavailable only if every one was. */
+function combineDrainOutcomes(outcomes: DiscordAwarenessDrainOutcome[]): DiscordAwarenessDrainOutcome {
+  if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
+    return {
+      status: 'unavailable',
+      accounted: outcomes.reduce((count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0), 0),
+    };
+  }
+  return {
+    status: 'delivered',
+    delivered: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0), 0),
+    failed: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0), 0),
+  };
+}
+
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
@@ -5360,7 +5375,9 @@ export class AgentFramework {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
 
-    await this.syncDiscordAwarenessMarkers();
+    // The branch has moved: delivery of the marks it changes starts behind
+    // the data-plane gate, and the command doesn't wait for Discord.
+    this.startDiscordAwarenessDelivery('turn undo', agentName);
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -6065,7 +6082,7 @@ export class AgentFramework {
         // Installs the MCPL data-plane gate synchronously, before the store is
         // released, and starts delivery without awaiting it (the first
         // reaction request may already be on the wire when this returns).
-        this.deliverDiscordAwarenessInBackground('rollback', agentName);
+        this.startDiscordAwarenessDelivery('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6250,14 +6267,15 @@ export class AgentFramework {
         // Every redaction committed: the body change has landed and the fork
         // is safe to serve from. Activating the marker batch is bookkeeping
         // about a world-side effect; if it fails, the suppression still
-        // stands and the receipt says the marks were not scheduled. (No
-        // interval needs resuming any more, so retiring the batch there
-        // loses nothing.)
+        // stands and the receipt says the marks were not scheduled. (The
+        // batch's resume journal has nothing left to do, since every interval
+        // has committed, so retiring the batch gives up only the marks, and
+        // the receipt says so.)
         markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
         // Installs the MCPL data-plane gate synchronously, before the store is
         // released, and starts delivery without awaiting it (the first
         // reaction request may already be on the wire when this returns).
-        this.deliverDiscordAwarenessInBackground('suppress', agentName);
+        this.startDiscordAwarenessDelivery('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6304,10 +6322,17 @@ export class AgentFramework {
    * activated is retired, so no later reconciliation can deliver it behind a
    * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
    * too, the receipt says only that the outcome is `unresolved`: the batch is
-   * still prepared, and the reconciliation that delivery runs next may well
-   * promote it. A batch with no refs (a suppression journal with nothing
-   * addressable) is still activated, which closes its resume journal; it
-   * schedules no marks.
+   * still prepared, and it may still be delivered. A rollback's batch
+   * (activated by target branch) may be promoted by the very next
+   * reconciliation, the one the delivery it starts runs; a suppression's
+   * (activated explicitly) waits for the next start.
+   *
+   * A batch with no refs (a suppression journal with nothing addressable) is
+   * still activated, which closes its resume journal. It schedules no marks,
+   * so it reports `none` whatever the ledger does. If it can be neither
+   * activated nor retired, its journal is left prepared and closes at the
+   * next start: every interval it names has already committed, so the resume
+   * skips them all and activates it.
    */
   private activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,
@@ -6351,25 +6376,35 @@ export class AgentFramework {
   }
 
   /**
-   * Start awareness delivery without the caller awaiting it.
-   * `syncDiscordAwarenessMarkers` installs the MCPL data-plane gate
-   * synchronously, before its first await, so calling this while a surgery
-   * still holds the store keeps MCPL-borne wakes behind the gate exactly as
-   * before. The drain starts in the same synchronous run (the first reaction
-   * request can be written before this returns) and continues independently;
-   * only the surgery's response and its store reservation stop waiting on
-   * remote reactions. A failure is accounted by the gate itself (connections
-   * recycled); here it is logged and raised as an ops alert.
+   * Start awareness delivery after a branch move (a surgery, a switch, an
+   * undo or redo) without the caller awaiting it. No operator response waits
+   * for Discord to accept marks: the MCPL data-plane gate alone holds channel
+   * traffic until they are attempted. `syncDiscordAwarenessMarkers` installs
+   * that gate synchronously, before its first await, so calling this while a
+   * surgery still holds the store keeps MCPL-borne wakes behind the gate
+   * exactly as before. The drain starts in the same synchronous run (the
+   * first reaction request can be written before this returns) and continues
+   * independently; the caller's response and any store reservation stop
+   * waiting on remote reactions. A wake that carries no channel traffic (a
+   * scheduler timer, a provider admission) may run during delivery. A failure
+   * is accounted by the gate itself (connections recycled); here it is
+   * logged and raised as an ops alert, and the next sync, reconnect or start
+   * delivers what is still pending.
+   *
+   * @param after What moved the branch, for the log and the alert
+   *   ("rollback", "branch switch", "undo" …).
+   * @param agentName The agent the move was for, or "framework" for a
+   *   branch switch that names none.
    */
-  private deliverDiscordAwarenessInBackground(verb: 'rollback' | 'suppress', agentName: string): void {
+  startDiscordAwarenessDelivery(after: string, agentName = 'framework'): void {
     if (!this.discordAwarenessOutbox) return;
     this.syncDiscordAwarenessMarkers().catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
-      console.error(`[discord-awareness] delivery after ${verb} agent=${agentName} failed: ${detail}`);
+      console.error(`[discord-awareness] delivery after ${after} agent=${agentName} failed: ${detail}`);
       this.opsAlert(
         'discord-awareness-delivery',
         agentName,
-        `Awareness mark delivery after ${verb} failed: ${detail}`,
+        `Awareness mark delivery after ${after} failed: ${detail}`,
       );
     });
   }
@@ -13520,8 +13555,8 @@ export class AgentFramework {
     // present, so the ledger shows nothing to do while the drain goes on to
     // send its saved adds and then the removals they need. So a generation
     // accounts for every running drain as well as for every pending
-    // operation, and joins those drains instead of releasing the data planes
-    // beside them.
+    // operation, and waits for those drains instead of releasing the data
+    // planes beside them (drainForGeneration).
     const serverIds = [...new Set([
       ...pending.map((operation) => operation.ref.serverId),
       ...this.discordAwarenessDrains.keys(),
@@ -13533,30 +13568,42 @@ export class AgentFramework {
       };
     }
     const promise = Promise.all(
-      serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)),
-    ).then((outcomes): DiscordAwarenessDrainOutcome => {
-      if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
-        return {
-          status: 'unavailable',
-          accounted: outcomes.reduce(
-            (count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0),
-            0,
-          ),
-        };
-      }
-      return {
-        status: 'delivered',
-        delivered: outcomes.reduce(
-          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0),
-          0,
-        ),
-        failed: outcomes.reduce(
-          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0),
-          0,
-        ),
-      };
-    });
+      serverIds.map((serverId) => this.drainForGeneration(serverId)),
+    ).then(combineDrainOutcomes);
     return { requiresBarrier: true, promise };
+  }
+
+  /**
+   * One server's drain for a new generation: a gate completes only after
+   * every operation pending when it was armed has been attempted. A drain
+   * already running can't promise that. It never re-sends a key it has
+   * attempted, so an operation re-pended while it runs (a rollback, its undo,
+   * then a redo, all mid-drain) stays pending, and it may already have made
+   * its last read of the ledger, missing a batch activated since. So a
+   * generation that finds a drain running waits for it, then drains again
+   * with a fresh pass that reads the ledger anew. Two generations waiting on
+   * the same drain share the fresh pass that follows it.
+   */
+  private drainForGeneration(serverId: string): Promise<DiscordAwarenessDrainOutcome> {
+    const running = this.discordAwarenessDrains.get(serverId);
+    if (!running) return this.drainDiscordAwarenessOutbox(serverId);
+    return running.then((first) => this.drainDiscordAwarenessOutbox(serverId)
+      .then((fresh) => combineDrainOutcomes([first, fresh])));
+  }
+
+  /**
+   * Wait out the awareness gate for an inbound event: the generation current
+   * now, and any generation installed while waiting, until none is current
+   * or the current one is one already waited for. A handler that waited only
+   * for the generation it first saw would go on behind a newer one armed
+   * meanwhile. Rejects as the generation it waited for rejects.
+   */
+  private async awaitDiscordAwarenessBarriers(): Promise<void> {
+    let waited: DiscordAwarenessBarrier | null = null;
+    for (let barrier = this.discordAwarenessBarrier; barrier && barrier !== waited; barrier = this.discordAwarenessBarrier) {
+      waited = barrier;
+      await barrier.promise;
+    }
   }
 
   /**
@@ -14229,8 +14276,7 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
+      await this.awaitDiscordAwarenessBarriers();
       await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
@@ -14245,8 +14291,7 @@ export class AgentFramework {
         return;
       }
       if (this.inferenceRouter && responder) {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
+        await this.awaitDiscordAwarenessBarriers();
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
           respond: responder.respond,
           respondError: responder.respondError,
@@ -14332,8 +14377,7 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
+      await this.awaitDiscordAwarenessBarriers();
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
@@ -14344,8 +14388,7 @@ export class AgentFramework {
     ) => {
       if (!responder) return;
       try {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
+        await this.awaitDiscordAwarenessBarriers();
         const result = await this.handleHostCommand(connection.id, params ?? {});
         responder.respond(result);
       } catch (error) {
@@ -14387,7 +14430,7 @@ export class AgentFramework {
       // grant) before the data-plane barrier releases — otherwise the first
       // post-reconnect events land while the grant is still empty and are
       // rejected fail-closed instead of delivered.
-      void (async () => {
+      const reregistered = (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
           if (config) {
@@ -14402,7 +14445,11 @@ export class AgentFramework {
         this.releaseMcplDataPlaneGate(awarenessBarrier);
         this.handleToolsListChanged(connection.id);
       })();
-      void awarenessBarrier.promise.then(() => {
+      // The gate completes, and the data planes go ready, only once both the
+      // awareness drain and the re-registration have finished. A drain can
+      // settle first (one already running, or little to send), and the grant
+      // must exist before the first data-plane event flows.
+      void Promise.all([awarenessBarrier.promise, reregistered]).then(() => {
         if (
           awarenessBarrier.requiresBarrier
           && !this.completeMcplDataPlaneGate(awarenessBarrier)

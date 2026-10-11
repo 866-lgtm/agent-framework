@@ -128,8 +128,11 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
  *   `discordAwarenessOutboxPath` and no `storePath`). It is not proof that
  *   no addressable Discord message was removed: the surgery's `removedRefs`
  *   (`discordRefs` in the operator log) say whether any was.
- * - `queued` — the outbox batch is durably active and its delivery has been
- *   handed to the background drain. It is not a delivery claim: per-message
+ * - `queued` — the outbox batch is durably active, and its delivery was
+ *   started in the background. If starting it fails (reconciliation reading
+ *   or writing the ledger), the batch stays durably active, the
+ *   `discord-awareness-delivery` ops alert says so, and the next sync,
+ *   reconnect or start delivers it. It is not a delivery claim: per-message
  *   outcomes stay in the outbox ledger.
  * - `not-scheduled` — the body change landed, but recording the batch as
  *   active failed, so it was retired from the ledger: none of its marks will

@@ -2,15 +2,18 @@
 //
 // Every tools/call is appended to CALLS_PATH. While HOLD_PATH is set and that
 // file does not exist, replies are withheld, standing in for Discord pacing a
-// long reaction drain. When PROBE_PATH appears, the server sends one
-// inference-bearing channels/incoming request and appends to EVENTS_PATH when
-// the host answers it, so a test can see whether the MCPL data plane was held.
-import { appendFileSync, existsSync } from 'node:fs';
+// long reaction drain. ANSWER_LIMIT_PATH, when that file exists, caps how many
+// calls are answered in all: later calls wait until the number in it grows.
+// When PROBE_PATH appears, the server sends one inference-bearing
+// channels/incoming request and appends to EVENTS_PATH when the host answers
+// it, so a test can see whether the MCPL data plane was held.
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
 const callsPath = process.env.CALLS_PATH;
 const eventsPath = process.env.EVENTS_PATH;
 const holdPath = process.env.HOLD_PATH;
 const probePath = process.env.PROBE_PATH;
+const answerLimitPath = process.env.ANSWER_LIMIT_PATH;
 const channelId = process.env.CHANNEL_ID ?? 'discord:g1:c1';
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
@@ -21,11 +24,23 @@ const event = (name, extra = {}) => {
 };
 
 const held = [];
+let answered = 0;
 let probed = false;
 let buf = '';
 
+function answerLimit() {
+  if (!answerLimitPath || !existsSync(answerLimitPath)) return Infinity;
+  const limit = Number(readFileSync(answerLimitPath, 'utf8').trim());
+  return Number.isFinite(limit) ? limit : Infinity;
+}
+
+function mayAnswer() {
+  return (!holdPath || existsSync(holdPath)) && answered < answerLimit();
+}
+
 function answer(message) {
-  event('reaction-answered', { messageId: message.params?.arguments?.messageId });
+  answered++;
+  event('reaction-answered', { messageId: message.params?.arguments?.messageId, name: message.params?.name });
   reply(message.id, { content: [{ type: 'text', text: 'Reaction applied' }] });
 }
 
@@ -68,7 +83,7 @@ function handle(message) {
     if (callsPath) {
       appendFileSync(callsPath, JSON.stringify({ at: Date.now(), name: message.params?.name, args: message.params?.arguments }) + '\n');
     }
-    if (holdPath && !existsSync(holdPath)) held.push(message);
+    if (held.length > 0 || !mayAnswer()) held.push(message);
     else answer(message);
     return;
   }
@@ -93,9 +108,7 @@ process.stdin.on('data', (chunk) => {
 });
 
 const timer = setInterval(() => {
-  if (held.length > 0 && holdPath && existsSync(holdPath)) {
-    for (const message of held.splice(0)) answer(message);
-  }
+  while (held.length > 0 && mayAnswer()) answer(held.shift());
   if (!probed && probePath && existsSync(probePath)) {
     probed = true;
     event('probe-sent');

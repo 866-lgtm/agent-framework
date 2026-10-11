@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AgentFramework, DiscordAwarenessOutbox } from '../src/index.js';
+import { AgentFramework, ApiServer, DiscordAwarenessOutbox } from '../src/index.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -60,16 +60,32 @@ describe('surgery marker receipt', () => {
   let callsPath: string;
   let eventsPath: string;
   let holdPath: string;
+  let answerLimitPath: string;
   let probePath: string;
   let framework: AgentFramework;
 
   const cm = () => framework.getAgent('resident')!.getContextManager();
   const outboxPath = () => join(storePath, 'recovery', 'discord-awareness-outbox.json');
   const ledger = () => new DiscordAwarenessOutbox(outboxPath()).batches();
+  type Internals = {
+    discordAwarenessBarrier: { requiresBarrier: boolean } | null;
+    mcplServerRegistry: { getServer(id: string): { dataPlaneReady: boolean } | undefined } | null;
+    reserveStoreForSurgery(verb: string, agentName: string): () => void;
+    recordTurnCheckpoint(agentName: string): void;
+    handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
+  const internals = () => framework as unknown as Internals;
+  /** The delivery gate is up: a generation that requires it, and discord's data plane paused. */
+  const assertGateUp = (when: string) => {
+    assert.equal(internals().discordAwarenessBarrier?.requiresBarrier, true, `${when}: an awareness generation requires the gate`);
+    assert.equal(internals().mcplServerRegistry?.getServer('discord')?.dataPlaneReady, false, `${when}: discord's data plane is paused`);
+  };
+  const probeAnswer = () => jsonl<{ event: string; error?: unknown }>(eventsPath).find((e) => e.event === 'probe-answered');
 
-  async function start(withDiscord: boolean): Promise<void> {
+  /** With `appStore`, the framework gets an app-owned store and no storePath, so its outbox is disabled. */
+  async function start(withDiscord: boolean, appStore?: unknown): Promise<void> {
     framework = await AgentFramework.create({
-      storePath,
+      ...(appStore ? { store: appStore as never } : { storePath }),
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
       modules: [],
@@ -83,6 +99,7 @@ describe('surgery marker receipt', () => {
             CALLS_PATH: callsPath,
             EVENTS_PATH: eventsPath,
             HOLD_PATH: holdPath,
+            ANSWER_LIMIT_PATH: answerLimitPath,
             PROBE_PATH: probePath,
           },
           enabledFeatureSets: ['chat'],
@@ -114,6 +131,7 @@ describe('surgery marker receipt', () => {
     callsPath = join(dir, 'calls.jsonl');
     eventsPath = join(dir, 'events.jsonl');
     holdPath = join(dir, 'release-reactions');
+    answerLimitPath = join(dir, 'answer-limit');
     probePath = join(dir, 'send-probe');
   });
 
@@ -186,6 +204,7 @@ describe('surgery marker receipt', () => {
 
     // The gate was installed before release: ordinary channel traffic sent
     // during delivery is not answered until the reactions are.
+    assertGateUp('during the first surgery\'s delivery');
     writeFileSync(probePath, '1');
     await waitFor('the probe to be sent', () => jsonl(eventsPath).some((e) => e.event === 'probe-sent'));
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -198,6 +217,7 @@ describe('surgery marker receipt', () => {
     writeFileSync(holdPath, '1');
     await waitFor('the probe to be answered after delivery', () =>
       jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
+    assert.equal(probeAnswer()?.error, null, 'the probe was answered, not refused');
     // The server's own event order, not timestamps (two events can share a
     // millisecond), and every expected reaction by id: one compared only with
     // the reactions that happened to be answered would pass if the second
@@ -233,6 +253,9 @@ describe('surgery marker receipt', () => {
     // the running drain knows it will still send its saved adds.
     framework.getStore().switchBranch(rollback.sourceBranch);
     const restored = framework.syncDiscordAwarenessMarkers();
+    // Nothing pending for discord: only the running drain keeps the gate up.
+    assert.equal(new DiscordAwarenessOutbox(outboxPath()).pending('discord').length, 0, 'the ledger shows nothing pending');
+    assertGateUp('after the restore');
 
     writeFileSync(probePath, '1');
     await waitFor('the probe to be sent', () => jsonl(eventsPath).some((e) => e.event === 'probe-sent'));
@@ -247,6 +270,7 @@ describe('surgery marker receipt', () => {
     await settlesWithin(restored, 5_000, "the restore's synchronization");
     await waitFor('the probe to be answered after delivery', () =>
       jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
+    assert.equal(probeAnswer()?.error, null, 'the probe was answered, not refused');
 
     // Every reaction request the drain made, including the removals the
     // restore needs, was answered before channel traffic was released, and
@@ -344,6 +368,226 @@ describe('surgery marker receipt', () => {
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]));
     assert.equal(result.markers.status, 'not-scheduled');
     assert.deepEqual(ledger(), [], 'every interval committed, so the retired journal loses nothing');
+    const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'suppress');
+    assert.equal(entry?.error, undefined, 'logged as an applied suppression');
+    assert.deepEqual(entry?.result?.markers, result.markers);
+  });
+
+  it('installs the delivery gate before the surgery releases the store', async () => {
+    await start(true);
+    const { tail } = seed(2);
+    const atRelease: Array<{ installed: boolean; requires?: boolean }> = [];
+    const reserve = internals().reserveStoreForSurgery.bind(framework);
+    internals().reserveStoreForSurgery = (verb, agentName) => {
+      const release = reserve(verb, agentName);
+      return () => {
+        const barrier = internals().discordAwarenessBarrier;
+        atRelease.push({ installed: barrier !== null, requires: barrier?.requiresBarrier });
+        release();
+      };
+    };
+    await settlesWithin(framework.rollbackToMessage('resident', { messageId: tail }), 3_000, 'rollback with reactions held');
+    assert.deepEqual(atRelease, [{ installed: true, requires: true }]);
+  });
+
+  it('a switch, an undo, a redo and a turn undo during a running drain return while replies are held', async () => {
+    await start(true);
+    internals().recordTurnCheckpoint('resident');
+    const { tail } = seed(3);
+    const rollback = await settlesWithin(
+      framework.rollbackToMessage('resident', { messageId: tail }),
+      3_000,
+      'rollbackToMessage with reactions held',
+    );
+    await waitFor('the first reaction call to reach the server', () => jsonl(callsPath).length >= 1);
+
+    // The web API's commands, called as its WebSocket dispatch calls them.
+    const server = new ApiServer(framework, { port: 0 }) as unknown as {
+      cmdBranchSwitch(params: { name: string }): Promise<{ switched: boolean }>;
+      cmdUndo(params: { agentName: string }): Promise<{ undone?: boolean }>;
+      cmdRedo(params: { agentName: string }): Promise<{ redone?: boolean }>;
+    };
+    const switched = await settlesWithin(server.cmdBranchSwitch({ name: rollback.sourceBranch }), 3_000, 'web branch switch');
+    assert.equal(switched.switched, true);
+    assertGateUp('after the switch');
+    const undone = await settlesWithin(server.cmdUndo({ agentName: 'resident' }), 3_000, 'web undo');
+    assert.equal(undone.undone, true);
+    const redone = await settlesWithin(server.cmdRedo({ agentName: 'resident' }), 3_000, 'web redo');
+    assert.equal(redone.redone, true);
+    const turnUndo = await settlesWithin(
+      internals().handleHostCommand('discord', { command: 'undo', agentName: 'resident', turns: 1 }),
+      3_000,
+      'host/command turn undo',
+    );
+    assert.equal(turnUndo.undone, 1);
+
+    // None of them waited for Discord: no reaction has been answered, and the
+    // gate still holds traffic for the marks they moved.
+    assert.equal(jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length, 0);
+    assertGateUp('after every command returned');
+    writeFileSync(holdPath, '1');
+    await framework.syncDiscordAwarenessMarkers();
+    assert.equal(new DiscordAwarenessOutbox(outboxPath()).pending().length, 0, 'every mark the moves needed was delivered');
+  });
+
+  it('a rollback, its restore and a redo during one drain: every mark is sent before traffic is released', async () => {
+    await start(true);
+    const { tail } = seed(2);
+    const rollback = await settlesWithin(
+      framework.rollbackToMessage('resident', { messageId: tail }),
+      3_000,
+      'rollbackToMessage with reactions held',
+    );
+    await waitFor('the first add to reach the server', () => jsonl(callsPath).length >= 1);
+
+    // The source is restored while the first add waits for its reply.
+    framework.getStore().switchBranch(rollback.sourceBranch);
+    const restored = framework.syncDiscordAwarenessMarkers();
+    // The drain sends both adds, then the removals the restore needs. The
+    // first removal is held.
+    writeFileSync(answerLimitPath, '2');
+    writeFileSync(holdPath, '1');
+    await waitFor('the first removal to reach the server', () =>
+      jsonl<{ name: string }>(callsPath).some((call) => call.name === 'remove_reaction'));
+    // The rollback is redone while that removal is in flight. The drain has
+    // already attempted both adds, so it won't send them again itself.
+    framework.getStore().switchBranch(rollback.targetBranch);
+    const redone = framework.syncDiscordAwarenessMarkers();
+    writeFileSync(probePath, '1');
+    await waitFor('the probe to be sent', () => jsonl(eventsPath).some((e) => e.event === 'probe-sent'));
+    assertGateUp('after the redo');
+
+    writeFileSync(answerLimitPath, '99');
+    await settlesWithin(Promise.all([restored, redone]), 5_000, 'the restore and redo synchronizations');
+    await waitFor('the probe to be answered after delivery', () => probeAnswer() !== undefined);
+    assert.equal(probeAnswer()?.error, null, 'the probe was answered, not refused');
+
+    assert.deepEqual(
+      ledger()[0].refs.map((ref) => [ref.messageId, ref.desired, ref.markerPresent]),
+      [['amb-0', true, true], ['amb-1', true, true]],
+      'the redo\'s marks are on Discord',
+    );
+    const events = jsonl<{ event: string; name?: string; messageId?: string }>(eventsPath);
+    const probeIndex = events.findIndex((e) => e.event === 'probe-answered');
+    assert.deepEqual(
+      events.slice(0, probeIndex).filter((e) => e.event === 'reaction-answered').map((e) => `${e.name}:${e.messageId}`),
+      [
+        'add_reaction:amb-0', 'add_reaction:amb-1',
+        'remove_reaction:amb-0', 'remove_reaction:amb-1',
+        'add_reaction:amb-0', 'add_reaction:amb-1',
+      ],
+      'the redo\'s adds were sent again, before channel traffic was released',
+    );
+  });
+
+  it('with the awareness outbox disabled, a rollback schedules no marks and puts up no gate', async () => {
+    const { JsStore } = await import('@animalabs/chronicle');
+    await start(true, JsStore.openOrCreate({ path: join(dir, 'app-store') }));
+    const { tail } = seed(2);
+    const result = await settlesWithin(
+      framework.rollbackToMessage('resident', { messageId: tail }),
+      3_000,
+      'rollbackToMessage without an outbox',
+    );
+    assert.equal(result.messagesRemoved, 2);
+    assert.equal(result.removedRefs.length, 2, 'it removed addressable Discord messages');
+    assert.deepEqual(result.markers, { status: 'none', queued: 0 });
+    assert.equal(internals().discordAwarenessBarrier, null, 'no gate');
+
+    // Reactions are still held, and none is needed: traffic flows at once.
+    writeFileSync(probePath, '1');
+    await waitFor('the probe to be answered with no gate', () => probeAnswer() !== undefined);
+    assert.equal(probeAnswer()?.error, null);
+    assert.equal(jsonl(callsPath).length, 0, 'no reaction was sent');
+  });
+
+  it('a delivery that fails to start raises an ops alert and leaves no unhandled rejection', async () => {
+    await start(true);
+    const { tail } = seed(2);
+    const alerts: Array<{ kind: string; message: string }> = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; message: string });
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    const reconcile = DiscordAwarenessOutbox.prototype.reconcileForBranch;
+    DiscordAwarenessOutbox.prototype.reconcileForBranch = function () {
+      throw new Error('injected ledger read failure');
+    };
+    let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
+    try {
+      result = await settlesWithin(
+        framework.rollbackToMessage('resident', { messageId: tail }),
+        3_000,
+        'rollbackToMessage whose delivery fails to start',
+      );
+      await waitFor('the delivery alert', () => alerts.some((alert) => alert.kind === 'discord-awareness-delivery'));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      DiscordAwarenessOutbox.prototype.reconcileForBranch = reconcile;
+      process.off('unhandledRejection', onUnhandled);
+    }
+    assert.deepEqual(unhandled, [], 'the background failure is handled');
+    assert.match(
+      alerts.find((alert) => alert.kind === 'discord-awareness-delivery')!.message,
+      /after rollback failed: .*injected ledger read failure/,
+    );
+    // Scheduling succeeded: the batch stays durably active for the next sync.
+    assert.equal(result.markers.status, 'queued');
+    assert.equal(ledger()[0].status, 'active');
+  });
+
+  it('a suppression with nothing addressable reports none, whether or not its journal can be closed', async () => {
+    await start(false);
+    const local = String(cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {}));
+    const other = String(cm().addMessage('resident', [{ type: 'text', text: 'also local' }], {}));
+    cm().addMessage('resident', [{ type: 'text', text: 'after' }], {});
+
+    const closed = await framework.suppressMessages('resident', { messageIds: [local] });
+    assert.deepEqual(closed.markers, { status: 'none', queued: 0 });
+    const [journal] = ledger();
+    assert.equal(journal?.status, 'active', 'activated, which closes the resume journal');
+    assert.deepEqual(journal.refs, []);
+
+    // When the journal can be neither activated nor retired, it still
+    // schedules nothing, and the receipt says none, not unresolved.
+    const activate = DiscordAwarenessOutbox.prototype.activate;
+    const discard = DiscordAwarenessOutbox.prototype.discard;
+    DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected ledger failure'); };
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    let stuck: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
+    try {
+      stuck = await framework.suppressMessages('resident', { messageIds: [other] });
+    } finally {
+      DiscordAwarenessOutbox.prototype.activate = activate;
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.deepEqual(stuck.markers, { status: 'none', queued: 0 });
+    assert.equal(ledger().filter((batch) => batch.status === 'prepared').length, 1, 'its journal is left prepared');
+  });
+
+  it('a suppression whose batch can be neither activated nor retired reports unresolved', async () => {
+    await start(false);
+    const { removed } = seed(3);
+    const activate = DiscordAwarenessOutbox.prototype.activate;
+    const discard = DiscordAwarenessOutbox.prototype.discard;
+    DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected ledger failure'); };
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    let result: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
+    try {
+      result = await framework.suppressMessages('resident', { messageIds: [removed[1]] });
+    } finally {
+      DiscordAwarenessOutbox.prototype.activate = activate;
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.equal(cm().currentBranch().name, result.targetBranch, 'the suppression stands');
+    assert.equal(result.markers.status, 'unresolved');
+    const [batch] = ledger();
+    assert.equal(batch.status, 'prepared');
+    assert.equal(result.markers.status === 'unresolved' && result.markers.batchId, batch.id);
+    const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'suppress');
+    assert.deepEqual(entry?.result?.markers, result.markers);
   });
 
   it('a surgery that removes nothing addressable schedules no marks', async () => {
@@ -351,6 +595,7 @@ describe('surgery marker receipt', () => {
     const keep = String(cm().addMessage('Operator', [{ type: 'text', text: 'kept' }], {}));
     cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {});
     const result = await framework.rollbackToMessage('resident', { messageId: keep });
+    assert.equal(result.messagesRemoved, 1, 'the rollback did change the body');
     assert.deepEqual(result.markers, { status: 'none', queued: 0 });
     assert.equal(ledger().length, 0);
   });
