@@ -48,7 +48,7 @@ describe('waitDeadline', () => {
   });
 
   it('is the moment it was stated for a negative wait: already over, never held (PR #251 review)', () => {
-    // -Infinity too: as negative as any, so over, never held (sw-af251 I18).
+    // -Infinity too: as negative as any, so over, never held.
     for (const negative of [-1, -1_000, -0.4, -0, -1e20, -Number.MAX_VALUE, Number.NEGATIVE_INFINITY]) {
       assert.equal(waitDeadline(negative, 1_000), 1_000, String(negative));
     }
@@ -161,7 +161,7 @@ describe('ProviderWaits', () => {
       const waits = new ProviderWaits(store, { now: time.now, ...quiet });
       for (const stated of [-1, -1_000, 0]) {
         const set = waits.set('ada', 'zz-model', stated, `retry now (${stated})`);
-        assert.equal(set.changed, false, `${stated} records nothing (sw-af251 I32)`);
+        assert.equal(set.changed, false, `${stated} records nothing`);
         assert.equal(waits.active('ada', 'zz-model'), undefined, `${stated} binds nothing`);
       }
       assert.equal(store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length, 0, 'no record for a wait already over');
@@ -615,7 +615,7 @@ test('a stated wait past the framework cap is honoured in full, until an operato
   });
 });
 
-test("a non-retryable failure worded as organization acceleration keeps its terminal disposition (sw-af251 I40)", async () => {
+test("a non-retryable failure worded as organization acceleration keeps its terminal disposition", async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, 400);
@@ -641,7 +641,7 @@ test("a non-retryable failure worded as organization acceleration keeps its term
   });
 });
 
-test('a turn arriving at a recorded wait is held without counting a failure (sw-af251 I41)', async () => {
+test('a turn arriving at a recorded wait is held without counting a failure', async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, 60_000);
@@ -744,7 +744,7 @@ test('a restart honours the wait, even after a switch to a branch from before it
   });
 });
 
-for (const [delay, label] of [[3_000_000_000, 'a 34-day delay'], [Number.POSITIVE_INFINITY, 'an infinite delay (sw-af251 I39)']] as const) {
+for (const [delay, label] of [[3_000_000_000, 'a 34-day delay'], [Number.POSITIVE_INFINITY, 'an infinite delay']] as const) {
 test(`a retry policy delay past one timer is waited in full, and stop() ends the wait: ${label}`, async () => {
   await withStoreDir(async (path) => {
     const log = silence();
@@ -1048,7 +1048,7 @@ test('a hold for unreadable records ends by itself once they read again: its own
   });
 });
 
-test('an auxiliary call naming no model is held by the unreadable-records hold, and only by it (sw-af251 I22)', async () => {
+test('an auxiliary call naming no model is held by the unreadable-records hold, and only by it', async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, 60_000);
