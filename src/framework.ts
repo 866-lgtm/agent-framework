@@ -3748,6 +3748,15 @@ export class AgentFramework {
   ): unknown {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    return this.previewContextFor(agent, budgetTokens, overrides, opts);
+  }
+
+  private previewContextFor(
+    agent: Agent,
+    budgetTokens: number,
+    overrides?: Record<string, unknown>,
+    opts?: { render?: boolean },
+  ): unknown {
     const cm = agent.getContextManager() as unknown as {
       previewContext?: (
         budget: TokenBudget,
@@ -3791,6 +3800,14 @@ export class AgentFramework {
   ): RuntimeSettingsPreview {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    return this.previewRuntimeSettingsFor(agent, patch);
+  }
+
+  /** previewAgentRuntimeSettings for an agent in hand: boot restore previews one not yet registered. */
+  private previewRuntimeSettingsFor(
+    agent: Agent,
+    patch?: AgentRuntimeSettingsPatch,
+  ): RuntimeSettingsPreview {
     const plan = agent.planRuntimeSettings(patch);
     const settings = agent.getRuntimeSettings();
     const base: RuntimeSettingsPreview = {
@@ -3806,8 +3823,8 @@ export class AgentFramework {
       reason?: string;
     } => {
       try {
-        const result = this.previewContextSettings(
-          agentName,
+        const result = this.previewContextFor(
+          agent,
           budgetTokens,
           Object.keys(plan.overrides).length > 0 ? plan.overrides : undefined,
         );
@@ -4060,7 +4077,7 @@ export class AgentFramework {
     const budget = settings.contextBudgetTokens;
     if (budget !== undefined && reached === budget) {
       const patch: AgentRuntimeSettingsPatch = { ...settings, immediate: true };
-      const preview = this.previewAgentRuntimeSettings(agentName, patch);
+      const preview = this.previewRuntimeSettingsFor(agent, patch);
       if (preview.available && preview.effective?.fits) {
         agent.restoreRuntimeSettings(patch, { provenBudget: budget });
         return;
@@ -6542,10 +6559,6 @@ export class AgentFramework {
     this.restoreToolResultGuardSetting(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
-    // Registered before its settings are restored: the restore's preflight
-    // previews the agent by name.
-    this.agents.set(config.name, agent);
-    this.agentConfigs.set(config.name, config);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       this.restorePersistedRuntimeSettings(
@@ -6555,6 +6568,8 @@ export class AgentFramework {
       );
     }
     agent.onContextBudgetCompiled((budget, fit) => this.recordCompiledContextBudget(config.name, budget, fit));
+    this.agents.set(config.name, agent);
+    this.agentConfigs.set(config.name, config);
 
     // First non-ephemeral agent becomes the primary for message routing
     if (!this.primaryAgentName) {
