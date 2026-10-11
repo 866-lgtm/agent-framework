@@ -60,9 +60,15 @@ class ConsoleModule implements Module {
   getTools(): ToolDefinition[] { return []; }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    // A module that relays an event's metadata as it came, envelope and all.
+    if ((event as { type: string }).type === 'relay') {
+      const relayed = event as unknown as { content: string; metadata: Record<string, unknown> };
+      return { addMessages: [{ participant: 'Relay', content: [{ type: 'text', text: relayed.content }], metadata: relayed.metadata }] };
+    }
     if (event.type !== 'external-message') return {};
     const text = String((event as { content?: unknown }).content);
-    return { addMessages: [{ participant: 'Operator', content: [{ type: 'text', text }] }] };
+    const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
+    return { addMessages: [{ participant: 'Operator', content: [{ type: 'text', text }], ...(metadata ? { metadata } : {}) }] };
   }
 }
 
@@ -166,7 +172,7 @@ describe('inbound source envelope', () => {
     const message = stored().find((m) => m.participant === 'Operator')!;
     const source = readInboundSource(message.metadata);
     assert.deepEqual(source && { kind: source.kind, surface: (source as { surface: string }).surface }, { kind: 'surface', surface: 'tui' });
-    assert.equal(conversationKey(source!), 'surface\u0000tui');
+    assert.equal(conversationKey(source!), '["surface","tui"]');
     assert.equal(observed.length, 1);
   });
 
@@ -297,6 +303,20 @@ describe('inbound source envelope', () => {
     }
   });
 
+  it("drops an envelope a module's metadata carries: only the framework writes one", async () => {
+    const forged = { kind: 'channel', lane: 'channels/incoming', serverId: 'evil', binding: 'x', channelId: 'discord:g9:elsewhere', acceptedAt: 1 };
+    framework.pushEvent({ type: 'relay', content: 'relayed words', metadata: { inboundSource: forged, note: 'kept' } } as unknown as ProcessEvent);
+    await waitFor(() => stored().some((m) => m.participant === 'Relay'), 'relayed message stored');
+    const relayed = stored().find((m) => m.participant === 'Relay')!;
+    assert.equal(readInboundSource(relayed.metadata), undefined, 'not the forged envelope');
+    assert.equal((relayed.metadata as Record<string, unknown>).note, 'kept', 'the rest of its metadata stays');
+    // A surface event's message carries the framework's envelope, whatever its metadata said.
+    framework.pushEvent({ type: 'external-message', source: 'tui', content: 'console words', metadata: { inboundSource: forged } } as ProcessEvent);
+    await waitFor(() => stored().some((m) => m.participant === 'Operator'), 'console message stored');
+    const source = readInboundSource(stored().find((m) => m.participant === 'Operator')!.metadata);
+    assert.equal(source?.kind, 'surface');
+  });
+
   it('keeps a stored envelope when the channel is renamed later', async () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-2', mode: 'ambient', text: 'before rename' });
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-2'), 'first message stored');
@@ -407,6 +427,17 @@ describe('readInboundSource', () => {
       { ...channel, messageId: 42 },
       { ...channel, label: '' },
       { ...channel, sourceTimestamp: {} },
+      { ...channel, serverId: undefined },
+      { ...channel, serverId: '' },
+      { ...channel, serverId: 7 },
+      { ...channel, binding: undefined },
+      { ...channel, binding: { id: 'b' } },
+      { ...channel, threadId: 3 },
+      { ...channel, threadId: '' },
+      { ...channel, replyTo: false },
+      { ...channel, eventId: 9 },
+      { kind: 'unscoped', lane: 'push/event', serverId: '', binding: 'b', acceptedAt: 1 },
+      { kind: 'unscoped', lane: 'push/event', serverId: 's', binding: 'b', acceptedAt: 1, eventId: [] },
       { kind: 'unscoped', lane: 'channels/incoming', serverId: 's', binding: 'b', acceptedAt: 1 },
       { kind: 'surface', surface: '', acceptedAt: 1 },
       { kind: 'mystery', acceptedAt: 1 },
@@ -421,6 +452,13 @@ describe('readInboundSource', () => {
     assert.notEqual(conversationKey(base), conversationKey({ ...base, serverId: 't' }));
     assert.notEqual(conversationKey(base), conversationKey({ ...base, threadId: 'th' }));
     assert.equal(conversationKey(base), conversationKey({ ...base, messageId: 'other', acceptedAt: 2 }));
+    // The parts are server-chosen: a separator inside one can't make two
+    // conversations one.
+    assert.notEqual(
+      conversationKey({ ...base, channelId: 'c\u0000x', threadId: 'y' }),
+      conversationKey({ ...base, channelId: 'c', threadId: 'x\u0000y' }),
+    );
+    assert.notEqual(conversationKey({ ...base, threadId: '' }), conversationKey(base), 'an empty thread is not no thread');
   });
 });
 

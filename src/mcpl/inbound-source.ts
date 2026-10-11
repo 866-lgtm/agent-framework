@@ -2,18 +2,18 @@
  * Where an inbound item came from, decided once at Agent Framework's
  * ingestion boundary and stored on the message as `metadata.inboundSource`.
  *
- * Every later consumer reads this one value instead of re-deriving identity
- * from the lane it happened to arrive on: speech routing compares
- * conversations with it, the visible provenance header renders from it, and
- * delivery bookkeeping keys on it. It is frozen when the host ACCEPTS the
- * item. A coalesced occurrence (RFC-006) carries the value stamped at its
- * acceptance through deferral, fan-out and replay, so a later rename,
- * reconnect or re-render never rewrites where an old item says it came from.
+ * A consumer of where an item came from reads this one value
+ * (readInboundSource) rather than re-deriving identity from the lane the
+ * item happened to arrive on, and compares conversations with
+ * conversationKey. It is frozen when the host ACCEPTS the item. A coalesced
+ * occurrence (RFC-006) carries the value stamped at its acceptance through
+ * deferral, fan-out and replay, so a later rename, reconnect or re-render
+ * never rewrites where an old item says it came from.
  *
  * The field is framework-owned. It is written after any adapter-supplied
- * metadata is spread, so an adapter cannot supply or spoof it (adapter
- * `origin` objects already use a free-form `source` string, which is why this
- * is not called `source`).
+ * metadata is spread, so an adapter cannot supply or spoof it, and one a
+ * module's messages carry is dropped (adapter `origin` objects already use a
+ * free-form `source` string, which is why this is not called `source`).
  *
  * Facts only, no policy: whether an item is a body, an edit or a deletion
  * stays in its tags (`chat:edited`, `chat:deleted`); `deferred` and
@@ -145,13 +145,15 @@ export function readInboundSource(metadata: unknown): InboundSource | undefined 
 /**
  * The conversation an item belongs to, as a comparable key: server + channel
  * + thread for a channel item, the surface for console input. Undefined for an
- * unscoped push, which belongs to no conversation.
+ * unscoped push, which belongs to no conversation. The parts are server-chosen
+ * strings, so they are encoded as a JSON array, never joined with a separator
+ * one of them could contain: two keys are equal only for the same parts.
  */
 export function conversationKey(source: InboundSource): string | undefined {
   if (source.kind === 'channel') {
-    return `channel\u0000${source.serverId}\u0000${source.channelId}\u0000${source.threadId ?? ''}`;
+    return JSON.stringify(['channel', source.serverId, source.channelId, source.threadId ?? null]);
   }
-  if (source.kind === 'surface') return `surface\u0000${source.surface}`;
+  if (source.kind === 'surface') return JSON.stringify(['surface', source.surface]);
   return undefined;
 }
 
