@@ -268,7 +268,7 @@ describe('a reached budget across a restart', () => {
       await compile(framework());
       const log = quietErrors();
       try {
-        // A new recipe (a longer system prompt, say) raised the folded floor.
+        // A restart with a new maxTokens or strategy configuration raised the folded floor.
         const restarted = await withPatched('previewContext', (budget: { maxTokens: number }) => ({
           finalTokens: 70_000, budgetTokens: budget.maxTokens, fits: 70_000 <= budget.maxTokens,
         }), restart);
@@ -374,6 +374,25 @@ describe('a reached budget across a restart', () => {
       }
       assert.ok(log.lines.some((l) => l.includes("couldn't record agent's compile at budget 60000")), log.lines.join('\n'));
       assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000 });
+      // The next compile at that budget records it, once writes work again.
+      await compile(framework());
+      assert.deepEqual(persisted(framework()), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
+    });
+  });
+
+  it('a budget changed while a compile runs is not proven by that compile', async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      // The compile was asked for at the recipe's 100k; the budget drops to
+      // 60k at once while it runs.
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+        return original.apply(this, args);
+      }, () => compile(f));
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'the 100k compile proves nothing about 60k');
+      await compile(f);
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
     });
   });
 });

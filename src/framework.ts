@@ -4063,9 +4063,13 @@ export class AgentFramework {
    * refused: a persisted budget that no longer fits can't brick startup.
    * When the record says the last compile before the stop fit at its budget
    * (`contextBudgetReachedTokens`), that budget is applied at once instead,
-   * but only if the preflight says it fits now: the restart may bring a new
-   * system prompt, tools or maxTokens, and the agent may have run at another
-   * budget since the record was written (context-manager #162). Otherwise it
+   * but only if the preflight says it fits now. The preflight plans the
+   * stored context as the context manager will, so it sees what a restart can
+   * change there: a new maxTokens (the response reserve) or strategy
+   * configuration. It also sees a context that grew while the agent ran at
+   * another budget after the record was written, through a persist: false
+   * change. The system prompt and tools are outside the context manager's
+   * budget, so they don't enter it (context-manager #162). Otherwise it
    * restores paced, with a line saying why.
    */
   private restorePersistedRuntimeSettings(
@@ -4117,15 +4121,18 @@ export class AgentFramework {
    * budget) writes nothing. A failed write is logged; an unreadable record
    * counts as none. Either way the restore then paces, as without the field.
    */
-  private recordCompiledContextBudget(agentName: string, budget: number, fit: boolean): void {
+  private recordCompiledContextBudget(agentName: string, budget: number, fit: boolean): boolean {
     try {
       const persisted = this.readAgentRuntimeSettings(agentName);
-      if (!persisted || persisted.contextBudgetTokens !== budget) return;
-      if ((persisted.contextBudgetReachedTokens === budget) === fit) return;
+      if (!persisted || persisted.contextBudgetTokens !== budget) return true;
+      if ((persisted.contextBudgetReachedTokens === budget) === fit) return true;
       const { contextBudgetReachedTokens: _previous, ...settings } = persisted;
       this.persistAgentRuntimeSettings(agentName, fit ? { ...settings, contextBudgetReachedTokens: budget } : settings);
+      return true;
     } catch (error) {
+      // The agent tells it again at its next compile.
       console.error(`[agent-settings] couldn't record ${agentName}'s compile at budget ${budget}:`, error);
+      return false;
     }
   }
 

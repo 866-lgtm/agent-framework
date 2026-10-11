@@ -145,8 +145,10 @@ export class Agent {
   private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
   /** The live budget the last compile planned at, and whether it fit. */
   private lastCompiledBudget?: { budget: number; fit: boolean };
+  /** The last outcome the listener recorded; a failed record is told again. */
+  private recordedCompiledBudget?: { budget: number; fit: boolean };
   /** Told when that changes (the framework records it beside the persisted budget). */
-  private compiledBudgetListener?: (budget: number, fit: boolean) => void;
+  private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -319,7 +321,7 @@ export class Agent {
    * didn't plan at (after a settle, the target), or the context manager
    * refused a budget the last one fit at.
    */
-  onContextBudgetCompiled(listener: ((budget: number, fit: boolean) => void) | undefined): void {
+  onContextBudgetCompiled(listener: ((budget: number, fit: boolean) => boolean) | undefined): void {
     this.compiledBudgetListener = listener;
   }
 
@@ -329,14 +331,20 @@ export class Agent {
   }
 
   private noteCompiledBudget(budget: number, fit: boolean): void {
-    if (this.lastCompiledBudget?.budget === budget && this.lastCompiledBudget.fit === fit) return;
     this.lastCompiledBudget = { budget, fit };
-    this.compiledBudgetListener?.(budget, fit);
+    const recorded = this.recordedCompiledBudget;
+    if (recorded?.budget === budget && recorded.fit === fit) return;
+    // A listener that couldn't record it returns false, and hears it again
+    // at the next compile.
+    if (this.compiledBudgetListener?.(budget, fit) !== false) this.recordedCompiledBudget = { budget, fit };
   }
 
   /** Compile at the live budget (no explicit one), noting whether it fit. */
   private async compileAtLiveBudget(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    // The budget this compile plans at, and the descent under way when it
+    // started: a change made while it runs is no part of what it shows.
     const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const target = this.contextBudgetTargetTokens;
     let result: CompileResult;
     try {
       result = await compile();
@@ -345,9 +353,13 @@ export class Agent {
       if (error instanceof OverBudgetError || err?.name === 'OverBudgetError') this.noteCompiledBudget(live, false);
       throw error;
     }
-    // A settle proves the target: the frontier fit the window prepared for it.
     this.settleRuntimeSettingsTransition();
-    this.noteCompiledBudget(this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS, true);
+    // A settle of the descent this compile began under proves its target:
+    // the frontier fits the window prepared for it. Otherwise the compile
+    // proves the budget it planned at.
+    const settled = target !== undefined && this.contextBudgetTargetTokens === undefined
+      && this.contextBudgetTokens === target;
+    this.noteCompiledBudget(settled ? target : live, true);
     return result;
   }
 
