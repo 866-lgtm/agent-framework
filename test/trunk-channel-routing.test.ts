@@ -87,12 +87,15 @@ describe('Trunk channel routing (item-3 redux)', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function makeFramework() {
+  async function makeFramework(proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled') {
     // NO `conversations` — this is connectome-host's single-trunk mode.
     return AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{
+        name: 'scout', model: 'test-model', systemPrompt: 'You are scout.',
+        ...(proseRouting ? { proseRouting } : {}),
+      }],
       modules: [],
     });
   }
@@ -183,9 +186,13 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(text, /optionally set acknowledge/);
     assert.match(text, /Doing nothing is also fine\./);
     // 2026-08-05 accuracy pass: the delivery model must be stated correctly —
-    // direct addresses still arrive; un-@'d follow-ups to a reply do not.
+    // direct addresses still arrive while closed.
     assert.match(text, /address you directly/);
-    assert.match(text, /follow-ups to your reply will NOT reach you/);
+    // Replying OPENS the channel (send-opens-channel) in every mode, so the
+    // old "reply without joining / follow-ups won't reach you" option was
+    // false; it must not come back.
+    assert.doesNotMatch(text, /without joining/);
+    assert.doesNotMatch(text, /will NOT reach you/);
     // No surface-tracked tally on this event → no missed-count sentence.
     assert.doesNotMatch(text, /passed there without you/);
     await framework.stop();
@@ -237,6 +244,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     // Live bug (2026-10-02): a first DM arrived on a closed channel labelled "DM: _reim0n"; the
     // invitation said to prefix ">>#DM: _reim0n", which parses as target "#DM:" + body "_reim0n …":
     // the reply bounced, and the retained text later went out with a stray "_reim0n" line.
+    // The `>>` prefix is explicit-mode grammar only, so these agents run explicit routing.
     const textOf = (framework: Awaited<ReturnType<typeof makeFramework>>) =>
       framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
         .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
@@ -256,7 +264,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     });
 
     // The registry knows the channel: its round-trip target is used.
-    const framework = await makeFramework();
+    const framework = await makeFramework('explicit');
     const i = internals(framework);
     const asked: string[] = [];
     i.channelRegistry = {
@@ -275,7 +283,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
 
     // The registry finds no safe token (shared id, whitespace): no prefix is offered at all.
-    const fw2 = await makeFramework();
+    const fw2 = await makeFramework('explicit');
     const i2 = internals(fw2);
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
@@ -287,12 +295,12 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.handleMcplPushEvent(dmEvent('m4'));
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
-    assert.match(t2, /Reply without joining isn't available here/);
+    assert.match(t2, /Replying with a ">>" prefix isn't available here/);
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
 
     // A registry stand-in without proseTargetFor: a whitespace-free guess, never the spaced label.
-    const fw3 = await makeFramework();
+    const fw3 = await makeFramework('explicit');
     const i3 = internals(fw3);
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
@@ -303,6 +311,127 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.handleMcplPushEvent(dmEvent('m5'));
     assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
     await fw3.stop();
+  });
+
+  describe('closed-channel invitation reply option follows the reader\'s prose-routing mode', () => {
+    const textOf = (framework: Awaited<ReturnType<typeof makeFramework>>) =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const stubRegistry = (framework: Awaited<ReturnType<typeof makeFramework>>, asked: string[] = []) => {
+      internals(framework).channelRegistry = {
+        ensureChannelRegistered: () => {},
+        isChannelOpen: () => false,
+        getDescriptor: () => ({ label: 'portables', capabilities: { history: { maxMessages: 80 } } }),
+        proseTargetFor: (id: string) => { asked.push(id); return '#portables'; },
+        stopAll: () => {},
+      };
+      return asked;
+    };
+    const pushMention = (framework: Awaited<ReturnType<typeof makeFramework>>, waking: boolean) =>
+      internals(framework).handleMcplPushEvent({
+        type: 'mcpl:push-event',
+        serverId: 'discord',
+        featureSet: 'discord.messaging',
+        eventId: `discord_msg_${Math.random().toString(36).slice(2)}`,
+        content: [{ type: 'text', text: 'Antra: can you look at this?' }],
+        origin: { source: 'discord', messageId: 'm9', mcplChannelId: 'discord:G1:C7', channelName: 'portables' },
+        tags: ['chat:mention', 'chat:addressed'],
+        timestamp: new Date().toISOString(),
+        inferenceId: 'i9',
+        triggerInference: waking,
+      });
+
+    for (const mode of ['locus', 'hybrid'] as const) {
+      it(`${mode}: a waking mention says to reply in plain text — no \`>>\` (not parsed in ${mode} mode)`, async () => {
+        // In locus/hybrid mode a ">>#portables …" reply went out VERBATIM,
+        // prefix and all, to the turn's locus — which this addressed wake
+        // makes #portables anyway, opening it on delivery.
+        const framework = await makeFramework(mode);
+        const asked = stubRegistry(framework);
+        pushMention(framework, true);
+        const text = textOf(framework);
+        assert.match(text, /1\. Reply — write your reply as plain text this turn; it will be delivered in #portables/);
+        assert.match(text, /that delivery opens the channel/);
+        assert.match(text, /call channel_close with channelId "discord:G1:C7" to leave again/);
+        assert.doesNotMatch(text, />>/, 'no prefix grammar offered');
+        assert.doesNotMatch(text, /without joining|will NOT reach you/);
+        assert.deepEqual(asked, [], 'no prose target is resolved for a mode that cannot use it');
+        // Options 2 and 3 are unchanged.
+        assert.match(text, /2\. Join the channel — call channel_open with channelId "discord:G1:C7"/);
+        assert.match(text, /3\. Stay out — call channel_decline/);
+        await framework.stop();
+      });
+    }
+
+    it('locus: a NON-waking mention does not promise that plain prose lands there', async () => {
+      // Nothing wakes on it, so whichever turn later reads it has its own
+      // locus; channel_open (which moves the pin) or an explicit send is the
+      // way to answer there.
+      const framework = await makeFramework('locus');
+      stubRegistry(framework);
+      pushMention(framework, false);
+      const text = textOf(framework);
+      assert.match(text, /this message did not start a turn, so your plain prose won't land in #portables by itself/);
+      assert.match(text, /join it \(option 2\) and your plain reply goes there, or answer with an explicit send tool/);
+      assert.doesNotMatch(text, /write your reply as plain text this turn/);
+      assert.doesNotMatch(text, />>/);
+      await framework.stop();
+    });
+
+    it('explicit: keeps the `>>target` syntax and says delivery opens the channel', async () => {
+      const framework = await makeFramework('explicit');
+      const asked = stubRegistry(framework);
+      pushMention(framework, true);
+      const text = textOf(framework);
+      assert.deepEqual(asked, ['discord:G1:C7']);
+      assert.match(text, /1\. Reply — write your reply this turn prefixed with ">>#portables"; it will be delivered there, and that delivery opens the channel/);
+      assert.match(text, /channel_close with channelId "discord:G1:C7"/);
+      assert.doesNotMatch(text, /without joining|will NOT reach you/);
+      await framework.stop();
+    });
+
+    it('disabled: points at an explicit send tool (prose is never published)', async () => {
+      const framework = await makeFramework('disabled');
+      stubRegistry(framework);
+      pushMention(framework, true);
+      const text = textOf(framework);
+      assert.match(text, /your plain prose is not published \(prose routing is disabled\)/);
+      assert.match(text, /channel_publish with channelId "discord:G1:C7"/);
+      assert.doesNotMatch(text, />>|write your reply as plain text/);
+      await framework.stop();
+    });
+
+    it('the channels/incoming path words the option for the reader\'s mode too', async () => {
+      const incoming = (triggerInference: boolean) => ({
+        type: 'mcpl:channel-incoming' as const,
+        serverId: 'portal',
+        channelId: 'portal:lobby',
+        messageId: 'pm1',
+        author: { id: 'U2', name: 'rhys' },
+        content: [{ type: 'text' as const, text: 'rhys: @scout hello?' }],
+        timestamp: new Date().toISOString(),
+        metadata: {},
+        tags: ['chat:mention', 'chat:addressed'],
+        triggerInference,
+      });
+      const run = async (mode: 'locus' | 'explicit') => {
+        const framework = await makeFramework(mode);
+        stubRegistry(framework);
+        await (framework as unknown as {
+          handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+        }).handleMcplChannelIncoming(incoming(true));
+        const text = textOf(framework);
+        await framework.stop();
+        return text;
+      };
+      const locusText = await run('locus');
+      assert.match(locusText, /write your reply as plain text this turn; it will be delivered in #portables/);
+      assert.doesNotMatch(locusText, />>/);
+      const explicitText = await run('explicit');
+      assert.match(explicitText, /prefixed with ">>#portables"/);
+    });
   });
 
   it('a channel-incoming trunk turn records its triggering channel', async () => {

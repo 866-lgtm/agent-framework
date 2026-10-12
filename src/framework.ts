@@ -7305,6 +7305,10 @@ export class AgentFramework {
         missedCharacters: typeof event.metadata?.missedCharacters === 'number'
           ? event.metadata.missedCharacters
           : undefined,
+        // Stored below via addMessage() into the default window — word the
+        // reply option for THAT agent's prose-routing mode.
+        proseRouting: this.defaultWindowProseRouting(),
+        waking: event.triggerInference === true,
       });
       if (invitation) {
         incomingContent.push(invitation.block);
@@ -7648,6 +7652,20 @@ export class AgentFramework {
   }
 
   /**
+   * Prose-routing mode of the agent whose window a default (untargeted)
+   * framework message lands in — the same primary-agent resolution
+   * addMessage() uses. The closed-channel invitation is built once and stored
+   * there, so that agent is the one whose mode its reply instructions must
+   * match.
+   */
+  private defaultWindowProseRouting(): Agent['proseRouting'] {
+    const agent = this.primaryAgentName
+      ? this.agents.get(this.primaryAgentName)
+      : this.agents.values().next().value;
+    return agent?.proseRouting ?? 'locus';
+  }
+
+  /**
    * Build the addressed-while-CLOSED channel invitation block, shared by the
    * push-event and channels/incoming ingest paths. Until 2026-07-27 only push
    * events (discord-mcpl mentions) carried it; channels.publish surfaces
@@ -7655,10 +7673,18 @@ export class AgentFramework {
    * explicit-prose agent's natural plain reply bounced with nowhere to go
    * (Rhys's first portal mention: a 2,320-char reply stranded).
    *
-   * Wording: option 1 teaches the `>>` destination prefix, which delivers for
-   * BOTH legacy (host-inferred) and explicit prose-routing agents. The
-   * previous "simply write your reply as normal text" was a false promise
-   * under explicit routing (the metadata flags it set had no consumers).
+   * Wording is prose-routing-mode aware (`proseRouting`: the mode of the
+   * agent whose window stores the invitation). Explicit mode: option 1
+   * teaches the `>>` destination prefix — "simply write your reply as normal
+   * text" was a false promise there (unprefixed prose bounces). Locus and
+   * hybrid modes do NOT parse `>>` (hybrid only `>>>`): a `>>target` reply
+   * went out verbatim, prefix and all, to the turn's locus. There, the honest
+   * instruction is the plain reply — this addressed wake makes the channel
+   * the turn's locus. Either way delivery OPENS the channel (routeSpeech:
+   * send-opens-channel), so the old "reply without joining / follow-ups won't
+   * reach you" claims were false in every mode; the option now says the
+   * channel opens and channel_close leaves it. Disabled mode never publishes
+   * prose, so it points at an explicit send tool instead.
    *
    * Human-readable names wherever the surface provided them — a mind reading
    * this should see WHO addressed it WHERE, not a wall of snowflake ids. Raw
@@ -7688,6 +7714,14 @@ export class AgentFramework {
     missedMessages?: number;
     /** Characters across those dropped messages. */
     missedCharacters?: number;
+    /** Prose-routing mode of the agent that will read the invitation —
+     *  decides how option 1 says to reply. Defaults to 'locus' (the Agent
+     *  default). */
+    proseRouting?: Agent['proseRouting'];
+    /** Whether this message starts a turn (triggerInference). Locus/hybrid
+     *  only: a non-waking message does not become the turn's locus, so a
+     *  plain reply would not land there. Defaults to true. */
+    waking?: boolean;
   }): { block: ContentBlock; metadataPatch: Record<string, unknown> } | null {
     if (!this.channelRegistry) return null;
     if (!opts.tags?.includes('chat:addressed')) return null;
@@ -7697,19 +7731,43 @@ export class AgentFramework {
     const label = opts.channelLabel ?? descriptor?.label;
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
-    // The label is for reading; the prefix must be ONE token that resolves back
-    // here, on this server (a DM label "DM: alice" quoted verbatim parses as
-    // target "#DM:"). A registry that can name targets is authoritative: no safe
-    // token means no prefix option. A stand-in without proseTargetFor gets a
-    // whitespace-free guess, never a label with spaces.
-    const namer = this.channelRegistry as { proseTargetFor?: (id: string, serverId?: string) => string | undefined };
-    const target = typeof namer.proseTargetFor === 'function'
-      ? namer.proseTargetFor(opts.channelId, opts.serverId)
-      : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
-    const replyOption = target
-      ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
-        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
-      : `1. Reply without joining isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
+    // Delivering a reply opens the channel (routeSpeech: send-opens-channel),
+    // in every mode — say so, and how to leave again.
+    const opensNote =
+      `that delivery opens the channel, so its other traffic starts reaching you ` +
+      `(call channel_close with channelId "${opts.channelId}" to leave again).\n`;
+    const mode = opts.proseRouting ?? 'locus';
+    let replyOption: string;
+    if (mode === 'explicit') {
+      // The label is for reading; the prefix must be ONE token that resolves
+      // back here, on this server (a DM label "DM: alice" quoted verbatim
+      // parses as target "#DM:"). A registry that can name targets is
+      // authoritative: no safe token means no prefix option. A stand-in
+      // without proseTargetFor gets a whitespace-free guess, never a label
+      // with spaces.
+      const namer = this.channelRegistry as { proseTargetFor?: (id: string, serverId?: string) => string | undefined };
+      const target = typeof namer.proseTargetFor === 'function'
+        ? namer.proseTargetFor(opts.channelId, opts.serverId)
+        : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
+      replyOption = target
+        ? `1. Reply — write your reply this turn prefixed with ">>${target}"; it will be delivered there, and ` + opensNote
+        : `1. Replying with a ">>" prefix isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
+    } else if (mode === 'disabled') {
+      replyOption =
+        `1. Reply — your plain prose is not published (prose routing is disabled), so answering there takes an explicit ` +
+        `send tool (e.g. channel_publish with channelId "${opts.channelId}").\n`;
+    } else if (opts.waking === false) {
+      // locus / hybrid, but nothing wakes on this message: the turn that
+      // eventually reads it has its own locus. channel_open moves the pin
+      // (locus/hybrid), so joining first is the plain-prose route.
+      replyOption =
+        `1. Reply — this message did not start a turn, so your plain prose won't land in ${place} by itself: ` +
+        `join it (option 2) and your plain reply goes there, or answer with an explicit send tool.\n`;
+    } else {
+      // locus / hybrid: `>>` is not parsed; this addressed wake makes the
+      // channel the turn's locus, so a plain reply lands there.
+      replyOption = `1. Reply — write your reply as plain text this turn; it will be delivered in ${place}, and ` + opensNote;
+    }
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -8251,6 +8309,10 @@ export class AgentFramework {
         missedMessages: typeof origin.missedMessages === 'number' ? origin.missedMessages : undefined,
         missedCharacters:
           typeof origin.missedCharacters === 'number' ? origin.missedCharacters : undefined,
+        // Stored below via addMessage() into the default window — word the
+        // reply option for THAT agent's prose-routing mode.
+        proseRouting: this.defaultWindowProseRouting(),
+        waking: event.triggerInference === true,
       });
       if (invitation) {
         content.push(invitation.block);
