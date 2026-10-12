@@ -142,8 +142,10 @@ export interface SurgeryMarkerFacts {
  *   the addressable ones left unmarked, and the surgery's `removedRefs`
  *   (`discordRefs` in the operator log) list every one.
  * - `queued` — one add request per mark is durably recorded and delivery has
- *   started. It is not a delivery claim: per-request outcomes stay in the
- *   awareness journal.
+ *   started. If delivery fails, the requests stay recorded, the
+ *   `discord-awareness-delivery` ops alert says so, and a later pass (a
+ *   reconnect, a channel-list change or the next start) delivers them. It is
+ *   not a delivery claim: per-request outcomes stay in the awareness journal.
  * - `not-scheduled` — the body change landed, but the batch was never
  *   recorded, or recording it as active failed and it was retired from the
  *   journal: none of its marks will be delivered.

@@ -6647,10 +6647,17 @@ export class AgentFramework {
    * activated is retired, so no later reconciliation can deliver it behind a
    * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
    * too, the receipt says only that the outcome is `unresolved`: the batch is
-   * still prepared, and the reconciliation that delivery runs next may well
-   * promote it. A batch with no refs (a suppression journal with nothing
-   * addressable) is still activated, which closes its resume journal; it
-   * schedules no marks.
+   * still prepared, and it may still be delivered. A rollback's batch
+   * (activated by target branch) may be promoted by the very next
+   * reconciliation, the one the delivery it starts runs; a suppression's
+   * (activated explicitly) waits for the next start.
+   *
+   * A batch with no refs (a suppression journal with nothing addressable) is
+   * still activated, which closes its resume journal. It schedules no marks,
+   * so it reports `none` whatever the ledger does. If it can be neither
+   * activated nor retired, its journal is left prepared and closes at the
+   * next start: every interval it names has already committed, so the resume
+   * skips them all and activates it.
    */
   private activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,

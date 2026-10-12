@@ -523,6 +523,7 @@ describe('surgery and awareness marks', () => {
     const keep = String(cm().addMessage('Operator', [{ type: 'text', text: 'kept' }], {}));
     cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {});
     const result = await framework.rollbackToMessage('resident', { messageId: keep, marks: { scope: 'all' } });
+    assert.equal(result.messagesRemoved, 1, 'the rollback did change the body');
     assert.deepEqual(result.markers, { scope: 'all', unmarked: 0, notRemoved: 0, status: 'none', queued: 0 });
     assert.equal(outbox().batches().length, 0);
   });
