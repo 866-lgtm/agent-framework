@@ -225,6 +225,162 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  /** The registry stub answers skip_reply as the real registry does: the turn ends, and nothing is sent. */
+  function answerSkipReply(framework: AgentFramework): { calls: number } {
+    const answered = { calls: 0 };
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.handleChannelToolCall = async (name: string) => {
+      if (name === 'skip_reply') answered.calls++;
+      return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };
+    };
+    return answered;
+  }
+
+  /** The texts of the agent's context, and the bounce notices among them. */
+  function context(framework: AgentFramework): { texts: string[]; bounces: number } {
+    const messages = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{
+      content: Array<{ type: string; text?: string }>;
+      metadata?: { kind?: string };
+    }>;
+    return {
+      texts: messages.flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '')),
+      bounces: messages.filter((m) => m.metadata?.kind === 'prose-bounce').length,
+    };
+  }
+
+  const clipboardOf = (framework: AgentFramework): string | undefined =>
+    (framework as unknown as { proseClipboards: Map<string, string> }).proseClipboards.get('assistant');
+
+  it('a round that calls skip_reply keeps its unprefixed prose private: nothing delivered, bounced, retained or woken for', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Weighing whether this needs an answer from me.' },
+      { type: 'tool_use', id: 'sr1', name: 'skip_reply', input: { reason: 'nothing to add' } },
+    ] as ContentBlock[], 'tool_use'));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+    // Were the text bounced, its wake would start a second turn: give that
+    // turn a response, so the test fails on its count instead of hanging.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the skip_reply round ran');
+    assert.equal(routed.length, 0, 'nothing is delivered');
+    const seen = context(framework);
+    assert.equal(seen.bounces, 0, 'no bounce notice reaches the context');
+    assert.ok(seen.texts.some((t) => t.includes('Weighing whether this needs an answer')), 'the text stays in the context');
+    assert.equal(clipboardOf(framework), undefined, 'nothing is retained for {{unsent}}');
+    assert.equal(turns, 1, 'no bounce wake starts another turn');
+
+    await framework.stop();
+  });
+
+  it('a round that calls skip_reply keeps its unprefixed prose from a sticky destination', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first, deliberately' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Second thoughts I keep to myself.' },
+      { type: 'tool_use', id: 'sr2', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the skip_reply round ran');
+    assert.deepEqual(routed, [{ text: 'first, deliberately', locus: 'chan-alpha' }],
+      'only the earlier, deliberately addressed segment goes out');
+    assert.ok(context(framework).texts.some((t) => t.includes('Second thoughts I keep to myself.')), 'the text stays in the context');
+
+    await framework.stop();
+  });
+
+  it('a round that calls skip_reply sends nothing, a prefixed segment included, and asks for no continuation', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha ! addressed, then thought better of' },
+      { type: 'tool_use', id: 'sr3', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+    // A continuation would start a second turn: give it a response, so the
+    // test fails on its count instead of hanging.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the skip_reply round ran');
+    assert.equal(routed.length, 0, 'skip_reply ends the turn without sending anything');
+    assert.equal(context(framework).bounces, 0);
+    assert.equal(turns, 1, "the round's ' !' starts no continuation after skip_reply ended the turn");
+
+    await framework.stop();
+  });
+
+  it("a private round's ' !' leaves no continuation request behind", async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const internals = framework as unknown as {
+      deliverProse(agent: unknown, text: string, round?: { keepPrivate?: boolean }): Promise<void>;
+      proseContinuations: Set<string>;
+    };
+    const agent = framework.getAgent('assistant')!;
+
+    // When skip_reply ends an explicit turn, the speech chain isn't awaited,
+    // so the round's delivery can run once the next turn has begun.
+    await internals.deliverProse(agent, '>>#alpha ! kept private', { keepPrivate: true });
+    assert.equal(routed.length, 0, 'nothing is delivered');
+    assert.equal(internals.proseContinuations.has('assistant'), false, 'and no continuation is asked for');
+
+    // The same envelope outside a private round asks for one.
+    await internals.deliverProse(agent, '>>#alpha ! sent');
+    assert.equal(routed.length, 1);
+    assert.equal(internals.proseContinuations.has('assistant'), true);
+
+    await framework.stop();
+  });
+
+  it('a skip_reply round that sets the retained text aside with >>skip_reply {{unsent}} clears it', async () => {
+    // Turn 1 bounces its text, which retains it and wakes turn 2.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'An answer with nowhere to go.' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+    feedTurn(framework, 2, [
+      { type: 'text', text: '>>skip_reply {{unsent}}' },
+      { type: 'tool_use', id: 'sr4', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use');
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the bounce wake ran the skip_reply round');
+    assert.equal(routed.length, 0);
+    assert.equal(clipboardOf(framework), undefined, 'the retained text is set aside, as >>skip_reply {{unsent}} says');
+
+    await framework.stop();
+  });
+
   it("' !' continuation starts another turn immediately after prose ends the current one", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#alpha ! step one done, continuing' },

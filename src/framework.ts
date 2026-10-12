@@ -8758,7 +8758,7 @@ export class AgentFramework {
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
-  private async deliverProse(agent: Agent, rawText: string): Promise<void> {
+  private async deliverProse(agent: Agent, rawText: string, round?: { keepPrivate?: boolean }): Promise<void> {
     // Multi-envelope: a single prose block may address SEVERAL destinations —
     // every line beginning with `>>` opens a new envelope, routed
     // independently (first live use: Tilde 2026-07-24, one block carrying a
@@ -8782,7 +8782,7 @@ export class AgentFramework {
 
     for (const envelope of envelopes) {
       if (!envelope.trim()) continue;
-      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''));
+      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''), round);
     }
   }
 
@@ -8877,10 +8877,18 @@ export class AgentFramework {
     }
   }
 
-  private async deliverProseEnvelope(agent: Agent, rawText: string): Promise<void> {
+  private async deliverProseEnvelope(
+    agent: Agent,
+    rawText: string,
+    round?: { keepPrivate?: boolean },
+  ): Promise<void> {
     const name = agent.name;
     const parsed = parseProsePrefix(rawText);
-    if (parsed.continueTurn) this.proseContinuations.add(name);
+    // A private round (one that called skip_reply) asks for no continuation.
+    // Its turn ends at the round's tool results, and explicit mode doesn't
+    // await the speech chain there, so this delivery can run after the next
+    // turn has begun: a flag set here would reach that turn.
+    if (parsed.continueTurn && !round?.keepPrivate) this.proseContinuations.add(name);
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -8888,6 +8896,18 @@ export class AgentFramework {
       // segment embedded it.
       if (parsed.body.includes('{{unsent}}')) this.proseClipboards.delete(name);
       console.error(`[prose] ${name}: >>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
+      return;
+    }
+
+    if (round?.keepPrivate) {
+      // skip_reply's promise: "Any plain text you wrote this turn stays
+      // private and is NOT posted". Every envelope of the round stays in the
+      // context, as a >>skip_reply envelope does: it isn't sent, doesn't
+      // bounce to the clipboard and doesn't move the destination.
+      console.error(
+        `[prose] ${name}: ${parsed.kind === 'target' ? `>>${parsed.target}` : 'unprefixed'} — ` +
+          `${parsed.body.length} chars kept in context (skip_reply round)`,
+      );
       return;
     }
 
@@ -9911,16 +9931,22 @@ export class AgentFramework {
                       }
                     }
                   } else if (turnProseRouting === 'explicit') {
-                    // Explicit mode: every segment through the prose gateway.
-                    // Silencing does not apply — unprefixed prose bounces and
-                    // prefixed prose is deliberate; think-privacy still holds.
+                    // Explicit mode: the segments go through the prose
+                    // gateway, unless a private think in the round holds them
+                    // back. Send silencing does not apply: unprefixed prose
+                    // bounces, and prefixed prose is deliberate. skip_reply
+                    // does: its round's envelopes all stay in the context
+                    // (deliverProseEnvelope's keepPrivate), as the tool
+                    // promises, and skip_reply then ends the turn at this
+                    // round's tool results.
                     if (!hasSameRoundPrivateThink) {
+                      const keepPrivate = roundToolNames.some((n) => bareToolName(n) === 'skip_reply');
                       console.error(
-                        `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway`,
+                        `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                       );
                       for (const seg of roundSegments) {
                         turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverProse(agent, seg))
+                          .then(() => this.deliverProse(agent, seg, { keepPrivate }))
                           .catch((err) => console.error('mid-turn prose delivery failed:', err));
                       }
                     }
