@@ -50,10 +50,12 @@ import {
   type RootIdentity,
   candidateOf,
   sameCandidate,
+  sameRootIdentity,
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
 import {
   type MountView,
+  ROOT_REPLACED,
   type Walk,
   fingerprintVouches,
   locateRoot,
@@ -633,6 +635,22 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
     const hasStore = store.treeGet(mount.treeStateId, path) !== null;
     const hasIntent = mount.intents.get(path) !== null;
     gathered.facts.set(path, await learnDisk(mount, path, { p, hasStore, hasIntent }, opts));
+  }
+
+  // Everything above was observed by path beneath the root's path. A root
+  // replaced meanwhile lends its replacement's files, and their absence, to
+  // the original's paths, so if the root isn't the one the pass began under
+  // now, nothing observed counts and nothing is decided from it.
+  if (gathered.rootIdentity !== null) {
+    const after = await locateRoot(mount.view, mount.rootReal);
+    if (!('identity' in after) || !sameRootIdentity(after.identity, gathered.rootIdentity)) {
+      const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
+      for (const path of gathered.facts.keys()) gathered.facts.set(path, { kind: 'unobserved', reason });
+      gathered.rootIdentity = null;
+      gathered.walk = null;
+      gathered.dirs = [];
+      gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason });
+    }
   }
   return gathered;
 }

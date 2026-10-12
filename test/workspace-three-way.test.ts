@@ -23,7 +23,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
-import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
+import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -208,7 +208,7 @@ async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promis
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
-async function withFsPromises<T>(name: 'readdir' | 'lstat' | 'open', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+async function withFsPromises<T>(name: 'readdir' | 'lstat' | 'open' | 'realpath', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
   const original = fsp[name]!;
   fsp[name] = make(original);
@@ -1694,6 +1694,95 @@ describe('trust and identity at the point of use', () => {
     }
   });
 
+  /** A root identified as it is now, and a way to replace it: renamed away, with an empty `sub` in its place. */
+  const replaceable = (env: Env) => {
+    mkdirSync(env.disk('sub'), { recursive: true });
+    const st = statSync(env.dir, { bigint: true });
+    const view = viewOf(env.dir, { rootIdentity: { dev: st.dev.toString(), ino: st.ino.toString() } });
+    const away = `${env.dir}-away`;
+    const replace = () => {
+      renameSync(env.dir, away);
+      mkdirSync(join(env.dir, 'sub'), { recursive: true });
+    };
+    return { view, rootReal: realpathSync(env.dir), away, replace };
+  };
+  const isSub = (env: Env, rootReal: string, path: unknown) =>
+    String(path) === join(env.dir, 'sub') || String(path) === join(rootReal, 'sub');
+
+  test('a write whose root is replaced after it was checked, before its parent is found, writes nothing there', async (t) => {
+    const env = new Env(t);
+    const { view, rootReal, replace } = replaceable(env);
+    let replaced = false;
+    const err = await withFsPromises('realpath', (realpath) => async (path: unknown, ...rest: unknown[]) => {
+      if (!replaced && isSub(env, rootReal, path)) {
+        replaced = true;
+        replace();
+      }
+      return realpath(path, ...rest);
+    }, () => writeContained(view, rootReal, 'sub/a.txt', Buffer.from('content'), { kind: 'any' }).then(() => null, (e) => e));
+    assert.equal(replaced, true);
+    assert.ok(err instanceof EffectFailed, `refused: ${err}`);
+    const there = join(env.dir, 'sub/a.txt');
+    assert.equal(existsSync(there) ? readFileSync(there, 'utf8') : '', '', 'no content reached the replacement');
+  });
+
+  test("an edit made while a forced write is checked isn't overwritten", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a.txt', 'before');
+    const rootReal = realpathSync(env.dir);
+    const target = join(rootReal, 'a.txt');
+    let edited = false;
+    const err = await withFsPromises('realpath', (realpath) => async (path: unknown, ...rest: unknown[]) => {
+      if (!edited && String(path) === target) {
+        edited = true;
+        writeFileSync(target, 'before, and an edit');
+      }
+      return realpath(path, ...rest);
+    }, () => writeContained(viewOf(env.dir), rootReal, 'a.txt', Buffer.from('overwrite'), { kind: 'any' }).then(() => null, (e) => e));
+    assert.equal(edited, true);
+    assert.ok(err instanceof EffectFailed && !err.touched, `refused untouched: ${err}`);
+    assert.equal(readFileSync(target, 'utf8'), 'before, and an edit');
+  });
+
+  test("an edit made after a file was hashed for its unlink isn't deleted", async (t) => {
+    const env = new Env(t);
+    mkdirSync(env.disk('sub'), { recursive: true });
+    env.writeDisk('sub/a.txt', 'old');
+    const rootReal = realpathSync(env.dir);
+    const target = join(rootReal, 'sub/a.txt');
+    let subChecks = 0;
+    let edited = false;
+    // The parent is resolved once to find it and again to check it is still
+    // there, which comes after the hash and before the unlink: the edit lands
+    // in between.
+    const err = await withFsPromises('realpath', (realpath) => async (path: unknown, ...rest: unknown[]) => {
+      if (isSub(env, rootReal, path) && ++subChecks === 2) {
+        edited = true;
+        writeFileSync(target, 'old, edited');
+      }
+      return realpath(path, ...rest);
+    }, () => unlinkContained(viewOf(env.dir), rootReal, 'sub/a.txt', { kind: 'content', hash: createHash('sha256').update('old').digest('hex') })
+      .then(() => null, (e) => e));
+    assert.equal(edited, true);
+    assert.ok(err instanceof EffectFailed && !err.touched, `refused untouched: ${err}`);
+    assert.equal(readFileSync(target, 'utf8'), 'old, edited');
+  });
+
+  test('a directory sync under a root replaced before the directory was found reports it, not a success', async (t) => {
+    const env = new Env(t);
+    const { view, rootReal, replace } = replaceable(env);
+    let replaced = false;
+    const failed = await withFsPromises('realpath', (realpath) => async (path: unknown, ...rest: unknown[]) => {
+      if (!replaced && isSub(env, rootReal, path)) {
+        replaced = true;
+        replace();
+      }
+      return realpath(path, ...rest);
+    }, () => syncDirectories(view, rootReal, ['sub']));
+    assert.equal(replaced, true);
+    assert.match(failed.get('sub') ?? '', /not the directory disk last agreed with/);
+  });
+
   test("an effect under a replaced root acts on nothing, whatever its caller checked", async (t) => {
     const env = new Env(t);
     const rootReal = realpathSync(env.dir);
@@ -1775,6 +1864,32 @@ describe('the mount boundary', () => {
     assert.equal(swapped, true);
     assert.equal(typeof proof, 'string', `no absence is proven: ${JSON.stringify(proof)}`);
     assert.equal(readFileSync(join(away, 'sub/a.txt'), 'utf8'), 'A', 'the original still holds the file');
+  });
+
+  test('a root replaced after a walk listed it decides nothing: no deletion is taken from the replacement', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a/f.txt', content: 'F' });
+    await call(m, 'materialize', { path: 'work/a/f.txt' });
+    const rootReal = realpathSync(env.dir);
+    const away = `${env.dir}-away`;
+    let replaced = false;
+    // Once the walk has listed the root, the root is replaced by one whose
+    // `a` is empty: the walk then lists the replacement's `a`.
+    const result = await withFsPromises('readdir', (readdir) => async (path: unknown, ...rest: unknown[]) => {
+      const entries = await readdir(path, ...rest);
+      if (!replaced && String(path) === rootReal) {
+        replaced = true;
+        renameSync(env.dir, away);
+        mkdirSync(join(env.dir, 'a'), { recursive: true });
+      }
+      return entries;
+    }, () => call(m, 'sync', {}));
+    assert.equal(replaced, true);
+    assert.notEqual(env.store.treeGet('workspace/work/tree', 'a/f.txt'), null, 'the workspace keeps the file');
+    assert.notEqual((m as unknown as { agreement: DiskAgreement }).agreement.get('work', 'a/f.txt')?.kind, 'absent');
+    assert.match(JSON.stringify(result), /not the directory disk last agreed with/);
+    assert.equal(readFileSync(join(away, 'a/f.txt'), 'utf8'), 'F');
   });
 
   test('a root replaced during a pass takes no deletion: the entry and its evidence stay', async (t) => {

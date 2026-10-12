@@ -254,8 +254,14 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
  * the one the pass was given, and the one disk last agreed under), else why not.
  */
 export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity } | { reason: string }> {
+  const found = await checkRoot(view, rootReal);
+  return 'dir' in found ? { identity: found.dir.identity() } : found;
+}
+
+/** The mount root as locateRoot finds it, checked, so a caller can ask later whether it's still there. */
+export async function checkRoot(view: MountView, rootReal: string): Promise<{ dir: CheckedDir } | { reason: string }> {
   const found = await locateDir(view, rootReal, '');
-  if (found.kind === 'checked') return { identity: found.dir.identity() };
+  if (found.kind === 'checked') return { dir: found.dir };
   return { reason: found.kind === 'unobserved' ? found.reason : ROOT_UNAVAILABLE };
 }
 
@@ -540,6 +546,16 @@ async function openContained(
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
+    }
+    if (!view.followSymlinks) {
+      // Where no symlink is followed, the path itself must be the file the
+      // descriptor holds: without O_NOFOLLOW, a link swapped in after the
+      // lstat above is followed by the open.
+      const entry = await lstat(lexical, { bigint: true }).catch(() => null);
+      if (entry?.isSymbolicLink()) return { kind: 'unobserved', reason: NOT_FOLLOWED };
+      if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) {
+        return { kind: 'unobserved', reason: 'the file changed while it was read' };
+      }
     }
     keep = true;
     return { handle, info };
