@@ -1623,9 +1623,13 @@ describe('trust and identity at the point of use', () => {
     for (const how of ['read', 'write'] as const) {
       env.writeDisk(`${how}.txt`, 'regular');
       const path = join(rootReal, `${how}.txt`);
+      // The read opens the path under the view's root as given; where the
+      // temp directory is reached through a symlink (macOS's /var), that
+      // isn't the real path.
+      const named = join(env.dir, `${how}.txt`);
       let swapped = false;
       const outcome = await withFsPromises('open', (original) => async (...args: any[]) => {
-        if (!swapped && args[0] === path) {
+        if (!swapped && (args[0] === path || args[0] === named)) {
           swapped = true; // between any lstat and this open
           swapIn(path);
         }
