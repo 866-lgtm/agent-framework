@@ -5,7 +5,12 @@
 // long reaction drain. When PROBE_PATH appears, the server sends one
 // inference-bearing channels/incoming request and appends to EVENTS_PATH when
 // the host answers it, so a test can see whether the MCPL data plane was held.
-import { appendFileSync, existsSync } from 'node:fs';
+// When CRASH_PATH appears, the server consumes it and exits, and a server that
+// starts while DOWN_PATH exists exits at once, so a test can take the route
+// down and bring it back while the host reconnects.
+import { appendFileSync, existsSync, rmSync } from 'node:fs';
+
+if (process.env.DOWN_PATH && existsSync(process.env.DOWN_PATH)) process.exit(1);
 
 const callsPath = process.env.CALLS_PATH;
 const eventsPath = process.env.EVENTS_PATH;
@@ -93,6 +98,10 @@ process.stdin.on('data', (chunk) => {
 });
 
 const timer = setInterval(() => {
+  if (process.env.CRASH_PATH && existsSync(process.env.CRASH_PATH)) {
+    rmSync(process.env.CRASH_PATH, { force: true });
+    process.exit(1);
+  }
   if (held.length > 0 && holdPath && existsSync(holdPath)) {
     for (const message of held.splice(0)) answer(message);
   }

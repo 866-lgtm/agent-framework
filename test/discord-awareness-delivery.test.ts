@@ -29,6 +29,21 @@ function jsonl(path: string): Array<Record<string, unknown>> {
   return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
+/** Resolve with the promise's value, or fail if it is still pending after ms: a hang detector. */
+async function settlesWithin<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} still pending after ${ms} ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function waitFor(description: string, predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -46,6 +61,8 @@ function setup() {
     events: join(dir, 'events.jsonl'),
     hold: join(dir, 'release'),
     probe: join(dir, 'probe'),
+    crash: join(dir, 'crash'),
+    down: join(dir, 'down'),
   };
   /** Queue marks in the store's journal while no host has it open. */
   const queueMarks = (messageIds: string[]) => {
@@ -68,7 +85,7 @@ function setup() {
   /** The running framework's own journal instance. */
   const journal = (framework: AgentFramework): DiscordAwarenessOutbox =>
     (framework as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
-  const config = (opts: { discord?: boolean; requestTimeoutMs?: number; awarenessDeadlineMs?: number } = {}) => ({
+  const config = (opts: { discord?: boolean; requestTimeoutMs?: number; awarenessDeadlineMs?: number; reconnect?: boolean } = {}) => ({
     storePath,
     membrane: new MockMembrane().asMembrane(),
     agents: [{ name: 'resident', model: 'test', systemPrompt: 'test' }],
@@ -81,8 +98,12 @@ function setup() {
         command: process.execPath,
         args: [FIXTURE],
         ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
-        env: { CALLS_PATH: paths.calls, EVENTS_PATH: paths.events, HOLD_PATH: paths.hold, PROBE_PATH: paths.probe },
+        env: {
+          CALLS_PATH: paths.calls, EVENTS_PATH: paths.events, HOLD_PATH: paths.hold, PROBE_PATH: paths.probe,
+          CRASH_PATH: paths.crash, DOWN_PATH: paths.down,
+        },
         enabledFeatureSets: ['chat'],
+        ...(opts.reconnect ? { reconnect: true, reconnectIntervalMs: 50, reconnectMaxIntervalMs: 200 } : {}),
       }],
     }),
   });
@@ -95,7 +116,8 @@ test('startup does not wait for queued marks, and channel traffic flows while th
   try {
     queueMarks(['m1', 'm2']);
     writeFileSync(paths.probe, '1'); // the server sends channel traffic as soon as it can
-    framework = await AgentFramework.create(config());
+    // A hang detector: startup that waited on the withheld reactions would never return.
+    framework = await settlesWithin(AgentFramework.create(config()), 30_000, 'AgentFramework.create with reactions withheld');
     await waitFor('the queued add to reach the server', () => jsonl(paths.calls).length >= 1);
     await waitFor('the channel traffic to be answered', () =>
       jsonl(paths.events).some((event) => event.event === 'probe-answered'));
@@ -204,6 +226,45 @@ test('a branch switch neither adds nor removes marks', async () => {
     assert.equal(journal(framework).operations().length, 1);
   } finally {
     writeFileSync(paths.hold, '1');
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('marks queued while a configured route is down go out when it reconnects, without a restart', async () => {
+  const { dir, journal, paths, config } = setup();
+  let framework: AgentFramework | undefined;
+  try {
+    writeFileSync(paths.hold, '1');
+    framework = await AgentFramework.create(config({ reconnect: true }));
+    const cm = framework.getAgent('resident')!.getContextManager();
+    const tail = String(cm.addMessage('Operator', [{ type: 'text', text: 'tail' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'tail',
+    }));
+    cm.addMessage('Member', [{ type: 'text', text: 'hi' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1', tags: ['chat:addressed'],
+    });
+    const connection = (framework as unknown as { mcplServerRegistry: { getServer(id: string): { isConnected: boolean } } })
+      .mcplServerRegistry.getServer('discord');
+
+    // The route goes down and stays down while the marks are chosen.
+    writeFileSync(paths.down, '1');
+    writeFileSync(paths.crash, '1');
+    await waitFor('the route to go down', () => !connection.isConnected);
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
+    assert.equal(result.markers.status, 'queued');
+    assert.deepEqual(jsonl(paths.calls), [], 'nothing reached a route that is down');
+
+    // It comes back: the reconnect itself starts delivery.
+    rmSync(paths.down, { force: true });
+    await waitFor('the queued add confirmed after the reconnect', () => {
+      const outbox = journal(framework!);
+      return outbox.operations().length === 1 && outbox.operations().every((op) => outbox.operationStatus(op) === 'confirmed');
+    }, 10_000);
+    assert.deepEqual(jsonl(paths.calls).map((call) => call.name), ['add_reaction']);
+  } finally {
+    writeFileSync(paths.hold, '1');
+    rmSync(paths.down, { force: true });
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
   }

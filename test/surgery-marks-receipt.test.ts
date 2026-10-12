@@ -26,6 +26,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
+import { DISCORD_AWARENESS_RECORD_TYPE } from '../src/recovery/discord-awareness-outbox.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -229,6 +230,101 @@ describe('surgery and awareness marks', () => {
     ]);
   });
 
+  it('a choice bound to refs counts the ones its surgery did not remove, and the log records how many were authorized', async () => {
+    await start(false);
+    const { tail, removed } = seed(3, [0, 1, 2]);
+    const elsewhere = { serverId: 'discord', channelId: 'discord:g1:c2', messageId: 'not-removed' };
+    const refs = [...framework.previewSurgeryMarks('resident', { rollbackTo: tail }).scopes.all.refs, elsewhere];
+    const rolled = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all', refs } });
+    assert.equal(rolled.markers.notRemoved, 1);
+    assert.equal(rolled.markers.status === 'queued' && rolled.markers.queued, 3);
+    const logged = framework.getOperatorLog({ limit: 5 }).find((entry) => entry.kind === 'rollback');
+    assert.deepEqual(logged?.params?.marks, { scope: 'all', authorizedRefs: 4 });
+    void removed;
+
+    // A suppression counts the same way.
+    const kept = String(cm().addMessage('Member', [{ type: 'text', text: 'later' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'later', tags: ['chat:addressed'],
+    }));
+    const later = { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'later' };
+    const suppressed = await framework.suppressMessages('resident', { messageIds: [kept], marks: { scope: 'all', refs: [later, elsewhere] } });
+    assert.equal(suppressed.markers.notRemoved, 1);
+  });
+
+  it('a delivery that fails to start raises an ops alert and leaves no unhandled rejection', async () => {
+    await start(true);
+    const { tail } = seed(2);
+    const alerts: Array<{ kind: string; message: string }> = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; message: string });
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    const pendingDispatches = DiscordAwarenessOutbox.prototype.pendingDispatches;
+    DiscordAwarenessOutbox.prototype.pendingDispatches = function () {
+      throw new Error('injected journal read failure');
+    };
+    let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
+    try {
+      result = await settlesWithin(
+        framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
+        20_000,
+        'rollbackToMessage whose delivery fails to start',
+      );
+      await waitFor('the delivery alert', () => alerts.some((alert) => alert.kind === 'discord-awareness-delivery'));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      DiscordAwarenessOutbox.prototype.pendingDispatches = pendingDispatches;
+      process.off('unhandledRejection', onUnhandled);
+    }
+    assert.deepEqual(unhandled, [], 'the background failure is handled');
+    assert.match(
+      alerts.find((alert) => alert.kind === 'discord-awareness-delivery')!.message,
+      /after rollback failed: .*injected journal read failure/,
+    );
+    // Scheduling succeeded: the batch stays durably active for the next pass.
+    assert.equal(result.markers.status, 'queued');
+    assert.equal(outbox().batches()[0].status, 'active');
+  });
+
+  it('a suppression with nothing addressable reports none, whether or not its journal can be closed', async () => {
+    await start(false);
+    const local = String(cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {}));
+    const other = String(cm().addMessage('resident', [{ type: 'text', text: 'also local' }], {}));
+    cm().addMessage('resident', [{ type: 'text', text: 'after' }], {});
+    const none = { scope: 'none', unmarked: 0, notRemoved: 0, status: 'none', queued: 0 };
+
+    const closed = await framework.suppressMessages('resident', { messageIds: [local] });
+    assert.deepEqual(closed.markers, none);
+    const [journal] = outbox().batches();
+    assert.equal(journal?.status, 'active', 'activated, which closes the resume journal');
+    assert.deepEqual(journal.refs, []);
+
+    // When the journal can be neither activated nor retired, it still
+    // schedules nothing, and the receipt says none, not unresolved; the
+    // operator hears that the journal failed.
+    const alerts: Array<{ kind: string; message: string }> = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; message: string });
+    });
+    const activate = DiscordAwarenessOutbox.prototype.activate;
+    const discard = DiscordAwarenessOutbox.prototype.discard;
+    DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected ledger failure'); };
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    let stuck: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
+    try {
+      stuck = await framework.suppressMessages('resident', { messageIds: [other] });
+    } finally {
+      DiscordAwarenessOutbox.prototype.activate = activate;
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.deepEqual(stuck.markers, none);
+    assert.equal(outbox().batches().filter((batch) => batch.status === 'prepared').length, 1, 'its journal is left prepared');
+    const alert = alerts.find((candidate) => candidate.kind === 'discord-awareness-unresolved');
+    assert.match(alert?.message ?? '', /suppress applied, but its resume journal \(awareness batch \S+, no marks\) could not be closed.*it stays prepared/);
+  });
+
   it('a choice bound to previewed refs never widens to messages that arrive before it applies', async () => {
     await start(true);
     const { tail } = seed(3, [0, 2]);
@@ -255,9 +351,11 @@ describe('surgery and awareness marks', () => {
     await start(true);
     const { tail, removed } = seed(4);
 
+    // A hang detector, not a latency verdict: answered() === 0 below is what
+    // shows the rollback didn't wait on Discord.
     const result = await settlesWithin(
       framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
-      3_000,
+      20_000,
       'rollbackToMessage with reactions held',
     );
     assert.equal(result.markers.status, 'queued');
@@ -272,7 +370,7 @@ describe('surgery and awareness marks', () => {
     const fresh = cm().getAllMessages().at(-1)!;
     const second = await settlesWithin(
       framework.suppressMessages('resident', { messageIds: [String(fresh.id)] }),
-      3_000,
+      20_000,
       'a second surgery during delivery',
     );
     assert.equal(second.markers.status, 'none');
@@ -281,6 +379,7 @@ describe('surgery and awareness marks', () => {
     writeFileSync(probePath, '1');
     await waitFor('the probe to be answered while reactions are still held', () =>
       jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
+    assert.equal(jsonl(eventsPath).find((e) => e.event === 'probe-answered')?.error, null, 'accepted, not refused');
     assert.equal(answered(), 0, 'the probe was not waiting behind the marks');
 
     writeFileSync(holdPath, '1');
@@ -372,7 +471,7 @@ describe('surgery and awareness marks', () => {
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the suppression is not undone');
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]));
     assert.equal(result.markers.status, 'not-scheduled');
-    assert.equal(outbox().batches().every((batch) => batch.status === 'discarded' || batch.status === 'active'), true);
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['discarded'], 'its one batch is retired');
   });
 
   it('cancel stops unsent marks without removing any; retract removes this bot\'s marks and discloses an unknown add', async () => {
@@ -398,7 +497,7 @@ describe('surgery and awareness marks', () => {
     assert.ok(calls().every((c) => c.name === 'add_reaction'));
 
     const retracted = framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
-    assert.ok(retracted.removalsQueued >= 1);
+    assert.equal(retracted.removalsQueued, 3, 'one removal per selected message, whatever history says');
     assert.ok(retracted.keysWithUnresolvedAdds >= 1, 'the unknown add is disclosed, not assumed absent');
     await waitFor('the removals to be sent', () =>
       calls().slice(sentBeforeRetract).filter((c) => c.name === 'remove_reaction').length === retracted.removalsQueued);
@@ -420,6 +519,9 @@ describe('surgery and awareness marks', () => {
     assert.equal(result.markers.status, 'queued');
     assert.equal(result.markers.queued, 1);
     assert.equal(result.markers.unmarked, 1);
+    // The journal is records in the caller's store, and no ledger file is written.
+    assert.ok(framework.getStore().getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length > 0);
+    assert.equal(existsSync(join(storePath, 'recovery', 'discord-awareness-outbox.json')), false);
   });
 
   it('cancel during delivery stops the marks not yet sent: exactly one request reaches the server', async () => {
@@ -433,8 +535,11 @@ describe('surgery and awareness marks', () => {
     writeFileSync(holdPath, '1');
     await waitFor('the held add answered and recorded', () =>
       outbox().operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
+    // Nothing is due, and once every drain pass has ended nothing can send
+    // without a new trigger.
+    assert.equal(outbox().pendingDispatches('discord').length, 0);
     await framework.syncDiscordAwarenessMarkers();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await Promise.all([...(framework as unknown as { discordAwarenessDrains: Map<string, Promise<unknown>> }).discordAwarenessDrains.values()]);
     assert.equal(calls().length, 1, 'the cancelled marks were never sent');
   });
 
@@ -451,7 +556,7 @@ describe('surgery and awareness marks', () => {
     try {
       await assert.rejects(
         framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
-        /awareness batch .* kept, since the source branch could not be confirmed/,
+        /awareness batch .* kept, since the source branch could not be confirmed: a start on rollback\/resident\/\d+ completes it, and a start on another branch holds it/,
       );
     } finally {
       live.switchBranch = realSwitch;
@@ -472,7 +577,7 @@ describe('surgery and awareness marks', () => {
     try {
       await assert.rejects(
         framework.suppressMessages('resident', { messageIds: [removed[0]], marks: { scope: 'all' } }),
-        /could not be retired \(injected retire failure\)/,
+        /could not be retired \(injected retire failure\); it stays prepared, and a start on main holds it: cancel it then, not release it, since its messages were never removed/,
       );
     } finally {
       live.fork = realFork;
@@ -482,7 +587,10 @@ describe('surgery and awareness marks', () => {
     // With retirement working, the same failure retires it (source confirmed).
     live.fork = async () => { throw new Error('injected fork failure'); };
     try {
-      await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[1]], marks: { scope: 'all' } }));
+      await assert.rejects(
+        framework.suppressMessages('resident', { messageIds: [removed[1]], marks: { scope: 'all' } }),
+        (error: unknown) => error instanceof OperatorActionError && /^Suppression failed creating .*injected fork failure$/.test(error.message),
+      );
     } finally {
       live.fork = realFork;
     }
