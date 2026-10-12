@@ -1690,7 +1690,7 @@ test('#281: a compile waits for an annotation that began while it waited for ano
     // A second batch settles while the compile waits for the first annotation.
     r.cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-2', name: 'search', input: {} }]);
     secondId = r.guard.storeResults([{ type: 'tool_result', toolUseId: 'tu-2', content: 'SECOND' }],
-      [{ toolUseId: 'tu-2', content: 'SECOND' }], []);
+      [{ toolUseId: 'tu-2', content: 'SECOND' }], [], undefined, undefined);
     r.guard.submissionResults([{ toolUseId: 'tu-2', content: 'SECOND' }]);
     assert.ok(r.guard.withhold('test-category'));
     first.open();
@@ -2170,6 +2170,22 @@ test('#277: a withheld batch keeps what each marked result listed; an unmarked o
     const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
     assert.deepEqual(retried.map((b) => b.content), [marked, plain], 'the retry already carries the lists');
     assert.doesNotMatch(marked, /refus|test-category/, "#159's line: no refusal or category in the context");
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: a marked result skipped for a branch change keeps its fields in the stub that names the audit record', async () => {
+  const h = await workspaceHarness([[calls('marked', 'plain'), refused()], [answer()]]);
+  h.module.results.marked = { success: true, data: { written: ['LOG.md'], detail: 'payload-marked' }, keepWhenWithheld: ['written'] };
+  // Declined where it commits, and the store is back on the batch's branch by
+  // the edit, as after an undo and a redo.
+  (h.framework as unknown as { writeToolResultFile: () => Promise<unknown> }).writeToolResultFile = async () =>
+    ({ path: 'work/tool-results/declined.txt', branchLeft: true });
+  try {
+    await bounded(h.run(), 'the run');
+    const [marked, plain] = toolResults(h.framework).map((block) => String(block.content));
+    assert.equal(plain, AUDIT_STUB);
+    assert.ok(marked.startsWith(`${AUDIT_STUB} Kept from its result: `), marked);
+    assert.deepEqual(keptLists(marked), { written: ['LOG.md'] });
   } finally { await h.framework.stop(); }
 });
 

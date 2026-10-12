@@ -6,8 +6,8 @@
   removed (a `delete` that failed keeps nothing, as any failed result). The
   result as stored still goes where every withheld original goes. Past the
   inline cap the kept fields are cut in that order, so a later list can be
-  cut away entirely, and the stub says so. If the active branch changes
-  before the stub is written, it stays the bare notice, lists included, as
+  cut away entirely, and the stub says so. While the store is away from the
+  batch's branch, the stub stays the bare notice, without the kept fields, as
   every withheld stub does then. A tool marks which fields of its result's
   data are kept with the new `ToolResult.keepWhenWithheld`; only these three
   mark any. Before this, a withheld receipt hid even which files a write had
