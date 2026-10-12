@@ -25,7 +25,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import { AgentFramework, DiscordAwarenessOutbox } from '../src/index.js';
+import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -131,6 +131,64 @@ describe('surgery and awareness marks', () => {
     writeFileSync(holdPath, '1');
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a marks value that is not a choice is refused before anything changes', async () => {
+    await start(false);
+    const { tail, removed } = seed(3);
+    const branch = cm().currentBranch().name;
+    const invalid = (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+      && /marks must be 'none' or \{ scope: 'addressed' \| 'all', refs\? \}/.test(error.message);
+    // A bare scope (host/command's vocabulary), a misspelled scope, refs that
+    // aren't Discord addresses: each would otherwise mark every message.
+    for (const marks of ['addressed', { scope: 'adressed' }, { scope: 'all', refs: ['amb-0'] }]) {
+      await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, marks: marks as never }), invalid);
+      await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], marks: marks as never }), invalid);
+    }
+    assert.equal(cm().currentBranch().name, branch);
+    assert.equal(cm().getAllMessages().length, 5);
+    assert.equal(outbox().batches().length, 0);
+  });
+
+  it('a surgery whose marker batch cannot be recorded does not start, and says so', async () => {
+    await start(false);
+    const { tail } = seed(2);
+    const branch = cm().currentBranch().name;
+    const original = DiscordAwarenessOutbox.prototype.prepare;
+    DiscordAwarenessOutbox.prototype.prepare = function () {
+      throw new Error('recording awareness batch b1 failed: disk full');
+    };
+    try {
+      await assert.rejects(
+        framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
+        (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
+          && /^Rollback not started, nothing changed: recording awareness batch b1 failed: disk full/.test(error.message),
+      );
+    } finally {
+      DiscordAwarenessOutbox.prototype.prepare = original;
+    }
+    assert.equal(cm().currentBranch().name, branch);
+    assert.equal(cm().getAllMessages().length, 4);
+  });
+
+  it('an operator control the journal refuses is invalid; one it fails to record is failed', async () => {
+    await start(false);
+    assert.throws(
+      () => framework.cancelDiscordAwareness('no-such-batch'),
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid',
+    );
+    const original = DiscordAwarenessOutbox.prototype.retract;
+    DiscordAwarenessOutbox.prototype.retract = function () {
+      throw new Error('disk full');
+    };
+    try {
+      assert.throws(
+        () => framework.retractDiscordAwareness('all'),
+        (error: unknown) => error instanceof OperatorActionError && error.code === 'failed' && /disk full/.test(error.message),
+      );
+    } finally {
+      DiscordAwarenessOutbox.prototype.retract = original;
+    }
   });
 
   it('a rollback is local by default: no reaction, and the receipt counts what stayed unmarked', async () => {

@@ -142,9 +142,11 @@ export interface SurgeryMarkerFacts {
  *   the addressable ones left unmarked, and the surgery's `removedRefs`
  *   (`discordRefs` in the operator log) list every one.
  * - `queued` — one add request per mark is durably recorded and delivery has
- *   started. If delivery fails, the requests stay recorded, the
+ *   started. If a delivery pass fails, the requests stay recorded, the
  *   `discord-awareness-delivery` ops alert says so, and a later pass (a
- *   reconnect, a channel-list change or the next start) delivers them. It is
+ *   reconnect, a channel-list change or the next start) delivers them. The
+ *   same alert names the requests a pass gave up on: refused by Discord for
+ *   good, or after three attempts that reached the server unconfirmed. It is
  *   not a delivery claim: per-request outcomes stay in the awareness journal.
  * - `not-scheduled` — the body change landed, but the batch was never
  *   recorded, or recording it as active failed and it was retired from the
@@ -152,8 +154,8 @@ export interface SurgeryMarkerFacts {
  * - `unresolved` — the journal could record neither the activation nor the
  *   retirement, or could not be read back to say whether the batch was
  *   recorded at all. `batchId` names the batch, whose scheduling outcome is
- *   unresolved: any later reconciliation or restart that can read it may
- *   activate and deliver it, and nothing here promises otherwise.
+ *   unresolved: the next start, if it can read the batch, may activate and
+ *   deliver it, and nothing here promises otherwise.
  */
 export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
   | { status: 'none'; queued: 0 }

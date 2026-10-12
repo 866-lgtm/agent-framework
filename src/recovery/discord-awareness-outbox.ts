@@ -13,14 +13,23 @@ import { RecordJournal, type AppendOptions } from '../record-journal.js';
  * Marks are an explicit publication choice, separate from the surgery itself
  * (`DiscordAwarenessMarks`, default `none`). Once requested, they are
  * one-shot: branch moves and restarts never derive new operations from branch
- * state; an operator retracts, cancels or releases explicitly.
+ * state. The one thing a restart does with branch state is complete a
+ * surgery that crashed after its switch: a prepared batch whose target is
+ * the active branch carries out that surgery's own recorded choice (see
+ * recoverAtStartup). An operator retracts, cancels or releases explicitly.
  *
  * The ledger is an append-only journal of what was asked and what was
  * answered, never a model of what is on Discord. Each operation is recorded
- * as `requested`, then `dispatching` (written before the request can leave),
- * then an outcome. A request that was dispatched and never answered stays
- * `unknown` for good: a later retry's confirmation does not resolve it, and a
- * later opposite operation discloses it.
+ * as `requested`, then each attempt as `dispatching` (written before its
+ * request can leave), then that attempt's outcome. A request that was
+ * dispatched and never answered stays `unknown` for good: a later attempt's
+ * answer doesn't change it, receipts count it as unresolved, and a later
+ * opposite operation discloses it. An operation's status is its latest
+ * answer, so an add whose retry Discord confirmed is confirmed, while its
+ * first request is still counted as unresolved. An operation is not sent
+ * again after three attempts that reached the server without a confirmation
+ * (refused or unanswered); an attempt refused before it left the host
+ * doesn't count, so a route that is down keeps its work queued.
  *
  * Operations are keyed by (MCPL server id, channel, message, emoji). The
  * server id is the configured route to a bot, not the bot's identity: if the
@@ -33,7 +42,9 @@ import { RecordJournal, type AppendOptions } from '../record-journal.js';
  * holding a group of journal records that apply together. A record that
  * asserts a branch change (an activation after a switch or redaction, or a
  * batch recorded after an in-place change) is appended only after that
- * state is synced, so it can never outlive it.
+ * state is synced, so it can never outlive it. A write that fails inside the
+ * store leaves the journal refusing every read and write until the store is
+ * reopened (see load).
  */
 
 export const DEFAULT_DISCORD_AWARENESS_EMOJI = '💤';
@@ -56,27 +67,40 @@ export function boundDiscordAwarenessText(text: string, max = 500): string {
 }
 
 /**
- * Where a pre-journal awareness ledger (the JSON file earlier releases kept
- * under a store) is found, to import once.
- */
-/**
  * A Discord answer that the reaction can never succeed: the message or
- * channel is gone or inaccessible. Retrying cannot help.
+ * channel is gone or inaccessible, the emoji can't be used, or the message
+ * takes no more reactions (or blocks this one). Retrying cannot help.
  */
 export function isPermanentDiscordReactionFailure(message: string): boolean {
-  return /unknown message|unknown channel|missing access|missing permissions|missing permission|cannot access|channel .* not found|message .* not found/i
+  return /unknown message|unknown channel|unknown emoji|missing access|missing permissions|missing permission|cannot access|maximum number of reactions|reaction was blocked|channel .* not found|message .* not found/i
     .test(message);
+}
+
+/**
+ * An operator's request the journal won't carry out: an unknown batch or
+ * retract request, or one in the wrong state. Nothing was written. Any other
+ * error from an operator control is a failure to read or write the journal.
+ */
+export class DiscordAwarenessRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DiscordAwarenessRefusal';
+  }
 }
 
 /** AF's own refusal to write a request on a closed connection. */
 const PRE_WRITE_REFUSAL = /^Cannot send request:/;
 
+/** The pre-journal (version 1 and 2) ledger file name, imported once. */
+const LEGACY_LEDGER_NAME = 'discord-awareness-outbox.json';
+
+/**
+ * Where a pre-journal awareness ledger (the JSON file earlier releases kept
+ * under a store) is found, to import once.
+ */
 export function defaultDiscordAwarenessOutboxPath(storePath: string): string {
   return join(storePath, 'recovery', LEGACY_LEDGER_NAME);
 }
-
-/** The pre-journal (version 1 and 2) ledger file name, imported once. */
-const LEGACY_LEDGER_NAME = 'discord-awareness-outbox.json';
 
 export interface DiscordAwarenessRef {
   serverId: string;
@@ -131,9 +155,13 @@ export interface DiscordAwarenessBatchRecord {
   /** Authorized refs the surgery did not remove. */
   notRemoved?: number;
   /**
-   * `target-branch`: startup activates the batch only if its target is
-   * exactly the active branch (the surgery crashed after switching).
-   * `explicit`: only the surgery (or startup's resume of its intervals) does.
+   * Who completes a batch a crash left prepared. With suppression intervals,
+   * `explicit` means only its surgery, or startup's resume of its intervals
+   * on its target branch, activates it: that branch being active doesn't
+   * prove the redactions finished. Without intervals the policy changes
+   * nothing: startup activates a prepared batch whose target is exactly the
+   * active branch (its surgery crashed after its switch, or after the
+   * in-place change it was recorded for) and holds any other.
    */
   activationPolicy?: 'target-branch' | 'explicit';
   /** Idempotent interval operations used to resume an interrupted suppression. */
@@ -244,8 +272,9 @@ export interface DiscordAwarenessCancelReceipt {
   /** The batch id or retract request id that was cancelled. */
   target: string;
   kind: 'batch' | 'retract';
-  /** Requests that will now never be sent (for a batch not yet activated,
-   *  every mark it would have requested). */
+  /** Requests this call stopped before they were ever sent (for a batch not
+   *  yet activated, every mark it would have requested). A repeated cancel
+   *  stops none. */
   cancelled: number;
   /** Held release actions dropped (a held batch was cancelled). */
   heldDropped: number;
@@ -269,7 +298,10 @@ export interface DiscordAwarenessRetractReceipt {
   requestId: string;
   /** Removals queued: one per selected reaction key, whatever history says. */
   removalsQueued: number;
-  /** Add requests for those keys that had not been sent, now superseded. */
+  /** Add requests for those keys that had not ended (due, on the wire, or
+   *  unknown), whose later sends and retries are now retired. One on the
+   *  wire still settles before the removal is sent, and any unresolved one
+   *  may land or have landed (keysWithUnresolvedAdds). */
   addsSuperseded: number;
   /** Keys whose earlier add attempts are unresolved (on the wire or unknown):
    *  such an add may land after this removal. */
@@ -486,7 +518,7 @@ type JournalRecord =
   | { t: 'request-cancelled'; at: number; requestId: string; by?: string }
   | { t: 'suppression-complete'; at: number; batchId: string }
   | { t: 'legacy-evidence'; at: number; evidence: DiscordAwarenessLegacyEvidence }
-  | { t: 'import-complete'; at: number; source: 'v2'; sha256: string };
+  | { t: 'import-complete'; at: number; source: 'v1' | 'v2'; sha256: string };
 
 /** One journal entry (one Chronicle record): records that apply together. */
 interface JournalEntryGroup {
@@ -566,14 +598,44 @@ export class DiscordAwarenessOutbox {
   /**
    * Record a surgery's request before its branch switch. Returns null when it
    * carries neither marks nor a suppression journal. A prepared batch never
-   * delivers: activate() (or startup's crash completion) does.
+   * delivers: activate() (or startup's crash completion) does. If its write
+   * fails it throws, saying what the journal may hold (failedPrepare), and the
+   * surgery doesn't run.
    */
   prepare(input: DiscordAwarenessPrepareInput): DiscordAwarenessBatch | null {
     const batch = batchRecord(input);
     if (!batch) return null;
-    // Durable before the surgery's switch, so startup can crash-complete it.
-    this.append([{ t: 'batch', at: batch.createdAt, batch }], { durable: true });
+    try {
+      // Durable before the surgery's switch, so startup can crash-complete it.
+      this.append([{ t: 'batch', at: batch.createdAt, batch }], { durable: true });
+    } catch (error) {
+      throw new Error(this.failedPrepare(batch.id, error), { cause: error });
+    }
     return { ...structuredClone(batch), status: 'prepared' };
+  }
+
+  /**
+   * What a prepare whose write failed leaves, for the surgery's error (the
+   * surgery then doesn't run): nothing; the batch, retired at once when it is
+   * in this process's view; or, after a write that failed inside the store, a
+   * batch this process can't see, which the next start holds for an operator.
+   * A held batch of a surgery that never ran is to be cancelled, not
+   * released: its messages were never removed.
+   */
+  private failedPrepare(batchId: string, error: unknown): string {
+    const detail = `recording awareness batch ${batchId} failed: ${errorText(error)}`;
+    const cancelIt = 'cancel it then, not release it, since its surgery didn\'t run';
+    if (this.journal.needsReopen) {
+      return `${detail}; the batch may be in the store, unseen until the store is reopened, ` +
+        `and if so the next start holds it: ${cancelIt}`;
+    }
+    if (!this.journal.needsReconcile) return detail;
+    try {
+      return this.discard(batchId) ? `${detail}; it reached the journal and is retired` : detail;
+    } catch (retireError) {
+      return `${detail}; it reached the journal, and retiring it also failed (${errorText(retireError)}), ` +
+        `so the next start holds it: ${cancelIt}`;
+    }
   }
 
   /**
@@ -588,8 +650,10 @@ export class DiscordAwarenessOutbox {
    * that is not there is `not-scheduled` (nothing was recorded); one that is
    * there is settled like any prepared batch (activated, else retired, else
    * `unresolved`); and if the journal can't be read back, `unresolved`, since
-   * the batch may be there. Returns null when there is nothing to mark.
-   * Never throws.
+   * the batch may be there. That includes a write that failed inside the
+   * store: its record may be in the store's log, which this process can't
+   * read until the store is reopened (see load). Returns null when there is
+   * nothing to mark. Never throws.
    */
   settleApplied(
     input: Omit<DiscordAwarenessPrepareInput, 'sourceBranch' | 'targetBranch' | 'activationPolicy' | 'suppressionIntervals'>
@@ -816,7 +880,7 @@ export class DiscordAwarenessOutbox {
     if (state.retracts.has(target)) return this.cancelRetract(state, target, by);
     const batchId = target;
     const batch = state.batches.get(batchId);
-    if (!batch) throw new Error(`Discord awareness batch or retract request not found: ${target}`);
+    if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch or retract request not found: ${target}`);
     const receipt: DiscordAwarenessCancelReceipt = {
       target: batchId,
       kind: 'batch',
@@ -932,7 +996,7 @@ export class DiscordAwarenessOutbox {
       ]);
     } else {
       const batch = state.batches.get(target);
-      if (!batch) throw new Error(`Discord awareness batch not found: ${target}`);
+      if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch not found: ${target}`);
       candidateKeys = uniqueKeys(batch.refs.map((ref) => ({ ...ref, emoji: batch.emoji })));
     }
     const requestId = randomUUID();
@@ -971,9 +1035,9 @@ export class DiscordAwarenessOutbox {
   release(batchId: string, by?: string): DiscordAwarenessReleaseReceipt {
     const state = this.load();
     const batch = state.batches.get(batchId);
-    if (!batch) throw new Error(`Discord awareness batch not found: ${batchId}`);
+    if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch not found: ${batchId}`);
     if (batch.status !== 'held' || !batch.held) {
-      throw new Error(`Discord awareness batch ${batchId} is ${batch.status}, not held`);
+      throw new DiscordAwarenessRefusal(`Discord awareness batch ${batchId} is ${batch.status}, not held`);
     }
     const at = Date.now();
     const actions = batch.held.releaseActions;
@@ -997,7 +1061,8 @@ export class DiscordAwarenessOutbox {
    * wire. A key's operations go out in request order; consecutive requested
    * operations with the same action share one dispatch. An `unknown`
    * operation is retried only while it is still the newest live operation
-   * for its key.
+   * for its key. No operation is sent again once three of its attempts
+   * reached the server without a confirmation.
    */
   pendingDispatches(serverId?: string): DiscordAwarenessDispatch[] {
     const state = this.load();
@@ -1074,7 +1139,10 @@ export class DiscordAwarenessOutbox {
       const op = live[index];
       const status = this.opStatus(op);
       if (status === 'requested') { head = op; break; }
-      if (status === 'unknown' && index === live.length - 1) { head = op; break; }
+      // An unanswered request is sent again only while its operation is the
+      // newest live one for its key, and within the bound.
+      if (status === 'unknown' && index === live.length - 1
+        && unconfirmedAttempts(op) < MAX_UNCONFIRMED_ATTEMPTS) { head = op; break; }
     }
     if (!head) return null;
     const opIds = [head.opId];
@@ -1086,12 +1154,17 @@ export class DiscordAwarenessOutbox {
     return { key: { ...head.key }, action: head.action, opIds, order: head.requestedAt };
   }
 
-  /** Record the outcome of a dispatch's attempts. */
+  /**
+   * Record the outcome of a dispatch's attempts. Returns how many of its
+   * operations this outcome ended without a confirmation: refused for good,
+   * or at their third attempt that reached the server unconfirmed, so they
+   * will not be sent again.
+   */
   recordOutcome(
     attempts: Array<{ opId: string; attempt: number }>,
     outcome: DiscordAwarenessOutcome,
     detail: { permanent?: boolean; error?: string } = {},
-  ): void {
+  ): number {
     const at = Date.now();
     const error = detail.error !== undefined ? boundDiscordAwarenessText(detail.error) : undefined;
     try {
@@ -1107,6 +1180,15 @@ export class DiscordAwarenessOutbox {
     } finally {
       for (const { opId } of attempts) this.inFlight.delete(opId);
     }
+    if (outcome !== 'failed' && outcome !== 'unknown') return 0;
+    const state = this.load();
+    let ended = 0;
+    for (const { opId } of attempts) {
+      const op = state.ops.get(opId);
+      if (!op || op.cancelled) continue;
+      if ((outcome === 'failed' && detail.permanent) || unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS) ended++;
+    }
+    return ended;
   }
 
   // -- views ------------------------------------------------------------------
@@ -1195,17 +1277,23 @@ export class DiscordAwarenessOutbox {
 
   // -- internals --------------------------------------------------------------
 
+  /**
+   * What became of an operation, latest answer first. What Discord may have
+   * comes before whether it will be sent again: a confirmation is a fact
+   * about Discord, and a request on the wire or never answered may land or
+   * have landed whatever was decided after it was sent (a cancel, or a later
+   * opposite act, stops what would be sent next, not a request already
+   * sent). Then: cancelled, refused for good (permanently, or after the
+   * bound on unconfirmed attempts), or due.
+   */
   private opStatus(op: DiscordAwarenessOp): DiscordAwarenessOpStatus {
     const last = op.attempts.at(-1);
-    // A confirmation is a fact about Discord, even for a request cancelled
-    // while it was on the wire.
     if (last?.outcome === 'confirmed') return 'confirmed';
+    if (last && last.outcome === undefined) return this.inFlight.has(op.opId) ? 'dispatching' : 'unknown';
+    if (last?.outcome === 'unknown') return 'unknown';
     if (op.cancelled) return 'cancelled';
-    if (!last) return 'requested';
-    if (last.outcome === undefined) return this.inFlight.has(op.opId) ? 'dispatching' : 'unknown';
-    if (last.outcome === 'unknown') return 'unknown';
-    if (last.outcome === 'not-sent') return 'requested';
-    return last.permanent ? 'failed' : 'requested';
+    if (!last || last.outcome === 'not-sent') return 'requested';
+    return last.permanent || unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS ? 'failed' : 'requested';
   }
 
   /**
@@ -1278,8 +1366,20 @@ export class DiscordAwarenessOutbox {
    * a reload before writing again): every entry is replayed, after an
    * earlier build's checkpoint if there is one (see JournalSnapshot). The
    * first load also imports a pre-journal ledger, once.
+   *
+   * After an append that threw inside the store, its record may be in the
+   * store's log where no load in this process can see it (RecordJournal's
+   * needsReopen), so nothing decided here could be trusted: every read and
+   * write refuses until the store is reopened, as at the next start, which
+   * reads that record with the rest.
    */
   private load(): JournalState {
+    if (this.journal.needsReopen) {
+      throw new Error(
+        'The Discord awareness journal can\'t be read in this process: an earlier write failed inside the store, ' +
+          'and its record may be there unseen. Nothing is read or written until the store is reopened, as at the next start',
+      );
+    }
     if (this.state && !this.journal.needsReconcile) return this.state;
     const { snapshot, entries } = this.journal.load();
     const state = snapshot ? restoreState(snapshot) : emptyState();
@@ -1336,8 +1436,10 @@ export class DiscordAwarenessOutbox {
 
   /**
    * Append one group of records as one journal entry and apply it. A failed
-   * append leaves the state to be rebuilt from the journal: whether it was
-   * written is unknown, and the next operation reloads before writing.
+   * append leaves the state to be rebuilt from the journal before the next
+   * operation: one whose record reached this process's view (a barrier
+   * failed) is read back with it, and one that failed inside the store
+   * leaves the journal refusing until the store is reopened (see load).
    */
   private append(records: JournalRecord[], opts: AppendOptions = {}): void {
     if (records.length === 0) return;
@@ -1366,13 +1468,24 @@ function liveRequests(records: JournalRecord[]): number {
   return records.filter((record) => record.t === 'requested' && !cancelled.has(record.opId)).length;
 }
 
-/** The state an earlier build's checkpoint recorded (see JournalSnapshot). */
+/**
+ * The state an earlier build's checkpoint recorded (see JournalSnapshot).
+ * Checkpoints written before authorization order existed carry no
+ * authorizations and no position: a restored act takes 0, older than
+ * anything recorded after the restore, which is when it was decided.
+ */
 function restoreState(snapshot: JournalSnapshot): JournalState {
   const state: JournalState = {
-    batches: new Map(snapshot.batches.map((batch) => [batch.id, structuredClone(batch)])),
-    ops: new Map(snapshot.ops.map((op) => [op.opId, structuredClone(op)])),
+    batches: new Map(snapshot.batches.map((batch) => [
+      batch.id,
+      { ...structuredClone(batch), authorization: batch.authorization ?? 0 },
+    ])),
+    ops: new Map(snapshot.ops.map((op) => [op.opId, { ...structuredClone(op), authorization: op.authorization ?? 0 }])),
     legacy: new Map(),
-    retracts: new Map((snapshot.retracts ?? []).map((retract) => [retract.requestId, structuredClone(retract)])),
+    retracts: new Map((snapshot.retracts ?? []).map((retract) => [
+      retract.requestId,
+      { ...structuredClone(retract), authorization: retract.authorization ?? 0 },
+    ])),
     importedSources: new Set(snapshot.importedSources),
     position: snapshot.position ?? 0,
   };
@@ -1560,8 +1673,10 @@ interface LegacyBatch {
  * What the old ledger recorded about each ref is kept as legacy evidence:
  * facts (attempt count, last action, status and error), never synthesized
  * attempts and never a judgment about what is on Discord. Pending work, and
- * batches still prepared, are held for an operator: they were queued before
- * marks were an explicit choice. Nothing imported is ever dispatched.
+ * batches still prepared, are held for an operator when they have marks to
+ * release: they were queued before marks were an explicit choice. A prepared
+ * suppression with nothing to mark only has its body resumed on its branch
+ * (see preparedSuppressionsForBranch). Nothing imported is ever dispatched.
  *
  * Each batch is imported once. A batch the journal already holds, or a
  * second listing of one in this file, is skipped whole: its evidence would
@@ -1618,7 +1733,9 @@ function importLegacy(
     const releaseActions: DiscordAwarenessReleaseAction[] = [];
     for (const entry of raw.refs) {
       const key = { serverId: entry.serverId, channelId: entry.channelId, messageId: entry.messageId, emoji: raw.emoji };
-      // v1 entries carry no delivery state: an active v1 batch was all pending.
+      // v1 entries carry no delivery state. A v1 batch is `prepared` or
+      // `pending`, and `pending` was the active one, every mark still to
+      // deliver: its entries are pending, a prepared one's are not.
       const status = entry.deliveryStatus ?? (raw.status === 'pending' ? 'pending' : 'applied');
       const desired = entry.desired ?? raw.status === 'pending';
       if (!legacyActive || status === 'pending') {
@@ -1647,7 +1764,7 @@ function importLegacy(
       });
     }
   }
-  records.push({ t: 'import-complete', at, source: 'v2', sha256 });
+  records.push({ t: 'import-complete', at, source: document.version === 1 ? 'v1' : 'v2', sha256 });
   return records;
 }
 
@@ -1739,6 +1856,18 @@ function refKey(ref: DiscordAwarenessRef): string {
 
 function markKey(key: DiscordAwarenessRef & { emoji: string }): string {
   return `${key.emoji}\0${refKey(key)}`;
+}
+
+/**
+ * Attempts that reached the server without a confirmation (refused, or never
+ * answered) after which an operation is not sent again. Without a bound, a
+ * refusal Discord repeats, or a server that never answers, would be sent
+ * again at every drain, two journal records each time.
+ */
+const MAX_UNCONFIRMED_ATTEMPTS = 3;
+
+function unconfirmedAttempts(op: DiscordAwarenessOp): number {
+  return op.attempts.filter((attempt) => attempt.outcome === 'failed' || attempt.outcome === 'unknown').length;
 }
 
 /** Unresolved requests among these operations' attempts, one per dispatch. */

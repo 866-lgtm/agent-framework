@@ -129,6 +129,7 @@ export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } fro
 // Offline outage recovery and the Discord awareness-mark journal
 export {
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,

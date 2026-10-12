@@ -19,7 +19,9 @@ import { JsStore } from '@animalabs/chronicle';
 import {
   DISCORD_AWARENESS_RECORD_TYPE,
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   boundDiscordAwarenessText,
+  isPermanentDiscordReactionFailure,
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
   type DiscordAwarenessBatchView,
@@ -79,8 +81,8 @@ function answer(
 ) {
   const claimed = outbox.claimDispatch('discord', (d) => d.key.messageId !== messageId);
   assert.ok(claimed, `a dispatch for ${messageId} is due`);
-  outbox.recordOutcome(claimed.attempts, outcome, detail);
-  return claimed;
+  const ended = outbox.recordOutcome(claimed.attempts, outcome, detail);
+  return { ...claimed, ended };
 }
 
 const batches = (outbox: DiscordAwarenessOutbox) =>
@@ -309,7 +311,8 @@ test('a newer opposite request stops the retries of a retryably failed one, in b
   answer(outbox, 'm1', 'failed', { error: 'Discord 503' }); // retryable
   const receipt = outbox.retract(batch.id);
   assert.equal(receipt.addsSuperseded, 1);
-  for (let i = 0; i < 3; i++) {
+  // Retried while refused, within the bound of three unconfirmed attempts.
+  for (let i = 0; i < 2; i++) {
     const claimed = outbox.claimDispatch('discord')!;
     assert.equal(claimed.dispatch.action, 'remove');
     outbox.recordOutcome(claimed.attempts, 'failed', { error: 'Discord 503' });
@@ -468,6 +471,13 @@ test('a retry confirming an unknown add never erases the unresolved first attemp
   assert.deepEqual(retry.dispatch.opIds, first.dispatch.opIds);
   assert.equal(retry.attempts[0].attempt, 2);
   outbox.recordOutcome(retry.attempts, 'confirmed');
+  // The operation's status is its latest answer; the first request stays
+  // unknown in its history and is counted as unresolved.
+  const [op] = outbox.operations();
+  assert.equal(outbox.operationStatus(op), 'confirmed');
+  assert.deepEqual(op.attempts.map((attempt) => attempt.outcome), ['unknown', 'confirmed']);
+  assert.equal(batches(outbox)[0].adds.confirmed, 1);
+  assert.equal(batches(outbox)[0].adds.unknown, 0);
   assert.equal(batches(outbox)[0].unresolvedAttempts, 1);
   const receipt = outbox.retract(batch.id);
   assert.equal(receipt.unresolvedAddAttempts, 1);
@@ -756,7 +766,7 @@ async function muted<T>(fn: () => Promise<T>): Promise<T> {
 test('framework drain classifies outcomes from what reached the server', async () => {
   const h = storeHarness();
   try {
-    activeBatch(h.outbox, [ref('m1'), ref('m2'), ref('m3'), ref('m4'), ref('m5')]);
+    activeBatch(h.outbox, [ref('m1'), ref('m2'), ref('m3'), ref('m4'), ref('m5'), ref('m6'), ref('m7')]);
     const calls: string[] = [];
     let connected = true;
     const connection = {
@@ -766,6 +776,8 @@ test('framework drain classifies outcomes from what reached the server', async (
         if (args.messageId === 'm2') return { isError: true, content: [{ type: 'text', text: 'Unknown Message' }] };
         if (args.messageId === 'm3') throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent');
         if (args.messageId === 'm4') throw new McplRequestError('did not respond', 'no-response');
+        if (args.messageId === 'm6') throw new McplRequestError('Internal error', 'error-response', -32603);
+        if (args.messageId === 'm7') throw new TypeError('transport went away');
         return { content: [{ type: 'text', text: 'Reaction applied' }] };
       },
     };
@@ -774,13 +786,20 @@ test('framework drain classifies outcomes from what reached the server', async (
     framework.discordAwarenessDrains = new Map();
     framework.discordAwarenessDeadlineMs = 1000;
     framework.mcplServerRegistry = { getServer: () => connection };
+    const alerts: Array<{ kind: string; message: string }> = [];
+    framework.opsAlert = (kind: string, _agent: string, message: string) => { alerts.push({ kind, message }); };
     await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
-    assert.deepEqual(calls.sort(), ['add_reaction:m1', 'add_reaction:m2', 'add_reaction:m3', 'add_reaction:m4', 'add_reaction:m5']);
+    assert.deepEqual(calls.sort(), ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7'].map((m) => `add_reaction:${m}`));
     const status = new Map(h.outbox.operations().map((op) => [op.key.messageId, h.outbox.operationStatus(op)]));
     assert.equal(status.get('m1'), 'confirmed');
     assert.equal(status.get('m2'), 'failed', 'Discord said the message is gone: final');
     assert.equal(status.get('m3'), 'requested', 'never written: still queued');
     assert.equal(status.get('m4'), 'unknown', 'written, no answer: unknown');
+    assert.equal(status.get('m6'), 'unknown', 'a JSON-RPC error may come after the server acted');
+    assert.equal(status.get('m7'), 'unknown', 'an error the connection did not classify may follow a write');
+    assert.equal(alerts.length, 1, 'one alert for the pass');
+    assert.equal(alerts[0].kind, 'discord-awareness-delivery');
+    assert.match(alerts[0].message, /^1 awareness mark operation\(s\) on discord won't be sent again.*add discord:g1:c1\/m2: failed: Unknown Message/);
 
     // A disconnected route leaves its work queued without writing anything.
     connected = false;
@@ -792,7 +811,7 @@ test('framework drain classifies outcomes from what reached the server', async (
     connected = true;
     calls.length = 0;
     await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
-    assert.deepEqual(calls.sort(), ['add_reaction:m3', 'add_reaction:m4']);
+    assert.deepEqual(calls.sort(), ['add_reaction:m3', 'add_reaction:m4', 'add_reaction:m6', 'add_reaction:m7']);
   } finally {
     h.cleanup();
   }
@@ -1174,18 +1193,28 @@ const afterAnAppend = (calls: string[]) => calls.includes(JOURNAL_APPEND);
  * The harness store with its journal seams observed and faultable. `fail`
  * makes calls at a seam throw while `matches` holds for the calls before
  * them (up to `times` of them): `before` the real call, so nothing reaches
- * the store, or `after` it, so it did.
+ * the store, or `after` it, so it did. `unindexed` is an append as
+ * Chronicle 0.4.0's can fail: the record is written to the log, the periodic
+ * sync then throws, and the record stays out of this process's view of the
+ * store (its lists and reads) until the store is reopened. A view of the
+ * underlying store, as a restarted process has, sees it.
  */
 function journalSeams(store: JsStore) {
   type Seam = 'sync' | 'append' | 'list';
+  type When = 'before' | 'after' | 'unindexed';
   const calls: string[] = [];
-  const faults: Array<{ seam: Seam; when: 'before' | 'after'; matches: (calls: string[]) => boolean; times: number }> = [];
-  const through = <T>(seam: Seam, label: string, call: () => T): T => {
+  const hidden = new Set<string>();
+  const faults: Array<{ seam: Seam; when: When; matches: (calls: string[]) => boolean; times: number }> = [];
+  const through = <T>(seam: Seam, label: string, call: () => T, hide?: (result: T) => void): T => {
     const fault = faults.find((candidate) => candidate.seam === seam && candidate.times > 0 && candidate.matches(calls));
     calls.push(label);
     if (fault) fault.times--;
     if (fault?.when === 'before') throw new Error(`injected ${seam} failure`);
     const result = call();
+    if (fault?.when === 'unindexed') {
+      hide?.(result);
+      throw new Error(`injected ${seam} failure after writing`);
+    }
     if (fault?.when === 'after') throw new Error(`injected ${seam} failure`);
     return result;
   };
@@ -1193,11 +1222,14 @@ function journalSeams(store: JsStore) {
     get(target, prop) {
       if (prop === 'sync') return () => through('sync', 'sync', () => target.sync());
       if (prop === 'appendJson') {
-        return (type: string, payload: unknown) => through('append', `append ${type}`, () => target.appendJson(type, payload));
+        return (type: string, payload: unknown) => through(
+          'append', `append ${type}`, () => target.appendJson(type, payload), (record) => hidden.add(record.id),
+        );
       }
       if (prop === 'getRecordIdsByType') {
-        return (type: string) => through('list', `list ${type}`, () => target.getRecordIdsByType(type));
+        return (type: string) => through('list', `list ${type}`, () => target.getRecordIdsByType(type).filter((id) => !hidden.has(id)));
       }
+      if (prop === 'getRecord') return (id: string) => (hidden.has(id) ? null : target.getRecord(id));
       const value = Reflect.get(target, prop);
       return typeof value === 'function' ? value.bind(target) : value;
     },
@@ -1205,7 +1237,7 @@ function journalSeams(store: JsStore) {
   return {
     store: proxy as JsStore,
     calls,
-    fail: (seam: Seam, when: 'before' | 'after', matches: (calls: string[]) => boolean, times = 1) => {
+    fail: (seam: Seam, when: When, matches: (calls: string[]) => boolean, times = 1) => {
       faults.push({ seam, when, matches, times });
     },
   };
@@ -1235,7 +1267,7 @@ async function hideOverFaultyJournal(arrange: (seams: ReturnType<typeof journalS
   const result: any = await muted(() => framework.handleHostCommand('discord', {
     command: 'hide', agentName: 'cairn', fromMessageId: 'm1', marks: 'all',
   }));
-  return { h, seams, result, alerts };
+  return { h, seams, outbox, result, alerts };
 }
 
 test('a hide records its batch only after the removal is synced: the batch can never outlive the change', async () => {
@@ -1330,6 +1362,216 @@ test('an applied change\'s batch whose journal cannot be read back after a faile
     assert.equal(batch.status, 'prepared');
     assert.match(result.markers.error, /reading the journal back also failed: injected list failure/);
     assert.deepEqual(alerts, ['discord-awareness-unresolved']);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an applied change\'s batch written but out of this view of the store is unresolved, and the journal refuses until reopened', async () => {
+  // The batch's append writes its record, then Chronicle's periodic sync
+  // fails: the record is in the store's log, unindexed until a reopen. Read
+  // back in this process, it would look like nothing was recorded.
+  const { h, outbox, result, alerts } = await hideOverFaultyJournal((seams) => {
+    seams.fail('append', 'unindexed', (calls) => calls.includes('remove'));
+  });
+  try {
+    assert.equal(result.ok, true, 'the hide stands');
+    assert.equal(result.markers.status, 'unresolved', 'not a not-scheduled receipt over a batch the next start may deliver');
+    assert.match(result.markers.error, /recording the batch failed: injected append failure after writing.*until the store is reopened/);
+    assert.deepEqual(alerts, ['discord-awareness-unresolved']);
+    assert.throws(() => outbox.batches(), /can't be read in this process.*until the store is reopened/);
+    assert.throws(() => outbox.claimDispatch('discord'), /until the store is reopened/);
+    // The next start reads the batch and, as the receipt says it may, completes it.
+    const fresh = new DiscordAwarenessOutbox(h.store);
+    const [batch] = fresh.batches();
+    assert.equal(batch.id, result.markers.batchId);
+    assert.equal(batch.status, 'prepared');
+    assert.deepEqual(fresh.recoverAtStartup('main').activated, [batch.id]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an activation written but out of this view is unresolved: nothing retires it, and the next start delivers it', withJournal((_outbox, h) => {
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store);
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all' })!;
+  seams.fail('append', 'unindexed', () => true);
+  const settled = outbox.settleActivation(batch.id);
+  assert.equal(settled.status, 'unresolved');
+  assert.match((settled as { error: string }).error, /injected append failure after writing; retiring it also failed: .*until the store is reopened/);
+  assert.throws(() => outbox.pendingDispatches('discord'), /until the store is reopened/);
+  const fresh = new DiscordAwarenessOutbox(h.store);
+  assert.equal(fresh.batches()[0].status, 'active', 'the activation reached the store, and no retirement follows it');
+  assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
+}));
+
+test('a cancel written but out of this view: this process sends nothing more, and the next start reads the cancel', withJournal((_outbox, h) => {
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store);
+  const batch = activeBatch(outbox, [ref('m1'), ref('m2')]);
+  seams.fail('append', 'unindexed', () => true);
+  assert.throws(() => outbox.cancel(batch.id), /injected append failure after writing/);
+  assert.throws(() => outbox.claimDispatch('discord'), /until the store is reopened/, 'nothing is claimed from a view that may lack the cancel');
+  assert.throws(() => outbox.view(), /until the store is reopened/);
+  const fresh = new DiscordAwarenessOutbox(h.store);
+  assert.ok(fresh.batches()[0].cancelled);
+  assert.equal(fresh.pendingDispatches('discord').length, 0);
+}));
+
+test('a legacy import written but out of this view is not imported again in this process', withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 2,
+    batches: [{
+      id: 'old', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1',
+      emoji: '💤', createdAt: 1, refs: [{ ...ref('a1'), lastAction: 'add', desired: true, deliveryStatus: 'pending', attempts: 2, lastError: 'did not respond' }],
+    }],
+  }));
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store, { legacyPath: h.legacyPath });
+  seams.fail('append', 'unindexed', () => true);
+  assert.throws(() => outbox.batches(), /injected append failure after writing/);
+  assert.throws(() => outbox.batches(), /until the store is reopened/, 'no second import is written');
+  assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, 1);
+  // The next start reads the one import, and the file it names isn't imported again.
+  const fresh = h.reopen();
+  const [view] = batches(fresh);
+  assert.equal(view.id, 'old');
+  assert.equal(view.legacy?.entries, 1);
+  assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, 1);
+}));
+
+test('a prepare whose write failed says what the journal may hold, and retires a batch it can see', withJournal((_outbox, h) => {
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store);
+  outbox.batches();
+  const input = (n: number) => ({ agentName: 'cairn', sourceBranch: 'main', targetBranch: `rollback/cairn/${n}`, refs: [ref('m1')], scope: 'all' as const });
+  // The record reached this view and its durability barrier failed: retired at once.
+  seams.fail('sync', 'before', rightAfterAppend);
+  assert.throws(() => outbox.prepare(input(1)), /recording awareness batch \S+ failed: injected sync failure; it reached the journal and is retired/);
+  assert.deepEqual(new DiscordAwarenessOutbox(h.store).batches().map((b) => b.status), ['discarded']);
+  // Written but out of this view: the next start holds it, and the error says to cancel it.
+  seams.fail('append', 'unindexed', () => true);
+  assert.throws(() => outbox.prepare(input(2)), /may be in the store, unseen until the store is reopened, and if so the next start holds it: cancel it then, not release it/);
+  const fresh = new DiscordAwarenessOutbox(h.store);
+  assert.equal(fresh.recoverAtStartup('main').held.length, 1);
+}));
+
+test('an operation\'s status says first what Discord may have: an add on the wire that a retract superseded is dispatching, then unknown', withJournal((outbox, h) => {
+  const batch = activeBatch(outbox, [ref('m1')]);
+  const claimed = outbox.claimDispatch('discord')!;
+  outbox.retract(batch.id);
+  const add = (journal: DiscordAwarenessOutbox) => journal.operations().find((op) => op.action === 'add')!;
+  assert.ok(add(outbox).cancelled, 'the retract retired its later sends');
+  assert.equal(outbox.operationStatus(add(outbox)), 'dispatching', 'its request is on the wire');
+  outbox.recordOutcome(claimed.attempts, 'unknown');
+  assert.equal(outbox.operationStatus(add(outbox)), 'unknown', 'never answered: it may have landed');
+  assert.equal(batches(outbox)[0].adds.unknown, 1);
+  assert.equal(batches(outbox)[0].adds.cancelled, 0);
+  const restarted = h.reopen();
+  assert.equal(restarted.operationStatus(add(restarted)), 'unknown');
+  // An add retired before it was ever sent is just cancelled.
+  const second = activeBatch(restarted, [ref('m2')]);
+  restarted.cancel(second.id);
+  const unsent = restarted.operations().find((op) => op.key.messageId === 'm2')!;
+  assert.equal(restarted.operationStatus(unsent), 'cancelled');
+}));
+
+test('an operation is not sent again after three attempts that reached the server unconfirmed; one refused before it left does not count', withJournal((outbox) => {
+  activeBatch(outbox, [ref('m1'), ref('m2'), ref('m3')]);
+  const op = (messageId: string) => outbox.operations().find((o) => o.key.messageId === messageId)!;
+  const due = () => outbox.pendingDispatches('discord').map((d) => d.key.messageId).sort();
+  // m1: a refusal the pattern doesn't know, three times.
+  assert.equal(answer(outbox, 'm1', 'failed', { error: 'Internal Server Error' }).ended, 0);
+  assert.equal(outbox.operationStatus(op('m1')), 'requested');
+  assert.equal(answer(outbox, 'm1', 'failed', { error: 'Internal Server Error' }).ended, 0);
+  assert.equal(answer(outbox, 'm1', 'failed', { error: 'Internal Server Error' }).ended, 1, 'the third ends it');
+  assert.equal(outbox.operationStatus(op('m1')), 'failed');
+  // m2: twice refused before it left (the route was down), then three unanswered requests.
+  answer(outbox, 'm2', 'not-sent');
+  answer(outbox, 'm2', 'not-sent');
+  assert.equal(answer(outbox, 'm2', 'unknown').ended, 0);
+  assert.equal(answer(outbox, 'm2', 'unknown').ended, 0);
+  assert.equal(answer(outbox, 'm2', 'unknown').ended, 1);
+  assert.equal(outbox.operationStatus(op('m2')), 'unknown', 'it may have landed');
+  // m3: refused for good at once.
+  assert.equal(answer(outbox, 'm3', 'failed', { permanent: true, error: 'Unknown Message' }).ended, 1);
+  assert.deepEqual(due(), [], 'none of them is sent again');
+  assert.equal(op('m2').attempts.length, 5);
+}));
+
+test('Discord refusals that no retry can change are permanent', () => {
+  for (const text of ['Unknown Message', 'Unknown Channel', 'Unknown Emoji', 'Missing Access', 'Missing Permissions',
+    'Maximum number of reactions reached (20)', 'Reaction was blocked']) {
+    assert.equal(isPermanentDiscordReactionFailure(text), true, text);
+  }
+  for (const text of ['Internal Server Error', 'You are being rate limited.', 'did not respond within 10000ms']) {
+    assert.equal(isPermanentDiscordReactionFailure(text), false, text);
+  }
+});
+
+test('a checkpoint from before authorization order restores its acts as older than anything after it', withJournal((outbox, h) => {
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all' })!;
+  // The earliest checkpointing build wrote batches and operations with no
+  // authorization, and no position.
+  const earlier = new RecordJournal<{ records: unknown[] }, unknown>(h.store, { type: DISCORD_AWARENESS_RECORD_TYPE });
+  earlier.load();
+  const { authorization: _authorization, ...unauthorized } = outbox.batches()[0];
+  earlier.checkpoint({ batches: [unauthorized], ops: [], legacy: [], importedSources: [] });
+  const restored = h.reopen();
+  // A retract after the restore is the later act: the batch's activation
+  // (its surgery's earlier choice) is recorded superseded and never sent.
+  restored.retract('all');
+  assert.equal(restored.activate(batch.id), 0);
+  assert.ok(restored.operations().filter((op) => op.action === 'add').every((op) => op.cancelled?.reason === 'superseded'));
+  assert.deepEqual(restored.pendingDispatches('discord').map((d) => d.action), ['remove']);
+}));
+
+test('an operator\'s request the journal won\'t carry out is a refusal; a journal failure is not', withJournal((_outbox, h) => {
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store);
+  const batch = activeBatch(outbox, [ref('m1')]);
+  assert.throws(() => outbox.cancel('no-such-batch'), DiscordAwarenessRefusal);
+  assert.throws(() => outbox.retract('no-such-batch'), DiscordAwarenessRefusal);
+  assert.throws(() => outbox.release(batch.id), (error) => error instanceof DiscordAwarenessRefusal && /is active, not held/.test(error.message));
+  seams.fail('sync', 'before', () => true);
+  assert.throws(() => outbox.cancel(batch.id), (error) => !(error instanceof DiscordAwarenessRefusal) && /injected sync failure/.test((error as Error).message));
+}));
+
+test('a version 1 ledger\'s import is recorded as v1', withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 1,
+    batches: [{ id: 'v1-batch', status: 'pending', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1', emoji: '💤', createdAt: 1, refs: [ref('a1')] }],
+  }));
+  h.reopen().batches();
+  const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE)
+    .flatMap((id) => (JSON.parse(Buffer.from(h.store.getRecord(id)!.payload).toString('utf-8')) as { records: Array<{ t: string; source?: string }> }).records);
+  assert.deepEqual(records.filter((record) => record.t === 'import-complete').map((record) => record.source), ['v1']);
+}));
+
+test('a sync for one server drains only that server', async () => {
+  const h = storeHarness();
+  try {
+    activeBatch(h.outbox, [ref('m1'), { serverId: 'discord-b', channelId: 'discord:g2:c1', messageId: 'n1' }]);
+    const calls: string[] = [];
+    const connection = (id: string) => ({
+      isConnected: true,
+      sendToolsCallWithDeadline: async (_name: string, args: Record<string, unknown>) => {
+        calls.push(`${id}:${args.messageId}`);
+        return { content: [{ type: 'text', text: 'Reaction added' }] };
+      },
+    });
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = h.outbox;
+    framework.discordAwarenessDrains = new Map();
+    framework.discordAwarenessDeadlineMs = 1000;
+    framework.mcplServerRegistry = { getServer: (id: string) => connection(id) };
+    await muted(() => framework.syncDiscordAwarenessMarkers('discord-b'));
+    assert.deepEqual(calls, ['discord-b:n1']);
+    await muted(() => framework.syncDiscordAwarenessMarkers());
+    assert.deepEqual(calls, ['discord-b:n1', 'discord:m1']);
   } finally {
     h.cleanup();
   }
