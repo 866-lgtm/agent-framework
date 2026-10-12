@@ -33,7 +33,8 @@
   `applyDeletions: true` removes those whose disk copy is still one the workspace held, and
   `force` too removes those changed since. A `sync` of the path takes disk's copy back into the
   workspace when it's one the workspace can hold (text within the size limit). Once the deletion
-  is on disk, a file that later appears at the path is a new file, adopted like any other.
+  is confirmed on disk, a file that later appears at the path is a new file, adopted like any
+  other.
   `autoMaterialize` writes and deletes follow materialize's freshness rule: a disk copy changed
   by another writer since it last agreed is refused, not overwritten or unlinked.
 - **A `materialize` without a path takes up only what disk still owes:** workspace edits,
@@ -53,9 +54,10 @@
   in global chronicle records rather than branch state, so selecting an earlier state keeps that
   state as a draft over the later disk version, and a file present only in another branch's
   history is listed `not-in-branch`, never ingested or unlinked. Each write or unlink a
-  materialize makes, and each adoption of a disk change into the tree, is recorded as an intent
-  ahead of it and completed once it is durable, so a crash or a torn record tail never costs an
-  edit. After a crash, an interrupted write or unlink is decided by what disk shows (a copy
+  materialize makes, and each adoption that ingests a disk change or removes a file, is recorded
+  as an intent ahead of it and completed once it is durable, so a crash or a torn record tail
+  never costs an edit. A binary or oversize disk version, for which the workspace drops its copy,
+  forgets the evidence first instead. After a crash, an interrupted write or unlink is decided by what disk shows (a copy
   matching neither the one before nor the one intended is an `interrupted` conflict), and one
   that shows on disk without proof it is durable is completed only by the next `materialize`,
   which redoes it; an interrupted adoption is settled by its own branch's tree. This replaces
@@ -84,13 +86,14 @@
   directory from a written file up to the mount root is synced before the write counts as done,
   directories it had to create included. Listings likewise accept a directory's contents only
   while it is still the directory at its path, and a scan, write or unlink accepts what it found
-  only while the mount root is still the one it began under: a scan under a root replaced while
-  it ran decides nothing and reports the root. Each check is made where the operation happens,
+  only while the mount root is still the one it began under: a scan that finds the root replaced
+  when it looks again treats what it observed as unverified, and reports the root. Each check is made where the operation happens,
   against what is there at that moment. Node has no `openat`, so a parent directory replaced
   concurrently in the window between a check and a create, `mkdir`, unlink or listing can still
   redirect that one operation: an empty file or directory can appear outside the mount, or a
   same-named file there can be unlinked. Nor can a write or an unlink be bound to the moment of
-  its last check: a file put at the path, or an edit made to it, just after the last look and
-  before the truncate or unlink is overwritten or removed. Content writes stay bound to the
+  its last check: an edit to the open file between the last look and the truncate can be
+  overwritten, and a file put at the path, or an edit made to it, between the last look and the
+  unlink can be removed. Content writes stay bound to the
   descriptor verified, inside the mount and with no other hard links, before modification; a
   hard link made to the file after that check shares the write.
