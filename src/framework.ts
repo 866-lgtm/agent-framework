@@ -7461,7 +7461,9 @@ export class AgentFramework {
       // A dry run whose fold plan doesn't fit returns the render rather than
       // throwing, so a template whose context doesn't fit the budget compiled
       // here (context-manager's default: none is passed) seeds the fork
-      // instead of failing the spawn; the fork's own compiles meet its window.
+      // instead of failing the spawn; the fork's own compiles fit its window
+      // or refuse (its first compile folds to fit, or throws over_budget for
+      // the drain breaker).
       // The seed leaves out the template's thinking (withoutThinking): a
       // signed block verifies only while everything before it is what it was
       // minted under, and a fork's system, tools and scoped injections don't

@@ -32,7 +32,11 @@
   Unsigned reasoning, from text-only providers or XML mode, goes by the same
   rule. On models that don't bind thinking to its prefix (by probes, Fable 5
   and Sonnet 5), the fork loses the template's reasoning, as
-  context-manager#160 renders no unstamped thinking.
+  context-manager#160 renders no unstamped thinking. That a provider accepts
+  the stripped seed, including one that ends on a completed tool round with
+  a `tool_use` and no thinking before it, rests on probes of Opus 5.5, Haiku
+  5.5, Sonnet 5.5, Fable 5.1, Fable 5 and Sonnet 5; other thinking models
+  weren't probed.
 - On the OpenAI Responses path, the seed's items that were paired with a
   reasoning item it left out (the message's text, a function call) lose
   their provider-native raw item and render from their fields, so the fork
