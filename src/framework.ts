@@ -113,6 +113,7 @@ import {
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { channelOpenOnSend } from './routing-flags.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -7744,10 +7745,13 @@ export class AgentFramework {
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
     // Delivering a reply opens the channel (routeSpeech: send-opens-channel),
-    // in every mode — say so, and how to leave again.
-    const opensNote =
-      `that delivery opens the channel, so its other traffic starts reaching you ` +
-      `(call channel_close with channelId "${opts.channelId}" to leave again).\n`;
+    // in every mode — say so, and how to leave again. CHANNEL_OPEN_ON_SEND=false
+    // turns that off: the delivery leaves the channel's lifecycle alone.
+    const opensOnSend = channelOpenOnSend();
+    const opensNote = opensOnSend
+      ? `that delivery opens the channel, so its other traffic starts reaching you ` +
+        `(call channel_close with channelId "${opts.channelId}" to leave again).\n`
+      : `delivering it does not join the channel (only messages that address you directly keep reaching you from it).\n`;
     const mode = opts.proseRouting ?? 'locus';
     let replyOption: string;
     if (mode === 'explicit') {
@@ -15182,7 +15186,11 @@ export class AgentFramework {
                   }
                   engaged.add(channelId ?? target);
                 }
-                if (status === 'opened') {
+                if (status === 'left-closed') {
+                  console.error(
+                    `[channel] ${agentName}: explicit ${toolName} into closed channel ${target} — delivered, channel left closed (CHANNEL_OPEN_ON_SEND=false)`,
+                  );
+                } else if (status === 'opened') {
                   console.error(
                     `[channel] ${agentName}: explicit ${toolName} into closed channel ${target} — opened (send implies engagement)`,
                   );

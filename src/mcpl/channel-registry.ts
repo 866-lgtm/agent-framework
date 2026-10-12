@@ -38,6 +38,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { channelOpenOnSend } from '../routing-flags.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 
@@ -2529,7 +2530,9 @@ export class ChannelRegistry {
     rawChannelId: string,
     serverId?: string,
   ): Promise<{
-    status: 'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed';
+    /** `left-closed`: CHANNEL_OPEN_ON_SEND=false and the channel is not open —
+     *  the delivery stands, the lifecycle is untouched. */
+    status: 'opened' | 'already-open' | 'left-closed' | 'unknown-channel' | 'ambiguous' | 'open-failed';
     channelId?: string;
     label?: string;
   }> {
@@ -2549,6 +2552,9 @@ export class ChannelRegistry {
     const resolved = { channelId: entry.descriptor.id, label: entry.descriptor.label };
     if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') {
       return { status: 'already-open', ...resolved };
+    }
+    if (!channelOpenOnSend()) {
+      return { status: entry.open ? 'already-open' : 'left-closed', ...resolved };
     }
     try {
       await this.openChannelNow(entry, 'opened-by-reply');
@@ -3029,7 +3035,14 @@ export class ChannelRegistry {
     // so typing indicators, reaction machinery, and inbound forwarding come
     // alive with the reply. If the open fails, the speech does NOT go out:
     // a half-alive delivery is worse than a loud marker.
-    if (!entry.open) {
+    if (!entry.open && !channelOpenOnSend()) {
+      // CHANNEL_OPEN_ON_SEND=false: deliver into the closed (or declined)
+      // channel without changing its lifecycle — no desired-state entry, no
+      // subscribe, no auto-open notice.
+      console.error(
+        `[routeSpeech] ${conversationId}: locus ${channelId} is closed — delivering without opening (CHANNEL_OPEN_ON_SEND=false)`,
+      );
+    } else if (!entry.open) {
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
