@@ -250,7 +250,10 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  * when its render settles or falls back to it. So: an array of objects, which
  * the converters turn into blocks, a block they can't render (a video, an
  * unknown type, an image with neither uri nor data) becoming a placeholder
- * there as here. Nor does the uncoalesced path set a byte budget on content:
+ * there as here. The converters take any object without throwing: a type,
+ * text, data, mimeType or uri that isn't a string is treated as absent, so a
+ * malformed block is a placeholder too (or, for a text block, no text).
+ * Nor does the uncoalesced path set a byte budget on content:
  * an inline image is admitted here as it is there (agent-framework#266: a
  * 1 MiB serialized-content budget here dropped every coalesced message
  * carrying a screenshot). A deferred occurrence's content is held, until then,

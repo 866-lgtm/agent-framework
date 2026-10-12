@@ -222,6 +222,71 @@ test('a block the converters can\'t render is admitted coalesced exactly as unco
   }
 });
 
+/** How many times `needle` occurs in `haystack`. */
+function occurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+test('a block whose type, text or source isn\'t a string converts on both lanes, coalesced or not, without stopping a batch', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  f.alwaysRespond();
+  // What isn't a string is left out of the block. An object whose toString
+  // isn't a function throws when converted to text, as a placeholder would.
+  // `shows` is what the context then holds for it.
+  const malformed: Array<{ content: unknown[]; shows: string }> = [
+    { content: [{ type: { toString: 1 } }], shows: '[unrecognized content block: untyped]' },
+    { content: [{ type: 7 }], shows: '[unrecognized content block: untyped]' },
+    { content: [{ type: 'image', data: { toString: 1 }, mimeType: 'image/png' }], shows: '[Image: no data]' },
+    { content: [{ type: 'image', uri: { toString: 1 } }], shows: '[Image: no data]' },
+    { content: [{ type: 'audio', data: 'AAAA', mimeType: { toString: 1 } }], shows: '[Audio: no data]' },
+    { content: [{ type: 'text', text: { toString: 1 } }, { type: 'text', text: 'beside_text_without_text' }], shows: 'beside_text_without_text' },
+  ];
+  const messages: unknown[] = malformed.flatMap(({ content }, i) => [
+    { ...f.channel(`e${i}`, '', { initial: true }, 'chat', `coalesced${i}`), content },
+    { channelId: 'chat', messageId: `plain${i}`, timestamp: TS, author: { id: 'u', name: 'User' }, content },
+  ]);
+  // A valid message after them all, which a throw in conversion never reached.
+  messages.push(f.channel('last', 'sibling_after_malformed', { initial: true }, 'chat', 'last'));
+  const r = await f.send('channels/incoming', { messages });
+  assert.equal(r.error, undefined);
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), messages.map(() => true));
+  for (const [i, { content }] of malformed.entries()) {
+    const coalesced = await f.send('push/event', { ...f.params(`p${i}`, '', { initial: true, key: `doc${i}` }), payload: { content } });
+    assert.equal(coalesced.error, undefined, JSON.stringify(content));
+    assert.equal(coalesced.result.accepted, true);
+    const { coalesce: _coalesce, ...uncoalesced } = f.params(`q${i}`, '');
+    const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
+    assert.equal(plain.error, undefined, JSON.stringify(content));
+    assert.equal(plain.result.accepted, true);
+  }
+  await f.framework.runUntilIdle();
+  const context = f.context();
+  assert(context.includes('sibling_after_malformed'), 'the batch went on past the malformed messages');
+  // Each malformed block, four times: coalesced and not, on each lane.
+  for (const shows of new Set(malformed.map((m) => m.shows))) {
+    const expected = malformed.filter((m) => m.shows === shows).length * 4;
+    assert.equal(occurrences(context, JSON.stringify(shows)), expected, shows);
+  }
+  assert(!context.includes('toString'), 'nothing that was not a string reaches the context');
+});
+
+test('a text block whose text isn\'t a string is no text, so alone it is refused as empty on both lanes, coalesced or not', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const content = [{ type: 'text', text: { toString: 1 } }];
+  const r = await f.send('channels/incoming', { messages: [
+    { ...f.channel('e1', '', { initial: true }, 'chat', 'coalesced'), content },
+    { channelId: 'chat', messageId: 'plain', timestamp: TS, author: { id: 'u', name: 'User' }, content },
+  ] });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean; reason?: string }) => [x.accepted, x.reason]),
+    [[false, 'empty_content'], [false, 'empty_content']]);
+  const coalesced = await f.send('push/event', { ...f.params('p1', '', { initial: true }), payload: { content } });
+  const { coalesce: _coalesce, ...uncoalesced } = f.params('q1', '');
+  const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
+  assert.equal(coalesced.error?.code, -32602);
+  assert.equal(plain.error?.code, -32602);
+  assert.equal(coalesced.error?.message, plain.error?.message);
+});
+
 test('a render result with a malformed block falls back, and the host names it on a console line', async (t) => {
   const f = await fixture(); t.after(f.close);
   const lines = captureConsoleError(t);

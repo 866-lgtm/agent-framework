@@ -250,7 +250,9 @@ interface McplChannelIncomingEvent {
 function convertBlock(block: McplContentBlock): ContentBlock {
   switch (block.type) {
     case 'text':
-      return { type: 'text', text: block.text };
+      // Text that isn't a string is no text, as the request sanitizer and
+      // the visible-content check already read it.
+      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
 
     case 'image':
       if (isInlineContradiction(block)) {
@@ -263,13 +265,13 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
       }
-      if (block.data && block.mimeType) {
+      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
           type: 'image',
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      if (block.uri) {
+      if (isFilledString(block.uri)) {
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
@@ -288,7 +290,7 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
       }
-      if (block.data && block.mimeType) {
+      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
           type: 'audio',
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
@@ -301,11 +303,22 @@ function convertBlock(block: McplContentBlock): ContentBlock {
       // (a signed URL is a bearer credential that looks like a location).
       return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
 
-    default:
+    default: {
       // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly.
-      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
+      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
+      // that isn't a string is no type, and is never converted to one: an
+      // object can throw when it is.
+      const type: unknown = (block as { type?: unknown }).type;
+      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
+    }
   }
+}
+
+/** A string with something in it: the only data, mimeType or uri a block's
+ *  source is built from. Anything else a sender puts there leaves the block
+ *  without it, so conversion never throws and never copies a non-string. */
+function isFilledString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
 }
 
 // ============================================================================
