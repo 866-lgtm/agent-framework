@@ -13,7 +13,7 @@ import { describe, test, type TestContext } from 'node:test';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -22,7 +22,7 @@ import { basename, dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
-import { fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
+import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
@@ -1753,6 +1753,71 @@ describe('incomplete walks', () => {
 });
 
 describe('the mount boundary', () => {
+  test('a root replaced during an absence proof proves nothing: the replacement lacks what the original still holds', async (t) => {
+    const env = new Env(t);
+    mkdirSync(env.disk('sub'), { recursive: true });
+    env.writeDisk('sub/a.txt', 'A');
+    const st = statSync(env.dir, { bigint: true });
+    const view = { root: env.dir, rootIdentity: { dev: String(st.dev), ino: String(st.ino) }, followSymlinks: false, maxFileSize: 1e6, ignore: [] } as unknown as MountView;
+    const away = `${env.dir}-away`;
+    let swapped = false;
+    // Once the root has been checked, it's renamed away and an empty one put
+    // in its place, with the same subdirectory.
+    const proof = await withFsPromises('lstat', (lstat) => async (path: string, ...rest: unknown[]) => {
+      const info = await lstat(path, ...rest);
+      if (!swapped && String(path) === env.dir) {
+        swapped = true;
+        renameSync(env.dir, away);
+        mkdirSync(join(env.dir, 'sub'), { recursive: true });
+      }
+      return info;
+    }, () => confirmAbsent(view, env.dir, 'sub/a.txt'));
+    assert.equal(swapped, true);
+    assert.equal(typeof proof, 'string', `no absence is proven: ${JSON.stringify(proof)}`);
+    assert.equal(readFileSync(join(away, 'sub/a.txt'), 'utf8'), 'A', 'the original still holds the file');
+  });
+
+  test('a root replaced during a pass takes no deletion: the entry and its evidence stay', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/sub/a.txt', content: 'A' });
+    await call(m, 'materialize', { path: 'work/sub/a.txt' });
+    const file = env.disk('sub/a.txt');
+    const away = `${env.dir}-away`;
+    unlinkSync(file);
+    let restored = false;
+    let swapped = false;
+    // The pass finds the file gone, then it's put back, and the root is
+    // replaced by one whose subdirectory lacks it before absence is proven.
+    await withFsPromises('lstat', (lstat) => async (path: string, ...rest: unknown[]) => {
+      let info;
+      try {
+        info = await lstat(path, ...rest);
+      } catch (err) {
+        if (!restored && String(path) === file && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+          writeFileSync(file, 'A');
+          restored = true;
+        }
+        throw err;
+      }
+      if (restored && !swapped && String(path) === env.dir) {
+        renameSync(env.dir, away);
+        mkdirSync(join(env.dir, 'sub'), { recursive: true });
+        swapped = true;
+      }
+      return info;
+    }, () => {
+      // The pass a watcher's change to that path runs.
+      const internals = m as unknown as { mounts: Map<string, unknown>; passUnlocked(mount: unknown, scope: unknown): Promise<unknown> };
+      return internals.passUnlocked(internals.mounts.get('work'), { kind: 'paths', paths: ['sub/a.txt'] });
+    });
+    assert.equal(restored, true);
+    assert.equal(swapped, true);
+    assert.notEqual(env.store.treeGet('workspace/work/tree', 'sub/a.txt'), null, 'the workspace keeps the file');
+    assert.notEqual((m as unknown as { agreement: DiskAgreement }).agreement.get('work', 'sub/a.txt')?.kind, 'absent');
+    assert.equal(readFileSync(join(away, 'sub/a.txt'), 'utf8'), 'A');
+  });
+
   test('not even a forced materialize writes through a symlink or a symlinked directory out of the mount', async (t) => {
     const env = new Env(t);
     const m = await env.open();
