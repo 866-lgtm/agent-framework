@@ -1394,11 +1394,25 @@ export class WorkspaceModule implements Module {
    * mount, through the same Chronicle-tree + auto-materialize path as the
    * `write` tool. Public API for the framework's synthesized `save_image`
    * tool and other peer callers that hold bytes rather than text.
+   *
+   * `branch`, when given, ties the write to that branch: the store's current
+   * branch is checked where the tree entry is set, nothing yielding between
+   * the check and the entry, so the file's tree entry lands on that branch or
+   * the write is refused, with `data: { branchLeft: true }`. A mount has one
+   * directory on disk, so with autoMaterialize the file's copy there is
+   * written like any other write's. The tool-result guard writes a
+   * withheld original this way, for the branch its stub is on
+   * (agent-framework #277).
+   *
+   * A write whose tree entry is set but whose copy on disk fails returns
+   * success false with `data: { inChronicle: true }`: the workspace's tools
+   * read the file from the tree, so it is there for them.
    */
   async writeBinary(
     mountPrefixedPath: string,
     data: Buffer,
     mimeType: string,
+    options: { branch?: string } = {},
   ): Promise<ToolResult> {
     let mount: MountState;
     let relativePath: string;
@@ -1421,13 +1435,23 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     return this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
+      // Checked inside the mount's turn, after anything the write waited on:
+      // commitToolChange sets the tree entry before it first yields.
+      if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
+        return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
+      }
       const blobHash = store.storeBlob(data, mimeType);
       const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
       if (materializeError) {
+        // The file is in the Chronicle tree, where the workspace's tools read
+        // it; only its copy on disk failed. `inChronicle` lets a caller that
+        // needs the file readable tell this from a write that never happened
+        // (agent-framework #281).
         return {
           success: false,
           error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
           isError: true,
+          data: { inChronicle: true },
         };
       }
       return {

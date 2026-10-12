@@ -1,12 +1,81 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import type { ContextManager, MessageId } from '@animalabs/context-manager';
+import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { isStateExistsError } from './module-registry.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
 export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
+
+/** Where a withheld result's original went: a workspace path; the path a
+ *  write to it failed at (`error`); the path a write was still under way to
+ *  when the host stopped waiting for it (`unfinished`); no write, because the
+ *  workspace isn't answering (`workspace_unanswered`: an earlier write is
+ *  still under way past the host's deadline) or because the workspace had
+ *  left the stub's branch when the file would have been committed
+ *  (`branch_changed`); or null when no file is written at all (no writable
+ *  workspace, or the host is stopping). */
+export type WithheldSpill =
+  | { path: string; error?: string; unfinished?: true }
+  | { skipped: 'workspace_unanswered' | 'branch_changed' }
+  | null;
+
+/** Writes one withheld original as a workspace file (the framework's
+ *  tool-results spill). It reports a failed write rather than throwing, and
+ *  it settles within a bounded time: a write still under way at the host's
+ *  deadline is reported as unfinished, and until that write settles the host
+ *  starts no other (each is `workspace_unanswered`), so a stalled workspace
+ *  costs one deadline however many results and batches queue behind it. The
+ *  file lands on `branch`, the branch the stub is on, or isn't written: the
+ *  workspace checks the branch where it commits the file
+ *  (WorkspaceModule.writeBinary), and a write it declines is
+ *  `branch_changed`. */
+export type WithheldSpiller = (label: string, text: string, branch: string) => Promise<WithheldSpill>;
+
+/** What a host gives a guard for its withheld results: where originals are
+ *  written, where each annotation is registered, so the host's stop can
+ *  wait for it even after the agent itself was disposed, and where the
+ *  guard says whether it has work left. */
+export interface WithheldHost {
+  spill: WithheldSpiller;
+  track(annotation: Promise<void>): void;
+  /** Whether the guard is idle (see ToolResultGuard.idle), told after each
+   *  change that can alter it: when an annotation starts or ends, and after
+   *  each pass over the storage queue. A host keeps a guard that isn't idle
+   *  within reach for retries, whatever has become of its agent, and lets
+   *  an idle one go. */
+  idle(idle: boolean): void;
+}
+
+/**
+ * The stub a withheld result settles to: #159's neutral notice, then where
+ * the original is. It names no refusal and no category (#159 keeps those in
+ * operational logs), only the place, so reading it back is the agent's
+ * deliberate choice (agent-framework #277). The place holds the result as
+ * stored, which for one over the inline cap is its capped text, whose own
+ * note names the file with the whole output; so the stub says "its result",
+ * not its full result. A failed write's own error text
+ * stays in the audit record and the logs, not here. The audit
+ * record is said to keep the original only when it was saved: a staged
+ * record whose save failed is still queued in memory, and a restart before
+ * its retry loses it.
+ */
+export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean): string {
+  const audit = `the guard's audit record (${TOOL_RESULT_GUARD_AUDIT_STATE}), for an operator`;
+  const kept = (only: string) => auditDurable
+    ? `is kept ${only}in ${audit}`
+    : `went ${only}to ${audit}, though saving that record had failed when the result arrived`;
+  if (!spill || 'skipped' in spill) return `${TOOL_RESULT_GUARD_NOTICE} Its result ${kept('')}.`;
+  if (spill.unfinished) {
+    return `${TOOL_RESULT_GUARD_NOTICE} Its result was still being written to workspace file ${spill.path} ` +
+      `when this note was made; if that file is missing, it ${kept('')}.`;
+  }
+  if (spill.error === undefined) {
+    return `${TOOL_RESULT_GUARD_NOTICE} Its result is in workspace file ${spill.path}.`;
+  }
+  return `${TOOL_RESULT_GUARD_NOTICE} Writing its result to workspace file ${spill.path} failed, so it ${kept('only ')}.`;
+}
 
 interface PendingBatch {
   id: string;
@@ -43,6 +112,13 @@ export class ToolResultGuard {
   private override: boolean | undefined;
   /** True until a recovery produces a clean response/new tool round. */
   recovering = false;
+  /** Writes withheld originals where the agent can read them; without it,
+   *  a stub names only the audit record. */
+  private host: WithheldHost | undefined;
+  /** Annotations of withheld stubs, chained in settlement order. */
+  private annotating: Promise<void> | undefined;
+  /** Annotations started so far, so a read can tell one began during it. */
+  private annotationsStarted = 0;
 
   constructor(
     private readonly agentName: string,
@@ -51,6 +127,51 @@ export class ToolResultGuard {
   ) {}
 
   get enabled(): boolean { return this.override ?? this.configured; }
+  setHost(host: WithheldHost | undefined): void { this.host = host; }
+  /** Settles once every annotation started so far has finished: each of
+   *  those stubs has been edited to say where its original is, or its edit
+   *  failed and waits in the storage queue, retried in order until it lands
+   *  or an operator's change supersedes it (until then the stub is the bare
+   *  notice, kept out of summaries by its compression hold, and the audit
+   *  record names the place). It never rejects. Its wait is bounded: the host
+   *  reports a write still under way at its deadline as unfinished and starts
+   *  no other until that write settles. */
+  whenAnnotated(): Promise<void> { return this.annotating ?? Promise.resolve(); }
+
+  /**
+   * Runs `read` (a compile of the context) once no withheld stub is still
+   * being annotated, and again if an annotation began while it ran, since a
+   * settlement can land during the compile's own awaits, such as a previous
+   * frame's teardown abandoning its batch. Every compile of a
+   * request that is sent goes through it: the agent's activations, its direct
+   * API calls and their refusal retry, and a conversation fork's seed from its
+   * template. A request preview doesn't, so it never waits on a
+   * workspace write.
+   *
+   * Before `read`, a stub edit that failed gets another try with the rest of
+   * the storage queue; a store that is still failing then compiles the bare
+   * notice, which its hold keeps out of summaries.
+   */
+  async afterAnnotations<T>(read: () => Promise<T>): Promise<T> {
+    for (;;) {
+      // Counted before the wait, so an annotation that starts while this one
+      // is awaited is waited for too.
+      const started = this.annotationsStarted;
+      await this.whenAnnotated();
+      if (this.annotationsStarted !== started) continue;
+      try {
+        this.flushUnrecorded();
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${this.agentName} storage retry before a compile failed:`, error);
+      }
+      const result = await read();
+      if (this.annotationsStarted === started) return result;
+    }
+  }
+
+  /** No annotation is running and no storage work is queued: nothing of this
+   *  guard is left for a host to wait on or retry. */
+  get idle(): boolean { return this.annotating === undefined && this.unrecorded.length === 0; }
   setOverride(value: boolean | undefined): void { this.override = value; }
   get settingOverride(): boolean | undefined { return this.override; }
   get hasPending(): boolean { return this.pending !== undefined; }
@@ -84,36 +205,47 @@ export class ToolResultGuard {
    * hold here; it can never re-arm refusal handling or tool submission. */
   private unrecorded: AuditOperation[] = [];
 
-  /** Retry edits and audit writes before a new activation, audit write,
-   * maintenance pass, or shutdown. A failed operation stays at the head. */
+  /** Retry edits and audit writes before a new activation, a compile of a
+   * request that is sent (afterAnnotations), an audit write, a maintenance
+   * pass, or shutdown. A failed operation stays at the head. */
   flushUnrecorded(): void {
-    while (this.unrecorded.length > 0) {
-      const operation = this.unrecorded[0];
-      try {
-        if (operation.admission) {
-          const { messageId, content, expected, branch } = operation.admission;
-          const sameBranch = this.cm.currentBranch().name === branch;
-          const current = sameBranch ? this.cm.getMessage(messageId) : null;
-          // A retry must not undo an operator's later edit/removal/rollback.
-          // Reapplying our own payload is safe if an earlier edit wrote the
-          // message and then failed while propagating to context entries.
-          // Chronicle normalizes object-key order and drops undefined fields.
-          if (!sameBranch || !current ||
-            (!isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(expected)))
-              && !isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(content))))) {
-            operation.record.historyUpdate = 'superseded';
-          } else {
-            this.cm.editMessage(messageId, content);
-          }
-          // An audit-only retry must not repeat an edit that already succeeded.
-          operation.admission = undefined;
+    try {
+      while (this.unrecorded.length > 0) {
+        const operation = this.unrecorded[0];
+        try {
+          this.applyEdit(operation);
+          this.write(operation.record);
+          this.unrecorded.shift();
+        } finally {
+          if (!operation.admission) this.releaseOperationHold(operation);
         }
-        this.write(operation.record);
-        this.unrecorded.shift();
-      } finally {
-        if (!operation.admission) this.releaseOperationHold(operation);
       }
+    } finally {
+      this.host?.idle(this.idle);
     }
+  }
+
+  /** Make an operation's history edit, if it still has one: once it is made,
+   *  or superseded by an operator's change, only its record is left to
+   *  write, and its hold can go. */
+  private applyEdit(operation: AuditOperation): void {
+    if (!operation.admission) return;
+    const { messageId, content, expected, branch } = operation.admission;
+    const sameBranch = this.cm.currentBranch().name === branch;
+    const current = sameBranch ? this.cm.getMessage(messageId) : null;
+    // A retry must not undo an operator's later edit/removal/rollback.
+    // Reapplying our own payload is safe if an earlier edit wrote the
+    // message and then failed while propagating to context entries.
+    // Chronicle normalizes object-key order and drops undefined fields.
+    if (!sameBranch || !current ||
+      (!isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(expected)))
+        && !isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(content))))) {
+      operation.record.historyUpdate = 'superseded';
+    } else {
+      this.cm.editMessage(messageId, content);
+    }
+    // An audit-only retry must not repeat an edit that already succeeded.
+    operation.admission = undefined;
   }
 
   private append(record: Record<string, unknown>): void {
@@ -144,8 +276,13 @@ export class ToolResultGuard {
       : JSON.parse(json);
   }
 
-  storeResults(content: ContentBlock[], wireResults: ToolResult[], originals: CompletedToolCall[]): MessageId {
-    if (!this.enabled) return this.cm.addMessage('user', content);
+  storeResults(
+    content: ContentBlock[],
+    wireResults: ToolResult[],
+    originals: CompletedToolCall[],
+    metadata?: MessageMetadata,
+  ): MessageId {
+    if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {
       // Idempotent for the same not-yet-submitted batch: a caller that
       // retries after a failure between staging and submission (e.g. a
@@ -175,7 +312,7 @@ export class ToolResultGuard {
     // chunk is ever summarized from the placeholder; released after the
     // settlement edit. Holds are in-memory only — a reopened manager has none,
     // which is correct since a reopened guard has no pending batch.
-    const messageId = this.cm.addMessage('user', withheld, undefined, undefined, { holdCompression: true });
+    const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
     this.pending = { id, messageId, content, withheld, wireResults,
       branch: this.cm.currentBranch().name, submitted: false, durable: false };
     // Durability barrier: the audit must reach Chronicle's chain heads before
@@ -285,7 +422,9 @@ export class ToolResultGuard {
 
   /** Transfer ownership from provider admission to an ordered storage job.
    * Failure retains the accepted payload and its hold until the edit succeeds.
-   * Withheld content is final already, so audit failures cannot keep it held. */
+   * A withheld batch's hold passes to its annotation instead, and from there
+   * to its stub's edit, so no summary is made of a stub that doesn't yet say
+   * where its original went. */
   private settle(pending: PendingBatch, record: Record<string, unknown>, admit: boolean): void {
     this.pending = undefined;
     const operation: AuditOperation = {
@@ -293,8 +432,9 @@ export class ToolResultGuard {
         batchId: pending.id, messageId: pending.messageId, sourceBranch: pending.branch },
       ...(admit ? { admission: { messageId: pending.messageId, content: pending.content,
         expected: pending.withheld, branch: pending.branch } } : {}),
-      heldMessageId: pending.messageId,
+      heldMessageId: admit ? pending.messageId : undefined,
     };
+    if (!admit) this.annotate(pending);
     this.unrecorded.push(operation);
     try {
       this.flushUnrecorded();
@@ -303,6 +443,151 @@ export class ToolResultGuard {
     } finally {
       if (!operation.admission) this.releaseOperationHold(operation);
     }
+  }
+
+  /**
+   * Turn a withheld batch's notices into stubs that say where each original
+   * is (agent-framework #277): written to the workspace when a writable mount
+   * takes it, else kept in the audit record. Its own unedited placeholder is
+   * the only thing it edits: an operator's later edit, removal or rollback
+   * stands.
+   *
+   * Where each original went is queued first, on its own ('annotated'), so
+   * a stub edit that fails can't take the record of a written file with it.
+   * The edit is then made at once, so no storage work queued ahead of it
+   * holds it, not even that record if its write is failing, and its record
+   * ('stub_updated') is written in order after the others. An
+   * edit that fails joins the ordered storage queue like an admission's, with
+   * the batch's compression hold: retried before the next activation, compile,
+   * maintenance pass or stop until it lands or an operator's change supersedes
+   * it. Until then the stub is the bare notice, which the hold keeps out of
+   * summaries, and the audit record names the file.
+   */
+  private annotate(pending: PendingBatch): void {
+    const previous = this.annotating ?? Promise.resolve();
+    this.annotationsStarted += 1;
+    const run = previous.then(async () => {
+      // Set once the stub's edit is queued with the hold: the queue releases
+      // it when the edit lands or is superseded.
+      let holdQueued = false;
+      try {
+        const date = new Date().toISOString().slice(0, 10);
+        // A file is named by its batch and its place in the batch, ahead of
+        // anything the writer may cut or substitute: results of one batch
+        // never share a file, and results of two batches share one only if 48
+        // random bits of their batch ids agree. The tool use id after them is
+        // for whoever lists the directory.
+        const batch = pending.id.replace(/-/g, '').slice(0, 12);
+        // Keyed by the result's index in the batch, which the stub and the
+        // original share.
+        const spills = new Map<number, WithheldSpill>();
+        // A spill that threw, by index: its error, for the record.
+        const thrown = new Map<number, string>();
+        // Set once the branch has changed: no more is written.
+        let branchLeft = false;
+        for (const [index, block] of pending.content.entries()) {
+          if (block.type !== 'tool_result') continue;
+          // Once the store has left the batch's branch (a rollback, an undo, a
+          // host's switch), write no more. This result and every later one is
+          // skipped, and its original stays in the audit record. Nothing
+          // yields from here to the edit's own branch check, so while the
+          // store is away the stub stays as it is. A write already under way
+          // when the branch changes is refused where it commits, since it
+          // names the batch's branch, so no file lands elsewhere.
+          if (branchLeft || this.cm.currentBranch().name !== pending.branch) {
+            branchLeft = true;
+            spills.set(index, { skipped: 'branch_changed' });
+            continue;
+          }
+          // The result as stored. Both paths that store a tool result store
+          // its text; content stored as blocks would be written as their JSON.
+          const original = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+          let spill: WithheldSpill = null;
+          if (this.host) {
+            try {
+              spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original, pending.branch);
+            } catch (error) {
+              // The host reports a failed write rather than throwing; a throw
+              // is recorded all the same, without a path.
+              thrown.set(index, (error instanceof Error ? error.message : String(error)).slice(0, 200));
+              console.error(`[tool-result-guard] agent=${this.agentName} could not spill withheld result ` +
+                `${block.toolUseId}:`, error);
+            }
+          }
+          // Declined where it would have committed, since the workspace had
+          // left the batch's branch. Nothing was written, and no more are, as
+          // for the results the branch check above stops. If the branch is
+          // back by the edit, as after an undo and a redo, the stubs of this
+          // result and the later ones name the audit record.
+          if (spill && 'skipped' in spill && spill.skipped === 'branch_changed') branchLeft = true;
+          spills.set(index, spill);
+        }
+        const annotated: ContentBlock[] = pending.withheld.map((block, index) => block.type === 'tool_result'
+          ? { ...block, content: withheldResultNotice(spills.get(index) ?? null, pending.durable) }
+          : block);
+        try {
+          this.append({
+            type: 'annotated', batchId: pending.id, messageId: pending.messageId, sourceBranch: pending.branch,
+            results: pending.content.flatMap((block, index): Array<Record<string, string | true>> => {
+              if (block.type !== 'tool_result') return [];
+              if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
+              const spill = spills.get(index) ?? null;
+              // No file was written: no writable workspace, or the framework
+              // was stopping.
+              if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
+              if ('skipped' in spill) return [{ toolUseId: block.toolUseId, skipped: spill.skipped }];
+              return [{ toolUseId: block.toolUseId, path: spill.path,
+                ...(spill.error !== undefined ? { error: spill.error } : {}),
+                ...(spill.unfinished ? { unfinished: true as const } : {}) }];
+            }),
+          });
+        } catch (error) {
+          // It stays queued and is retried in order with the storage work
+          // ahead of it; the stub's record is written after it.
+          console.error(`[tool-result-guard] agent=${this.agentName} batch=${pending.id} annotation record queued for retry:`, error);
+        }
+        const stub: AuditOperation = {
+          record: { agentName: this.agentName, timestamp: Date.now(), type: 'stub_updated',
+            batchId: pending.id, messageId: pending.messageId, sourceBranch: pending.branch },
+          admission: { messageId: pending.messageId, content: annotated, expected: pending.withheld, branch: pending.branch },
+          heldMessageId: pending.messageId,
+        };
+        try {
+          this.applyEdit(stub);
+        } catch (error) {
+          console.error(`[tool-result-guard] agent=${this.agentName} batch=${pending.id} stub edit queued for retry:`, error);
+        }
+        this.unrecorded.push(stub);
+        holdQueued = true;
+        try {
+          // A made edit's hold goes now, whatever storage work is still
+          // queued ahead of its record.
+          if (!stub.admission) this.releaseOperationHold(stub);
+          this.flushUnrecorded();
+        } catch (error) {
+          console.error(`[tool-result-guard] agent=${this.agentName} batch=${pending.id} stub's storage work queued for retry:`, error);
+        }
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${this.agentName} batch=${pending.id} could not annotate withheld results:`, error);
+      } finally {
+        // Never rejects: a compile and stop() wait on this chain. With no
+        // stub edit queued, nothing else holds the batch.
+        if (!holdQueued) {
+          try {
+            this.releaseHold(pending.messageId);
+          } catch (error) {
+            console.error(`[tool-result-guard] agent=${this.agentName} could not release a withheld batch's hold:`, error);
+          }
+        }
+      }
+    });
+    this.annotating = run;
+    void run.finally(() => {
+      if (this.annotating === run) this.annotating = undefined;
+      this.host?.idle(this.idle);
+    });
+    this.host?.track(run);
+    this.host?.idle(false);
   }
 
   private releaseOperationHold(operation: AuditOperation): void {

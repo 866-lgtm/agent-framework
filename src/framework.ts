@@ -8,6 +8,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolRes
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
+import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
@@ -68,15 +69,17 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
-import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
+import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } from './mcpl/tool-lifecycle.js';
+import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
-  coalescingSubjectKey, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
   type CoalescingReceiptRecord,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './mcpl/visible-content.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -85,6 +88,7 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
+import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -766,6 +770,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
+/** How long the tool-result guard waits for a withheld original's workspace
+ *  write before its stub says the write was still under way. A local
+ *  write takes milliseconds; this bounds a stalled mount, which would otherwise
+ *  hold every later request of the agent and the framework's stop. */
+const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 /** Poll pending context-strategy maintenance independently of user activity. */
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
@@ -1315,10 +1324,16 @@ export class AgentFramework {
   private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
   private codeExecutionRunners: Map<string, PyRunner> = new Map();
   private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
-  /** Agents whose running script hit an endTurn-carrying inner result —
-   *  deferred and applied to the final code_execution result instead of
-   *  cancelling the stream mid-script (which would wedge the turn). */
-  private scriptDeferredEndTurn: Set<string> = new Set();
+  /** Per agent, the foreground script now running. An endTurn-carrying inner
+   *  result marks the script that made the call, and is applied to that
+   *  script's code_execution result instead of cancelling the stream
+   *  mid-script (which would wedge the turn). A stopped script's late result
+   *  marks only that script, never the agent's next one. */
+  private scriptDeferredEndTurn: Map<string, { endTurn: boolean }> = new Map();
+  /** RFC-007: per agent, the origin of the foreground script its runner is
+   *  executing, handed to that script's inner calls (scripts run one at a
+   *  time per runner). Background runners capture theirs in the closure. */
+  private foregroundScriptOrigins: Map<string, ScriptCallOrigin> = new Map();
   /** Background (daemon) scripts: model-authored watchers that outlive their
    *  spawning turn. Each gets a DEDICATED PyRunner; wake_agent() injects a
    *  provenance envelope + payload and requests inference. Keyed by script id. */
@@ -1350,6 +1365,16 @@ export class AgentFramework {
   /** Namespaced tool name → the server whose tools/list produced it. Prefixes
    *  can nest (`foo`, `foo--bar`), so a prefix match alone can name two. */
   private mcplToolServers: Map<string, string> = new Map();
+  /** Servers whose tools/list answered in the latest refresh. */
+  private mcplListedServers: Set<string> = new Set();
+  /** Zero-match tool-pattern diagnostics (checkToolPatterns): set at the end
+   *  of create(), when the tool universe is first complete. */
+  private toolPatternChecksArmed = false;
+  /** Patterns already reported as matching nothing — each is reported once. */
+  private toolPatternsReported: Set<string> = new Set();
+  /** Every (prefix → serverId) ever configured. A removed or restarting
+   *  server's patterns stay undecided rather than reported mid-restart. */
+  private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
   /** Host capabilities advertised during the MCP handshake — stored so servers
@@ -1879,6 +1904,12 @@ export class AgentFramework {
       // SIGUSR2 not available on this platform — non-fatal.
     }
 
+    // Modules, agents, MCPL servers and the tune-out tool are all in place:
+    // the first point at which "matches no tool" can be judged. Later tool
+    // refreshes re-check patterns still undecided.
+    framework.toolPatternChecksArmed = true;
+    framework.checkToolPatterns();
+
     return framework;
   }
 
@@ -1993,6 +2024,18 @@ export class AgentFramework {
     this.eventGate?.dispose();
     this.livenessWatchdog?.stop();
 
+    // A stopping stream's batch settles as withheld, and its stub names where
+    // the original went: let those writes finish while the workspace is up.
+    // Tracked here rather than per agent, since an ephemeral run or a closed
+    // fork leaves the agent map while its annotation can still be running.
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+    // An annotation that starts after this point, such as one from a direct
+    // Agent API call stop doesn't cancel, starts no write to the stopping
+    // workspace: its stub names the audit record. A write that was past its
+    // deadline is not waited for, and may still finish or fail after the
+    // modules stop.
+    this.guardSpillsClosed = true;
+
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll()];
     if (this.mcplServerRegistry) {
@@ -2000,13 +2043,19 @@ export class AgentFramework {
     }
     await Promise.all(shutdownPromises);
 
+    // Those later annotations write nothing, so they finish at once; let them
+    // record and edit their stubs before the store closes.
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+
     // Streams may queue storage repairs while being cancelled above. Retry
-    // after their teardown, while the store is still open, before final sync.
-    for (const agent of this.agents.values()) {
+    // after their teardown, while the store is still open, before final sync:
+    // every live agent's guard, and every other guard that isn't idle, whose
+    // ephemeral run or closed fork has left the agent map.
+    for (const [guard, name] of this.guardsWithStorageWork()) {
       try {
-        agent.toolResultGuard.flushUnrecorded();
+        guard.flushUnrecorded();
       } catch (error) {
-        console.error(`[tool-result-guard] agent=${agent.name} could not finish queued storage work at stop:`, error);
+        console.error(`[tool-result-guard] agent=${name} could not finish queued storage work at stop:`, error);
       }
     }
 
@@ -2240,6 +2289,17 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
+    // A guard whose agent has left the map gets no activation to retry its
+    // queue; retry it here. It leaves busyGuards once nothing of it is left.
+    const live = new Set([...this.agents.values()].map((agent) => agent.toolResultGuard));
+    for (const [guard, name] of this.busyGuards) {
+      if (live.has(guard)) continue;
+      try {
+        guard.flushUnrecorded();
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
+      }
+    }
     const queued = [...this.agents.values()].flatMap((agent) => {
       try {
         agent.toolResultGuard.flushUnrecorded();
@@ -2669,7 +2729,31 @@ export class AgentFramework {
     };
   }
 
-  private restoreToolResultGuardSetting(agent: Agent): void {
+  /** Every guard's annotation still running, for stop() (agent-framework #277). */
+  private readonly guardAnnotations = new Set<Promise<void>>();
+  /** Each guard that isn't idle, by agent name, as the guard reports it. An
+   *  ephemeral run or a closed fork leaves the agent map with an annotation
+   *  maybe still running, or a stub edit, acceptance edit or audit write
+   *  queued, which maintenance and stop then retry (agent-framework #277). A
+   *  guard is here from the moment it has work left until the moment it has
+   *  none, however that comes about. */
+  private readonly busyGuards = new Map<ToolResultGuard, string>();
+  /** Withheld originals' writes still under way past their deadline: while
+   *  any is, the workspace isn't answering and no other withheld original's
+   *  write is started. Several can be, when writes of different agents'
+   *  batches stalled together. */
+  private readonly stalledSpills = new Set<Promise<void>>();
+  /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
+  private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
+  /** Set once stop() has let the running annotations finish: a withheld
+   *  original is then no longer written to a workspace that is stopping, and
+   *  its stub names the audit record. */
+  private guardSpillsClosed = false;
+
+  /** A new agent's guard: its persisted setting, the tool-results spill its
+   *  withheld originals are written to, and the set stop() waits on
+   *  (agent-framework #277). */
+  private adoptToolResultGuard(agent: Agent): void {
     const enabled = (this.store.getStateJson(FRAMEWORK_STATE_ID) as {
       toolResultGuards?: Record<string, unknown>;
     } | null)?.toolResultGuards?.[agent.name];
@@ -2677,6 +2761,27 @@ export class AgentFramework {
       throw new Error(`Invalid persisted tool_result_guard for ${agent.name}: expected a boolean`);
     }
     agent.toolResultGuard.setOverride(enabled);
+    const guard = agent.toolResultGuard;
+    guard.setHost({
+      spill: (label, text, branch) => this.spillWithheld(label, text, branch),
+      track: (annotation) => {
+        this.guardAnnotations.add(annotation);
+        void annotation.finally(() => this.guardAnnotations.delete(annotation));
+      },
+      idle: (idle) => {
+        if (idle) this.busyGuards.delete(guard);
+        else this.busyGuards.set(guard, agent.name);
+      },
+    });
+  }
+
+  /** Each guard that may have queued storage work, once, by agent name: the
+   *  live agents' and every other that isn't idle. */
+  private guardsWithStorageWork(): Map<ToolResultGuard, string> {
+    const guards = new Map<ToolResultGuard, string>();
+    for (const agent of this.agents.values()) guards.set(agent.toolResultGuard, agent.name);
+    for (const [guard, name] of this.busyGuards) if (!guards.has(guard)) guards.set(guard, name);
+    return guards;
   }
 
   private buildThinkTool(
@@ -4126,7 +4231,7 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
-      this.restoreToolResultGuardSetting(agent);
+      this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
 
@@ -6432,7 +6537,7 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
+    this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
@@ -6509,7 +6614,7 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
+    this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
@@ -6580,6 +6685,10 @@ export class AgentFramework {
       const scriptWaiter = this.scriptToolWaiters.get(event.callId);
       if (scriptWaiter) {
         this.scriptToolWaiters.delete(event.callId);
+        // RFC-007: the inner call's terminal. Also reached when the script
+        // was killed while the call ran: the result reaches no one, but the
+        // call did finish.
+        this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
         scriptWaiter(event.result);
         return;
       }
@@ -6654,8 +6763,9 @@ export class AgentFramework {
         if (currentState.status === 'ready') {
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
+          const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
           if (pendingBlocks) {
-            agent.addAssistantResponse(pendingBlocks);
+            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
             this.pendingAssistantBlocks.delete(agent.name);
           }
 
@@ -6674,7 +6784,7 @@ export class AgentFramework {
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults);
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata);
 
           // Flush any messages that were deferred while this turn was in
           // flight. Route to the PRIMARY agent — deferred messages are
@@ -6911,6 +7021,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
+              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -7100,6 +7211,16 @@ export class AgentFramework {
     assemblingFor?: string;
     deliverTo?: string;
   }): Promise<CoalescingPlacement | undefined> {
+    // Same backstop as the push lane: no row, no wake, no fork spawned for a
+    // message with nothing visible in it.
+    if (isVisiblyEmptyContent(event.content)) {
+      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${event.channelId} messageId=${event.messageId} reason=empty-content`);
+      this.emitTrace({
+        type: 'mcpl:empty-content-dropped', lane: 'channel', serverId: event.serverId,
+        channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
+      });
+      return undefined;
+    }
     const metadata: Record<string, unknown> = {
       ...event.metadata,
       ...(event.eventId ? { eventId: event.eventId } : {}),
@@ -7370,7 +7491,11 @@ export class AgentFramework {
       // seeding again would stack another template copy on top of it.
       const { messages: existing } = await contextManager.compile();
       if (existing.length === 0) {
-        const { messages: compiled } = await template.getContextManager().compile();
+        // The copy is the fork's own, and the template's annotation edits only
+        // the template's message: seed only once each of the template's
+        // annotations has finished.
+        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+          () => template.getContextManager().compile());
         for (const msg of compiled) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -7379,7 +7504,7 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
-      this.restoreToolResultGuardSetting(agent);
+      this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
@@ -7742,7 +7867,7 @@ export class AgentFramework {
         throw new CoalesceError('eventId', 'eventId is required with coalesce');
       }
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(message.content);
+      validateCoalescedContent(message.content, undefined, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
       const result = await this.pushCoalescer.accept({
         serverId,
@@ -7769,7 +7894,11 @@ export class AgentFramework {
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
       if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(params.payload?.content);
+      validateCoalescedContent(params.payload?.content, undefined, {
+        allowEmpty: params.coalesce.retract === true || isSilentHeartbeatMarker({
+          serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content,
+        }),
+      });
       const c = params.coalesce;
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
@@ -7941,6 +8070,7 @@ export class AgentFramework {
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
         coalescingSubject: subject,
+        coalescingBatch: true,
       });
     }
   }
@@ -8055,6 +8185,16 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
+    // Backstop for the MCPL boundary's empty-content rejection, covering
+    // events that never crossed it (module-emitted, coalescer deliveries):
+    // content with nothing visible stores no row and queues no wake — the
+    // model would wake to `[Continue]` or an older message re-presented as
+    // the newest, a wake with no visible cause.
+    if (isVisiblyEmptyContent(event.content) && !isSilentHeartbeatMarker(event)) {
+      console.error(`[push-event-dropped] server=${event.serverId} eventId=${event.eventId} reason=empty-content`);
+      this.emitTrace({ type: 'mcpl:empty-content-dropped', lane: 'push', serverId: event.serverId, eventId: event.eventId });
+      return undefined;
+    }
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
@@ -8109,12 +8249,7 @@ export class AgentFramework {
     // Accept the no-message path only for the heartbeat feature's own exact
     // marker with an empty payload — arbitrary MCPL servers cannot hide
     // content merely by setting `origin.silent`.
-    const silentHeartbeat =
-      event.serverId === 'heartbeat' &&
-      event.featureSet === 'heartbeat' &&
-      event.origin?.source === 'heartbeat' &&
-      event.origin?.silent === true &&
-      content.length === 0;
+    const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content });
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
@@ -8145,6 +8280,7 @@ export class AgentFramework {
             ephemeralSystemPrompt:
               '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
               'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+            silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
@@ -8469,10 +8605,19 @@ export class AgentFramework {
       // A silent tick never suppresses a genuine coalesced wake. If any
       // ordinary request shares this batch, the ordinary turn semantics win.
       const silentOnly = requests.every((r) => r.suppressProse === true);
+      // RFC-006 §5: when every cause is a deferred batch, the turn's content
+      // exists only once assembly renders it. Recorded for the whole batch
+      // (not inherited from requests[0]), so a requeued trigger stays honest.
+      const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
       await this.startAgentStream(agent, {
         ...trigger,
+        coalescingBatch: batchOnly || undefined,
+        coalescingBatchSubjects: batchOnly
+          ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
+          : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
+        silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
@@ -8484,6 +8629,23 @@ export class AgentFramework {
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
       });
     }
+  }
+
+  /**
+   * Metadata for rows the agent's current turn stores: a silent heartbeat
+   * tick stamps each of them (assistant responses, tool_result rows) so they
+   * stay identifiable after the turn — request builds key the tick separator
+   * on it, and a later retention policy can find or collapse them. The stamp
+   * names the agent: residents share one message slot and a broadcast tick
+   * reaches each of them with the same eventId. Undefined for ordinary
+   * turns, whose rows are stored exactly as before.
+   */
+  private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
+    const tick = this.activeTurnTriggers.get(agentName)?.silentHeartbeat;
+    const stamp: SilentHeartbeatStamp | undefined = tick
+      ? { eventId: tick.eventId, serverId: tick.serverId, agentName }
+      : undefined;
+    return stamp ? { silentHeartbeat: stamp } : undefined;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
@@ -9086,12 +9248,46 @@ export class AgentFramework {
     // boundary — after the deferred flush (same window: turn alive, compile
     // not yet run) and before the checkpoint (they are the turn's inputs).
     // Not on a context-budget restart: that continues the same logical turn.
+    let assembly: AssemblyResult | undefined;
     if (attempt === 0 && !continuingTurn && this.pushCoalescer?.pendingBatches()) {
       try {
-        await this.pushCoalescer.assemble(agent.name);
+        assembly = await this.pushCoalescer.assemble(agent.name);
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
+    }
+
+    // A turn whose only causes were deferred batches, all of which rendered
+    // nothing (empty or blank render, §5.2; cancelled; revoked), has nothing
+    // new to show: running it would wake the model to `[Continue]` or an
+    // older message, an uncaused wake. Stop before the checkpoint, locus,
+    // typing and compile. Any batch this assembly materialized keeps the
+    // turn, including one that was not among its causes (a batch whose wake
+    // the freeze withdrew, or one that never qualified for a wake). A cause
+    // this assembly did not settle (rendered elsewhere, not yet frozen) keeps
+    // the turn, as before.
+    const batchSubjects = trigger?.coalescingBatchSubjects;
+    if (assembly && batchSubjects?.length && assembly.materialized.size === 0
+      && batchSubjects.every((s) => assembly.settled.has(s))) {
+      console.error(`[coalescing] ${agent.name}: deferred render produced nothing; turn not started (no wake cause left)`);
+      this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: agent.name, subjects: batchSubjects });
+      // Release the turn and land anything deferred while assembly awaited
+      // the render, as a torn-down turn would.
+      if (this.activeTurnTokens.get(agent.name) === turnToken) {
+        this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
+      }
+      if (!this.activeTurnTokens.has(agent.name)
+        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const msg of this.drainDeferredFor(agent.name)) {
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
+        }
+        this.ackDeferredWrites();
+      }
+      return false;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
@@ -9267,9 +9463,10 @@ export class AgentFramework {
         injections = injections ? [...injections, silentInjection] : [silentInjection];
       }
 
-      // An ephemeral watchdog may dispose this Agent while hooks/compile await.
-      // Do not create a provider stream after its generation lost ownership.
-      if (this.agents.get(agent.name) !== agent) {
+      // An ephemeral watchdog may dispose this Agent while hooks/compile await,
+      // and stop() may close provider admission. Do not create a provider
+      // stream after its generation lost ownership, or once admission closed.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -9291,10 +9488,23 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
-      } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools);
-      if (this.agents.get(agent.name) !== agent) {
+      } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
+        silentHeartbeat: trigger?.silentHeartbeat,
+      });
+      // The compile can wait for a withheld batch's annotation, up to the
+      // spill deadline (see ToolResultGuard.afterAnnotations), so check both
+      // again. Membrane's yielding stream starts its request when it is first
+      // iterated, so cancelling it here, before driveStream, sends nothing.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         stream.cancel();
         agent.cancelStream();
+        if (this.agents.get(agent.name) === agent) {
+          // The compile took the agent's stream id, so a frame that started
+          // this one (a guard or budget restart) no longer owns the entries
+          // it left, and its teardown leaves them to this frame.
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+        }
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -9920,7 +10130,7 @@ export class AgentFramework {
               // Flush pending assistant blocks
               const pending = this.pendingAssistantBlocks.get(agent.name);
               if (pending) {
-                agent.addAssistantResponse(pending);
+                agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
                 this.pendingAssistantBlocks.delete(agent.name);
               }
               // Store tool results — same bounded spill policy as the
@@ -9935,7 +10145,8 @@ export class AgentFramework {
                   cap,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
-                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults);
+                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
+                  this.silentTurnRowMetadata(agent.name));
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
@@ -9979,16 +10190,17 @@ export class AgentFramework {
                 system: true,
                 kind: 'tool-wrapper-prose-contained',
                 toolName: guardedWrapperTool,
+                ...this.silentTurnRowMetadata(agent.name),
               });
               console.error(
                 `[tool-boundary] ${agent.name}: contained whole-response prose wrapper for registered tool ${guardedWrapperTool}; no tool called`,
               );
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent);
+                agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
               }
             } else {
-              agent.addAssistantResponse(terminalContent);
+              agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -11194,6 +11406,11 @@ export class AgentFramework {
    * results reach the running script and never the model context.
    */
   private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
+    // RFC-007: what the script's own tool calls are attributed to. Read
+    // before the first await: it is only known while this call is being
+    // dispatched. Undefined off the model dispatch path (ephemeral callers),
+    // whose code_execution call is not reported either.
+    const origin = this.toolLifecycleEmitter?.scriptOrigin(agentName, call.id);
     const input = (call.input ?? {}) as {
       code?: unknown;
       background?: unknown;
@@ -11269,7 +11486,7 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs, origin);
       if (capNote && started.success && started.data && typeof started.data === 'object') {
         (started.data as Record<string, unknown>).time_limit_note = capNote;
       }
@@ -11277,9 +11494,23 @@ export class AgentFramework {
     }
 
     const runner = this.getOrCreateScriptRunner(agentName);
-    this.scriptDeferredEndTurn.delete(agentName);
-    const exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
-    const endTurn = this.scriptDeferredEndTurn.delete(agentName);
+    // A busy runner refuses this exec; the running script keeps its mark and
+    // its origin.
+    const ownsRunner = !runner.busy;
+    const script = { endTurn: false };
+    if (ownsRunner) this.scriptDeferredEndTurn.set(agentName, script);
+    const ownsOrigin = origin !== undefined && ownsRunner;
+    if (ownsOrigin) this.foregroundScriptOrigins.set(agentName, origin);
+    let exec: import('./code-execution/py-runner.js').ExecResult;
+    try {
+      exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
+    } finally {
+      if (this.scriptDeferredEndTurn.get(agentName) === script) this.scriptDeferredEndTurn.delete(agentName);
+      if (ownsOrigin && this.foregroundScriptOrigins.get(agentName) === origin) {
+        this.foregroundScriptOrigins.delete(agentName);
+      }
+    }
+    const endTurn = script.endTurn;
 
     return {
       success: true,
@@ -11311,6 +11542,7 @@ export class AgentFramework {
     code: string,
     injected: import('./code-execution/py-runner.js').InjectedTool[],
     timeLimitMs?: number,
+    origin?: ScriptCallOrigin,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
@@ -11360,7 +11592,7 @@ export class AgentFramework {
       scriptTimeoutMs: cfg?.scriptTimeoutMs,
       idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
       label: `${agentName}:${scriptId}`,
-      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, origin),
     });
 
     const record: BackgroundScriptRecord = {
@@ -11602,6 +11834,110 @@ export class AgentFramework {
     return { blocks, spilled };
   }
 
+  /** Where a tool result labelled `label` is written: `<first writable
+   *  mount>/tool-results/<label>.txt`, or null when there is no writable
+   *  workspace. */
+  private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
+    const workspace = this.getWorkspaceModule();
+    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
+    if (!workspace || !mountName) return null;
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+    return { workspace, path: `${mountName}/tool-results/${safeLabel}.txt`, safeLabel };
+  }
+
+  /**
+   * The guard's spill of a withheld original (agent-framework #277): the
+   * tool-results file, waited for at most withheldSpillDeadlineMs. A write
+   * still under way then is reported as unfinished at its path. Nothing waits
+   * for it after that, stop() included: it goes on by itself and may finish
+   * or fail after the workspace has stopped, and its record says only that
+   * it was unfinished. Until it settles, the workspace isn't answering, and no
+   * other write is started: each later spill, of any agent's batch, is
+   * reported unanswered at once, so a stalled mount costs one deadline. A
+   * write the workspace declines because it had left `branch` is reported
+   * as such, with no path, since no file was written. Once stop() has let the
+   * running annotations finish, no new write is started.
+   */
+  private async spillWithheld(label: string, text: string, branch: string): Promise<WithheldSpill> {
+    if (this.guardSpillsClosed) return null;
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    if (this.stalledSpills.size > 0) return { skipped: 'workspace_unanswered' };
+    const write = this.writeToolResultFile(label, text, branch);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => {
+        // Marked as the deadline passes, before anything else runs, so no
+        // spill that starts after it finds the workspace answering.
+        const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => this.stalledSpills.delete(stalled));
+        this.stalledSpills.add(stalled);
+        resolve('late');
+      }, this.withheldSpillDeadlineMs);
+      timer.unref?.();
+    });
+    try {
+      const written = await Promise.race([write, late]);
+      if (written !== 'late') {
+        if (!written) return null;
+        if (written.branchLeft) return { skipped: 'branch_changed' };
+        return { path: written.path, ...(written.error !== undefined ? { error: written.error } : {}) };
+      }
+      return { path: place.path, unfinished: true };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Write one tool result's text to its tool-results file (see
+   * toolResultFilePlace): the one place both the inline cap's spill and the
+   * guard's withheld originals go. null when there is no writable workspace.
+   * A failed write is reported, traced and logged here, never thrown. With a
+   * branch, the file lands on that branch or isn't written (see writeBinary).
+   */
+  private async writeToolResultFile(
+    label: string,
+    content: string,
+    branch?: string,
+  ): Promise<{ path: string; error?: string; branchLeft?: true } | null> {
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    const { workspace, path, safeLabel } = place;
+    let failure: string;
+    try {
+      const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain', { branch });
+      if (result.success) return { path };
+      // The file is in the workspace's Chronicle tree, where its tools read
+      // it, and only its copy on disk failed: it is written for every reader
+      // the stub or the truncation note sends there. The workspace
+      // reports the disk failure itself (workspace:materialize-failed).
+      if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${result.error}`);
+        return { path };
+      }
+      // Declined, not failed: the store left the branch the file is for, so
+      // it isn't written anywhere, as the caller asked.
+      if ((result.data as { branchLeft?: boolean } | undefined)?.branchLeft === true) {
+        return { path, error: result.error ?? 'the workspace had left the branch this file is for', branchLeft: true };
+      }
+      failure = result.error ?? 'write refused';
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    failure = failure.slice(0, 200);
+    this.emitTrace({
+      type: 'tool:spill_failed',
+      label: safeLabel,
+      path,
+      contentLength: content.length,
+      error: failure,
+    });
+    console.error(
+      `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
+    );
+    return { path, error: failure };
+  }
+
   private async spillOrTruncate(
     content: string,
     cap: number | undefined,
@@ -11616,52 +11952,32 @@ export class AgentFramework {
     const { head, tail } = splitPreservingImageSlots(content, cap);
     const kept = formatPreservedImageSlots(tail);
 
-    const workspace = this.getWorkspaceModule();
-    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
-    if (workspace && mountName) {
-      const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
-      const path = `${mountName}/tool-results/${safeLabel}.txt`;
-      let failure: string;
-      try {
-        const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
-        if (result.success) {
-          // JSON serialization can expand each read-back code unit to six
-          // chars (\\u0000). Leave room for the page's metadata and a possible
-          // extra code unit at a surrogate-pair boundary.
-          const pageOverhead = JSON.stringify(path).length + 256;
-          const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
-          return {
-            text: head
-              + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-              + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-              + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-              + 'agent_settings update tool_result_inline_max_chars.]'
-              + kept,
-            filePath: path,
-          };
-        }
-        failure = result.error ?? 'write refused';
-      } catch (err) {
-        failure = err instanceof Error ? err.message : String(err);
-      }
+    const written = await this.writeToolResultFile(label, content);
+    if (written && written.error === undefined) {
+      const path = written.path;
+      // JSON serialization can expand each read-back code unit to six
+      // chars (\\u0000). Leave room for the page's metadata and a possible
+      // extra code unit at a surrogate-pair boundary.
+      const pageOverhead = JSON.stringify(path).length + 256;
+      const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
+      return {
+        text: head
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
+          + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
+          + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
+          + 'agent_settings update tool_result_inline_max_chars.]'
+          + kept,
+        filePath: path,
+      };
+    }
+    if (written) {
       // A workspace was there and the write FAILED — say that, loudly and
       // distinctly. Telling the agent "no writable workspace" would teach
       // them their residence lacks a capability it actually has.
-      failure = failure.slice(0, 200);
-      this.emitTrace({
-        type: 'tool:spill_failed',
-        label: safeLabel,
-        path,
-        contentLength: content.length,
-        error: failure,
-      });
-      console.error(
-        `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
-      );
       return {
         text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${path} FAILED`
-          + ` (${failure}); content over the cap was not retained]`
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
+          + ` (${written.error}); content over the cap was not retained]`
           + kept,
         filePath: null,
       };
@@ -11684,7 +12000,13 @@ export class AgentFramework {
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
         label: agentName,
-        onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+        // The script that made the call is the one running when it arrives.
+        onToolCall: (toolName, args) =>
+          this.handleScriptToolCall(
+            agentName, toolName, args,
+            this.foregroundScriptOrigins.get(agentName),
+            this.scriptDeferredEndTurn.get(agentName),
+          ),
       });
       this.codeExecutionRunners.set(agentName, runner);
     }
@@ -11704,16 +12026,19 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    origin?: ScriptCallOrigin,
+    /** The foreground script that made the call; none for a background script. */
+    script?: { endTurn: boolean },
   ): Promise<string> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return 'Error: code_execution cannot be called from within a script';
     }
-    const result = await this.dispatchScriptToolCall(agentName, toolName, args);
-    if (result.endTurn) {
+    const result = await this.dispatchScriptToolCall(agentName, toolName, args, origin);
+    if (result.endTurn && script) {
       // Deferred: applied to the final code_execution result (see
       // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
       // stream while the script still runs and wedge the tool round.
-      this.scriptDeferredEndTurn.add(agentName);
+      script.endTurn = true;
     }
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
@@ -11745,11 +12070,16 @@ export class AgentFramework {
    * resolve with its result. The waiter intercept in handleProcessEvent
    * (keyed by the pytc- call ID) routes the tool-result event here instead
    * of into the agent's pending tool round.
+   *
+   * RFC-007: with an `origin`, observers see the call as they see a model
+   * call (register, dispatch with its refusal sites, open; the terminal at
+   * the waiter intercept), under the inner tool's own name and class.
    */
   private dispatchScriptToolCall(
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    origin?: ScriptCallOrigin,
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
@@ -11759,6 +12089,9 @@ export class AgentFramework {
       const safetyMs = (this.codeExecutionConfig?.toolCallTimeoutMs ?? 270_000) + 30_000;
       const safety = setTimeout(() => {
         if (this.scriptToolWaiters.delete(callId)) {
+          // RFC-007: no result reached the host — the call failed.
+          this.toolLifecycleEmitter?.markDispatchFailure(agentName, callId);
+          this.toolLifecycleEmitter?.onResult(agentName, callId, undefined);
           resolve({
             success: false,
             error: `tool '${toolName}' produced no result within ${Math.round(safetyMs / 1000)}s`,
@@ -11773,15 +12106,28 @@ export class AgentFramework {
         resolve(result);
       });
 
+      const call = { id: callId, name: toolName, input: args };
+      if (origin) this.toolLifecycleEmitter?.registerScriptCall(agentName, origin, call);
       try {
-        this.dispatchToolCall(agentName, { id: callId, name: toolName, input: args });
+        this.dispatchToolCall(agentName, call);
       } catch (error) {
+        // Dispatch threw. Not a refusal (refusal sites call refuse() and
+        // answer): the tool may have done work first (sleep sets the gate,
+        // then formats its reply), so the call started and the host got no
+        // result — `failed`, as for a dispatch that rejects.
+        if (origin) {
+          this.toolLifecycleEmitter?.open(agentName, callId);
+          this.toolLifecycleEmitter?.markDispatchFailure(agentName, callId);
+          this.toolLifecycleEmitter?.onResult(agentName, callId, undefined);
+        }
         if (this.scriptToolWaiters.delete(callId)) {
           clearTimeout(safety);
           const err = error instanceof Error ? error : new Error(String(error));
           resolve({ success: false, error: err.message, isError: true });
         }
+        return;
       }
+      if (origin) this.toolLifecycleEmitter?.open(agentName, callId);
     });
   }
 
@@ -12990,7 +13336,9 @@ export class AgentFramework {
     inferenceRouting?: import('./mcpl/types.js').InferenceRoutingPolicy,
   ): Promise<void> {
     this.mcplServerRegistry = new McplServerRegistry();
-    this.featureSetManager = new FeatureSetManager();
+    this.featureSetManager = new FeatureSetManager(
+      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+    );
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
     this.toolLifecycleEmitter = new ToolLifecycleEmitter({
       observers: () => this.mcplServerRegistry?.getAllServers() ?? [],
@@ -13627,6 +13975,22 @@ export class AgentFramework {
   private static readonly MANIFEST_FETCH_FLOOR_MS = 5_000;
 
   /**
+   * The `mcpl:policy-refused` fields from a refusal receipt, as the host
+   * acts on them: the receipt is server-supplied, so `fallback` is the
+   * branch actually taken (anything but `close` is treated as `mcp-only`)
+   * and a non-string `reason` is dropped.
+   */
+  private static policyRefusalFields(receipt: { fallback?: unknown; reason?: unknown }): {
+    fallback: 'close' | 'mcp-only';
+    reason: string | null;
+  } {
+    return {
+      fallback: receipt.fallback === 'close' ? 'close' : 'mcp-only',
+      reason: typeof receipt.reason === 'string' ? receipt.reason : null,
+    };
+  }
+
+  /**
    * §17.5 host processing: fetch the complete manifest, validate exactly as
    * at initialize, diff, apply §6.7 consequences (removals eagerly even
    * when other declarations are invalid; additions only through
@@ -13741,6 +14105,12 @@ export class AgentFramework {
         if (receipt && receipt.accepted === false) {
           const fallback = receipt.fallback ?? 'mcp-only';
           console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
+          this.emitTrace({
+            type: 'mcpl:policy-refused',
+            serverId: connection.id,
+            phase: 'manifest-change',
+            ...AgentFramework.policyRefusalFields(receipt),
+          });
           if (fallback === 'close') {
             await connection.close();
             return;
@@ -13853,6 +14223,12 @@ export class AgentFramework {
         console.error(
           `[mcpl] ${config.id} refused initial policy (${receipt.reason ?? 'no reason'}) — fallback: ${fallback}`,
         );
+        this.emitTrace({
+          type: 'mcpl:policy-refused',
+          serverId: config.id,
+          phase: 'initial',
+          ...AgentFramework.policyRefusalFields(receipt),
+        });
         if (fallback === 'close') {
           await connection.close();
           return;
@@ -14412,12 +14788,14 @@ export class AgentFramework {
     const toolFeatureSets = new Map<string, string>();
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
+    const listedServers = new Set<string>();
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       try {
         const result = await server.sendToolsList();
+        listedServers.add(server.id);
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
           const namespacedName = `${prefix}--${tool.name}`;
@@ -14447,7 +14825,12 @@ export class AgentFramework {
           }
         }
       } catch {
-        // Server may not support tools/list — skip silently
+        // Server may not support tools/list — skip silently. A live server
+        // whose handshake advertised no MCP `tools` has, in effect, listed
+        // nothing; count it as listed so tool-pattern checks do not wait on
+        // it forever. (A server that advertised tools but failed to list
+        // them stays unknown.)
+        if (server.isConnected && !server.mcpToolsAdvertised) listedServers.add(server.id);
       }
     }
 
@@ -14455,6 +14838,91 @@ export class AgentFramework {
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
+    this.mcplListedServers = listedServers;
+    if (this.toolPatternChecksArmed) this.checkToolPatterns();
+  }
+
+  /**
+   * Report operator tool-name patterns that match no model-facing tool:
+   * `toolClassOverrides` keys and each server's `toolLifecycle.observe.tools`
+   * / `toolLifecycle.inputs.tools`. These match `<toolPrefix>--<tool>`, and
+   * the default prefix is `mcpl--<serverId>`, so a pattern written against
+   * the bare server id is valid config that silently does nothing.
+   *
+   * Each pattern is reported at most once (console line + a
+   * `mcpl:tool-pattern-unmatched` trace). A pattern that could still name
+   * tools of a server whose listing is not in (not connected yet,
+   * reconnecting, restarting) stays undecided until that listing arrives.
+   * Diagnostic only: never throws into the refresh that called it.
+   */
+  private checkToolPatterns(): void {
+    try {
+      const entries: Array<{ setting: string; serverId?: string; pattern: string }> = [];
+      for (const [pattern] of this.toolClassOverrides ?? []) {
+        entries.push({ setting: 'toolClassOverrides', pattern });
+      }
+      const configs = [...(this.mcplServerConfigs?.values() ?? [])];
+      for (const config of configs) {
+        const lifecycle = config.toolLifecycle as Record<string, { tools?: unknown } | undefined> | undefined;
+        for (const key of ['observe', 'inputs'] as const) {
+          const tools = lifecycle?.[key]?.tools;
+          if (!Array.isArray(tools)) continue;
+          for (const pattern of tools) {
+            if (typeof pattern === 'string') {
+              entries.push({ setting: `toolLifecycle.${key}.tools`, serverId: config.id, pattern });
+            }
+          }
+        }
+      }
+      const reported = (this.toolPatternsReported ??= new Set());
+      const keyOf = (e: { setting: string; serverId?: string; pattern: string }) =>
+        `${e.serverId ?? ''}\u0000${e.setting}\u0000${e.pattern}`;
+      const pending = entries.filter((e) => !reported.has(keyOf(e)));
+      if (pending.length === 0) return;
+
+      const known = (this.toolPatternKnownPrefixes ??= new Map());
+      for (const c of configs) known.set(c.toolPrefix ?? `mcpl--${c.id}`, c.id);
+      const servers: PatternServer[] = [...known].map(([prefix, id]) => {
+        const current = this.mcplServerConfigs?.get(id);
+        return {
+          id,
+          prefix,
+          listed: !!current
+            && (current.toolPrefix ?? `mcpl--${id}`) === prefix
+            && (this.mcplListedServers?.has(id) ?? false),
+        };
+      });
+      const names = this.modelFacingToolNames();
+
+      for (const entry of pending) {
+        const verdict = checkToolPattern(entry.pattern, names, servers);
+        if (verdict.kind !== 'unmatched') continue;
+        reported.add(keyOf(entry));
+        const where = entry.serverId ? `${entry.serverId}: ${entry.setting}` : entry.setting;
+        console.error(describeUnmatchedPattern(where, entry.pattern, verdict));
+        this.emitTrace({
+          type: 'mcpl:tool-pattern-unmatched',
+          setting: entry.setting,
+          ...(entry.serverId ? { serverId: entry.serverId } : {}),
+          pattern: entry.pattern,
+          ...(verdict.suggestion ? { suggestion: verdict.suggestion } : {}),
+          hint: verdict.hint,
+        });
+      }
+    } catch (error) {
+      console.error('[mcpl] tool pattern check failed:', error instanceof Error ? error.message : error);
+    }
+  }
+
+  /** Every tool name the framework offers to anyone: the shared board plus
+   *  each agent's own surface, before presentation visibility (a hidden tool
+   *  is still callable, so classes and lifecycle still apply to it). */
+  private modelFacingToolNames(): Set<string> {
+    const names = new Set(this.getAllTools().map((t) => t.name));
+    for (const agent of this.agents.values()) {
+      for (const tool of this.availableToolsForPresentation(agent.name)) names.add(tool.name);
+    }
+    return names;
   }
 
   /**
