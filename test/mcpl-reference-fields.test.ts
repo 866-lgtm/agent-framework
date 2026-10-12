@@ -92,7 +92,10 @@ test('an admitted but unparseable expiry still fails closed; a schema-invalid ex
 });
 
 test('the stub shows every server label without controls, and leaves out one that sanitizes to nothing', () => {
-  const { testimony } = reference('resource', { name: '\u061C\u202E', mimeType: 'image/\u202Epng\u061C', sizeBytes: 10 });
+  // Its own uri: the saved path it sets below stays on this test's record in the shared registry.
+  const { testimony } = reference('resource', {
+    uri: 'https://example.test/stub-labels', name: '\u061C\u202E', mimeType: 'image/\u202Epng\u061C', sizeBytes: 10,
+  });
   const stub = buildReferenceStub(testimony, 'from \u2066a\u0085tool\u2069');
   assert.ok(!/[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/.test(stub), stub);
   assert.ok(stub.includes('image/png, 10B claimed'), stub);
@@ -122,5 +125,6 @@ test('large invalid labels cannot change the bounded model-visible stub', () => 
   const stub = buildReferenceStub(testimony, 'server');
   assert.ok(stub.length < 150);
   assert.ok(stub.includes('claimed'));
+  assert.ok(stub.includes('fetch with fetch_reference'), `an unfetched reference's stub: ${stub}`);
   assert.ok(!stub.includes(testimony.uri));
 });
