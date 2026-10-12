@@ -322,6 +322,18 @@ test('failure logs print a bounded projection, never the error object with its r
   assert.equal(quotedLine.split('zz-quoted').length - 1, 1, 'the quoted frame is in the projection only');
   assert.match(quotedLine, /\n {4}at .*inference-failure-bounds\.test/);
 
+  // A stack without its header, as a copied one can be: the message's text
+  // inside a frame's name isn't taken for the header, so the throw site stays.
+  const requestHandler = (): Error => new Error('request');
+  const headless = requestHandler();
+  headless.stack = headless.stack!.split('\n').slice(1).join('\n');
+  const bare = makeHarness({ tick: async () => { throw headless; } });
+  try {
+    bare.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
+    await settle();
+  } finally { bare.restore(); }
+  assert.match(assertBoundedStrings(bare.rawArgs, 'drain kick failed'), /\n {4}at requestHandler /);
+
   // Every component of the projection is bounded, the name and type included.
   const named = new Error('zz-short');
   named.name = `Zz${'N'.repeat(MEGA)}`;

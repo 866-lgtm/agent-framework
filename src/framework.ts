@@ -1065,9 +1065,13 @@ function describeFailureWithFrames(error: unknown): string {
     const stack = error instanceof Error ? error.stack : undefined;
     if (typeof stack === 'string') {
       const message = String((error as Error).message);
+      // The message is the stack's header only before its first frame: a
+      // stack without its header (copied, or frames only) can hold the
+      // message's text inside a frame's name.
+      const firstFrame = stack.search(/^\s+at /m);
       const at = message ? stack.indexOf(message) : -1;
       const frameLine = /^\s+at /gm;
-      frameLine.lastIndex = at >= 0 ? at + message.length : 0;
+      frameLine.lastIndex = at >= 0 && (firstFrame < 0 || at < firstFrame) ? at + message.length : 0;
       const found = frameLine.exec(stack);
       if (found) frames = boundFailureText(stack.slice(found.index));
     }
