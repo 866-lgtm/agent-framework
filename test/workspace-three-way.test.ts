@@ -1212,6 +1212,70 @@ describe('restarts and faults', () => {
     assert.equal(intents.get('a.txt'), null);
   });
 
+  test("a push whose root is replaced while it observes records nothing it saw there", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'A' });
+    await call(m, 'materialize', { path: 'work/a.txt' });
+    await call(m, 'write', { path: 'work/a.txt', content: 'C' });
+    const agreement = (m as any).agreement;
+    const agreed = agreement.get('work', 'a.txt');
+    const rootReal = realpathSync(env.dir);
+    const away = `${env.dir}-away`;
+    const mount = (m as any).mounts.get('work');
+    const runtime = await (m as any).runtime(mount);
+    let replaced = false;
+    // Once the push has checked the root, it's replaced by one holding the
+    // workspace's draft, which the push then observes.
+    const pushed = await withFsPromises('lstat', (lstat) => async (path: unknown, ...rest: unknown[]) => {
+      if (!replaced && (String(path) === join(env.dir, 'a.txt') || String(path) === join(rootReal, 'a.txt'))) {
+        replaced = true;
+        renameSync(env.dir, away);
+        mkdirSync(env.dir);
+        writeFileSync(join(env.dir, 'a.txt'), 'C');
+      }
+      return lstat(path, ...rest);
+    }, () => pushPaths(env.store, agreement, runtime, ['a.txt'], {}));
+    assert.equal(replaced, true);
+    assert.deepEqual(pushed.written, []);
+    assert.match(JSON.stringify(pushed.skipped), /not the directory disk last agreed with/);
+    assert.deepEqual(agreement.get('work', 'a.txt'), agreed, "the replacement's copy isn't recorded as agreed");
+    assert.equal(readFileSync(join(away, 'a.txt'), 'utf8'), 'A');
+  });
+
+  test('a push whose write is refused untouched puts back the evidence its own planning settled, not the stale intent', async (t) => {
+    if (IS_ROOT) return t.skip('root writes through file permissions');
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'A' });
+    await call(m, 'materialize', { path: 'work/a.txt' });
+    await call(m, 'write', { path: 'work/a.txt', content: 'C' });
+    const agreement = (m as any).agreement;
+    const agreed = agreement.get('work', 'a.txt');
+    // An earlier push of C announced its write and stopped before the effect:
+    // disk still holds A, which this push's planning resolves the intent to.
+    agreement.intend('work', 'a.txt', {
+      effect: 'disk', prior: agreed, expect: { kind: 'content', hash: sha('C') }, branchId: env.store.currentBranch().id,
+    }, { durable: true });
+    assert.equal(agreement.get('work', 'a.txt').kind, 'pending');
+    const mount = (m as any).mounts.get('work');
+    const runtime = await (m as any).runtime(mount);
+    let pushed;
+    try {
+      pushed = await pushPaths(env.store, agreement, runtime, ['a.txt'], {
+        beforeEffect: () => chmodSync(env.disk('a.txt'), 0o444),
+      });
+    } finally {
+      chmodSync(env.disk('a.txt'), 0o644);
+    }
+    assert.deepEqual(pushed.written, []);
+    assert.match(JSON.stringify(pushed.skipped), /not written/);
+    const now = agreement.get('work', 'a.txt');
+    assert.equal(now.kind, 'content', `the resolved evidence, not the stale intent: ${JSON.stringify(now)}`);
+    assert.equal(now.hash, agreed.hash);
+    assert.equal(env.readDisk('a.txt'), 'A');
+  });
+
   test('a failed durability barrier is reported, and its intent stays pending', async (t) => {
     const env = new Env(t);
     const m = await env.open();
