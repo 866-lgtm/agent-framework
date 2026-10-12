@@ -24,9 +24,13 @@ structured provider `stopReason: 'refusal'`, not keywords in output, ordinary
 provider errors, or natural-language refusal text.
 
 On that signal, every result in the batch is withheld. Tool calls, result IDs,
-and error flags remain intact; each entire payload becomes:
+and error flags remain intact; each entire payload becomes the guard's notice,
 
 > Tool result withheld by the guard. The tool has already executed.
+
+followed by where the original is (see "Where a withheld original goes"
+below). The same holds for every withheld settlement: a refusal, an aborted
+stream, a batch that was never submitted, and one whose audit sync failed.
 
 The refused attempt's partial assistant output is discarded. Inference is
 retried once on the same model, within the same logical turn; executed tools
@@ -86,11 +90,14 @@ placeholder is not summarized while awaiting a decision: it is staged with a
 context-manager compression hold (`addMessage(..., { holdCompression: true })`,
 context-manager >= 0.12), placed before the strategy's ingress callback runs.
 Every settlement path (accept, withhold, turn-ended, unsubmitted, aborted)
-edits in the final content first and then releases the hold. Audit-only
-failures cannot keep a settled message held. If an acceptance edit fails,
-the guard keeps the accepted payload and its hold in a separate retry queue;
-it does not re-arm provider submission or refusal handling. Compression sees
-only the settled message: accepted output, or the notice for a withheld batch.
+edits in the final content first and then releases the hold: an accepted
+batch's payload, or a withheld batch's stub, which is edited once its
+originals have been written, so a withheld batch stays held meanwhile.
+Audit-only failures cannot keep a settled message held. If an acceptance
+edit or a stub's edit fails, the guard keeps the content and its hold in a
+separate retry queue; it does not re-arm provider submission or refusal
+handling. Compression sees only the settled message: accepted output, or a
+withheld batch's stub.
 Holds are in-memory; a reopened process has no pending batch and therefore
 no holds. Raw
 pending output goes directly to the provider. A clean following response
@@ -106,18 +113,21 @@ the provider receives placeholders instead of the originals, and the batch settl
 provider.
 
 Failed edits and audit writes are retried in order before the next real
-activation or guard audit write, during maintenance, and after stream teardown
-at shutdown. Preview/compile calls do not flush the queue. A history edit is
-retried only on its original branch and only if the message still contains the
-guard's placeholder or the accepted payload; later operator edits, removals,
-and branch changes take precedence. Such an acceptance is audited with
+activation, compile of a request that is sent, or guard audit write, during
+maintenance, and after stream teardown at shutdown, including those of an
+ephemeral run or a closed conversation fork that has left the agent map.
+Previews do not flush the queue. A history edit is retried only on its
+original branch and only if the message still contains the guard's
+placeholder or the content the edit writes; later operator edits, removals,
+and branch changes take precedence. Such an edit is audited with
 `historyUpdate: "superseded"` and its `sourceBranch` rather than overwriting
 the operator's view. Originals in the audit are never edited or removed.
 
 Storage retries are in-memory. If the process dies before storage recovers,
 unsynced records or unfinished edits cannot be promised to survive. Originals
 already made durable remain in Chronicle; reopened context conservatively
-retains any withholding notice whose acceptance edit did not persist.
+retains any withholding notice whose acceptance edit or stub edit did not
+persist, and an `annotated` record that was saved still names a written file.
 
 A stream that ends without a clean round and without a successor (abort,
 exhausted error retries; also an aborted direct `Agent.runInference`)
@@ -129,6 +139,77 @@ restart; originals whose audit reached durability are still available. This is
 deliberately conservative: an interrupted submission does not establish that
 the output was accepted. Similarly, if context compilation omits a pending
 exchange, its unsubmitted payload is not admitted to memory.
+
+## Where a withheld original goes
+
+Each withheld result's original is written, as the result was stored (its
+text; for a result over the inline cap, its capped text, whose own note names
+the file with the whole output), to a file under the first writable mount's
+`tool-results/` directory, named
+`<date>-withheld-<batch>-<index>-<toolUseId>.txt` with any character outside
+`A-Za-z0-9._-` replaced and the name cut to 80 characters. Its stub names it:
+
+> Tool result withheld by the guard. The tool has already executed. Its result
+> is in workspace file work/tool-results/2026-10-10-withheld-1a2b3c4d5e6f-0-toolu_01.txt.
+
+Otherwise the stub names the guard's audit record, for an operator:
+
+- with no writable workspace, or once the framework is stopping: "Its result is
+  kept in the guard's audit record (framework/tool-result-guard), for an
+  operator.";
+- when the write failed: "Writing its result to workspace file … failed, so it
+  is kept only in the guard's audit record …". The error itself stays in the
+  audit record and the logs;
+- when the write was still under way after 30 seconds, as on a stalled mount:
+  "Its result was still being written to workspace file … when this note was
+  made; if that file is missing, it is kept in the guard's audit record …".
+  Nothing waits for that write after that, stop included: it goes on by itself
+  and may finish or fail after the workspace has stopped. Until it settles, no
+  other withheld original is written, for any agent; their stubs name the audit
+  record, so a stalled mount costs one 30-second wait however many batches
+  queue behind it.
+
+When saving the staged audit record itself had failed as the result arrived,
+the stub says the result went to the audit record "though saving that record
+had failed when the result arrived", rather than that it is kept there.
+
+The file is an ordinary workspace file. The agent can read it back
+deliberately, and so can whoever else reads the mount: another agent sharing
+it, a process, or a synced copy. Withholding keeps the original out of the
+agent's context, not out of its workspace.
+
+If the active branch changes while the originals are being written (a
+rollback, an undo, a host's switch), no more are written, and the stub stays as
+it was. A write already under way names the batch's branch, and the workspace
+refuses it where it commits the file (`WorkspaceModule.writeBinary`'s `branch`
+option, whose refusal carries `data: { branchLeft: true }`), so no original
+lands on another branch. With `autoMaterialize`, a mount has one directory on
+disk, and a written file's copy there is written like any other write's.
+
+Two audit records describe it, each with `batchId`, `messageId` and
+`sourceBranch`:
+
+- `annotated`, written first, on its own: one entry in `results` per result.
+  `{ toolUseId, path }` is a written file; with `error`, a failed write; with
+  `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
+  error }` is a write that threw. `{ toolUseId, skipped }` is no write:
+  `no_workspace_file` (no writable workspace, or the framework was stopping),
+  `workspace_unanswered` (an earlier write was still under way past its
+  deadline) or `branch_changed` (the branch changed before or while it was
+  written).
+- `stub_updated`: the stub's edit, with `historyUpdate: "superseded"` when an
+  operator's edit, removal, rollback or branch change came first.
+
+The stub's edit is made at once. If it fails, it waits in the retry queue
+above, and the batch stays held until it lands, so no summary is made of a
+stub that doesn't yet say where its original went; meanwhile the agent's
+requests carry the bare notice, and the `annotated` record names the file.
+Every request that is sent is compiled once each annotation started so far
+has finished, including the refusal retry and the seed of a conversation fork
+from its template. A request preview (rollback, undo, redo) doesn't wait, and
+can show a stub before its place is added. At stop, the framework lets
+running annotations finish while the workspace is up; one that starts after
+that writes no file and is saved before the store closes.
 
 For example, an operator can inspect records without changing the agent's
 view:
@@ -160,3 +241,6 @@ retroactive and does not rewrite results already accepted into memory.
 - **Held stream text on abort.** Text held while a submitted batch is
   pending is dropped (not previewed) if the stream aborts or errors before
   the round settles.
+- **Withheld originals in the workspace.** Every reader of the mount can read
+  a withheld original's file, and nothing removes it; delete it as any
+  workspace file.

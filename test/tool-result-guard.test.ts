@@ -1030,6 +1030,17 @@ async function until(check: () => boolean, what: string) {
   for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(check(), `timed out waiting until ${what}`);
 }
+/** `promise`, or a failure once it has taken `ms`: a wait the code under test
+ *  should bound fails the test rather than hanging it. */
+async function bounded<T>(promise: Promise<T>, what: string, ms = 5000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally { clearTimeout(timer); }
+}
 
 /** Calls of a guard's afterAnnotations, the compile's wait for its stubs. */
 function watchCompiles(framework: AgentFramework, agentName = 'assistant') {
@@ -1390,7 +1401,7 @@ test('#277: a rollback while an aborted batch is being annotated gets none of it
   } finally { release(); await h.framework.stop(); }
 });
 
-test('#277: a write under way when a rollback lands is refused where it commits, and neither branch gets its file', async () => {
+test('#277: a write under way when a rollback lands is refused where it commits, recorded as skipped for the branch change, and neither branch gets its file', async () => {
   const h = await workspaceHarness([[calls('one', 'two')]]);
   type Writer = (label: string, text: string, branch?: string) => Promise<{ path: string; error?: string } | null>;
   const framework = h.framework as unknown as { writeToolResultFile: Writer };
@@ -1398,10 +1409,15 @@ test('#277: a write under way when a rollback lands is refused where it commits,
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const branches: Array<string | undefined> = [];
-  // The first write is held after the guard's branch check and before the
-  // workspace commits the file: the rollback lands in between.
+  const labels: string[] = [];
+  // The guard's branch check and the workspace's commit run with nothing
+  // yielding between them. This wrapper adds a wait there, so a rollback
+  // lands in between, and the test pins the commit's own check, the one that
+  // holds should an await ever come between them. writeBinary's check alone
+  // is pinned by the test after this one.
   framework.writeToolResultFile = async (label, text, branch) => {
     branches.push(branch);
+    labels.push(label);
     if (branches.length === 1) await gate;
     return write(label, text, branch);
   };
@@ -1428,12 +1444,10 @@ test('#277: a write under way when a rollback lands is refused where it commits,
     const annotated = audit.find((record) => record.type === 'annotated') as
       { results: Array<{ toolUseId: string; path?: string; error?: string; skipped?: string }> } | undefined;
     assert.ok(annotated, `the annotation is recorded: ${JSON.stringify(audit)}`);
-    const [one, two] = annotated.results;
-    assert.equal(one.toolUseId, 'one');
-    assert.equal(one.error, 'the workspace had left the branch this file is for');
-    assert.deepEqual(two, { toolUseId: 'two', skipped: 'branch_changed' });
+    assert.deepEqual(annotated.results, [{ toolUseId: 'one', skipped: 'branch_changed' }, { toolUseId: 'two', skipped: 'branch_changed' }],
+      'the declined write names no path, since no file was written, and the next is not started');
     assert.ok(!traces.some((event) => event.type === 'tool:spill_failed'), 'a declined write is not traced as a failed spill');
-    const relative = one.path!.replace(/^work\//, '');
+    const relative = `tool-results/${labels[0].replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80)}.txt`;
     const store = h.framework.getStore();
     assert.equal(store.treeGet('workspace/work/tree', relative), null, 'the branch rolled back to has no file');
     await cm.switchBranch(source);
@@ -1523,7 +1537,7 @@ test('#281: a write still under way at the deadline is named as unfinished, and 
   };
   let stopped = false;
   try {
-    await h.run();
+    await bounded(h.run(), 'the run, with its write stalled');
     assert.equal(writes, 1, "once the workspace stopped answering, the batch's next result isn't written");
     assert.equal(h.membrane.requests.length, 2, 'the retry went out without the write');
     const [one, two] = toolResults(h.framework).map((block) => String(block.content));
@@ -1539,36 +1553,223 @@ test('#281: a write still under way at the deadline is named as unfinished, and 
   } finally { stalled.open(); if (!stopped) await h.framework.stop(); }
 });
 
-test('#281: a failed stub edit leaves the record of the written file, and the edit is retried before the next activation', async () => {
+test("#281: a stub edit that keeps failing leaves the record of the written file and keeps the batch's hold until it lands", async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()], [answer()]]);
   const cm = h.framework.getAgent('assistant')!.getContextManager() as unknown as {
     editMessage: (id: unknown, content: ContentBlock[]) => unknown;
+    getCompressionHolds(): Set<unknown>;
   };
   const edit = cm.editMessage.bind(cm);
-  let failures = 0;
+  let failing = true;
+  let attempts = 0;
   cm.editMessage = (id, content) => {
-    if (failures === 0 && JSON.stringify(content).includes('Its result is in workspace file')) {
-      failures++;
-      throw new Error('injected stub edit failure');
+    if (JSON.stringify(content).includes('Its result is in workspace file')) {
+      attempts++;
+      if (failing) throw new Error('injected stub edit failure');
     }
     return edit(id, content);
   };
+  // The write waits until the refusal retry's compile is waiting for it, so
+  // the stub's edit fails only where the guard handles it.
+  const framework = h.framework as unknown as { writeToolResultFile: (...args: unknown[]) => Promise<unknown> };
+  const writeFile = framework.writeToolResultFile.bind(h.framework);
+  const write = gate();
+  framework.writeToolResultFile = async (...args) => { await write.opened; return writeFile(...args); };
+  const compiles = watchCompiles(h.framework);
   const audit = () => h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
   try {
-    await h.run();
-    assert.equal(failures, 1);
+    const running = h.run();
+    await until(() => compiles.calls === 2, 'the refusal retry waits for the stub');
+    write.open();
+    await running;
+    assert.ok(attempts >= 3, `made at once, retried with the queue, and again before the retry was compiled: ${attempts}`);
     const annotated = audit().find((record) => record.type === 'annotated') as { results: Array<{ path?: string }> };
     const path = annotated.results[0].path;
     assert.ok(path && SPILLED_STUB.test(`${TOOL_RESULT_GUARD_NOTICE} Its result is in workspace file ${path}.`),
       `the record names the written file though the edit failed: ${JSON.stringify(annotated)}`);
     assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE, 'the stub is still the bare notice');
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), [TOOL_RESULT_GUARD_NOTICE], 'the retry went out with the store still failing');
     assert.equal(audit().some((record) => record.type === 'stub_updated'), false, 'the edit is still queued');
+    assert.equal(cm.getCompressionHolds().size, 1, 'and still holds the batch out of summaries');
+    failing = false;
     await h.run();
     assert.equal(toolResults(h.framework)[0].content, `${TOOL_RESULT_GUARD_NOTICE} Its result is in workspace file ${path}.`);
     assert.equal(audit().at(-1)?.type, 'stub_updated');
     assert.equal(audit().at(-1)?.historyUpdate, undefined);
-    assert.equal(h.framework.getAgent('assistant')!.getContextManager().getCompressionHolds().size, 0);
-  } finally { await h.framework.stop(); }
+    assert.equal(cm.getCompressionHolds().size, 0, 'released once it landed');
+  } finally { write.open(); await h.framework.stop(); }
+});
+
+test('#281: a stub edit that failed is retried before the refusal retry is compiled, so the retry says where the original is', async () => {
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  const write = gate();
+  slowSpill(h.framework, () => write.opened);
+  const cm = h.framework.getAgent('assistant')!.getContextManager() as unknown as {
+    editMessage: (id: unknown, content: ContentBlock[]) => unknown;
+  };
+  const edit = cm.editMessage.bind(cm);
+  let attempts = 0;
+  cm.editMessage = (id, content) => {
+    if (JSON.stringify(content).includes('Its result is kept in')) {
+      attempts++;
+      // Both tries the annotation makes fail; the next succeeds.
+      if (attempts <= 2) throw new Error('injected stub edit failure');
+    }
+    return edit(id, content);
+  };
+  const compiles = watchCompiles(h.framework);
+  try {
+    const running = h.run();
+    await until(() => compiles.calls === 2, 'the refusal retry waits for the stub');
+    write.open();
+    await running;
+    assert.equal(attempts, 3);
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), [AUDIT_STUB]);
+  } finally { write.open(); await h.framework.stop(); }
+});
+
+test("#281: when the record of where each original went can't be saved at first, the stub is still edited, and the records keep their order", async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
+  const store = h.framework.getStore();
+  const append = store.appendToStateJson.bind(store);
+  let failures = 0;
+  store.appendToStateJson = (id, value) => {
+    if (id === TOOL_RESULT_GUARD_AUDIT_STATE && (value as { type?: string } | undefined)?.type === 'annotated' && failures === 0) {
+      failures++;
+      throw new Error('injected annotated append failure');
+    }
+    return append(id, value);
+  };
+  try {
+    await h.run();
+    assert.equal(failures, 1);
+    const stub = String(toolResults(h.framework)[0].content);
+    const path = SPILLED_STUB.exec(stub)?.[1];
+    assert.ok(path, `the stub names the file: ${stub}`);
+    const audit = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    assert.deepEqual(audit.slice(-3).map((record) => record.type), ['withheld', 'annotated', 'stub_updated']);
+    assert.deepEqual(audit.at(-2)?.results, [{ toolUseId: 'one', path }]);
+    const branch = h.framework.getAgent('assistant')!.getContextManager().currentBranch().name;
+    for (const record of audit.slice(-3)) assert.equal(record.sourceBranch, branch, `${String(record.type)} names its branch`);
+  } finally { store.appendToStateJson = append; await h.framework.stop(); }
+});
+
+test('#281: a compile waits for an annotation that began while it waited for another', async () => {
+  const r = await compressionRig();
+  try {
+    const first = gate();
+    const second = gate();
+    let entered = 0;
+    r.guard.setHost({ spill: async () => {
+      entered++;
+      await (entered === 1 ? first.opened : second.opened);
+      return null;
+    }, track: () => {} });
+    r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
+    assert.ok(r.guard.withhold('test-category'));
+    await until(() => entered === 1, 'the first annotation is writing');
+    const stub = (id: unknown) => (r.cm.getMessage(id as typeof r.messageId)!.content[0] as { content: unknown }).content;
+    let secondId: unknown;
+    let reads = 0;
+    const compiled = r.guard.afterAnnotations(async () => { reads++; return [stub(r.messageId), stub(secondId)]; });
+    // A second batch settles while the compile waits for the first annotation.
+    r.cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-2', name: 'search', input: {} }]);
+    secondId = r.guard.storeResults([{ type: 'tool_result', toolUseId: 'tu-2', content: 'SECOND' }],
+      [{ toolUseId: 'tu-2', content: 'SECOND' }], []);
+    r.guard.submissionResults([{ toolUseId: 'tu-2', content: 'SECOND' }]);
+    assert.ok(r.guard.withhold('test-category'));
+    first.open();
+    await until(() => entered === 2, 'the second annotation is writing');
+    assert.equal(reads, 0, 'the compile waits for it too');
+    second.open();
+    assert.deepEqual(await compiled, [AUDIT_STUB, AUDIT_STUB]);
+    assert.equal(reads, 1);
+  } finally { r.cm.close(); }
+});
+
+test("#281: a disposed run's failed stub edit is retried by maintenance and at stop", async () => {
+  const h = await harness([[calls('one')]]);
+  slowSpill(h.framework, async () => {});
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  let stopped = false;
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    const cm = created.contextManager as unknown as { editMessage: (id: unknown, content: ContentBlock[]) => unknown };
+    const edit = cm.editMessage.bind(cm);
+    let failing = true;
+    let attempts = 0;
+    cm.editMessage = (id, content) => {
+      if (JSON.stringify(content).includes('Its result is kept in')) {
+        attempts++;
+        if (failing) throw new Error('injected stub edit failure');
+      }
+      return edit(id, content);
+    };
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    h.framework.start();
+    await completion.catch(() => {});
+    await created.agent.toolResultGuard.whenAnnotated();
+    assert.equal(h.framework.getAgent('ephemeral') ?? null, null, 'the run was disposed');
+    assert.ok(attempts >= 2, `made at once and retried with the queue: ${attempts}`);
+    assert.equal(created.agent.toolResultGuard.idle, false, 'and still queued');
+    const before = attempts;
+    await (h.framework as unknown as { runQueuedMaintenance(): Promise<void> }).runQueuedMaintenance();
+    assert.ok(attempts > before, "maintenance retries the disposed run's queue");
+    failing = false;
+    await h.framework.stop();
+    stopped = true;
+    assert.equal(created.agent.toolResultGuard.idle, true, 'stop retried it, and it landed');
+    const restarted = await AgentFramework.create(h.base);
+    try {
+      const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+      assert.ok(audit.some((record) => record.type === 'stub_updated' && record.agentName === 'ephemeral'),
+        "the disposed run's stub edit landed before the store closed");
+    } finally { await restarted.stop(); }
+  } finally { if (!stopped) await h.framework.stop(); }
+});
+
+test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async () => {
+  const h = await workspaceHarness([
+    [calls('one'), refused()], [answer()],
+    [calls('two'), refused()], [answer()],
+    [calls('three'), refused()], [answer()],
+  ]);
+  (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
+  const framework = h.framework as unknown as {
+    writeToolResultFile: (...args: unknown[]) => Promise<unknown>;
+    stalledSpill: Promise<void> | undefined;
+  };
+  const writeFile = framework.writeToolResultFile.bind(h.framework);
+  const stalled = gate();
+  let writes = 0;
+  framework.writeToolResultFile = async (...args) => {
+    writes++;
+    if (writes === 1) await stalled.opened;
+    return writeFile(...args);
+  };
+  const annotated = () => (h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>)
+    .filter((record) => record.type === 'annotated') as Array<{ results: Array<Record<string, unknown>> }>;
+  try {
+    await bounded(h.run(), 'the first batch');
+    await bounded(h.run(), 'the second batch');
+    assert.equal(writes, 1, "no write starts while the first is still under way, for this agent's next batch either");
+    assert.equal(annotated()[0].results[0].unfinished, true);
+    assert.deepEqual(annotated()[1].results, [{ toolUseId: 'two', skipped: 'workspace_unanswered' }]);
+    assert.equal(toolResults(h.framework)[1].content, AUDIT_STUB);
+    stalled.open();
+    await until(() => framework.stalledSpill === undefined, 'the stalled write settles');
+    await bounded(h.run(), 'the third batch');
+    assert.equal(writes, 2, 'once it has settled, the next original is written');
+    assert.ok(typeof annotated()[2].results[0].path === 'string' && annotated()[2].results[0].unfinished === undefined);
+  } finally { stalled.open(); await h.framework.stop(); }
 });
 
 test("#281: a file whose copy on disk fails is still in the workspace's tree, and the stub names it", async () => {

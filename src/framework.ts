@@ -88,7 +88,7 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
-import type { WithheldSpill } from './tool-result-guard.js';
+import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -2030,8 +2030,10 @@ export class AgentFramework {
     // fork leaves the agent map while its annotation can still be running.
     while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
     // An annotation that starts after this point, such as one from a direct
-    // Agent API call stop doesn't cancel, writes no file to the stopping
-    // workspace: its stub names the audit record.
+    // Agent API call stop doesn't cancel, starts no write to the stopping
+    // workspace: its stub names the audit record. A write that was past its
+    // deadline is not waited for, and may still finish or fail after the
+    // modules stop.
     this.guardSpillsClosed = true;
 
     // Stop modules and MCPL servers in parallel
@@ -2046,12 +2048,14 @@ export class AgentFramework {
     while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
 
     // Streams may queue storage repairs while being cancelled above. Retry
-    // after their teardown, while the store is still open, before final sync.
-    for (const agent of this.agents.values()) {
+    // after their teardown, while the store is still open, before final sync:
+    // every live agent's guard, and every guard that annotated, which an
+    // ephemeral run or a closed fork takes out of the agent map.
+    for (const [guard, name] of this.guardsWithStorageWork()) {
       try {
-        agent.toolResultGuard.flushUnrecorded();
+        guard.flushUnrecorded();
       } catch (error) {
-        console.error(`[tool-result-guard] agent=${agent.name} could not finish queued storage work at stop:`, error);
+        console.error(`[tool-result-guard] agent=${name} could not finish queued storage work at stop:`, error);
       }
     }
 
@@ -2285,6 +2289,19 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
+    // A guard whose agent has left the map gets no activation to retry its
+    // queue; retry it here, and forget it once nothing of it is left.
+    const live = new Set([...this.agents.values()].map((agent) => agent.toolResultGuard));
+    for (const [guard, name] of this.annotatingGuards) {
+      if (!live.has(guard)) {
+        try {
+          guard.flushUnrecorded();
+        } catch (error) {
+          console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
+        }
+      }
+      if (guard.idle) this.annotatingGuards.delete(guard);
+    }
     const queued = [...this.agents.values()].flatMap((agent) => {
       try {
         agent.toolResultGuard.flushUnrecorded();
@@ -2716,6 +2733,14 @@ export class AgentFramework {
 
   /** Every guard's annotation still running, for stop() (agent-framework #277). */
   private readonly guardAnnotations = new Set<Promise<void>>();
+  /** Each guard that has annotated, by agent name, until it is idle: an
+   *  ephemeral run or a closed fork leaves the agent map with its annotation
+   *  still running and maybe a stub edit queued, which maintenance and stop
+   *  then retry (agent-framework #277). */
+  private readonly annotatingGuards = new Map<ToolResultGuard, string>();
+  /** A withheld original's write still under way past its deadline: until it
+   *  settles, the workspace isn't answering and no other is started. */
+  private stalledSpill: Promise<void> | undefined;
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
   /** Set once stop() has let the running annotations finish: a withheld
@@ -2734,13 +2759,24 @@ export class AgentFramework {
       throw new Error(`Invalid persisted tool_result_guard for ${agent.name}: expected a boolean`);
     }
     agent.toolResultGuard.setOverride(enabled);
-    agent.toolResultGuard.setHost({
+    const guard = agent.toolResultGuard;
+    guard.setHost({
       spill: (label, text, branch) => this.spillWithheld(label, text, branch),
       track: (annotation) => {
         this.guardAnnotations.add(annotation);
+        this.annotatingGuards.set(guard, agent.name);
         void annotation.finally(() => this.guardAnnotations.delete(annotation));
       },
     });
+  }
+
+  /** Each guard that may have queued storage work, once, by agent name: the
+   *  live agents' and those that annotated. */
+  private guardsWithStorageWork(): Map<ToolResultGuard, string> {
+    const guards = new Map<ToolResultGuard, string>();
+    for (const agent of this.agents.values()) guards.set(agent.toolResultGuard, agent.name);
+    for (const [guard, name] of this.annotatingGuards) if (!guards.has(guard)) guards.set(guard, name);
+    return guards;
   }
 
   private buildThinkTool(
@@ -7417,8 +7453,8 @@ export class AgentFramework {
       const { messages: existing } = await contextManager.compile();
       if (existing.length === 0) {
         // The copy is the fork's own, and the template's annotation edits only
-        // the template's message: seed only from stubs that already say where
-        // their originals went.
+        // the template's message: seed only once each of the template's
+        // annotations has finished.
         const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile());
         for (const msg of compiled) {
@@ -11761,21 +11797,39 @@ export class AgentFramework {
   /**
    * The guard's spill of a withheld original (agent-framework #277): the
    * tool-results file, waited for at most withheldSpillDeadlineMs. A write
-   * still under way then is reported as unfinished at its path, and goes on
-   * by itself. Once stop() has let the running annotations finish,
-   * nothing more is written.
+   * still under way then is reported as unfinished at its path. Nothing waits
+   * for it after that, stop() included: it goes on by itself and may finish
+   * or fail after the workspace has stopped, and its record says only that
+   * it was unfinished. Until it settles, the workspace isn't answering, and no
+   * other write is started: each later spill, of any agent's batch, is
+   * reported unanswered at once, so a stalled mount costs one deadline. A
+   * write the workspace declines because it had left `branch` is reported
+   * as such, with no path, since no file was written. Once stop() has let the
+   * running annotations finish, no new write is started.
    */
   private async spillWithheld(label: string, text: string, branch: string): Promise<WithheldSpill> {
     if (this.guardSpillsClosed) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
+    if (this.stalledSpill) return { skipped: 'workspace_unanswered' };
+    const write = this.writeToolResultFile(label, text, branch);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<WithheldSpill>((resolve) => {
-      timer = setTimeout(() => resolve({ path: place.path, unfinished: true }), this.withheldSpillDeadlineMs);
+    const late = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => resolve('late'), this.withheldSpillDeadlineMs);
       timer.unref?.();
     });
     try {
-      return await Promise.race([this.writeToolResultFile(label, text, branch), late]);
+      const written = await Promise.race([write, late]);
+      if (written !== 'late') {
+        if (!written) return null;
+        if (written.branchLeft) return { skipped: 'branch_changed' };
+        return { path: written.path, ...(written.error !== undefined ? { error: written.error } : {}) };
+      }
+      const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => {
+        if (this.stalledSpill === stalled) this.stalledSpill = undefined;
+      });
+      this.stalledSpill = stalled;
+      return { path: place.path, unfinished: true };
     } finally {
       clearTimeout(timer);
     }
@@ -11792,7 +11846,7 @@ export class AgentFramework {
     label: string,
     content: string,
     branch?: string,
-  ): Promise<{ path: string; error?: string } | null> {
+  ): Promise<{ path: string; error?: string; branchLeft?: true } | null> {
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
     const { workspace, path, safeLabel } = place;
@@ -11811,7 +11865,7 @@ export class AgentFramework {
       // Declined, not failed: the store left the branch the file is for, so
       // it isn't written anywhere, as the caller asked.
       if ((result.data as { branchLeft?: boolean } | undefined)?.branchLeft === true) {
-        return { path, error: result.error ?? 'the workspace had left the branch this file is for' };
+        return { path, error: result.error ?? 'the workspace had left the branch this file is for', branchLeft: true };
       }
       failure = result.error ?? 'write refused';
     } catch (err) {

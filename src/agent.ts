@@ -675,9 +675,11 @@ export class Agent {
       ? this.buildToolResultMessages(this._state.toolResults) : [];
 
     // Compile the context (with optional injections) into a request. The
-    // guard's refusal retry is assembled the same way, afresh. A withheld
-    // stub is compiled only once it says where its original went, including
-    // one whose annotation began during the compile.
+    // guard's refusal retry is assembled the same way, afresh. It is compiled
+    // only once each withheld stub's annotation has finished, including one
+    // that began during the compile, and after a stub edit that failed has
+    // been retried; one whose store still fails is compiled as the bare
+    // notice.
     const assemble = async (): Promise<NormalizedRequest> => {
       const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections));
@@ -970,8 +972,9 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    // A withheld stub is compiled only once it says where its original went,
-    // including one whose annotation began during the compile.
+    // Compiled only once each withheld stub's annotation has finished,
+    // including one that began during the compile, and after a stub edit that
+    // failed has been retried (see afterAnnotations).
     const request = await this.toolResultGuard.afterAnnotations(
       () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
@@ -1205,8 +1208,8 @@ export class Agent {
       const ids = this.toolResultGuard.withhold('unknown');
       if (ids) {
         abandonedUsage = response.usage;
-        // The retry is compiled afresh, like every request: once each stub
-        // says where its original went (agent-framework #277), and against the
+        // The retry is compiled afresh, like every request: once each stub's
+        // annotation has finished (agent-framework #277), and against the
         // budget without the batch's reservation, so a stub longer than its
         // original can't carry the request past the budget.
         response = await this.membrane.stream(await reassemble(), { signal });
