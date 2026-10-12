@@ -35,7 +35,7 @@ import { isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel } 
 const EXPIRY_REFUSAL = {
   passed: 'reference expired: its expiresAt has passed',
   unparseable: 'reference treated as expired: its expiresAt does not parse (fail closed)',
-  rejected: 'reference treated as expired: its expiresAt was rejected as a field, over 64 characters or not a string (fail closed)',
+  rejected: `reference treated as expired: its expiresAt was rejected as a field, over ${REFERENCE_LIMITS.expiresAt} characters or not a string (fail closed)`,
 } as const;
 
 /** Per-fetch hard ceiling on actual bytes (overridable per server / call). */
