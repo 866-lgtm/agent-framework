@@ -2808,6 +2808,28 @@ describe('on-agent-action', () => {
 });
 
 describe('materialize, status and shutdown', () => {
+  test("a materialize between initStore and start keeps its pin: the saved one, older, isn't applied over it", async (t) => {
+    const env = new Env(t);
+    const first = await env.open();
+    await call(first, 'write', { path: 'work/a.txt', content: 'A' });
+    await call(first, 'materialize', { path: 'work/a.txt' });
+    let saved: unknown;
+    (first as any).ctx.setState = (state: unknown) => { saved = state; };
+    await env.shutdown(first);
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    // The next process materializes before its start, then starts as a restart.
+    const m = new WorkspaceModule({ mounts: [{ name: 'work', path: env.dir, mode: 'read-write', watch: 'never' }] });
+    m.initStore(env.store);
+    await call(m, 'write', { path: 'work/b.txt', content: 'B' });
+    await call(m, 'materialize', { path: 'work/b.txt' });
+    const mount = (m as any).mounts.get('work');
+    const pinned = { seq: mount.lastMaterializedSeq, branch: mount.lastMaterializedBranchId };
+    assert.notEqual(pinned.seq, (saved as { mounts: { work: { lastMaterializedSeq: number } } }).mounts.work.lastMaterializedSeq);
+    await m.start({ isRestart: true, getState: () => saved, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    (env as any).live.push(m);
+    assert.deepEqual({ seq: mount.lastMaterializedSeq, branch: mount.lastMaterializedBranchId }, pinned);
+  });
+
   test('the module takes no work after it has stopped and saved its pins, until it starts again', async (t) => {
     const env = new Env(t);
     const m = await env.open();
@@ -2821,6 +2843,9 @@ describe('materialize, status and shutdown', () => {
     assert.match(String(after.error), /has stopped/);
     assert.equal(existsSync(env.disk('a.txt')), false, 'nothing was written after the stop');
     assert.equal((await m.writeBinary('work/late.bin', Buffer.from('x'), 'application/octet-stream')).success, false);
+    assert.deepEqual(await m.readBinary('work/a.txt'), { error: 'The workspace has stopped: it takes no more work until it starts again' });
+    assert.deepEqual(await m.materializeMount('work'), []);
+    assert.equal(existsSync(env.disk('a.txt')), false);
     assert.ok(saved, 'stop saved its state');
     // Started again, it takes work again.
     await m.start({ isRestart: true, getState: () => saved, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);

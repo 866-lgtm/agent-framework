@@ -826,7 +826,9 @@ export class WorkspaceModule implements Module {
 
     for (const [name, meta] of Object.entries(this.savedState.mounts)) {
       const mount = this.mounts.get(name);
-      if (mount) {
+      // A mount materialized this session already (a call between initStore
+      // and start) has a pin and watermark newer than anything saved.
+      if (mount && mount.lastMaterializedBranchId === null && mount.lastMaterializedSeq === 0) {
         mount.lastMaterializedSeq = meta.lastMaterializedSeq;
         mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
         // A store that ran #169's stop-time baselines (#109) saved them here
@@ -1457,6 +1459,7 @@ export class WorkspaceModule implements Module {
   async readBinary(
     mountPrefixedPath: string,
   ): Promise<{ data: Buffer } | { error: string }> {
+    if (!this.running()) return { error: NOT_RUNNING };
     let mount: MountState;
     let relativePath: string;
     try {
@@ -2731,6 +2734,7 @@ export class WorkspaceModule implements Module {
    * Resets branch tracking to allow cross-branch materialization.
    */
   async materializeMount(mountName: string): Promise<string[]> {
+    if (!this.running()) return [];
     const store = this.getStore();
     const mount = this.mounts.get(mountName);
     if (!mount || mount.config.mode === 'read-only') return [];
