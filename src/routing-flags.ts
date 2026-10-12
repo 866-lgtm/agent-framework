@@ -12,7 +12,9 @@
  *     earliest-arrived wake) and holds the rest for their own turns;
  *   - a turn whose locus cannot come from a trigger uses the configured home
  *     channel, else publishes nowhere — never the "most recent inbound"
- *     default.
+ *     default;
+ *   - no delivery receipts, locus announcements, routing notices or
+ *     channel auto-open notices.
  *
  * CHANNEL_OPEN_ON_SEND=false — delivering into a closed or declined channel
  *   (routed prose or an explicit send tool) does not reopen it.

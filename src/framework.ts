@@ -7795,7 +7795,17 @@ export class AgentFramework {
       : `delivering it does not join the channel (only messages that address you directly keep reaching you from it).\n`;
     const mode = opts.proseRouting ?? 'locus';
     let replyOption: string;
-    if (mode === 'explicit') {
+    if (routingStrict() && (mode === 'locus' || mode === 'hybrid')) {
+      // ROUTING_STRICT: a turn's replies go only to the place whose message
+      // started it, so one plain statement covers waking and non-waking
+      // messages alike.
+      replyOption =
+        `1. Reply — if this turn's replies go to ${place}, write your reply as plain text and it lands there; ` +
+        `from anywhere else, use an explicit send tool with channelId "${opts.channelId}". ` +
+        (opensOnSend
+          ? `Delivering a reply opens the channel (call channel_close with channelId "${opts.channelId}" to leave again).\n`
+          : `Replying does not join the channel.\n`);
+    } else if (mode === 'explicit') {
       // The label is for reading; the prefix must be ONE token that resolves
       // back here, on this server (a DM label "DM: alice" quoted verbatim
       // parses as target "#DM:"). A registry that can name targets is
@@ -8858,6 +8868,13 @@ export class AgentFramework {
    * ([discord-send-failed]); this is the success half.
    */
   private appendProseDeliveryReceipt(agent: Agent): void {
+    // ROUTING_STRICT: no delivery receipts (prose only ever lands in the
+    // turn's own place, so there is nothing to report).
+    if (routingStrict()) {
+      this.turnProseDeliveries.delete(agent.name);
+      this.turnProseSuppressed.delete(agent.name);
+      return;
+    }
     const list = this.turnProseDeliveries.get(agent.name);
     const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
     if ((!list || list.length === 0) && suppressed === 0) return;
@@ -8908,6 +8925,8 @@ export class AgentFramework {
    * inference; never locus-eligible itself (system + no channel metadata).
    */
   private announceLocusIfChanged(agentName: string, locus: string | null): void {
+    // ROUTING_STRICT: no turn-start locus announcements.
+    if (routingStrict()) return;
     const hasBaseline = this.lastAnnouncedLocus.has(agentName);
     const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
     if (hasBaseline ? prev === locus : locus === null) {
@@ -8964,6 +8983,11 @@ export class AgentFramework {
     cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
   ): void {
     if (channels.length === 0) return;
+    // ROUTING_STRICT: no channel auto-open notices in the window.
+    if (routingStrict()) {
+      console.error(`[channel] auto-open notice (${cause}) not recorded (strict routing): ${channels.map((c) => c.channelId).join(', ')}`);
+      return;
+    }
     const shown = channels
       .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
       .join(', ');
