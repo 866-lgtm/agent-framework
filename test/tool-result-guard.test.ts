@@ -838,10 +838,13 @@ test('storage recovery: failed accepted edit is retried before the next activati
     assert.equal(cm.getCompressionHolds().size, 1, 'keep provisional history out of compression until repaired');
     assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
     assert.throws(() => agent.toolResultGuard.flushUnrecorded(), /injected edit failure/);
+    const busy = (h.framework as unknown as { busyGuards: Map<unknown, string> }).busyGuards;
+    assert.equal(busy.has(agent.toolResultGuard), true, 'a queued acceptance edit keeps the guard within reach');
     failing = false;
     await h.run();
     assert.match(JSON.stringify(h.membrane.requests[1]), /payload-one/, 'next activation must see the accepted result');
     assert.equal(cm.getCompressionHolds().size, 0);
+    assert.equal(busy.has(agent.toolResultGuard), false, 'and the guard is let go once it lands');
     const records = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     assert.equal(records.filter((r) => r.type === 'accepted').length, 1);
     assert.deepEqual(h.module.calls, ['one']);
@@ -1167,7 +1170,7 @@ test("#277: an operator's edit made before the stub is annotated stands, and the
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let entered = false;
-    r.guard.setHost({ spill: async () => { entered = true; await gate; return null; }, track: () => {} });
+    r.guard.setHost({ spill: async () => { entered = true; await gate; return null; }, track: () => {}, idle: () => {} });
     r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
     assert.ok(r.guard.withhold('test-category'));
     for (let i = 0; i < 100 && !entered; i++) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1241,6 +1244,11 @@ test('#277: the stub has the same text for each place the original can be', () =
   assert.equal(withheldResultNotice(null, false), `${notice} Its result went to ${unsaved}.`);
   assert.equal(withheldResultNotice(null, true), AUDIT_STUB);
   assert.equal(withheldResultNotice(null, false), UNSAVED_STUB);
+  // A skipped write reads as no write at all.
+  for (const skipped of ['workspace_unanswered', 'branch_changed'] as const) {
+    assert.equal(withheldResultNotice({ skipped }, true), AUDIT_STUB);
+    assert.equal(withheldResultNotice({ skipped }, false), UNSAVED_STUB);
+  }
 });
 
 test('#277: direct API: a request after an aborted batch is compiled once its stub is annotated', async () => {
@@ -1547,7 +1555,7 @@ test('#281: a write still under way at the deadline is named as unfinished, and 
     const annotated = audit.find((record) => record.type === 'annotated') as { results: Array<Record<string, unknown>> };
     assert.equal(annotated.results[0].unfinished, true);
     assert.deepEqual(annotated.results[1], { toolUseId: 'two', skipped: 'workspace_unanswered' });
-    await h.framework.stop();
+    await bounded(h.framework.stop(), 'stop, with the write still stalled');
     stopped = true;
     assert.equal(writes, 1, 'stop finished with the write still stalled');
   } finally { stalled.open(); if (!stopped) await h.framework.stop(); }
@@ -1592,12 +1600,16 @@ test("#281: a stub edit that keeps failing leaves the record of the written file
     assert.deepEqual(retried.map((b) => b.content), [TOOL_RESULT_GUARD_NOTICE], 'the retry went out with the store still failing');
     assert.equal(audit().some((record) => record.type === 'stub_updated'), false, 'the edit is still queued');
     assert.equal(cm.getCompressionHolds().size, 1, 'and still holds the batch out of summaries');
+    const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+    const busy = (h.framework as unknown as { busyGuards: Map<unknown, string> }).busyGuards;
+    assert.equal(busy.has(guard), true, 'the framework keeps the guard within reach while its edit waits');
     failing = false;
     await h.run();
     assert.equal(toolResults(h.framework)[0].content, `${TOOL_RESULT_GUARD_NOTICE} Its result is in workspace file ${path}.`);
     assert.equal(audit().at(-1)?.type, 'stub_updated');
     assert.equal(audit().at(-1)?.historyUpdate, undefined);
     assert.equal(cm.getCompressionHolds().size, 0, 'released once it landed');
+    assert.equal(busy.has(guard), false, 'and lets it go once the edit lands, with no maintenance pass');
   } finally { write.open(); await h.framework.stop(); }
 });
 
@@ -1666,7 +1678,7 @@ test('#281: a compile waits for an annotation that began while it waited for ano
       entered++;
       await (entered === 1 ? first.opened : second.opened);
       return null;
-    }, track: () => {} });
+    }, track: () => {}, idle: () => {} });
     r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
     assert.ok(r.guard.withhold('test-category'));
     await until(() => entered === 1, 'the first annotation is writing');
@@ -1684,7 +1696,7 @@ test('#281: a compile waits for an annotation that began while it waited for ano
     await until(() => entered === 2, 'the second annotation is writing');
     assert.equal(reads, 0, 'the compile waits for it too');
     second.open();
-    assert.deepEqual(await compiled, [AUDIT_STUB, AUDIT_STUB]);
+    assert.deepEqual(await bounded(compiled, 'the compile'), [AUDIT_STUB, AUDIT_STUB]);
     assert.equal(reads, 1);
   } finally { r.cm.close(); }
 });
@@ -1736,6 +1748,44 @@ test("#281: a disposed run's failed stub edit is retried by maintenance and at s
   } finally { if (!stopped) await h.framework.stop(); }
 });
 
+test("#281: a disposed run's failed acceptance edit is retried by maintenance, and its guard is let go once it lands", async () => {
+  const h = await harness([[calls('one'), answer()]]);
+  const maintain = () => (h.framework as unknown as { runQueuedMaintenance(): Promise<void> }).runQueuedMaintenance();
+  const busy = (h.framework as unknown as { busyGuards: Map<unknown, string> }).busyGuards;
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    const cm = created.contextManager as unknown as { editMessage: (id: unknown, content: ContentBlock[]) => unknown };
+    const edit = cm.editMessage.bind(cm);
+    let failing = true;
+    let attempts = 0;
+    cm.editMessage = (id, content) => {
+      if (JSON.stringify(content).includes('payload-one')) {
+        attempts++;
+        if (failing) throw new Error('injected acceptance edit failure');
+      }
+      return edit(id, content);
+    };
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    h.framework.start();
+    await bounded(completion, 'the ephemeral run');
+    const guard = created.agent.toolResultGuard;
+    assert.equal(h.framework.getAgent('ephemeral') ?? null, null, 'the run was disposed');
+    assert.equal(guard.idle, false, 'with its acceptance edit queued');
+    assert.equal(busy.has(guard), true, 'which keeps its guard within reach');
+    const before = attempts;
+    await maintain();
+    assert.ok(attempts > before, "maintenance retries the disposed run's acceptance edit");
+    assert.equal(busy.has(guard), true, 'and keeps the guard while the edit fails');
+    failing = false;
+    await maintain();
+    assert.equal(guard.idle, true, 'the edit landed');
+    assert.equal(busy.has(guard), false, 'and the guard is let go');
+  } finally { await h.framework.stop(); }
+});
+
 test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async () => {
   const h = await workspaceHarness([
     [calls('one'), refused()], [answer()],
@@ -1770,6 +1820,54 @@ test('#281: batches behind one stalled write cost one deadline: no write starts 
     assert.equal(writes, 2, 'once it has settled, the next original is written');
     assert.ok(typeof annotated()[2].results[0].path === 'string' && annotated()[2].results[0].unfinished === undefined);
   } finally { stalled.open(); await h.framework.stop(); }
+});
+
+test('#281: a write declined for a branch the workspace left stops the writes, and a stub edited after the branch came back names the audit record', async () => {
+  const h = await workspaceHarness([[calls('one', 'two'), refused()], [answer()]]);
+  let writes = 0;
+  // Declined where it commits, as when the branch changed while the write was
+  // under way; the store is back on the batch's branch by the time it ends,
+  // as after an undo and a redo.
+  (h.framework as unknown as { writeToolResultFile: () => Promise<unknown> }).writeToolResultFile = async () => {
+    writes++;
+    return { path: 'work/tool-results/declined.txt', branchLeft: true };
+  };
+  try {
+    await bounded(h.run(), 'the run');
+    assert.equal(writes, 1, 'no write starts after the decline');
+    assert.deepEqual(toolResults(h.framework).map((block) => block.content), [AUDIT_STUB, AUDIT_STUB]);
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const annotated = audit.find((record) => record.type === 'annotated') as { results: Array<Record<string, unknown>> };
+    assert.deepEqual(annotated.results, [
+      { toolUseId: 'one', skipped: 'branch_changed' },
+      { toolUseId: 'two', skipped: 'branch_changed' },
+    ]);
+  } finally { await h.framework.stop(); }
+});
+
+test('#281: stop during a compile that waits for an annotation lets no provider stream start after it', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
+  const framework = h.framework as unknown as { writeToolResultFile: (...args: unknown[]) => Promise<unknown> };
+  const writeFile = framework.writeToolResultFile.bind(h.framework);
+  const write = gate();
+  framework.writeToolResultFile = async (...args) => { await write.opened; return writeFile(...args); };
+  const compiles = watchCompiles(h.framework);
+  const traces: string[] = [];
+  h.framework.onTrace((event) => traces.push((event as { type: string }).type));
+  let stopped = false;
+  try {
+    const running = h.run();
+    await until(() => compiles.calls === 2, 'the refusal retry waits for the stub');
+    const stopping = h.framework.stop();
+    write.open();
+    await bounded(stopping, 'stop');
+    stopped = true;
+    // Nothing is left to drive, so the run ends too: the refused stream's
+    // entry went with the retry it started.
+    await bounded(running, 'the run');
+    assert.equal(h.membrane.requests.length, 2, 'the retry was compiled once its stub was written');
+    assert.equal(traces.includes('inference:completed'), false, 'but, compiled after stop began, it was never driven');
+  } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
 test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async () => {
@@ -1827,7 +1925,7 @@ test("#281: a disposed run's guard is forgotten once its annotation ends with no
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(h.framework.getAgent('ephemeral') ?? null, null, 'the run was disposed');
     assert.equal(created.agent.toolResultGuard.idle, true);
-    const remembered = (h.framework as unknown as { annotatingGuards: Map<unknown, string> }).annotatingGuards;
+    const remembered = (h.framework as unknown as { busyGuards: Map<unknown, string> }).busyGuards;
     assert.equal(remembered.has(created.agent.toolResultGuard), false, 'nothing keeps the disposed guard');
   } finally { await h.framework.stop(); }
 });
@@ -1887,7 +1985,7 @@ test('#281: a compile during which an annotation began is compiled again once it
   try {
     const write = gate();
     let entered = false;
-    r.guard.setHost({ spill: async () => { entered = true; await write.opened; return null; }, track: () => {} });
+    r.guard.setHost({ spill: async () => { entered = true; await write.opened; return null; }, track: () => {}, idle: () => {} });
     r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
     let reads = 0;
     const stub = () => (r.cm.getMessage(r.messageId)!.content[0] as { content: unknown }).content;

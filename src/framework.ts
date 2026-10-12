@@ -2049,8 +2049,8 @@ export class AgentFramework {
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync:
-    // every live agent's guard, and every guard that annotated, which an
-    // ephemeral run or a closed fork takes out of the agent map.
+    // every live agent's guard, and every other guard that isn't idle, whose
+    // ephemeral run or closed fork has left the agent map.
     for (const [guard, name] of this.guardsWithStorageWork()) {
       try {
         guard.flushUnrecorded();
@@ -2290,17 +2290,15 @@ export class AgentFramework {
 
   private async runQueuedMaintenance(): Promise<void> {
     // A guard whose agent has left the map gets no activation to retry its
-    // queue; retry it here, and forget it once nothing of it is left.
+    // queue; retry it here. It leaves busyGuards once nothing of it is left.
     const live = new Set([...this.agents.values()].map((agent) => agent.toolResultGuard));
-    for (const [guard, name] of this.annotatingGuards) {
-      if (!live.has(guard)) {
-        try {
-          guard.flushUnrecorded();
-        } catch (error) {
-          console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
-        }
+    for (const [guard, name] of this.busyGuards) {
+      if (live.has(guard)) continue;
+      try {
+        guard.flushUnrecorded();
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
       }
-      if (guard.idle) this.annotatingGuards.delete(guard);
     }
     const queued = [...this.agents.values()].flatMap((agent) => {
       try {
@@ -2733,16 +2731,17 @@ export class AgentFramework {
 
   /** Every guard's annotation still running, for stop() (agent-framework #277). */
   private readonly guardAnnotations = new Set<Promise<void>>();
-  /** Each guard that has annotated, by agent name, until it is idle: an
-   *  ephemeral run or a closed fork leaves the agent map with its annotation
-   *  still running and maybe a stub edit queued, which maintenance and stop
-   *  then retry (agent-framework #277). A guard leaves when an annotation of
-   *  its ends with nothing of it left; one left with queued work stays until
-   *  a maintenance pass finds that work done. */
-  private readonly annotatingGuards = new Map<ToolResultGuard, string>();
+  /** Each guard that isn't idle, by agent name, as the guard reports it. An
+   *  ephemeral run or a closed fork leaves the agent map with an annotation
+   *  maybe still running, or a stub edit, acceptance edit or audit write
+   *  queued, which maintenance and stop then retry (agent-framework #277). A
+   *  guard is here from the moment it has work left until the moment it has
+   *  none, however that comes about. */
+  private readonly busyGuards = new Map<ToolResultGuard, string>();
   /** Withheld originals' writes still under way past their deadline: while
-   *  any is, the workspace isn't answering and no other is started. Several
-   *  can be, when writes of different agents' batches stalled together. */
+   *  any is, the workspace isn't answering and no other withheld original's
+   *  write is started. Several can be, when writes of different agents'
+   *  batches stalled together. */
   private readonly stalledSpills = new Set<Promise<void>>();
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
@@ -2767,24 +2766,21 @@ export class AgentFramework {
       spill: (label, text, branch) => this.spillWithheld(label, text, branch),
       track: (annotation) => {
         this.guardAnnotations.add(annotation);
-        this.annotatingGuards.set(guard, agent.name);
-        void annotation.finally(() => {
-          this.guardAnnotations.delete(annotation);
-          // The guard clears its own record of a finished annotation in a
-          // callback it registered before calling track, so `idle` already
-          // counts this one as done.
-          if (guard.idle) this.annotatingGuards.delete(guard);
-        });
+        void annotation.finally(() => this.guardAnnotations.delete(annotation));
+      },
+      idle: (idle) => {
+        if (idle) this.busyGuards.delete(guard);
+        else this.busyGuards.set(guard, agent.name);
       },
     });
   }
 
   /** Each guard that may have queued storage work, once, by agent name: the
-   *  live agents' and those that annotated. */
+   *  live agents' and every other that isn't idle. */
   private guardsWithStorageWork(): Map<ToolResultGuard, string> {
     const guards = new Map<ToolResultGuard, string>();
     for (const agent of this.agents.values()) guards.set(agent.toolResultGuard, agent.name);
-    for (const [guard, name] of this.annotatingGuards) if (!guards.has(guard)) guards.set(guard, name);
+    for (const [guard, name] of this.busyGuards) if (!guards.has(guard)) guards.set(guard, name);
     return guards;
   }
 
@@ -9433,9 +9429,10 @@ export class AgentFramework {
         injections = injections ? [...injections, silentInjection] : [silentInjection];
       }
 
-      // An ephemeral watchdog may dispose this Agent while hooks/compile await.
-      // Do not create a provider stream after its generation lost ownership.
-      if (this.agents.get(agent.name) !== agent) {
+      // An ephemeral watchdog may dispose this Agent while hooks/compile await,
+      // and stop() may close provider admission. Do not create a provider
+      // stream after its generation lost ownership, or once admission closed.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -9460,9 +9457,20 @@ export class AgentFramework {
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
-      if (this.agents.get(agent.name) !== agent) {
+      // The compile can wait for a withheld batch's annotation, up to the
+      // spill deadline (see ToolResultGuard.afterAnnotations), so check both
+      // again. Membrane's yielding stream starts its request when it is first
+      // iterated, so cancelling it here, before driveStream, sends nothing.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         stream.cancel();
         agent.cancelStream();
+        if (this.agents.get(agent.name) === agent) {
+          // The compile took the agent's stream id, so a frame that started
+          // this one (a guard or budget restart) no longer owns the entries
+          // it left, and its teardown leaves them to this frame.
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+        }
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -11824,7 +11832,13 @@ export class AgentFramework {
     const write = this.writeToolResultFile(label, text, branch);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<'late'>((resolve) => {
-      timer = setTimeout(() => resolve('late'), this.withheldSpillDeadlineMs);
+      timer = setTimeout(() => {
+        // Marked as the deadline passes, before anything else runs, so no
+        // spill that starts after it finds the workspace answering.
+        const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => this.stalledSpills.delete(stalled));
+        this.stalledSpills.add(stalled);
+        resolve('late');
+      }, this.withheldSpillDeadlineMs);
       timer.unref?.();
     });
     try {
@@ -11834,8 +11848,6 @@ export class AgentFramework {
         if (written.branchLeft) return { skipped: 'branch_changed' };
         return { path: written.path, ...(written.error !== undefined ? { error: written.error } : {}) };
       }
-      const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => this.stalledSpills.delete(stalled));
-      this.stalledSpills.add(stalled);
       return { path: place.path, unfinished: true };
     } finally {
       clearTimeout(timer);

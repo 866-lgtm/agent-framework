@@ -19,13 +19,14 @@
   tool had done (agent-framework #277). The file is an ordinary workspace
   file: the agent can read it back deliberately, and so can whoever else reads
   the mount, such as another agent sharing it or a synced copy.
-- How the stub is written. Where each original went is recorded first, and the
-  stub's edit is then made at once. If it fails, it is retried before the next
-  activation, compile of a request that is sent, maintenance pass or stop,
-  including for an ephemeral run or a closed fork that has left the agent map,
-  and the batch stays held out of summaries until it lands. Until then, or if
-  the store keeps failing or the process stops first, the stub is the bare
-  notice and the audit record names the file. A file whose copy on disk fails
+- How the stub is written. Where each original went is queued first, as an
+  audit record of its own, and the stub's edit is then made at once. If it
+  fails, it is retried before the next activation, compile of a request that
+  is sent, maintenance pass or stop, including for an ephemeral run or a
+  closed fork that has left the agent map, and the batch stays held out of
+  summaries until it lands. Until then, or if the store keeps failing or the
+  process stops first, the stub is the bare notice, and the `annotated` audit
+  record names the file once its own write has landed. A file whose copy on disk fails
   is still in the workspace's tree, where its tools read it, so the stub names
   it; for this, `WorkspaceModule.writeBinary`'s result for that case carries
   `data: { inChronicle: true }`. A write still under way after 30 seconds, as
@@ -45,15 +46,17 @@
   workspace is up; one that starts after that writes no file and is saved
   before the store closes. A crash before a stub is written leaves the notice
   alone, and the staged audit record still holds the original. If the active
-  branch changes while the originals are being written, no more are written, a
-  write already under way is refused where it commits and recorded as skipped
-  for the branch change, and the stub stays as it was, so no original lands on
-  another branch. For this,
-  `WorkspaceModule.writeBinary` takes an optional `branch`: the file's tree
-  entry lands on that branch or isn't written, and a refused write's result
-  carries `data: { branchLeft: true }` (it isn't traced as a failed spill). A
-  mount has one directory on disk, so with `autoMaterialize` the file's copy
-  there is written like any other write's. The audit records `annotated`
+  branch changes while the originals are being written, no more are written:
+  a write already under way is refused where it commits, and it and the rest
+  are recorded as skipped for the branch change. While the store is away the
+  stub stays as it was; if the branch is back by the edit, those results'
+  stubs name the audit record. So no original's tree entry lands on another
+  branch. For this, `WorkspaceModule.writeBinary` takes an optional `branch`:
+  the file's tree entry lands on that branch or isn't written, and a refused
+  write's result carries `data: { branchLeft: true }` (it isn't traced as a
+  failed spill). A mount has one directory on disk for every branch, so with
+  `autoMaterialize` a file's copy there, made after its tree entry, is there
+  whichever branch is active, like any other write's. The audit records `annotated`
   (where each original went) and `stub_updated` (the stub's edit) carry the
   batch's `sourceBranch`. The direct Agent API's refusal retry is now
   compiled afresh, as the framework's is, so its longer stubs fit the budget.

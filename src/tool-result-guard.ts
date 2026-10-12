@@ -34,11 +34,18 @@ export type WithheldSpill =
 export type WithheldSpiller = (label: string, text: string, branch: string) => Promise<WithheldSpill>;
 
 /** What a host gives a guard for its withheld results: where originals are
- *  written, and where each annotation is registered, so the host's stop can
- *  wait for it even after the agent itself was disposed. */
+ *  written, where each annotation is registered, so the host's stop can
+ *  wait for it even after the agent itself was disposed, and where the
+ *  guard says whether it has work left. */
 export interface WithheldHost {
   spill: WithheldSpiller;
   track(annotation: Promise<void>): void;
+  /** Whether the guard is idle (see ToolResultGuard.idle), told after each
+   *  change that can alter it: when an annotation starts or ends, and after
+   *  each pass over the storage queue. A host keeps a guard that isn't idle
+   *  within reach for retries, whatever has become of its agent, and lets
+   *  an idle one go. */
+  idle(idle: boolean): void;
 }
 
 /**
@@ -198,18 +205,23 @@ export class ToolResultGuard {
    * hold here; it can never re-arm refusal handling or tool submission. */
   private unrecorded: AuditOperation[] = [];
 
-  /** Retry edits and audit writes before a new activation, audit write,
-   * maintenance pass, or shutdown. A failed operation stays at the head. */
+  /** Retry edits and audit writes before a new activation, a compile of a
+   * request that is sent (afterAnnotations), an audit write, a maintenance
+   * pass, or shutdown. A failed operation stays at the head. */
   flushUnrecorded(): void {
-    while (this.unrecorded.length > 0) {
-      const operation = this.unrecorded[0];
-      try {
-        this.applyEdit(operation);
-        this.write(operation.record);
-        this.unrecorded.shift();
-      } finally {
-        if (!operation.admission) this.releaseOperationHold(operation);
+    try {
+      while (this.unrecorded.length > 0) {
+        const operation = this.unrecorded[0];
+        try {
+          this.applyEdit(operation);
+          this.write(operation.record);
+          this.unrecorded.shift();
+        } finally {
+          if (!operation.admission) this.releaseOperationHold(operation);
+        }
       }
+    } finally {
+      this.host?.idle(this.idle);
     }
   }
 
@@ -440,10 +452,11 @@ export class ToolResultGuard {
    * the only thing it edits: an operator's later edit, removal or rollback
    * stands.
    *
-   * Where each original went is recorded first, on its own ('annotated'), so
+   * Where each original went is queued first, on its own ('annotated'), so
    * a stub edit that fails can't take the record of a written file with it.
-   * The edit is made at once, so no storage work queued ahead of it holds it,
-   * and its record ('stub_updated') is written in order after the others. An
+   * The edit is then made at once, so no storage work queued ahead of it
+   * holds it, not even that record if its write is failing, and its record
+   * ('stub_updated') is written in order after the others. An
    * edit that fails joins the ordered storage queue like an admission's, with
    * the batch's compression hold: retried before the next activation, compile,
    * maintenance pass or stop until it lands or an operator's change supersedes
@@ -470,15 +483,22 @@ export class ToolResultGuard {
         const spills = new Map<number, WithheldSpill>();
         // A spill that threw, by index: its error, for the record.
         const thrown = new Map<number, string>();
+        // Set once the branch has changed: no more is written.
+        let branchLeft = false;
         for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
           // Once the store has left the batch's branch (a rollback, an undo, a
-          // host's switch), the stub below stays as it is: write no more.
-          // Nothing yields between this break and the edit's own branch check,
-          // so a batch whose writes stopped is never edited. A write already
-          // under way when the branch changes is refused where it commits,
-          // since it names the batch's branch, so no file lands elsewhere.
-          if (this.cm.currentBranch().name !== pending.branch) break;
+          // host's switch), write no more. This result and every later one is
+          // skipped, and its original stays in the audit record. Nothing
+          // yields from here to the edit's own branch check, so while the
+          // store is away the stub stays as it is. A write already under way
+          // when the branch changes is refused where it commits, since it
+          // names the batch's branch, so no file lands elsewhere.
+          if (branchLeft || this.cm.currentBranch().name !== pending.branch) {
+            branchLeft = true;
+            spills.set(index, { skipped: 'branch_changed' });
+            continue;
+          }
           // The result as stored. Both paths that store a tool result store
           // its text; content stored as blocks would be written as their JSON.
           const original = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
@@ -495,13 +515,14 @@ export class ToolResultGuard {
             }
           }
           // Declined where it would have committed, since the workspace had
-          // left the batch's branch: nothing was written, and no more are, as
-          // for the results the branch check above stops.
-          if (spill && 'skipped' in spill && spill.skipped === 'branch_changed') break;
+          // left the batch's branch. Nothing was written, and no more are, as
+          // for the results the branch check above stops. If the branch is
+          // back by the edit, as after an undo and a redo, the stubs of this
+          // result and the later ones name the audit record.
+          if (spill && 'skipped' in spill && spill.skipped === 'branch_changed') branchLeft = true;
           spills.set(index, spill);
         }
         const annotated: ContentBlock[] = pending.withheld.map((block, index) => block.type === 'tool_result'
-          && spills.has(index)
           ? { ...block, content: withheldResultNotice(spills.get(index) ?? null, pending.durable) }
           : block);
         try {
@@ -509,12 +530,11 @@ export class ToolResultGuard {
             type: 'annotated', batchId: pending.id, messageId: pending.messageId, sourceBranch: pending.branch,
             results: pending.content.flatMap((block, index): Array<Record<string, string | true>> => {
               if (block.type !== 'tool_result') return [];
-              if (!spills.has(index)) return [{ toolUseId: block.toolUseId, skipped: 'branch_changed' }];
               if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
-              const spill = spills.get(index);
+              const spill = spills.get(index) ?? null;
               // No file was written: no writable workspace, or the framework
               // was stopping.
-              if (spill === null || spill === undefined) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
+              if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               if ('skipped' in spill) return [{ toolUseId: block.toolUseId, skipped: spill.skipped }];
               return [{ toolUseId: block.toolUseId, path: spill.path,
                 ...(spill.error !== undefined ? { error: spill.error } : {}),
@@ -562,8 +582,12 @@ export class ToolResultGuard {
       }
     });
     this.annotating = run;
-    void run.finally(() => { if (this.annotating === run) this.annotating = undefined; });
+    void run.finally(() => {
+      if (this.annotating === run) this.annotating = undefined;
+      this.host?.idle(this.idle);
+    });
     this.host?.track(run);
+    this.host?.idle(false);
   }
 
   private releaseOperationHold(operation: AuditOperation): void {

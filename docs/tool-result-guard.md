@@ -91,8 +91,9 @@ context-manager compression hold (`addMessage(..., { holdCompression: true })`,
 context-manager >= 0.12), placed before the strategy's ingress callback runs.
 Every settlement path (accept, withhold, turn-ended, unsubmitted, aborted)
 edits in the final content first and then releases the hold: an accepted
-batch's payload, or a withheld batch's stub, which is edited once its
-originals have been written, so a withheld batch stays held meanwhile.
+batch's payload, or a withheld batch's stub, which is edited once the write
+of each of its originals has ended, written or not, so a withheld batch stays
+held meanwhile.
 Audit-only failures cannot keep a settled message held. If an acceptance
 edit or a stub's edit fails, the guard keeps the content and its hold in a
 separate retry queue; it does not re-arm provider submission or refusal
@@ -125,9 +126,10 @@ the operator's view. Originals in the audit are never edited or removed.
 
 Storage retries are in-memory. If the process dies before storage recovers,
 unsynced records or unfinished edits cannot be promised to survive. Originals
-already made durable remain in Chronicle; reopened context conservatively
-retains any withholding notice whose acceptance edit or stub edit did not
-persist, and an `annotated` record that was saved still names a written file.
+already made durable remain in Chronicle. A reopened context keeps the
+withholding notice of any batch whose acceptance edit or stub edit did not
+persist, with no compression hold, and nothing edits it later; an
+`annotated` record that was saved still names a written file.
 
 A stream that ends without a clean round and without a successor (abort,
 exhausted error retries; also an aborted direct `Agent.runInference`)
@@ -167,7 +169,9 @@ Otherwise the stub names the guard's audit record, for an operator:
   and may finish or fail after the workspace has stopped. Until it settles, no
   other withheld original is written, for any agent; their stubs name the audit
   record, so a stalled mount costs one 30-second wait however many batches
-  queue behind it.
+  queue behind it. Writes already under way when it stalled each run to their
+  own deadline, and a write that never settles keeps the others from being
+  written for the life of the process.
 
 When saving the staged audit record itself had failed as the result arrived,
 the stub says the result went to the audit record "though saving that record
@@ -179,17 +183,21 @@ it, a process, or a synced copy. Withholding keeps the original out of the
 agent's context, not out of its workspace.
 
 If the active branch changes while the originals are being written (a
-rollback, an undo, a host's switch), no more are written, and the stub stays as
-it was. A write already under way names the batch's branch, and the workspace
+rollback, an undo, a host's switch), no more are written, and the rest are
+recorded as skipped for the branch change. While the store is away from the
+batch's branch, the stub stays as it was; if the branch is back by the edit,
+as after an undo and a redo, each skipped result's stub names the audit
+record. A write already under way names the batch's branch, and the workspace
 refuses it where it commits the file (`WorkspaceModule.writeBinary`'s `branch`
-option, whose refusal carries `data: { branchLeft: true }`), so no original
-lands on another branch. With `autoMaterialize`, a mount has one directory on
-disk, and a written file's copy there is written like any other write's.
+option, whose refusal carries `data: { branchLeft: true }`), so no original's
+tree entry lands on another branch. With `autoMaterialize`, a mount has one
+directory on disk for every branch, so a written file's copy there, made after
+its tree entry, is there whichever branch is active, like any other write's.
 
 Two audit records describe it, each with `batchId`, `messageId` and
 `sourceBranch`:
 
-- `annotated`, written first, on its own: one entry in `results` per result.
+- `annotated`, queued first, on its own: one entry in `results` per result.
   `{ toolUseId, path }` is a written file; with `error`, a failed write; with
   `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
@@ -202,8 +210,11 @@ Two audit records describe it, each with `batchId`, `messageId` and
 
 The stub's edit is made at once. If it fails, it waits in the retry queue
 above, and the batch stays held until it lands, so no summary is made of a
-stub that doesn't yet say where its original went; meanwhile the agent's
-requests carry the bare notice, and the `annotated` record names the file.
+stub that doesn't yet say where its original went. Meanwhile a request
+compiled while it is failing, as the refusal retry is, carries the bare
+notice, and the `annotated` record, once saved, names the file. An activation
+or a direct API call retries the queue first, and fails while the edit keeps
+failing, as it does for a failing acceptance edit.
 Every request that is sent is compiled once each annotation started so far
 has finished, including the refusal retry and the seed of a conversation fork
 from its template. A request preview (rollback, undo, redo) doesn't wait, and
