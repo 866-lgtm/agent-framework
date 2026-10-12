@@ -1082,7 +1082,13 @@ export class ChannelRegistry {
     label?: string,
     extraMetadata?: Record<string, unknown>,
   ): void {
-    const existing = this.findChannelEntry(channelId);
+    // ROUTING_STRICT: a channel is identified by its server too. Another
+    // server that already registered the same bare id (a self-deployed
+    // server, a second world host) must not stand in for this one — the
+    // routed reply would be published on THAT server.
+    const existing = routingStrict()
+      ? this.findChannelEntryOn(channelId, serverId)
+      : this.findChannelEntry(channelId);
     if (existing) {
       // Backfill identity onto a bare lazy registration: a DM that first
       // arrived with no label/recipient info gets a usable name the next
@@ -1381,7 +1387,11 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.homeChannel
+    // ROUTING_STRICT: for an agent's turn the active channel IS the turn's
+    // publish target (set from its place), so a turn that publishes nowhere
+    // names no outgoing channel rather than the configured home.
+    const outgoing = home ?? active
+      ?? (routingStrict() && agentName ? null : this.homeChannel)
       ?? (routingStrict() ? null : this.defaultPublishChannel);
 
     if (openChannels.length === 0 && !outgoing) {
@@ -2225,6 +2235,15 @@ export class ChannelRegistry {
       .map((e) => e.descriptor);
   }
 
+  /** Every server that registered a channel with this descriptor id. */
+  serverIdsForChannel(channelId: string): string[] {
+    const servers: string[] = [];
+    for (const entry of this.channels.values()) {
+      if (entry.descriptor.id === channelId && !servers.includes(entry.serverId)) servers.push(entry.serverId);
+    }
+    return servers;
+  }
+
   /** Server id owning a registered channel (by descriptor id), or null. */
   getChannelServerId(channelId: string): string | null {
     return this.findChannelEntry(channelId)?.serverId ?? null;
@@ -2239,6 +2258,16 @@ export class ChannelRegistry {
       if (entry.descriptor.id === channelId) {
         return entry;
       }
+    }
+    return undefined;
+  }
+
+  /** The entry for `channelId` registered by `serverId`, if any. */
+  private findChannelEntryOn(channelId: string, serverId: string): ChannelEntry | undefined {
+    const keyed = this.channels.get(`${serverId}:${channelId}`);
+    if (keyed && keyed.serverId === serverId && keyed.descriptor.id === channelId) return keyed;
+    for (const entry of this.channels.values()) {
+      if (entry.serverId === serverId && entry.descriptor.id === channelId) return entry;
     }
     return undefined;
   }
@@ -3001,6 +3030,11 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
+    /** ROUTING_STRICT: the server the turn's locus channel belongs to. Two
+     *  servers can register the same channel id; the locus is the one the
+     *  turn's place names, never the first registered. Absent = first match
+     *  (upstream behavior). */
+    locusServerId?: string,
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
@@ -3042,9 +3076,11 @@ export class ChannelRegistry {
       return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
-    const entry = this.findChannelEntry(channelId);
+    const entry = locusServerId
+      ? this.findChannelEntryOn(channelId, locusServerId)
+      : this.findChannelEntry(channelId);
     if (!entry) {
-      return fail(channelId, `no registered channel for locus "${channelId}"`);
+      return fail(channelId, `no registered channel for locus "${channelId}"${locusServerId ? ` on server "${locusServerId}"` : ''}`);
     }
 
     // INVARIANT: it is not possible to send into a closed channel. Speech

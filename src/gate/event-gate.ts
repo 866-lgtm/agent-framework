@@ -120,9 +120,17 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** MCPL server of the event `routeChannelId` came from. Two servers can
+   *  register the same channel id; a host that keys conversations by server
+   *  needs it to tell them apart. Set only alongside `routeChannelId`. */
+  routeServerId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /** Host-opaque token handed in when the host arms a self-wake or a sleep
+   *  and handed back on that wake (the conversation the wake continues).
+   *  Never set by the gate itself. */
+  place?: string;
 }
 
 interface DebounceState {
@@ -226,6 +234,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
     ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
+    ...(pick.addressed && pick.routeChannelId && pick.serverId ? { routeServerId: pick.serverId } : {}),
     at: pick.timestamp,
   };
 }
@@ -592,6 +601,8 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
+  /** Handed back on the sleep's expiry wake (see setSleep). */
+  private sleepProvenance: WakeProvenance | undefined;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
   // a self-wake suppresses NOTHING — it means "if nothing else wakes me by
@@ -1649,6 +1660,27 @@ export class EventGate {
     }
   }
 
+  /**
+   * Wakes the gate still owes: one entry per debounce batch that has not
+   * fired and one for the inference buffer (delivered as a single batch when
+   * the running turns end). Each names the route its wake will carry — the
+   * same pick `deliverEvents` makes — or nothing for an ambient-only batch.
+   * Ids only, never content.
+   */
+  pendingWakeRoutes(): Array<{ routeChannelId?: string; routeServerId?: string }> {
+    const out: Array<{ routeChannelId?: string; routeServerId?: string }> = [];
+    const add = (events: PendingEvent[]): void => {
+      if (events.length === 0) return;
+      const provenance = wakeProvenance(events);
+      out.push(provenance?.routeChannelId
+        ? { routeChannelId: provenance.routeChannelId, ...(provenance.routeServerId ? { routeServerId: provenance.routeServerId } : {}) }
+        : {});
+    };
+    for (const state of this.debounceTimers.values()) add(state.events);
+    add(this.inferenceBuffer);
+    return out;
+  }
+
   /** Live inference-gating snapshot for diagnostics (e.g. a SIGUSR2 dump).
    *  A non-empty `inferring` with a stale timestamp + growing `bufferedEvents`
    *  is the signature of the wake-wedge: an agent stuck mid-"inference" so all
@@ -1702,11 +1734,18 @@ export class EventGate {
   // =========================================================================
 
   /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
+  setSleep(
+    seconds: number,
+    note?: string,
+    agentName?: string,
+    /** Handed back verbatim on the expiry wake (e.g. a host place token). */
+    provenance?: WakeProvenance,
+  ): { until: number } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepUntil = this.now() + ms;
     this.sleepNote = note;
     this.sleepAgent = agentName;
+    this.sleepProvenance = provenance;
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
@@ -1736,7 +1775,13 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+  armSelfWake(
+    agentName: string,
+    seconds: number,
+    source = 'skip_reply',
+    /** Handed back verbatim on the wake (e.g. a host place token). */
+    provenance?: WakeProvenance,
+  ): { inMs: number } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
@@ -1767,6 +1812,7 @@ export class EventGate {
         agentName,
         `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
         'self-wake',
+        ...(provenance ? [provenance] : []),
       );
     }, ms);
     this.selfWakeTimers.set(agentName, timer);
@@ -1787,6 +1833,7 @@ export class EventGate {
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
+    this.sleepProvenance = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     return wasAsleep;
   }
@@ -1803,9 +1850,11 @@ export class EventGate {
     if (this.sleepUntil === 0 || this.sleepUntil > this.now()) return;
     const note = this.sleepNote;
     const agent = this.sleepAgent;
+    const provenance = this.sleepProvenance;
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
+    this.sleepProvenance = undefined;
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'sleep:expired',
@@ -1816,7 +1865,10 @@ export class EventGate {
     });
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();
-    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep');
+    for (const a of targets) {
+      if (provenance && a === agent) this.requestInferenceFn(a, detail, 'sleep', provenance);
+      else this.requestInferenceFn(a, detail, 'sleep');
+    }
   }
 
   /** Current sleep state, or null if awake. */

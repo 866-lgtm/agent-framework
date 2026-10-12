@@ -367,4 +367,15 @@ export interface InferenceRequest {
    * turn stores is stamped `metadata.silentHeartbeat` with it, and request
    * builds render a request-only separator before the tick's first row. */
   silentHeartbeat?: SilentHeartbeatTick;
+  /** Framework-owned, ROUTING_STRICT only: the place (strict-places.ts) whose
+   *  turn this wake starts — the triggering message's place, or the place of
+   *  the turn a framework follow-up continues. Unset = derived from
+   *  `channelId`, else the home channel. */
+  strictPlace?: string;
+  /** Framework-owned, ROUTING_STRICT only: earliest arrival among the wakes a
+   *  parked (quiesced) wake absorbed, so place order survives coalescing. */
+  strictArrivedAt?: number;
+  /** Framework-owned, ROUTING_STRICT only: this wake's message aborted a turn
+   *  (privileged interrupt) — its place takes the next turn. */
+  strictBrake?: boolean;
 }

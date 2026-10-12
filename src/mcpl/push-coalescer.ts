@@ -604,7 +604,12 @@ export class PushCoalescer<E = unknown> {
    * settled and which of them produced content, so the host can tell a turn
    * whose only cause rendered nothing.
    */
-  async assemble(agentName: string): Promise<AssemblyResult> {
+  async assemble(
+    agentName: string,
+    /** Host filter: batches it rejects are left pending — not frozen, their
+     *  wake not withdrawn — for an assembly they belong to. */
+    accept?: (occurrence: CoalescedOccurrence<E>) => boolean,
+  ): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
     if (this.suspended) return result;
     const work: Promise<void>[] = [];
@@ -612,7 +617,7 @@ export class PushCoalescer<E = unknown> {
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock.
-      const started = await this.locked(() => this.freeze(subject, agentName));
+      const started = await this.locked(() => this.freeze(subject, agentName, accept));
       if (started) {
         work.push(started.done.then(() => {
           result.settled.add(subject);
@@ -631,9 +636,15 @@ export class PushCoalescer<E = unknown> {
    * the RPC. Returns the render's completion (shared by every assembly that
    * waits on this batch, vector 25) or undefined when nothing was started.
    */
-  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void>; rendering: Rendering<E> } | undefined> {
+  private async freeze(
+    subject: string,
+    agentName: string,
+    accept?: (occurrence: CoalescedOccurrence<E>) => boolean,
+  ): Promise<{ done: Promise<void>; rendering: Rendering<E> } | undefined> {
     const state = this.subjects.get(subject);
     if (!state || this.suspended) return undefined;
+    const pendingLatest = state.rendering?.batch.latest ?? state.batch?.latest;
+    if (accept && pendingLatest && !accept(pendingLatest)) return undefined;
     if (state.rendering) {
       // Another assembly froze this batch; share its outcome (vector 25).
       const rendering = state.rendering;

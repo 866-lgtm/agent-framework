@@ -21,6 +21,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { routingStrict } from '../routing-flags.js';
 
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
@@ -41,8 +42,14 @@ export interface TuneOutFrameworkHooks {
     metadata?: Record<string, unknown>,
     forAgent?: string,
   ) => string;
-  /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  /** Queue an inference request for an agent. `channel` names the channel
+   *  whose conversation the wake is about (the cancel dump's channel). */
+  requestInference: (
+    agentName: string,
+    reason: string,
+    source: string,
+    channel?: { serverId: string; channelId: string },
+  ) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
@@ -232,7 +239,10 @@ export class TuneOutCoordinator {
     this.hooks.addMessage(
       'user',
       [{ type: 'text', text: `[Tune-out: ${channelId} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]\n\n${dump}` }],
-      { system: true, kind: 'tune-out-cancel', channelId, epochId },
+      // ROUTING_STRICT: the dump is that channel's own traffic, so it names
+      // the channel's server like any delivery from it (and is held out of
+      // a turn running elsewhere, as the channel's messages would be).
+      { system: true, kind: 'tune-out-cancel', channelId, epochId, ...(routingStrict() ? { serverId } : {}) },
     );
     // The subconscious's own words, under its own name, verbatim.
     const subName = this.hooks.subconsciousName();
@@ -245,7 +255,11 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      if (routingStrict()) {
+        this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', { serverId, channelId });
+      } else {
+        this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      }
     }
     // The subconscious gets one cancel turn of its own (unless it initiated
     // the cancel — its note already carries its words): the issue's cancel
