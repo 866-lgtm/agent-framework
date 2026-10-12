@@ -13,6 +13,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
 import type {
+  AgentActionScan,
   WorkspaceConfig,
   MountConfig,
   MountState,
@@ -2897,71 +2898,81 @@ export class WorkspaceModule implements Module {
     if (mounts.length === 0 || !this.store) return;
     const deadlineMs = this.agentActionScanDeadlineMs();
     await Promise.all(mounts.map(async (mount) => {
-      const missed = (reason: string): void => {
-        mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
-        this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
-      };
       const runningLate = mount.agentActionScanLate !== undefined;
       const scan = this.agentActionScan(mount);
       if (runningLate) {
         // An earlier batch's scan outlasted its deadline and still runs: this
-        // round isn't held as well. Its own scan is queued after that one.
-        missed('an earlier scan is still running past its deadline; this batch is scanned after it');
+        // round isn't held as well. Its own scan is queued after that one,
+        // and records its outcome when it finishes.
+        scan.late = true;
+        this.agentActionScanMissed(mount, 'an earlier scan is still running past its deadline; this batch is scanned after it');
         return;
       }
-      let late = false;
-      const recorded = scan.then(
-        (pass) => {
-          const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
-          mount.lastAgentActionScan = late
-            ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
-            : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
-        },
-        (err: unknown) => {
-          missed(`scan failed: ${err instanceof Error ? err.message : String(err)}`);
-        },
-      );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<'late'>((resolveDeadline) => {
         timer = setTimeout(() => resolveDeadline('late'), deadlineMs);
       });
-      const outcome = await Promise.race([recorded.then(() => 'done' as const), deadline]);
+      const outcome = await Promise.race([scan.settled.then(() => 'done' as const), deadline]);
       clearTimeout(timer);
       if (outcome === 'late') {
-        late = true;
+        scan.late = true;
         if (mount.agentActionScanLate === undefined) {
-          mount.agentActionScanLate = recorded;
-          void recorded.then(() => { if (mount.agentActionScanLate === recorded) mount.agentActionScanLate = undefined; });
+          const settled = scan.settled;
+          mount.agentActionScanLate = settled;
+          void settled.then(() => { if (mount.agentActionScanLate === settled) mount.agentActionScanLate = undefined; });
         }
-        missed(`deadline exceeded (${deadlineMs} ms); the scan continues`);
+        this.agentActionScanMissed(mount, `deadline exceeded (${deadlineMs} ms); the scan continues`);
       }
     }));
+  }
+
+  /** A batch's scan missed its deadline, or failed: said on status and as an event. */
+  private agentActionScanMissed(mount: MountState, reason: string): void {
+    mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
+    this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
   }
 
   /**
    * The mount's after-batch scan: one may run and one wait behind it. A batch
    * that comes while one waits shares it, since it starts after the batch's
-   * tools ran. A scan that finished without seeing everything (the file cap,
-   * an unreadable or changing region, a branch that kept changing) says
-   * where, as an event.
+   * tools ran. Each scan records its own outcome when it settles: on status
+   * while it is the mount's newest scan (a scan queued behind it describes a
+   * later batch), and as an event for regions it couldn't observe (the file
+   * cap, an unreadable or changing region, a branch that kept changing) or a
+   * failure, whichever scan it is.
    */
-  private agentActionScan(mount: MountState): Promise<{ incomplete: Array<{ path: string; reason: string }> }> {
+  private agentActionScan(mount: MountState): AgentActionScan {
     if (mount.agentActionScanWaiting) return mount.agentActionScanWaiting;
-    const waiting = this.withMount(mount, () => {
-      if (mount.agentActionScanWaiting === waiting) mount.agentActionScanWaiting = undefined;
+    const scan: AgentActionScan = { late: false, settled: Promise.resolve() };
+    const pass = this.withMount(mount, () => {
+      if (mount.agentActionScanWaiting === scan) mount.agentActionScanWaiting = undefined;
       return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
     });
-    mount.agentActionScanWaiting = waiting;
-    void waiting.then((pass) => {
-      if (pass.incomplete.length === 0) return;
-      this.ctx?.pushEvent({
-        type: 'workspace:agent-action-scan-incomplete',
-        mount: mount.config.name,
-        reason: 'the scan finished, but some regions could not be observed',
-        incomplete: pass.incomplete,
-      } as ProcessEvent);
-    }, () => {});
-    return waiting;
+    scan.settled = pass.then(
+      (result) => {
+        if (result.incomplete.length > 0) {
+          this.ctx?.pushEvent({
+            type: 'workspace:agent-action-scan-incomplete',
+            mount: mount.config.name,
+            reason: 'the scan finished, but some regions could not be observed',
+            incomplete: result.incomplete,
+          } as ProcessEvent);
+        }
+        if (mount.agentActionScanLatest !== scan) return;
+        const incomplete = result.incomplete.length > 0 ? { incomplete: result.incomplete } : {};
+        mount.lastAgentActionScan = scan.late
+          ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
+          : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
+      },
+      (err: unknown) => {
+        const reason = `scan failed: ${err instanceof Error ? err.message : String(err)}`;
+        if (mount.agentActionScanLatest === scan) this.agentActionScanMissed(mount, reason);
+        else this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+      },
+    );
+    mount.agentActionScanWaiting = scan;
+    mount.agentActionScanLatest = scan;
+    return scan;
   }
 
   /** The scan deadline, kept below the framework's hook bound (warned once). */

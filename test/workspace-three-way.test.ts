@@ -2616,6 +2616,51 @@ describe('on-agent-action', () => {
     assert.doesNotMatch(scan.reason ?? '', /an earlier scan is still running/);
   });
 
+  test("a scan queued behind a late one puts its own outcome on status, which the late one's doesn't overwrite", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 50 });
+    const mod = m as any;
+    // Stand-ins for the two scans' passes: the first runs, then waits to be
+    // released, and each says a different region couldn't be observed.
+    const pass = mod.passUnlocked.bind(mod);
+    const gates = [0, 1].map(() => { let open!: () => void; const shut = new Promise<void>((resolve) => { open = resolve; }); return { open, shut }; });
+    let passes = 0;
+    mod.passUnlocked = async (...args: unknown[]) => {
+      const n = ++passes;
+      const result = await pass(...args);
+      await gates[n - 1]!.shut;
+      return { ...result, incomplete: [{ path: n === 1 ? 'FIRST' : 'SECOND', reason: 'stand-in' }] };
+    };
+    const events: Array<{ type: string; incomplete?: Array<{ path: string }> }> = [];
+    mod.ctx = { ...mod.ctx, pushEvent: (e: { type: string }) => { events.push(e); } };
+    // A failed assertion mustn't leave a scan waiting on its gate: the
+    // module's stop at cleanup would wait for it.
+    try {
+      await m.onToolBatchComplete('agent'); // its scan starts, and runs past the deadline
+      await m.onToolBatchComplete('agent'); // not held: its own scan is queued behind the first
+      const status = async () => (await call(m, 'status', {})).work.lastAgentActionScan;
+      assert.match((await status()).reason, /an earlier scan is still running past its deadline/);
+      gates[0]!.open();
+      for (let i = 0; i < 100 && passes < 2; i++) await sleep(10);
+      await new Promise((resolve) => setImmediate(resolve));
+      // The first scan is done and the second runs: the first's outcome is not
+      // the second batch's.
+      assert.match((await status()).reason, /an earlier scan is still running past its deadline/, "the older scan doesn't speak for the newer batch");
+      gates[1]!.open();
+      await mod.mountTurns.get('work');
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(passes, 2, 'the second batch had a scan of its own');
+      const last = await status();
+      assert.equal(last.complete, true);
+      assert.equal(last.withinDeadline, false, 'its batch was never held for it');
+      assert.deepEqual(last.incomplete?.map((r: { path: string }) => r.path), ['SECOND'], JSON.stringify(last));
+      const regions = events.flatMap((e) => (e.incomplete ?? []).map((r) => r.path));
+      assert.deepEqual(regions.sort(), ['FIRST', 'SECOND'], 'each scan still reports its regions as an event');
+    } finally {
+      for (const gate of gates) gate.open();
+    }
+  });
+
   test("a scan deadline within 1 s of the framework's hook bound is lowered below it, with a warning", async (t) => {
     const env = new Env(t);
     const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 60_000 });
