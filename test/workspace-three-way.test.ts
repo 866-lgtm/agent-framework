@@ -1018,6 +1018,57 @@ describe('restarts and faults', () => {
     assert.equal(agreement.needsBarrier, true);
   });
 
+  test('an append that fails inside the store leaves no decision to stale evidence: passes refuse until a reopen, which finds the evidence', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'A' });
+    await call(m, 'materialize', { path: 'work/a.txt' });
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('draft-c', main);
+    env.store.switchBranch('draft-c');
+    await call(m, 'write', { path: 'work/a.txt', content: 'C' });
+    env.store.switchBranch(main);
+    await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+    env.writeDisk('a.txt', 'B');
+
+    // The pass that agrees at B appends that evidence, and the append throws
+    // after it landed, as Chronicle's does when the log's periodic sync fails.
+    const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+    const store = env.store as unknown as { appendJson: (type: string, payload: any) => unknown };
+    const append = store.appendJson;
+    let fired = false;
+    store.appendJson = function (this: unknown, type: string, payload: any) {
+      const record = append.call(this, type, payload);
+      if (!fired && type === 'workspace/disk-agreement' && payload.t === 'set' && payload.value?.hash === sha('B')) {
+        fired = true;
+        throw new Error('injected: the append landed, then the store failed');
+      }
+      return record;
+    };
+    try {
+      assert.match(await refused(m, 'ls', { path: 'work', recursive: true }), /injected: the append landed/);
+    } finally {
+      store.appendJson = append;
+    }
+    assert.equal(fired, true);
+
+    // Its evidence would still say A, so the draft branch's listing would read
+    // C against A on disk B as both-changed and record a sticky conflict. It
+    // refuses instead, and records nothing.
+    env.store.switchBranch('draft-c');
+    assert.match(await refused(m, 'ls', { path: 'work', recursive: true }), /evidence is unavailable until the store is reopened/);
+    assert.match(await refused(m, 'materialize', { path: 'work/a.txt' }), /evidence is unavailable until the store is reopened/);
+    const intents = (m as unknown as { intents: Map<string, { get(path: string): { conflict?: unknown } | undefined }> }).intents;
+    assert.equal(intents.get('work')!.get('a.txt')?.conflict, undefined, 'no conflict was recorded');
+
+    // Reopened, the store has the evidence at B, and the draft is a draft.
+    m = await env.restart(m);
+    env.store.switchBranch('draft-c');
+    const entry = (await call(m, 'ls', { path: 'work', recursive: true })).entries.find((e: { path: string }) => e.path === 'a.txt');
+    assert.equal(entry.state, 'workspace-draft');
+    assert.equal(readFileSync(join(env.dir, 'a.txt'), 'utf8'), 'B', 'disk is untouched');
+  });
+
   test('a checkpoint check after an ambiguous append reconciles first, like every entry point', (t) => {
     const env = new Env(t);
     let failSync = false;
