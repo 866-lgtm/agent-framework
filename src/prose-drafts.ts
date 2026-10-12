@@ -307,9 +307,13 @@ export class ProseDraftStore {
   }
 
   /**
-   * Journal and apply one entry. A write that fails after reaching the store
-   * leaves the journal unreconciled: rebuild from it before rethrowing, so
-   * the projection never disagrees with what the journal holds.
+   * Journal and apply one entry. A write that fails after the store's append
+   * returned leaves the journal unreconciled: rebuild from it before
+   * rethrowing, so the projection never disagrees with what the journal
+   * holds. An append that fails inside the store can't be read back until
+   * the store is reopened: the journal then refuses every write until the
+   * next start, which replays that entry, so until then each write throws,
+   * no new draft is kept, and the projection lacks that entry.
    */
   private write(entry: DraftEntry, durable: boolean, afterCommittedState = false): void {
     try {
