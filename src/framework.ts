@@ -113,7 +113,11 @@ import {
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
-import { channelOpenOnSend } from './routing-flags.js';
+import { channelOpenOnSend, routingStrict } from './routing-flags.js';
+
+/** ROUTING_STRICT place of a turn that has no channel to publish into (no
+ *  trigger channel, no configured home channel): its prose stays private. */
+const STRICT_NOWHERE = '\u0000nowhere';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -1062,6 +1066,13 @@ export class AgentFramework {
    *  the addressed re-pin block in the tool-result handler). Ambient chatter
    *  elsewhere, reactions, and system markers still cannot move it. */
   private turnLocusPins: Map<string, string> = new Map();
+  /** ROUTING_STRICT: the PLACE (channel) of each agent's current logical
+   *  turn — fork home, else the trigger's channel, else the configured home
+   *  channel, else STRICT_NOWHERE. Set once at fresh-turn start (kept by a
+   *  context-budget restart) and never moved. It is both the turn's locus
+   *  and the hold boundary: mid-turn, only messages from this place are
+   *  injected; every other place's messages are held for their own turns. */
+  private strictTurnPlaces: Map<string, string> = new Map();
   /** Per-agent count of consecutive think-only inference rounds in the current
    *  turn — drives the think loop guard (see THINK_SOFT_CAP / THINK_HARD_CAP).
    *  Reset at each fresh inference start and on any non-think round. */
@@ -1831,10 +1842,16 @@ export class AgentFramework {
       // replays. Serving boot with a remainder → flush it right now (no turn
       // is alive yet, so this is a safe boundary).
       const restoredWrites = framework.restorePersistedDeferredWrites();
+      // ROUTING_STRICT: a restored message that had woken the agent re-arms
+      // its wake, so a crash between its hold and its own turn neither drops
+      // it nor demotes it to ambient (the flush below keeps it held).
+      if (restoredWrites > 0) framework.rearmStrictHeldWakes();
       if (!hostMode?.quiesced && restoredWrites > 0) {
         console.error(
           `[host-mode] ${restoredWrites} deferred context write(s) found at a serving boot ` +
-          `(an earlier resume did not finish its flush) — landing them now`,
+          (routingStrict()
+            ? `(held or deferred when the process last stopped) — landing what no pending wake holds`
+            : `(an earlier resume did not finish its flush) — landing them now`),
         );
         await framework.flushDeferredWrites('boot-recovery');
       }
@@ -3424,9 +3441,18 @@ export class AgentFramework {
     }
     const keep: typeof this.deferredMessages = [];
     const flush: typeof this.deferredMessages = [];
+    // ROUTING_STRICT: a place with a pending wake stays held for the turn
+    // that wake starts (see the strict place holds).
+    const releasable = new Map<string, ((msg: DeferredWrite) => boolean) | undefined>();
+    const held = (target: string | null, msg: DeferredWrite): boolean => {
+      if (!target) return false;
+      if (!releasable.has(target)) releasable.set(target, this.strictReleasable(target, 'idle'));
+      const release = releasable.get(target);
+      return !!release && !release(msg);
+    };
     for (const msg of this.deferredMessages) {
       const target = msg.forAgent ?? this.primaryAgentName;
-      (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
+      (target && this.activeTurnTokens.has(target) || held(target, msg) ? keep : flush).push(msg);
     }
     // Hand-off: the batch leaves the pending queue and enters the un-acked
     // set. The DURABLE queue (pending + un-acked) is unchanged by this, so a
@@ -3456,7 +3482,9 @@ export class AgentFramework {
     this.ackDeferredWrites();
     console.error(
       `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
-      (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
+      (keep.length > 0
+        ? `, ${keep.length} kept for a still-alive turn${routingStrict() ? ' or a pending place wake' : ''}`
+        : ''),
     );
   }
 
@@ -3590,9 +3618,10 @@ export class AgentFramework {
    * window is operator-length, not turn-length. Lives in the
    * branch-independent recovery file so a rollback cannot orphan it.
    * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
-   * still memory-only: they flush within the turn, as before.
+   * still memory-only: they flush within the turn, as before — unless
+   * `force` (ROUTING_STRICT holds, which outlive the turn) starts the mirror.
    */
-  private persistDeferredWrites(): void {
+  private persistDeferredWrites(force = false): void {
     try {
       // The durable queue is everything not yet acked: writes still pending
       // AND writes handed to a context manager whose sync has not happened.
@@ -3600,7 +3629,7 @@ export class AgentFramework {
       // split: a re-deferred entry must not jump the queue.
       const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
       const scanFrom = Object.fromEntries(this.deferredScanFrom);
-      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+      if ((this.quiesced || this.deferredWritesPersisted || force) && durable.length > 0) {
         const payload = JSON.stringify(durable);
         if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
           if (!this.deferredWritesCapWarned) {
@@ -6013,10 +6042,15 @@ export class AgentFramework {
       if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         for (const name of reserved.keys()) {
           if (this.activeTurnTokens.has(name)) continue;
-          for (const msg of this.drainDeferredFor(name)) {
+          for (const msg of this.drainDeferredFor(name, this.strictReleasable(name, 'idle'))) {
             try {
-              this.addMessage(msg.participant, msg.content, msg.metadata,
-                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+              this.addMessage(msg.participant, msg.content, msg.metadata, {
+                ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+                // ROUTING_STRICT: carry the entry's durable identity like
+                // every other flush, so a store here is never mistaken for
+                // a fresh arrival (and re-held under a second id).
+                ...(routingStrict() ? { deferredWriteId: msg.id } : {}),
+              });
             } catch (error) {
               console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -6822,7 +6856,11 @@ export class AgentFramework {
           // injection — or in driveStream's finally when its turn ends.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           {
-            const deferred = this.drainDeferredFor(agent.name);
+            // ROUTING_STRICT: only the turn's own place (and non-channel
+            // framework messages) is heard mid-turn; messages from every
+            // other place stay held — neither stored nor injected — until
+            // this turn is over (see the strict place holds).
+            const deferred = this.drainDeferredFor(agent.name, this.strictReleasable(agent.name, 'boundary'));
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
@@ -6920,9 +6958,12 @@ export class AgentFramework {
           // classifier-safe D-class from the 2026-07-24 ablation). It also
           // updates lastAnnouncedLocus so the next turn's announce-on-change
           // diffs against what the agent was actually last told.
+          // ROUTING_STRICT: the locus never moves after turn start — no
+          // mid-turn re-pin of any kind (and nothing from another place was
+          // injected above to re-pin to).
           if (
             (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
-            !shouldEndTurn && !overBudget && currentState.stream
+            !shouldEndTurn && !overBudget && currentState.stream && !routingStrict()
           ) {
             // Two signals qualify an injection to move the pin (n=6 + n=7):
             //  - chat:addressed — someone explicitly spoke TO the agent
@@ -7149,7 +7190,7 @@ export class AgentFramework {
     // Add messages
     if (response.addMessages) {
       for (const msg of response.addMessages) {
-        const id = this.addMessage(msg.participant, msg.content, msg.metadata);
+        const id = this.addMessage(msg.participant, msg.content, this.stampStrictPlace(event, response, msg.metadata));
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
     }
@@ -8465,6 +8506,7 @@ export class AgentFramework {
   }
 
   private async processInferenceRequests(): Promise<void> {
+    this.releaseStrictOrphans();
     if (this.pendingRequests.length === 0) {
       return;
     }
@@ -8563,7 +8605,10 @@ export class AgentFramework {
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2); it
           // must not absorb an unrelated wake that would vanish with it.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
+          // ROUTING_STRICT: wakes of different places never absorb each
+          // other — each place keeps its own turn after resume.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`
+            + (routingStrict() ? `|${request.channelId ?? ''}` : '');
           const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
             newestByKey.set(key, request);
@@ -8628,6 +8673,35 @@ export class AgentFramework {
         }
         this.pendingRequests.push(...requests);
         continue;
+      }
+
+      // ROUTING_STRICT: one place per turn. A batch whose wakes span several
+      // places starts the turn for the place of the EARLIEST-arrived wake
+      // only; the other places' wakes go back to the queue (their messages
+      // stay held — strictHoldOnArrival / strictReleasable) and start their
+      // own turns afterwards, in arrival order. A continuation of the current
+      // turn (budget restart etc.) keeps the turn's place and never consumes
+      // another place's wake.
+      if (routingStrict()) {
+        const placeOf = (r: InferenceRequest): string => this.strictWakePlace(agentName, r.channelId);
+        let keepPlace: string;
+        if (requests.some((r) => isTurnContinuation(r.reason))) {
+          keepPlace = this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE;
+        } else {
+          const arrivedAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
+          let earliest = requests[0]!;
+          for (const r of requests) if (arrivedAt(r) < arrivedAt(earliest)) earliest = r;
+          keepPlace = placeOf(earliest);
+        }
+        const elsewhere = requests.filter((r) => !isTurnContinuation(r.reason) && placeOf(r) !== keepPlace);
+        if (elsewhere.length > 0) {
+          this.pendingRequests.push(...elsewhere);
+          requests = requests.filter((r) => !elsewhere.includes(r));
+          console.error(
+            `[strict-routing] ${agentName}: turn for ${keepPlace === STRICT_NOWHERE ? '(nowhere)' : keepPlace}; ` +
+            `${elsewhere.length} wake(s) for other place(s) wait for their own turns`,
+          );
+        }
       }
 
       // Check policy
@@ -9304,6 +9378,13 @@ export class AgentFramework {
     const continuingTurn = trigger?.reason === 'context_budget_restart'
       || trigger?.reason === 'tool_result_guard_retry';
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
+    // ROUTING_STRICT: this logical turn's place, fixed before the turn-start
+    // drain below and never moved (a continuation keeps its predecessor's).
+    // It is the turn's locus and its hold boundary. Recorded unconditionally
+    // (it is only read under the flag).
+    if (!continuingTurn) {
+      this.strictTurnPlaces.set(agent.name, this.strictWakePlace(agent.name, trigger?.channelId));
+    }
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -9324,7 +9405,13 @@ export class AgentFramework {
       this.deferredMessages.length > 0
     ) {
       {
-        const deferred = this.drainDeferredFor(agent.name);
+        // ROUTING_STRICT: this turn's own place and every ambient place are
+        // stored now (they are this turn's input / context); places that
+        // have their own pending wake stay held for the turn it starts.
+        const deferred = this.drainDeferredFor(
+          agent.name,
+          this.strictReleasable(agent.name, 'turn-start', this.strictTurnPlaces.get(agent.name)),
+        );
         for (const msg of deferred) {
           // Per-message try/catch (mirrors announceLocusIfChanged): one
           // poison message — or a transient store-write failure — must not
@@ -9381,7 +9468,7 @@ export class AgentFramework {
       }
       if (!this.activeTurnTokens.has(agent.name)
         && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        for (const msg of this.drainDeferredFor(agent.name)) {
+        for (const msg of this.drainDeferredFor(agent.name, this.strictReleasable(agent.name, 'idle'))) {
           this.addMessage(msg.participant, msg.content, msg.metadata, {
             deferredWriteId: msg.id,
             ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
@@ -9463,7 +9550,13 @@ export class AgentFramework {
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
       } else {
-        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        // ROUTING_STRICT: the locus IS the turn's place (trigger channel,
+        // else home, else nowhere) — the same value the holds use, and
+        // never the registry's "most recent inbound" default.
+        const strictPlace = this.strictTurnPlaces.get(agent.name);
+        const locus = routingStrict() && this.channelRegistry
+          ? strictPlace && strictPlace !== STRICT_NOWHERE ? strictPlace : null
+          : this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) this.turnLocusPins.set(agent.name, locus);
         else this.turnLocusPins.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
@@ -11174,8 +11267,11 @@ export class AgentFramework {
       // pending). Only THIS agent's messages: other targets' entries wait
       // for their own boundaries (re-adding via addMessage re-defers if the
       // target has meanwhile started a turn).
+      // ROUTING_STRICT: a place whose wake is still pending stays held — its
+      // own turn's start stores it; everything else lands now, as if it had
+      // arrived while the agent was idle.
       if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        const deferred = this.drainDeferredFor(agent.name);
+        const deferred = this.drainDeferredFor(agent.name, this.strictReleasable(agent.name, 'idle'));
         for (const msg of deferred) {
           this.addMessage(msg.participant, msg.content, msg.metadata, {
             deferredWriteId: msg.id,
@@ -11363,7 +11459,7 @@ export class AgentFramework {
       // nobody else will flush it, so we do.
       if (!this.activeTurnTokens.has(agentName)
         && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        for (const msg of this.drainDeferredFor(agentName)) {
+        for (const msg of this.drainDeferredFor(agentName, this.strictReleasable(agentName, 'idle'))) {
           this.addMessage(msg.participant, msg.content, msg.metadata, {
             deferredWriteId: msg.id,
             ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
@@ -12795,13 +12891,19 @@ export class AgentFramework {
     const midToolCycle = opts?.forAgent
       ? this.pendingAssistantBlocks.has(agent.name)
       : this.pendingAssistantBlocks.size > 0;
+    // ROUTING_STRICT: a fresh message from a place other than the one whose
+    // turn is running — or about to run — is held (see strictHoldOnArrival).
+    // Flushes of already-queued entries (deferredWriteId) are never re-held.
+    const strictHold = !hasToolResult && !opts?.deferredWriteId && routingStrict()
+      && this.strictHoldOnArrival(agent.name, metadata);
     if (
       !hasToolResult &&
-      opts?.bypassDeferralFor !== agent.name &&
+      (opts?.bypassDeferralFor !== agent.name || strictHold) &&
       (this.quiesced ||
         midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
-        this.activeStreams.has(agent.name))
+        this.activeStreams.has(agent.name) ||
+        strictHold)
     ) {
       // A re-deferral of a drained entry keeps its id and leaves the un-acked
       // set: one logical message, one durable identity — never two entries.
@@ -12813,7 +12915,8 @@ export class AgentFramework {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
       this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      if (strictHold) this.makeHeldWritesDurable();
+      else if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
@@ -12832,7 +12935,14 @@ export class AgentFramework {
    * via forAgent, or implicitly when it is the primary), leaving other
    * targets' messages queued for their own boundaries.
    */
-  private drainDeferredFor(agentName: string): Array<{
+  private drainDeferredFor(
+    agentName: string,
+    /** ROUTING_STRICT hold boundary (see strictReleasable): entries it rejects
+     *  stay queued — same id, same seq, same durable record — and are made
+     *  durable even outside a quiesce window. Absent = drain everything for
+     *  the agent (upstream behavior). */
+    release?: (msg: DeferredWrite) => boolean,
+  ): Array<{
     /** Durable identity — every write of this entry must carry it
      *  (`withDeferredWriteId` / `opts.deferredWriteId`). */
     id: string;
@@ -12844,9 +12954,17 @@ export class AgentFramework {
     if (this.deferredMessages.length === 0) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
+    let held = 0;
     for (const msg of this.deferredMessages) {
       const target = msg.forAgent ?? this.primaryAgentName;
-      (target === agentName ? mine : rest).push(msg);
+      if (target !== agentName) {
+        rest.push(msg);
+      } else if (release && !release(msg)) {
+        rest.push(msg);
+        held++;
+      } else {
+        mine.push(msg);
+      }
     }
     this.deferredMessages = rest;
     mine.sort(bySeq);
@@ -12855,7 +12973,220 @@ export class AgentFramework {
     // ackDeferredWrites() has synced the chronicle. Removing them here would
     // acknowledge before the write is durable.
     this.handOffDeferredWrites(mine);
+    if (held > 0) this.makeHeldWritesDurable();
     return mine;
+  }
+
+  /**
+   * ROUTING_STRICT arrival check for a fresh message bound for `agentName`:
+   * hold it when it belongs to a place (strictMessagePlace) and
+   *  - that agent's turn is alive for a DIFFERENT place, or
+   *  - no turn is alive but a wake for a different place is pending (that
+   *    turn starts next and must not see this place's messages), or
+   *  - this place already has held messages (arrival order within a place
+   *    is preserved: a later message never lands before an earlier one).
+   */
+  private strictHoldOnArrival(agentName: string, metadata: MessageMetadata | undefined): boolean {
+    const place = this.strictMessagePlace(metadata);
+    if (place === null) return false;
+    if (this.activeTurnTokens.has(agentName) || this.activeStreams.has(agentName)) {
+      return place !== (this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE);
+    }
+    for (const msg of this.deferredMessages) {
+      if ((msg.forAgent ?? this.primaryAgentName) === agentName && this.strictMessagePlace(msg.metadata) === place) {
+        return true;
+      }
+    }
+    for (const wakePlace of this.strictPendingWakePlaces(agentName)) {
+      if (wakePlace !== place) return true;
+    }
+    return false;
+  }
+
+  /** ROUTING_STRICT boot recovery: queue a wake per (agent, place) for every
+   *  restored deferred write from a place that woke the agent
+   *  (`metadata.triggered`). The in-memory wakes died with the process; the
+   *  messages did not. No-op when the flag is off. */
+  private rearmStrictHeldWakes(): void {
+    if (!routingStrict()) return;
+    const armed = new Set<string>();
+    for (const msg of this.deferredMessages) {
+      const place = this.strictMessagePlace(msg.metadata);
+      const meta = msg.metadata as Record<string, unknown> | undefined;
+      // A channel message that woke the agent, or stamped operator input
+      // (stamped only when it requested a wake).
+      const channelWake = meta?.triggered === true && typeof meta.channelId === 'string';
+      const stampedWake = typeof meta?.strictPlace === 'string';
+      if (place === null || !meta || (!channelWake && !stampedWake)) continue;
+      const agentName = msg.forAgent ?? this.primaryAgentName;
+      if (!agentName || !this.agents.has(agentName)) continue;
+      const key = `${agentName}\u0000${place}`;
+      if (armed.has(key)) continue;
+      armed.add(key);
+      this.pendingRequests.push({
+        agentName,
+        reason: 'strict-hold:recovered',
+        source: 'framework',
+        timestamp: Date.now(),
+        ...(channelWake ? { channelId: place } : {}),
+        addressed: isAddressedMessage(meta.tags as string[] | undefined, meta),
+      });
+    }
+    if (armed.size > 0) {
+      console.error(`[strict-routing] re-armed ${armed.size} wake(s) for held message(s) restored at boot`);
+    }
+  }
+
+  // ---- ROUTING_STRICT place holds -----------------------------------------
+  //
+  // Held messages are ordinary deferred writes that a drain declined to
+  // release: they stay in `deferredMessages` with their original id and seq
+  // (so arrival order within a place is preserved and nothing is written
+  // twice), and the durable recovery queue mirrors them for as long as any
+  // remain. Release points:
+  //   - a round boundary releases only the turn's own place (+ non-channel
+  //     framework messages) for hear-while-acting injection;
+  //   - a turn start releases its own place and every place with no pending
+  //     wake (ambient), keeping other WAKING places for their own turns;
+  //   - a turn end / idle point releases every place with no pending wake;
+  //     a waking place's messages wait for the turn its wake starts, whose
+  //     turn-start drain stores them as that turn's new input.
+
+  /** The place a queued message belongs to — its channel, or the stamped
+   *  place of channel-less operator input (stampStrictPlace) — or null for a
+   *  non-channel framework message (module notes, subagent returns,
+   *  channel-less push events, the framework's own system markers), which a
+   *  hold never applies to. MCPL deliveries always carry their serverId, so
+   *  a server cannot pass its traffic off as a framework marker. */
+  private strictMessagePlace(metadata: MessageMetadata | undefined): string | null {
+    const m = metadata as Record<string, unknown> | undefined;
+    const channelId = m?.channelId;
+    if (typeof channelId === 'string' && channelId !== '') {
+      if (m?.system === true && m.serverId === undefined) return null;
+      return channelId;
+    }
+    const stamped = m?.strictPlace;
+    return typeof stamped === 'string' && stamped !== '' ? stamped : null;
+  }
+
+  /** The place a turn woken by a request with `channelId` belongs to: fork
+   *  home, else the trigger channel, else the configured home channel, else
+   *  STRICT_NOWHERE (prose is kept private). Also the strict turn locus. */
+  private strictWakePlace(agentName: string, channelId: string | undefined): string {
+    return this.conversationAgentHomes.get(agentName)
+      ?? this.conversationRouter?.channelForAgent(agentName)
+      ?? channelId
+      ?? this.mcplHomeChannel
+      ?? STRICT_NOWHERE;
+  }
+
+  /** Places with a wake still waiting to start a turn for `agentName`
+   *  (queued, or held by a provider cooldown). Continuations of the current
+   *  turn are not wakes of a place. */
+  private strictPendingWakePlaces(agentName: string): Set<string> {
+    const places = new Set<string>();
+    const consider = (r: InferenceRequest): void => {
+      if (r.agentName !== agentName || isTurnContinuation(r.reason)) return;
+      places.add(this.strictWakePlace(agentName, r.channelId));
+    };
+    for (const r of this.pendingRequests) consider(r);
+    for (const r of this.providerAccelerationCooldowns.get(agentName)?.heldRequests ?? []) consider(r);
+    return places;
+  }
+
+  /**
+   * ROUTING_STRICT: conversational operator input that carries no channel
+   * (CLI / IPC / API messages that wake the agent) belongs to the place a
+   * channel-less wake is answered in — the home channel, else nowhere — so it
+   * is held like any other place's message instead of being heard inside a
+   * turn running elsewhere. The place rides in metadata (`strictPlace`) so it
+   * survives deferral, persistence and boot recovery. No-op without the flag.
+   */
+  private stampStrictPlace(event: ProcessEvent, response: EventResponse, metadata: MessageMetadata | undefined): MessageMetadata | undefined {
+    if (!routingStrict() || !response.requestInference) return metadata;
+    if (event.type !== 'external-message' && event.type !== 'api:message') return metadata;
+    const channelId = (metadata as Record<string, unknown> | undefined)?.channelId;
+    if (typeof channelId === 'string' && channelId !== '') return metadata;
+    const target = this.primaryAgentName ?? this.agents.keys().next().value;
+    if (!target) return metadata;
+    return { ...(metadata ?? {}), strictPlace: this.strictWakePlace(target, undefined) } as MessageMetadata;
+  }
+
+  /**
+   * ROUTING_STRICT drain filter for `agentName`, or undefined when the flag
+   * is off (drain everything — upstream behavior).
+   *  - 'boundary': mid-turn — release only the turn's own place.
+   *  - 'turn-start' / 'idle': release every place except those with a
+   *    pending wake; 'turn-start' also releases the new turn's own place.
+   */
+  private strictReleasable(
+    agentName: string,
+    phase: 'boundary' | 'turn-start' | 'idle',
+    turnPlace?: string,
+  ): ((msg: DeferredWrite) => boolean) | undefined {
+    if (!routingStrict()) return undefined;
+    if (phase === 'boundary') {
+      const place = this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE;
+      return (msg) => {
+        const p = this.strictMessagePlace(msg.metadata);
+        return p === null || p === place;
+      };
+    }
+    const waking = this.strictPendingWakePlaces(agentName);
+    if (phase === 'turn-start') waking.delete(turnPlace ?? STRICT_NOWHERE);
+    return (msg) => {
+      const p = this.strictMessagePlace(msg.metadata);
+      return p === null || !waking.has(p);
+    };
+  }
+
+  /** Mirror the deferred-write queue durably now that it holds messages a
+   *  later turn depends on (the quiesce-only mirror would otherwise leave
+   *  them memory-only across turns). The mirror stays on until the queue
+   *  drains empty, exactly as after a quiesce. */
+  private makeHeldWritesDurable(): void {
+    if (this.quiesced || this.deferredWritesPersisted) {
+      this.persistDeferredWrites();
+      return;
+    }
+    this.persistDeferredWrites(true);
+  }
+
+  /**
+   * ROUTING_STRICT idle point: an agent with no turn alive and no pending
+   * wake left (its wakes were dropped by policy, withdrawn, or never came)
+   * gets its held messages stored now. While any wake is pending the next
+   * turn start releases what is no longer held, so this never races it.
+   * Cheap no-op otherwise; called from the scheduler loop, so a hold can
+   * never outlive its reason.
+   */
+  private releaseStrictOrphans(): void {
+    if (!routingStrict() || !this.deferredMessages?.length) return;
+    if (this.quiesced || this.surgeryHold || this.pendingAssistantBlocks.size > 0) return;
+    // A stopped framework stores nothing more: what is still held stays in
+    // the durable queue for the next boot (rearmStrictHeldWakes).
+    if (this.providerAdmissionClosed) return;
+    const targets = new Set<string>();
+    for (const msg of this.deferredMessages) {
+      const target = msg.forAgent ?? this.primaryAgentName;
+      if (target && !this.activeTurnTokens.has(target) && !this.activeStreams.has(target)) targets.add(target);
+    }
+    for (const target of targets) {
+      if (this.strictPendingWakePlaces(target).size > 0) continue;
+      const drained = this.drainDeferredFor(target);
+      for (const msg of drained) {
+        try {
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
+        } catch (err) {
+          console.error(`[strict-routing] failed to store a released message for ${target}:`, err);
+        }
+      }
+      this.ackDeferredWrites();
+      console.error(`[strict-routing] ${target}: stored ${drained.length} held message(s) whose place has no pending wake`);
+    }
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
@@ -15321,7 +15652,9 @@ export class AgentFramework {
         // distance zero, the safest role there is — instead of a separate
         // window notice. lastAnnouncedLocus tracks it so announce-on-change
         // stays coherent. Locus-mode agents only: explicit mode has no pin.
-        if (call.name === 'channel_open' && result?.success) {
+        // ROUTING_STRICT: opening a channel never moves the running turn's
+        // locus (the locus is fixed at turn start); it only opens.
+        if (call.name === 'channel_open' && result?.success && !routingStrict()) {
           const opened =
             (result.data as { channelId?: string } | undefined)?.channelId
             ?? (call.input as { channelId?: string } | undefined)?.channelId;

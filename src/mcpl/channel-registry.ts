@@ -38,7 +38,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
-import { channelOpenOnSend } from '../routing-flags.js';
+import { channelOpenOnSend, routingStrict } from '../routing-flags.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 
@@ -1381,7 +1381,8 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.homeChannel ?? this.defaultPublishChannel;
+    const outgoing = home ?? active ?? this.homeChannel
+      ?? (routingStrict() ? null : this.defaultPublishChannel);
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1392,7 +1393,12 @@ export class ChannelRegistry {
     // Incoming: the most-recent inbound message (what the agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
-    if (this.defaultPublishChannel && this.defaultPublishMessageId) {
+    // ROUTING_STRICT: every server receives this context, so name another
+    // place's latest message only when it IS this turn's outgoing place.
+    if (
+      this.defaultPublishChannel && this.defaultPublishMessageId
+      && (!routingStrict() || this.defaultPublishChannel === outgoing)
+    ) {
       context.incoming = {
         channelId: this.defaultPublishChannel,
         messageId: this.defaultPublishMessageId,
@@ -2978,7 +2984,9 @@ export class ChannelRegistry {
     return home
       ?? this.activeChannelResolver?.(conversationId)
       ?? this.homeChannel
-      ?? this.defaultPublishChannel
+      // ROUTING_STRICT: no "most recent inbound" guess — a turn with no
+      // trigger channel and no configured home publishes nowhere.
+      ?? (routingStrict() ? null : this.defaultPublishChannel)
       ?? null;
   }
 
@@ -3018,6 +3026,16 @@ export class ChannelRegistry {
     }
     const channelId = locusChannelId;
     if (!channelId) {
+      // ROUTING_STRICT: a locus-less turn is the designed outcome (no trigger
+      // channel, no configured home), not a delivery failure — the prose
+      // stays private in the archive with a log line, and no failure marker
+      // is written into the window.
+      if (routingStrict()) {
+        console.error(
+          `[routeSpeech] ${conversationId}: turn has no locus — ${text.length} chars kept private, not published (strict routing)`,
+        );
+        return null;
+      }
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
@@ -3125,6 +3143,15 @@ export class ChannelRegistry {
       };
     }
 
+    // ROUTING_STRICT: an explicit send names its destination — never the
+    // "most recent inbound" default.
+    if (!input.channelId && routingStrict()) {
+      return {
+        success: false,
+        error: 'channelId is required (strict routing: there is no default channel)',
+        isError: true,
+      };
+    }
     // Resolve channelId: default to most recent incoming channel
     const channelId = input.channelId ?? this.defaultPublishChannel;
     if (!channelId) {
