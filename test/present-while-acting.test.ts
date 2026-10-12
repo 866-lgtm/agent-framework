@@ -673,6 +673,75 @@ describe('present while acting', () => {
     });
   }
 
+  for (const verb of ['say', 'whisper'] as const) {
+    it(`ROUTING_NO_SILENCE_ON_SEND=true: world \`${verb}\` does NOT silence adjacent prose (fork opt-out parity)`, async () => {
+      // The fork opt-out (only skip_reply silences; duplicates are preferred
+      // over dropped replies) predates the world-verb set. Without gating it
+      // too, an Eidoverse `say` beside a Discord reply would silently eat the
+      // reply under the flag — exactly what the opt-out exists to prevent.
+      const prev = process.env.ROUTING_NO_SILENCE_ON_SEND;
+      process.env.ROUTING_NO_SILENCE_ON_SEND = 'true';
+      try {
+        const input = verb === 'say'
+          ? { text: 'the intended utterance' }
+          : { to: 'sill', text: 'the intended utterance' };
+        membrane.pushResponse(createMockResponse([
+          { type: 'text', text: 'the Discord reply beside the world utterance' },
+          { type: 'tool_use', id: 'c1', name: `robot--${verb}`, input },
+        ] as ContentBlock[], 'tool_use'));
+        membrane.pushResponse(createMockResponse([
+          { type: 'text', text: 'trailing prose' },
+        ] as ContentBlock[]));
+
+        const framework = await createFramework();
+        const routed = stubChannelRegistry(framework);
+
+        trigger(framework);
+        await framework.runUntilIdle();
+
+        assert.deepEqual(
+          routed.map((r) => r.text),
+          ['the Discord reply beside the world utterance', 'trailing prose'],
+          `${verb}: under the opt-out, prose beside a world utterance still routes`,
+        );
+
+        await framework.stop();
+      } finally {
+        if (prev === undefined) delete process.env.ROUTING_NO_SILENCE_ON_SEND;
+        else process.env.ROUTING_NO_SILENCE_ON_SEND = prev;
+      }
+    });
+  }
+
+  it('ROUTING_NO_SILENCE_ON_SEND=true: an explicit send does not silence adjacent prose either', async () => {
+    // The original opt-out (fork 453cf8b), now asserted: with the flag only
+    // skip_reply silences, so a send_message round's prose still routes.
+    const prev = process.env.ROUTING_NO_SILENCE_ON_SEND;
+    process.env.ROUTING_NO_SILENCE_ON_SEND = 'true';
+    try {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'prose beside the send' },
+        { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'hi' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'trailing prose' },
+      ] as ContentBlock[]));
+
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed.map((r) => r.text), ['prose beside the send', 'trailing prose']);
+
+      await framework.stop();
+    } finally {
+      if (prev === undefined) delete process.env.ROUTING_NO_SILENCE_ON_SEND;
+      else process.env.ROUTING_NO_SILENCE_ON_SEND = prev;
+    }
+  });
+
   it('a non-publishing world tool (move) does not silence — speak-while-acting unchanged', async () => {
     // Negative control for the world-verb silencing: only publication verbs
     // silence. Ordinary acting tools still narrate live to the locus.

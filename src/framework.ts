@@ -154,16 +154,14 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * starts a new conversational round and must be answerable with plain prose.
  * `skip_reply` ends the turn at the tool-result boundary.
  *
- * ROUTING_NO_SILENCE_ON_SEND=true narrows the set to `skip_reply` only:
- * delivery tools no longer suppress prose routing, trading occasional
- * double-posts for never dropping a reply (e.g. when the explicit send
- * fails but still silences the turn).
+ * ROUTING_NO_SILENCE_ON_SEND=true (fork opt-out) narrows silencing to
+ * `skip_reply` only: delivery tools — AND the world publication verbs in
+ * WORLD_PUBLICATION_TOOLS — no longer suppress prose routing, trading
+ * occasional double-posts for never dropping a reply (e.g. when the explicit
+ * send fails but still silences the turn). Applied in isSilencingTool, which
+ * reads the flag per call.
  */
-const SILENCING_TOOLS = new Set(
-  process.env.ROUTING_NO_SILENCE_ON_SEND === 'true'
-    ? ['skip_reply']
-    : ['skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm'],
-);
+const SILENCING_TOOLS = new Set(['skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm']);
 
 /**
  * Think loop guard. think() carries no endTurn, so a model can in principle
@@ -187,13 +185,26 @@ const THINK_HARD_CAP = Number(process.env.THINK_HARD_CAP ?? 8);
  * (Cairn world seq 15146 = the say text, 15147 = the adjacent prose,
  * byte-for-byte). Hybrid additionally lets these outrank a same-round
  * `>>>destination` envelope.
+ *
+ * Gated by the same ROUTING_NO_SILENCE_ON_SEND opt-out as the delivery tools:
+ * with the flag set, a world `say`/`whisper` does NOT silence the round's
+ * prose (a Discord reply written beside an Eidoverse utterance still lands),
+ * accepting that a locus pinned to the world surface may double-publish
+ * there. Without the flag this is upstream's behavior, unchanged.
  */
 const WORLD_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
 
+/** ROUTING_NO_SILENCE_ON_SEND opt-out. Read per call rather than captured at
+ *  import so it can be exercised in-process (tests toggle process.env). */
+const noSilenceOnSend = (): boolean => process.env.ROUTING_NO_SILENCE_ON_SEND === 'true';
+
 /** True when a tool call (possibly MCPL-prefixed) is an explicit delivery
- *  that silences the round's auto-routed prose, regardless of mode. */
+ *  that silences the round's auto-routed prose, regardless of mode. Under
+ *  ROUTING_NO_SILENCE_ON_SEND=true only `skip_reply` (the deliberate
+ *  stay-silent signal) silences. */
 const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
+  if (noSilenceOnSend()) return bare === 'skip_reply';
   return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
 };
 
