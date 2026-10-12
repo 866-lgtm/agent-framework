@@ -191,4 +191,94 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     connection.ready();
     assert.deepStrictEqual(controlEvents, ['tools-list-changed', 'tools-list-changed'], 'and released when the planes open');
   });
+
+  it('holds a reconnected transport\'s data traffic until the host has its grant and opens the planes', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    const pushes: unknown[] = [];
+    connection.on('push-event', (params: unknown) => pushes.push(params));
+    let reconnected = false;
+    connection.on('reconnect', () => { reconnected = true; });
+    connection.ready();
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected, 5000, 'reconnect after crash');
+    // Admitted now, it would meet the empty grant and be refused; held, it
+    // meets the grant the host establishes.
+    connection.emit('push-event', { n: 1 });
+    assert.deepStrictEqual(pushes, [], 'data traffic is held after the boundary');
+    connection.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
+    connection.ready();
+    assert.deepStrictEqual(pushes, [{ n: 1 }], 'and delivered against the new grant');
+  });
+
+  it('drops a server request held across a transport boundary, and never answers one on the next transport', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.establishGrant(new CapabilityGrant(new Set(['inferenceRequest']), []));
+    const requests: Array<{ id: unknown; respond: (result: unknown) => void }> = [];
+    connection.on('inference-request', (_params: unknown, responder: { id: unknown; respond: (result: unknown) => void }) => {
+      requests.push(responder);
+    });
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    connection.ready();
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    // One request is admitted and its handler still holds the responder; a
+    // second is held while the data plane is paused (a quiesce).
+    serverSends({ id: 5, method: 'inference/request', params: { n: 5 } });
+    assert.equal(requests.length, 1);
+    connection.pauseDataPlane();
+    serverSends({ id: 7, method: 'inference/request', params: { n: 7 } });
+    assert.equal(requests.length, 1, 'held while paused');
+
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    const written: string[] = [];
+    const transport = (connection as unknown as { transport: { writeLine(line: string): void } }).transport;
+    const writeLine = transport.writeLine.bind(transport);
+    transport.writeLine = (line: string) => { written.push(line); writeLine(line); };
+
+    // The handler answers its request after the reconnect: not written.
+    requests[0]!.respond({ ok: true });
+    connection.establishGrant(new CapabilityGrant(new Set(['inferenceRequest']), []));
+    connection.ready();
+    assert.equal(requests.length, 1, 'the held request from the closed transport is not admitted on the new one');
+    assert.deepStrictEqual(written.filter((line) => /"id":(5|7)\b/.test(line)), [], 'nothing answers the closed transport\'s requests');
+  });
+
+  it('a close during a reconnect\'s handshake closes the new transport instead of adopting it', async () => {
+    // Flag file absent: the initial connect fails and we get a stub that
+    // reconnects in the background.
+    connection = await McplServerConnection.connectWithReconnect(makeConfig({ reconnectIntervalMs: 20 }), HOST_CAPS);
+    const statics = McplServerConnection as unknown as { handshake: (...args: unknown[]) => Promise<unknown> };
+    const handshake = statics.handshake;
+    let release!: (value: unknown) => void;
+    let started = false;
+    let closedNew = false;
+    statics.handshake = () => {
+      started = true;
+      return new Promise((resolve) => { release = resolve; });
+    };
+    try {
+      await waitFor(() => started, 5000, 'a reconnect handshake in flight');
+      const reconnected: unknown[] = [];
+      connection.on('reconnect', (p: unknown) => reconnected.push(p));
+      await connection.close();
+      release({
+        transport: { close: async () => { closedNew = true; }, on: () => {}, writeLine: () => {} },
+        capabilities: { version: '0.5' },
+        droppedCapabilities: [],
+        mcpToolsAdvertised: false,
+      });
+      await waitFor(() => closedNew, 2000, 'the new transport closed');
+      assert.deepStrictEqual(reconnected, [], 'nothing is emitted for it');
+      assert.strictEqual(connection.isConnected, false);
+      assert.strictEqual(connection.willReconnect, false);
+    } finally {
+      statics.handshake = handshake;
+      connection = null;
+    }
+  });
 });

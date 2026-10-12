@@ -114,21 +114,36 @@ describe('MCPL reconnect and channel registration', () => {
       enabledFeatureSets: ['chat'],
       ...(id === 'retry' ? { reconnect: true, reconnectIntervalMs: 20 } : {}),
     });
-    framework = await AgentFramework.create({
-      storePath: join(dir, 'store'),
-      membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
-      modules: [],
-      maintenanceIntervalMs: 0,
-      mcplServers: [
-        server('retry', { FAIL_FIRST_PATH: join(dir, 'failed-once'), POLICY_PENDING_PATH: pending, POLICY_RELEASE_PATH: release }),
-        server('stager', { INITIALIZE_AFTER_PATH: pending }),
-      ],
-    });
+    // Record each open of every connection's planes (startup's staged open,
+    // or a resume), and whether the retry's exchange was in flight then.
+    const opensOfEvery: boolean[] = [];
+    const proto = AgentFramework.prototype as unknown as { readyMcplPlanes: (connections?: unknown[]) => void };
+    const readyMcplPlanes = proto.readyMcplPlanes;
+    proto.readyMcplPlanes = function (this: any, connections?: unknown[]) {
+      if (!connections) {
+        const retryConnection = this.mcplServerRegistry?.getServer('retry');
+        opensOfEvery.push(!!retryConnection && this.mcplPolicyExchanges.get(retryConnection) === retryConnection.transportEpoch);
+      }
+      return readyMcplPlanes.call(this, connections);
+    };
+    try {
+      framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
+        modules: [],
+        maintenanceIntervalMs: 0,
+        mcplServers: [
+          server('retry', { FAIL_FIRST_PATH: join(dir, 'failed-once'), POLICY_PENDING_PATH: pending, POLICY_RELEASE_PATH: release }),
+          server('stager', { INITIALIZE_AFTER_PATH: pending }),
+        ],
+      });
+    } finally {
+      proto.readyMcplPlanes = readyMcplPlanes;
+    }
     const retry = () => serverEvents(eventsPath).filter((e) => e.role === 'retry');
-    // Startup has opened every plane it may; the retry's policy is still held.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.ok(retry().some((e) => e.event === 'policy-held'), `events: ${JSON.stringify(retry())}`);
+    await waitFor('the retry\'s policy answer held', () => retry().some((e) => e.event === 'policy-held'));
+    assert.ok(opensOfEvery.includes(true), `startup opened every connection's planes while the retry's exchange was in flight: ${JSON.stringify(opensOfEvery)}`);
     assert.equal(
       retry().find((e) => e.event === 'register-answered'),
       undefined,
@@ -149,15 +164,18 @@ describe('MCPL reconnect: a pending policy exchange holds its planes', () => {
   function harness() {
     const answers: Array<(receipt: { accepted: true }) => void> = [];
     let opened = 0;
+    let controlOnly = 0;
+    let granted = 0;
     const connection = Object.assign(new EventEmitter(), {
       id: 'srv',
       transportEpoch: 0,
+      isConnected: true,
       capabilities: { version: '0.5', pushEvents: true, featureSets: { chat: { description: 'chat', uses: ['pushEvents'] } } },
       mcpToolsAdvertised: false,
-      establishGrant: () => {},
+      establishGrant: () => { granted++; },
       sendFeatureSetsUpdateRequest: () => new Promise<{ accepted: true }>((resolve) => { answers.push(resolve); }),
       ready: () => { opened++; },
-      readyControlPlane: () => { opened++; },
+      readyControlPlane: () => { controlOnly++; },
     });
     const fw = Object.create(AgentFramework.prototype) as any;
     fw.traceListeners = [];
@@ -173,7 +191,11 @@ describe('MCPL reconnect: a pending policy exchange holds its planes', () => {
       connection,
       answers,
       opened: () => opened,
-      reconnect: () => { connection.transportEpoch++; connection.emit('reconnect', { attempts: 1 }); },
+      controlOnly: () => controlOnly,
+      granted: () => granted,
+      reconnect: () => { connection.transportEpoch++; connection.isConnected = true; connection.emit('reconnect', { attempts: 1 }); },
+      /** The transport closes, as its close handler leaves the connection. */
+      drop: () => { connection.transportEpoch++; connection.isConnected = false; },
     };
   }
 
@@ -200,5 +222,86 @@ describe('MCPL reconnect: a pending policy exchange holds its planes', () => {
     h.answers[1]({ accepted: true });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(h.opened(), 1);
+  });
+});
+
+describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runtime connect', () => {
+  function harness() {
+    const answers: Array<(receipt: { accepted: true }) => void> = [];
+    const counts = { opened: 0, controlOnly: 0, granted: 0 };
+    const connection = Object.assign(new EventEmitter(), {
+      id: 'srv',
+      transportEpoch: 0,
+      isConnected: true,
+      capabilities: { version: '0.5', pushEvents: true, featureSets: { chat: { description: 'chat', uses: ['pushEvents'] } } },
+      mcpToolsAdvertised: false,
+      establishGrant: () => { counts.granted++; },
+      sendFeatureSetsUpdateRequest: () => new Promise<{ accepted: true }>((resolve) => { answers.push(resolve); }),
+      ready: () => { counts.opened++; },
+      readyControlPlane: () => { counts.controlOnly++; },
+    });
+    const fw = Object.create(AgentFramework.prototype) as any;
+    fw.traceListeners = [];
+    fw.mcplPolicyExchanges = new WeakMap();
+    fw.mcplServerConfigs = new Map([['srv', { id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] }]]);
+    fw.mcplPrefixMap = new Map();
+    fw.featureSetManager = new FeatureSetManager();
+    fw.checkpointManager = null;
+    fw.mcplHostCapabilities = { version: '0.5' };
+    fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: () => connection, addServer: async () => connection };
+    fw.handleToolsListChanged = () => {};
+    fw.deliverDiscordAwarenessInBackground = () => {};
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    return {
+      fw,
+      connection,
+      answers,
+      counts,
+      settle,
+      reconnect: () => { connection.transportEpoch++; connection.isConnected = true; connection.emit('reconnect', { attempts: 1 }); },
+      drop: () => { connection.transportEpoch++; connection.isConnected = false; },
+    };
+  }
+
+  it('a transport that drops during its exchange leaves the planes closed, and its late answer grants nothing', async () => {
+    const h = harness();
+    h.fw.wireMcplEvents(h.connection);
+    h.reconnect();
+    h.drop();
+    h.fw.readyMcplPlanes(); // a resume while the connection is down
+    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'a closed connection is not opened');
+    h.answers[0]({ accepted: true }); // answered just as the transport went
+    await h.settle();
+    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'the dead transport\'s exchange opens and grants nothing');
+    // The next transport's exchange grants and opens.
+    h.reconnect();
+    h.answers[1]({ accepted: true });
+    await h.settle();
+    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 });
+  });
+
+  it('a reconnect on a quiesced host opens only the control plane; resume opens the data plane', async () => {
+    const h = harness();
+    h.fw.wireMcplEvents(h.connection);
+    h.fw.quiesced = true;
+    h.reconnect();
+    h.answers[0]({ accepted: true });
+    await h.settle();
+    assert.deepEqual(h.counts, { opened: 0, controlOnly: 1, granted: 1 }, 'data stays held for the maintenance window');
+    h.fw.quiesced = false;
+    h.fw.readyMcplPlanes(); // resume()
+    assert.equal(h.counts.opened, 1);
+  });
+
+  it('a runtime connect\'s exchange holds its planes against a resume until it settles', async () => {
+    const h = harness();
+    const connecting = h.fw.connectMcplServerInternal({ id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] });
+    await h.settle();
+    assert.equal(h.answers.length, 1, 'its policy Request is in flight');
+    h.fw.readyMcplPlanes(); // a resume during the connect
+    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'held while the exchange is in flight');
+    h.answers[0]({ accepted: true });
+    await connecting;
+    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 }, 'opened by the connect once the grant exists');
   });
 });

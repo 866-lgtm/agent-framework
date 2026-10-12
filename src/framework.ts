@@ -13980,29 +13980,57 @@ export class AgentFramework {
   }
 
   /**
-   * Per connection, the transport epoch whose §5.3 policy exchange a
-   * reconnect has in flight. Until it settles, that transport's traffic must
-   * wait for its grant, so its planes stay closed whoever else opens planes
-   * meanwhile (startup's staged open, resume()); the reconnect opens them.
+   * Per connection, the transport epoch whose §5.3 policy exchange is in
+   * flight (a connect's or a reconnect's). Until it settles, that transport's
+   * traffic must wait for its grant, so its planes stay closed whoever else
+   * opens planes meanwhile (startup's staged open, resume()); the exchange's
+   * own caller opens them (settlePolicyExchange).
    */
   private readonly mcplPolicyExchanges = new WeakMap<McplServerConnection, number>();
 
   /**
-   * Open MCPL connections' planes (every connection when none is given),
-   * except a connection whose reconnect's policy exchange is still in flight
-   * (see mcplPolicyExchanges). A quiesced host (issue #122) opens only
-   * control planes, so data planes stay held for the whole maintenance
-   * window; resume() calls this again once the flag is cleared. Control
-   * planes always come up, since host/command (and with it resume) rides the
-   * control plane.
+   * Open MCPL connections' planes (every connection when none is given). A
+   * connection that isn't connected is left as it is: its buffered traffic
+   * belongs to a transport that is gone, and the next transport's exchange
+   * opens it. So is one whose policy exchange is in flight on its current
+   * transport (see mcplPolicyExchanges): both its planes stay held. A
+   * quiesced host (issue #122) opens only control planes, so data planes
+   * stay held for the whole maintenance window; resume() calls this again
+   * once the flag is cleared. Otherwise a control plane comes up even while
+   * quiesced, since host/command (and with it resume) rides it.
    */
   private readyMcplPlanes(connections?: McplServerConnection[]): void {
     for (const connection of connections ?? this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (!connection.isConnected) continue;
       const exchange = this.mcplPolicyExchanges.get(connection);
       if (exchange !== undefined && exchange === connection.transportEpoch) continue;
       if (this.quiesced) connection.readyControlPlane();
       else connection.ready();
     }
+  }
+
+  /**
+   * Run a connection's §5.3 policy exchange with its planes held: it is
+   * marked in flight for the transport it runs on, so no other opener
+   * releases that transport's traffic before its grant exists. Returns
+   * whether the caller may open the planes: the exchange settled (answered or
+   * not) on the transport that is still the connection's, and it is
+   * connected. A transport that dropped meanwhile is left closed; the next
+   * one's exchange opens the planes.
+   */
+  private async settlePolicyExchange(
+    config: import('./mcpl/types.js').McplServerConfig,
+    connection: McplServerConnection,
+  ): Promise<boolean> {
+    const epoch = connection.transportEpoch;
+    this.mcplPolicyExchanges.set(connection, epoch);
+    try {
+      await this.registerMcplServerFeatures(config, connection);
+    } finally {
+      // A newer transport's exchange may have taken the marker over.
+      if (this.mcplPolicyExchanges.get(connection) === epoch) this.mcplPolicyExchanges.delete(connection);
+    }
+    return connection.transportEpoch === epoch && connection.isConnected;
   }
 
   /**
@@ -14042,13 +14070,14 @@ export class AgentFramework {
     // §5.3 initial policy handshake with both planes still closed (PR #79
     // review blocker 3: an early control flush released channels-register/
     // changed before any grant existed). The grant is established (or
-    // knowingly left empty) before ANY buffered traffic flows.
-    await this.registerMcplServerFeatures(config, connection);
+    // knowingly left empty) before ANY buffered traffic flows, whoever else
+    // opens planes meanwhile (a resume during a runtime connect).
+    const current = await this.settlePolicyExchange(config, connection);
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
     // Staged startup opens every connection together (initializeMcpl).
     if (staged) return;
 
-    this.readyMcplPlanes([connection]);
+    if (current) this.readyMcplPlanes([connection]);
     // A connection can make queued awareness work deliverable; it never
     // waits on it.
     this.deliverDiscordAwarenessInBackground('connect', 'host');
@@ -14255,6 +14284,8 @@ export class AgentFramework {
     connection: McplServerConnection,
   ): Promise<void> {
     if (!connection.capabilities) return;
+    // A grant belongs to the transport it was negotiated on.
+    const epoch = connection.transportEpoch;
 
     // §5.4: compute the effective grant from the (config-masked)
     // advertisement. Not yet active — expansion activates only after the
@@ -14284,6 +14315,12 @@ export class AgentFramework {
 
     try {
       const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+      if (connection.transportEpoch !== epoch) {
+        // The transport this exchange was for is gone: its answer grants
+        // nothing to the next one, which negotiates its own.
+        console.error(`[mcpl] ${config.id}: policy answer arrived after its transport closed; not applied`);
+        return;
+      }
       if (receipt && receipt.accepted === false) {
         const fallback = receipt.fallback ?? 'mcp-only';
         console.error(
@@ -14689,20 +14726,18 @@ export class AgentFramework {
     connection.on('reconnect', (info?: { attempts?: number }) => {
       // The connection closed both planes before wiring the fresh transport,
       // as at initial connect. Re-establish the grant first: the §5.3 policy
-      // Request (whose response is never buffered) must be answered before
-      // any plane opens, otherwise the first post-reconnect traffic, control
+      // Request (whose response is never buffered) must settle before any
+      // plane opens, otherwise the first post-reconnect traffic, control
       // included (the server's channels/register), lands while the grant is
       // still empty and is rejected fail-closed instead of delivered. The
-      // exchange is marked in flight for this transport, so no other opener
-      // (startup's staged open, resume) releases the traffic early.
+      // exchange is marked in flight for this transport synchronously, here,
+      // so no other opener (startup's staged open, resume) releases the
+      // traffic early (settlePolicyExchange).
       const epoch = connection.transportEpoch;
-      this.mcplPolicyExchanges.set(connection, epoch);
       void (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
-          if (config) {
-            await this.registerMcplServerFeatures(config, connection);
-          }
+          if (config) await this.settlePolicyExchange(config, connection);
         } catch (error) {
           console.error(
             `MCPL server "${connection.id}" re-registration after reconnect failed:`,
@@ -14711,9 +14746,9 @@ export class AgentFramework {
         }
         // Settled, granted or not (an unanswered or refused policy leaves the
         // grant empty and the connection MCP-only, as at initial connect):
-        // open the planes, unless a newer transport's exchange has taken over.
-        if (this.mcplPolicyExchanges.get(connection) === epoch) {
-          this.mcplPolicyExchanges.delete(connection);
+        // open the planes if this transport is still the connection's. One
+        // that dropped meanwhile stays closed; the next reconnect opens it.
+        if (connection.transportEpoch === epoch && connection.isConnected) {
           this.readyMcplPlanes([connection]);
         }
         this.handleToolsListChanged(connection.id);

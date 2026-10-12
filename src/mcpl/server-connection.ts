@@ -211,6 +211,18 @@ export class McplServerConnection extends EventEmitter {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
+    // A server request held in the buffer came on the transport that is now
+    // gone: its sender can't be answered, and admitting it against the next
+    // transport's grant, or answering its id there, would act for a request
+    // the next server never made. Events without a responder stay, to be
+    // admitted against the next grant.
+    const held = this.bufferedEvents.length;
+    this.bufferedEvents = this.bufferedEvents.filter((item) => !McplServerConnection.hasResponder(item));
+    if (this.bufferedEvents.length < held) {
+      console.error(
+        `[mcpl] ${this.id}: dropped ${held - this.bufferedEvents.length} held request(s) from a transport that closed`,
+      );
+    }
     // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
     // server sends it again, and until then receives metadata only.
     this.toolObserveFilter = null;
@@ -416,10 +428,7 @@ export class McplServerConnection extends EventEmitter {
     // strand that call forever (the server timing out and reconnecting is the
     // accepted bound there, and reconnect re-runs the barrier funnel).
     if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
-      const hasResponder = (item: { args: unknown[] }): boolean => {
-        const responder = item.args[1] as { respond?: unknown } | undefined;
-        return typeof responder?.respond === 'function';
-      };
+      const hasResponder = McplServerConnection.hasResponder;
       if (!hasResponder({ args })) {
         this.droppedBufferedEvents++;
         if (this.droppedBufferedEvents % 100 === 1) {
@@ -439,6 +448,12 @@ export class McplServerConnection extends EventEmitter {
     }
     this.bufferedEvents.push({ event: name, args });
     return true;
+  }
+
+  /** A buffered server→host request: it carries a responder its server waits on. */
+  private static hasResponder(item: { args: unknown[] }): boolean {
+    const responder = item.args[1] as { respond?: unknown } | undefined;
+    return typeof responder?.respond === 'function';
   }
 
   /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time
@@ -890,27 +905,6 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /**
-   * Tear down a live transport after an awareness-accounting failure without
-   * disabling configured auto-reconnect. The normal transport close handler
-   * rejects requests, emits lifecycle state, and schedules the next bounded
-   * reconnect attempt. With reconnect disabled this leaves the server closed.
-   */
-  async reconnectAfterFailure(): Promise<void> {
-    this.pauseDataPlane();
-    if (this.closed) {
-      this.scheduleReconnect();
-      return;
-    }
-    if (this.transport) {
-      await this.transport.close();
-      return;
-    }
-    this.closed = true;
-    this.emit('close');
-    this.scheduleReconnect();
-  }
-
-  /**
    * Schedule a background reconnection attempt.
    *
    * Delay grows exponentially with consecutive failures (base
@@ -952,6 +946,12 @@ export class McplServerConnection extends EventEmitter {
         this.config,
         this.hostCapabilities,
       );
+      if (!this.reconnectEnabled) {
+        // close() ran while the handshake was in flight: the host is done
+        // with this server, so the new transport is closed, not adopted.
+        await transport.close().catch(() => {});
+        return;
+      }
 
       // Close both planes before the new transport can emit, as at initial
       // connect: its traffic is admitted against the grant, which this
@@ -1188,12 +1188,15 @@ export class McplServerConnection extends EventEmitter {
       if (eventName) {
         // Emit the typed event with params and (for requests) a respond callback
         if (request.id != null) {
-          // Server expects a response — provide a respond helper
+          // Server expects a response — provide a respond helper, bound to
+          // the transport the request came on: an answer after a reconnect
+          // would reach a server that never asked it.
+          const epoch = this.transportEpoch;
           this.emit(eventName, request.params, {
             id: request.id,
-            respond: (result: unknown) => this.sendResponse(request.id!, result),
+            respond: (result: unknown) => this.sendResponse(request.id!, result, epoch),
             respondError: (code: number, message: string, data?: unknown) =>
-              this.sendErrorResponse(request.id!, code, message, data),
+              this.sendErrorResponse(request.id!, code, message, data, epoch),
           });
         } else {
           // Notification — no response expected
@@ -1263,17 +1266,30 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send a successful JSON-RPC response back to the server.
    */
-  private sendResponse(id: string | number, result: unknown): void {
-    if (this.closed) return;
+  private sendResponse(id: string | number, result: unknown, epoch = this.transportEpoch): void {
+    if (this.closed || !this.sameTransport(id, epoch)) return;
     const response: JsonRpcResponse = { jsonrpc: '2.0', id, result };
     this.transport?.writeLine(JSON.stringify(response));
+  }
+
+  /** Whether a response to a request received on `epoch` may go out now. */
+  private sameTransport(id: string | number, epoch: number): boolean {
+    if (epoch === this.transportEpoch) return true;
+    console.error(`[mcpl] ${this.id}: not answering request ${String(id)}: the transport it came on has closed`);
+    return false;
   }
 
   /**
    * Send a JSON-RPC error response back to the server.
    */
-  private sendErrorResponse(id: string | number, code: number, message: string, data?: unknown): void {
-    if (this.closed) return;
+  private sendErrorResponse(
+    id: string | number,
+    code: number,
+    message: string,
+    data?: unknown,
+    epoch = this.transportEpoch,
+  ): void {
+    if (this.closed || !this.sameTransport(id, epoch)) return;
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',
       id,
