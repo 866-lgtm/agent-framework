@@ -185,6 +185,17 @@ describe('placed-reaction baseline', () => {
     assert.equal((await childEnv(fw)).baseline, '🟪');
   });
 
+  it('reads a non-string declared baseline as the child sees it, rather than failing the connect, and a null as unset', async () => {
+    // A config loaded from JSON can carry a number despite the type; spawn
+    // writes it as its string form.
+    const fw = await create(undefined, [server({ env: { [ENV_KEY]: 7 as unknown as string } })]);
+    assert.equal((await childEnv(fw)).baseline, '7');
+    // A null means no value: the derived default, not spawn's "null".
+    await fw.disconnectMcplServer('probe');
+    await fw.connectMcplServer(server({ env: { [ENV_KEY]: null as unknown as string } }));
+    assert.equal((await childEnv(fw)).baseline, [...REFUSAL_REACTION_BASELINE, '💤'].join(','));
+  });
+
   for (const blank of ['', '  ']) {
     it('a blank baseline, declared or inherited, counts as unset ' + JSON.stringify(blank), async (t) => {
       // The adapter reads an empty value as "no tokens": a blank inherited

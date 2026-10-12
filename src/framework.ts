@@ -13582,19 +13582,28 @@ export class AgentFramework {
    * Windows names are matched in both sources: Workers expose a case-
    * sensitive `process.env` copy. Within one source, Node's spawn keeps the
    * first spelling in sorted order, so each source is resolved that way.
+   *
+   * A value is read as the child will see it. A config loaded from JSON can
+   * carry a non-string there despite the type, and spawn writes every
+   * defined value as its string form, so a number is a declared value, not a
+   * failed connect. A null counts as unset, like a blank: written in JSON it
+   * means no value, and read as spawn's "null" it would replace the
+   * protective default with a list that suppresses nothing.
    */
   private declaredReactionBaseline(
     config: import('./mcpl/types.js').McplServerConfig,
   ): { value: string; source: 'env' | 'inherited' } | undefined {
     const valueIn = (env: NodeJS.ProcessEnv | undefined): string | undefined => {
-      let value: string | undefined;
-      if (process.platform !== 'win32') value = env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+      let raw: unknown;
+      if (process.platform !== 'win32') raw = env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
       else {
         const key = Object.keys(env ?? {}).sort()
           .find((name) => name.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE');
-        value = key === undefined ? undefined : env?.[key];
+        raw = key === undefined ? undefined : env?.[key];
       }
-      return value !== undefined && value.trim() !== '' ? value : undefined;
+      if (raw === undefined || raw === null) return undefined;
+      const value = String(raw);
+      return value.trim() !== '' ? value : undefined;
     };
     const declared = valueIn(config.env);
     if (declared !== undefined) return { value: declared, source: 'env' };
