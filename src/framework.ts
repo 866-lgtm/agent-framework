@@ -6619,17 +6619,21 @@ export class AgentFramework {
         agent && agent.state.status === 'waiting_for_tools'
         && agent.state.pending.size === 1 && agent.state.pending.has(event.callId)
       ) {
+        // The call this result answers, as this round holds it: a new round
+        // that reuses the call's id holds a new entry for it.
+        const owed = agent.state.pending.get(event.callId);
         const failures = await this.moduleRegistry.notifyToolBatchComplete(event.agentName);
         for (const failure of failures) {
           this.emitTrace({ type: 'module:batch_hook_failed', agentName: event.agentName, module: failure.module, error: failure.error });
         }
         // The turn may have been reset, cancelled or replaced while the hook
-        // ran, even back to waiting on a new batch: this result is still owed
-        // only if this agent still waits on this call.
+        // ran, even back to waiting on a new batch, whose calls may reuse this
+        // one's id: this result is still owed only if this agent still waits
+        // on this round's call.
         const after = agent.state as AgentState;
         if (
           this.agents.get(event.agentName) !== agent
-          || after.status !== 'waiting_for_tools' || !after.pending.has(event.callId)
+          || after.status !== 'waiting_for_tools' || after.pending.get(event.callId) !== owed
         ) {
           console.warn(
             `[framework] Dropping tool-result for agent '${event.agentName}' (callId=${event.callId}): ` +
