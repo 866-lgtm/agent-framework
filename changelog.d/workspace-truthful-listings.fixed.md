@@ -75,6 +75,9 @@
   framework's event loop, so while it lasts every agent's events wait.
 - Disk text is stored as its raw bytes rather than through a UTF-8 round trip, so a file in
   another encoding no longer differs from its own stored copy.
+- `status` with `mount` reports that mount alone, and refuses one that doesn't exist. A
+  `materialize` that names a read-only mount lists it under `skipped`, rather than answering as
+  if nothing was owed there.
 - `materialize` and `autoMaterialize` check each write and unlink where it happens, not only when
   it is planned. A file is opened in its directory without truncating and located before any
   byte changes: never through a symlink the mount doesn't follow, or a directory that resolves

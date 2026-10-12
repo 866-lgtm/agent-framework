@@ -2456,6 +2456,51 @@ describe('grep', () => {
   });
 });
 
+describe('grep, when the branch or the store changes under it', () => {
+  test("a pass whose branch is no longer selected isn't read with another branch's content: grep runs it again, then gives up", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'needle on main');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.store.switchBranch('other');
+    await call(m, 'write', { path: 'work/a.txt', content: 'needle on other' });
+    env.store.switchBranch(main);
+    // Every pass is followed by a switch to the other branch before grep
+    // reads the tree that goes with it.
+    const internals = m as unknown as { passUnlocked: (...args: unknown[]) => Promise<unknown> };
+    const real = internals.passUnlocked.bind(m);
+    internals.passUnlocked = async (...args: unknown[]) => {
+      const result = await real(...args);
+      env.store.switchBranch(env.store.currentBranch().name === main ? 'other' : main);
+      return result;
+    };
+    const data = await call(m, 'grep', { pattern: 'needle' });
+    assert.deepEqual(data.results, [], JSON.stringify(data.results));
+    assert.match(JSON.stringify(data.incomplete), /the selected branch kept changing while grep ran/);
+  });
+
+  test("a version missing from the store is listed as not searched, not taken for no match", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'conflict.txt', 'nothing');
+    env.writeDisk('conflict.txt', 'needle on disk');
+    await call(m, 'write', { path: 'work/conflict.txt', content: 'needle in the workspace' });
+    const listed = (await call(m, 'ls', { path: 'work' })).entries.find((e: { name: string }) => e.name === 'conflict.txt');
+    assert.equal(listed?.conflict?.diskCopy, 'stored');
+    // Both stored versions go missing.
+    const store = env.store as unknown as { getBlob: (hash: string) => Buffer | null };
+    const getBlob = store.getBlob.bind(env.store);
+    const gone = new Set([sha('needle on disk'), sha('needle in the workspace')]);
+    store.getBlob = (hash: string) => (gone.has(hash) ? null : getBlob(hash));
+    const data = await call(m, 'grep', { pattern: 'needle' });
+    assert.deepEqual(data.results, []);
+    const reasons = (data.skipped ?? []).map((x: { reason: string }) => x.reason).join('\n');
+    assert.match(reasons, /the workspace copy is missing from the store/);
+    assert.match(reasons, /the disk version recorded with the conflict is missing from the store/);
+  });
+});
+
 describe('on-agent-action', () => {
   test('a completed tool batch brings disk changes in before the next inference', async (t) => {
     const env = new Env(t);
@@ -2812,6 +2857,49 @@ describe('materialize, status and shutdown', () => {
     });
     await stopping;
     assert.equal(finished, true, 'nothing still runs once stop returns');
+  });
+});
+
+describe('a named mount, and a path the workspace and disk hold differently', () => {
+  test("status reports the mount it's asked about, and a materialize of a read-only mount says it wrote nothing there", async (t) => {
+    const env = new Env(t);
+    const second = join(env.root, 'second');
+    mkdirSync(second);
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never' },
+      { name: 'second', path: second, mode: 'read-only', watch: 'never' },
+    ] } as Partial<WorkspaceConfig>);
+    const status = await call(m, 'status', { mount: 'work' });
+    assert.deepEqual(Object.keys(status.mounts ?? status), ['work'], JSON.stringify(status));
+    assert.match(await refused(m, 'status', { mount: 'nowhere' }), /Unknown mount: nowhere/);
+    const done = await call(m, 'materialize', { mount: 'second' });
+    assert.equal(done.count, 0);
+    assert.match(JSON.stringify(done.skipped), /a read-only mount: materialize writes nothing to it/);
+  });
+
+  test('a path sync takes in a file disk has where the workspace holds a directory, and drops what was beneath', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'd/x.txt', 'x');
+    rmSync(env.disk('d'), { recursive: true });
+    env.writeDisk('d', 'now a file');
+    const data = await call(m, 'sync', { path: 'work/d' });
+    assert.equal(env.store.treeGet('workspace/work/tree', 'd/x.txt'), null, 'what was beneath is gone');
+    const entry = env.store.treeGet('workspace/work/tree', 'd');
+    assert.ok(entry, `the file is taken in: ${JSON.stringify(data)}`);
+    assert.equal(env.store.getBlob(entry!.blobHash)?.toString('utf8'), 'now a file');
+  });
+
+  test("a path sync where disk has a directory over a workspace file takes in what's beneath, and says the file wasn't checked", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'f', 'a file');
+    rmSync(env.disk('f'));
+    mkdirSync(env.disk('f'));
+    env.writeDisk('f/y.txt', 'y');
+    const data = await call(m, 'sync', { path: 'work/f' });
+    assert.ok(env.store.treeGet('workspace/work/tree', 'f/y.txt'), 'what disk has beneath is taken in');
+    assert.match(JSON.stringify(data.skipped ?? []), /"path":"f".*disk could not be checked: a directory/);
   });
 });
 

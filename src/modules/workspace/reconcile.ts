@@ -108,10 +108,6 @@ export type TreeOp = 'created' | 'modified' | 'deleted';
 export interface PassResult {
   /** Tree changes adopted from disk. */
   ops: Array<{ path: string; op: TreeOp }>;
-  /**
-   * A path sync's adoptions that gave up a change of the workspace's own,
-   * each with the state the rule would otherwise have kept (`was`).
-   */
   /** What a path sync gave up of the workspace's own; `op` is what it did to the
    *  workspace copy, absent when it changed none (a deletion or conflict given
    *  up for a disk copy the workspace can't hold). */
@@ -124,6 +120,12 @@ export interface PassResult {
   incomplete: Array<{ path: string; reason: string }>;
   /** For a directory scope: the subdirectories disk shows directly beneath it. */
   dirs: string[];
+  /**
+   * The branch the pass decided on, absent when it decided nothing. A caller
+   * that reads the tree or branch intent to go with the reports checks it is
+   * still the selected branch, synchronously, before it reads.
+   */
+  branchId?: string;
 }
 
 export interface MountRuntime {
@@ -702,6 +704,7 @@ export async function reconcilePass(
 
   // Decide and apply — synchronously, so nothing interleaves.
   const branchId = store.currentBranch().id;
+  result.branchId = branchId;
   type Planned = { path: string; verdict: Verdict; d: DiskFact; s: { hash: string; size: number } | null; p: Physical | undefined; bi: BranchIntent | null };
   const planned: Planned[] = [];
   for (const [path, d] of facts) {

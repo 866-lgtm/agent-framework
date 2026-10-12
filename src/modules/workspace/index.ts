@@ -1129,8 +1129,9 @@ export class WorkspaceModule implements Module {
         description: 'List a directory, checked against disk first. Each file has a state: synced; '
           + 'workspace-draft (the workspace has changes disk lacks); workspace-deleted (deleted in the workspace, '
           + 'still on disk); not-in-branch (on disk, absent from this branch\'s workspace); disk-only (binary or over '
-          + 'the size limit, never stored — shown with size and image type); conflict (disk and workspace both '
-          + 'changed — sync the path to take disk, or materialize with force to take the workspace); '
+          + 'the size limit, never stored — shown with size and image type); conflict, with its kind (disk and the '
+          + 'workspace both changed; disk holds a different copy and nothing records which is newer; or a write was '
+          + 'interrupted) — sync the path to take disk, or materialize that path with force to take the workspace; '
           + 'disk-missing-provenance-unknown; unverified (disk could not be checked). `incomplete` names regions '
           + 'the listing could not see.',
         inputSchema: {
@@ -2396,9 +2397,25 @@ export class WorkspaceModule implements Module {
           store.treeGet(mount.treeStateId, relativePath) !== null ||
           await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
         );
-        const pass = await this.passUnlocked(mount, fileScope
-          ? { kind: 'paths', paths: [relativePath] }
-          : { kind: 'dir', dir: relativePath, recursive: true });
+        // What follows reads the tree and branch intent to go with the pass's
+        // reports, synchronously. They must be the branch the pass decided
+        // on: one selected in between would label its content with the other
+        // branch's states. So a pass whose branch is no longer selected runs
+        // again, and a branch that keeps changing leaves the scope unsearched.
+        let pass: PassResult | null = null;
+        for (let attempt = 0; attempt < 3 && pass === null; attempt++) {
+          const next = await this.passUnlocked(mount, fileScope
+            ? { kind: 'paths', paths: [relativePath] }
+            : { kind: 'dir', dir: relativePath, recursive: true });
+          if (next.branchId === undefined || next.branchId === store.currentBranch().id) pass = next;
+        }
+        if (pass === null) {
+          incomplete.push({
+            path: `${mount.config.name}/${relativePath}`,
+            reason: 'the selected branch kept changing while grep ran; nothing here was searched — grep again',
+          });
+          return;
+        }
         for (const region of pass.incomplete) {
           incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
         }
@@ -2422,6 +2439,8 @@ export class WorkspaceModule implements Module {
           if (blob) {
             const found = search(blob.toString('utf-8'));
             if (found.length > 0) results.push({ file, state: report.state, version: 'workspace', matches: found });
+          } else if (entry) {
+            skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
           }
           if (report.state !== 'conflict') continue;
           // A conflict's disk side. The version recorded with the conflict is
@@ -2435,6 +2454,9 @@ export class WorkspaceModule implements Module {
           if (diskBlob) {
             const found = search(diskBlob.toString('utf-8'));
             if (found.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', matches: found });
+          }
+          if (disk?.stored && !diskBlob) {
+            skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
           }
           if (changed) {
             if (report.diskNow === 'file') {
@@ -2459,11 +2481,15 @@ export class WorkspaceModule implements Module {
     };
   }
 
-  private async handleStatus(_input: StatusInput): Promise<ToolResult> {
+  private async handleStatus(input: StatusInput): Promise<ToolResult> {
     const store = this.getStore();
     const status: Record<string, unknown> = {};
+    if (input.mount !== undefined && !this.mounts.has(input.mount)) {
+      return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
+    }
 
     for (const [name, mount] of this.mounts) {
+      if (input.mount !== undefined && name !== input.mount) continue;
       const entries = store.treeList(mount.treeStateId);
       const currentSeq = store.currentSequence();
       const intents = this.intents.get(name)!.list();
@@ -2593,7 +2619,12 @@ export class WorkspaceModule implements Module {
     let proceeded = 0;
 
     for (const { name, mount } of mountsToMaterialize) {
-      if (mount.config.mode === 'read-only') continue;
+      if (mount.config.mode === 'read-only') {
+        // Only a mount the caller named gets here read-only (a bare
+        // materialize takes the read-write ones): say why nothing was written.
+        blocked.push({ mount: name, reason: 'a read-only mount: materialize writes nothing to it' });
+        continue;
+      }
       const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean }> => {
         const branchId = store.currentBranch().id;
         const reason = this.mountMaterializeBlockReason(store, mount);
@@ -2751,10 +2782,29 @@ export class WorkspaceModule implements Module {
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
-        const scope: Scope = isDir
-          ? { kind: 'dir', dir: relativePath, recursive: true }
-          : { kind: 'paths', paths: [relativePath] };
-        return this.passUnlocked(mount, scope, { rehash: true, adopt: () => true, branchId: askedOn });
+        const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn };
+        if (!isDir) return this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
+        const beneath = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }, opts);
+        // Something at the path itself is no part of a directory scope: a file
+        // disk has where the workspace holds a directory, or a workspace file
+        // where disk has a directory. Its own pass takes disk's state there
+        // too, after what lies beneath, so a file never sits over entries it
+        // replaced.
+        const onDisk = await lstat(join(mount.config.path, relativePath)).catch(() => null);
+        const atPath = (onDisk !== null && !onDisk.isDirectory())
+          || store.treeGet(mount.treeStateId, relativePath) !== null
+          || this.agreementOrThrow().get(name, relativePath) !== undefined
+          || this.intents.get(name)!.get(relativePath) !== null;
+        if (!atPath) return beneath;
+        const itself = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
+        return {
+          ops: [...beneath.ops, ...itself.ops],
+          discarded: [...beneath.discarded, ...itself.discarded],
+          newConflicts: [...beneath.newConflicts, ...itself.newConflicts],
+          reports: new Map([...beneath.reports, ...itself.reports]),
+          incomplete: [...beneath.incomplete, ...itself.incomplete],
+          dirs: beneath.dirs,
+        };
       });
 
       const conflicts = [...pass.reports.values()]
