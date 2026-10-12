@@ -6938,12 +6938,24 @@ export class AgentFramework {
             //    Reactions and system markers are already excluded by
             //    isConversationalInjection, and the engaged-this-turn scope
             //    keeps unrelated channels from moving the pin.
+            //
+            // Fork exception, ahead of BOTH signals: a bot message that did
+            // NOT wake the agent (`chat:from-bot` without `triggered: true`)
+            // never moves the pin. Parity with the live 2026-07-28 fix
+            // (20b2c7c, "only a WAKING mid-turn injection may move the reply
+            // locus"): an unaddressed bot message in #residency-hall arrived
+            // while Polaris was answering Helen in #the-apartment and pulled
+            // the whole reply into the bot's channel. Bot chatter is still
+            // heard mid-turn (it is injected above); it just cannot capture
+            // the reply. A bot message the gate DID wake on qualifies like
+            // anyone's, and human follow-ups are unaffected.
             const engaged = this.turnEngagedChannels.get(agent.name);
             const lastQualifying = [...midTurnInjections].reverse().find((inj) => {
               const m = inj.metadata as Record<string, unknown> | undefined;
               if (!isConversationalInjection(inj.metadata)) return false;
               if (typeof m?.channelId !== 'string') return false;
               const tags = m.tags as string[] | undefined;
+              if (Array.isArray(tags) && tags.includes('chat:from-bot') && m.triggered !== true) return false;
               if (isAddressedMessage(tags, m)) return true;
               return engaged?.has(m.channelId as string) === true;
             });

@@ -433,12 +433,20 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('an agent-resident follow-up in an engaged channel re-pins too (no author-kind filter)', async () => {
+  it('a WAKING agent-resident follow-up in an engaged channel re-pins too', async () => {
     // Fleet participants include agent-residents — "bot" by Discord flag,
     // full conversational participants in fact. Their in-flow replies in a
     // channel the agent just engaged move the pin exactly like anyone
     // else's (antra, 2026-07-31: the author-kind distinction is fragile and
     // wrong for this fleet).
+    //
+    // Fork change: upstream's version of this test sent the bot message
+    // WITHOUT `triggered` and expected a re-pin ("no author-kind filter").
+    // The fork keeps Helen's 2026-07-28 live protection (20b2c7c): a bot
+    // message that did not wake the agent must never pull the reply (see
+    // the next two tests). A resident message the gate DID wake on
+    // (`triggered: true`) still re-pins like anyone's — the upstream intent
+    // for genuinely conversational residents is preserved for that case.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -453,6 +461,7 @@ describe('present while acting', () => {
     module.interjectionMetadata = {
       channelId: 'discord:guild:hospital',
       tags: ['chat:ambient', 'chat:from-bot'],
+      triggered: true,
     };
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
@@ -468,6 +477,89 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [
       { text: 'Continuing with the colleague.', locus: 'discord:guild:hospital' },
     ], 'the agent-resident follow-up moved the pin like any participant');
+
+    await framework.stop();
+  });
+
+  it('an UNTRIGGERED bot follow-up in an engaged channel does NOT re-pin (fork 2026-07-28 parity)', async () => {
+    // 2026-07-28 (live): an unaddressed bot message arrived mid-turn while
+    // Polaris was answering Helen elsewhere, and the whole reply was
+    // published into the bot's channel. Bot chatter the gate did not wake
+    // on is heard (injected) but cannot capture the reply — even in a
+    // channel the agent engaged this turn.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Life is good, here is how things are going.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'unrelated bot chatter in the engaged channel';
+    module.interjectionMetadata = {
+      channelId: 'discord:guild:residency-hall',
+      tags: ['chat:ambient', 'chat:from-bot'],
+      triggered: false,
+    };
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as {
+        turnEngagedChannels: Map<string, Set<string>>;
+      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:residency-hall']));
+      return origHandle(call);
+    };
+
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Life is good, here is how things are going.', locus: 'chan-live-1' },
+    ], 'the reply stayed on the turn-start locus');
+    assert.equal(notices.length, 1, 'only the boot-baseline announcement — no re-pin notice');
+    // Still HEARD: the bot message itself rode the injection batch.
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('unrelated bot chatter')), 'the bot message was injected');
+
+    await framework.stop();
+  });
+
+  it('an UNTRIGGERED bot message tagged chat:addressed does NOT re-pin either', async () => {
+    // The gate runs ahead of BOTH qualifying signals: a bot @-mentioning the
+    // agent from another channel without waking it cannot move the reply.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still answering the original conversation.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = '@assistant ping from another bot';
+    module.interjectionMetadata = {
+      channelId: 'discord:guild:botspam',
+      tags: ['chat:addressed', 'chat:from-bot'],
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+      { text: 'Still answering the original conversation.', locus: 'chan-live-1' },
+    ], 'an untriggered bot address left the pin alone');
 
     await framework.stop();
   });
