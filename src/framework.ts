@@ -1021,11 +1021,13 @@ function boundProviderErrorCode(code: unknown): string | undefined {
 /**
  * A bounded string describing a failure, for logs that would otherwise print
  * the error object; it is one line unless one of its parts has newlines, as a
- * message can. Printing the object shows every own field, and a
- * MembraneError's `rawRequest` is the whole request that failed: a long system
- * prompt at depth one is printed in full. The projection keeps what a reader
- * needs (name, classification, status, provider code, message) and nothing
- * else.
+ * message can. Printing the object prints its message whole, in the stack,
+ * and every own field: a MembraneError's `rawRequest` is the whole request
+ * that failed, and Node's console prints each of its strings, a long system
+ * prompt among them, up to 10,000 characters. The projection keeps what a
+ * reader needs (name, classification, status, provider code, message) and
+ * nothing else. The head's parts are bounded each, and the whole is cut once,
+ * so its marker states the length of the head and the whole message.
  */
 function describeFailure(error: unknown): string {
   try {
@@ -1042,7 +1044,7 @@ function describeFailure(error: unknown): string {
     ].filter((part): part is string => part !== undefined);
     const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
     const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
-    return boundFailureText(`${head}: ${boundFailureText(String(error.message))}`);
+    return boundFailureText(`${head}: ${String(error.message)}`);
   } catch {
     return '[failure could not be described]';
   }
@@ -1050,16 +1052,25 @@ function describeFailure(error: unknown): string {
 
 /**
  * describeFailure, then the error's stack frames (the stack from its first
- * `at` line), bounded, on the lines below: for a log of a failure the
- * framework's own code may have thrown, where the frames say where. The leak
- * the projection closes was the object's own fields, not its stack.
+ * `at` line after the message), bounded, on the lines below: for a log of a
+ * failure the framework's own code may have thrown, where the frames say
+ * where. The stack opens with the message, and a message's own lines can look
+ * like frames (an echoed request quoting a stack trace), so the frames are
+ * looked for after it. The leak the projection closes was the object's own
+ * fields, not its stack.
  */
 function describeFailureWithFrames(error: unknown): string {
   let frames: string | undefined;
   try {
     const stack = error instanceof Error ? error.stack : undefined;
-    const start = typeof stack === 'string' ? stack.search(/^\s+at /m) : -1;
-    if (start >= 0) frames = boundFailureText(stack!.slice(start));
+    if (typeof stack === 'string') {
+      const message = String((error as Error).message);
+      const at = message ? stack.indexOf(message) : -1;
+      const frameLine = /^\s+at /gm;
+      frameLine.lastIndex = at >= 0 ? at + message.length : 0;
+      const found = frameLine.exec(stack);
+      if (found) frames = boundFailureText(stack.slice(found.index));
+    }
   } catch { /* the projection alone */ }
   const described = describeFailure(error);
   return frames === undefined ? described : `${described}\n${frames}`;
@@ -2262,7 +2273,8 @@ export class AgentFramework {
       return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
         reason: boundFailureText(typeof hold.reason === 'string' && hold.reason ? hold.reason : String(error.message)) };
     } catch (err) {
-      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      // The hook is handed the model's error, and may throw it back.
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold: ${describeFailureWithFrames(err)}`);
       return undefined;
     }
   }
@@ -12823,8 +12835,8 @@ export class AgentFramework {
   ): void {
     const message = boundFailureText(rawMessage);
     // The caller's data goes to failures.log and to trace listeners, bounded
-    // the same way for both.
-    const data = opts?.data === undefined ? undefined : boundFailureFields(opts.data);
+    // the same way for both. A JavaScript caller's null is no data.
+    const data = opts?.data == null ? undefined : boundFailureFields(opts.data);
     if (!opts?.skipLog) {
       this.logFailure({ agent: agentName, kind, reason: message, ...data });
     }

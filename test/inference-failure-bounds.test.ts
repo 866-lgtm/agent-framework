@@ -306,8 +306,21 @@ test('failure logs print a bounded projection, never the error object with its r
     try {
       refused.fw.noteInferenceExhausted('cairn', 'boom');
     } finally { refused.restore(); }
-    assertBoundedStrings(refused.rawArgs, 'could not record chronicle marker');
+    assert.match(assertBoundedStrings(refused.rawArgs, 'could not record chronicle marker'), /\n {4}at .*inference-failure-bounds\.test/);
   }
+
+  // A message's own lines can look like frames (an echoed request quoting a
+  // stack trace): the frames are the stack's, after the message, so the throw
+  // site is kept rather than spending the frames' bound on the message.
+  const quoting = new Error(`tool output:\n    at zz-quoted (quoted.js:1:1)\n${echo()}`);
+  const quoted = makeHarness({ tick: async () => { throw quoting; } });
+  try {
+    quoted.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
+    await settle();
+  } finally { quoted.restore(); }
+  const quotedLine = assertBoundedStrings(quoted.rawArgs, 'drain kick failed');
+  assert.equal(quotedLine.split('zz-quoted').length - 1, 1, 'the quoted frame is in the projection only');
+  assert.match(quotedLine, /\n {4}at .*inference-failure-bounds\.test/);
 
   // Every component of the projection is bounded, the name and type included.
   const named = new Error('zz-short');
@@ -372,6 +385,18 @@ test('a provider hold keeps a bounded reason, and a failed resume logs the bound
     held.fw.cancelProviderAdmission();
     held.restore();
   }
+
+  // A hook is handed the model's error, and one that throws it back logs its
+  // projection, never the object with its request.
+  const threw = makeHarness();
+  providerState(threw.fw);
+  try {
+    threw.fw.providerHoldHook = (error: Error) => { throw error; };
+    assert.equal(threw.fw.holdProviderAcceleration(threw.fw.agents.get('cairn'), hugeProviderError()), false);
+  } finally { threw.restore(); }
+  const threwLine = assertBoundedStrings(threw.rawArgs, 'providerHold hook threw');
+  assert.match(threwLine, /treating as no hold: MembraneError \(invalid_request, HTTP 400, zz_bad_request, retryable=false\): Bad request: zz-head/);
+  assert.match(threwLine, /\n {4}at /);
 
   // The built-in acceleration cooldown keeps the error's own message as its reason.
   const accelerated = makeHarness();
@@ -453,22 +478,36 @@ test('opsAlert bounds its message on the trace and the failures.log record', () 
   assert.ok((logged[0].reason as string).length <= 2_000);
 });
 
+test('alert data of null, from a JavaScript caller, is no data: the alert is still logged and traced', () => {
+  const { fw, traces, logged, restore } = makeHarness();
+  try {
+    fw.notifyOpsAlert('zz-detector', 'cairn', 'short message', null);
+  } finally { restore(); }
+  assert.equal(traces.find((t) => t.type === 'ops:alert')?.message, 'short message');
+  assert.deepEqual(logged, [{ agent: 'cairn', kind: 'zz-detector', reason: 'short message' }]);
+});
+
+/** The projection's head for hugeProviderError(), before ': ' and the message. */
+const HUGE_ERROR_HEAD = 'MembraneError (invalid_request, HTTP 400, zz_bad_request, retryable=false)';
+
 test('alert data is bounded field by field, on the trace and the failures.log record', () => {
   const { fw, traces, logged, restore } = makeHarness();
   const nested = { items: Array.from({ length: 2_000 }, (_, i) => ({ i, note: 'zz' })) };
+  const text = echo();
+  const error = hugeProviderError();
   try {
     fw.notifyOpsAlert('zz-detector', 'cairn', 'short message', {
-      text: echo(), error: hugeProviderError(), nested, count: 3, small: { a: 1 },
+      text, error, nested, count: 3, small: { a: 1 },
       // Small JSON, large value: the listener gets the JSON's data, not the value.
       held: new Map([['zz', echo()]]), at: new Date(0),
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
   for (const [sink, fields] of [['trace', alert.data], ['failures.log', logged[0]]] as const) {
-    assert.ok(fields.text.length <= 2_000, `${sink}: text`);
+    assertCut(text, fields.text, 2_000, `${sink}: text`);
     // An Error is its projection: serialising it would write its rawRequest.
-    assert.match(fields.error, /^MembraneError \(invalid_request, HTTP 400, zz_bad_request, retryable=false\): Bad request: zz-head/, sink);
-    assert.ok(fields.error.length <= 2_000, `${sink}: error`);
+    // It is cut once, so its marker states the head and the whole message.
+    assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, fields.error, 2_000, `${sink}: error`);
     // A value whose JSON is too long becomes its JSON, bounded.
     assert.equal(typeof fields.nested, 'string', `${sink}: nested`);
     assert.ok(fields.nested.length <= 2_000 && fields.nested.startsWith('{"items":[{"i":0,'), `${sink}: nested`);
@@ -488,16 +527,21 @@ test('logFailure bounds every field it writes', () => {
     const fw = Object.create(FrameworkClass.prototype) as any;
     const circular: Record<string, unknown> = { zz: 1 };
     circular.self = circular;
+    const reason = echo();
+    const note = `zz-note ${echo(5_000)}`;
+    const error = hugeProviderError();
     fw.logFailure({
-      agent: 'cairn', reason: echo(), note: echo(), consecutive: 1,
-      error: hugeProviderError(), nested: { list: Array.from({ length: 2_000 }, (_, i) => i) }, circular,
+      agent: 'cairn', reason, note, consecutive: 1,
+      error, nested: { list: Array.from({ length: 2_000 }, (_, i) => i) }, circular,
     });
     const line = readFileSync(join(dir, 'logs', 'failures.log'), 'utf-8').trim();
     assert.ok(line.length < 9_000, `failures.log line is ${line.length} chars`);
     const record = JSON.parse(line);
-    assert.ok(record.reason.length <= 2_000 && record.note.length <= 2_000);
+    // The written record, not what a caller passed: each string is cut by the one rule.
+    assertCut(reason, record.reason, 2_000, 'failures.log reason');
+    assertCut(note, record.note, 2_000, 'failures.log note');
     assert.equal(record.consecutive, 1);
-    assert.match(record.error, /^MembraneError \(invalid_request, HTTP 400, zz_bad_request, retryable=false\): Bad request: zz-head/);
+    assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, record.error, 2_000, 'failures.log error');
     assert.ok(typeof record.nested === 'string' && record.nested.length <= 2_000);
     // A value JSON can't write no longer loses the whole record.
     assert.equal(record.circular, '[object Object]');
@@ -705,6 +749,34 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   } finally {
     harness.fw.cancelProviderAdmission();
     harness.restore();
+  }
+});
+
+test("the default error policy reads either copy's retryable and retryAfterMs", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-failure-bounds-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'),
+    membrane: new FailingMembrane('stream setup throws', () => hugeProviderError()).asMembrane(),
+    agents: [], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  try {
+    // The policy the framework built for itself, with no errorPolicy configured.
+    const policy = (framework as any).errorPolicy as ErrorPolicy;
+    const foreign = (fields: Record<string, unknown>) => Object.assign(new Error('Rate limited'), {
+      name: 'MembraneError', type: 'rate_limit', httpStatus: 429, ...fields,
+    });
+    const own = new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 1234, message: 'Rate limited', rawError: { status: 429 },
+    });
+    // A stated wait is honoured, from another copy as from the framework's own.
+    assert.deepEqual(policy.onInferenceError(own, 'resident', 0), { retry: true, delayMs: 1234 });
+    assert.deepEqual(policy.onInferenceError(foreign({ retryable: true, retryAfterMs: 1234 }), 'resident', 0), { retry: true, delayMs: 1234 });
+    // Without retryable, it retries as an unknown error does; refused only when false.
+    assert.deepEqual(policy.onInferenceError(foreign({}), 'resident', 0), { retry: true, delayMs: 1_000 });
+    assert.deepEqual(policy.onInferenceError(foreign({ retryable: false, retryAfterMs: 1234 }), 'resident', 0), { retry: false });
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
