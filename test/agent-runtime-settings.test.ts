@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 
 import { AutobiographicalStrategy, ContextManager } from '@animalabs/context-manager';
-import { AgentFramework, BudgetPreflightError } from '../src/index.js';
+import { Agent, AgentFramework, BudgetPreflightError } from '../src/index.js';
 
 const membrane = {} as any;
 
@@ -277,6 +277,35 @@ describe('a reached budget across a restart', () => {
         log.restore();
       }
       assert.ok(log.lines.some((line) => line.includes('folded floor renders 70000 tokens against it now')), log.lines.join('\n'));
+    });
+  });
+
+  it('a reached budget the preflight says fits but that fails to apply at once restores paced, with a line naming that step', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(framework());
+      const proto = Agent.prototype as unknown as {
+        restoreRuntimeSettings: (settings: unknown, opts?: { provenBudget?: number }) => unknown;
+      };
+      const original = proto.restoreRuntimeSettings;
+      proto.restoreRuntimeSettings = function (this: unknown, settings: unknown, opts?: { provenBudget?: number }) {
+        if (opts?.provenBudget !== undefined) throw new Error('hot settings refused');
+        return original.call(this, settings, opts);
+      };
+      const log = quietErrors();
+      let restarted: AgentFramework;
+      try {
+        restarted = await restart();
+      } finally {
+        proto.restoreRuntimeSettings = original;
+        log.restore();
+      }
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 100_000, transition: 'converging' });
+      assert.ok(
+        log.lines.some((line) => line.includes('applying it at once failed (hot settings refused), though the preflight says it fits now')),
+        log.lines.join('\n'),
+      );
+      assert.ok(!log.lines.some((line) => line.includes("can't be checked")), log.lines.join('\n'));
     });
   });
 

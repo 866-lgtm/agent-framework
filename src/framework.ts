@@ -4090,17 +4090,23 @@ export class AgentFramework {
       if (budget !== undefined && reached === budget) {
         const patch: AgentRuntimeSettingsPatch = { ...settings, immediate: true };
         let why: string;
+        let fits = false;
         try {
           const preview = this.previewRuntimeSettingsFor(agent, patch);
-          if (preview.available && preview.effective?.fits) {
-            agent.restoreRuntimeSettings(patch, { provenBudget: budget });
-            return;
-          }
+          fits = preview.available && preview.effective?.fits === true;
           why = preview.available
             ? `the folded floor renders ${preview.effective?.finalTokens} tokens against it now`
             : `whether it fits now can't be checked (${preview.reason ?? 'no preview'})`;
         } catch (error) {
           why = `whether it fits now can't be checked (${error instanceof Error ? error.message : String(error)})`;
+        }
+        if (fits) {
+          try {
+            agent.restoreRuntimeSettings(patch, { provenBudget: budget });
+            return;
+          } catch (error) {
+            why = `applying it at once failed (${error instanceof Error ? error.message : String(error)}), though the preflight says it fits now`;
+          }
         }
         console.error(
           `[agent-settings] ${agentName}: its last compile before the stop fit at contextBudgetTokens=${budget}, but ${why}; ` +
