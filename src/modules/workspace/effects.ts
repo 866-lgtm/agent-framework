@@ -98,7 +98,7 @@ function noFollowFlag(view: MountView): number {
  * disk last agreed under, as any observation of it checks. An effect under a
  * replaced root acts on nothing, whatever its caller checked before, and the
  * parent is found by path beneath the root's path, so whoever acts checks the
- * root again with the parent (`stillUnder`): a root replaced after it was
+ * root again with the parent (`moved`): a root replaced after it was
  * checked would otherwise lend the effect its replacement's directory.
  */
 async function parentFor(view: MountView, rootReal: string, rel: string, create: boolean) {
@@ -109,10 +109,18 @@ async function parentFor(view: MountView, rootReal: string, rel: string, create:
   return { ...checked, root: root.dir };
 }
 
-/** Whether the parent, and the root it was found beneath, are each still the directory its path names. */
-async function stillUnder(root: CheckedDir, parent: CheckedDir): Promise<boolean> {
-  return (await parent.stillHere()) && (await root.stillHere());
+/**
+ * Why the parent, or the root it was found beneath, is no longer the
+ * directory its path names; null while each still is. The root is asked
+ * first, so a replaced root reads the same wherever it's found.
+ */
+async function moved(root: CheckedDir, parent: CheckedDir): Promise<string | null> {
+  if (!(await root.stillHere())) return ROOT_REPLACED;
+  return (await parent.stillHere()) ? null : MOVED;
 }
+
+/** A file as a stat describes it: which file, and the size and stamps a write changes. */
+type Stamped = { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint };
 
 /**
  * Whether the file at `target` is still the one `before` described: the same
@@ -121,8 +129,7 @@ async function stillUnder(root: CheckedDir, parent: CheckedDir): Promise<boolean
  * was hashed is never overwritten or deleted unseen; what remains is the
  * moment between this and the effect, which Node can't close (see the header).
  */
-function unchanged(before: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint },
-  now: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint } | null): boolean {
+function unchanged(before: Stamped, now: Stamped | null): boolean {
   return now !== null && now.dev === before.dev && now.ino === before.ino && now.size === before.size
     && now.mtimeNs === before.mtimeNs && now.ctimeNs === before.ctimeNs;
 }
@@ -224,7 +231,8 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
       if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
     }
     if (info.nlink > 1n) throw new EffectFailed(HARD_LINKED, touched);
-    if (!(await stillUnder(root, parent))) throw new EffectFailed(MOVED, touched);
+    const gone = await moved(root, parent);
+    if (gone !== null) throw new EffectFailed(gone, touched);
     // Nothing wrote it while those ran.
     if (!unchanged(info, await handle.stat({ bigint: true }).catch(() => null))) throw new EffectFailed(CHANGED, touched);
 
@@ -263,7 +271,8 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     info = await lstat(target, { bigint: true });
   } catch (err) {
     if (errno(err) === 'ENOENT') {
-      if (!(await stillUnder(root, parent))) throw new EffectFailed(MOVED, false);
+      const gone = await moved(root, parent);
+      if (gone !== null) throw new EffectFailed(gone, false);
       return parent.rel;
     }
     throw new EffectFailed(`cannot stat (${errno(err) ?? message(err)})`, false);
@@ -287,7 +296,8 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     throw new EffectFailed('a directory', false);
   }
   if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
-  if (!(await stillUnder(root, parent))) throw new EffectFailed(MOVED, false);
+  const gone = await moved(root, parent);
+  if (gone !== null) throw new EffectFailed(gone, false);
   // The entry checked is still the one at the path, unwritten since it was
   // hashed, as close to the unlink as Node allows (see the header): a file
   // replaced or edited while it was hashed isn't removed.

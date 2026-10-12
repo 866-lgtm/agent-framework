@@ -1721,7 +1721,7 @@ describe('trust and identity at the point of use', () => {
       return realpath(path, ...rest);
     }, () => writeContained(view, rootReal, 'sub/a.txt', Buffer.from('content'), { kind: 'any' }).then(() => null, (e) => e));
     assert.equal(replaced, true);
-    assert.ok(err instanceof EffectFailed, `refused: ${err}`);
+    assert.ok(err instanceof EffectFailed && /not the directory disk last agreed with/.test(err.message), `refused, naming the root: ${err}`);
     const there = join(env.dir, 'sub/a.txt');
     assert.equal(existsSync(there) ? readFileSync(there, 'utf8') : '', '', 'no content reached the replacement');
   });
