@@ -2808,6 +2808,26 @@ describe('on-agent-action', () => {
 });
 
 describe('materialize, status and shutdown', () => {
+  test('the module takes no work after it has stopped and saved its pins, until it starts again', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'A' });
+    let saved: { mounts: Record<string, { lastMaterializedSeq: number }> } | undefined;
+    (m as any).ctx.setState = (state: typeof saved) => { saved = state; };
+    await m.stop();
+    // After stop has saved the pins and watermarks, nothing more changes them.
+    const after = await m.handleToolCall({ id: 't', name: 'materialize', input: { path: 'work/a.txt' } });
+    assert.equal(after.success, false);
+    assert.match(String(after.error), /has stopped/);
+    assert.equal(existsSync(env.disk('a.txt')), false, 'nothing was written after the stop');
+    assert.equal((await m.writeBinary('work/late.bin', Buffer.from('x'), 'application/octet-stream')).success, false);
+    assert.ok(saved, 'stop saved its state');
+    // Started again, it takes work again.
+    await m.start({ isRestart: true, getState: () => saved, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    await call(m, 'materialize', { path: 'work/a.txt' });
+    assert.equal(env.readDisk('a.txt'), 'A');
+  });
+
   test('a materialize queued behind a pass is guarded on the branch it then selects on', async (t) => {
     const env = new Env(t);
     const m = await env.open();

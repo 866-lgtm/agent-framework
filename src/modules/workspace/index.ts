@@ -57,6 +57,8 @@ import {
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
+/** Why a call is refused once the module has stopped. */
+const NOT_RUNNING = 'The workspace has stopped: it takes no more work until it starts again';
 /** The workspace's own deadline must end before the framework's hook bound. */
 const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
 
@@ -626,6 +628,8 @@ export class WorkspaceModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private store: JsStore | null = null;
+  /** Set once stop has drained and saved, cleared by start (running()). */
+  private stopped = false;
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
@@ -797,6 +801,7 @@ export class WorkspaceModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+    this.stopped = false;
 
     // Decode persisted state if restarting; application waits until mounts
     // exist (see applySavedState) — in the Host ordering they don't yet.
@@ -1023,6 +1028,9 @@ export class WorkspaceModule implements Module {
       const now = [...this.mountTurns.values()];
       if (now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
     }
+    // Nothing is queued now, and nothing more is taken: what follows saves
+    // the pins and watermarks as the last work left them.
+    this.stopped = true;
 
     // Persist state
     if (this.ctx) {
@@ -1268,6 +1276,7 @@ export class WorkspaceModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     try {
       const input = call.input as Record<string, unknown>;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
@@ -1402,6 +1411,7 @@ export class WorkspaceModule implements Module {
     data: Buffer,
     mimeType: string,
   ): Promise<ToolResult> {
+    if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     let mount: MountState;
     let relativePath: string;
     try {
@@ -1529,6 +1539,18 @@ export class WorkspaceModule implements Module {
     }
 
     return { mount, relativePath };
+  }
+
+  /**
+   * Whether the module takes work: stop hasn't finished. Work admitted while
+   * stop drains still runs; once stop has saved the pins and watermarks,
+   * nothing more changes them, so it takes nothing until it starts again. A
+   * call before start is taken, as it always was (a generated file's read
+   * needs no store at all): in the host's order, start runs first, and
+   * initStore applies the saved pins.
+   */
+  private running(): boolean {
+    return !this.stopped;
   }
 
   private getStore(): JsStore {
@@ -2876,7 +2898,7 @@ export class WorkspaceModule implements Module {
    */
   private async handleFsChanges(mountName: string, changes: FsChange[]): Promise<void> {
     const mount = this.mounts.get(mountName);
-    if (!this.store || !mount) return;
+    if (!this.store || !this.running() || !mount) return;
     const paths = [...new Set(changes.map((c) => c.path))];
     if (paths.length === 0) return;
     await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'paths', paths }));
@@ -2895,7 +2917,7 @@ export class WorkspaceModule implements Module {
     // Every agent's workspace is the store's current branch, so the agent
     // that ran the batch doesn't choose what is scanned.
     const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
-    if (mounts.length === 0 || !this.store) return;
+    if (mounts.length === 0 || !this.store || !this.running()) return;
     const deadlineMs = this.agentActionScanDeadlineMs();
     await Promise.all(mounts.map(async (mount) => {
       const runningLate = mount.agentActionScanLate !== undefined;
