@@ -632,12 +632,14 @@ describe('strict routing hunt: turn start / turn end (ROUTING_STRICT=true)', () 
 
   // -------------------------------------------------------------------------
   // H9: async subagent returns. A subagent spawned by a DM turn returns
-  // later via ctx.addMessage (no metadata → strictMessagePlace null, the
-  // S2 "subagent return" exemption) + an `inference-request` wake (no
-  // channelId → strict place = home). If a world turn is running when it
-  // returns, the DM task's result is injected into the world turn; the wake
-  // it raises is answered in the home channel. Mirrors
-  // SubagentModule.deliverAsyncResult exactly.
+  // later via ctx.addMessage + an `inference-request` wake. Spec S2/S4 treat
+  // channel-less module content as a non-channel framework message (heard
+  // mid-turn) and a module's wake as channel-less (home channel) — see the
+  // round-2 R2-SPEC-S2 / R2-SPEC-S4 cases. A module that RELAYS material
+  // belonging to a place names that place (channelId + serverId) on both
+  // the content and the wake: then, if a world turn is running when it
+  // returns, the DM task's result is held from the world turn, and the wake
+  // it raises is answered in the DM — never in the world or at home.
   // -------------------------------------------------------------------------
   it('H9: an async subagent spawned for a DM must not return its result into a world turn or a home-channel turn', async () => {
     const h = await harness();
@@ -653,8 +655,13 @@ describe('strict routing hunt: turn start / turn end (ROUTING_STRICT=true)', () 
 
     h.probe.hooks.push(async () => {
       // The diver (spawned in the DM turn) finishes while the world turn runs.
-      h.probe.ctx!.addMessage('user', [text("[Subagent 'diver' returned]\n\nThe biopsy report says: positive.")]);
-      h.probe.ctx!.pushEvent({ type: 'inference-request', agentName: AGENT, reason: 'subagent-completed:diver', source: 'subagent' } as unknown as ProcessEvent);
+      // The relaying module names the DM the subagent was spawned for.
+      h.probe.ctx!.addMessage('user', [text("[Subagent 'diver' returned]\n\nThe biopsy report says: positive.")],
+        { channelId: DM, serverId: 'discord' } as never);
+      h.probe.ctx!.pushEvent({
+        type: 'inference-request', agentName: AGENT, reason: 'subagent-completed:diver', source: 'subagent',
+        channelId: DM, serverId: 'discord',
+      } as unknown as ProcessEvent);
       await settle();
     });
     h.fw.pushEvent(worldEvent('@resident look at the fountain'));
@@ -666,6 +673,8 @@ describe('strict routing hunt: turn start / turn end (ROUTING_STRICT=true)', () 
     assert.deepEqual(publishedTo(h, HOME), [],
       'LEAK: the subagent-completion turn published the DM\'s private result in the home channel');
     assert.deepEqual(publishedTo(h, WORLD), ['Admiring the fountain.', 'Lovely plaza.']);
+    assert.deepEqual(h.turnLoci, [DM, WORLD, DM], 'the relayed return is answered in the DM it belongs to');
+    assert.deepEqual(publishedTo(h, DM).slice(-1), ['Your diver says: the biopsy came back positive.']);
   });
 
   // -------------------------------------------------------------------------
@@ -870,4 +879,467 @@ test('H1: a turn for place A must not swallow the wake of place B\'s deferred ba
     restore();
     void f.close();
   }
+});
+
+// ===========================================================================
+// Round 2: turn start / turn end, after the round-1 fixes.
+// ===========================================================================
+
+/** Emulates the ChannelRegistry ingress: the gate decides triggerInference
+ *  (debounce → false now, a gate wake later), as in H5. */
+function gateIngress(h: Harness) {
+  const shouldTrigger = h.internals.eventGate!.asShouldTriggerCallback();
+  return (serverId: string, channelId: string, body: string): boolean => {
+    const decision = shouldTrigger(body, {
+      eventType: 'mcpl:channel-incoming', serverId, channelId, messageId: nextId('g'),
+      author: { id: 'visitor', name: 'visitor' }, tags: ['chat:mention', 'chat:addressed'],
+    });
+    h.fw.pushEvent(channelEvent(serverId, channelId, body, { waking: decision, addressed: true }));
+    return decision;
+  };
+}
+
+/** Index of the first turn whose locus is `channelId` (-1 when none ran). */
+const turnIndexOf = (h: Harness, channelId: string): number => h.turnLoci.indexOf(channelId);
+
+/** Every turn that ran BEFORE `place`'s own turn must not contain `secret`;
+ *  then `place` must have had a turn of its own. */
+function assertHeldUntilOwnTurn(h: Harness, place: string, secret: RegExp, what: string): void {
+  const own = turnIndexOf(h, place);
+  const before = own === -1 ? h.membrane.calls.length : own;
+  for (let k = 0; k < before; k++) {
+    assert.doesNotMatch(requestText(h.membrane.calls[k]), secret,
+      `LEAK: ${what} is in the context of turn #${k} (locus ${h.turnLoci[k]}) before its own turn ` +
+      `(turns: ${JSON.stringify(h.turnLoci)})`);
+  }
+  assert.notEqual(own, -1,
+    `LOSS: ${what} (a waking message) never got a turn of its own — turns ran for ${JSON.stringify(h.turnLoci)}`);
+}
+
+describe('strict routing hunt round 2: turn start / turn end (ROUTING_STRICT=true)', () => {
+  let dir: string;
+  let restore: () => void;
+  const harnesses: Harness[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'strict-hunt-r2-'));
+    restore = setStrict(true);
+  });
+
+  afterEach(async () => {
+    for (const h of harnesses.splice(0)) {
+      await Promise.all([...h.probe.inFlight]);
+      try { await h.fw.runUntilIdle(); } catch { /* best effort */ }
+      try { await h.fw.stop(); } catch { /* already stopped */ }
+    }
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function harness(opts: HarnessOpts = {}): Promise<Harness> {
+    const h = await makeHarness(dir, opts);
+    harnesses.push(h);
+    return h;
+  }
+
+  // -------------------------------------------------------------------------
+  // R2-1: one debounce policy covering several channels (a glob such as
+  // `discord:G1:*`, or `source: discord`). Two addressed messages from two
+  // places land in ONE debounce batch; the gate delivers ONE wake whose
+  // route is the batch's newest addressed event (wakeProvenance), and
+  // pendingWakeRoutes() reports only that route. The earlier place's message
+  // (held as a gate wake at its arrival) loses its pending wake the moment
+  // the later one joins the batch: the routed turn's start releases it into
+  // that turn's context, and nothing ever re-arms its own turn.
+  // -------------------------------------------------------------------------
+  it('R2-1: a debounce batch spanning two places gives each place its own turn; neither sees the other first', async () => {
+    const h = await harness({
+      gatePolicies: [{ name: 'guild-debounce', match: { channel: 'discord:G1:*' }, behavior: { debounce: 120 } }],
+    });
+    const ingress = gateIngress(h);
+    h.membrane
+      .turn(final(text('first answer')))
+      .turn(final(text('second answer')));
+
+    assert.equal(ingress('discord', PRIVATE, '@resident private: the salary list is attached'), false, 'debounced');
+    await settle(10);
+    assert.equal(ingress('discord', HOME, '@resident hello at home'), false, 'debounced (same batch)');
+    await settle(260); // the batch fires once
+    await h.fw.runUntilIdle();
+    await settle(20);
+    await h.fw.runUntilIdle();
+
+    assertHeldUntilOwnTurn(h, PRIVATE, /salary list/, 'the private-channel message');
+    assert.ok(!publishedTo(h, HOME).some((t) => /salary/.test(t)));
+    assert.deepEqual(h.turnLoci, [PRIVATE, HOME], 'one turn per place, earliest first');
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-2: per-channel debounce policies whose timers fire while a turn runs.
+  // fireDebounce() puts every batch into ONE gate inference buffer
+  // (inferring.size > 0); at the turn's end the buffer is delivered as one
+  // batch → one wake → one place. The other buffered place's addressed
+  // message was held mid-turn as a plain 'hold' (no strictWake), has no
+  // pending wake once the buffer's single route is computed, and is released
+  // as ambient at the DM turn's teardown — into the context of the routed
+  // place's turn — and never answered in a turn of its own.
+  // -------------------------------------------------------------------------
+  it('R2-2: two places debounced during a turn each get their own turn after it (the gate buffer is one batch)', async () => {
+    const h = await harness({
+      gatePolicies: [
+        { name: 'private-debounce', match: { channel: PRIVATE }, behavior: { debounce: 20 } },
+        { name: 'world-debounce', match: { channel: WORLD }, behavior: { debounce: 20 } },
+      ],
+    });
+    const ingress = gateIngress(h);
+    h.membrane
+      .turn(
+        round(text('Let me check.'), tool('c1', 'probe--wait')),
+        final(text('dm done')),
+      )
+      .turn(final(text('second answer')))
+      .turn(final(text('third answer')));
+    h.probe.hooks.push(async () => {
+      assert.equal(ingress('discord', PRIVATE, '@resident private: payroll numbers attached'), false);
+      await settle(5);
+      assert.equal(ingress('eidoverse', WORLD, '@resident hello from the plaza'), false);
+      await settle(80); // both debounce timers fire while the DM turn is inferring
+    });
+    h.fw.pushEvent(dmEvent('private: quick question'));
+    await h.fw.runUntilIdle();
+    await settle(30);
+    await h.fw.runUntilIdle();
+
+    assert.equal(h.turnLoci[0], DM);
+    assertHeldUntilOwnTurn(h, PRIVATE, /payroll numbers/, 'the private-channel message');
+    assert.deepEqual(h.turnLoci, [DM, PRIVATE, WORLD], 'each held place answered in its own turn, in arrival order');
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-3: resume() clears the gate's quiesce (setQuiesced(false) splices the
+  // inference buffer and schedules deliverEvents as a MICROTASK) and then
+  // runs flushDeferredWrites('resume') synchronously up to its partition. In
+  // that gap the buffered (debounced) place's wake is neither in the gate
+  // nor in pendingRequests, so strictReleasable('idle') releases its held
+  // message as if ambient. The DM's parked wake (earlier arrival) then runs
+  // first with the private channel's waking message in its context.
+  // -------------------------------------------------------------------------
+  it('R2-3: a debounced place parked by a quiesce is not visible to an earlier place\'s turn after resume', async () => {
+    const h = await harness({
+      gatePolicies: [{ name: 'private-debounce', match: { channel: PRIVATE }, behavior: { debounce: 20 } }],
+    });
+    const ingress = gateIngress(h);
+    h.membrane.turn(final(text('dm answer'))).turn(final(text('private answer')));
+
+    await h.fw.quiesce({ reason: 'maintenance' });
+    h.fw.pushEvent(dmEvent('private: first, during maintenance'));
+    await h.fw.runUntilIdle();
+    await settle(5);
+    assert.equal(ingress('discord', PRIVATE, '@resident private: payroll numbers attached'), false);
+    await settle(80); // the debounce fires into the quiesced gate's buffer
+    await h.fw.runUntilIdle();
+
+    await h.fw.resume();
+    await h.fw.runUntilIdle();
+    await settle(20);
+    await h.fw.runUntilIdle();
+
+    assert.equal(h.turnLoci[0], DM, 'the DM arrived first');
+    assertHeldUntilOwnTurn(h, PRIVATE, /payroll numbers/, 'the debounced private-channel message');
+    assert.deepEqual(publishedTo(h, PRIVATE), ['private answer']);
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-4: module notes. The spec's hold boundary keeps "non-channel framework
+  // messages: module notes, ..." flowing mid-turn. stampModulePlace() files
+  // EVERY ModuleContext.addMessage without a channel under the private
+  // NOWHERE place, so a module's note about the running turn itself — the
+  // TTS relay's "[voice] your reply was interrupted after: …", the time
+  // module's notes — is held from the turn it is about and only stored after
+  // it ends (no wake: it is not answered either). (Round-1 H9 holds async
+  // subagent returns the same way on purpose; a fix has to tell a module's
+  // own note from content it relays.)
+  // -------------------------------------------------------------------------
+  it('R2-4: a module note added mid-turn (no channel) is still heard at the next round boundary', async () => {
+    const h = await harness();
+    await runR24(h);
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-5: brake pedal during an inference-error retry. A retryable stream
+  // error resets the agent to 'idle' and the error policy retries the SAME
+  // turn after a backoff (1 s, 2 s, 4 s) from inside driveStream — the turn
+  // stays alive (token held) while the event loop keeps processing events.
+  // interruptForPrivileged() only aborts inferring/streaming/waiting agents,
+  // so a privileged STOP during the backoff (or the retry's compile) brakes
+  // nothing. Upstream still delivers it: deferred, then injected at the
+  // retried turn's first round boundary. Strict holds it as another place's
+  // message, so the runaway turn neither stops nor hears the operator.
+  // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // R2-6: a DEBOUNCED in-world whisper. The eidoverse door delivers a
+  // whisper on the PUBLIC world channel tagged chat:dm + chat:private; strict
+  // files it under a one-party place whose turn publishes nowhere (round-1
+  // publication H4). But a gate wake knows only routeChannelId/routeServerId:
+  // the debounced batch's wake (and pendingWakeRoutes) name the PUBLIC world
+  // place. The whisper is held at arrival (its party place has no pending
+  // wake), the gate's wake starts a public world turn, that turn's start
+  // releases the whisper (no wake for its party place) as the turn's input,
+  // and the reply to the private whisper is said aloud to the whole world.
+  // -------------------------------------------------------------------------
+  it('R2-6: a debounced whisper is never answered aloud on the public world channel', async () => {
+    const h = await harness({
+      gatePolicies: [{ name: 'world-debounce', match: { channel: WORLD }, behavior: { debounce: 40 } }],
+    });
+    const shouldTrigger = h.internals.eventGate!.asShouldTriggerCallback();
+    const whisperTags = ['chat:dm', 'chat:private', 'chat:addressed', 'eidoverse:whisper'];
+    const body = 'mira: (whispers to you) my locker code is 4471, keep it between us';
+    const decision = shouldTrigger(body, {
+      eventType: 'mcpl:channel-incoming', serverId: 'eidoverse', channelId: WORLD, messageId: nextId('g'),
+      author: { id: 'mira', name: 'mira' }, tags: whisperTags,
+    });
+    assert.equal(decision, false, 'debounced');
+    h.membrane.turn(final(text('Got it, 4471 stays between us.')));
+    h.fw.pushEvent({
+      type: 'mcpl:channel-incoming',
+      serverId: 'eidoverse',
+      channelId: WORLD,
+      messageId: nextId('w'),
+      author: { id: 'mira', name: 'mira' },
+      content: [{ type: 'text', text: body }],
+      timestamp: new Date().toISOString(),
+      metadata: { mentioned: true, isExplicitMention: true },
+      tags: whisperTags,
+      triggerInference: decision,
+    } as unknown as ProcessEvent);
+    await h.fw.runUntilIdle();
+    await settle(120); // the debounce fires
+    await h.fw.runUntilIdle();
+
+    assert.equal(h.membrane.calls.length, 1, 'the debounced whisper woke a turn');
+    assert.deepEqual(publishedTo(h, WORLD), [],
+      'LEAK: the reply to a private (debounced) whisper was said aloud on the public world channel');
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-7: durability of a DEBOUNCED waking message held mid-turn. Round 1
+  // made a gate-owed wake survive a crash by stamping `strictWake` — but only
+  // when the message is held while the agent is idle (strictHoldOnArrival
+  // returns plain 'hold' as soon as a turn is alive, before it ever looks at
+  // the gate). The debounce timer / inference buffer is in memory; a stop
+  // (or kill -9) mid-turn takes it, and at the next boot the restored
+  // message has neither `triggered` nor `strictWake`: rearmStrictHeldWakes
+  // skips it and it is stored as ambient — its place never gets the turn
+  // the gate had promised (a direct wake in the same spot is re-armed: FH1).
+  // -------------------------------------------------------------------------
+  it('R2-7: a debounced message held mid-turn keeps its own turn across a stop/restart', async () => {
+    const policies = [{ name: 'private-debounce', match: { channel: PRIVATE }, behavior: { debounce: 400 } }];
+    const a = await makeHarness(dir, { gatePolicies: policies });
+    const ingress = gateIngress(a);
+    a.membrane.turn(
+      round(text('Long task.'), tool('c1', 'probe--wait')),
+      final(text('never delivered')),
+    );
+    a.probe.hooks.push(async () => {
+      assert.equal(ingress('discord', PRIVATE, '@resident private: payroll numbers attached'), false, 'debounced');
+      // The tool never returns: the process goes down mid-turn.
+      await new Promise<void>(() => {});
+    });
+    a.fw.start();
+    a.fw.pushEvent(dmEvent('private: begin'));
+    await waitFor('the private-channel message to be held', () =>
+      a.internals.deferredMessages.some((m) => m.metadata?.channelId === PRIVATE));
+    await a.fw.stop();
+
+    const b = await harness({ gatePolicies: policies });
+    b.membrane.turn(final(text('Sorry for the wait — got the payroll file.')));
+    await b.fw.runUntilIdle();
+    await settle(20);
+    await b.fw.runUntilIdle();
+
+    assert.deepEqual(b.turnLoci, [PRIVATE],
+      'LOSS: the debounced (waking) private-channel message held mid-turn was demoted to ambient by the restart');
+    assert.deepEqual(publishedTo(b, PRIVATE), ['Sorry for the wait — got the payroll file.']);
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-8 (minor): the gate's batched-wake notice. deliverEvents() writes
+  // "[Gate: N events matched] — 1 message in #<channel> … already shown above
+  // at arrival" with no channelId, so strictMessagePlace() treats it as a
+  // framework marker: never held, stored into whichever turn comes next.
+  // When another place's turn is about to start (here: dequeued and parked
+  // behind an auxiliary call), that turn reads a notice naming the private
+  // channel and claiming its message was already shown — while the message
+  // itself is (correctly) held for its own turn.
+  // -------------------------------------------------------------------------
+  it('R2-8: a gate notice about a held place is not shown to another place\'s turn', async () => {
+    const h = await harness({
+      gatePolicies: [{ name: 'private-debounce', match: { channel: PRIVATE }, behavior: { debounce: 30 } }],
+    });
+    const i = h.internals;
+    const ingress = gateIngress(h);
+    h.membrane.turn(final(text('dm answer'))).turn(final(text('private answer')));
+    let release!: () => void;
+    const aux = i.withAuxiliaryAdmission(AGENT, () => new Promise<void>((resolve) => { release = resolve; }));
+    await settle(5);
+
+    assert.equal(ingress('discord', PRIVATE, '@resident private: payroll numbers attached'), false, 'debounced');
+    h.fw.pushEvent(dmEvent('private: quick DM question'));
+    await i.processNextEvent(); // the private-channel message (held: its wake is owed by the gate)
+    await i.processNextEvent(); // the DM: its wake is dequeued and parks on the auxiliary call
+    await settle(90);           // the debounce fires while nothing is inferring
+    release();
+    await aux;
+    await h.fw.runUntilIdle();
+    await settle(20);
+    await h.fw.runUntilIdle();
+
+    assert.deepEqual(h.turnLoci, [DM, PRIVATE]);
+    assert.doesNotMatch(requestText(h.membrane.calls[0]), /payroll/, 'the message itself is held');
+    assert.doesNotMatch(requestText(h.membrane.calls[0]), /discord:G1:private/,
+      'LEAK (metadata): the DM turn reads a gate notice naming the private channel\'s held message as "already shown"');
+  });
+
+  it('R2-5: a privileged STOP sent during an error-retry backoff still brakes (or reaches) the running turn', async () => {
+    const h = await harness({ privileged: true });
+    const { aborted, heard } = await runR25(h);
+    assert.ok(aborted || heard,
+      'REGRESSION: the brake pedal did nothing — the retried world turn was neither aborted nor told about the privileged STOP');
+  });
+
+  // -------------------------------------------------------------------------
+  // R2-5b: the same brake gap while the world turn is dequeued but PARKED
+  // behind an in-flight auxiliary call (H4's window). Nothing is streaming,
+  // so interruptForPrivileged() aborts nothing and the STOP carries no
+  // strictBrake; strict holds it from the parked turn (its own place is the
+  // DM). Upstream stores it before the world turn compiles, so that turn
+  // reads the STOP. Strict starts the world turn as if the operator had said
+  // nothing, and only answers the STOP after the world turn has run.
+  // -------------------------------------------------------------------------
+  it('R2-5b: a privileged STOP that lands while the world turn waits for auxiliary admission is not ignored by that turn', async () => {
+    const h = await harness({ privileged: true });
+    const r = await runR25b(h);
+    assert.ok(r.dmFirst || r.heard || r.aborted,
+      `REGRESSION: the world turn ran first without the privileged STOP (turns: ${JSON.stringify(h.turnLoci)})`);
+  });
+});
+
+async function runR25b(h: Harness): Promise<{ dmFirst: boolean; heard: boolean; aborted: boolean }> {
+  const i = h.internals;
+  h.membrane
+    .turn(final(text('Tower built, three floors!')))
+    .turn(final(text('Stopped, as you asked.')));
+  let release!: () => void;
+  const aux = i.withAuxiliaryAdmission(AGENT, () => new Promise<void>((resolve) => { release = resolve; }));
+  await settle(5);
+  h.fw.pushEvent(worldEvent('@resident build a tall tower'));
+  await i.processNextEvent(); // the world wake is dequeued and parks on the auxiliary call
+  h.fw.pushEvent(dmEvent('private: STOP, do not build anything', { authorId: OPERATOR }));
+  await i.processNextEvent();
+  release();
+  await aux;
+  await h.fw.runUntilIdle();
+  await settle(20);
+  await h.fw.runUntilIdle();
+  return {
+    dmFirst: h.turnLoci[0] === DM,
+    heard: /STOP, do not build/.test(requestText(h.membrane.calls[0])),
+    aborted: h.traces.some((t) => t.type === 'inference:aborted' && t.reason === 'privileged-interrupt'),
+  };
+}
+
+/** A stream that fails at once with a retryable (non-Membrane) error. */
+class FailingStream extends MockYieldingStream {
+  constructor() {
+    super([]);
+    (this as unknown as { events: unknown[] }).events = [{ type: 'error', error: new Error('provider overloaded (529)') }];
+  }
+}
+
+async function runR25(h: Harness): Promise<{ aborted: boolean; heard: boolean }> {
+  const scripted = h.membrane.streamYielding.bind(h.membrane);
+  let failNext = true;
+  h.membrane.streamYielding = (request: NormalizedRequest) => {
+    if (!failNext) return scripted(request);
+    failNext = false;
+    h.membrane.calls.push(request);
+    const failing = new FailingStream();
+    h.membrane.streams.push(failing);
+    return failing;
+  };
+  h.membrane
+    .turn(
+      round(text('Building floor two.'), tool('c1', 'probe--wait')),
+      final(text('Third floor done.')),
+    )
+    .turn(final(text('Stopped, as you asked.')));
+  let sent = false;
+  h.fw.onTrace((event) => {
+    const e = event as { type: string };
+    if (e.type === 'inference:failed' && !sent) {
+      sent = true;
+      // The operator hits the brake while the turn waits out its retry backoff.
+      setTimeout(() => h.fw.pushEvent(dmEvent('private: STOP building now', { authorId: OPERATOR })), 100);
+    }
+  });
+  h.fw.pushEvent(worldEvent('@resident build a tall tower'));
+  await h.fw.runUntilIdle();
+  await settle(50);
+  await h.fw.runUntilIdle();
+  assert.equal(h.turnLoci[0], WORLD);
+  assert.ok(sent, 'the first attempt failed and was retried');
+  const aborted = h.traces.some((t) => t.type === 'inference:aborted' && t.reason === 'privileged-interrupt');
+  const heard = h.membrane.streams.some((s) => /STOP building now/.test(injectedText(s)));
+  return { aborted, heard };
+}
+
+async function runR24(h: Harness): Promise<void> {
+  h.membrane.turn(
+    round(text('Reading it aloud now.'), tool('c1', 'probe--wait')),
+    final(text('And that is the end of the story.')),
+  );
+  h.probe.hooks.push(async () => {
+    h.probe.ctx!.addMessage('user', [text('[voice] Your reply was interrupted by user speech after: "Reading it"')]);
+    await settle();
+  });
+  h.fw.pushEvent(dmEvent('please read me the story'));
+  await h.fw.runUntilIdle();
+  assert.match(injectedText(h.membrane.streams[0]), /Your reply was interrupted/,
+    'REGRESSION: a module note about the running turn was held from that turn (not heard at the next boundary)');
+}
+
+describe('strict routing hunt round 2 controls (flags unset)', () => {
+  async function withUpstream(opts: HarnessOpts, run: (h: Harness) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'strict-hunt-r2-ctl-'));
+    const restore = setStrict(false);
+    const h = await makeHarness(dir, opts);
+    try {
+      await run(h);
+    } finally {
+      await Promise.all([...h.probe.inFlight]);
+      await h.fw.runUntilIdle();
+      await h.fw.stop();
+      restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('R2-4 control: upstream injects a mid-turn module note at the next round boundary', async () => {
+    await withUpstream({}, runR24);
+  });
+
+  it('R2-5b control: upstream lets the parked world turn read the privileged STOP', async () => {
+    await withUpstream({ privileged: true }, async (h) => {
+      const r = await runR25b(h);
+      assert.equal(r.heard, true, 'upstream: the STOP is stored before the parked turn compiles');
+    });
+  });
+
+  it('R2-5 control: upstream cannot abort an idle retry either, but the retried turn hears the STOP', async () => {
+    await withUpstream({ privileged: true }, async (h) => {
+      const { aborted, heard } = await runR25(h);
+      assert.equal(aborted, false, 'upstream: nothing streaming to abort during the backoff');
+      assert.equal(heard, true, 'upstream: the STOP is injected at the retried turn\'s first boundary');
+    });
+  });
 });

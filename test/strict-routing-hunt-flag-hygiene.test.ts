@@ -26,6 +26,8 @@ import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-gr
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { wakeProvenance } from '../src/gate/event-gate.js';
+import { channelPlace } from '../src/strict-places.js';
 
 const AGENT = 'resident';
 const DM = 'discord:dm:42';
@@ -845,5 +847,532 @@ describe('strict routing hunt — flag hygiene controls (flags unset)', () => {
     assert.equal(existsSync(join(dir, 'store', 'recovery', 'deferred-writes.json'))
       ? /BIG-ATTACHMENT/.test(readFileSync(join(dir, 'store', 'recovery', 'deferred-writes.json'), 'utf8'))
       : false, false);
+  });
+});
+
+// ===========================================================================
+// Round 2 — flag hygiene & durability against the place model (9bc7d19,
+// 6ebad6a). Cases that FAIL against the implementation are the findings;
+// the passing ones are controls.
+// ===========================================================================
+
+type GatePolicies = unknown[];
+
+async function makeGateHarness(
+  storeDir: string,
+  gateDir: string,
+  policies: GatePolicies,
+  opts: { membrane?: ScriptedMembrane; probe?: ProbeModule; privileged?: boolean; homeChannel?: string | null } = {},
+): Promise<Harness> {
+  const membrane = opts.membrane ?? new ScriptedMembrane();
+  const probe = opts.probe ?? new ProbeModule();
+  if (opts.privileged) writeFileSync(join(gateDir, 'privileged.json'), JSON.stringify([OPERATOR]));
+  const fw = await AgentFramework.create({
+    storePath: storeDir,
+    membrane: membrane.asMembrane(),
+    agents: [{ name: AGENT, model: 'test-model', systemPrompt: 'You are a resident.' }],
+    modules: [probe],
+    ...(opts.homeChannel === null ? {} : { homeChannel: opts.homeChannel ?? HOME }),
+    gate: {
+      configPath: join(gateDir, 'gate.json'),
+      config: { policies: policies as never[], default: 'always' as const },
+      ...(opts.privileged ? { privilegedUsersPath: join(gateDir, 'privileged.json') } : {}),
+    },
+  } as never);
+  const turnLoci: Array<string | undefined> = [];
+  fw.onTrace((event) => {
+    const e = event as { type: string; [k: string]: unknown };
+    if (e.type === 'inference:started' && e.agentName === AGENT) turnLoci.push(e.channelId as string | undefined);
+  });
+  return { fw, membrane, probe, turnLoci, internals: internalsOf(fw), ...attachRegistry(fw) };
+}
+
+/** Emulates the ChannelRegistry ingress: the gate decides triggerInference
+ *  for an addressed world mention (a debounce policy answers false and owes
+ *  the wake), then the event is delivered with that verdict. */
+function ingressWorldMention(h: Harness, body: string): boolean {
+  const gate = (h.fw as unknown as {
+    eventGate: { asShouldTriggerCallback(): (c: string, m: Record<string, unknown>) => boolean };
+  }).eventGate;
+  const tags = ['chat:mention', 'chat:addressed'];
+  const decision = gate.asShouldTriggerCallback()(body, {
+    eventType: 'mcpl:channel-incoming', serverId: 'eidoverse', channelId: WORLD, messageId: nextId('g'),
+    author: { id: 'visitor', name: 'visitor' }, tags,
+  });
+  h.fw.pushEvent({
+    type: 'mcpl:channel-incoming',
+    serverId: 'eidoverse',
+    channelId: WORLD,
+    messageId: nextId('w'),
+    author: { id: 'visitor', name: 'visitor' },
+    content: [text(body)],
+    timestamp: new Date().toISOString(),
+    metadata: {},
+    tags,
+    triggerInference: decision,
+  } as unknown as ProcessEvent);
+  return decision;
+}
+
+describe('strict routing hunt round 2 — flag hygiene & durability (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=false)', () => {
+  let dir: string;
+  const saved: Partial<Record<(typeof FLAGS)[number], string | undefined>> = {};
+  const live: AgentFramework[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'strict-hunt-hyg2-'));
+    for (const f of FLAGS) saved[f] = process.env[f];
+    process.env.ROUTING_STRICT = 'true';
+    process.env.CHANNEL_OPEN_ON_SEND = 'false';
+    process.env.ROUTING_NO_SILENCE_ON_SEND = 'true';
+  });
+
+  afterEach(async () => {
+    for (const fw of live.splice(0)) {
+      try { await fw.stop(); } catch { /* already stopped */ }
+    }
+    for (const f of FLAGS) {
+      if (saved[f] === undefined) delete process.env[f];
+      else process.env[f] = saved[f];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const WORLD_DEBOUNCE: GatePolicies = [
+    { name: 'world-debounce', match: { channel: WORLD }, behavior: { debounce: 60_000 } },
+  ];
+
+  /** A DM turn hanging forever in a tool round, with a gate configured. */
+  async function gateDmTurnHanging(storeDir: string, policies: GatePolicies, during: (h: Harness) => void | Promise<void>): Promise<Harness> {
+    const membrane = new ScriptedMembrane();
+    const probe = new ProbeModule();
+    const h = await makeGateHarness(storeDir, dir, policies, { membrane, probe });
+    live.push(h.fw);
+    membrane.turn(round(text('Thinking about your DM.'), tool('c1', 'probe--wait')), final(text('never delivered')));
+    let arrived = false;
+    probe.hooks.push(async () => {
+      await during(h);
+      await settle();
+      arrived = true;
+      await never();
+    });
+    h.fw.start();
+    h.fw.pushEvent(dmEvent('private: a long question'));
+    await waitFor('the mid-turn arrival', () => arrived);
+    return h;
+  }
+
+  function crashSnapshot(from: string): string {
+    const to = join(dir, `crash-${++counter}`);
+    cpSync(from, to, { recursive: true });
+    return to;
+  }
+
+  it('R2-control: live path — a DEBOUNCED world mention held mid-DM-turn is answered in its own world turn when the debounce fires', async () => {
+    const policies: GatePolicies = [{ name: 'world-debounce', match: { channel: WORLD }, behavior: { debounce: 150 } }];
+    const membrane = new ScriptedMembrane();
+    const probe = new ProbeModule();
+    const h = await makeGateHarness(join(dir, 'store'), dir, policies, { membrane, probe });
+    live.push(h.fw);
+    membrane
+      .turn(round(text('Thinking about your DM.'), tool('c1', 'probe--wait')), final(text('DM answer.')))
+      .turn(final(text('On my way to the plaza.')));
+    probe.hooks.push(async () => {
+      assert.equal(ingressWorldMention(h, '@resident DEBOUNCED-MENTION are you coming?'), false, 'precondition: debounced');
+      await settle();
+    });
+    h.fw.start();
+    h.fw.pushEvent(dmEvent('private: a quick question'));
+    await waitFor('the world turn', () => publishedTo(h, WORLD).length > 0, 4000);
+    assert.deepEqual(publishedTo(h, WORLD), ['On my way to the plaza.']);
+    assert.ok(!publishedTo(h, DM).some((t) => /plaza/.test(t)));
+  });
+
+  it('R2-FH9: a DEBOUNCED world mention held mid-DM-turn must keep its wake across a kill -9 (it is demoted to ambient and never answered)', async () => {
+    // strictHoldOnArrival stamps `strictWake` (the crash re-arm marker) only
+    // on its idle 'gate-wake' branch. While a turn for ANOTHER place is alive
+    // it returns plain 'hold' first, so a message whose wake the gate still
+    // owes (debounce timer / inference buffer — memory-only) is mirrored with
+    // triggered=false and no strictWake. A kill -9 before the debounce fires
+    // re-arms nothing: the boot flush stores the mention as ambient.
+    const store = join(dir, 'store');
+    const a = await gateDmTurnHanging(store, WORLD_DEBOUNCE, (h) => {
+      assert.equal(ingressWorldMention(h, '@resident DEBOUNCED-MENTION are you coming?'), false, 'precondition: debounced');
+    });
+    await waitFor('the debounced mention to be held', () =>
+      a.internals.deferredMessages.some((m) => /DEBOUNCED-MENTION/.test(blockText(m.content))));
+    assert.doesNotMatch(windowTexts(a.fw).join('\n'), /DEBOUNCED-MENTION/, 'held, not stored');
+    const snap = crashSnapshot(store);
+
+    const membrane2 = new ScriptedMembrane().turn(final(text('On my way to the plaza.')));
+    const b = await makeGateHarness(snap, dir, WORLD_DEBOUNCE, { membrane: membrane2 });
+    live.push(b.fw);
+    await b.fw.runUntilIdle();
+    await settle(100);
+    await b.fw.runUntilIdle();
+
+    assert.equal(windowTexts(b.fw).filter((t) => /DEBOUNCED-MENTION/.test(t)).length, 1, 'stored exactly once');
+    assert.deepEqual(publishedTo(b, WORLD), ['On my way to the plaza.'],
+      'LOSS: the waking (debounced) world mention lost its wake across the crash — stored as ambient, never answered');
+  });
+
+  it('R2-FH10: a DEBOUNCED world mention held mid-DM-turn must keep its wake across a graceful stop + restart', async () => {
+    // Same gap through framework.stop(): stop() disposes the gate (debounce
+    // timers and inference buffer die), the aborted DM turn's teardown keeps
+    // the mention held (its gate wake still counts as pending at that
+    // instant), and the recovery file carries it without a wake marker.
+    const store = join(dir, 'store');
+    const a = await gateDmTurnHanging(store, WORLD_DEBOUNCE, (h) => {
+      assert.equal(ingressWorldMention(h, '@resident DEBOUNCED-STOP are you coming?'), false, 'precondition: debounced');
+    });
+    await waitFor('the debounced mention to be held', () =>
+      a.internals.deferredMessages.some((m) => /DEBOUNCED-STOP/.test(blockText(m.content))));
+    await a.fw.stop();
+    live.splice(live.indexOf(a.fw), 1);
+
+    const membrane2 = new ScriptedMembrane().turn(final(text('On my way to the plaza.')));
+    const b = await makeGateHarness(store, dir, WORLD_DEBOUNCE, { membrane: membrane2 });
+    live.push(b.fw);
+    await b.fw.runUntilIdle();
+    await settle(100);
+    await b.fw.runUntilIdle();
+
+    assert.equal(windowTexts(b.fw).filter((t) => /DEBOUNCED-STOP/.test(t)).length, 1, 'stored exactly once');
+    assert.deepEqual(publishedTo(b, WORLD), ['On my way to the plaza.'],
+      'LOSS: the waking (debounced) world mention lost its wake across stop/restart — never answered');
+  });
+
+  it('R2-control: an IDLE debounced world mention (held for its gate wake) does keep its wake across a kill -9', async () => {
+    // The 'gate-wake' branch: with no turn alive, the hold stamps strictWake
+    // and the boot re-arms it. Shows R2-FH9/FH10 are the turn-alive gap only.
+    const policies: GatePolicies = WORLD_DEBOUNCE;
+    const store = join(dir, 'store');
+    const a = await makeGateHarness(store, dir, policies);
+    live.push(a.fw);
+    a.fw.start();
+    assert.equal(ingressWorldMention(a, '@resident IDLE-DEBOUNCED hello?'), false, 'precondition: debounced');
+    await waitFor('the debounced mention to be held', () =>
+      a.internals.deferredMessages.some((m) => /IDLE-DEBOUNCED/.test(blockText(m.content))));
+    const snap = crashSnapshot(store);
+
+    const membrane2 = new ScriptedMembrane().turn(final(text('Hello plaza.')));
+    const b = await makeGateHarness(snap, dir, policies, { membrane: membrane2 });
+    live.push(b.fw);
+    await b.fw.runUntilIdle();
+    assert.deepEqual(publishedTo(b, WORLD), ['Hello plaza.']);
+  });
+});
+
+describe('strict routing hunt round 2 — flag hygiene (flags unset)', () => {
+  const saved: Partial<Record<(typeof FLAGS)[number], string | undefined>> = {};
+
+  beforeEach(() => {
+    for (const f of FLAGS) { saved[f] = process.env[f]; delete process.env[f]; }
+  });
+
+  afterEach(() => {
+    for (const f of FLAGS) {
+      if (saved[f] === undefined) delete process.env[f];
+      else process.env[f] = saved[f];
+    }
+  });
+
+  it('R2-HY1: flags unset, a batched gate wake hands the host the upstream provenance shape (no routeServerId)', () => {
+    // 9bc7d19 adds `routeServerId` to wakeProvenance() unconditionally: every
+    // gate-requested wake (EventGate requestInference callback — a public
+    // host contract, also used by hosts that construct EventGate directly)
+    // now carries a field upstream never sent, with ROUTING_STRICT unset.
+    const events = [{
+      policyName: 'chat', content: 'hi', eventType: 'mcpl:channel-incoming', timestamp: 1000,
+      inContext: true, channelId: WORLD, serverId: 'eidoverse', authorId: 'visitor',
+      addressed: true, routeChannelId: WORLD,
+    }] as Parameters<typeof wakeProvenance>[0];
+    assert.deepEqual(wakeProvenance(events), {
+      channelId: WORLD,
+      counterparty: 'eidoverse:user:visitor',
+      addressed: true,
+      routeChannelId: WORLD,
+      at: 1000,
+    }, 'byte-identical upstream provenance when the routing flags are unset');
+  });
+});
+
+/** Mirrors the host's async subagent delivery (SubagentModule.deliverAsyncResult):
+ *  ModuleContext.addMessage with no channel, then an `inference-request`
+ *  event that onProcess turns into a wake for the parent agent. */
+class SubagentLikeModule implements Module {
+  readonly name = 'subagentlike';
+  private ctx: { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>): string; pushEvent(e: ProcessEvent): void } | null = null;
+
+  async start(ctx: unknown): Promise<void> {
+    this.ctx = ctx as typeof this.ctx;
+  }
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(): Promise<ToolResult> { return { success: false, error: 'no tools', isError: true }; }
+
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    const e = event as { type: string; source?: string; agentName?: string };
+    if (e.type === 'inference-request' && e.source === 'subagent' && e.agentName) {
+      return { requestInference: [e.agentName] };
+    }
+    return {};
+  }
+
+  deliver(summary: string): void {
+    this.ctx!.addMessage('user', [text(`[Subagent 'diver' returned]\n\n${summary}`)]);
+    this.ctx!.pushEvent({
+      type: 'inference-request', agentName: AGENT, reason: 'subagent-completed:diver', source: 'subagent',
+    } as unknown as ProcessEvent);
+  }
+}
+
+describe('strict routing hunt round 2 — module-originated input vs the spec (ROUTING_STRICT=true)', () => {
+  let dir: string;
+  const saved: Partial<Record<(typeof FLAGS)[number], string | undefined>> = {};
+  const live: AgentFramework[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'strict-hunt-hyg2b-'));
+    for (const f of FLAGS) saved[f] = process.env[f];
+    process.env.ROUTING_STRICT = 'true';
+    process.env.CHANNEL_OPEN_ON_SEND = 'false';
+    process.env.ROUTING_NO_SILENCE_ON_SEND = 'true';
+  });
+
+  afterEach(async () => {
+    for (const fw of live.splice(0)) {
+      try { await fw.stop(); } catch { /* already stopped */ }
+    }
+    for (const f of FLAGS) {
+      if (saved[f] === undefined) delete process.env[f];
+      else process.env[f] = saved[f];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function subagentHarness(): Promise<Harness & { sub: SubagentLikeModule }> {
+    const membrane = new ScriptedMembrane();
+    const probe = new ProbeModule();
+    const sub = new SubagentLikeModule();
+    const fw = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: AGENT, model: 'test-model', systemPrompt: 'You are a resident.' }],
+      modules: [probe, sub],
+      homeChannel: HOME,
+    });
+    live.push(fw);
+    const turnLoci: Array<string | undefined> = [];
+    fw.onTrace((event) => {
+      const e = event as { type: string; [k: string]: unknown };
+      if (e.type === 'inference:started' && e.agentName === AGENT) turnLoci.push(e.channelId as string | undefined);
+    });
+    return { fw, membrane, probe, sub, turnLoci, internals: internalsOf(fw), ...attachRegistry(fw) };
+  }
+
+  const injected = (h: Harness): string =>
+    h.membrane.streams
+      .flatMap((s) => s.receivedToolResultOptions ?? [])
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .map((m) => blockText(m.content))
+      .join('\n');
+
+  it('R2-SPEC-S2: an async subagent return arriving mid-turn is heard while acting (spec S2 lists subagent returns as injected framework messages)', async () => {
+    // 6ebad6a stamps ModuleContext.addMessage content with no channel as the
+    // private NOWHERE place, so a subagent return is HELD from every channel
+    // turn — the opposite of the spec, which keeps hear-while-acting for
+    // "module notes, subagent returns, push events without a channelId".
+    const h = await subagentHarness();
+    h.membrane.turn(
+      round(text('Sending a diver; one moment.'), tool('c1', 'probe--wait')),
+      final(text('Here is what the diver found.')),
+    );
+    h.probe.hooks.push(async () => {
+      h.sub.deliver('SUBAGENT-RESULT the archive says 42.');
+      await settle();
+    });
+    h.fw.pushEvent(dmEvent('private: can you look into the archive?'));
+    await h.fw.runUntilIdle();
+
+    assert.match(injected(h), /SUBAGENT-RESULT/,
+      'REGRESSION: the subagent return was not injected into the running turn (held as another place)');
+  });
+
+  it('R2-SPEC-S4: a module-originated wake (async subagent completion) with a home channel publishes to the home channel (spec S4), not nowhere', async () => {
+    // Spec S4: "whenever the locus cannot be resolved from a trigger
+    // (no-trigger turns, CLI/ipc external messages without a channel,
+    // module-originated wakes), use homeChannel". The implementation gives a
+    // bare `inference-request` wake the NOWHERE place, and S5 removed the
+    // "[routing] Your plain speech currently has no channel" announcement —
+    // so the agent's reply is silently kept private and never delivered.
+    const h = await subagentHarness();
+    h.membrane.turn(final(text('The diver says the archive answer is 42.')));
+    h.fw.start();
+    h.sub.deliver('SUBAGENT-RESULT the archive says 42.');
+    await waitFor('the subagent wake turn', () => h.turnLoci.length > 0 && h.fw.getAgent(AGENT)!.state.status === 'idle', 3000);
+    await h.fw.runUntilIdle();
+
+    assert.equal(h.turnLoci.length, 1, 'precondition: the completion woke one turn');
+    assert.deepEqual(publishedTo(h, HOME), ['The diver says the archive answer is 42.'],
+      `LOSS: the module-woken turn's prose was published nowhere (published=${JSON.stringify(h.published)}) and the agent was not told`);
+  });
+});
+
+describe('strict routing hunt round 2 — upstream harness compatibility with ROUTING_STRICT=true in the environment', () => {
+  const saved: Partial<Record<(typeof FLAGS)[number], string | undefined>> = {};
+
+  beforeEach(() => {
+    for (const f of FLAGS) saved[f] = process.env[f];
+    process.env.ROUTING_STRICT = 'true';
+  });
+
+  afterEach(() => {
+    for (const f of FLAGS) {
+      if (saved[f] === undefined) delete process.env[f];
+      else process.env[f] = saved[f];
+    }
+  });
+
+  it('R2-HY2 (minor): a prototype-built scheduler harness (as upstream busy-agent-scheduler.test uses) does not crash in processInferenceRequests', async () => {
+    // Upstream deliberately keeps prototype-built harnesses working ("field
+    // added later leaves the slot undefined, which must read as not held").
+    // The strict paths read strictTurnPlaces / ephemeralRuns / pendingRequests
+    // unguarded, so with ROUTING_STRICT=true exported (e.g. a CI run on the
+    // deploy host) busy-agent-scheduler, inference-exhaustion-rewind (3) and
+    // puppet-tool-call crash with TypeError instead of exercising upstream.
+    const fw = Object.create(AgentFramework.prototype) as Record<string, unknown> & {
+      processInferenceRequests(): Promise<void>;
+    };
+    const now = Date.now();
+    fw.queue = { tryPop: () => null };
+    fw.pendingRequests = [
+      { agentName: 'Sol', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: now - 1 },
+      { agentName: 'Sol', reason: 'context_budget_restart', source: 'framework', timestamp: now },
+    ];
+    fw.agents = new Map([['Sol', { state: { status: 'idle' } }]]);
+    fw.activeStreams = new Map();
+    fw.activeTurnTokens = new Map([['Sol', 1]]);
+    fw.staleWarnAt = new Map();
+    fw.sweepExpiredConversations = () => {};
+    fw.createFrameworkState = () => ({});
+    fw.emitTrace = () => {};
+    fw.inferencePolicy = { shouldInfer: () => true };
+    let started: unknown;
+    fw.startAgentStream = async (_agent: unknown, trigger: unknown) => { started = trigger; };
+    await fw.processInferenceRequests();
+    assert.ok(started, 'the budget restart starts (no TypeError from the strict paths)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 2 mutation guards: each PASSES on the implementation and FAILS when
+// the named guard is reverted. The committed strict suites (privacy, places,
+// and the three round-1 hunt files: 74 tests) let these mutants survive.
+// ---------------------------------------------------------------------------
+
+describe('strict routing hunt round 2 — mutation guards (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=false)', () => {
+  let dir: string;
+  const saved: Partial<Record<(typeof FLAGS)[number], string | undefined>> = {};
+  const live: AgentFramework[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'strict-hunt-hyg2m-'));
+    for (const f of FLAGS) saved[f] = process.env[f];
+    process.env.ROUTING_STRICT = 'true';
+    process.env.CHANNEL_OPEN_ON_SEND = 'false';
+    process.env.ROUTING_NO_SILENCE_ON_SEND = 'true';
+  });
+
+  afterEach(async () => {
+    for (const fw of live.splice(0)) {
+      try { await fw.stop(); } catch { /* already stopped */ }
+    }
+    for (const f of FLAGS) {
+      if (saved[f] === undefined) delete process.env[f];
+      else process.env[f] = saved[f];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const whisper = (body: string): ProcessEvent => ({
+    type: 'mcpl:channel-incoming',
+    serverId: 'eidoverse',
+    channelId: WORLD,
+    messageId: nextId('wh'),
+    author: { id: 'visitor', name: 'visitor' },
+    content: [text(body)],
+    timestamp: new Date().toISOString(),
+    metadata: {},
+    tags: ['chat:private', 'chat:addressed'],
+    triggerInference: true,
+  } as unknown as ProcessEvent);
+
+  it('MG2-repin-gate: a same-party whisper follow-up mid-whisper-turn never re-pins the reply onto the public world channel', async () => {
+    // A whisper on a shared channel is a one-party place whose turn publishes
+    // nowhere (locus null). Its follow-up is the SAME place, so it is
+    // injected — and it is addressed and names WORLD. Only the
+    // `!routingStrict()` term on the mid-turn re-pin keeps that injection
+    // from moving the pin to the public channel. Reverting it leaks the
+    // whispered answer aloud.
+    const h = await makeHarness(join(dir, 'store'));
+    live.push(h.fw);
+    h.membrane.turn(
+      round(text('Let me check, quietly.'), tool('c1', 'probe--wait')),
+      final(text('WHISPER-SECRET: the code is 1234.')),
+    );
+    h.probe.hooks.push(async () => {
+      h.fw.pushEvent(whisper('psst — also, what was the code?'));
+      await settle();
+    });
+    h.fw.pushEvent(whisper('psst — can you tell me privately?'));
+    await h.fw.runUntilIdle();
+    assert.ok(h.membrane.calls.length >= 1, 'precondition: the whisper woke a turn');
+    assert.deepEqual(publishedTo(h, WORLD).filter((t) => /WHISPER-SECRET/.test(t)), [],
+      'the whispered answer must never be said on the public world channel');
+  });
+
+  it('MG2-tuneout-inject: a tune-out-diverted message drained mid-turn is stored for the subconscious but not injected into the resident', async () => {
+    const h = await makeHarness(join(dir, 'store'));
+    live.push(h.fw);
+    h.membrane.turn(
+      round(text('Working.'), tool('c1', 'probe--wait')),
+      final(text('Done.')),
+    );
+    h.probe.hooks.push(async () => {
+      h.internals.addMessage('user', [text('visitor: TUNED-OUT-CHATTER in the plaza')], {
+        channelId: WORLD, serverId: 'eidoverse', messageId: nextId('w'),
+        author: { id: 'visitor', name: 'visitor' }, triggered: true,
+        tags: ['chat:ambient'], tuneOut: { epochId: 'epoch-1' },
+      });
+      await settle();
+    });
+    h.fw.pushEvent(dmEvent('private: hello'));
+    await h.fw.runUntilIdle();
+    const injected = h.membrane.streams
+      .flatMap((s) => s.receivedToolResultOptions ?? [])
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .map((m) => blockText(m.content)).join('\n');
+    assert.doesNotMatch(injected, /TUNED-OUT-CHATTER/, 'diverted traffic is never heard by the resident mid-turn');
+  });
+
+  it('MG2-script-place: a background script started in a DM turn wakes a DM turn (its output is not answered at home)', async () => {
+    const h = await makeHarness(join(dir, 'store'));
+    live.push(h.fw);
+    h.membrane
+      .turn(final(text('Started the job.')))
+      .turn(final(text('The job finished: SCRIPT-RESULT ready.')));
+    h.fw.pushEvent(dmEvent('private: run my private job'));
+    await h.fw.runUntilIdle();
+    // As startBackgroundScript records it for the turn that started it.
+    const fw = h.fw as unknown as {
+      strictScriptPlaces: Map<string, string>;
+      injectScriptWake(record: { id: string; agentName: string }, envelope: string): void;
+    };
+    fw.strictScriptPlaces.set('script-1', channelPlace('discord', DM));
+    fw.injectScriptWake({ id: 'script-1', agentName: AGENT }, '[script script-1 finished] SCRIPT-RESULT private payload');
+    await h.fw.runUntilIdle();
+    assert.deepEqual(publishedTo(h, HOME), [], 'nothing of the DM job is said at home');
+    assert.deepEqual(publishedTo(h, DM), ['Started the job.', 'The job finished: SCRIPT-RESULT ready.']);
   });
 });

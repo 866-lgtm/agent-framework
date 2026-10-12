@@ -25,6 +25,7 @@ import { AgentFramework } from '../src/index.js';
 import type {
   EventResponse,
   Module,
+  ModuleContext,
   ProcessEvent,
   ToolCall,
   ToolDefinition,
@@ -85,8 +86,9 @@ class ProbeModule implements Module {
   hooks: Array<() => Promise<void>> = [];
   /** Tool calls still running (a call can outlive an aborted turn). */
   inFlight = new Set<Promise<unknown>>();
+  ctx: ModuleContext | null = null;
 
-  async start(): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -115,12 +117,16 @@ class ProbeModule implements Module {
 
   /** Operator input over the CLI/IPC lane: a channel-less waking message. */
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
-    const e = event as { type: string; source?: string; content?: unknown };
+    const e = event as { type: string; source?: string; content?: unknown; agentName?: string };
     if (e.type === 'external-message' && e.source === 'cli') {
       return {
         addMessages: [{ participant: 'operator', content: [{ type: 'text', text: String(e.content) }] }],
         requestInference: true,
       };
+    }
+    // A module's own wake request (as the host's subagent module raises it).
+    if (e.type === 'inference-request' && e.source === 'relay' && e.agentName) {
+      return { requestInference: [e.agentName] };
     }
     return {};
   }
@@ -741,6 +747,74 @@ describe('strict routing privacy (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=fals
     assert.deepEqual(publishedTo(h, DM), ['dm answer']);
     assert.deepEqual(publishedTo(h, WORLD), ['world answer']);
     assert.doesNotMatch(requestText(h.membrane.calls[0]!), /during maintenance too/);
+  });
+
+  it('S4 (armed place): a reminder a DM turn armed on a server is answered in the DM, also after a restart', async () => {
+    const membrane = new ScriptedMembrane();
+    const a = await makeHarness(dir, { membrane });
+    membrane.turn(
+      round(
+        text('Noted.'),
+        tool('c1', 'discord--reminder_add', { inMinutes: 60, message: 'Tell the operator the lab results are fine.' }),
+      ),
+      final(text('I will remind you.')),
+    );
+    a.fw.pushEvent(dmEvent('private: remind me about the lab results in an hour'));
+    await a.fw.runUntilIdle();
+    assert.deepEqual(a.sends.map((s) => s.tool), ['reminder_add'], 'the DM turn armed the reminder');
+    assert.deepEqual(publishedTo(a, DM), ['Noted.', 'I will remind you.']);
+    await a.fw.stop();
+
+    // After a restart the server fires the reminder: a channel-less push that
+    // names the id the server answered the arming call with (`sent-1`).
+    const membrane2 = new ScriptedMembrane().turn(final(text('Reminder: the lab results are fine.')));
+    const b = await makeHarness(dir, { membrane: membrane2 });
+    harnesses.push(b);
+    b.fw.pushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'reminders',
+      eventId: nextId('rem'),
+      content: [text('A reminder is due.')],
+      origin: { source: 'reminder', reminderId: 'sent-1' },
+      timestamp: new Date().toISOString(),
+      inferenceId: nextId('inf'),
+      triggerInference: true,
+    } as unknown as ProcessEvent);
+    await b.fw.runUntilIdle();
+
+    assert.deepEqual(b.turnLoci, [DM], 'the reminder is answered in the place that armed it');
+    assert.deepEqual(publishedTo(b, HOME), [], 'never in the home channel');
+    assert.deepEqual(publishedTo(b, DM), ['Reminder: the lab results are fine.']);
+  });
+
+  it('S2 (module place): content a module relays for a DM is held from a world turn and answered in the DM', async () => {
+    const h = await harness();
+    h.membrane
+      .turn(
+        round(text('Admiring the plaza.'), tool('c1', 'probe--wait')),
+        final(text('Lovely plaza.')),
+      )
+      .turn(final(text('Your file is summarized.')));
+    h.probe.hooks.push(async () => {
+      // A module relaying a result produced for the DM names the DM.
+      h.probe.ctx!.addMessage('user', [text('[relay] RELAYED-DM-RESULT: summary of the private file')],
+        { channelId: DM, serverId: 'discord' } as never);
+      h.probe.ctx!.pushEvent({
+        type: 'inference-request', agentName: AGENT, reason: 'relay-done', source: 'relay',
+        channelId: DM, serverId: 'discord',
+      } as unknown as ProcessEvent);
+      await settle();
+    });
+    h.fw.pushEvent(worldEvent('@resident look around'));
+    await h.fw.runUntilIdle();
+
+    assert.deepEqual(h.turnLoci, [WORLD, DM]);
+    assert.doesNotMatch(injectedText(h.membrane.streams[0]!), /RELAYED-DM-RESULT/, 'not heard inside the world turn');
+    assert.doesNotMatch(requestText(h.membrane.calls[0]!), /RELAYED-DM-RESULT/);
+    assert.deepEqual(publishedTo(h, WORLD), ['Admiring the plaza.', 'Lovely plaza.']);
+    assert.deepEqual(publishedTo(h, DM), ['Your file is summarized.']);
+    assert.deepEqual(publishedTo(h, HOME), []);
   });
 
   it('closed-channel invitation: plain wording, no delivery-opens claim, other places need a send tool', async () => {
