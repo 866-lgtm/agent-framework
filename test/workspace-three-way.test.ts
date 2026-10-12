@@ -1913,18 +1913,21 @@ describe('the mount boundary', () => {
     const st = statSync(env.dir, { bigint: true });
     const view = { root: env.dir, rootIdentity: { dev: String(st.dev), ino: String(st.ino) }, followSymlinks: false, maxFileSize: 1e6, ignore: [] } as unknown as MountView;
     const away = `${env.dir}-away`;
+    // The code checks the root by its resolved path (on macOS the temp
+    // directory is under /var, a symlink to /private/var).
+    const rootReal = realpathSync(env.dir);
     let swapped = false;
     // Once the root has been checked, it's renamed away and an empty one put
     // in its place, with the same subdirectory.
     const proof = await withFsPromises('lstat', (lstat) => async (path: string, ...rest: unknown[]) => {
       const info = await lstat(path, ...rest);
-      if (!swapped && String(path) === env.dir) {
+      if (!swapped && String(path) === rootReal) {
         swapped = true;
         renameSync(env.dir, away);
         mkdirSync(join(env.dir, 'sub'), { recursive: true });
       }
       return info;
-    }, () => confirmAbsent(view, env.dir, 'sub/a.txt'));
+    }, () => confirmAbsent(view, rootReal, 'sub/a.txt'));
     assert.equal(swapped, true);
     assert.equal(typeof proof, 'string', `no absence is proven: ${JSON.stringify(proof)}`);
     assert.equal(readFileSync(join(away, 'sub/a.txt'), 'utf8'), 'A', 'the original still holds the file');
@@ -1963,6 +1966,10 @@ describe('the mount boundary', () => {
     await call(m, 'materialize', { path: 'work/sub/a.txt' });
     const file = env.disk('sub/a.txt');
     const away = `${env.dir}-away`;
+    // The pass observes paths under the root's resolved path (on macOS the
+    // temp directory is under /var, a symlink to /private/var).
+    const rootReal = realpathSync(env.dir);
+    const fileReal = join(rootReal, 'sub/a.txt');
     unlinkSync(file);
     let restored = false;
     let swapped = false;
@@ -1973,13 +1980,13 @@ describe('the mount boundary', () => {
       try {
         info = await lstat(path, ...rest);
       } catch (err) {
-        if (!restored && String(path) === file && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+        if (!restored && String(path) === fileReal && (err as NodeJS.ErrnoException).code === 'ENOENT') {
           writeFileSync(file, 'A');
           restored = true;
         }
         throw err;
       }
-      if (restored && !swapped && String(path) === env.dir) {
+      if (restored && !swapped && String(path) === rootReal) {
         renameSync(env.dir, away);
         mkdirSync(join(env.dir, 'sub'), { recursive: true });
         swapped = true;

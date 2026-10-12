@@ -56,7 +56,11 @@
   history is listed `not-in-branch`, never ingested or unlinked. Each write or unlink a
   materialize makes, and each adoption that ingests a disk change or removes a file, is recorded
   as an intent ahead of it and completed once it is durable, so a crash or a torn record tail
-  never costs an edit. A binary or oversize disk version, for which the workspace drops its copy,
+  never costs an edit. If an append of disk-agreement evidence fails inside Chronicle, the
+  workspace refuses operations that need that evidence and reports why. Those operations remain
+  unavailable until the host restarts and reloads the store's records. The append may have
+  reached the log without becoming readable in this process, so deciding a conflict from
+  possibly incomplete evidence would be unsafe. A binary or oversize disk version, for which the workspace drops its copy,
   forgets the evidence first instead. After a crash, an interrupted write or unlink is decided by what disk shows (a copy
   matching neither the one before nor the one intended is an `interrupted` conflict), and one
   that shows on disk without proof it is durable is completed only by the next `materialize`,
