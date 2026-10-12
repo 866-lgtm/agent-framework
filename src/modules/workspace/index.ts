@@ -1213,8 +1213,9 @@ export class WorkspaceModule implements Module {
           + 'ignore list covers that hold nothing the workspace tracks (an ignored directory counts once). So a '
           + 'total of 0, with no conflicts and nothing under `passedOver`, `incomplete` or `skipped`, means the '
           + 'sync looked everywhere and nothing had changed. A path the mount ignores is synced when you name '
-          + 'it, a directory\'s contents included, and listed under `ignored`: a sync without a path passes '
-          + 'over it.',
+          + 'it, and listed under `ignored`: a sync without a path passes over it. Naming an ignored directory '
+          + 'sets aside the patterns that cover it or a directory above it; one that covers only something '
+          + 'inside it still applies, and what it covers is passed over.',
         inputSchema: {
           type: 'object' as const,
           properties: {

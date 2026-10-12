@@ -620,6 +620,20 @@ describe('a sync says what it passed over (agent-framework #276)', () => {
     assert.equal(named.passedOver, undefined, 'nothing beneath the named directory was passed over');
   });
 
+  test('naming an ignored directory sets aside only the patterns that cover it: one that covers something inside it still applies', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build/**', '*.md'] });
+    env.writeDisk('build/out.txt', 'built');
+    env.writeDisk('build/LOG.md', 'log');
+
+    const named = await call(m, 'sync', { path: 'work/build' });
+    assert.equal(named.totalSynced, 1, 'out.txt only');
+    assert.equal(await contentOf(m, 'build/out.txt'), 'built');
+    assert.equal(env.store.treeGet('workspace/work/tree', 'build/LOG.md'), null, 'LOG.md stays untracked');
+    assert.deepEqual(named.ignored.map(({ path }: { path: string }) => path), ['build']);
+    assert.deepEqual(named.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }], 'LOG.md was passed over');
+  });
+
   test('a listing of a directory the ignore list covers keeps the ignore, and tracks nothing beneath it', async (t) => {
     const env = new Env(t);
     const m = await env.open({ ignore: ['build/**'] });
