@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { routingStrict } from '../routing-flags.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -93,6 +94,10 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** Host-opaque place of the event (ROUTING_STRICT; see the `resolvePlace`
+   *  option). A batch whose events name several places is delivered as one
+   *  wake per place. Absent when the host resolves none. */
+  place?: string;
 }
 
 /**
@@ -128,9 +133,14 @@ export interface WakeProvenance {
    *  requests can order by event recency, not by flush order. */
   at?: number;
   /** Host-opaque token handed in when the host arms a self-wake or a sleep
-   *  and handed back on that wake (the conversation the wake continues).
-   *  Never set by the gate itself. */
+   *  and handed back on that wake (the conversation the wake continues), or
+   *  the place the host's `resolvePlace` gave every event of a per-place
+   *  batch wake. */
   place?: string;
+  /** Timestamp (ms) of the EARLIEST event of a per-place batch wake, so the
+   *  host can order places by first arrival. Set only alongside `place` on
+   *  a batch wake. */
+  firstAt?: number;
 }
 
 interface DebounceState {
@@ -234,7 +244,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
     ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
-    ...(pick.addressed && pick.routeChannelId && pick.serverId ? { routeServerId: pick.serverId } : {}),
+    // ROUTING_STRICT only: with the flag unset the provenance keeps its
+    // upstream shape.
+    ...(routingStrict() && pick.addressed && pick.routeChannelId && pick.serverId ? { routeServerId: pick.serverId } : {}),
     at: pick.timestamp,
   };
 }
@@ -630,6 +642,11 @@ export class EventGate {
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
+  private resolvePlaceFn: ((info: GateEventInfo) => string | undefined) | undefined;
+  /** Batches spliced out of the inference buffer whose delivery is queued
+   *  (deferred to a microtask): still owed, so pendingWakeRoutes reports them
+   *  until they are delivered. */
+  private deliveringBatches: PendingEvent[][] = [];
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -655,6 +672,12 @@ export class EventGate {
      *  how push-event origins compose into channel ids). Default: a
      *  channel-incoming event's own channel id; nothing for push events. */
     resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+    /** Host-opaque place of an event (the conversation it belongs to), or
+     *  undefined. When any event of a debounced batch (or of the inference
+     *  buffer) has a place, the batch is delivered as one wake per place, in
+     *  order of each place's earliest event, each with its own provenance
+     *  and notice. Default: none — one wake per batch (upstream). */
+    resolvePlace?: (info: GateEventInfo) => string | undefined;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -663,6 +686,7 @@ export class EventGate {
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
+    this.resolvePlaceFn = opts.resolvePlace;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -1489,8 +1513,19 @@ export class EventGate {
     }
   }
 
+  /** Host place for an event; a resolver fault never breaks gating. */
+  private placeFor(info: GateEventInfo): string | undefined {
+    if (!this.resolvePlaceFn) return undefined;
+    try {
+      return this.resolvePlaceFn(info) || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
+    const place = this.placeFor(info);
 
     const event: PendingEvent = {
       policyName: policy.name,
@@ -1509,6 +1544,7 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      ...(place ? { place } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1555,7 +1591,40 @@ export class EventGate {
   // Event delivery
   // =========================================================================
 
+  /**
+   * A batch split by the host place of its events (see `resolvePlace`), in
+   * order of each place's earliest event; events with no place form one
+   * group of their own. Null when no event has a place (one batch, as
+   * upstream).
+   */
+  private groupByPlace(events: PendingEvent[]): Array<{ place?: string; events: PendingEvent[] }> | null {
+    if (!events.some((e) => e.place)) return null;
+    const groups = new Map<string, PendingEvent[]>();
+    for (const e of events) {
+      const key = e.place ?? '';
+      const group = groups.get(key);
+      if (group) group.push(e);
+      else groups.set(key, [e]);
+    }
+    const firstAt = (g: PendingEvent[]): number => Math.min(...g.map((e) => e.timestamp));
+    return [...groups.entries()]
+      .map(([key, group]) => ({ ...(key ? { place: key } : {}), events: group }))
+      .sort((a, b) => firstAt(a.events) - firstAt(b.events));
+  }
+
   private deliverEvents(events: PendingEvent[]): void {
+    if (events.length === 0) return;
+    const groups = this.groupByPlace(events);
+    if (groups) {
+      // One wake per place: a batch never hands one place's messages to
+      // another place's turn.
+      for (const group of groups) this.deliverBatch(group.events, group.place);
+      return;
+    }
+    this.deliverBatch(events);
+  }
+
+  private deliverBatch(events: PendingEvent[], place?: string): void {
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
@@ -1600,6 +1669,9 @@ export class EventGate {
     this.addMessageFn('user', [{ type: 'text', text }], {
       source: 'gate:debounce',
       policies: policyNames,
+      // A per-place batch's notice belongs to that place (it names the
+      // place's channel and messages).
+      ...(place ? { place } : {}),
     });
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -1609,7 +1681,10 @@ export class EventGate {
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
     // any traffic. Ambient-only batches carry telemetry only.
-    const provenance = wakeProvenance(events);
+    const picked = wakeProvenance(events);
+    const provenance: WakeProvenance | undefined = place
+      ? { ...(picked ?? {}), place, firstAt: Math.min(...events.map((e) => e.timestamp)) }
+      : picked;
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
@@ -1655,29 +1730,44 @@ export class EventGate {
     if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
+      // Still owed until delivered (pendingWakeRoutes).
+      this.deliveringBatches.push(events);
       // Defer to avoid re-entrancy inside trace callbacks
-      queueMicrotask(() => this.deliverEvents(events));
+      queueMicrotask(() => {
+        const at = this.deliveringBatches.indexOf(events);
+        if (at !== -1) this.deliveringBatches.splice(at, 1);
+        this.deliverEvents(events);
+      });
     }
   }
 
   /**
    * Wakes the gate still owes: one entry per debounce batch that has not
-   * fired and one for the inference buffer (delivered as a single batch when
-   * the running turns end). Each names the route its wake will carry — the
-   * same pick `deliverEvents` makes — or nothing for an ambient-only batch.
-   * Ids only, never content.
+   * fired, one for the inference buffer (delivered as a single batch when
+   * the running turns end), and one per buffered batch whose delivery is
+   * queued — or, for a batch whose events have host places, one entry per
+   * place (the wakes `deliverEvents` will raise). Each names the route its
+   * wake will carry — the same pick `deliverEvents` makes — or nothing for
+   * an ambient-only batch, plus its place when it has one. Ids only, never
+   * content.
    */
-  pendingWakeRoutes(): Array<{ routeChannelId?: string; routeServerId?: string }> {
-    const out: Array<{ routeChannelId?: string; routeServerId?: string }> = [];
+  pendingWakeRoutes(): Array<{ routeChannelId?: string; routeServerId?: string; place?: string }> {
+    const out: Array<{ routeChannelId?: string; routeServerId?: string; place?: string }> = [];
     const add = (events: PendingEvent[]): void => {
       if (events.length === 0) return;
-      const provenance = wakeProvenance(events);
-      out.push(provenance?.routeChannelId
-        ? { routeChannelId: provenance.routeChannelId, ...(provenance.routeServerId ? { routeServerId: provenance.routeServerId } : {}) }
-        : {});
+      for (const group of this.groupByPlace(events) ?? [{ events } as { place?: string; events: PendingEvent[] }]) {
+        const provenance = wakeProvenance(group.events);
+        out.push({
+          ...(provenance?.routeChannelId
+            ? { routeChannelId: provenance.routeChannelId, ...(provenance.routeServerId ? { routeServerId: provenance.routeServerId } : {}) }
+            : {}),
+          ...(group.place ? { place: group.place } : {}),
+        });
+      }
     };
     for (const state of this.debounceTimers.values()) add(state.events);
     add(this.inferenceBuffer);
+    for (const batch of this.deliveringBatches) add(batch);
     return out;
   }
 

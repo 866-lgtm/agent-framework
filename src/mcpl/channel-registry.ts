@@ -653,6 +653,9 @@ export class ChannelRegistry {
   /** Per-channel typing metadata — carried on the 7s refresh so the target
    *  server keeps getting the same routing hints (e.g. Zulip topic). */
   private typingMetadata = new Map<string, Record<string, unknown>>();
+  /** Server a typing indicator was started on, when the caller named one
+   *  (two servers can register the same channel id). */
+  private typingServers = new Map<string, string>();
 
   /** Chronicle-projected desired lifecycle state, keyed by server + channel.
    *  Provenance is kept so reconcile can tell a pure default (nobody ever
@@ -1156,7 +1159,13 @@ export class ChannelRegistry {
    *
    * No-op if already typing on this channel.
    */
-  startTyping(channelId: string, metadata?: Record<string, unknown>): void {
+  startTyping(
+    channelId: string,
+    metadata?: Record<string, unknown>,
+    /** The server the channel is on (ROUTING_STRICT: the turn's place). Absent
+     *  = first registration of the channel id (upstream behavior). */
+    serverId?: string,
+  ): void {
     const metadataChanged =
       metadata !== undefined &&
       !shallowEqualRecord(this.typingMetadata.get(channelId), metadata);
@@ -1171,7 +1180,7 @@ export class ChannelRegistry {
       // within this request instead of waiting up to TYPING_INTERVAL_MS for
       // the next tick.
       if (metadataChanged) {
-        const entry = this.findChannelEntry(channelId);
+        const entry = this.typingEntry(channelId);
         if (entry) {
           this.sendTypingNotification(entry.serverId, channelId);
         }
@@ -1180,10 +1189,11 @@ export class ChannelRegistry {
     }
 
     // Find the channel entry and its server
-    const entry = this.findChannelEntry(channelId);
+    const entry = serverId ? this.findChannelEntryOn(channelId, serverId) : this.findChannelEntry(channelId);
     if (!entry) {
       return;
     }
+    if (serverId) this.typingServers.set(channelId, serverId);
 
     // Send typing immediately
     this.sendTypingNotification(entry.serverId, channelId);
@@ -1216,12 +1226,13 @@ export class ChannelRegistry {
         // topic/thread as the start. Guarded by `interval`: matches the
         // global-clear branch's semantics, and keeps defensive stopTyping(ch)
         // calls from spamming stops at a server that never saw a start.
-        const entry = this.findChannelEntry(channelId);
+        const entry = this.typingEntry(channelId);
         if (entry && this.sendTypingFn) {
           this.sendTypingFn(entry.serverId, channelId, this.typingMetadata.get(channelId), 'stop');
         }
       }
       this.typingMetadata.delete(channelId);
+      this.typingServers.delete(channelId);
     } else {
       // Clear all typing intervals and dispatch stop for each known channel
       const channels = Array.from(this.typingIntervals.keys());
@@ -1231,12 +1242,20 @@ export class ChannelRegistry {
       this.typingIntervals.clear();
       if (this.sendTypingFn) {
         for (const id of channels) {
-          const entry = this.findChannelEntry(id);
+          const entry = this.typingEntry(id);
           if (entry) this.sendTypingFn(entry.serverId, id, this.typingMetadata.get(id), 'stop');
         }
       }
       this.typingMetadata.clear();
+      this.typingServers.clear();
     }
+  }
+
+  /** The entry a typing indicator for `channelId` runs on: the server it was
+   *  started on when one was named, else the first registration. */
+  private typingEntry(channelId: string): ChannelEntry | undefined {
+    const serverId = this.typingServers.get(channelId);
+    return serverId ? this.findChannelEntryOn(channelId, serverId) : this.findChannelEntry(channelId);
   }
 
   // ==========================================================================
