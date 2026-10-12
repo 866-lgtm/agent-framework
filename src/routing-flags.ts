@@ -12,11 +12,20 @@
  *     held and processed after the turn, each place in its own turn;
  *   - a wake batch spanning several places starts ONE place's turn (the
  *     earliest-arrived wake; a wake whose message braked the running turn
- *     first) and holds the rest for their own turns;
+ *     first) and holds the rest for their own turns; a debounced gate batch
+ *     spanning several places is delivered as one wake per place;
  *   - a framework follow-up (retry, bounce, continuation, self-wake, sleep
- *     expiry, background script) continues its own turn's place;
- *   - content a module adds on its own, and an ephemeral run's prose, belong
- *     to no channel: never heard in a channel's turn, published nowhere;
+ *     expiry, background script) continues its own turn's place, and so
+ *     does a channel-less push echoing what a turn armed on that server (a
+ *     reminder it set);
+ *   - content a module adds on its own with no channel is a non-channel
+ *     framework message (heard mid-turn); a module's own wake is a
+ *     channel-less wake; a module relaying a place's material names that
+ *     place (channelId + serverId) and is held and answered with it;
+ *   - an ephemeral run's prose belongs to no channel: published nowhere;
+ *   - the privileged-human brake also reaches a turn that is alive but not
+ *     streaming (waiting out a retry backoff, or parked behind an auxiliary
+ *     call);
  *   - a turn whose locus cannot come from a trigger uses the configured home
  *     channel, else publishes nowhere — never the "most recent inbound"
  *     default;

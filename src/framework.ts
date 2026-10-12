@@ -428,6 +428,7 @@ function validateUtilityArgs(
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
+import type { GateEventInfo } from './gate/types.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
@@ -527,6 +528,70 @@ function strictUnstamped(fields: Record<string, unknown> | undefined): Record<st
   if (!fields || !routingStrict() || (!('strictPlace' in fields) && !('strictWake' in fields))) return fields;
   const { strictPlace: _place, strictWake: _wake, ...rest } = fields;
   return rest;
+}
+
+/** ROUTING_STRICT: one MCPL tool call made by a turn whose place is not the
+ *  home place — the free text it passed and the ids the server answered
+ *  with (see strictArmedPlace). */
+interface StrictArming {
+  serverId: string;
+  place: string;
+  callId: string;
+  texts: string[];
+  ids: string[];
+  at: number;
+}
+
+/** ROUTING_STRICT: prose state of one logical turn (strictProseTurns). */
+interface StrictProseTurn {
+  /** The turn's place. */
+  place: string | undefined;
+  /** Sticky `>>` / `>>>` prose target of the turn. */
+  target?: string;
+  /** Hybrid mode: plain prose suppressed after a `>>>` miss or skip. */
+  hybridSuppressed?: boolean;
+  /** The turn's locus and the server it is on. */
+  locus: string | null;
+  locusServer?: string;
+}
+
+const STRICT_ARMINGS_CAP = 100;
+const STRICT_ARMING_TEXT_MIN = 12;
+const STRICT_ARMING_TEXT_MAX = 200;
+
+const normalizeArmingText = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+
+/** Free-text string leaves of a tool call's arguments (bounded). */
+function armingTexts(args: unknown): string[] {
+  const out: string[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (out.length >= 4 || depth > 4) return;
+    if (typeof value === 'string') {
+      const text = normalizeArmingText(value);
+      if (text.length >= STRICT_ARMING_TEXT_MIN) out.push(text.slice(0, STRICT_ARMING_TEXT_MAX));
+    } else if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+    } else if (value && typeof value === 'object') {
+      for (const item of Object.values(value as Record<string, unknown>)) visit(item, depth + 1);
+    }
+  };
+  visit(args, 0);
+  return out;
+}
+
+/** Id-like tokens (letters and digits, 6+ chars) in a tool result's text. */
+function armingIds(content: unknown): string[] {
+  const text = (Array.isArray(content) ? content : [content])
+    .map((b) => (typeof b === 'string' ? b : (b as { text?: unknown } | null)?.text))
+    .filter((t): t is string => typeof t === 'string')
+    .join('\n');
+  const ids = new Set<string>();
+  for (const token of text.match(/[A-Za-z0-9][A-Za-z0-9_.:-]{5,}/g) ?? []) {
+    const id = token.replace(/[.:-]+$/, '');
+    if (id.length >= 6 && /\d/.test(id) && /[A-Za-z]/.test(id)) ids.add(id);
+    if (ids.size >= 20) break;
+  }
+  return [...ids];
 }
 
 /** ROUTING_STRICT arrival time of a wake: the earliest arrival it absorbed,
@@ -1107,6 +1172,25 @@ export class AgentFramework {
   /** ROUTING_STRICT: the place of the turn that started each background
    *  script, so its later wake continues that conversation. */
   private strictScriptPlaces: Map<string, string> = new Map();
+  /** ROUTING_STRICT: what turns away from the home place armed on MCPL
+   *  servers (strictArmedPlace). Newest last, bounded, mirrored to a
+   *  recovery file next to the deferred-writes file. */
+  private strictArmings: StrictArming[] = [];
+  /** ROUTING_STRICT: noted calls awaiting the server's answer, by call id. */
+  private strictPendingArmings: Map<string, StrictArming> = new Map();
+  /** ROUTING_STRICT: agents whose dequeued wake is parked behind an
+   *  auxiliary call and was braked by a privileged message meanwhile — the
+   *  parked wake goes back to the queue instead of starting first. */
+  private strictParkBrakes: Set<string> = new Set();
+  /** ROUTING_STRICT: cancel hooks for turns waiting out an error-policy
+   *  retry backoff (turn alive, agent idle) — a privileged message brakes
+   *  the retry instead of letting it run. */
+  private strictRetryBackoffs: Map<string, () => void> = new Map();
+  /** ROUTING_STRICT: per logical turn prose state (sticky prose target,
+   *  hybrid suppression, locus and its server). Speech links queued by a
+   *  turn keep that turn's object, so a link that runs after its turn has
+   *  ended still resolves against its own turn, never the next one's. */
+  private strictProseTurns: Map<string, StrictProseTurn> = new Map();
   /** Per-agent count of consecutive think-only inference rounds in the current
    *  turn — drives the think loop guard (see THINK_SOFT_CAP / THINK_HARD_CAP).
    *  Reset at each fresh inference start and on any non-think round. */
@@ -1538,8 +1622,11 @@ export class AgentFramework {
     // Initialize module registry with callbacks
     this.moduleRegistry = new ModuleRegistry(store, this.queue, {
       getAgents: () => Array.from(this.agents.values()),
-      // ROUTING_STRICT: a module's own content names no place (stampModulePlace).
-      addMessage: (p, c, m) => this.addMessage(p, c, this.stampModulePlace(m)),
+      // ROUTING_STRICT: a module's own content with no channel is a
+      // non-channel framework message (heard mid-turn, spec S2); a module
+      // relaying a place's material names that place in the metadata
+      // (`channelId` + `serverId`) and is held with it.
+      addMessage: (p, c, m) => this.addMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
@@ -1769,9 +1856,16 @@ export class AgentFramework {
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
-        addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
+        addMessage: (p, c, m, forAgent) => framework.addMessage(
+          p, c, framework.strictGateNoticeMetadata(m) as MessageMetadata, forAgent ? { forAgent } : undefined,
+        ),
         requestInference: (agentName, reason, source, provenance) => {
           const takesRoute = !!provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId);
+          // ROUTING_STRICT: a per-place batch wake carries its place; a
+          // channel bound to a conversation fork is that fork's alone.
+          const parsedPlace = routingStrict() && provenance?.place ? parsePlace(provenance.place) : undefined;
+          const placeChannel = parsedPlace?.kind === 'channel' ? parsedPlace.channelId : undefined;
+          const takesPlace = !!provenance?.place && (!placeChannel || framework.mayTakeGateRoute(agentName, placeChannel));
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -1800,8 +1894,11 @@ export class AgentFramework {
             // route's channel on that event's server; anything else is a
             // channel-less wake (home).
             ...(routingStrict()
-              ? provenance?.place
-                ? { strictPlace: provenance.place }
+              ? takesPlace
+                ? {
+                    strictPlace: provenance!.place,
+                    ...(provenance!.firstAt !== undefined ? { strictArrivedAt: provenance!.firstAt } : {}),
+                  }
                 : takesRoute
                   ? { strictPlace: channelPlace(
                       provenance!.routeServerId ?? framework.strictUniqueServerOf(provenance!.routeChannelId!),
@@ -1824,6 +1921,8 @@ export class AgentFramework {
           }
           return undefined;
         },
+        // ROUTING_STRICT: a debounced batch is delivered one wake per place.
+        resolvePlace: (info) => framework.strictGateEventPlace(info),
       });
     }
 
@@ -1884,6 +1983,7 @@ export class AgentFramework {
       ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
     framework.deferredWritesPath = config.deferredWritesPath
       ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    framework.restoreStrictArmings();
     {
       const hostMode = framework.readHostMode();
       // Deferred writes are recovered REGARDLESS of the mode flag: a crash
@@ -2609,6 +2709,29 @@ export class AgentFramework {
           // Nothing was actually aborted — don't leave a stale marker that would
           // swallow the next genuine failure.
           this.pendingPrivilegedInterrupts.delete(agentName);
+        }
+      } else if (routingStrict()) {
+        // ROUTING_STRICT: a turn can be alive without streaming — waiting out
+        // an error-policy retry backoff, or dequeued and parked behind an
+        // auxiliary call. Strict holds the privileged message from that
+        // turn (another place), so the brake must reach it here: the retry
+        // is cancelled, the parked wake goes back behind the braking one.
+        const cancelRetry = this.strictRetryBackoffs.get(agentName);
+        if (cancelRetry) {
+          this.strictRetryBackoffs.delete(agentName);
+          this.pendingPrivilegedInterrupts.add(agentName);
+          cancelRetry();
+          this.emitTrace({ type: 'inference:aborted', agentName, reason: 'privileged-interrupt', durationMs: 0 });
+          braked = true;
+          console.error(
+            `[privileged-interrupt] agent=${agentName} retry cancelled by privileged author ${authorId} (${source})`,
+          );
+        } else if (this.strictParkedPlaces.has(agentName)) {
+          this.strictParkBrakes.add(agentName);
+          braked = true;
+          console.error(
+            `[privileged-interrupt] agent=${agentName} parked wake braked by privileged author ${authorId} (${source})`,
+          );
         }
       }
     }
@@ -4587,6 +4710,10 @@ export class AgentFramework {
       this.activeTurnTokens.delete(agent.name);
       this.activeTurnTriggers.delete(agent.name);
       this.logicalTurnToolCalls.delete(agent);
+      // ROUTING_STRICT per-turn state of the disposed ephemeral.
+      this.strictTurnPlaces?.delete(agent.name);
+      this.strictLocusServers?.delete(agent.name);
+      this.strictProseTurns?.delete(agent.name);
     }
   }
 
@@ -7371,11 +7498,10 @@ export class AgentFramework {
             source,
             timestamp: Date.now(),
             // ROUTING_STRICT: a module's bare wake request ('inference-request',
-            // e.g. an async subagent's return) asks the agent to process
-            // content the module added on its own — content of unknown origin,
-            // whose place is private (stampModulePlace). Its turn publishes
-            // nowhere.
-            ...(routingStrict() && event.type === 'inference-request' ? { strictPlace: STRICT_NOWHERE } : {}),
+            // e.g. an async subagent's return) has no trigger channel: its
+            // turn is the home channel's (else nowhere), unless the module
+            // names the place the wake belongs to.
+            ...(routingStrict() && event.type === 'inference-request' ? this.strictModuleWakeFields(event) : {}),
           });
         }
       }
@@ -7748,6 +7874,9 @@ export class AgentFramework {
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
+    this.strictTurnPlaces?.delete(agentName);
+    this.strictLocusServers?.delete(agentName);
+    this.strictProseTurns?.delete(agentName);
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -8516,6 +8645,15 @@ export class AgentFramework {
     // servers that also send `rawChannelId`-style origin fields.
     if (triggerChannel) {
       metadata.channelId = triggerChannel.channelId;
+    } else if (routingStrict()) {
+      // ROUTING_STRICT: a channel-less push echoing what a turn armed on this
+      // server (a reminder it set) belongs to that turn's place.
+      const armed = this.strictArmedPlace(
+        event.serverId,
+        event.content.filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text').map((b) => b.text).join('\n'),
+        strictUnstamped(event.origin),
+      );
+      if (armed !== null) metadata.strictPlace = armed;
     }
 
     const content = [...event.content];
@@ -8866,7 +9004,8 @@ export class AgentFramework {
         const placeOf = (r: InferenceRequest): string => this.strictWakePlace(agentName, r);
         let keepPlace: string;
         if (requests.some((r) => isTurnContinuation(r.reason))) {
-          keepPlace = this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE;
+          // Optional chaining: prototype-built harnesses leave fields unset.
+          keepPlace = this.strictTurnPlaces?.get(agentName) ?? STRICT_NOWHERE;
         } else {
           const brakes = requests.filter((r) => r.strictBrake);
           const pool = brakes.length > 0 ? brakes : requests;
@@ -9199,6 +9338,48 @@ export class AgentFramework {
     }
   }
 
+  // ---- ROUTING_STRICT per-turn prose state -------------------------------
+  // With `turn` (strict), the sticky target, hybrid suppression and clipboard
+  // are the logical turn's own, so a speech link that runs after its turn
+  // ended never reads or writes the next turn's state; the agent-wide maps
+  // mirror the CURRENT turn's values for every other reader. Without `turn`
+  // these are the agent-wide maps (upstream).
+
+  private proseStickyFor(name: string, turn?: StrictProseTurn): string | undefined {
+    return turn ? turn.target : this.proseTargetPins.get(name);
+  }
+
+  private setProseSticky(name: string, target: string | undefined, turn?: StrictProseTurn): void {
+    if (turn) turn.target = target;
+    if (turn && this.strictProseTurns.get(name) !== turn) return;
+    if (target === undefined) this.proseTargetPins.delete(name);
+    else this.proseTargetPins.set(name, target);
+  }
+
+  private proseHybridSuppressedFor(name: string, turn?: StrictProseTurn): boolean {
+    return turn ? turn.hybridSuppressed === true : this.proseHybridSuppressed.has(name);
+  }
+
+  private setProseHybridSuppressed(name: string, on: boolean, turn?: StrictProseTurn): void {
+    if (turn) turn.hybridSuppressed = on;
+    if (turn && this.strictProseTurns.get(name) !== turn) return;
+    if (on) this.proseHybridSuppressed.add(name);
+    else this.proseHybridSuppressed.delete(name);
+  }
+
+  /** The clipboard of bounced prose: per place under strict routing (a
+   *  `{{unsent}}` never pastes another place's words). */
+  private proseClipboardKey(name: string, turn?: StrictProseTurn): string {
+    return turn ? `${name}\u0000${turn.place ?? ''}` : name;
+  }
+
+  /** The server for a prose delivery into `channelId`: the turn's locus
+   *  server when it is the turn's locus channel (strict), else first match. */
+  private proseServerFor(name: string, channelId: string | null, turn?: StrictProseTurn): string | undefined {
+    if (turn) return channelId !== null && channelId === turn.locus ? turn.locusServer : undefined;
+    return this.strictLocusServerFor(name, channelId);
+  }
+
   /**
    * Explicit-prose-routing delivery gateway (docs/explicit-prose-routing.md).
    * Every prose segment of an `explicit`-mode agent flows through here:
@@ -9207,7 +9388,12 @@ export class AgentFramework {
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
-  private async deliverProse(agent: Agent, rawText: string): Promise<void> {
+  private async deliverProse(
+    agent: Agent,
+    rawText: string,
+    /** ROUTING_STRICT: the logical turn the prose belongs to (strictProseTurns). */
+    turn?: StrictProseTurn,
+  ): Promise<void> {
     // Multi-envelope: a single prose block may address SEVERAL destinations —
     // every line beginning with `>>` opens a new envelope, routed
     // independently (first live use: Tilde 2026-07-24, one block carrying a
@@ -9231,7 +9417,7 @@ export class AgentFramework {
 
     for (const envelope of envelopes) {
       if (!envelope.trim()) continue;
-      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''));
+      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''), turn);
     }
   }
 
@@ -9241,7 +9427,10 @@ export class AgentFramework {
     rawText: string,
     locus: string | null,
     allowLocus: boolean,
+    /** ROUTING_STRICT: the logical turn the prose belongs to (strictProseTurns). */
+    turn?: StrictProseTurn,
   ): Promise<void> {
+    const name = agent.name;
     const lines = rawText.split('\n');
     const envelopes: string[] = [];
     let current: string[] = [];
@@ -9261,64 +9450,68 @@ export class AgentFramework {
       const parsed = parseHybridProsePrefix(normalized);
       if (parsed.continueTurn) this.proseContinuations.add(agent.name);
       if (parsed.kind === 'private') {
-        this.proseTargetPins.delete(agent.name);
-        this.proseHybridSuppressed.add(agent.name);
+        this.setProseSticky(name, undefined, turn);
+        this.setProseHybridSuppressed(name, true, turn);
         console.error(`[prose] ${agent.name}: >>>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
         continue;
       }
       if (parsed.kind === 'target') {
         const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
         if ('error' in resolved) {
-          this.proseTargetPins.delete(agent.name);
-          this.proseHybridSuppressed.add(agent.name);
-          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>');
+          this.setProseSticky(name, undefined, turn);
+          this.setProseHybridSuppressed(name, true, turn);
+          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>', turn);
           continue;
         }
         let body = parsed.body;
         const usedClipboard = body.includes('{{unsent}}');
-        if (usedClipboard) body = body.replaceAll('{{unsent}}', this.proseClipboards.get(agent.name) ?? '');
-        this.proseTargetPins.set(agent.name, resolved.channelId);
-        this.proseHybridSuppressed.delete(agent.name);
+        if (usedClipboard) body = body.replaceAll('{{unsent}}', this.proseClipboards.get(this.proseClipboardKey(name, turn)) ?? '');
+        this.setProseSticky(name, resolved.channelId, turn);
+        this.setProseHybridSuppressed(name, false, turn);
         if (!body.trim()) {
           console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
           continue;
         }
         try {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, body, resolved.channelId);
+          const outcome = await this.channelRegistry!.routeSpeech(
+            agent.name, body, resolved.channelId, this.proseServerFor(name, resolved.channelId, turn),
+          );
           this.recordProseDelivery(agent.name, outcome);
           if (outcome?.delivered) {
             this.proseBounceStreaks.delete(agent.name);
-            if (usedClipboard) this.proseClipboards.delete(agent.name);
+            if (usedClipboard) this.proseClipboards.delete(this.proseClipboardKey(name, turn));
           } else {
-            this.proseTargetPins.delete(agent.name);
-            this.proseHybridSuppressed.add(agent.name);
-            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>');
+            this.setProseSticky(name, undefined, turn);
+            this.setProseHybridSuppressed(name, true, turn);
+            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>', turn);
           }
         } catch (err) {
-          this.proseTargetPins.delete(agent.name);
-          this.proseHybridSuppressed.add(agent.name);
-          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>');
+          this.setProseSticky(name, undefined, turn);
+          this.setProseHybridSuppressed(name, true, turn);
+          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', turn);
         }
         continue;
       }
       if (attempted) {
-        this.proseTargetPins.delete(agent.name);
-        this.proseHybridSuppressed.add(agent.name);
-        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>');
+        this.setProseSticky(name, undefined, turn);
+        this.setProseHybridSuppressed(name, true, turn);
+        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>', turn);
         continue;
       }
-      if (this.proseHybridSuppressed.has(agent.name)) {
+      if (this.proseHybridSuppressedFor(name, turn)) {
         this.recordProseSuppression(agent.name, 1);
         continue;
       }
-      const sticky = this.proseTargetPins.get(agent.name);
+      const sticky = this.proseStickyFor(name, turn);
       if (!allowLocus && !sticky) {
         this.recordProseSuppression(agent.name, 1);
         continue;
       }
       const target = sticky ?? locus;
       try {
-        const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
+        const outcome = await this.channelRegistry!.routeSpeech(
+          agent.name, envelope, target, this.proseServerFor(name, target, turn),
+        );
         this.recordProseDelivery(agent.name, outcome);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
@@ -9326,7 +9519,7 @@ export class AgentFramework {
     }
   }
 
-  private async deliverProseEnvelope(agent: Agent, rawText: string): Promise<void> {
+  private async deliverProseEnvelope(agent: Agent, rawText: string, turn?: StrictProseTurn): Promise<void> {
     const name = agent.name;
     const parsed = parseProsePrefix(rawText);
     if (parsed.continueTurn) this.proseContinuations.add(name);
@@ -9335,7 +9528,7 @@ export class AgentFramework {
       // The text already lives in the assistant message (window/chronicle);
       // "delivery" is deliberately a no-op. Consumes the retained text if the
       // segment embedded it.
-      if (parsed.body.includes('{{unsent}}')) this.proseClipboards.delete(name);
+      if (parsed.body.includes('{{unsent}}')) this.proseClipboards.delete(this.proseClipboardKey(name, turn));
       console.error(`[prose] ${name}: >>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
       return;
     }
@@ -9345,17 +9538,17 @@ export class AgentFramework {
     if (parsed.kind === 'target') {
       const res = this.channelRegistry!.resolveProseTarget(parsed.target!);
       if ('error' in res) {
-        this.bounceProse(agent, parsed.body, res.error, res.candidates);
+        this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', turn);
         return;
       }
       targetChannel = res.channelId;
       // Sticky within the turn: later unprefixed segments follow this target.
-      this.proseTargetPins.set(name, targetChannel);
+      this.setProseSticky(name, targetChannel, turn);
       body = parsed.body;
     } else {
-      const sticky = this.proseTargetPins.get(name);
+      const sticky = this.proseStickyFor(name, turn);
       if (!sticky) {
-        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
+        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn', undefined, '>>', turn);
         return;
       }
       targetChannel = sticky;
@@ -9364,7 +9557,7 @@ export class AgentFramework {
 
     const usedClipboard = body.includes('{{unsent}}');
     if (usedClipboard) {
-      body = body.replaceAll('{{unsent}}', this.proseClipboards.get(name) ?? '');
+      body = body.replaceAll('{{unsent}}', this.proseClipboards.get(this.proseClipboardKey(name, turn)) ?? '');
     }
     if (!body.trim()) {
       console.error(`[prose] ${name}: empty body after prefix/substitution — nothing to send`);
@@ -9372,10 +9565,12 @@ export class AgentFramework {
     }
 
     try {
-      const result = await this.channelRegistry!.routeSpeech(name, body, targetChannel);
+      const result = await this.channelRegistry!.routeSpeech(
+        name, body, targetChannel, this.proseServerFor(name, targetChannel, turn),
+      );
       if (result?.delivered) {
         this.proseBounceStreaks.delete(name);
-        if (usedClipboard) this.proseClipboards.delete(name);
+        if (usedClipboard) this.proseClipboards.delete(this.proseClipboardKey(name, turn));
       }
     } catch (err) {
       console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
@@ -9385,9 +9580,17 @@ export class AgentFramework {
   /** Cap on consecutive bounce-triggered wakes (notices still append after). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
-  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>'): void {
+  private bounceProse(
+    agent: Agent,
+    text: string,
+    reason: string,
+    candidates?: string[],
+    prefix: '>>' | '>>>' = '>>',
+    /** ROUTING_STRICT: the logical turn the bounced prose belongs to. */
+    turn?: StrictProseTurn,
+  ): void {
     const name = agent.name;
-    this.proseClipboards.set(name, text);
+    this.proseClipboards.set(this.proseClipboardKey(name, turn), text);
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
     this.proseBounceStreaks.set(name, streak);
     const cand = candidates?.length ? ` Known channels it could mean: ${candidates.join(', ')}.` : '';
@@ -9405,10 +9608,15 @@ export class AgentFramework {
       // the prefix within the same turn. A direct append here would land the
       // notice before the turn's assistant blocks (cache bust, invisible
       // until the next compile).
+      // ROUTING_STRICT: the notice belongs to the turn's place — a late
+      // bounce (a link that ran after its turn ended) is held from, and never
+      // heard in, another place's turn.
       const id = this.addMessage(
         'user',
         [{ type: 'text', text: notice }],
-        { system: true, kind: 'prose-bounce' },
+        turn?.place !== undefined
+          ? { system: true, kind: 'prose-bounce', strictPlace: turn.place } as MessageMetadata
+          : { system: true, kind: 'prose-bounce' },
       );
       if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
       else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
@@ -9428,7 +9636,7 @@ export class AgentFramework {
         reason: 'prose-bounce',
         source: 'framework',
         timestamp: Date.now(),
-        ...this.strictFollowUp(name),
+        ...(turn?.place !== undefined ? { strictPlace: turn.place } : this.strictFollowUp(name)),
       });
     }
   }
@@ -9509,7 +9717,19 @@ export class AgentFramework {
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
           unpark();
           if (this.providerAdmissionClosed) {
+            this.strictParkBrakes.delete(agent.name);
             this.releasePrimaryProviderGate(agent.name);
+            return;
+          }
+          // ROUTING_STRICT: a privileged message braked this parked wake —
+          // it goes back to the queue, where the braking message's wake
+          // starts first (processInferenceRequests).
+          if (this.strictParkBrakes.delete(agent.name)) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: parked wake braked by a privileged message — requeued`);
             return;
           }
           // The scheduler's turn-alive test passed BEFORE the park; the wait
@@ -9546,6 +9766,7 @@ export class AgentFramework {
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           unpark();
+          this.strictParkBrakes.delete(agent.name);
           this.releasePrimaryProviderGate(agent.name);
           console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
         });
@@ -9822,6 +10043,21 @@ export class AgentFramework {
       this.proseContinuations.delete(agent.name);
     }
 
+    // ROUTING_STRICT: this logical turn's prose state (strictProseTurns). A
+    // continuation keeps its predecessor's; the speech links each stream
+    // queues capture it.
+    if (routingStrict() && (!continuingTurn || !this.strictProseTurns.has(agent.name))) {
+      const locusServer = this.strictLocusServers.get(agent.name);
+      this.strictProseTurns.set(agent.name, {
+        place: this.strictTurnPlaces.get(agent.name),
+        locus: this.turnLocusPins.get(agent.name) ?? null,
+        ...(locusServer ? { locusServer } : {}),
+      });
+    } else if (routingStrict() && trigger?.suppressProse) {
+      const prose = this.strictProseTurns.get(agent.name);
+      if (prose) { prose.locus = null; prose.target = undefined; }
+    }
+
     this.touchEphemeralRun(agent.name, true);
     this.emitTrace({
       type: 'inference:started',
@@ -9851,7 +10087,11 @@ export class AgentFramework {
       turnProseRouting === 'explicit'
         ? trigger?.channelId ?? null
         : this.turnLocusPins.get(agent.name) ?? null;
-    if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
+    if (earlyTypingChannel) {
+      const typingServer = this.strictPlaceServerFor(agent.name, earlyTypingChannel);
+      if (typingServer) this.channelRegistry?.startTyping(earlyTypingChannel, undefined, typingServer);
+      else this.channelRegistry?.startTyping(earlyTypingChannel);
+    }
 
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
@@ -10082,6 +10322,10 @@ export class AgentFramework {
     // logical turn, fresh driveStream) keeps it.
     const resolveTurnLocus = (): string | null =>
       this.turnLocusPins.get(agent.name) ?? null;
+    // ROUTING_STRICT: this logical turn's prose state, captured once — every
+    // delivery of this stream (live links, trailing prose) resolves its
+    // sticky target and locus server against its own turn.
+    const strictProseTurn = this.strictProseTurns.get(agent.name);
 
     // Ordered delivery chain for live-routed prose. Links are enqueued
     // WITHOUT awaiting in the stream-event loop — an awaited network post
@@ -10092,10 +10336,14 @@ export class AgentFramework {
     // post must not silence the rest of the turn.
     let turnSpeechChain: Promise<void> = Promise.resolve();
     const enqueueSpeech = (text: string, locus: string | null): void => {
+      // The locus server is resolved NOW, while this turn owns the pin: a
+      // link can run after the turn ended (an abort does not drain the
+      // chain), when the pin belongs to the next turn.
+      const locusServer = this.proseServerFor(agent.name, locus, strictProseTurn);
       turnSpeechChain = turnSpeechChain
         .then(async () => {
           const outcome = await this.channelRegistry!.routeSpeech(
-            agent.name, text, locus, this.strictLocusServerFor(agent.name, locus),
+            agent.name, text, locus, locusServer,
           );
           this.recordProseDelivery(agent.name, outcome);
         })
@@ -10136,7 +10384,11 @@ export class AgentFramework {
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
-    if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+    if (typingChannel) {
+      const typingServer = this.strictPlaceServerFor(agent.name, typingChannel);
+      if (typingServer) this.channelRegistry!.startTyping(typingChannel, undefined, typingServer);
+      else this.channelRegistry!.startTyping(typingChannel);
+    }
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
     // destination server AS THEY GENERATE (voice synthesis, live message
@@ -10426,7 +10678,7 @@ export class AgentFramework {
                       const locus = resolveTurnLocus();
                       for (const seg of roundSegments) {
                         turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverHybridProse(agent, seg, locus, true))
+                          .then(() => this.deliverHybridProse(agent, seg, locus, true, strictProseTurn))
                           .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
                       }
                     }
@@ -10440,7 +10692,7 @@ export class AgentFramework {
                       );
                       for (const seg of roundSegments) {
                         turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverProse(agent, seg))
+                          .then(() => this.deliverProse(agent, seg, strictProseTurn))
                           .catch((err) => console.error('mid-turn prose delivery failed:', err));
                       }
                     }
@@ -10916,14 +11168,14 @@ export class AgentFramework {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
-                    await this.deliverHybridProse(agent, speechText, locus, true);
+                    await this.deliverHybridProse(agent, speechText, locus, true, strictProseTurn);
                   } catch (err) {
                     console.error('text-only hybrid prose delivery failed:', err);
                   }
                 } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   try {
-                    await this.deliverProse(agent, speechText);
+                    await this.deliverProse(agent, speechText, strictProseTurn);
                   } catch (err) {
                     console.error('text-only prose delivery failed:', err);
                   }
@@ -10940,7 +11192,7 @@ export class AgentFramework {
                   );
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(
-                      agent.name, speechText, locus, this.strictLocusServerFor(agent.name, locus),
+                      agent.name, speechText, locus, this.proseServerFor(agent.name, locus, strictProseTurn),
                     );
                     this.recordProseDelivery(agent.name, outcome);
                   } catch (err) {
@@ -10992,7 +11244,7 @@ export class AgentFramework {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
                     try {
-                      await this.deliverHybridProse(agent, seg, locus, true);
+                      await this.deliverHybridProse(agent, seg, locus, true, strictProseTurn);
                     } catch (err) {
                       console.error('trailing hybrid prose delivery failed:', err);
                     }
@@ -11005,7 +11257,7 @@ export class AgentFramework {
                   );
                   for (const seg of segments) {
                     try {
-                      await this.deliverProse(agent, seg);
+                      await this.deliverProse(agent, seg, strictProseTurn);
                     } catch (err) {
                       console.error('trailing prose delivery failed:', err);
                     }
@@ -11035,7 +11287,7 @@ export class AgentFramework {
                 for (const seg of segments) {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(
-                      agent.name, seg, locus, this.strictLocusServerFor(agent.name, locus),
+                      agent.name, seg, locus, this.proseServerFor(agent.name, locus, strictProseTurn),
                     );
                     this.recordProseDelivery(agent.name, outcome);
                   } catch (err) {
@@ -11145,8 +11397,40 @@ export class AgentFramework {
 
             const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
-              await new Promise((resolve) => setTimeout(resolve, action.delayMs));
-              await this.startAgentStream(agent, trigger, attempt + 1);
+              if (!routingStrict()) {
+                await new Promise((resolve) => setTimeout(resolve, action.delayMs));
+                await this.startAgentStream(agent, trigger, attempt + 1);
+                break;
+              }
+              // ROUTING_STRICT: the backoff is brakeable (interruptForPrivileged).
+              const braked = await new Promise<boolean>((resolve) => {
+                const timer = setTimeout(() => {
+                  if (this.strictRetryBackoffs.get(agent.name) === cancel) this.strictRetryBackoffs.delete(agent.name);
+                  resolve(false);
+                }, action.delayMs);
+                const cancel = (): void => {
+                  clearTimeout(timer);
+                  resolve(true);
+                };
+                this.strictRetryBackoffs.set(agent.name, cancel);
+              });
+              if (!braked) {
+                await this.startAgentStream(agent, trigger, attempt + 1);
+                break;
+              }
+              // Braked: the turn ends here, as an aborted turn does.
+              lifecyclePhase = 'aborted';
+              this.settleAgent(agent.name, {
+                stopReason: 'exhausted',
+                speech: '',
+                error: 'Turn interrupted by a privileged user before its retry',
+              });
+              this.emitTrace({
+                type: 'inference:exhausted',
+                agentName: agent.name,
+                error: 'Turn interrupted by a privileged user before its retry',
+              });
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -11796,12 +12080,15 @@ export class AgentFramework {
       };
     }
     try {
+      if (call.callerAgentName) this.strictNoteArming(call.callerAgentName, config.id, call.id, call.input);
       const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
+      this.strictNoteArmingResult(call.id, result.content);
       return {
         success: true,
         data: result.content,
       };
     } catch (err) {
+      this.strictDropArming(call.id);
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),
@@ -13276,18 +13563,27 @@ export class AgentFramework {
   private strictHoldOnArrival(agentName: string, metadata: MessageMetadata | undefined): false | 'hold' | 'gate-wake' {
     const place = this.strictMessagePlace(metadata);
     if (place === null) return false;
-    if (this.activeTurnTokens.has(agentName) || this.activeStreams.has(agentName)) {
-      return samePlace(place, this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE) ? false : 'hold';
+    // A held message whose wake the gate still owes is marked as waking
+    // ('gate-wake'), whether a turn is alive or not: the gate's debounce and
+    // buffer are memory-only, and a stop or crash before they fire must
+    // re-arm the place's turn (rearmStrictHeldWakes), not demote it.
+    const ownGateWake = (): boolean => this.strictGateWakePlaces(agentName).some((p) => samePlace(p, place));
+    if (this.activeTurnTokens?.has(agentName) || this.activeStreams?.has(agentName)) {
+      if (samePlace(place, this.strictTurnPlaces?.get(agentName) ?? STRICT_NOWHERE)) return false;
+      return ownGateWake() ? 'gate-wake' : 'hold';
     }
-    const parked = this.strictParkedPlaces.get(agentName);
-    if (parked !== undefined) return samePlace(place, parked) ? false : 'hold';
-    const ownGateWake = this.strictGateWakePlaces(agentName).some((p) => samePlace(p, place));
-    for (const msg of this.deferredMessages) {
+    const parked = this.strictParkedPlaces?.get(agentName);
+    if (parked !== undefined) {
+      if (samePlace(place, parked)) return false;
+      return ownGateWake() ? 'gate-wake' : 'hold';
+    }
+    const gateWake = ownGateWake();
+    for (const msg of this.deferredMessages ?? []) {
       if ((msg.forAgent ?? this.primaryAgentName) !== agentName) continue;
       const held = this.strictMessagePlace(msg.metadata);
-      if (held !== null && samePlace(held, place)) return ownGateWake ? 'gate-wake' : 'hold';
+      if (held !== null && samePlace(held, place)) return gateWake ? 'gate-wake' : 'hold';
     }
-    if (ownGateWake) return 'gate-wake';
+    if (gateWake) return 'gate-wake';
     return this.strictPendingWakePlaces(agentName).some((p) => !samePlace(p, place)) ? 'hold' : false;
   }
 
@@ -13305,7 +13601,10 @@ export class AgentFramework {
       const place = this.strictMessagePlace(msg.metadata);
       const meta = msg.metadata as Record<string, unknown> | undefined;
       if (place === null || !meta || meta.tuneOut) continue;
-      const channelWake = meta.triggered === true && typeof meta.channelId === 'string';
+      // A channel message the gate let through, or a channel-less push filed
+      // under the place that armed it (strictArmedPlace), that woke the agent.
+      const channelWake = meta.triggered === true
+        && (typeof meta.channelId === 'string' || typeof meta.strictPlace === 'string');
       const stampedWake = meta.strictWake === true;
       if (!channelWake && !stampedWake) continue;
       const agentName = msg.forAgent ?? this.primaryAgentName;
@@ -13405,8 +13704,9 @@ export class AgentFramework {
    *  own place (`strictPlace`), else its channel, else the configured home
    *  channel, else NOWHERE (prose is kept private). */
   private strictWakePlace(agentName: string, request?: { channelId?: string; strictPlace?: string }): string {
-    if (this.ephemeralRuns.has(agentName)) return STRICT_NOWHERE;
-    const forkHome = this.conversationAgentHomes.get(agentName) ?? this.conversationRouter?.channelForAgent(agentName);
+    // Optional chaining: prototype-built harnesses leave fields unset.
+    if (this.ephemeralRuns?.has(agentName)) return STRICT_NOWHERE;
+    const forkHome = this.conversationAgentHomes?.get(agentName) ?? this.conversationRouter?.channelForAgent(agentName);
     if (forkHome) return channelPlace('', forkHome);
     if (request?.strictPlace) return request.strictPlace;
     if (request?.channelId) return channelPlace(this.strictUniqueServerOf(request.channelId), request.channelId);
@@ -13426,7 +13726,7 @@ export class AgentFramework {
    *  it carries that turn's place; empty otherwise. */
   private strictFollowUp(agentName: string): Partial<InferenceRequest> {
     if (!routingStrict()) return {};
-    const place = this.strictTurnPlaces.get(agentName);
+    const place = this.strictTurnPlaces?.get(agentName);
     return place !== undefined ? { strictPlace: place } : {};
   }
 
@@ -13434,23 +13734,170 @@ export class AgentFramework {
    *  that locus (undefined otherwise — routeSpeech then resolves the bare id
    *  as upstream does). */
   private strictLocusServerFor(agentName: string, locus: string | null): string | undefined {
-    if (!routingStrict() || locus === null || this.turnLocusPins.get(agentName) !== locus) return undefined;
-    return this.strictLocusServers.get(agentName);
+    if (!routingStrict() || locus === null || this.turnLocusPins?.get(agentName) !== locus) return undefined;
+    return this.strictLocusServers?.get(agentName);
+  }
+
+  /** ROUTING_STRICT: the server of `agentName`'s turn place when `channelId`
+   *  is that place's channel (undefined otherwise, and without the flag). */
+  private strictPlaceServerFor(agentName: string, channelId: string): string | undefined {
+    if (!routingStrict()) return undefined;
+    const place = this.strictTurnPlaces.get(agentName);
+    const parsed = place !== undefined ? parsePlace(place) : undefined;
+    if (parsed?.kind === 'channel' && parsed.channelId === channelId && parsed.serverId) return parsed.serverId;
+    return this.strictLocusServerFor(agentName, channelId);
   }
 
   /** Places whose wake the gate still owes `agentName` (debounced or
    *  buffered batches), in the same terms the wake will carry. */
   private strictGateWakePlaces(agentName: string): string[] {
     if (!this.eventGate || agentName === this.subconsciousAgentName) return [];
-    let routes: Array<{ routeChannelId?: string; routeServerId?: string }> = [];
+    let routes: Array<{ routeChannelId?: string; routeServerId?: string; place?: string }> = [];
     try {
       routes = this.eventGate.pendingWakeRoutes();
     } catch {
       return [];
     }
-    return routes.map((r) => this.strictWakePlace(agentName, r.routeChannelId && this.mayTakeGateRoute(agentName, r.routeChannelId)
-      ? { channelId: r.routeChannelId, strictPlace: channelPlace(r.routeServerId ?? this.strictUniqueServerOf(r.routeChannelId), r.routeChannelId) }
-      : undefined));
+    return routes.map((r) => {
+      if (r.place) {
+        // A per-place batch (strictGateEventPlace): the wake carries the place.
+        const parsed = parsePlace(r.place);
+        const channel = parsed.kind === 'channel' ? parsed.channelId : undefined;
+        return this.strictWakePlace(agentName, !channel || this.mayTakeGateRoute(agentName, channel)
+          ? { strictPlace: r.place }
+          : undefined);
+      }
+      return this.strictWakePlace(agentName, r.routeChannelId && this.mayTakeGateRoute(agentName, r.routeChannelId)
+        ? { channelId: r.routeChannelId, strictPlace: channelPlace(r.routeServerId ?? this.strictUniqueServerOf(r.routeChannelId), r.routeChannelId) }
+        : undefined);
+    });
+  }
+
+  /**
+   * ROUTING_STRICT: the place of an event the gate is about to batch — the
+   * same place its message is filed under (strictMessagePlace), so a batch
+   * spanning several places becomes one wake per place and each wake starts
+   * the turn of the place whose messages it carries. Undefined without the
+   * flag (one wake per batch, upstream) and for an event with no place of
+   * its own (its wake is a channel-less one).
+   */
+  private strictGateEventPlace(info: GateEventInfo): string | undefined {
+    if (!routingStrict()) return undefined;
+    const meta = strictUnstamped(info.metadata) ?? {};
+    let channelId: string | undefined;
+    if (info.eventType === 'mcpl:channel-incoming') channelId = info.channelId || undefined;
+    else if (info.eventType === 'mcpl:push-event') channelId = this.derivePushEventChannel(meta)?.channelId;
+    if (!channelId) {
+      // A channel-less push that echoes what a turn armed on its server
+      // belongs to that turn's place (strictArmedPlace).
+      if (info.eventType !== 'mcpl:push-event' || !info.serverId) return undefined;
+      return this.strictArmedPlace(info.serverId, info.content, meta) ?? undefined;
+    }
+    return this.strictMessagePlace({
+      ...meta,
+      ...(info.tags ? { tags: info.tags } : {}),
+      channelId,
+      serverId: info.serverId,
+    } as MessageMetadata) ?? undefined;
+  }
+
+  /**
+   * ROUTING_STRICT: a channel-less push from `serverId` (a reminder firing, a
+   * job finishing) that echoes what a turn armed on that server — an id the
+   * server answered that turn's call with (in the push's origin), or free
+   * text the turn passed to it (in the push's content) — belongs to that
+   * turn's place: words the agent wrote for a DM come back to the DM, never
+   * to the home channel. Several matching places are ambiguous: NOWHERE (kept
+   * private). Null when nothing matches (the channel-less fallback applies).
+   */
+  private strictArmedPlace(serverId: string, text: string, origin: Record<string, unknown> | undefined): string | null {
+    if (!routingStrict() || !this.strictArmings?.length) return null;
+    const originIds = new Set(
+      Object.values(origin ?? {}).filter((v): v is string => typeof v === 'string' && v.length >= 6),
+    );
+    const body = normalizeArmingText(text);
+    const places: string[] = [];
+    for (const arming of this.strictArmings) {
+      if (arming.serverId !== serverId) continue;
+      const byId = arming.ids.some((id) => originIds.has(id));
+      const byText = body.length > 0 && arming.texts.some((t) =>
+        body.includes(t) || (body.length >= STRICT_ARMING_TEXT_MIN && t.includes(body)));
+      if (byId || byText) places.push(arming.place);
+    }
+    if (places.length === 0) return null;
+    return places.every((p) => samePlace(p, places[0]!)) ? places[0]! : STRICT_NOWHERE;
+  }
+
+  /** ROUTING_STRICT: note an MCPL tool call made by `agentName`'s turn when
+   *  that turn's place is not the home place (the channel-less fallback would
+   *  answer its echo elsewhere). Kept once the server has answered
+   *  (strictNoteArmingResult). */
+  private strictNoteArming(agentName: string, serverId: string, callId: string, args: unknown): void {
+    if (!routingStrict()) return;
+    const place = this.strictTurnPlaces?.get(agentName);
+    if (place === undefined || samePlace(place, this.strictHomePlace())) return;
+    this.strictPendingArmings.set(callId, { serverId, place, callId, texts: armingTexts(args), ids: [], at: Date.now() });
+  }
+
+  /** ROUTING_STRICT: the server's answer to a noted call: its ids are kept
+   *  with the call's text (nothing to match → dropped), durably. */
+  private strictNoteArmingResult(callId: string, content: unknown): void {
+    const arming = this.strictPendingArmings?.get(callId);
+    if (!arming) return;
+    this.strictPendingArmings.delete(callId);
+    arming.ids = armingIds(content);
+    if (arming.ids.length === 0 && arming.texts.length === 0) return;
+    this.strictArmings.push(arming);
+    if (this.strictArmings.length > STRICT_ARMINGS_CAP) {
+      this.strictArmings.splice(0, this.strictArmings.length - STRICT_ARMINGS_CAP);
+    }
+    this.persistStrictArmings();
+  }
+
+  /** A noted call that failed armed nothing. */
+  private strictDropArming(callId: string): void {
+    this.strictPendingArmings?.delete(callId);
+  }
+
+  private strictArmingsPath(): string | undefined {
+    return this.deferredWritesPath ? join(dirname(this.deferredWritesPath), 'strict-armings.json') : undefined;
+  }
+
+  private persistStrictArmings(): void {
+    const path = this.strictArmingsPath();
+    if (!path) return;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      writeFileSync(temporary, JSON.stringify({ version: 1, armings: this.strictArmings }), { mode: 0o600 });
+      renameSync(temporary, path);
+    } catch (err) {
+      console.error('[strict-routing] failed to persist armed places:', err);
+    }
+  }
+
+  private restoreStrictArmings(): void {
+    const path = this.strictArmingsPath();
+    if (!path) return;
+    try {
+      const doc = this.readRecoveryFile(path) as { armings?: unknown } | undefined;
+      if (!Array.isArray(doc?.armings)) return;
+      this.strictArmings = (doc.armings as StrictArming[])
+        .filter((a) => a && typeof a.serverId === 'string' && typeof a.place === 'string'
+          && Array.isArray(a.texts) && Array.isArray(a.ids))
+        .slice(-STRICT_ARMINGS_CAP);
+    } catch (err) {
+      console.error('[strict-routing] failed to restore armed places:', err);
+    }
+  }
+
+  /** ROUTING_STRICT: a gate notice for a per-place batch carries the batch's
+   *  place (the gate's host-opaque `place`), so it is held and stored with
+   *  that place's messages. Identity otherwise. */
+  private strictGateNoticeMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+    if (!routingStrict() || !metadata || typeof metadata.place !== 'string' || !metadata.place) return metadata;
+    const { place, ...rest } = metadata;
+    return { ...rest, strictPlace: place };
   }
 
   /** Places with a wake still waiting to start a turn for `agentName`
@@ -13465,9 +13912,10 @@ export class AgentFramework {
       if (r.agentName !== agentName || isTurnContinuation(r.reason)) return;
       add(this.strictWakePlace(agentName, r));
     };
-    for (const r of this.pendingRequests) consider(r);
-    for (const r of this.providerAccelerationCooldowns.get(agentName)?.heldRequests ?? []) consider(r);
-    const parked = this.strictParkedPlaces.get(agentName);
+    // Optional chaining: prototype-built harnesses leave fields unset.
+    for (const r of this.pendingRequests ?? []) consider(r);
+    for (const r of this.providerAccelerationCooldowns?.get(agentName)?.heldRequests ?? []) consider(r);
+    const parked = this.strictParkedPlaces?.get(agentName);
     if (parked !== undefined) add(parked);
     for (const p of this.strictGateWakePlaces(agentName)) add(p);
     return places;
@@ -13497,19 +13945,18 @@ export class AgentFramework {
     } as MessageMetadata;
   }
 
-  /**
-   * ROUTING_STRICT: content a module adds on its own (ModuleContext
-   * addMessage — e.g. an async subagent's return) names no place, and its
-   * origin is unknowable here: it may carry another place's private
-   * material. It is its own private place (NOWHERE): never heard inside a
-   * turn for a channel, and a turn woken for it publishes nowhere. A module
-   * that knows the place passes `channelId` + `serverId` (or `strictPlace`).
-   */
-  private stampModulePlace(metadata: MessageMetadata | undefined): MessageMetadata | undefined {
-    if (!routingStrict()) return metadata;
-    const m = metadata as Record<string, unknown> | undefined;
-    if (m?.strictPlace || (typeof m?.channelId === 'string' && m.channelId !== '') || m?.tuneOut) return metadata;
-    return { ...(metadata ?? {}), strictPlace: STRICT_NOWHERE } as MessageMetadata;
+  /** ROUTING_STRICT wake fields of a module's `inference-request` event: the
+   *  place the event names (`channelId` + `serverId` — a module relaying a
+   *  place's material, e.g. a subagent spawned for a DM), else none — a
+   *  channel-less wake, answered in the home channel (else nowhere; spec
+   *  S4). */
+  private strictModuleWakeFields(event: ProcessEvent): Partial<InferenceRequest> {
+    const e = event as { channelId?: unknown; serverId?: unknown };
+    if (typeof e.channelId === 'string' && e.channelId !== '') {
+      const serverId = typeof e.serverId === 'string' && e.serverId ? e.serverId : this.strictUniqueServerOf(e.channelId);
+      return { channelId: e.channelId, strictPlace: channelPlace(serverId, e.channelId) };
+    }
+    return {};
   }
 
   /**
@@ -13526,7 +13973,7 @@ export class AgentFramework {
   ): ((msg: DeferredWrite) => boolean) | undefined {
     if (!routingStrict()) return undefined;
     if (phase === 'boundary') {
-      const place = this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE;
+      const place = this.strictTurnPlaces?.get(agentName) ?? STRICT_NOWHERE;
       return (msg) => {
         const p = this.strictMessagePlace(msg.metadata);
         return p === null || samePlace(p, place);
@@ -15855,6 +16302,8 @@ export class AgentFramework {
     this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
+    // ROUTING_STRICT: what this turn arms on the server keeps its place.
+    this.strictNoteArming(agentName, serverId, call.id, args);
 
     // Build state params for stateful tools (Step 8).
     // A tools/list attribution selects that exact stateful set. Untagged tools
@@ -15914,6 +16363,7 @@ export class AgentFramework {
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
+        this.strictNoteArmingResult(call.id, result.content);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -16016,6 +16466,7 @@ export class AgentFramework {
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
+        this.strictDropArming(call.id);
         this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
         // RFC-007: transport error, closed connection or timeout — no result.
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
