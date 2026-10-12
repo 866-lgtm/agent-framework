@@ -2,8 +2,10 @@
   `glob` and `grep` check their scope against disk before answering, under one rule over disk, the
   workspace store and what disk last agreed with. Files created by a shell show up, including
   binary and oversize ones, listed as `disk-only` with their size and, for images, their type.
-  Files deleted by a shell leave the workspace on every scan path: a watcher event, `sync`, a
-  listing, the scan after a restart, and a watcher reattach. Each entry carries a state:
+  A file deleted by a shell leaves the workspace on every scan path (a watcher event, `sync`, a
+  listing, the scan after a restart, and a watcher reattach) where the workspace held what disk
+  last agreed with; a workspace edit of it stays, as a `deleted-on-disk` conflict. Each file entry
+  carries a state:
   `synced`, `workspace-draft`, `workspace-deleted`, `not-in-branch`, `disk-only`, `conflict` (with
   its kind) or `disk-missing-provenance-unknown`. Where disk couldn't be checked, the state is
   `unverified`, and `incomplete` names the unreadable, ignored or capped regions. A pending
@@ -25,10 +27,13 @@
   `acceptRoot: true` takes the root as it is now: what was recorded about the old one is set
   aside, and every file is compared afresh.
 - **A workspace deletion stays deleted, and materialize never deletes from disk unasked.** Without
-  `autoMaterialize`, a deleted file's disk copy is listed as `workspace-deleted` and no scan or
-  lazy read brings it back. `materialize` lists the deletions it left on disk;
+  `autoMaterialize`, a deleted file's disk copy, unchanged since disk last agreed with the
+  workspace, is listed as `workspace-deleted`, and no scan or lazy read brings that copy back; a
+  copy changed on disk since is a conflict. `materialize` lists the deletions it left on disk;
   `applyDeletions: true` removes those whose disk copy is still one the workspace held, and
-  `force` too removes those changed since. A `sync` of the path restores the file.
+  `force` too removes those changed since. A `sync` of the path takes disk's copy back into the
+  workspace when it's one the workspace can hold (text within the size limit). Once the deletion
+  is on disk, a file that later appears at the path is a new file, adopted like any other.
   `autoMaterialize` writes and deletes follow materialize's freshness rule: a disk copy changed
   by another writer since it last agreed is refused, not overwritten or unlinked.
 - **A `materialize` without a path takes up only what disk still owes:** workspace edits,
@@ -47,12 +52,14 @@
 - **Undo and branch switches are not mistaken for disk edits.** What disk last agreed with is kept
   in global chronicle records rather than branch state, so selecting an earlier state keeps that
   state as a draft over the later disk version, and a file present only in another branch's
-  history is listed `not-in-branch`, never ingested or unlinked. Every change of that evidence is
-  written ahead of its disk write or tree adoption and completed after it is durable, so a crash
-  or a torn record tail never costs an edit: the next observation decides by what disk shows (a
-  disk copy matching neither outcome is an `interrupted` conflict), and a workspace write or
-  deletion that shows on disk without proof it is durable is completed only by the next
-  `materialize`, which redoes it. This replaces #109's stop-time baselines and refused paths,
+  history is listed `not-in-branch`, never ingested or unlinked. Each write or unlink a
+  materialize makes, and each adoption of a disk change into the tree, is recorded as an intent
+  ahead of it and completed once it is durable, so a crash or a torn record tail never costs an
+  edit. After a crash, an interrupted write or unlink is decided by what disk shows (a copy
+  matching neither the one before nor the one intended is an `interrupted` conflict), and one
+  that shows on disk without proof it is durable is completed only by the next `materialize`,
+  which redoes it; an interrupted adoption is settled by its own branch's tree. This replaces
+  #109's stop-time baselines and refused paths,
   which an abrupt exit or a branch switch could lose or rewind. A store that saved them doesn't
   import them, since they name no root: its first pass records each file disk agrees with, and
   lists any other as a conflict or of unknown provenance.
@@ -73,14 +80,17 @@
   store's, say) a write in place would change too, even with `force`. Unless `force`, it must
   also still hold what the materialize decided on, so a disk edit or a new file that appears
   meanwhile is refused, not overwritten. Refused paths are listed as skipped with the reason.
-  Every directory from a written file up to the mount root is synced before the write counts as
-  done, directories it had to create included. Listings likewise accept a directory's contents
-  only while it is still the directory at its path. Each check is made where the operation
-  happens, against what is there at that moment. Node has no `openat`, so a parent directory
-  replaced concurrently in the window between a check and a create, `mkdir`, unlink or listing
-  can still redirect that one operation: an empty file or directory can appear outside the
-  mount, or a same-named file there can be unlinked. Nor can an unlink be bound to the file it
-  checked: a file put at the path after its last check, just before the unlink, is the one
-  removed. Content writes stay bound to the
+  Where the platform can sync a directory (not Windows, nor a filesystem that refuses it), every
+  directory from a written file up to the mount root is synced before the write counts as done,
+  directories it had to create included. Listings likewise accept a directory's contents only
+  while it is still the directory at its path, and a scan, write or unlink accepts what it found
+  only while the mount root is still the one it began under: a scan under a root replaced while
+  it ran decides nothing and reports the root. Each check is made where the operation happens,
+  against what is there at that moment. Node has no `openat`, so a parent directory replaced
+  concurrently in the window between a check and a create, `mkdir`, unlink or listing can still
+  redirect that one operation: an empty file or directory can appear outside the mount, or a
+  same-named file there can be unlinked. Nor can a write or an unlink be bound to the moment of
+  its last check: a file put at the path, or an edit made to it, just after the last look and
+  before the truncate or unlink is overwritten or removed. Content writes stay bound to the
   descriptor verified, inside the mount and with no other hard links, before modification; a
   hard link made to the file after that check shares the write.
