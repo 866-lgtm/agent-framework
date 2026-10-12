@@ -3,13 +3,20 @@
  * so a running process and in-process tests see the current environment.
  * With every flag unset the framework behaves exactly as upstream.
  *
- * ROUTING_STRICT=true — strict place routing:
+ * ROUTING_STRICT=true — strict place routing (places: strict-places.ts —
+ * a channel ON ITS SERVER, a one-party place for a private message on a
+ * shared channel, or nowhere):
  *   - the turn locus is fixed at turn start and never moves mid-turn;
  *   - mid-turn, only messages from the turn's own place (plus non-channel
  *     framework messages) are injected; messages from every other place are
  *     held and processed after the turn, each place in its own turn;
  *   - a wake batch spanning several places starts ONE place's turn (the
- *     earliest-arrived wake) and holds the rest for their own turns;
+ *     earliest-arrived wake; a wake whose message braked the running turn
+ *     first) and holds the rest for their own turns;
+ *   - a framework follow-up (retry, bounce, continuation, self-wake, sleep
+ *     expiry, background script) continues its own turn's place;
+ *   - content a module adds on its own, and an ephemeral run's prose, belong
+ *     to no channel: never heard in a channel's turn, published nowhere;
  *   - a turn whose locus cannot come from a trigger uses the configured home
  *     channel, else publishes nowhere — never the "most recent inbound"
  *     default;

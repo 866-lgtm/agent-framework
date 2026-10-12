@@ -114,10 +114,14 @@ import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { channelOpenOnSend, routingStrict } from './routing-flags.js';
-
-/** ROUTING_STRICT place of a turn that has no channel to publish into (no
- *  trigger channel, no configured home channel): its prose stays private. */
-const STRICT_NOWHERE = '\u0000nowhere';
+import {
+  STRICT_NOWHERE,
+  channelPlace,
+  describePlace,
+  parsePlace,
+  placePublishTarget,
+  samePlace,
+} from './strict-places.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -514,6 +518,21 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
  *  message. */
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+}
+
+/** ROUTING_STRICT: a server's own metadata never carries the framework's
+ *  place stamps — a server must not file its traffic under another place.
+ *  Identity when the flag is off. */
+function strictUnstamped(fields: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!fields || !routingStrict() || (!('strictPlace' in fields) && !('strictWake' in fields))) return fields;
+  const { strictPlace: _place, strictWake: _wake, ...rest } = fields;
+  return rest;
+}
+
+/** ROUTING_STRICT arrival time of a wake: the earliest arrival it absorbed,
+ *  else its event's time, else its own. */
+function strictArrival(r: InferenceRequest): number {
+  return r.strictArrivedAt ?? r.wakeAt ?? r.timestamp;
 }
 
 function isTurnContinuation(reason: string): boolean {
@@ -1073,6 +1092,21 @@ export class AgentFramework {
    *  and the hold boundary: mid-turn, only messages from this place are
    *  injected; every other place's messages are held for their own turns. */
   private strictTurnPlaces: Map<string, string> = new Map();
+  /** ROUTING_STRICT: server of the turn's locus channel (alongside
+   *  turnLocusPins), so prose reaches that server's channel even when
+   *  another server registered the same channel id. */
+  private strictLocusServers: Map<string, string> = new Map();
+  /** ROUTING_STRICT: the place of a wake already dequeued but parked behind
+   *  an in-flight auxiliary call (startAgentStream) — its turn starts next,
+   *  so other places' messages are held from it exactly as from a live turn. */
+  private strictParkedPlaces: Map<string, string> = new Map();
+  /** ROUTING_STRICT: held deferred writes left out of the durable recovery
+   *  file (each over the size cap on its own, or 'all' when the write
+   *  failed). A graceful stop stores them instead of dropping them. */
+  private strictNonDurable: Set<string> | 'all' = new Set();
+  /** ROUTING_STRICT: the place of the turn that started each background
+   *  script, so its later wake continues that conversation. */
+  private strictScriptPlaces: Map<string, string> = new Map();
   /** Per-agent count of consecutive think-only inference rounds in the current
    *  turn — drives the think loop guard (see THINK_SOFT_CAP / THINK_HARD_CAP).
    *  Reset at each fresh inference start and on any non-think round. */
@@ -1504,7 +1538,8 @@ export class AgentFramework {
     // Initialize module registry with callbacks
     this.moduleRegistry = new ModuleRegistry(store, this.queue, {
       getAgents: () => Array.from(this.agents.values()),
-      addMessage: (p, c, m) => this.addMessage(p, c, m),
+      // ROUTING_STRICT: a module's own content names no place (stampModulePlace).
+      addMessage: (p, c, m) => this.addMessage(p, c, this.stampModulePlace(m)),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
@@ -1736,6 +1771,7 @@ export class AgentFramework {
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source, provenance) => {
+          const takesRoute = !!provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId);
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -1756,8 +1792,22 @@ export class AgentFramework {
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
-            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
-              ? { channelId: provenance.routeChannelId, addressed: true }
+            ...(takesRoute
+              ? { channelId: provenance!.routeChannelId, addressed: true }
+              : {}),
+            // ROUTING_STRICT: the wake's place — a self-wake continues the
+            // conversation that armed it; a routed batch belongs to its
+            // route's channel on that event's server; anything else is a
+            // channel-less wake (home).
+            ...(routingStrict()
+              ? provenance?.place
+                ? { strictPlace: provenance.place }
+                : takesRoute
+                  ? { strictPlace: channelPlace(
+                      provenance!.routeServerId ?? framework.strictUniqueServerOf(provenance!.routeChannelId!),
+                      provenance!.routeChannelId!,
+                    ) }
+                  : {}
               : {}),
           });
         },
@@ -1914,8 +1964,14 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+          requestInference: (agentName, reason, source, channel) => {
+            framework.pendingRequests.push({
+              agentName, reason, source, timestamp: Date.now(),
+              // ROUTING_STRICT: a cancel wake is about that channel's backlog.
+              ...(channel && routingStrict()
+                ? { channelId: channel.channelId, strictPlace: channelPlace(channel.serverId, channel.channelId) }
+                : {}),
+            });
           },
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
@@ -2038,6 +2094,7 @@ export class AgentFramework {
       record.runner.dispose();
     }
     this.backgroundScripts.clear();
+    this.strictScriptPlaces?.clear();
     // Retained tool images are per-process by design; a retained stopped
     // framework must not keep up to the whole ledger budget referenced.
     this.toolImageLedgers.clear();
@@ -2056,6 +2113,14 @@ export class AgentFramework {
     // Wait for all stream iteration handles to settle
     if (this.activeStreams.size > 0) {
       await Promise.allSettled(this.activeStreams.values());
+    }
+
+    // ROUTING_STRICT: what is still held is mirrored durably for the next
+    // boot — except what the recovery file could not take, stored now.
+    try {
+      this.storeNonDurableHeldWrites();
+    } catch (err) {
+      console.error('[strict-routing] stop: storing held messages failed:', err);
     }
 
     // Stop sync timer
@@ -2272,7 +2337,8 @@ export class AgentFramework {
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
-      reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
+      reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now(),
+      ...this.strictFollowUp(agentName) } satisfies InferenceRequest];
     this.pendingRequests.push(...requests);
     console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
       `fresh compile queued with ${requests.length} retained request(s)`);
@@ -2518,10 +2584,14 @@ export class AgentFramework {
    * `pendingPrivilegedInterrupts` tells emitTrace to treat this one exhaustion
    * as a deliberate turn-end instead, keeping repeated brake taps from driving
    * the agent hard-down.
+   *
+   * Returns true when a running turn was aborted (ROUTING_STRICT gives the
+   * braking message's place the next turn).
    */
-  private interruptForPrivileged(authorId: string | undefined | null, source: string): void {
-    if (!authorId || !this.eventGate) return;
-    if (!this.eventGate.isPrivilegedUser(authorId)) return;
+  private interruptForPrivileged(authorId: string | undefined | null, source: string): boolean {
+    if (!authorId || !this.eventGate) return false;
+    if (!this.eventGate.isPrivilegedUser(authorId)) return false;
+    let braked = false;
     for (const [agentName, agent] of this.agents) {
       const status = agent.state.status;
       if (status === 'inferring' || status === 'streaming' || status === 'waiting_for_tools') {
@@ -2531,6 +2601,7 @@ export class AgentFramework {
         this.pendingPrivilegedInterrupts.add(agentName);
         const aborted = this.abortInference(agentName, 'privileged-interrupt');
         if (aborted) {
+          braked = true;
           console.error(
             `[privileged-interrupt] agent=${agentName} turn aborted by privileged author ${authorId} (${source})`,
           );
@@ -2541,6 +2612,7 @@ export class AgentFramework {
         }
       }
     }
+    return braked;
   }
 
   /**
@@ -3627,10 +3699,34 @@ export class AgentFramework {
       // AND writes handed to a context manager whose sync has not happened.
       // Always in original deferral order, whatever the pending/un-acked
       // split: a re-deferred entry must not jump the queue.
-      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
+      let durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
       const scanFrom = Object.fromEntries(this.deferredScanFrom);
+      if (routingStrict()) this.strictNonDurable = new Set();
       if ((this.quiesced || this.deferredWritesPersisted || force) && durable.length > 0) {
-        const payload = JSON.stringify(durable);
+        let payload = JSON.stringify(durable);
+        // ROUTING_STRICT: held messages outlive their turn, so one oversized
+        // entry (an inline attachment) must not cost every other entry its
+        // durability. Leave out the largest entries until the rest fits;
+        // the ones left out are stored at a graceful stop
+        // (storeNonDurableHeldWrites) instead of being lost.
+        if (routingStrict() && payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
+          const sized = durable.map((m) => ({ m, size: JSON.stringify(m).length }));
+          const byLargest = [...sized].sort((a, b) => b.size - a.size);
+          const dropped = new Set<string>();
+          let total = payload.length;
+          for (const { m, size } of byLargest) {
+            if (total <= DEFERRED_WRITES_PERSIST_CAP_BYTES) break;
+            dropped.add(m.id);
+            total -= size + 1;
+          }
+          durable = durable.filter((m) => !dropped.has(m.id));
+          payload = JSON.stringify(durable);
+          this.strictNonDurable = dropped;
+          console.error(
+            `[strict-routing] ${dropped.size} deferred write(s) too large for the recovery file ` +
+            `(cap ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes) — kept in memory; a graceful stop stores them`,
+          );
+        }
         if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
           if (!this.deferredWritesCapWarned) {
             this.deferredWritesCapWarned = true;
@@ -3658,6 +3754,7 @@ export class AgentFramework {
         this.deferredWritesPersisted = false;
       }
     } catch (err) {
+      if (routingStrict()) this.strictNonDurable = 'all';
       console.error('[host-mode] failed to persist deferred context writes:', err);
     }
   }
@@ -4888,6 +4985,19 @@ export class AgentFramework {
   };
 
   /**
+   * ROUTING_STRICT: the message a refusal is signalled on — the most recent
+   * inbound message, only when it is in the refused turn's own locus. A
+   * refusal is never signalled in another place (where the message may not
+   * even have been read yet). Unset, the most recent inbound anywhere.
+   */
+  private refusalSignalTarget(agentName: string): { channelId: string; messageId: string } | undefined {
+    const locus = this.turnLocusPins.get(agentName);
+    if (!locus) return undefined;
+    const incoming = this.channelRegistry?.buildChannelContext(agentName)?.incoming;
+    return incoming && incoming.channelId === locus ? incoming : undefined;
+  }
+
+  /**
    * Mark an inference refusal visibly: react on the message that holds the
    * conversational locus (the most recent incoming channel message) with a
    * category-specific emoji. Best-effort — failures are logged, never thrown,
@@ -4895,7 +5005,9 @@ export class AgentFramework {
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      const incoming = routingStrict()
+        ? this.refusalSignalTarget(agentName)
+        : this.channelRegistry?.buildChannelContext()?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
       // the reaction tool wants the raw Discord channel (or thread) id — the
@@ -4908,7 +5020,8 @@ export class AgentFramework {
       // tools/call directly on its connection (bare tool name — no prefix
       // games), bypassing the agent event queue so no synthetic tool-result
       // is injected into a turn the agent never took.
-      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      const serverId = (routingStrict() ? this.strictLocusServers.get(agentName) : undefined)
+        ?? this.channelRegistry?.getChannelServerId(incoming.channelId);
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) {
         console.error(
@@ -5060,12 +5173,15 @@ export class AgentFramework {
     category: string,
   ): Promise<void> {
     try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      const incoming = routingStrict()
+        ? this.refusalSignalTarget(agentName)
+        : this.channelRegistry?.buildChannelContext()?.incoming;
       if (!incoming) return;
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
-      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      const serverId = (routingStrict() ? this.strictLocusServers.get(agentName) : undefined)
+        ?? this.channelRegistry?.getChannelServerId(incoming.channelId);
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) return;
       await server.sendToolsCall('send_message', {
@@ -5313,6 +5429,9 @@ export class AgentFramework {
         reason: 'unstick',
         source: 'framework',
         timestamp: Date.now(),
+        // ROUTING_STRICT: the forced rewind re-runs the last turn's
+        // conversation, in that turn's place.
+        ...this.strictFollowUp(agentName),
       });
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
@@ -6872,7 +6991,13 @@ export class AgentFramework {
                 const hasToolBlocks = msg.content.some(
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
-                if (!hasToolBlocks && msg.participant !== agent.name) {
+                // ROUTING_STRICT: a tune-out-diverted message is stored here
+                // (the subconscious reads it through the shared slot) but never
+                // heard by the resident — its compiled view filters it out,
+                // so the window still matches the wire.
+                const subconsciousOnly = routingStrict()
+                  && !!(msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+                if (!hasToolBlocks && msg.participant !== agent.name && !subconsciousOnly) {
                   midTurnInjections.push({
                     participant: msg.participant,
                     content: msg.content,
@@ -7245,6 +7370,12 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            // ROUTING_STRICT: a module's bare wake request ('inference-request',
+            // e.g. an async subagent's return) asks the agent to process
+            // content the module added on its own — content of unknown origin,
+            // whose place is private (stampModulePlace). Its turn publishes
+            // nowhere.
+            ...(routingStrict() && event.type === 'inference-request' ? { strictPlace: STRICT_NOWHERE } : {}),
           });
         }
       }
@@ -7289,7 +7420,7 @@ export class AgentFramework {
       return undefined;
     }
     const metadata: Record<string, unknown> = {
-      ...event.metadata,
+      ...strictUnstamped(event.metadata),
       ...(event.eventId ? { eventId: event.eventId } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
@@ -7303,7 +7434,7 @@ export class AgentFramework {
 
     // Privileged human interrupt: a message from a privileged author aborts any
     // runaway in-flight turn before this message is deferred/queued behind it.
-    this.interruptForPrivileged(event.author?.id, 'mcpl:channel-incoming');
+    const braked = this.interruptForPrivileged(event.author?.id, 'mcpl:channel-incoming');
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -7330,6 +7461,7 @@ export class AgentFramework {
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
             addressed: isAddressedMessage(event.tags, event.metadata),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+            ...this.strictWakeFields(metadata, braked),
           });
         }
         return { agent: target.name, messageId: id };
@@ -7416,6 +7548,7 @@ export class AgentFramework {
           // picks the turn's frozen speech locus.
           addressed,
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          ...this.strictWakeFields(metadata, braked),
         });
       }
     }
@@ -8198,6 +8331,7 @@ export class AgentFramework {
     // locus there (the materialized delivery at assembly wakes nobody).
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
+    const strictPlace = routingStrict() ? this.strictOccurrencePlace(occ) : null;
     for (const agentName of await this.coalescedAudience(occ)) {
       this.pendingRequests.push({
         agentName,
@@ -8209,8 +8343,30 @@ export class AgentFramework {
         addressed: isAddressedMessage(occ.tags, origin),
         coalescingSubject: subject,
         coalescingBatch: true,
+        ...(strictPlace !== null ? { strictPlace } : {}),
       });
     }
+  }
+
+  /** ROUTING_STRICT: the place a coalesced occurrence's delivery will belong
+   *  to (the same metadata its ordinary delivery path builds), or null for a
+   *  channel-less push. */
+  private strictOccurrencePlace(occ: CoalescedOccurrence<CoalescedDelivery>): string | null {
+    const event = occ.event.event as { metadata?: Record<string, unknown>; origin?: Record<string, unknown>; author?: unknown };
+    const base = (occ.event.lane === 'channel' ? event.metadata : event.origin) ?? {};
+    const channelId = occ.scope.kind === 'channel'
+      ? occ.scope.id
+      : occ.event.lane === 'channel'
+        ? (occ.event.event as { channelId?: string }).channelId
+        : this.derivePushEventChannel(event.origin)?.channelId;
+    if (!channelId) return null;
+    return this.strictMessagePlace({
+      ...base,
+      ...(occ.event.lane === 'channel' && event.author ? { author: event.author } : {}),
+      ...(occ.tags ? { tags: occ.tags } : {}),
+      channelId,
+      serverId: occ.serverId,
+    } as MessageMetadata);
   }
 
   /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
@@ -8344,7 +8500,7 @@ export class AgentFramework {
     }
 
     const metadata: Record<string, unknown> = {
-      ...event.origin,
+      ...strictUnstamped(event.origin),
       serverId: event.serverId,
       featureSet: event.featureSet,
       eventId: event.eventId,
@@ -8396,9 +8552,10 @@ export class AgentFramework {
     // Privileged human interrupt: a push message (e.g. a DM or a mention in a
     // closed channel) from a privileged author aborts any runaway in-flight
     // turn before this message is deferred/queued behind it.
+    let braked = false;
     {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
-      this.interruptForPrivileged(
+      braked = this.interruptForPrivileged(
         typeof origin.authorId === 'string' ? origin.authorId : undefined,
         'mcpl:push-event',
       );
@@ -8436,6 +8593,7 @@ export class AgentFramework {
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          ...this.strictWakeFields(metadata, braked),
         });
       }
     }
@@ -8618,10 +8776,17 @@ export class AgentFramework {
           // ROUTING_STRICT: wakes of different places never absorb each
           // other — each place keeps its own turn after resume.
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`
-            + (routingStrict() ? `|${request.channelId ?? ''}` : '');
+            + (routingStrict() ? `|${this.strictWakePlace(agentName, request)}` : '');
           const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
-            newestByKey.set(key, request);
+            // ROUTING_STRICT: the kept wake remembers the EARLIEST arrival it
+            // absorbed, so places are still answered in arrival order after
+            // a resume.
+            newestByKey.set(key, routingStrict() && prev
+              ? { ...request, strictArrivedAt: Math.min(strictArrival(prev), strictArrival(request)) }
+              : request);
+          } else if (routingStrict()) {
+            newestByKey.set(key, { ...prev, strictArrivedAt: Math.min(strictArrival(prev), strictArrival(request)) });
           }
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -8692,26 +8857,45 @@ export class AgentFramework {
       // own turns afterwards, in arrival order. A continuation of the current
       // turn (budget restart etc.) keeps the turn's place and never consumes
       // another place's wake.
+      //
+      // A wake whose message braked a running turn (privileged interrupt)
+      // goes first: the operator's message is answered next, never the
+      // conversation that was just braked.
+      let strictKeepPlace: string | undefined;
       if (routingStrict()) {
-        const placeOf = (r: InferenceRequest): string => this.strictWakePlace(agentName, r.channelId);
+        const placeOf = (r: InferenceRequest): string => this.strictWakePlace(agentName, r);
         let keepPlace: string;
         if (requests.some((r) => isTurnContinuation(r.reason))) {
           keepPlace = this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE;
         } else {
-          const arrivedAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
-          let earliest = requests[0]!;
-          for (const r of requests) if (arrivedAt(r) < arrivedAt(earliest)) earliest = r;
+          const brakes = requests.filter((r) => r.strictBrake);
+          const pool = brakes.length > 0 ? brakes : requests;
+          let earliest = pool[0]!;
+          for (const r of pool) if (strictArrival(r) < strictArrival(earliest)) earliest = r;
           keepPlace = placeOf(earliest);
         }
-        const elsewhere = requests.filter((r) => !isTurnContinuation(r.reason) && placeOf(r) !== keepPlace);
+        const elsewhere = requests.filter((r) => !isTurnContinuation(r.reason) && !samePlace(placeOf(r), keepPlace));
         if (elsewhere.length > 0) {
           this.pendingRequests.push(...elsewhere);
           requests = requests.filter((r) => !elsewhere.includes(r));
           console.error(
-            `[strict-routing] ${agentName}: turn for ${keepPlace === STRICT_NOWHERE ? '(nowhere)' : keepPlace}; ` +
+            `[strict-routing] ${agentName}: turn for ${describePlace(keepPlace)}; ` +
             `${elsewhere.length} wake(s) for other place(s) wait for their own turns`,
           );
         }
+        // Prefer the spelling that names the server (a channel-only wake
+        // matches its channel on any server).
+        const kept = parsePlace(keepPlace);
+        if (kept.kind === 'channel' && kept.serverId === '') {
+          for (const r of requests) {
+            const p = parsePlace(placeOf(r));
+            if (p.kind === 'channel' && p.serverId !== '' && samePlace(placeOf(r), keepPlace)) {
+              keepPlace = placeOf(r);
+              break;
+            }
+          }
+        }
+        strictKeepPlace = keepPlace;
       }
 
       // Check policy
@@ -8813,6 +8997,7 @@ export class AgentFramework {
         counterparty: budgetRestart ? undefined : provReq?.counterparty,
         wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
+        ...(strictKeepPlace !== undefined ? { strictPlace: strictKeepPlace, strictBrake: undefined } : {}),
       });
     }
   }
@@ -9243,6 +9428,7 @@ export class AgentFramework {
         reason: 'prose-bounce',
         source: 'framework',
         timestamp: Date.now(),
+        ...this.strictFollowUp(name),
       });
     }
   }
@@ -9305,10 +9491,23 @@ export class AgentFramework {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
       if (gate.auxiliaryInFlight > 0) {
+        // ROUTING_STRICT: the dequeued wake is neither queued nor turn-alive
+        // while it waits; record its place so other places' messages are
+        // held from the turn it is about to start.
+        const parkedPlace = routingStrict() && !isTurnContinuation(trigger?.reason ?? '')
+          ? this.strictWakePlace(agent.name, trigger)
+          : undefined;
+        if (parkedPlace !== undefined) this.strictParkedPlaces.set(agent.name, parkedPlace);
+        const unpark = (): void => {
+          if (parkedPlace !== undefined && this.strictParkedPlaces.get(agent.name) === parkedPlace) {
+            this.strictParkedPlaces.delete(agent.name);
+          }
+        };
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
+          unpark();
           if (this.providerAdmissionClosed) {
             this.releasePrimaryProviderGate(agent.name);
             return;
@@ -9346,6 +9545,7 @@ export class AgentFramework {
           }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
+          unpark();
           this.releasePrimaryProviderGate(agent.name);
           console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
         });
@@ -9404,10 +9604,9 @@ export class AgentFramework {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // ROUTING_STRICT: this logical turn's place, fixed before the turn-start
     // drain below and never moved (a continuation keeps its predecessor's).
-    // It is the turn's locus and its hold boundary. Recorded unconditionally
-    // (it is only read under the flag).
-    if (!continuingTurn) {
-      this.strictTurnPlaces.set(agent.name, this.strictWakePlace(agent.name, trigger?.channelId));
+    // It is the turn's locus and its hold boundary.
+    if (!continuingTurn && routingStrict()) {
+      this.strictTurnPlaces.set(agent.name, this.strictWakePlace(agent.name, trigger));
     }
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
@@ -9464,7 +9663,18 @@ export class AgentFramework {
     let assembly: AssemblyResult | undefined;
     if (attempt === 0 && !continuingTurn && this.pushCoalescer?.pendingBatches()) {
       try {
-        assembly = await this.pushCoalescer.assemble(agent.name);
+        // ROUTING_STRICT: only this turn's own place's batches (and
+        // channel-less ones) render into it. Another place's batch keeps its
+        // wake and renders at the start of its own turn.
+        if (routingStrict()) {
+          const turnPlace = this.strictTurnPlaces.get(agent.name) ?? STRICT_NOWHERE;
+          assembly = await this.pushCoalescer.assemble(agent.name, (occ) => {
+            const place = this.strictOccurrencePlace(occ);
+            return place === null || samePlace(place, turnPlace);
+          });
+        } else {
+          assembly = await this.pushCoalescer.assemble(agent.name);
+        }
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
@@ -9523,8 +9733,14 @@ export class AgentFramework {
     // Keep the turn's trigger channel across restarts; only real new turns
     // reset it.
     if (!continuingTurn) {
-      if (trigger?.channelId) {
-        this.activeTriggerChannels.set(agent.name, trigger.channelId);
+      // ROUTING_STRICT: the active channel is the turn's publish target (its
+      // place's channel), so a follow-up of a DM turn keeps the DM and a turn
+      // that publishes nowhere names no channel.
+      const activeChannel = routingStrict()
+        ? placePublishTarget(this.strictTurnPlaces.get(agent.name))?.channelId
+        : trigger?.channelId;
+      if (activeChannel) {
+        this.activeTriggerChannels.set(agent.name, activeChannel);
       } else {
         this.activeTriggerChannels.delete(agent.name);
       }
@@ -9573,16 +9789,25 @@ export class AgentFramework {
         this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
+        if (routingStrict()) this.strictLocusServers.delete(agent.name);
       } else {
-        // ROUTING_STRICT: the locus IS the turn's place (trigger channel,
-        // else home, else nowhere) — the same value the holds use, and
-        // never the registry's "most recent inbound" default.
-        const strictPlace = this.strictTurnPlaces.get(agent.name);
+        // ROUTING_STRICT: the locus IS the turn's place's channel on that
+        // place's server (trigger channel, else home, else nowhere; a
+        // one-party place on a shared channel publishes nowhere) — the same
+        // place the holds use, and never the registry's "most recent
+        // inbound" default.
+        const strictTarget = routingStrict() && this.channelRegistry
+          ? placePublishTarget(this.strictTurnPlaces.get(agent.name))
+          : undefined;
         const locus = routingStrict() && this.channelRegistry
-          ? strictPlace && strictPlace !== STRICT_NOWHERE ? strictPlace : null
+          ? strictTarget?.channelId ?? null
           : this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) this.turnLocusPins.set(agent.name, locus);
         else this.turnLocusPins.delete(agent.name);
+        if (routingStrict()) {
+          if (strictTarget?.serverId) this.strictLocusServers.set(agent.name, strictTarget.serverId);
+          else this.strictLocusServers.delete(agent.name);
+        }
         this.midTurnInputSignals.delete(agent.name);
         if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
       }
@@ -9869,7 +10094,9 @@ export class AgentFramework {
     const enqueueSpeech = (text: string, locus: string | null): void => {
       turnSpeechChain = turnSpeechChain
         .then(async () => {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+          const outcome = await this.channelRegistry!.routeSpeech(
+            agent.name, text, locus, this.strictLocusServerFor(agent.name, locus),
+          );
           this.recordProseDelivery(agent.name, outcome);
         })
         .catch((err) => console.error('mid-turn speech routing failed:', err));
@@ -9951,7 +10178,11 @@ export class AgentFramework {
       !agent.toolWrapperProseGuard
       ? new ProseStreamRouter({
           mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
-          initialTarget: typingChannel,
+          // ROUTING_STRICT: explicit mode streams nothing before a `>>`
+          // target (its typing channel is presence, not a destination) —
+          // unprefixed prose is private, and a stream consumer must never
+          // see text delivery would refuse to send.
+          initialTarget: routingStrict() && turnProseRouting === 'explicit' ? null : typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
             return 'channelId' in r ? r.channelId : null;
@@ -10575,6 +10806,7 @@ export class AgentFramework {
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
                   source: 'framework',
                   timestamp: Date.now(),
+                  ...this.strictFollowUp(agent.name),
                 });
                 handledByRewind = true;
               };
@@ -10707,7 +10939,9 @@ export class AgentFramework {
                     `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ?? '(none)'}`,
                   );
                   try {
-                    const outcome = await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
+                    const outcome = await this.channelRegistry.routeSpeech(
+                      agent.name, speechText, locus, this.strictLocusServerFor(agent.name, locus),
+                    );
                     this.recordProseDelivery(agent.name, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
@@ -10800,7 +11034,9 @@ export class AgentFramework {
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
                   try {
-                    const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
+                    const outcome = await this.channelRegistry.routeSpeech(
+                      agent.name, seg, locus, this.strictLocusServerFor(agent.name, locus),
+                    );
                     this.recordProseDelivery(agent.name, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
@@ -10833,6 +11069,7 @@ export class AgentFramework {
                 reason: 'prose-continuation',
                 source: 'framework',
                 timestamp: Date.now(),
+                ...this.strictFollowUp(agent.name),
               });
             }
 
@@ -11836,6 +12073,10 @@ export class AgentFramework {
       cancelled: false,
     };
     this.backgroundScripts.set(scriptId, record);
+    if (routingStrict()) {
+      const place = this.strictTurnPlaces.get(agentName);
+      if (place !== undefined) this.strictScriptPlaces.set(scriptId, place);
+    }
     this.emitTrace({
       type: 'tool:started', module: 'code_execution', tool: `background:${scriptId}`,
       callId: scriptId, input: { lines: code.split('\n').length },
@@ -11969,6 +12210,7 @@ export class AgentFramework {
       .filter((s) => s.agentName === record.agentName && s.status !== 'running');
     for (const old of settled.slice(0, Math.max(0, settled.length - 5))) {
       this.backgroundScripts.delete(old.id);
+      this.strictScriptPlaces?.delete(old.id);
     }
   }
 
@@ -11981,16 +12223,21 @@ export class AgentFramework {
    */
   private injectScriptWake(record: BackgroundScriptRecord, envelope: string): void {
     try {
+      // ROUTING_STRICT: the script's output belongs to the conversation whose
+      // turn started it — held from turns elsewhere, answered in that place.
+      const scriptPlace = routingStrict() ? this.strictScriptPlaces.get(record.id) ?? STRICT_NOWHERE : undefined;
       const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
         source: 'background-script',
         scriptId: record.id,
         tags: ['script:wake'],
+        ...(scriptPlace !== undefined ? { strictPlace: scriptPlace, strictWake: true } : {}),
       });
       this.pendingRequests.push({
         agentName: record.agentName,
         reason: 'script:wake',
         source: 'code_execution',
         timestamp: Date.now(),
+        ...(scriptPlace !== undefined ? { strictPlace: scriptPlace } : {}),
       });
       this.emitTrace({
         type: 'message:added',
@@ -12731,7 +12978,12 @@ export class AgentFramework {
         const secs = Number(inputObj.wake_in_seconds);
         const wants = inputObj.wake_in_seconds !== undefined && Number.isFinite(secs) && secs > 0;
         if (wants && this.eventGate) {
-          const { inMs } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
+          // ROUTING_STRICT: the self-wake continues THIS turn's conversation,
+          // so it carries this turn's place back to its wake.
+          const strictPlace = routingStrict() ? this.strictTurnPlaces.get(agentName) : undefined;
+          const { inMs } = strictPlace !== undefined
+            ? this.eventGate.armSelfWake(agentName, secs, 'skip_reply', { place: strictPlace })
+            : this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
         } else if (inputObj.wake_in_seconds !== undefined && !this.eventGate) {
           delete inputObj.wake_in_seconds;
@@ -12918,8 +13170,16 @@ export class AgentFramework {
     // ROUTING_STRICT: a fresh message from a place other than the one whose
     // turn is running — or about to run — is held (see strictHoldOnArrival).
     // Flushes of already-queued entries (deferredWriteId) are never re-held.
-    const strictHold = !hasToolResult && !opts?.deferredWriteId && routingStrict()
-      && this.strictHoldOnArrival(agent.name, metadata);
+    const strictHoldReason = !hasToolResult && !opts?.deferredWriteId && routingStrict()
+      ? this.strictHoldOnArrival(agent.name, metadata)
+      : false;
+    const strictHold = strictHoldReason !== false;
+    // A message held for a wake the gate still owes (debounced) records that
+    // it woke the agent, so a crash before the gate fires re-arms its turn
+    // instead of demoting it to ambient (rearmStrictHeldWakes).
+    if (strictHoldReason === 'gate-wake') {
+      metadata = { ...(metadata ?? {}), strictWake: true } as MessageMetadata;
+    }
     if (
       !hasToolResult &&
       (opts?.bypassDeferralFor !== agent.name || strictHold) &&
@@ -13004,60 +13264,67 @@ export class AgentFramework {
   /**
    * ROUTING_STRICT arrival check for a fresh message bound for `agentName`:
    * hold it when it belongs to a place (strictMessagePlace) and
-   *  - that agent's turn is alive for a DIFFERENT place, or
-   *  - no turn is alive but a wake for a different place is pending (that
-   *    turn starts next and must not see this place's messages), or
+   *  - that agent's turn is alive — or dequeued and about to start (parked
+   *    behind an auxiliary call) — for a DIFFERENT place, or
    *  - this place already has held messages (arrival order within a place
-   *    is preserved: a later message never lands before an earlier one).
+   *    is preserved: a later message never lands before an earlier one), or
+   *  - this place's own wake is still owed by the gate (debounced or
+   *    buffered): another place's turn can start first and must not see it, or
+   *  - no turn is alive but a wake for a different place is pending (that
+   *    turn starts next and must not see this place's messages).
    */
-  private strictHoldOnArrival(agentName: string, metadata: MessageMetadata | undefined): boolean {
+  private strictHoldOnArrival(agentName: string, metadata: MessageMetadata | undefined): false | 'hold' | 'gate-wake' {
     const place = this.strictMessagePlace(metadata);
     if (place === null) return false;
     if (this.activeTurnTokens.has(agentName) || this.activeStreams.has(agentName)) {
-      return place !== (this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE);
+      return samePlace(place, this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE) ? false : 'hold';
     }
+    const parked = this.strictParkedPlaces.get(agentName);
+    if (parked !== undefined) return samePlace(place, parked) ? false : 'hold';
+    const ownGateWake = this.strictGateWakePlaces(agentName).some((p) => samePlace(p, place));
     for (const msg of this.deferredMessages) {
-      if ((msg.forAgent ?? this.primaryAgentName) === agentName && this.strictMessagePlace(msg.metadata) === place) {
-        return true;
-      }
+      if ((msg.forAgent ?? this.primaryAgentName) !== agentName) continue;
+      const held = this.strictMessagePlace(msg.metadata);
+      if (held !== null && samePlace(held, place)) return ownGateWake ? 'gate-wake' : 'hold';
     }
-    for (const wakePlace of this.strictPendingWakePlaces(agentName)) {
-      if (wakePlace !== place) return true;
-    }
-    return false;
+    if (ownGateWake) return 'gate-wake';
+    return this.strictPendingWakePlaces(agentName).some((p) => !samePlace(p, place)) ? 'hold' : false;
   }
 
   /** ROUTING_STRICT boot recovery: queue a wake per (agent, place) for every
-   *  restored deferred write from a place that woke the agent
-   *  (`metadata.triggered`). The in-memory wakes died with the process; the
-   *  messages did not. No-op when the flag is off. */
+   *  restored deferred write that had woken the agent — a channel message
+   *  the gate let through (`metadata.triggered`), or channel-less operator
+   *  input that requested a wake (`metadata.strictWake`). The in-memory
+   *  wakes died with the process; the messages did not. A tune-out-diverted
+   *  message never wakes the resident (its `triggered` is the gate verdict
+   *  the subconscious reads). No-op when the flag is off. */
   private rearmStrictHeldWakes(): void {
     if (!routingStrict()) return;
-    const armed = new Set<string>();
+    const armed: Array<{ agentName: string; place: string }> = [];
     for (const msg of this.deferredMessages) {
       const place = this.strictMessagePlace(msg.metadata);
       const meta = msg.metadata as Record<string, unknown> | undefined;
-      // A channel message that woke the agent, or stamped operator input
-      // (stamped only when it requested a wake).
-      const channelWake = meta?.triggered === true && typeof meta.channelId === 'string';
-      const stampedWake = typeof meta?.strictPlace === 'string';
-      if (place === null || !meta || (!channelWake && !stampedWake)) continue;
+      if (place === null || !meta || meta.tuneOut) continue;
+      const channelWake = meta.triggered === true && typeof meta.channelId === 'string';
+      const stampedWake = meta.strictWake === true;
+      if (!channelWake && !stampedWake) continue;
       const agentName = msg.forAgent ?? this.primaryAgentName;
       if (!agentName || !this.agents.has(agentName)) continue;
-      const key = `${agentName}\u0000${place}`;
-      if (armed.has(key)) continue;
-      armed.add(key);
+      if (armed.some((a) => a.agentName === agentName && samePlace(a.place, place))) continue;
+      armed.push({ agentName, place });
+      const target = placePublishTarget(place);
       this.pendingRequests.push({
         agentName,
         reason: 'strict-hold:recovered',
         source: 'framework',
         timestamp: Date.now(),
-        ...(channelWake ? { channelId: place } : {}),
+        ...(target ? { channelId: target.channelId } : {}),
+        strictPlace: place,
         addressed: isAddressedMessage(meta.tags as string[] | undefined, meta),
       });
     }
-    if (armed.size > 0) {
-      console.error(`[strict-routing] re-armed ${armed.size} wake(s) for held message(s) restored at boot`);
+    if (armed.length > 0) {
+      console.error(`[strict-routing] re-armed ${armed.length} wake(s) for held message(s) restored at boot`);
     }
   }
 
@@ -13075,65 +13342,174 @@ export class AgentFramework {
   //   - a turn end / idle point releases every place with no pending wake;
   //     a waking place's messages wait for the turn its wake starts, whose
   //     turn-start drain stores them as that turn's new input.
+  // Places are server-qualified (strict-places.ts): the same channel id on
+  // two servers is two places.
 
-  /** The place a queued message belongs to — its channel, or the stamped
-   *  place of channel-less operator input (stampStrictPlace) — or null for a
-   *  non-channel framework message (module notes, subagent returns,
-   *  channel-less push events, the framework's own system markers), which a
-   *  hold never applies to. MCPL deliveries always carry their serverId, so
-   *  a server cannot pass its traffic off as a framework marker. */
+  /**
+   * The place a queued message belongs to, or null for a message no hold
+   * applies to:
+   *  - a stamped place (`strictPlace`: channel-less operator input, module
+   *    content of unknown origin) wins;
+   *  - a channel message's place is its channel on its server; a private
+   *    message on a shared channel (tagged `chat:private`/`chat:dm` on a
+   *    channel that is not itself a DM — an in-world whisper) is a separate
+   *    one-party place;
+   *  - null: tune-out-diverted traffic (never in the resident's view; it is
+   *    stored at every drain for the subconscious and never injected),
+   *    the framework's own system markers about the agent's own actions (a
+   *    `system` row with no server), and non-channel framework messages
+   *    (channel-less push events, module notes, gate notices). MCPL
+   *    deliveries always carry their serverId, so a server cannot pass its
+   *    traffic off as a framework marker; a marker that carries a channel's
+   *    own content (the tune-out backlog dump) names its server.
+   */
   private strictMessagePlace(metadata: MessageMetadata | undefined): string | null {
     const m = metadata as Record<string, unknown> | undefined;
-    const channelId = m?.channelId;
-    if (typeof channelId === 'string' && channelId !== '') {
-      if (m?.system === true && m.serverId === undefined) return null;
-      return channelId;
+    if (!m || m.tuneOut) return null;
+    const stamped = m.strictPlace;
+    if (typeof stamped === 'string' && stamped !== '') return stamped;
+    const channelId = m.channelId;
+    if (typeof channelId !== 'string' || channelId === '') return null;
+    if (m.system === true && m.serverId === undefined) return null;
+    const serverId = typeof m.serverId === 'string' ? m.serverId : '';
+    const tags = Array.isArray(m.tags) ? (m.tags as unknown[]) : [];
+    const privateTagged = tags.includes('chat:private') || tags.includes('chat:dm');
+    const dmChannel = m.isDM === true || m.guildId === null || m.channelType === 'dm' || /(^|:)dm:/.test(channelId);
+    if (privateTagged && !dmChannel) {
+      const author = m.author as { id?: unknown } | undefined;
+      const party = typeof author?.id === 'string' && author.id
+        ? author.id
+        : typeof m.authorId === 'string' && m.authorId ? m.authorId : 'unknown';
+      return channelPlace(serverId, channelId, party);
     }
-    const stamped = m?.strictPlace;
-    return typeof stamped === 'string' && stamped !== '' ? stamped : null;
+    return channelPlace(serverId, channelId);
   }
 
-  /** The place a turn woken by a request with `channelId` belongs to: fork
-   *  home, else the trigger channel, else the configured home channel, else
-   *  STRICT_NOWHERE (prose is kept private). Also the strict turn locus. */
-  private strictWakePlace(agentName: string, channelId: string | undefined): string {
-    return this.conversationAgentHomes.get(agentName)
-      ?? this.conversationRouter?.channelForAgent(agentName)
-      ?? channelId
-      ?? this.mcplHomeChannel
-      ?? STRICT_NOWHERE;
+  /** The configured home channel's place (server resolved through the
+   *  registry when it knows the channel), else NOWHERE. */
+  private strictHomePlace(): string {
+    const home = this.mcplHomeChannel;
+    if (!home) return STRICT_NOWHERE;
+    return channelPlace(this.strictUniqueServerOf(home), home);
+  }
+
+  /** The one server that registered `channelId`, or '' (unknown / ambiguous). */
+  private strictUniqueServerOf(channelId: string): string {
+    const servers = this.channelRegistry?.serverIdsForChannel(channelId) ?? [];
+    return servers.length === 1 ? servers[0]! : '';
+  }
+
+  /** The place a turn started by `request` belongs to: an ephemeral run
+   *  publishes nowhere (its words are its caller's tool result, never speech
+   *  to a place); a conversation fork is its home channel; else the wake's
+   *  own place (`strictPlace`), else its channel, else the configured home
+   *  channel, else NOWHERE (prose is kept private). */
+  private strictWakePlace(agentName: string, request?: { channelId?: string; strictPlace?: string }): string {
+    if (this.ephemeralRuns.has(agentName)) return STRICT_NOWHERE;
+    const forkHome = this.conversationAgentHomes.get(agentName) ?? this.conversationRouter?.channelForAgent(agentName);
+    if (forkHome) return channelPlace('', forkHome);
+    if (request?.strictPlace) return request.strictPlace;
+    if (request?.channelId) return channelPlace(this.strictUniqueServerOf(request.channelId), request.channelId);
+    return this.strictHomePlace();
+  }
+
+  /** Wake fields for a message-driven wake under ROUTING_STRICT (its place,
+   *  and whether its message braked a running turn); empty otherwise. */
+  private strictWakeFields(metadata: MessageMetadata | Record<string, unknown> | undefined, braked = false): Partial<InferenceRequest> {
+    if (!routingStrict()) return {};
+    const place = this.strictMessagePlace(metadata as MessageMetadata | undefined);
+    return { ...(place !== null ? { strictPlace: place } : {}), ...(braked ? { strictBrake: true } : {}) };
+  }
+
+  /** ROUTING_STRICT: a framework follow-up wake (a retry, a bounce, a
+   *  continuation) continues the conversation of the turn that raised it, so
+   *  it carries that turn's place; empty otherwise. */
+  private strictFollowUp(agentName: string): Partial<InferenceRequest> {
+    if (!routingStrict()) return {};
+    const place = this.strictTurnPlaces.get(agentName);
+    return place !== undefined ? { strictPlace: place } : {};
+  }
+
+  /** ROUTING_STRICT: the server of `agentName`'s turn locus when `locus` is
+   *  that locus (undefined otherwise — routeSpeech then resolves the bare id
+   *  as upstream does). */
+  private strictLocusServerFor(agentName: string, locus: string | null): string | undefined {
+    if (!routingStrict() || locus === null || this.turnLocusPins.get(agentName) !== locus) return undefined;
+    return this.strictLocusServers.get(agentName);
+  }
+
+  /** Places whose wake the gate still owes `agentName` (debounced or
+   *  buffered batches), in the same terms the wake will carry. */
+  private strictGateWakePlaces(agentName: string): string[] {
+    if (!this.eventGate || agentName === this.subconsciousAgentName) return [];
+    let routes: Array<{ routeChannelId?: string; routeServerId?: string }> = [];
+    try {
+      routes = this.eventGate.pendingWakeRoutes();
+    } catch {
+      return [];
+    }
+    return routes.map((r) => this.strictWakePlace(agentName, r.routeChannelId && this.mayTakeGateRoute(agentName, r.routeChannelId)
+      ? { channelId: r.routeChannelId, strictPlace: channelPlace(r.routeServerId ?? this.strictUniqueServerOf(r.routeChannelId), r.routeChannelId) }
+      : undefined));
   }
 
   /** Places with a wake still waiting to start a turn for `agentName`
-   *  (queued, or held by a provider cooldown). Continuations of the current
-   *  turn are not wakes of a place. */
-  private strictPendingWakePlaces(agentName: string): Set<string> {
-    const places = new Set<string>();
+   *  (queued, held by a provider cooldown, dequeued but parked, or owed by
+   *  the gate). Continuations of the current turn are not wakes of a place. */
+  private strictPendingWakePlaces(agentName: string): string[] {
+    const places: string[] = [];
+    const add = (place: string): void => {
+      if (!places.includes(place)) places.push(place);
+    };
     const consider = (r: InferenceRequest): void => {
       if (r.agentName !== agentName || isTurnContinuation(r.reason)) return;
-      places.add(this.strictWakePlace(agentName, r.channelId));
+      add(this.strictWakePlace(agentName, r));
     };
     for (const r of this.pendingRequests) consider(r);
     for (const r of this.providerAccelerationCooldowns.get(agentName)?.heldRequests ?? []) consider(r);
+    const parked = this.strictParkedPlaces.get(agentName);
+    if (parked !== undefined) add(parked);
+    for (const p of this.strictGateWakePlaces(agentName)) add(p);
     return places;
   }
 
   /**
    * ROUTING_STRICT: conversational operator input that carries no channel
-   * (CLI / IPC / API messages that wake the agent) belongs to the place a
-   * channel-less wake is answered in — the home channel, else nowhere — so it
-   * is held like any other place's message instead of being heard inside a
-   * turn running elsewhere. The place rides in metadata (`strictPlace`) so it
-   * survives deferral, persistence and boot recovery. No-op without the flag.
+   * (CLI / IPC / API messages) belongs to the place a channel-less wake is
+   * answered in — the home channel, else nowhere — so it is held like any
+   * other place's message instead of being heard inside a turn running
+   * elsewhere, whether or not it wakes the agent. The place rides in
+   * metadata (`strictPlace`, plus `strictWake` when it requested a wake) so
+   * it survives deferral, persistence and boot recovery. No-op without the
+   * flag.
    */
   private stampStrictPlace(event: ProcessEvent, response: EventResponse, metadata: MessageMetadata | undefined): MessageMetadata | undefined {
-    if (!routingStrict() || !response.requestInference) return metadata;
+    if (!routingStrict()) return metadata;
     if (event.type !== 'external-message' && event.type !== 'api:message') return metadata;
     const channelId = (metadata as Record<string, unknown> | undefined)?.channelId;
     if (typeof channelId === 'string' && channelId !== '') return metadata;
     const target = this.primaryAgentName ?? this.agents.keys().next().value;
     if (!target) return metadata;
-    return { ...(metadata ?? {}), strictPlace: this.strictWakePlace(target, undefined) } as MessageMetadata;
+    return {
+      ...(metadata ?? {}),
+      strictPlace: this.strictWakePlace(target, undefined),
+      ...(response.requestInference ? { strictWake: true } : {}),
+    } as MessageMetadata;
+  }
+
+  /**
+   * ROUTING_STRICT: content a module adds on its own (ModuleContext
+   * addMessage — e.g. an async subagent's return) names no place, and its
+   * origin is unknowable here: it may carry another place's private
+   * material. It is its own private place (NOWHERE): never heard inside a
+   * turn for a channel, and a turn woken for it publishes nowhere. A module
+   * that knows the place passes `channelId` + `serverId` (or `strictPlace`).
+   */
+  private stampModulePlace(metadata: MessageMetadata | undefined): MessageMetadata | undefined {
+    if (!routingStrict()) return metadata;
+    const m = metadata as Record<string, unknown> | undefined;
+    if (m?.strictPlace || (typeof m?.channelId === 'string' && m.channelId !== '') || m?.tuneOut) return metadata;
+    return { ...(metadata ?? {}), strictPlace: STRICT_NOWHERE } as MessageMetadata;
   }
 
   /**
@@ -13153,14 +13529,17 @@ export class AgentFramework {
       const place = this.strictTurnPlaces.get(agentName) ?? STRICT_NOWHERE;
       return (msg) => {
         const p = this.strictMessagePlace(msg.metadata);
-        return p === null || p === place;
+        return p === null || samePlace(p, place);
       };
     }
-    const waking = this.strictPendingWakePlaces(agentName);
-    if (phase === 'turn-start') waking.delete(turnPlace ?? STRICT_NOWHERE);
+    let waking = this.strictPendingWakePlaces(agentName);
+    if (phase === 'turn-start') {
+      const own = turnPlace ?? STRICT_NOWHERE;
+      waking = waking.filter((p) => !samePlace(p, own));
+    }
     return (msg) => {
       const p = this.strictMessagePlace(msg.metadata);
-      return p === null || !waking.has(p);
+      return p === null || !waking.some((w) => samePlace(w, p));
     };
   }
 
@@ -13196,7 +13575,7 @@ export class AgentFramework {
       if (target && !this.activeTurnTokens.has(target) && !this.activeStreams.has(target)) targets.add(target);
     }
     for (const target of targets) {
-      if (this.strictPendingWakePlaces(target).size > 0) continue;
+      if (this.strictPendingWakePlaces(target).length > 0) continue;
       const drained = this.drainDeferredFor(target);
       for (const msg of drained) {
         try {
@@ -13210,6 +13589,46 @@ export class AgentFramework {
       }
       this.ackDeferredWrites();
       console.error(`[strict-routing] ${target}: stored ${drained.length} held message(s) whose place has no pending wake`);
+    }
+  }
+
+  /**
+   * ROUTING_STRICT graceful stop: held messages the durable recovery file
+   * could not take (over its size cap, or the write failed) would otherwise
+   * be lost — upstream stores a mid-turn message at the turn teardown a stop
+   * forces. Store them now (their place's turn cannot run in this process
+   * any more); held messages the file does carry stay held for the next
+   * boot's re-armed turns.
+   */
+  private storeNonDurableHeldWrites(): void {
+    if (!routingStrict() || !this.deferredMessages?.length) return;
+    const nonDurable = this.strictNonDurable;
+    if (nonDurable !== 'all' && nonDurable.size === 0) return;
+    const isNonDurable = (msg: DeferredWrite): boolean => nonDurable === 'all' || nonDurable.has(msg.id);
+    const targets = new Set<string>();
+    for (const msg of this.deferredMessages) {
+      const target = msg.forAgent ?? this.primaryAgentName;
+      if (target && isNonDurable(msg)) targets.add(target);
+    }
+    let stored = 0;
+    for (const target of targets) {
+      const agent = this.agents.get(target);
+      if (!agent) continue;
+      for (const msg of this.drainDeferredFor(target, isNonDurable)) {
+        try {
+          agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+          stored++;
+        } catch (err) {
+          console.error(`[strict-routing] stop: failed to store a held message for ${target}:`, err);
+        }
+      }
+    }
+    this.ackDeferredWrites();
+    if (stored > 0) {
+      console.error(
+        `[strict-routing] stop: stored ${stored} held message(s) the recovery file could not carry ` +
+        `(their wakes do not survive the restart)`,
+      );
     }
   }
 
@@ -13731,6 +14150,7 @@ export class AgentFramework {
       reason: 'inference-failure-rewind-retry',
       source: 'framework',
       timestamp: Date.now(),
+      ...this.strictFollowUp(agent.name),
     });
   }
 
@@ -15938,7 +16358,11 @@ export class AgentFramework {
       return;
     }
 
-    const { until } = gate.setSleep(seconds, input.message, agentName);
+    // ROUTING_STRICT: the expiry wake resumes the conversation that slept.
+    const strictPlace = routingStrict() ? this.strictTurnPlaces.get(agentName) : undefined;
+    const { until } = strictPlace !== undefined
+      ? gate.setSleep(seconds, input.message, agentName, { place: strictPlace })
+      : gate.setSleep(seconds, input.message, agentName);
     const announce = input.announce !== false; // default true
     const human =
       seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
@@ -15967,7 +16391,7 @@ export class AgentFramework {
         }
       } else {
         const locus = this.turnLocusPins.get(agentName) ?? null;
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
+        this.channelRegistry.routeSpeech(agentName, text, locus, this.strictLocusServerFor(agentName, locus)).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });
       }
