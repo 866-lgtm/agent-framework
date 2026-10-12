@@ -6744,6 +6744,42 @@ export class AgentFramework {
             this.pendingAssistantBlocks.delete(agent.name);
           }
 
+          // Think loop guard: when this round's only tool call(s) were think(),
+          // count it and steer the model back toward acting. Any non-think tool
+          // call is real progress and clears the counter. See THINK_*_CAP.
+          // Runs BEFORE the results are serialized below: the soft-cap steer
+          // rewrites tc.result.data, and both the stored history copy and the
+          // live wire copy are built from it (byte-matched). Placed after
+          // serialization, the steer reached neither and only the hard cap
+          // took effect.
+          const roundToolNames = currentState.toolResults.map(tc => tc.name);
+          const thinkOnlyRound =
+            roundToolNames.length > 0 && roundToolNames.every(n => n === 'think');
+          let thinkGuardEndTurn = false;
+          if (thinkOnlyRound) {
+            const n = (this.consecutiveThinkRounds.get(agent.name) ?? 0) + 1;
+            this.consecutiveThinkRounds.set(agent.name, n);
+            if (THINK_HARD_CAP > 0 && n >= THINK_HARD_CAP) {
+              // Backstop: break a runaway think loop by ending the turn. The
+              // shouldEndTurn branch below emits inference:turn_ended.
+              thinkGuardEndTurn = true;
+            } else if (THINK_SOFT_CAP > 0 && n >= THINK_SOFT_CAP) {
+              // Rewrite the think result the model is about to read with a firm
+              // steer toward replying or using a concrete (non-think) tool.
+              for (const tc of currentState.toolResults) {
+                if (tc.name === 'think' && tc.result.success
+                    && tc.result.data && typeof tc.result.data === 'object') {
+                  (tc.result.data as Record<string, unknown>).note =
+                    `You have used think ${n} times in a row without replying or acting. ` +
+                    `Stop reasoning now and either reply to the user in plain text or call a ` +
+                    `concrete (non-think) tool. Do not call think again this turn.`;
+                }
+              }
+            }
+          } else {
+            this.consecutiveThinkRounds.delete(agent.name);
+          }
+
           // Effective inline cap: agent_settings override → durable config →
           // house default, clamped to the strategy bound (see resolver).
           const maxChars = this.resolveToolResultInlineCap(agent).cap;
@@ -6823,37 +6859,6 @@ export class AgentFramework {
           // the send suppression: nothing new was said to the agent.
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
-          }
-
-          // Think loop guard: when this round's only tool call(s) were think(),
-          // count it and steer the model back toward acting. Any non-think tool
-          // call is real progress and clears the counter. See THINK_*_CAP.
-          const roundToolNames = currentState.toolResults.map(tc => tc.name);
-          const thinkOnlyRound =
-            roundToolNames.length > 0 && roundToolNames.every(n => n === 'think');
-          let thinkGuardEndTurn = false;
-          if (thinkOnlyRound) {
-            const n = (this.consecutiveThinkRounds.get(agent.name) ?? 0) + 1;
-            this.consecutiveThinkRounds.set(agent.name, n);
-            if (THINK_HARD_CAP > 0 && n >= THINK_HARD_CAP) {
-              // Backstop: break a runaway think loop by ending the turn. The
-              // shouldEndTurn branch below emits inference:turn_ended.
-              thinkGuardEndTurn = true;
-            } else if (THINK_SOFT_CAP > 0 && n >= THINK_SOFT_CAP) {
-              // Rewrite the think result the model is about to read with a firm
-              // steer toward replying or using a concrete (non-think) tool.
-              for (const tc of currentState.toolResults) {
-                if (tc.name === 'think' && tc.result.success
-                    && tc.result.data && typeof tc.result.data === 'object') {
-                  (tc.result.data as Record<string, unknown>).note =
-                    `You have used think ${n} times in a row without replying or acting. ` +
-                    `Stop reasoning now and either reply to the user in plain text or call a ` +
-                    `concrete (non-think) tool. Do not call think again this turn.`;
-                }
-              }
-            }
-          } else {
-            this.consecutiveThinkRounds.delete(agent.name);
           }
 
           // Check if any tool result requested endTurn (skip_reply etc.), or the
