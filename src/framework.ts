@@ -9682,7 +9682,10 @@ export class AgentFramework {
       !agent.toolWrapperProseGuard
       ? new ProseStreamRouter({
           mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
-          initialTarget: typingChannel,
+          // Explicit text has no destination until a `>>` prefix names one,
+          // so the stream starts suppressed. The trigger channel is only
+          // where explicit mode's typing indicator shows.
+          initialTarget: turnProseRouting === 'explicit' ? null : typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
             return 'channelId' in r ? r.channelId : null;

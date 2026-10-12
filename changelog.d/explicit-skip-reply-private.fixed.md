@@ -12,3 +12,9 @@
   the retained text aside. A valid destination prefix, or a destination set
   earlier in the turn, can still send the round's text through the live
   outgoing stream as it is written.
+- Explicit prose routing no longer streams unprefixed text to the trigger
+  channel. The MCPL outgoing stream (`channels/outgoing/chunk` and
+  `complete`) started with the trigger channel as its destination, so a
+  streaming-capable server there received text that delivery would bounce.
+  It now starts with no destination, since explicit text has none until a
+  `>>` prefix names one.

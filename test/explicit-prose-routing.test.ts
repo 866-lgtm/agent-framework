@@ -22,6 +22,7 @@ import type {
   ToolDefinition,
   ToolCall,
   ToolResult,
+  InferenceRequest,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -236,6 +237,20 @@ describe('explicit prose routing', () => {
     return answered;
   }
 
+  /** What the registry stub's streaming surface receives (MCPL Spec 14.3 chunk and complete). */
+  function captureStream(framework: AgentFramework) {
+    const chunks: Array<{ channelId: string; delta: string }> = [];
+    const completes: Array<{ channelId: string; text: string }> = [];
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.sendOutgoingChunk = (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      chunks.push({ channelId, delta });
+    };
+    registry.sendOutgoingComplete = (channelId: string, _agent: string, _id: string, text: string) => {
+      completes.push({ channelId, text });
+    };
+    return { chunks, completes };
+  }
+
   /** The texts of the agent's context, and the bounce notices among them. */
   function context(framework: AgentFramework): { texts: string[]; bounces: number } {
     const messages = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{
@@ -377,6 +392,38 @@ describe('explicit prose routing', () => {
     assert.equal(skip.calls, 1, 'the bounce wake ran the skip_reply round');
     assert.equal(routed.length, 0);
     assert.equal(clipboardOf(framework), undefined, 'the retained text is set aside, as >>skip_reply {{unsent}} says');
+
+    await framework.stop();
+  });
+
+  it('explicit mode streams nothing before a destination: unprefixed text never reaches the trigger channel', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Unprefixed musing.\n>>#alpha streamed after the prefix' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubRegistry(framework);
+    const stream = captureStream(framework);
+    // The unprefixed line bounces, and its wake starts a second turn.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+
+    // A turn the trigger channel woke: chan-alpha is where its typing shows.
+    const internals = framework as unknown as {
+      pendingRequests: InferenceRequest[];
+      processInferenceRequests(): Promise<void>;
+    };
+    internals.pendingRequests.push({
+      agentName: 'assistant', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
+      channelId: 'chan-alpha', addressed: true,
+    });
+    await internals.processInferenceRequests();
+    await framework.runUntilIdle();
+
+    const streamed = stream.chunks.map((c) => c.delta).join('');
+    assert.ok(streamed.includes('streamed after the prefix'), 'prefixed text streams to its destination');
+    assert.equal(streamed.includes('Unprefixed musing.'), false, 'unprefixed text is never streamed');
+    assert.equal(stream.completes.some((c) => c.text.includes('Unprefixed musing.')), false,
+      'nor finalized by the stream complete');
 
     await framework.stop();
   });
