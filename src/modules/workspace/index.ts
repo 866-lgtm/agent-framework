@@ -2804,6 +2804,7 @@ export class WorkspaceModule implements Module {
           reports: new Map([...beneath.reports, ...itself.reports]),
           incomplete: [...beneath.incomplete, ...itself.incomplete],
           dirs: beneath.dirs,
+          branchId: itself.branchId ?? beneath.branchId,
         };
       });
 
