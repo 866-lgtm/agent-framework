@@ -1745,7 +1745,7 @@ test('#281: batches behind one stalled write cost one deadline: no write starts 
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const framework = h.framework as unknown as {
     writeToolResultFile: (...args: unknown[]) => Promise<unknown>;
-    stalledSpill: Promise<void> | undefined;
+    stalledSpills: Set<Promise<void>>;
   };
   const writeFile = framework.writeToolResultFile.bind(h.framework);
   const stalled = gate();
@@ -1765,11 +1765,71 @@ test('#281: batches behind one stalled write cost one deadline: no write starts 
     assert.deepEqual(annotated()[1].results, [{ toolUseId: 'two', skipped: 'workspace_unanswered' }]);
     assert.equal(toolResults(h.framework)[1].content, AUDIT_STUB);
     stalled.open();
-    await until(() => framework.stalledSpill === undefined, 'the stalled write settles');
+    await until(() => framework.stalledSpills.size === 0, 'the stalled write settles');
     await bounded(h.run(), 'the third batch');
     assert.equal(writes, 2, 'once it has settled, the next original is written');
     assert.ok(typeof annotated()[2].results[0].path === 'string' && annotated()[2].results[0].unfinished === undefined);
   } finally { stalled.open(); await h.framework.stop(); }
+});
+
+test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async () => {
+  const h = await workspaceHarness([]);
+  const framework = h.framework as unknown as {
+    withheldSpillDeadlineMs: number;
+    writeToolResultFile: (label: string) => Promise<unknown>;
+    spillWithheld: (label: string, text: string, branch: string) => Promise<unknown>;
+  };
+  framework.withheldSpillDeadlineMs = 30;
+  const gates = new Map<string, ReturnType<typeof gate>>([['a', gate()], ['b', gate()]]);
+  const started: string[] = [];
+  framework.writeToolResultFile = async (label) => {
+    started.push(label);
+    await gates.get(label)?.opened;
+    return { path: `work/tool-results/${label}.txt` };
+  };
+  const branch = h.framework.getAgent('assistant')!.getContextManager().currentBranch().name;
+  try {
+    // Two agents' writes start together, and both outlive their deadline. The
+    // deadline's timer doesn't hold the process open, so the wait goes through
+    // bounded, whose timer does.
+    const [a, b] = await bounded(
+      Promise.all([framework.spillWithheld('a', 'A', branch), framework.spillWithheld('b', 'B', branch)]),
+      'both writes reach their deadline',
+    );
+    assert.deepEqual([a, b], [{ path: 'work/tool-results/a.txt', unfinished: true }, { path: 'work/tool-results/b.txt', unfinished: true }]);
+    gates.get('b')!.open();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(await framework.spillWithheld('c', 'C', branch), { skipped: 'workspace_unanswered' },
+      'one stalled write settling leaves the other holding the workspace');
+    gates.get('a')!.open();
+    await until(() => (h.framework as unknown as { stalledSpills: Set<unknown> }).stalledSpills.size === 0, 'both settle');
+    assert.deepEqual(await framework.spillWithheld('d', 'D', branch), { path: 'work/tool-results/d.txt' });
+    assert.deepEqual(started, ['a', 'b', 'd']);
+  } finally { for (const g of gates.values()) g.open(); await h.framework.stop(); }
+});
+
+test("#281: a disposed run's guard is forgotten once its annotation ends with nothing queued, without a maintenance pass", async () => {
+  const h = await harness([[calls('one')]]);
+  slowSpill(h.framework, async () => {});
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    h.framework.start();
+    await completion.catch(() => {});
+    await created.agent.toolResultGuard.whenAnnotated();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.framework.getAgent('ephemeral') ?? null, null, 'the run was disposed');
+    assert.equal(created.agent.toolResultGuard.idle, true);
+    const remembered = (h.framework as unknown as { annotatingGuards: Map<unknown, string> }).annotatingGuards;
+    assert.equal(remembered.has(created.agent.toolResultGuard), false, 'nothing keeps the disposed guard');
+  } finally { await h.framework.stop(); }
 });
 
 test("#281: a file whose copy on disk fails is still in the workspace's tree, and the stub names it", async () => {

@@ -2736,11 +2736,14 @@ export class AgentFramework {
   /** Each guard that has annotated, by agent name, until it is idle: an
    *  ephemeral run or a closed fork leaves the agent map with its annotation
    *  still running and maybe a stub edit queued, which maintenance and stop
-   *  then retry (agent-framework #277). */
+   *  then retry (agent-framework #277). A guard leaves when an annotation of
+   *  its ends with nothing of it left; one left with queued work stays until
+   *  a maintenance pass finds that work done. */
   private readonly annotatingGuards = new Map<ToolResultGuard, string>();
-  /** A withheld original's write still under way past its deadline: until it
-   *  settles, the workspace isn't answering and no other is started. */
-  private stalledSpill: Promise<void> | undefined;
+  /** Withheld originals' writes still under way past their deadline: while
+   *  any is, the workspace isn't answering and no other is started. Several
+   *  can be, when writes of different agents' batches stalled together. */
+  private readonly stalledSpills = new Set<Promise<void>>();
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
   /** Set once stop() has let the running annotations finish: a withheld
@@ -2765,7 +2768,13 @@ export class AgentFramework {
       track: (annotation) => {
         this.guardAnnotations.add(annotation);
         this.annotatingGuards.set(guard, agent.name);
-        void annotation.finally(() => this.guardAnnotations.delete(annotation));
+        void annotation.finally(() => {
+          this.guardAnnotations.delete(annotation);
+          // The guard clears its own record of a finished annotation in a
+          // callback it registered before calling track, so `idle` already
+          // counts this one as done.
+          if (guard.idle) this.annotatingGuards.delete(guard);
+        });
       },
     });
   }
@@ -11811,7 +11820,7 @@ export class AgentFramework {
     if (this.guardSpillsClosed) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
-    if (this.stalledSpill) return { skipped: 'workspace_unanswered' };
+    if (this.stalledSpills.size > 0) return { skipped: 'workspace_unanswered' };
     const write = this.writeToolResultFile(label, text, branch);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<'late'>((resolve) => {
@@ -11825,10 +11834,8 @@ export class AgentFramework {
         if (written.branchLeft) return { skipped: 'branch_changed' };
         return { path: written.path, ...(written.error !== undefined ? { error: written.error } : {}) };
       }
-      const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => {
-        if (this.stalledSpill === stalled) this.stalledSpill = undefined;
-      });
-      this.stalledSpill = stalled;
+      const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => this.stalledSpills.delete(stalled));
+      this.stalledSpills.add(stalled);
       return { path: place.path, unfinished: true };
     } finally {
       clearTimeout(timer);
