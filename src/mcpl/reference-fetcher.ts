@@ -29,7 +29,14 @@
  */
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord } from './references.js';
-import { isReferenceExpired } from './references.js';
+import { isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel } from './references.js';
+
+/** Why the fetcher refuses a reference as expired (RFC-005 §7.4, §8). */
+const EXPIRY_REFUSAL = {
+  passed: 'reference expired: its expiresAt has passed',
+  unparseable: 'reference treated as expired: its expiresAt does not parse (fail closed)',
+  rejected: 'reference treated as expired: its expiresAt was rejected as a field, over 64 characters or not a string (fail closed)',
+} as const;
 
 /** Per-fetch hard ceiling on actual bytes (overridable per server / call). */
 export const DEFAULT_FETCH_MAX_BYTES = 256 * 1024 * 1024;
@@ -111,9 +118,11 @@ export class ReferenceFetcher {
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
   ) {}
 
-  /** Would the eager (autofetch) default fetch this record? */
+  /** Would the eager (autofetch) default fetch this record? Not one the
+   *  fetcher refuses as expired, which would only take an eager slot. */
   isEagerEligible(record: ReferenceRecord): boolean {
     if (record.fetchedPath) return false;
+    if (isReferenceExpired(record.testimony)) return false;
     if (record.serverId === undefined) return false;
     const binding = this.resolveServer(record.serverId);
     if (!binding) return false;
@@ -161,7 +170,8 @@ export class ReferenceFetcher {
 
     const refusal = this.originCheck(record, binding);
     if (refusal) return { ok: false, error: refusal };
-    if (isReferenceExpired(t)) return { ok: false, error: 'reference expired (or unparseable expiry — fail closed)' };
+    const expiry = referenceExpiry(t);
+    if (expiry) return { ok: false, error: EXPIRY_REFUSAL[expiry] };
 
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
     // Vector 4: a claim already over the ceiling refuses without dialing.
@@ -216,7 +226,10 @@ export class ReferenceFetcher {
       }
 
       const headerMime = resp.headers.get('content-type')?.split(';')[0].trim() || null;
-      const observedMime = sniffMime(data) ?? headerMime ?? t.mimeType ?? 'application/octet-stream';
+      // The server's claimed type is the last resort, and it reaches the
+      // model (fetch_reference's mime_type), so it's shown as a label is.
+      const claimedMime = t.mimeType !== undefined ? sanitizeLabel(t.mimeType, REFERENCE_LIMITS.mimeType) || undefined : undefined;
+      const observedMime = sniffMime(data) ?? headerMime ?? claimedMime ?? 'application/octet-stream';
       const ext = EXT_BY_MIME[observedMime] ?? EXT_BY_MIME[headerMime ?? ''] ?? EXT_BY_MIME[t.mimeType ?? ''] ?? 'bin';
       // §7.3: host-generated storage name; the server's `name` is display-only.
       const path = await this.saveFile(`${record.refId}.${ext}`, data, observedMime);

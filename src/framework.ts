@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -15619,7 +15619,7 @@ export class AgentFramework {
           }
           if (candidate.kind === 'reference') {
             throw new Error(
-              `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
+              `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${sanitizeLabel(candidate.mediaType, 120)}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
               'Fetch it with fetch_reference and save the materialized file instead.',
             );

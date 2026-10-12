@@ -50,6 +50,7 @@ import {
   splitPreservingImageSlots,
 } from '../src/tool-image-ledger.js';
 import { toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
+import { classifyBlock, referenceRegistry, type ReferenceTestimony } from '../src/mcpl/references.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 const PNG = Buffer.from(
@@ -399,6 +400,34 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(real[0]!.toolCallId, 'call_snap');
       assert.strictEqual(real[0]!.sha256, sha(PNG));
       assert.ok((await fileBytes(h, 'files/real.png'))?.equals(PNG));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a reference's claimed image type reaches the refusal without controls", async () => {
+    const c = classifyBlock({ type: 'image', uri: 'https://example.invalid/sri-label.png', mimeType: 'image/\u202Epng\u061C' });
+    assert.strictEqual(c.kind, 'reference');
+    const record = referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony);
+    const h = await startTurn({
+      prefix: 'sri-reference-label-',
+      responses: [[saveCall('call_save', { path: 'files/label.png', index: 0 })], done],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_cam',
+          toolName: 'mcpl--vst--camera',
+          content: `[${record.refId}] label.png — image/png, 1.2MB claimed — from tool result — fetch with fetch_reference`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      assert.strictEqual(result.isError, true);
+      assert.match(result.content, new RegExp(`index 0 is a reference \\(${record.refId}, image/png, from`));
+      assert.ok(!/[\u061C\u202E]/.test(result.content), result.content);
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

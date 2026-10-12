@@ -78,8 +78,30 @@ test('an admitted but unparseable expiry still fails closed; a schema-invalid ex
   assert.equal(isReferenceExpired(invalidShape), true, 'an overlong expiry is never read as immortal');
   const notAString = reference('resource', { expiresAt: 1_900_000_000 }).testimony;
   assert.equal(isReferenceExpired(notAString), true, 'nor is one that is not a string');
+  const nullExpiry = reference('resource', { expiresAt: null }).testimony;
+  assert.deepEqual(nullExpiry.rejectedFields, ['expiresAt'], 'null is not a string either');
+  assert.equal(isReferenceExpired(nullExpiry), true, 'and fails closed too');
   const absent = reference('resource', {}).testimony;
   assert.equal(isReferenceExpired(absent), false, 'a reference that claims no expiry has none');
+  const future = reference('resource', { expiresAt: '2999-01-01T00:00:00Z' }).testimony;
+  assert.equal(isReferenceExpired(future, Date.parse('2026-10-12T00:00:00Z')), false, 'an expiry still ahead has not passed');
+  // Only a rejected expiry makes a reference expired: other rejected fields don't.
+  const badName = reference('resource', { name: 123, sizeBytes: -1, digest: 'sha256:short' }).testimony;
+  assert.deepEqual(badName.rejectedFields.sort(), ['digest', 'name', 'sizeBytes']);
+  assert.equal(isReferenceExpired(badName), false);
+});
+
+test('the stub shows every server label without controls, and leaves out one that sanitizes to nothing', () => {
+  const { testimony } = reference('resource', { name: '\u061C\u202E', mimeType: 'image/\u202Epng\u061C', sizeBytes: 10 });
+  const stub = buildReferenceStub(testimony, 'from \u2066a\u0085tool\u2069');
+  assert.ok(!/[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/.test(stub), stub);
+  assert.ok(stub.includes('image/png, 10B claimed'), stub);
+  assert.ok(stub.includes('from atool'), stub);
+  const segments = stub.slice(stub.indexOf('] ') + 2).split(' — ');
+  assert.ok(segments.every((part) => part.trim() !== ''), `no empty segment for the name that sanitized away: ${JSON.stringify(stub)}`);
+  const record = referenceRegistry.findByUri(testimony.uri)!;
+  record.fetchedPath = 'scratch/refs/\u202Eevil\u061C.bin';
+  assert.ok(buildReferenceStub(testimony).includes('saved: scratch/refs/evil.bin'));
 });
 
 test('display labels lose every bidi control, the Arabic letter mark included', () => {

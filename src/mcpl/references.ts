@@ -142,15 +142,27 @@ export function isInlineContradiction(block: unknown): boolean {
 export const INLINE_WITHHELD_TEXT =
   '[inline content withheld: nonconformant bulk disposition on inline data]';
 
-export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now()): boolean {
-  // A rejected expiry (past its schema maximum, or not a string) is absent as
-  // testimony under the one invalid-field rule, but reading that absence as
-  // "never expires" would let field invalidity widen exposure (§8): like an
-  // unparseable one, it fails closed (§7.4).
-  if (t.rejectedFields.includes('expiresAt')) return true;
-  if (t.expiresAt === undefined) return false;
+/**
+ * Why a reference counts as expired, or null when it doesn't: its expiresAt
+ * has passed, doesn't parse, or was rejected as a field (§7.4, §8). A
+ * rejected expiry (past its schema maximum, or not a string, null included)
+ * is absent as testimony under the one invalid-field rule, but reading that
+ * absence as "never expires" would let field invalidity widen exposure:
+ * like an unparseable one, it fails closed. A reference that claims no
+ * expiry has none.
+ */
+export function referenceExpiry(
+  t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now(),
+): 'rejected' | 'unparseable' | 'passed' | null {
+  if (t.rejectedFields.includes('expiresAt')) return 'rejected';
+  if (t.expiresAt === undefined) return null;
   const exp = Date.parse(t.expiresAt);
-  return Number.isNaN(exp) ? true : exp <= nowMs;
+  if (Number.isNaN(exp)) return 'unparseable';
+  return exp <= nowMs ? 'passed' : null;
+}
+
+export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now()): boolean {
+  return referenceExpiry(t, nowMs) !== null;
 }
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
@@ -274,12 +286,16 @@ export const referenceRegistry = new ReferenceRegistry();
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string): string {
   const record = referenceRegistry.register(t, serverId);
   const parts: string[] = [];
-  if (t.name) parts.push(sanitizeLabel(t.name, STUB_FIELD_CHARS));
+  // A label is shown only when something is left of it once sanitized.
+  const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
+  if (name) parts.push(name);
   const meta: string[] = [];
-  if (t.mimeType) meta.push(sanitizeLabel(t.mimeType, STUB_FIELD_CHARS));
+  const mimeType = t.mimeType ? sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) : '';
+  if (mimeType) meta.push(mimeType);
   if (t.sizeBytes !== undefined) meta.push(`${formatSizeBytes(t.sizeBytes)} claimed`);
   if (meta.length) parts.push(meta.join(', '));
-  if (provenance) parts.push(sanitizeLabel(provenance, STUB_FIELD_CHARS));
+  const origin = provenance ? sanitizeLabel(provenance, STUB_FIELD_CHARS) : '';
+  if (origin) parts.push(origin);
   if (record.fetchedPath) {
     // Already materialized by the host-mediated fetcher: hand the model the
     // workspace path (host-generated, §7.3) so existing tools just work.

@@ -24,6 +24,9 @@ const server = createServer((req, res) => {
     res.writeHead(302, { location: 'http://evil.example/x' }); res.end();
   } else if (url.pathname === '/octet') {
     res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(PAYLOAD);
+  } else if (url.pathname === '/untyped') {
+    // no content-type header, and bytes no sniffer recognizes
+    res.writeHead(200); res.end(Buffer.from('plain bytes, nothing to sniff'));
   } else if (url.pathname === '/liar') {
     // claims small in testimony, streams big (vector 10)
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
@@ -123,12 +126,50 @@ test('third-party origin refused (v1 policy: dialed origin only)', async () => {
 test('vector 16: expired (and unparseable-expiry) references refuse locally', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: ORIGIN } });
-  for (const expiresAt of ['2001-01-01T00:00:00Z', 'not-a-date']) {
+  for (const [expiresAt, why] of [['2001-01-01T00:00:00Z', /has passed/], ['not-a-date', /does not parse/]] as const) {
     const rec = makeRecord(reg, `${ORIGIN}/ok?e=${expiresAt}`, { expiresAt });
     const out = await f.fetch(rec);
     assert.equal(out.ok, false);
     assert.match(out.error!, /expired/);
+    assert.match(out.error!, why);
   }
+});
+
+test('vector 16: an expiry rejected as a field refuses locally, with nothing dialed, and takes no eager slot', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const before = saved.length;
+  lastAuth = 'untouched';
+  for (const [label, expiresAt] of [['overlong', 'x'.repeat(65)], ['numeric', 1_900_000_000], ['null', null]] as const) {
+    const rec = makeRecord(reg, `${ORIGIN}/ok?e=${label}`, { expiresAt, sizeBytes: PAYLOAD.length });
+    assert.deepEqual(rec.testimony.rejectedFields, ['expiresAt'], label);
+    assert.equal(f.isEagerEligible(rec), false, `${label}: the eager default would only be refused`);
+    const out = await f.fetch(rec);
+    assert.equal(out.ok, false, label);
+    assert.match(out.error!, /rejected as a field/, label);
+  }
+  assert.equal(saved.length, before, 'nothing saved');
+  assert.equal(lastAuth, 'untouched', 'the origin was never dialed');
+});
+
+test('a reference whose expiry is still ahead is fetched', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/ok?e=future`, { expiresAt: '2999-01-01T00:00:00Z', sizeBytes: PAYLOAD.length });
+  assert.equal(f.isEagerEligible(rec), true);
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+});
+
+test('a claimed type that neither the bytes nor a header override reaches the result without controls', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/untyped`, { mimeType: 'text/\u202Eplain\u061C' });
+  assert.equal(rec.testimony.mimeType, 'text/\u202Eplain\u061C', 'testimony keeps what the server said');
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.mimeType, 'text/plain', 'fetch_reference shows it as a label is shown');
+  assert.equal(saved.at(-1)!.mime, 'text/plain');
 });
 
 test('per-server budget exhausts cumulatively', async () => {
