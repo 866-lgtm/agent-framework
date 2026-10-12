@@ -287,6 +287,30 @@ test('a text block whose text isn\'t a string is no text, so alone it is refused
   assert.equal(coalesced.error?.message, plain.error?.message);
 });
 
+test('an inference filter reads a text block whose text isn\'t a string as no text, on both lanes, coalesced or not', async (t) => {
+  const seen: string[] = [];
+  const f = await fixture({ server: { shouldTriggerInference: (text: string) => { seen.push(text); return false; } } });
+  t.after(f.close); await f.register();
+  const content = [{ type: 'text', text: { toString: 1 } }, { type: 'text', text: 'visible_text' }];
+  const r = await f.send('channels/incoming', { messages: [
+    { ...f.channel('e1', '', { initial: true }, 'chat', 'coalesced'), content },
+    { channelId: 'chat', messageId: 'plain', timestamp: TS, author: { id: 'u', name: 'User' }, content },
+    // A valid message after them, which a throw in the filter never reached.
+    { channelId: 'chat', messageId: 'sibling', timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'sibling_text' }] },
+  ] });
+  assert.equal(r.error, undefined);
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [true, true, true]);
+  const coalesced = await f.send('push/event', { ...f.params('p1', '', { initial: true }), payload: { content } });
+  const { coalesce: _coalesce, ...uncoalesced } = f.params('q1', '');
+  const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
+  assert.equal(coalesced.result?.accepted, true);
+  assert.equal(plain.result?.accepted, true);
+  // Each lane joins its text blocks with a line break, the non-string one as
+  // empty text, as conversion stores it.
+  assert.deepEqual(seen, ['\nvisible_text', '\nvisible_text', 'sibling_text', '\nvisible_text', '\nvisible_text'],
+    'the filter gets the same text on both lanes, and is reached for every message');
+});
+
 test('a render result with a malformed block falls back, and the host names it on a console line', async (t) => {
   const f = await fixture(); t.after(f.close);
   const lines = captureConsoleError(t);

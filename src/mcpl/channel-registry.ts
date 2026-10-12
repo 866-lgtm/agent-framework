@@ -1043,9 +1043,13 @@ export class ChannelRegistry {
       // Determine whether to trigger inference
       let triggerInference = true;
       if (this.shouldTriggerInference) {
+        // Text that isn't a string is empty text here too, as conversion
+        // stores it (the push lane's filter reads the converted text):
+        // joining an object could throw, or invent text the agent's context
+        // never gets.
         const textContent = message.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b) => b.text)
+          .filter((b) => b.type === 'text')
+          .map((b) => { const text: unknown = (b as { text?: unknown }).text; return typeof text === 'string' ? text : ''; })
           .join('\n');
         triggerInference = this.shouldTriggerInference(
           textContent,
