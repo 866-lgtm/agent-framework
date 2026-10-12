@@ -2661,6 +2661,37 @@ describe('on-agent-action', () => {
     }
   });
 
+  test("a batch that comes while a late scan's successor still runs isn't held either", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 300 });
+    const mod = m as any;
+    // Each scan's pass runs, then waits to be released.
+    const pass = mod.passUnlocked.bind(mod);
+    const gates = [0, 1, 2].map(() => { let open!: () => void; const shut = new Promise<void>((resolve) => { open = resolve; }); return { open, shut }; });
+    let passes = 0;
+    mod.passUnlocked = async (...args: unknown[]) => {
+      const n = ++passes;
+      const result = await pass(...args);
+      await gates[n - 1]!.shut;
+      return result;
+    };
+    try {
+      await m.onToolBatchComplete('agent'); // its scan runs past the deadline
+      await m.onToolBatchComplete('agent'); // not held: its scan is queued behind the first, late from the start
+      gates[0]!.open(); // the first scan finishes, and the second starts
+      for (let i = 0; i < 100 && passes < 2; i++) await sleep(10);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(passes, 2, 'the second scan runs');
+      const started = Date.now();
+      await m.onToolBatchComplete('agent'); // while the late second scan still runs
+      const held = Date.now() - started;
+      assert.ok(held < 150, `the third batch was not held (${held} ms, deadline 300 ms)`);
+      assert.match((await call(m, 'status', {})).work.lastAgentActionScan.reason, /an earlier scan is still running past its deadline/);
+    } finally {
+      for (const gate of gates) gate.open();
+    }
+  });
+
   test("a scan deadline within 1 s of the framework's hook bound is lowered below it, with a warning", async (t) => {
     const env = new Env(t);
     const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 60_000 });

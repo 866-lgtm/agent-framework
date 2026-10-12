@@ -2903,8 +2903,9 @@ export class WorkspaceModule implements Module {
       if (runningLate) {
         // An earlier batch's scan outlasted its deadline and still runs: this
         // round isn't held as well. Its own scan is queued after that one,
-        // and records its outcome when it finishes.
-        scan.late = true;
+        // and records its outcome when it finishes. It is late from the
+        // start, so a batch that comes while it runs isn't held either.
+        this.agentActionScanLateUntil(mount, scan);
         this.agentActionScanMissed(mount, 'an earlier scan is still running past its deadline; this batch is scanned after it');
         return;
       }
@@ -2915,15 +2916,23 @@ export class WorkspaceModule implements Module {
       const outcome = await Promise.race([scan.settled.then(() => 'done' as const), deadline]);
       clearTimeout(timer);
       if (outcome === 'late') {
-        scan.late = true;
-        if (mount.agentActionScanLate === undefined) {
-          const settled = scan.settled;
-          mount.agentActionScanLate = settled;
-          void settled.then(() => { if (mount.agentActionScanLate === settled) mount.agentActionScanLate = undefined; });
-        }
+        this.agentActionScanLateUntil(mount, scan);
         this.agentActionScanMissed(mount, `deadline exceeded (${deadlineMs} ms); the scan continues`);
       }
     }));
+  }
+
+  /**
+   * Mark a scan late, and the mount as running late until it settles. The
+   * marker follows the newest late scan: a mount's scans run one after
+   * another, so the newest is the last to settle, and a batch that comes
+   * while any late scan of the chain still runs isn't held.
+   */
+  private agentActionScanLateUntil(mount: MountState, scan: AgentActionScan): void {
+    scan.late = true;
+    const settled = scan.settled;
+    mount.agentActionScanLate = settled;
+    void settled.then(() => { if (mount.agentActionScanLate === settled) mount.agentActionScanLate = undefined; });
   }
 
   /** A batch's scan missed its deadline, or failed: said on status and as an event. */
