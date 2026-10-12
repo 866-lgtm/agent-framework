@@ -91,9 +91,9 @@ context-manager compression hold (`addMessage(..., { holdCompression: true })`,
 context-manager >= 0.12), placed before the strategy's ingress callback runs.
 Every settlement path (accept, withhold, turn-ended, unsubmitted, aborted)
 edits in the final content first and then releases the hold: an accepted
-batch's payload, or a withheld batch's stub, which is edited once the write
-of each of its originals has ended, written or not, so a withheld batch stays
-held meanwhile.
+batch's payload, or a withheld batch's stub, which is edited once the host
+has reported where each of its originals went, including a failed, skipped
+or unfinished write, so a withheld batch stays held meanwhile.
 Audit-only failures cannot keep a settled message held. If an acceptance
 edit or a stub's edit fails, the guard keeps the content and its hold in a
 separate retry queue; it does not re-arm provider submission or refusal
