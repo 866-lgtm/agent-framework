@@ -37,7 +37,6 @@ import type {
   HotContextSettingsUpdate,
   MessageMetadata,
 } from '@animalabs/context-manager';
-import { OverBudgetError } from '@animalabs/context-manager';
 import type {
   AgentConfig,
   AgentState,
@@ -143,10 +142,29 @@ export class Agent {
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   private contextBudgetTargetTokens?: number;
   private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
-  /** The live budget the last compile planned at, and whether it fit. */
-  private lastCompiledBudget?: { budget: number; fit: boolean };
-  /** The last outcome the listener recorded; a failed record is told again. */
-  private recordedCompiledBudget?: { budget: number; fit: boolean };
+  /**
+   * Counts changes of the live budget (an update, a reset, a restore, a
+   * settle). A compile speaks for the budget it planned at only if the live
+   * budget didn't change while it ran, and what it showed stands only until
+   * the next change.
+   */
+  private liveBudgetEpoch = 0;
+  /**
+   * Counts changes of the descent target (a paced update, a reset, a cancel,
+   * a settle). A settle proves its target only to a compile that began under
+   * that same descent.
+   */
+  private descentEpoch = 0;
+  /** The live budget the last compile planned at, whether it fit, and the live budget's epoch then. */
+  private lastCompiledBudget?: { budget: number; fit: boolean; epoch: number };
+  /** The last outcome the listener recorded; a failed record is told again, and so is any after a change. */
+  private recordedCompiledBudget?: { budget: number; fit: boolean; epoch: number };
+  /**
+   * A boot restore that applied a proven budget at once: the settings to
+   * restore paced instead, if the first compile at that budget is refused,
+   * and the live budget's epoch it was applied at.
+   */
+  private restoredAtOnce?: { settings: AgentRuntimeSettingsPatch; epoch: number };
   /** Told when that changes (the framework records it beside the persisted budget). */
   private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
@@ -325,39 +343,76 @@ export class Agent {
     this.compiledBudgetListener = listener;
   }
 
-  /** The live budget the last compile planned at and fit, if it fit. */
+  /**
+   * The live budget the last compile planned at and fit, if it fit and the
+   * live budget hasn't changed since.
+   */
   getProvenContextBudgetTokens(): number | undefined {
-    return this.lastCompiledBudget?.fit ? this.lastCompiledBudget.budget : undefined;
+    const last = this.lastCompiledBudget;
+    return last?.fit && last.epoch === this.liveBudgetEpoch ? last.budget : undefined;
+  }
+
+  /** Set the live budget and the descent target, counting a change of each. */
+  private setContextBudget(budget: number | undefined, target: number | undefined): void {
+    if (budget !== this.contextBudgetTokens) this.liveBudgetEpoch++;
+    if (target !== this.contextBudgetTargetTokens) this.descentEpoch++;
+    this.contextBudgetTokens = budget;
+    this.contextBudgetTargetTokens = target;
   }
 
   private noteCompiledBudget(budget: number, fit: boolean): void {
-    this.lastCompiledBudget = { budget, fit };
+    const epoch = this.liveBudgetEpoch;
+    this.lastCompiledBudget = { budget, fit, epoch };
     const recorded = this.recordedCompiledBudget;
-    if (recorded?.budget === budget && recorded.fit === fit) return;
-    // A listener that couldn't record it returns false, and hears it again
-    // at the next compile.
-    if (this.compiledBudgetListener?.(budget, fit) !== false) this.recordedCompiledBudget = { budget, fit };
+    if (recorded?.budget === budget && recorded.fit === fit && recorded.epoch === epoch) return;
+    // A listener that couldn't record it returns false: nothing is assumed
+    // recorded then, so the next compile tells it again whatever it shows.
+    this.recordedCompiledBudget = this.compiledBudgetListener?.(budget, fit) !== false ? { budget, fit, epoch } : undefined;
   }
 
   /** Compile at the live budget (no explicit one), noting whether it fit. */
   private async compileAtLiveBudget(compile: () => Promise<CompileResult>): Promise<CompileResult> {
     // The budget this compile plans at, and the descent under way when it
-    // started: a change made while it runs is no part of what it shows.
+    // started: a change of either while it runs is no part of what it shows.
     const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-    const target = this.contextBudgetTargetTokens;
+    const epoch = this.liveBudgetEpoch;
+    const descent = this.descentEpoch;
     let result: CompileResult;
     try {
       result = await compile();
     } catch (error) {
-      const err = error as { name?: unknown } | null;
-      if (error instanceof OverBudgetError || err?.name === 'OverBudgetError') this.noteCompiledBudget(live, false);
-      throw error;
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || this.liveBudgetEpoch !== epoch) throw error;
+      this.noteCompiledBudget(live, false);
+      // A budget a boot restore applied at once, refused at its first test:
+      // restore it paced instead, as the boot would have without its proof,
+      // and compile again from the recipe's budget.
+      const restored = this.restoredAtOnce;
+      if (restored?.epoch !== epoch) throw error;
+      this.restoredAtOnce = undefined;
+      try {
+        this.resetRuntimeSettings(['contextBudgetTokens']);
+        this.updateRuntimeSettings(restored.settings);
+      } catch (fallback) {
+        console.error(`[agent-settings] ${this.name}: couldn't restore contextBudgetTokens=${live} paced after its refusal:`, fallback);
+        throw error;
+      }
+      console.error(
+        `[agent-settings] ${this.name}: the context manager refused contextBudgetTokens=${live}, which the boot ` +
+          'applied at once; restored it as a paced descent from the recipe\'s budget',
+      );
+      return this.compileAtLiveBudget(compile);
     }
+    if (this.restoredAtOnce?.epoch === epoch) this.restoredAtOnce = undefined;
     // A settle, here, of the descent this compile began under proves its
-    // target: the frontier fits the window prepared for it. Otherwise the
-    // compile proves the budget it planned at, whatever changed meanwhile.
-    const settled = this.settleRuntimeSettingsTransition() && target !== undefined && this.contextBudgetTokens === target;
-    this.noteCompiledBudget(settled ? target! : live, true);
+    // target: the frontier fits the window prepared for it. Without a settle,
+    // the compile proves the budget it planned at. Either only if the live
+    // budget didn't change while it ran; a settle of a descent armed while it
+    // ran proves nothing (the next compile at the target does).
+    const sameLive = this.liveBudgetEpoch === epoch;
+    const sameDescent = this.descentEpoch === descent;
+    const settled = this.settleRuntimeSettingsTransition();
+    if (sameLive && settled && sameDescent) this.noteCompiledBudget(this.contextBudgetTokens!, true);
+    else if (sameLive && !settled) this.noteCompiledBudget(live, true);
     return result;
   }
 
@@ -403,14 +458,14 @@ export class Agent {
     if (patch?.tailTokens !== undefined) {
       overrides.recentWindowTokens = patch.tailTokens;
     }
-    if (
-      patch?.transitionPaceTokens !== undefined &&
-      hot?.preparedWindowTokens === undefined
-    ) {
-      overrides.kvStableReachTokens = patch.transitionPaceTokens;
-    }
+    // The pace is a descent's reach, which a preview with no prepared window
+    // models as the reach itself. An immediate change starts no descent and
+    // clears any prepared window, so its next compile plans at the
+    // configured reach, and the pace is no part of its preview.
+    const paceAsReach = patch?.transitionPaceTokens !== undefined && hot?.preparedWindowTokens === undefined;
 
     if (patch?.contextBudgetTokens === undefined) {
+      if (paceAsReach) overrides.kvStableReachTokens = patch!.transitionPaceTokens;
       return { effectiveBudgetTokens: live, liveBudgetTokens: live, path: 'none', overrides };
     }
     if (patch.contextBudgetTokens >= live || patch.immediate) {
@@ -421,6 +476,7 @@ export class Agent {
         overrides,
       };
     }
+    if (paceAsReach) overrides.kvStableReachTokens = patch.transitionPaceTokens;
     return {
       effectiveBudgetTokens: live,
       liveBudgetTokens: live,
@@ -488,8 +544,7 @@ export class Agent {
     if (Object.keys(hotPatch).length > 0) {
       this.updateHotContextSettings(hotPatch);
     }
-    this.contextBudgetTokens = nextContextBudget;
-    this.contextBudgetTargetTokens = nextContextTarget;
+    this.setContextBudget(nextContextBudget, nextContextTarget);
     if (appliedDefaultPace) {
       this.runtimeSettingsOverrides.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
     }
@@ -541,8 +596,7 @@ export class Agent {
           : this.configuredTransitionPaceTokens ?? null;
     }
     if (Object.keys(hotPatch).length > 0) this.updateHotContextSettings(hotPatch);
-    this.contextBudgetTokens = nextContextBudget;
-    this.contextBudgetTargetTokens = nextContextTarget;
+    this.setContextBudget(nextContextBudget, nextContextTarget);
     if (reset.has('contextBudgetTokens')) delete this.runtimeSettingsOverrides.contextBudgetTokens;
     if (reset.has('tailTokens')) delete this.runtimeSettingsOverrides.tailTokens;
     if (reset.has('transitionPaceTokens')) {
@@ -557,7 +611,7 @@ export class Agent {
   cancelRuntimeSettingsTransition(): AgentRuntimeSettingsSnapshot {
     if (this.contextBudgetTargetTokens !== undefined) {
       this.updateHotContextSettings({ preparedWindowTokens: null });
-      this.contextBudgetTargetTokens = undefined;
+      this.setContextBudget(this.contextBudgetTokens, undefined);
       const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       if (live === (this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)) {
         delete this.runtimeSettingsOverrides.contextBudgetTokens;
@@ -570,8 +624,10 @@ export class Agent {
 
   /**
    * Apply persisted settings at construction. `provenBudget` is a budget the
-   * caller has shown fits (the framework, from the record and a preflight):
-   * it stands as the last compile's until a compile here says otherwise.
+   * caller has shown fits (the framework, from the record and a preflight),
+   * applied at once: it stands as the last compile's until a compile here
+   * says otherwise, and if the first compile at it is refused, the settings
+   * are restored paced instead.
    */
   restoreRuntimeSettings(
     settings: AgentRuntimeSettingsPatch,
@@ -579,7 +635,12 @@ export class Agent {
   ): AgentRuntimeSettingsSnapshot {
     if (Object.keys(settings).length === 0) return this.getRuntimeSettings();
     const snapshot = this.updateRuntimeSettings(settings);
-    if (opts?.provenBudget !== undefined) this.lastCompiledBudget = { budget: opts.provenBudget, fit: true };
+    if (opts?.provenBudget !== undefined) {
+      const epoch = this.liveBudgetEpoch;
+      this.lastCompiledBudget = { budget: opts.provenBudget, fit: true, epoch };
+      const { immediate: _atOnce, ...paced } = settings;
+      this.restoredAtOnce = { settings: paced, epoch };
+    }
     return snapshot;
   }
 
@@ -614,8 +675,7 @@ export class Agent {
     if (this.contextBudgetTargetTokens === undefined) return false;
     const hot = this.getHotContextSettings();
     if (!hot?.prepared) return false;
-    this.contextBudgetTokens = this.contextBudgetTargetTokens;
-    this.contextBudgetTargetTokens = undefined;
+    this.setContextBudget(this.contextBudgetTargetTokens, undefined);
     this.updateHotContextSettings({ preparedWindowTokens: null });
     return true;
   }

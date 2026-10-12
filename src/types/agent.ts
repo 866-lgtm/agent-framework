@@ -244,15 +244,17 @@ export interface AgentRuntimeSettingsSnapshot {
 export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch & {
   /**
    * The budget the agent's last compile planned at, written while that
-   * compile fit: a compile that succeeds at the agent's live budget proves
-   * the store fits it, and one the context manager refuses as over budget
-   * withdraws it. When it equals `contextBudgetTokens`, a restore applies
-   * that budget at once rather than pacing a descent again from the
-   * recipe's budget (context-manager #162). Since the store fit it at the
-   * last compile, the planner can fold to it at once even if its carried
-   * frontier was lost. Any other value is stale (the budget changed since,
-   * or an earlier release carried the field forward) and the restore paces,
-   * as it does without the field. Never part of a patch.
+   * compile fit: a compile that succeeds at the agent's live budget, with
+   * nothing about the budget changed while it ran, proves the store fits it,
+   * and one the context manager refuses as over budget withdraws it. When it
+   * equals `contextBudgetTokens`, a restore applies that budget at once,
+   * rather than pacing a descent again from the recipe's budget
+   * (context-manager #162), if a preview at boot says it still fits; if not,
+   * or if the first compile at it is refused, the restore paces. Since the
+   * store fit it at the last compile, the planner can fold to it at once even
+   * if its carried frontier was lost. Any other value is stale (the budget
+   * changed since, or an earlier release carried the field forward) and the
+   * restore paces, as it does without the field. Never part of a patch.
    */
   contextBudgetReachedTokens?: number;
 };
