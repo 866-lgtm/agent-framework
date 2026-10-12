@@ -400,16 +400,43 @@ test('a failed offline suppression retires its batch once the source is confirme
   try {
     ContextManager.prototype.removeMessage = function () { throw new Error('injected redaction failure'); };
 
-    // The source comes back: the batch is retired; nothing will ever resume or mark.
+    // The source comes back: the batch is retired; nothing will ever resume
+    // or mark. The partly suppressed branch is named.
     await seed();
     await assert.rejects(
       createOfflineRecoveryBranch({
         storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
         marks: { scope: 'all' }, branchName: 'recovery/cairn/fail',
       }),
-      (error: Error) => /injected redaction failure/.test(error.message) && !/kept/.test(error.message),
+      (error: Error) => /^injected redaction failure; branch recovery\/cairn\/fail is kept for diagnosis: it may be partly suppressed, so don't start on it$/.test(error.message),
     );
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
+
+    // The source comes back but retiring the batch fails: the error says the
+    // surgery didn't happen, and to cancel the held batch rather than release it.
+    await seed();
+    const discard = DiscordAwarenessOutbox.prototype.discard;
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    try {
+      await assert.rejects(
+        createOfflineRecoveryBranch({
+          storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
+          marks: { scope: 'all' }, branchName: 'recovery/cairn/fail1',
+        }),
+        /awareness batch (\S+) could not be retired \(injected retire failure\); it stays prepared, and a start on main holds it: cancel it then \(--awareness cancel \1\), not release it, since its messages were never removed/,
+      );
+    } finally {
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['prepared'], due: 0 });
+    {
+      const store = JsStore.open({ path: storePath });
+      try {
+        assert.equal(new DiscordAwarenessOutbox(store).recoverAtStartup('main').held.length, 1, 'a start on the source holds it');
+      } finally {
+        store.close();
+      }
+    }
 
     // The source can't be confirmed: the batch stays as the unfinished body's record.
     await seed();
@@ -422,7 +449,7 @@ test('a failed offline suppression retires its batch once the source is confirme
         storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
         marks: { scope: 'all' }, branchName: 'recovery/cairn/fail2',
       }),
-      /injected redaction failure; restoring main failed: injected restore failure; awareness batch .* kept, since the source branch could not be confirmed/,
+      /injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept for diagnosis: it may be partly suppressed, so don't start on it; awareness batch .* kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 completes it, and a start on another branch holds it/,
     );
     assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
   } finally {

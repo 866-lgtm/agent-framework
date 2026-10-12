@@ -56,9 +56,26 @@ test('the offline awareness controls record each act in the operator log, done o
     assert.equal(cancelled.status, 0, cancelled.stderr);
     const receipt = JSON.parse(cancelled.stdout) as Record<string, unknown>;
     assert.equal(receipt.cancelled, 2);
+    // What the CLI says it did is what the journal now holds.
+    const journal = () => {
+      const reopened = JsStore.open({ path: storePath });
+      try {
+        const reader = new DiscordAwarenessOutbox(reopened);
+        return { batches: reader.batches(), operations: reader.operations() };
+      } finally {
+        reopened.close();
+      }
+    };
+    assert.ok(journal().batches[0].cancelled, 'the cancel is in the journal');
+    assert.ok(journal().operations.every((op) => op.cancelled?.reason === 'batch-cancelled'));
 
     const retracted = recover(storePath, '--awareness', 'retract', 'all');
     assert.equal(retracted.status, 0, retracted.stderr);
+    assert.deepEqual(
+      journal().operations.filter((op) => op.action === 'remove' && !op.cancelled).map((op) => op.key.messageId).sort(),
+      ['m1', 'm2'],
+      'the retract\'s removals are in the journal',
+    );
 
     const refused = recover(storePath, '--awareness', 'release', batch.id);
     assert.equal(refused.status, 1, 'releasing a batch that is not held is refused');
@@ -169,6 +186,47 @@ test('an offline recovery records its marks choice and receipt in the operator l
     assert.equal(refused.kind, 'recovery');
     assert.deepEqual(refused.params, { messageId: 'm-safe', marks: 'none' });
     assert.match(refused.error ?? '', /already exists/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a path that holds no store is refused, never created, for a list, a control or a recovery', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  try {
+    const missing = join(dir, 'no-such-store');
+    for (const args of [['--awareness', 'list'], ['--awareness', 'cancel', 'b1'], ['--agent', 'cairn', '--message-id', 'm1']]) {
+      const run = recover(missing, ...args);
+      assert.equal(run.status, 1, args.join(' '));
+      assert.match(run.stderr, /No Chronicle store could be opened at/);
+      assert.equal(existsSync(missing), false, `${args.join(' ')} created nothing there`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a recovery\'s options with an awareness verb are refused, not ignored', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const outbox = new DiscordAwarenessOutbox(store);
+    const batch = outbox.prepare({
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all',
+    })!;
+    outbox.activate(batch.id);
+    store.close();
+    const run = recover(storePath, '--awareness', 'retract', 'all', '--marks', 'all', '--branch', 'x');
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /--awareness takes only --store and --outbox; --marks, --branch belong to a recovery/);
+    const reopened = JsStore.open({ path: storePath });
+    try {
+      assert.equal(new DiscordAwarenessOutbox(reopened).operations().filter((op) => op.action === 'remove').length, 0, 'nothing was retracted');
+    } finally {
+      reopened.close();
+    }
+    assert.deepEqual(operatorLog(storePath), [], 'and nothing was recorded');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

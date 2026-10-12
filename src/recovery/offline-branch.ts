@@ -86,7 +86,13 @@ export async function createOfflineRecoveryBranch(
     throw new Error('messages must be a positive integer');
   }
 
-  const store = JsStore.openOrCreate({ path: options.storePath });
+  // The store must exist: a mistyped path is refused, never created.
+  let store: JsStore;
+  try {
+    store = JsStore.open({ path: options.storePath });
+  } catch (error) {
+    throw new Error(`No Chronicle store could be opened at ${options.storePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
   let contextManager: ContextManager | null = null;
   try {
     contextManager = await ContextManager.open({
@@ -226,12 +232,13 @@ export async function createOfflineRecoveryBranch(
       })),
     });
 
+    let createdBranch: string | undefined;
     try {
       // branchAt uses the target message's origin sequence. No message
       // content is compiled or submitted to Membrane during this operation.
       // Creating the branch is part of the body: a failure here settles the
       // batch like a failed switch or redaction.
-      const createdBranch = contextManager.branchAt(target.id, targetBranch);
+      createdBranch = contextManager.branchAt(target.id, targetBranch);
       await contextManager.switchBranch(createdBranch);
       // Work from newest to oldest so earlier redactions never perturb the
       // live positions used by later range endpoints.
@@ -242,11 +249,12 @@ export async function createOfflineRecoveryBranch(
     } catch (error) {
       // A partially suppressed branch is not safe to boot into. Preserve it
       // for diagnosis, but put Chronicle back on the untouched source branch.
-      // Once the source is confirmed, the batch is retired (after the
-      // restored state is synced): its surgery never happened. If it can't
-      // be confirmed, the batch stays prepared as the unfinished body's
-      // record (startup holds its marks, and resumes the body only on its
-      // branch). The error says which.
+      // Once the source is confirmed, the batch is retired (discard syncs the
+      // restored state before it records that): its surgery never happened.
+      // If it can't be confirmed, the batch stays prepared as the body's
+      // record: a start on its target branch completes it (a suppression's
+      // body first), since its body is in effect there, and a start on any
+      // other branch holds it. The error says which, and names the branch.
       const failure = error instanceof Error ? error.message : String(error);
       let restore = '';
       try {
@@ -259,19 +267,25 @@ export async function createOfflineRecoveryBranch(
       let retire = '';
       if (batch) {
         if (store.currentBranch().name !== sourceBranch) {
-          retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed`;
+          retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: a start on ` +
+            `${targetBranch} completes it, and a start on another branch holds it`;
         } else {
           try {
             outbox.discard(batch.id);
           } catch (discardError) {
             retire = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
-            )}); startup will hold it`;
+            )}); it stays prepared, and a start on ${sourceBranch} holds it: cancel it then ` +
+              `(--awareness cancel ${batch.id}), not release it, since its messages were never removed`;
           }
         }
       }
-      if (!restore && !retire) throw error;
-      throw new Error(`${failure}${restore}${retire}`, { cause: error });
+      const kept = createdBranch === undefined ? ''
+        : suppression.intervals.length > 0
+          ? `; branch ${createdBranch} is kept for diagnosis: it may be partly suppressed, so don't start on it`
+          : `; branch ${createdBranch} is kept for diagnosis`;
+      if (!restore && !retire && !kept) throw error;
+      throw new Error(`${failure}${restore}${kept}${retire}`, { cause: error });
     }
 
     // The body change landed. Marker bookkeeping is reported apart from it

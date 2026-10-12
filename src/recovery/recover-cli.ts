@@ -31,7 +31,13 @@ interface CliOptions {
   marks: 'none' | 'addressed' | 'all';
   awareness?: { verb: 'list' | 'cancel' | 'retract' | 'release'; target?: string };
   dryRun: boolean;
+  /** Every option given, as typed, so a combination can be refused rather
+   *  than some of it ignored. */
+  given: string[];
 }
+
+/** What an awareness verb takes besides itself; every other option belongs to a recovery. */
+const AWARENESS_OPTIONS = new Set(['--store', '--outbox', '--awareness']);
 
 function usage(): string {
   return `Usage:
@@ -73,21 +79,28 @@ Awareness journal (host stopped):
                               Queue removal of this bot's marks (through each
                               ref's configured MCPL route) on a batch's refs,
                               or on every ref an add was ever sent for
-  --awareness release <ID>    Queue a held batch's recorded operations
-  Each acts at once: inspect first with --awareness list.
+  --awareness release <ID>    Queue a held batch's recorded operations. A held
+                              batch whose surgery never ran (its error said
+                              so) is to be cancelled, not released: its
+                              messages were never removed
+  Each acts at once: inspect first with --awareness list. The awareness verbs
+  take only --store and --outbox; anything else is refused.
 
 Queued work is delivered when the host next connects to the Discord server.
-Each recovery, and each cancel, retract or release, is recorded in
-<store>/operator-actions.jsonl, the host's operator log, with the OS account
-that ran it, whether it was carried out or refused. A dry run and a list
-record nothing.
+Each recovery, and each cancel, retract or release, is recorded, best-effort,
+in <store>/operator-actions.jsonl, the host's operator log, with the OS
+account that ran it, whether it was carried out or refused: a log that can't
+be written says so on stderr, and the act stands. A dry run and a list write
+no entry. A list imports a pre-journal ledger if one is present, as the
+host's next start would. The store must exist: neither creates one.
 The agent host must be stopped before running this command.`;
 }
 
 function parseArgs(args: string[]): CliOptions {
-  const options: CliOptions = { dryRun: false, suppressMessageIds: [], suppressRanges: [], marks: 'none' };
+  const options: CliOptions = { dryRun: false, suppressMessageIds: [], suppressRanges: [], marks: 'none', given: [] };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    if (arg.startsWith('--')) options.given.push(arg);
     const value = () => {
       const next = args[++i];
       if (!next) throw new Error(`${arg} requires a value`);
@@ -176,7 +189,7 @@ function errorMessage(error: unknown): string {
 function awareness(options: CliOptions): void {
   // The journal lives in the store; with the host stopped, this process is
   // its only writer.
-  const store = JsStore.openOrCreate({ path: options.storePath! });
+  const store = openExistingStore(options.storePath!);
   try {
     const outbox = new DiscordAwarenessOutbox(store, {
       legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath!),
@@ -210,11 +223,26 @@ function awareness(options: CliOptions): void {
   }
 }
 
+/** The store at `path`, which must exist: a mistyped path is refused, never created. */
+function openExistingStore(path: string): JsStore {
+  try {
+    return JsStore.open({ path });
+  } catch (error) {
+    throw new Error(`No Chronicle store could be opened at ${path}: ${errorMessage(error)}`);
+  }
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options.awareness) {
     if (!options.storePath) {
       throw new Error(`--awareness needs --store\n\n${usage()}`);
+    }
+    // A recovery's options with an awareness verb are refused, never
+    // ignored: the operator would believe a choice applied that didn't.
+    const foreign = [...new Set(options.given.filter((arg) => !AWARENESS_OPTIONS.has(arg) && arg !== '--dry-run'))];
+    if (foreign.length > 0) {
+      throw new Error(`--awareness takes only --store and --outbox; ${foreign.join(', ')} belong to a recovery`);
     }
     // There is no preview of a control: refuse rather than act on a command
     // that asked not to change anything.
@@ -231,6 +259,10 @@ async function main(): Promise<void> {
   ) {
     throw new Error(`--store, --agent, and one anchor (--message-id, --context-id, or --messages) are required\n\n${usage()}`);
   }
+
+  // A path that holds no store is refused before anything else, and gets no
+  // log entry: the log lives in the store.
+  openExistingStore(options.storePath).close();
 
   // A CLI choice and its application are the same moment (the host is
   // stopped), so the scope is evaluated now rather than frozen to refs.

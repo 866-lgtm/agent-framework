@@ -6142,7 +6142,8 @@ export class AgentFramework {
   ): string {
     if (!batch) return '';
     if (this.store.currentBranch().name !== sourceBranch) {
-      return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed`;
+      return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: a start on ` +
+        `${batch.targetBranch} completes it, and a start on another branch holds it`;
     }
     try {
       this.discordAwarenessOutbox.discard(batch.id);
