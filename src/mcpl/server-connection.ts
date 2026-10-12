@@ -211,16 +211,19 @@ export class McplServerConnection extends EventEmitter {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
-    // A server request held in the buffer came on the transport that is now
-    // gone: its sender can't be answered, and admitting it against the next
-    // transport's grant, or answering its id there, would act for a request
-    // the next server never made. Events without a responder stay, to be
-    // admitted against the next grant.
+    // Everything the server sent that is still held in the buffer came on the
+    // transport that is now gone. Its requests can't be answered, and
+    // admitting one against the next transport's grant, or answering its id
+    // there, would act for a request the next server never made. Its
+    // notifications describe a process that is gone (a tools/observe filter,
+    // a channel registration): the next one announces its own. The host's
+    // own reports about the transport stay: its lifecycle (connect-failed,
+    // reconnect-failed), the server's stderr, and orphaned-response audits.
     const held = this.bufferedEvents.length;
-    this.bufferedEvents = this.bufferedEvents.filter((item) => !McplServerConnection.hasResponder(item));
+    this.bufferedEvents = this.bufferedEvents.filter((item) => !McplServerConnection.SERVER_EVENTS.has(item.event));
     if (this.bufferedEvents.length < held) {
       console.error(
-        `[mcpl] ${this.id}: dropped ${held - this.bufferedEvents.length} held request(s) from a transport that closed`,
+        `[mcpl] ${this.id}: dropped ${held - this.bufferedEvents.length} held message(s) from a transport that closed`,
       );
     }
     // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
@@ -454,6 +457,11 @@ export class McplServerConnection extends EventEmitter {
   private static hasResponder(item: { args: unknown[] }): boolean {
     const responder = item.args[1] as { respond?: unknown } | undefined;
     return typeof responder?.respond === 'function';
+  }
+
+  /** Events that carry a server's own messages, as routed from its transport. */
+  private static get SERVER_EVENTS(): ReadonlySet<string> {
+    return new Set(Object.values(McplServerConnection.METHOD_TO_EVENT));
   }
 
   /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time

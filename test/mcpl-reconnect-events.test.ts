@@ -248,6 +248,30 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(written.filter((line) => /"id":(5|7)\b/.test(line)), [], 'nothing answers the closed transport\'s requests');
   });
 
+  it('drops what a transport that closed during its exchange sent, so the next transport\'s grant never admits it', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    const filters: unknown[] = [];
+    connection.on('tools-observe', (params: unknown) => filters.push(params));
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    connection.ready();
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'first reconnect');
+    // The fresh transport sends its filter right after initialize, while
+    // its exchange holds both planes, and then dies before the exchange
+    // settles.
+    serverSends({ method: 'tools/observe', params: { rules: [{ tool: 'old-process' }] } });
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 2, 5000, 'second reconnect');
+    connection.establishGrant(new CapabilityGrant(new Set(['toolLifecycle.observe']), []));
+    connection.ready();
+    assert.deepStrictEqual(filters, [], 'the closed transport\'s filter is not admitted under the next grant');
+  });
+
   it('a close during a reconnect\'s handshake closes the new transport instead of adopting it', async () => {
     // Flag file absent: the initial connect fails and we get a stub that
     // reconnects in the background.

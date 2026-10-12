@@ -265,6 +265,8 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
 
   it('a transport that drops during its exchange leaves the planes closed, and its late answer grants nothing', async () => {
     const h = harness();
+    const traces: string[] = [];
+    h.fw.traceListeners = [(event: { type: string }) => traces.push(event.type)];
     h.fw.wireMcplEvents(h.connection);
     h.reconnect();
     h.drop();
@@ -273,11 +275,13 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
     h.answers[0]({ accepted: true }); // answered just as the transport went
     await h.settle();
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'the dead transport\'s exchange opens and grants nothing');
-    // The next transport's exchange grants and opens.
+    assert.deepEqual(traces.filter((type) => type === 'mcpl:server-reconnected' || type === 'module:added'), [], 'and announces nothing');
+    // The next transport's exchange grants, opens and announces.
     h.reconnect();
     h.answers[1]({ accepted: true });
     await h.settle();
     assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 });
+    assert.deepEqual(traces.filter((type) => type === 'mcpl:server-reconnected' || type === 'module:added'), ['mcpl:server-reconnected', 'module:added']);
   });
 
   it('a reconnect on a quiesced host opens only the control plane; resume opens the data plane', async () => {
@@ -291,6 +295,19 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
     h.fw.quiesced = false;
     h.fw.readyMcplPlanes(); // resume()
     assert.equal(h.counts.opened, 1);
+  });
+
+  it('a runtime connect whose transport drops during its exchange is neither opened nor announced', async () => {
+    const h = harness();
+    const traces: string[] = [];
+    h.fw.traceListeners = [(event: { type: string }) => traces.push(event.type)];
+    const connecting = h.fw.connectMcplServerInternal({ id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] });
+    await h.settle();
+    h.drop();
+    h.answers[0]({ accepted: true });
+    await connecting;
+    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 });
+    assert.equal(traces.includes('module:added'), false, 'its close reported it gone; its reconnect announces it');
   });
 
   it('a runtime connect\'s exchange holds its planes against a resume until it settles', async () => {

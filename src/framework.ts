@@ -14074,7 +14074,9 @@ export class AgentFramework {
     // knowingly left empty) before ANY buffered traffic flows, whoever else
     // opens planes meanwhile (a resume during a runtime connect).
     const current = await this.settlePolicyExchange(config, connection);
-    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+    // A transport that dropped during its exchange isn't announced: its close
+    // reported it gone, and its reconnect announces it.
+    if (current) this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
     // Staged startup opens every connection together (initializeMcpl).
     if (staged) return;
 
@@ -14346,6 +14348,10 @@ export class AgentFramework {
         }
       }
     } catch (err) {
+      if (connection.transportEpoch !== epoch) {
+        console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one negotiates its own`);
+        return;
+      }
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
@@ -14748,10 +14754,10 @@ export class AgentFramework {
         // Settled, granted or not (an unanswered or refused policy leaves the
         // grant empty and the connection MCP-only, as at initial connect):
         // open the planes if this transport is still the connection's. One
-        // that dropped meanwhile stays closed; the next reconnect opens it.
-        if (connection.transportEpoch === epoch && connection.isConnected) {
-          this.readyMcplPlanes([connection]);
-        }
+        // that dropped meanwhile stays closed and isn't announced: the close
+        // already reported it gone, and the next reconnect announces it.
+        if (connection.transportEpoch !== epoch || !connection.isConnected) return;
+        this.readyMcplPlanes([connection]);
         this.handleToolsListChanged(connection.id);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
