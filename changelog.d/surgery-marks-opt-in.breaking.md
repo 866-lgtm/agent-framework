@@ -24,9 +24,14 @@
   - `host/command` `hide` and turn-based `undo` now hold the store like
     every surgery, so they are refused (`agent-busy`) while any agent
     sharing the store is mid-turn.
-  - No sibling version is required: a host that ignores the new option simply
-    places no marks. The connectome-host and discord-mcpl companions add the
-    choice to their surfaces.
+  - No sibling version is required for the framework to place no marks
+    unless asked: a host that ignores the new option places none. An older
+    discord-mcpl's `/hide` is the exception: it reacts 💤 to every message in
+    `hiddenRefs` itself, whatever the framework does, until its companion
+    release, which stops that and passes the operator's choice instead. The
+    connectome-host companion adds the choice to its surface.
+  - `rollbackToMessage` and `suppressMessages` refuse a `marks` value that
+    isn't `'none'` or `{ scope: 'addressed' | 'all', refs? }` (`invalid`).
 - **Code using `DiscordAwarenessOutbox` directly:** the awareness ledger is now
   an append-only journal of typed records in the Chronicle store
   (`af:discord-awareness`, on the shared `RecordJournal`), so the constructor
@@ -40,4 +45,20 @@
   there later imports only batches the journal doesn't already hold. What it
   recorded is kept as evidence, never as synthesized attempts or as proof that
   a suppression's body completed, and its undelivered work is held for an
-  explicit release.
+  explicit release. A release before this one doesn't read the journal, so a
+  host downgraded after the import starts without that work, or anything
+  queued since: those marks aren't delivered.
+  - The exported `DiscordAwarenessEntry` and `DiscordAwarenessOperation`
+    types went with the JSON ledger: an operation is `DiscordAwarenessOp`
+    (one request and its attempts), a batch `DiscordAwarenessBatch`
+    (`DiscordAwarenessBatchRecord` as recorded), and `view()` returns
+    `DiscordAwarenessView`.
+  - An operator control the outbox won't carry out throws
+    `DiscordAwarenessRefusal`; any other error is a failure to read or write
+    the journal.
+- **`createOfflineRecoveryBranch` and `agent-framework-recover`:** the result
+  (and the CLI's JSON output) no longer has `outboxPath`, since the journal is
+  in the store. `discordMarkersQueued` is the marks queued (planned, for a dry
+  run), with `markers`, the receipt, beside it, and `discordAddressable`,
+  `marksScope`, `unmarked` and `notRemoved` are new. Both need a store that
+  exists: a path that holds none is refused, where it used to be created.

@@ -7,4 +7,13 @@
   now holds control traffic as well as data until the new grant is
   established, as initial connect already did, both for a connection that
   was open and for one whose first connect had failed, and even when
-  startup or a quiesce resume opens every connection meanwhile.
+  startup or a quiesce resume opens every connection meanwhile. A runtime
+  connect holds its planes the same way.
+- A transport that drops during that policy exchange no longer has its
+  planes opened: they stay closed until the next transport's exchange
+  settles, and an answer that arrives after its transport closed grants
+  nothing. A server request held while a plane was closed is dropped when
+  its transport closes, rather than admitted under the next transport's
+  grant, and an answer to a request from a closed transport is never written
+  to the next one. A `close()` during a reconnect's handshake now closes the
+  new transport instead of adopting it.

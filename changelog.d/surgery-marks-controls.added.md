@@ -18,10 +18,14 @@
     unrecorded.
   - `releaseDiscordAwareness(batch)` queues a held batch.
 
-  Each control is recorded in the operator log. The same controls are
-  available as the `host/command` `marks` verb (`action: list | cancel |
-  retract | release`, `target`) and, with the host stopped, as
-  `agent-framework-recover --awareness list|cancel|retract|release`.
+  Each control is recorded in the operator log. A request the journal won't
+  carry out (an unknown batch, or one in the wrong state) is refused as
+  `invalid`, and a failure to read or write the journal is `failed`. The same
+  controls are available as the `host/command` `marks` verb (`action: list |
+  cancel | retract | release`, `target`) and, with the host stopped, as
+  `agent-framework-recover --awareness list|cancel|retract|release`, which
+  takes only `--store` and `--outbox` and refuses a recovery's options given
+  with it.
 - A turn-based `host/command` `undo` that undoes a turn records one
   `undo-turns` entry in the operator log: the requested turns, the marks
   choice (`none` included) and the receipt, beside the per-turn `undo-turn`
