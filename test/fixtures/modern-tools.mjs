@@ -41,17 +41,18 @@ export function createServer(opts = {}) {
       content: [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }],
       structuredContent: { score: 0.9, label: 'cat' },
     }));
+  const media = [
+    { type: 'text', text: 'before' },
+    { type: 'resource_link', uri: 'file:///srv/report.pdf', name: 'report.pdf', mimeType: 'application/pdf' },
+    { type: 'resource', resource: { uri: 'memo://note', mimeType: 'text/plain', text: 'embedded note text' } },
+    { type: 'resource', resource: { uri: 'memo://bin', mimeType: 'application/octet-stream', blob: Buffer.from('binary!').toString('base64') } },
+    { type: 'audio', data: Buffer.from('RIFF0000WAVEfmt ').toString('base64'), mimeType: 'audio/wav' },
+    { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+  ];
   server.registerTool('media', { description: 'Mixed standard content', inputSchema: obj() },
-    async () => ({
-      content: [
-        { type: 'text', text: 'before' },
-        { type: 'resource_link', uri: 'file:///srv/report.pdf', name: 'report.pdf', mimeType: 'application/pdf' },
-        { type: 'resource', resource: { uri: 'memo://note', mimeType: 'text/plain', text: 'embedded note text' } },
-        { type: 'resource', resource: { uri: 'memo://bin', mimeType: 'application/octet-stream', blob: Buffer.from('binary!').toString('base64') } },
-        { type: 'audio', data: Buffer.from('RIFF0000WAVEfmt ').toString('base64'), mimeType: 'audio/wav' },
-        { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
-      ],
-    }));
+    async () => ({ content: media }));
+  server.registerTool('structured_media', { description: 'Mixed standard content with structured data', inputSchema: obj() },
+    async () => ({ content: media, structuredContent: { blocks: media.length } }));
   server.registerTool('fail', { description: 'Reports a tool error', inputSchema: obj() },
     async () => ({ content: [{ type: 'text', text: 'the tool failed on purpose' }], isError: true }));
   server.registerTool('slow', { description: 'Sleeps, then answers', inputSchema: obj({ ms: { type: 'number' } }) },

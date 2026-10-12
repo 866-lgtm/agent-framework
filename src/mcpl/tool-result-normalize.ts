@@ -12,8 +12,9 @@
  *   to the workspace, and a bounded stub says where it went. A stub tells the
  *   reader where the payload is; nothing is dropped silently. If a payload
  *   can't be saved, the result is a failure to materialize it, not a
- *   success. A `resource_link` is shown as a reference and never fetched. An
- *   embedded resource shows its text, or is saved like a blob.
+ *   success. A `resource_link` is shown as a link, with its name and URI,
+ *   and never fetched. An embedded resource shows its text, or is saved like
+ *   a blob.
  * - **`structuredContent` is the machine-readable view.** It is kept by
  *   presence on `ToolResult.structured`. The model sees it rendered as JSON
  *   only when the server's content has no text block of its own, because

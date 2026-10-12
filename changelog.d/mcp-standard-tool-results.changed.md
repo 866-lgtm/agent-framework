@@ -12,7 +12,8 @@
     and the host's log says why the save failed;
   - a failed result is read as its text alone, so there an inline image is
     saved and stubbed like any other payload;
-  - a `resource_link` is shown as a reference and never fetched;
+  - a `resource_link` is shown as a link, with its name and URI, and never
+    fetched;
   - an embedded text resource shows its text;
   - an unknown block is shown as JSON, bounded, saying how much was left
     out. A malformed entry is named and left out, and content that isn't a
@@ -26,12 +27,28 @@
   reading and gain `structured`.
 - A script whose tool call returns `structuredContent` receives the
   server's result itself, as one JSON object: `{ content, structuredContent,
-  isError, error? }`, with `content` the blocks as sent, so images and other
-  payloads survive. If it would exceed the 5 MB script cap, it is saved to the
-  workspace and the script gets `{ isError, oversized: { chars, savedTo } }`.
-  If it can't be saved, the script gets a failure that says the tool may have
-  completed. Results without structured content keep the existing script
-  contract.
+  isError, error? }`. From a server that isn't an MCPL peer, `content` is the
+  blocks as sent, so images and other payloads survive. `structuredContent`
+  is the tool's own JSON, as sent.
+- An MCPL peer's blocks in a script's `content` get the treatment every
+  lane the model reads gives them, since what a script prints comes back to
+  the model. An RFC-005 reference arrives without its URI, as the host's
+  reference id (`refId`), what the server said about it in that block
+  (`name`, `mimeType`, `sizeBytes`, `digest`, `expiresAt`, with control and
+  bidi characters stripped from the text fields, as in the model's stub),
+  and `savedTo`, the workspace path the framework fetched its payload to for
+  the script (`null` when it couldn't; `fetch_reference` takes the id as its
+  `ref_id` argument). A block the classifier rejects arrives as the model's
+  `[unrecognized content block: …]` notice, and inline data that also claims
+  a bulk disposition as the withheld notice. #181, by @Meganeuridae, first
+  found scripts losing `structuredContent`, and it kept the saved paths of
+  RFC-005 payloads for them by falling back to the text rendering. Here the
+  paths are in the structured object, as `savedTo`.
+- If a script's structured result would exceed the 5 MB script cap, the
+  framework saves it to the workspace and the script gets
+  `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
+  script gets a failure that says the tool may have completed. Results
+  without structured content keep the existing script contract.
 - The direct tool path (`executeToolCall`, `ModuleContext.callTool`) now
   treats an MCP tool error (`isError: true`) as a failure, with
   `success: false` and the error text; before, every answer counted as

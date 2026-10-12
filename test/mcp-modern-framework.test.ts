@@ -181,6 +181,22 @@ test('scripts get structured results whole, as one JSON object', async () => {
       structuredContent: { score: 0.9, label: 'cat' },
       isError: false,
     });
+    // A resource link, embedded resources and audio are ordinary MCP blocks
+    // from a modern server, not RFC-005 references: the script reads them as
+    // the server sent them.
+    const media = JSON.parse(await handle('agent', 'mcpl--modern--structured_media', {}));
+    assert.deepEqual(media, {
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'resource_link', uri: 'file:///srv/report.pdf', name: 'report.pdf', mimeType: 'application/pdf' },
+        { type: 'resource', resource: { uri: 'memo://note', mimeType: 'text/plain', text: 'embedded note text' } },
+        { type: 'resource', resource: { uri: 'memo://bin', mimeType: 'application/octet-stream', blob: Buffer.from('binary!').toString('base64') } },
+        { type: 'audio', data: Buffer.from('RIFF0000WAVEfmt ').toString('base64'), mimeType: 'audio/wav' },
+        { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+      ],
+      structuredContent: { blocks: 6 },
+      isError: false,
+    });
     // Without structured content the script contract is unchanged (pinned):
     // the history rendering, which JSON-encodes a text result.
     assert.equal(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), JSON.stringify('echo:x'));

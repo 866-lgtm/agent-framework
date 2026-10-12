@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceBlockForScript, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -2573,28 +2573,39 @@ export class AgentFramework {
     return this.referenceFetcherInstance;
   }
 
-  /** Register every RFC-005 reference in a tool-result content array against
-   *  its server, then eagerly fetch the ones inside the autofetch envelope
-   *  (below the eager ceiling, connection origin — never worse than the
-   *  server having inlined the bytes). Failures are non-fatal: the stub then
-   *  says fetch_reference instead of a path. */
-  private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
-    if (!content) return;
+  /** Register every RFC-005 reference in an MCPL peer's tool-result content
+   *  against its server, then eagerly fetch the ones inside the autofetch
+   *  envelope (below the eager ceiling, connection origin — never worse than
+   *  the server having inlined the bytes). Failures are non-fatal: the stub
+   *  then says fetch_reference instead of a path.
+   *
+   *  For a script that will read the blocks, every reference is then fetched
+   *  ("eagerly lazy"): a script receiving a result is the strongest
+   *  available signal that the bytes are wanted (scripts process, they do
+   *  not browse), so the stub it receives carries a workspace path it can
+   *  open directly. */
+  private async autoFetchReferences(content: unknown, serverId: string, forScript: boolean): Promise<void> {
+    if (!Array.isArray(content)) return;
     const fetcher = this.getReferenceFetcher();
-    const eligible: import('./mcpl/references.js').ReferenceRecord[] = [];
+    const records: import('./mcpl/references.js').ReferenceRecord[] = [];
     for (const block of content) {
       const c = classifyBlock(block);
-      if (c.kind !== 'reference') continue;
-      const record = referenceRegistry.register(c.testimony, serverId);
-      if (eager && fetcher.isEagerEligible(record)) eligible.push(record);
+      if (c.kind === 'reference') records.push(referenceRegistry.register(c.testimony, serverId));
     }
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
+    const eligible = records.filter((record) => fetcher.isEagerEligible(record));
     await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
       const outcome = await fetcher.fetch(record, { timeoutMs: EAGER_FETCH_TIMEOUT_MS });
       if (!outcome.ok) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
     }));
+    if (!forScript) return;
+    // A record the eager pass saved returns at once.
+    for (const record of records) {
+      const outcome = await fetcher.fetch(record);
+      if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+    }
   }
 
   /** Core agent_settings keys — extension keys must not collide with these. */
@@ -11885,21 +11896,9 @@ export class AgentFramework {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
     if (result.data === undefined && !structured) return '';
-    // RFC-005 "eagerly lazy": a script receiving a result is the strongest
-    // available signal that the bytes are wanted (scripts process, they do
-    // not browse) — materialize every referenced payload now, so the stub
-    // the script receives carries a workspace path it can open directly.
-    if (Array.isArray(result.data)) {
-      const fetcher = this.getReferenceFetcher();
-      for (const block of result.data) {
-        const c = classifyBlock(block);
-        if (c.kind !== 'reference') continue;
-        const record = referenceRegistry.findByUri(c.testimony.uri)
-          ?? referenceRegistry.register(c.testimony);
-        const outcome = await fetcher.fetch(record);
-        if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
-      }
-    }
+    // An MCPL peer's references were fetched for the script at dispatch
+    // (autoFetchReferences), so each one's stub carries the workspace path
+    // its payload was saved to.
     // Scripts get (nearly) full data — the script environment IS the spill:
     // filtering big results in code is the whole point. 5MB protocol safety
     // cap only; no context-cap truncation, no file spill.
@@ -11914,11 +11913,14 @@ export class AgentFramework {
    * A structured MCP result as a script receives it: one JSON object holding
    * both of the server's views, `{ content, structuredContent, isError }`,
    * plus `error` (the text) on a tool error. `content` is the content array
-   * as the server sent it (the dispatch gave this call the direct reading),
-   * so payloads and images survive. Past the size cap the result stays
-   * valid JSON: the whole object is saved to the workspace, and the script
-   * gets `{ isError, oversized: { chars, savedTo } }`. If it can't be saved,
-   * the script gets a failure to materialize the result, saying the tool may
+   * the dispatch gave this call (the direct reading): the server's blocks as
+   * sent, so payloads and images survive, except that an MCPL peer's blocks
+   * get the treatment RFC-005 gives them on every lane the model reads
+   * (referenceBlockForScript). `structuredContent` is the tool's own JSON, as
+   * sent. Past the size cap the result stays valid JSON: the whole object is
+   * saved to the workspace, and the script gets
+   * `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
+   * script gets a failure to materialize the result, saying the tool may
    * already have completed, never a success missing its result.
    */
   private async scriptStructuredResult(result: ToolResult): Promise<string> {
@@ -15352,12 +15354,18 @@ export class AgentFramework {
     // A script's call that returns structured content gets the server's
     // result itself (the direct reading): the script receives both views
     // whole, so nothing the model reading lowers (stubs, image placeholders,
-    // generated JSON) stands in for what the server sent.
+    // generated JSON) stands in for what the server sent. An MCPL peer's
+    // content blocks are the exception: what a script prints comes back to
+    // the model, so each gets the treatment RFC-005 gives it on every lane
+    // the model reads. A standard peer's blocks reach the script as sent.
     const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
-    const reading = (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean) =>
-      forScript && Object.prototype.hasOwnProperty.call(result, 'structuredContent')
-        ? Promise.resolve(AgentFramework.directToolResult(result))
-        : this.mcpToolResult(result, call.id, mcpl);
+    const reading = async (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean): Promise<ToolResult> => {
+      if (!forScript || !Object.prototype.hasOwnProperty.call(result, 'structuredContent')) {
+        return this.mcpToolResult(result, call.id, mcpl);
+      }
+      const direct = AgentFramework.directToolResult(result);
+      return mcpl && Array.isArray(direct.data) ? { ...direct, data: direct.data.map(referenceBlockForScript) } : direct;
+    };
 
     if (modern) {
       // Modern MCP: no state exchange, no channels, no RFC-005 references.
@@ -15424,11 +15432,16 @@ export class AgentFramework {
 
     legacy.sendToolsCall(toolName, args, stateParams)
       .then(async (result) => {
-        // RFC-005: register references and eagerly fetch the small ones
-        // before serialization, so their stubs carry a saved path. Only an
-        // MCPL peer's blocks are references; an MCP-only peer's are standard.
+        // RFC-005: register references and fetch the small ones, and every
+        // one a script will read, before serialization, so their stubs carry
+        // a saved path. Only an MCPL peer's blocks are references; an
+        // MCP-only peer's are standard. A script reads the blocks unless the
+        // result is an error without structured content, which reaches it as
+        // its error text alone.
         if (mcplPeer) {
-          await this.autoFetchReferences(result.content, serverId, true)
+          const scriptReads = forScript
+            && (!result.isError || Object.prototype.hasOwnProperty.call(result, 'structuredContent'));
+          await this.autoFetchReferences(result.content, serverId, scriptReads)
             .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         }
         return { result, toolResult: await reading(result, mcplPeer) };
@@ -15547,7 +15560,8 @@ export class AgentFramework {
    * `structured` too, with the JSON view when its content is empty. The
    * direct path (a module's callTool, a channel's tool call) doesn't come
    * here: it returns the server's result itself (directToolResult), for
-   * either engine, as does a script's call whose result is structured.
+   * either engine, as does a script's call whose result is structured, with
+   * an MCPL peer's blocks given RFC-005's treatment (referenceBlockForScript).
    */
   private async mcpToolResult(
     result: { content?: unknown; isError?: boolean; structuredContent?: unknown },
