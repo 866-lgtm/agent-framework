@@ -1,0 +1,1 @@
+- MCPL references (RFC-005): a display label now drops the Arabic letter mark (U+061C) along with the other bidi controls, and an `expiresAt` rejected as a field (past its 64-character maximum, or not a string) fails closed like an unparseable one. The reference is treated as already expired, never as immortal, so the fetcher refuses it.

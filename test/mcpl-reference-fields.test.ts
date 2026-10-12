@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildReferenceStub, classifyBlock, isReferenceExpired, REFERENCE_LIMITS,
+  buildReferenceStub, classifyBlock, isReferenceExpired, sanitizeLabel, REFERENCE_LIMITS,
   referenceRegistry, referenceStubOrNull,
 } from '../src/mcpl/references.js';
 
@@ -69,12 +69,26 @@ test('schema-admitted metadata still uses independent sanitized and bounded disp
   assert.ok(stub.length < 350);
 });
 
-test('an admitted but unparseable expiry still fails closed; schema-invalid expiry is absent', () => {
+test('an admitted but unparseable expiry still fails closed; a schema-invalid expiry is absent, and fails closed too', () => {
   const validShape = reference('resource', { expiresAt: 'not-a-date' }).testimony;
   assert.equal(isReferenceExpired(validShape), true);
   const invalidShape = reference('resource', { expiresAt: 'x'.repeat(REFERENCE_LIMITS.expiresAt + 1) }).testimony;
   assert.equal(invalidShape.expiresAt, undefined);
   assert.deepEqual(invalidShape.rejectedFields, ['expiresAt']);
+  assert.equal(isReferenceExpired(invalidShape), true, 'an overlong expiry is never read as immortal');
+  const notAString = reference('resource', { expiresAt: 1_900_000_000 }).testimony;
+  assert.equal(isReferenceExpired(notAString), true, 'nor is one that is not a string');
+  const absent = reference('resource', {}).testimony;
+  assert.equal(isReferenceExpired(absent), false, 'a reference that claims no expiry has none');
+});
+
+test('display labels lose every bidi control, the Arabic letter mark included', () => {
+  const controls = ['\u061C', '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069'];
+  for (const ch of controls) {
+    assert.equal(sanitizeLabel(`a${ch}b`, 100), 'ab', `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}`);
+  }
+  assert.equal(sanitizeLabel('a\u0000\u001F\u007F\u0085\u009Fb', 100), 'ab', 'C0, DEL and C1 controls');
+  assert.equal(sanitizeLabel('\u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u05E2\u05D1\u05E8\u05D9\u05EA', 100), '\u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u05E2\u05D1\u05E8\u05D9\u05EA', 'right-to-left text itself is kept');
 });
 
 test('large invalid labels cannot change the bounded model-visible stub', () => {

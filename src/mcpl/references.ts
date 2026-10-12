@@ -13,7 +13,8 @@
  *  - `disposition:"never"` withholds payload AND uri from model context
  *    unconditionally — enforced in code here, not by caller discipline (§5);
  *  - stub size is independent of every server-supplied field length (§5);
- *  - unparseable `expiresAt` fails closed (§7.4);
+ *  - unparseable `expiresAt` fails closed (§7.4), and so does one rejected
+ *    as a field: it's absent as testimony, never read as immortal;
  *  - unknown block types never propagate `undefined` (the pre-existing
  *    convertBlock switches had no default — a latent corruption this module
  *    retires).
@@ -141,16 +142,22 @@ export function isInlineContradiction(block: unknown): boolean {
 export const INLINE_WITHHELD_TEXT =
   '[inline content withheld: nonconformant bulk disposition on inline data]';
 
-export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt'>, nowMs = Date.now()): boolean {
+export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now()): boolean {
+  // A rejected expiry (past its schema maximum, or not a string) is absent as
+  // testimony under the one invalid-field rule, but reading that absence as
+  // "never expires" would let field invalidity widen exposure (§8): like an
+  // unparseable one, it fails closed (§7.4).
+  if (t.rejectedFields.includes('expiresAt')) return true;
   if (t.expiresAt === undefined) return false;
   const exp = Date.parse(t.expiresAt);
   return Number.isNaN(exp) ? true : exp <= nowMs;
 }
 
-/** Strip C0/C1 controls plus bidi marks/overrides/isolates; bound length.
+/** Strip control characters (C0, DEL, C1) and every bidi control (marks,
+ *  embeddings, overrides, isolates, and the Arabic letter mark); bound length.
  *  Labels are labels — storage naming is host-generated elsewhere (§7.3). */
 export function sanitizeLabel(s: string, maxChars: number): string {
-  const cleaned = s.replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '');
   if (cleaned.length <= maxChars) return cleaned;
   let cut = cleaned.slice(0, Math.max(0, maxChars - 1));
   // never split a surrogate pair at the truncation boundary
