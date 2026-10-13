@@ -1168,13 +1168,14 @@ export class AgentFramework {
    */
   private proseSpeechChains: Map<string, Promise<void>> = new Map();
   /**
-   * The logical turn whose unstreamed tool results are pending, per agent:
-   * set when the non-streaming fallback schedules their re-inference, and
-   * taken by the agent's next fresh start, whatever wake starts it. That
-   * turn consumes the tool results, since the scheduler batches the
-   * re-inference with the agent's other pending wakes (LogicalTurn).
+   * The logical turn the agent's next fresh start continues, per agent
+   * (LogicalTurn): one whose unstreamed tool results the non-streaming
+   * fallback scheduled for re-inference, or whose start a provider-capacity
+   * hold deferred to a later compile. The next fresh start takes it,
+   * whatever wake starts it, since the scheduler batches the agent's
+   * pending wakes and that turn is the one that continues.
    */
-  private toolResultsLogical: Map<string, LogicalTurn> = new Map();
+  private carriedLogical: Map<string, LogicalTurn> = new Map();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
@@ -4496,7 +4497,7 @@ export class AgentFramework {
         this.pendingAssistantBlocks.delete(agent.name);
         this.turnRouting.delete(agent.name);
         this.proseSpeechChains.delete(agent.name);
-        this.toolResultsLogical.delete(agent.name);
+        this.carriedLogical.delete(agent.name);
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
@@ -7109,8 +7110,7 @@ export class AgentFramework {
           } else {
             // Non-streaming fallback: schedule re-inference, which continues
             // this stream's logical turn.
-            const logical = this.turnRouting.get(agent.name)?.logical;
-            if (logical) this.toolResultsLogical.set(agent.name, logical);
+            this.carryLogicalTurn(agent.name);
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
@@ -7608,7 +7608,7 @@ export class AgentFramework {
     this.agents.delete(agentName);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
-    this.toolResultsLogical.delete(agentName);
+    this.carriedLogical.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
@@ -8879,6 +8879,12 @@ export class AgentFramework {
     }
   }
 
+  /** Hand the agent's current logical turn to its next fresh start (carriedLogical). */
+  private carryLogicalTurn(agentName: string): void {
+    const logical = this.turnRouting.get(agentName)?.logical;
+    if (logical) this.carriedLogical.set(agentName, logical);
+  }
+
   /**
    * A `!` continuation the turn asked for (`>>#x !`, `>>>#x !`): start another
    * turn now instead of pausing until the next external event. It reads the
@@ -9508,17 +9514,17 @@ export class AgentFramework {
       // tallies start empty. The previous turn's object isn't cleared: prose
       // it left queued still reads and writes its own.
       const fresh = freshTurnRouting();
-      // A framework retry, or the start that consumes unstreamed tool
-      // results, is the same logical turn on a new stream (LogicalTurn): it
-      // shares the earlier stream's ` !` and receipt tallies, which a
-      // delivery still queued there can write after this stream begins. A
-      // retry follows its stream at once; tool results pending from the
-      // non-streaming fallback go to the next fresh start, whichever wake
-      // starts it, with the logical turn recorded when they were scheduled.
+      // A framework retry, or the start that continues a turn its stream
+      // left open (unstreamed tool results, a provider-capacity hold), is the
+      // same logical turn on a new stream (LogicalTurn): it shares the
+      // earlier stream's ` !` and receipt tallies, which a delivery still
+      // queued there can write after this stream begins. A retry follows its
+      // stream at once; an open turn goes to the next fresh start, whichever
+      // wake starts it (carriedLogical).
       const previous = this.turnRouting.get(agent.name);
-      const scheduled = this.toolResultsLogical.get(agent.name);
+      const scheduled = this.carriedLogical.get(agent.name);
       if (scheduled) {
-        this.toolResultsLogical.delete(agent.name);
+        this.carriedLogical.delete(agent.name);
         fresh.logical = scheduled;
       } else if (attempt > 0 && previous) {
         fresh.logical = previous.logical;
@@ -9544,7 +9550,12 @@ export class AgentFramework {
     // opened/pinned a channel mid-turn.
     if (trigger?.suppressProse) {
       this.turnLocusPins.delete(agent.name);
-      this.turnRouting.set(agent.name, freshTurnRouting());
+      // Silent: no routing state, but the logical turn the start took or
+      // shares (a ` !`, receipt tallies) stays with it.
+      const silent = freshTurnRouting();
+      const logical = this.turnRouting.get(agent.name)?.logical;
+      if (logical) silent.logical = logical;
+      this.turnRouting.set(agent.name, silent);
     }
 
     this.touchEphemeralRun(agent.name, true);
@@ -9700,6 +9711,8 @@ export class AgentFramework {
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
+        // That compile continues this turn's logical turn.
+        this.carryLogicalTurn(agent.name);
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
       }
@@ -10908,6 +10921,8 @@ export class AgentFramework {
 
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               lifecyclePhase = 'failed';
+              // The cooldown's later fresh compile continues this logical turn.
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.carryLogicalTurn(agent.name);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
@@ -11152,6 +11167,8 @@ export class AgentFramework {
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abortAgentScript(agent.name, 'provider acceleration cooldown');
+        // The cooldown's later fresh compile continues this logical turn.
+        this.carryLogicalTurn(agent.name);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }

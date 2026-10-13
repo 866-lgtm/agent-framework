@@ -23,8 +23,9 @@
   that another event started meanwhile runs first. Before, hybrid mode
   started it only after the next turn, and explicit mode dropped it, or,
   when its delivery ran late, started it after the next turn.
-- A framework retry, or the start that consumes unstreamed tool results
-  (whichever wake the scheduler starts it with), begins the turn's sticky
+- A framework retry, the start that consumes unstreamed tool results
+  (whichever wake the scheduler starts it with), or the later start a
+  provider-capacity hold defers a turn to, begins the turn's sticky
   destination and hybrid's hold afresh, as before, but continues its
   logical turn: a ` !` asked for before it still stands, in explicit mode
   too, and the receipt at the turn's end reports the earlier stream's

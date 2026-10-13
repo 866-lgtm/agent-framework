@@ -693,7 +693,7 @@ describe('explicit prose routing', () => {
       const internals = framework as unknown as {
         turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
         proseSpeechChains: Map<string, Promise<void>>;
-        toolResultsLogical: Map<string, RoutingState['logical']>;
+        carriedLogical: Map<string, RoutingState['logical']>;
       };
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
@@ -704,7 +704,7 @@ describe('explicit prose routing', () => {
         // fallback that schedules it records the earlier stream's logical turn.
         const earlier: RoutingState = { destination: null, hybridHold: false, logical: { continuation: when === 'already set', deliveries: [], suppressed: 0 } };
         internals.turnRouting.set('assistant', earlier);
-        internals.toolResultsLogical.set('assistant', earlier.logical);
+        internals.carriedLogical.set('assistant', earlier.logical);
         if (when === 'set late') {
           internals.proseSpeechChains.set('assistant', held.then(() => { earlier.logical.continuation = true; }));
         }
@@ -743,7 +743,7 @@ describe('explicit prose routing', () => {
     const internals = framework as unknown as {
       turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
       proseSpeechChains: Map<string, Promise<void>>;
-      toolResultsLogical: Map<string, RoutingState['logical']>;
+      carriedLogical: Map<string, RoutingState['logical']>;
     };
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -753,7 +753,7 @@ describe('explicit prose routing', () => {
       // re-inference has begun, into the logical turn the two share.
       const earlier: RoutingState = { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } };
       internals.turnRouting.set('assistant', earlier);
-      internals.toolResultsLogical.set('assistant', earlier.logical);
+      internals.carriedLogical.set('assistant', earlier.logical);
       internals.proseSpeechChains.set('assistant', held.then(() => { earlier.logical.deliveries.push('chan-alpha'); }));
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
       const running = framework.runUntilIdle();
@@ -858,6 +858,63 @@ describe('explicit prose routing', () => {
   });
   }
 
+  it('the non-streaming fallback hands the scheduling turn its logical turn when it schedules the re-inference', async () => {
+    // Adapted from a reviewer's producer test: the agent's direct inference
+    // API leaves tools pending with no yielding stream, and the tool result
+    // goes through the framework's real event handling.
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      routingOf(name: string): RoutingState;
+      carriedLogical: Map<string, unknown>;
+      pendingRequests: InferenceRequest[];
+      handleProcessEvent(event: ProcessEvent): Promise<void>;
+    };
+    const origin = internals.routingOf('assistant').logical;
+    origin.continuation = true;
+    origin.deliveries.push('chan-alpha');
+    const response = createMockResponse([
+      { type: 'tool_use', id: 'unstreamed-one', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    try {
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
+      await agent.runInference(framework.getAllTools());
+      assert.equal(agent.state.status, 'waiting_for_tools');
+      assert.equal((agent.state as { stream?: unknown }).stream, undefined, 'the direct API has no yielding stream');
+      agent.addAssistantResponse(response.content);
+      await internals.handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-one',
+        result: { success: true, data: { ok: true } },
+      } as ProcessEvent);
+      assert.ok(internals.pendingRequests.some((r) => r.reason === 'tool_results_ready'), 'the fallback scheduled the re-inference');
+      assert.equal(internals.carriedLogical.get('assistant'), origin, 'and recorded the logical turn it continues');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a silent start that takes a carried logical turn keeps it', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'quiet' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
+      carriedLogical: Map<string, RoutingState['logical']>;
+    };
+    try {
+      const carried: RoutingState['logical'] = { continuation: false, deliveries: ['chan-alpha'], suppressed: 0 };
+      internals.carriedLogical.set('assistant', carried);
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true } as InferenceRequest);
+      await framework.runUntilIdle();
+      assert.equal(internals.carriedLogical.has('assistant'), false, 'the silent start took the record');
+      assert.equal(internals.turnRouting.get('assistant')?.logical, carried, 'and its routing kept that logical turn');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   for (const mode of ['explicit', 'hybrid'] as const) {
     it(`${mode}: the wake that consumes unstreamed tool results continues the turn that scheduled them`, async () => {
       const p = mode === 'explicit' ? '>>' : '>>>';
@@ -871,14 +928,14 @@ describe('explicit prose routing', () => {
       feedTurn(framework, 2, [{ type: 'text', text: `${p}skip_reply` }] as ContentBlock[]);
       const internals = framework as unknown as {
         turnRouting: Map<string, RoutingState>;
-        toolResultsLogical: Map<string, RoutingState['logical']>;
+        carriedLogical: Map<string, RoutingState['logical']>;
       };
       try {
         // The scheduling turn asked for a continuation and left its tool
         // results pending; the scheduler then starts the agent with another
         // wake, which consumes them.
         const scheduling: RoutingState = { destination: null, hybridHold: false, logical: { continuation: true, deliveries: [], suppressed: 0 } };
-        internals.toolResultsLogical.set('assistant', scheduling.logical);
+        internals.carriedLogical.set('assistant', scheduling.logical);
         internals.turnRouting.set('assistant', { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } });
         trigger(framework);
         await framework.runUntilIdle();
@@ -888,7 +945,7 @@ describe('explicit prose routing', () => {
         }
         assert.equal(turns, 2, "the consuming turn took the scheduling turn's ' !'");
         assert.equal(scheduling.logical.continuation, false);
-        assert.equal(internals.toolResultsLogical.has('assistant'), false, 'the record is taken once');
+        assert.equal(internals.carriedLogical.has('assistant'), false, 'the record is taken once');
       } finally {
         await framework.stop();
       }
