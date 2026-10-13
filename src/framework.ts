@@ -1023,7 +1023,9 @@ function boundProviderErrorCode(code: unknown): string | undefined {
  * whole projection (failureDescription): serialising an Error writes its own
  * fields, a MembraneError's whole `rawRequest` among them. The projection is
  * left uncut, as a nested string is, so the sink's one cut of the JSON states
- * its whole length. Throws, or returns undefined, as JSON.stringify does.
+ * its whole length. An Error is recognised by instanceof, so one from another
+ * realm (a vm context) is written as its own JSON, as any object is. Throws,
+ * or returns undefined, as JSON.stringify does.
  */
 function failureJson(value: unknown): string | undefined {
   return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? failureDescription(nested) : nested));
