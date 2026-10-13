@@ -2709,6 +2709,18 @@ test("an inline spill's failed disk copy is traced with its error, cut at 200 ch
   } finally { h.workspace.writeBinary = original; await h.framework.stop(); }
 });
 
+test('a batch that used its deadline is logged once for the batch, by the guard', async (t) => {
+  const h = await workspaceHarness([[calls('one', 'two', 'three'), refused()], [answer()]]);
+  (h.framework as unknown as { spillWithheld: () => Promise<unknown> }).spillWithheld = async () => ({ skipped: 'batch_deadline' });
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  try {
+    await bounded(h.run(), 'the run');
+    await h.framework.getAgent('assistant')!.toolResultGuard.whenAnnotated();
+    assert.equal(lines.filter((line) => /used its deadline/.test(line)).length, 1, lines.join('\n'));
+  } finally { await h.framework.stop(); }
+});
+
 test('a withheld spill with no finite deadline takes its own, not a 1 ms timer', async () => {
   const h = await workspaceHarness([]);
   const f = h.framework as unknown as {

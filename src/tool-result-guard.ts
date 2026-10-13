@@ -494,6 +494,7 @@ export class ToolResultGuard {
         const thrown = new Map<number, string>();
         // Set once the branch has changed: no more is written.
         let branchLeft = false;
+        let deadlineSpent = false;
         for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
           // Once the store has left the batch's branch (a rollback, an undo, a
@@ -530,6 +531,12 @@ export class ToolResultGuard {
           // back by the edit, as after an undo and a redo, the stubs of this
           // result and the later ones name the audit record.
           if (spill && 'skipped' in spill && spill.skipped === 'branch_changed') branchLeft = true;
+          // A batch that used its deadline is said once, here, where the
+          // batch is known; the host returns the skip without a line.
+          if (spill && 'skipped' in spill && spill.skipped === 'batch_deadline' && !deadlineSpent) {
+            deadlineSpent = true;
+            console.error(`[tool-result-guard] agent=${this.agentName} batch=${pending.id} used its deadline before all its originals were written; the rest name the audit record (batch_deadline)`);
+          }
           spills.set(index, spill);
         }
         const annotated: ContentBlock[] = pending.withheld.map((block, index) => block.type === 'tool_result'

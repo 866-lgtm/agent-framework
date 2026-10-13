@@ -2873,8 +2873,6 @@ export class AgentFramework {
   private readonly stalledSpills = new Set<Promise<void>>();
   /** Withheld spills skipped since the current stall began. */
   private stallSkips = 0;
-  /** The deadline of the last batch whose exhausted skips were logged. */
-  private lastExhaustedDeadline: number | null = null;
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
   /** The lifecycle generation whose stop() has let the running annotations
@@ -12146,14 +12144,8 @@ export class AgentFramework {
       return { skipped: 'workspace_unanswered' };
     }
     const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      // Once per batch (its deadline is the batch's), not per result.
-      if (this.lastExhaustedDeadline !== deadline) {
-        this.lastExhaustedDeadline = deadline;
-        console.error(`[spill] a withheld batch used its deadline before all its originals were written; the rest are skipped as batch_deadline (first: ${place.path})`);
-      }
-      return { skipped: 'batch_deadline' };
-    }
+    // The guard says once per batch that it used its deadline.
+    if (remaining <= 0) return { skipped: 'batch_deadline' };
     const write = this.writeToolResultFile(label, text, branch);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<'late'>((resolve) => {
