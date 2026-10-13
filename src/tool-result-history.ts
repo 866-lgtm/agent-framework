@@ -63,16 +63,21 @@ export function toolResultDataToHistoryString(
  * stores it, or, when it has no data, its error text. A tool can answer
  * `{ success: false, error, isError: false }`, a failure it doesn't flag as
  * an error for the model, and the model still reads what failed.
+ *
+ * Each field is read once: the direct Agent API passes its caller's own
+ * result here, unchecked, and a getter needn't answer the same way twice.
  */
 export function nonErrorResultText(
   result: { data?: unknown; error?: string },
   maxChars?: number,
   options?: HistorySerializeOptions,
 ): string {
-  if ((result.data === undefined || result.data === null) && typeof result.error === 'string' && result.error) {
-    return maxChars ? truncateForHistory(result.error, maxChars) : result.error;
+  const data = result.data;
+  if (data === undefined || data === null) {
+    const error = result.error;
+    if (typeof error === 'string' && error) return maxChars ? truncateForHistory(error, maxChars) : error;
   }
-  return toolResultDataToHistoryString(result.data, maxChars, options);
+  return toolResultDataToHistoryString(data, maxChars, options);
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice.

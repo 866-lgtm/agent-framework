@@ -351,3 +351,33 @@ test("the model's call through the utils meta-tool takes the checked form", asyn
     [{ content: unconvertible('cyclic', 'Converting circular structure to JSON'), isError: true }]);
   await within(framework.stop(), 10_000, 'stop()');
 });
+
+test("the direct Agent API reads each field of its caller's result once", async () => {
+  // The Agent class turns a result its caller hands it into history text
+  // without the framework's check, so a getter is read as it was written.
+  const { Agent } = await import('../src/agent.js');
+  const agent = new Agent(
+    { name: 'direct', model: 'test-model', systemPrompt: 'sys' },
+    {} as never,
+    {} as never,
+  );
+  const oneRead = (value: unknown) => {
+    let reads = 0;
+    return () => {
+      reads += 1;
+      if (reads > 1) throw new Error('read a second time');
+      return value;
+    };
+  };
+  const data = oneRead('the payload');
+  const quietError = oneRead('what failed');
+  const quietData = oneRead(undefined);
+  const results = [
+    { id: 'a', name: 'withData', result: { success: true, get data() { return data(); } } },
+    { id: 'b', name: 'quiet', result: { success: false, isError: false, get data() { return quietData(); }, get error() { return quietError(); } } },
+  ];
+  const built = (agent as unknown as { buildToolResultMessages(r: unknown[]): Array<{ content: Array<{ content: string }> }> })
+    .buildToolResultMessages(results);
+  assert.deepEqual(built[0].content.map((block) => block.content), [JSON.stringify('the payload'), 'what failed']);
+});
+
