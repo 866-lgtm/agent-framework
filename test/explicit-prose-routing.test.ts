@@ -1721,6 +1721,52 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it('hybrid: a hold beside a send writes the routing and drafts of its own round, not the live turn\'s', async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const gateway = framework as unknown as {
+      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+      turnRouting: Map<string, RoutingState>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    try {
+      const queued: RoutingState = { destination: null,
+        logical: { continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0 } };
+      const live: RoutingState = { ...queued, logical: { continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0 } };
+      gateway.turnRouting.set('assistant', live);
+      // A held round that a later start has overtaken: its envelopes move
+      // its own turn's routing, and its drafts are that turn's.
+      gateway.holdSilencedProse(agent, ['>>>#nowhere held words', 'after it'], 'send', false, { routing: queued, notice: 'later' });
+      assert.equal(queued.hybridHold, 'failed', 'the round that held it records the failed envelope');
+      assert.deepEqual(queued.logical.drafts.map((d) => d.text), ['held words', 'after it'], "and holds the round's words as its drafts");
+      assert.equal(live.hybridHold, undefined, 'the live turn is untouched');
+      assert.deepEqual(live.logical.drafts, [], 'and holds no draft of that round');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('hybrid: after >>>skip_reply, the next unprefixed envelope stays in the context and counts as kept private', async () => {
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as {
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, round: { routing: RoutingState; notice: 'later' }): Promise<void>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    try {
+      const routing: RoutingState = { destination: null,
+        logical: { continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0 } };
+      await gateway.deliverHybridProse(agent, '>>>skip_reply an aside', 'chan-locus', true, { routing, notice: 'later' });
+      await gateway.deliverHybridProse(agent, 'still private', 'chan-locus', true, { routing, notice: 'later' });
+      assert.deepEqual(routed, [], 'nothing is sent');
+      assert.equal(routing.hybridHold, 'private');
+      assert.equal(routing.logical.keptPrivate, 1, 'the unprefixed envelope after it is counted as kept private');
+      assert.deepEqual(routing.logical.drafts, [], 'and is never drafted');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('admission turns a resolver that throws into an envelope that bounces', async () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
