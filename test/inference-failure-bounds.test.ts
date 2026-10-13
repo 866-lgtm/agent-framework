@@ -1025,17 +1025,32 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
   }
 });
 
-test('the breaker reads the status a real failure carries: a 404 never sheds, a 400 does', async () => {
+test('the breaker reads the status a real failure carries: a 404 never sheds; a 400, a 413 and no status do', async () => {
   // Through classifyInferenceError, the inference:exhausted trace and
   // noteInferenceExhausted to the gate, three failed turns each: the
-  // escalation threshold.
-  for (const [status, sheds] of [[404, false], [400, true]] as const) {
-    const { errs, traces } = await runFailingTurn('stream error event', () => new MembraneError({
-      type: 'invalid_request', retryable: false, httpStatus: status, message: `zz-${status}`, rawError: { status },
+  // escalation threshold. A shed is read from its own line, since the cap's
+  // and nothing-left-to-shed's lines share its prefix.
+  for (const [status, sheds] of [[404, false], [400, true], [413, true], [undefined, true]] as const) {
+    const label = status === undefined ? 'no status' : `HTTP ${status}`;
+    const { errs, traces, messages } = await runFailingTurn('stream error event', () => new MembraneError({
+      type: 'invalid_request', retryable: false, message: `zz-${label}`, rawError: { status },
+      ...(status === undefined ? {} : { httpStatus: status }),
     }), { turns: 3 });
-    assert.ok(traces.some((t) => t.type === 'inference:exhausted' && t.httpStatus === status), `HTTP ${status} reached the trace`);
-    assert.ok(errs.some((e) => e.startsWith('[inference-hard-down] agent=resident')), `HTTP ${status} is reported hard-down`);
-    assert.equal(errs.some((e) => e.startsWith('[inference-rewind]')), sheds, `HTTP ${status} ${sheds ? 'sheds' : 'sheds nothing'}`);
+    const exhausted = traces.filter((t) => t.type === 'inference:exhausted');
+    assert.ok(exhausted.length >= 3, `${label}: ${exhausted.length} exhausted traces`);
+    // The status as the failure carried it: none is invented for an error without one.
+    assert.ok(exhausted.every((t) => t.httpStatus === status), `${label} reached the trace as it was`);
+    assert.ok(errs.some((e) => e.startsWith('[inference-hard-down] agent=resident')), `${label} is reported hard-down`);
+    const shed = errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
+    const kept = messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
+      .map((m) => (m.content[0] as { text: string }).text);
+    if (sheds) {
+      assert.ok(shed.length > 0, `${label} sheds`);
+      assert.ok(!kept.includes('hello 2'), `${label}: the newest exchange is shed`);
+    } else {
+      assert.equal(shed.length, 0, `${label} sheds nothing`);
+      assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);
+    }
   }
 });
 

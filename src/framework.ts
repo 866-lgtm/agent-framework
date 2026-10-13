@@ -1157,28 +1157,37 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
 
 /**
  * Whether the poison-history breaker may shed the newest exchange for a
- * failure: an `invalid_request` at HTTP 400 or 422, or one that carries no
- * status. 400 and 422 are the statuses a provider rejects a request that
- * fails its validation with, which is how a history it can't accept fails.
- * They don't show that the history is at fault: other rejections come back
- * the same way, such as Anthropic's 400 for a credit balance that's too low.
- * Other statuses keep the history, since shed history can't be got back: no
- * shed fixes a 404 (a model that doesn't exist), and a 413 (the request's
- * size) is left to the context budget and compression rather than met by
- * losing exchanges. Which statuses reach `invalid_request` depends on the
- * membrane:
- * - 0.5.86: Anthropic files a 400 as invalid_request (after its context
- *   check) and its other 4xx as unknown; the raw-fetch Responses adapter
- *   files every status it doesn't list (404, 405, 409, 410, 413, 415, 422 …)
- *   as invalid_request; the chat adapters file 4xx as unknown.
- * - From membrane #56 (unreleased), one table serves every adapter: auth
- *   codes and context overflow are checked on a 400 or 422 first, a 404 is
- *   invalid_request, a 413 context_length, and other 4xx invalid_request.
+ * failure: an `invalid_request` at HTTP 400, 413 or 422, or one that carries
+ * no status. The status is a heuristic for when a shed may help, not proof
+ * that the history is at fault. 400 and 422 are how a provider answers a
+ * request that fails its validation, as a history it can't accept does, but
+ * other refusals come back the same way, such as Anthropic's 400 for a
+ * credit balance that's too low. A 413 is the request's size, and its usual
+ * cause is the newest exchange, such as an oversized attachment: shedding it
+ * brings the request back under the limit, and nothing else in the framework
+ * recovers a 413. Other statuses keep the history, since shed history can't
+ * be got back and no shed fixes them: a 404 is a model that doesn't exist,
+ * and 405, 409, 410 and 415 are about the HTTP request or the resource
+ * rather than the conversation. Which statuses reach `invalid_request`
+ * depends on the membrane:
+ * - As membrane 0.5.86 classifies them: Anthropic files a 400 as
+ *   invalid_request (after its context check) and its other 4xx as unknown;
+ *   the chat adapters file every 4xx, 400 included, as unknown; the raw-fetch
+ *   Responses adapter files every status it doesn't list (404, 405, 409, 410,
+ *   413, 415, 422 …) as invalid_request, so it alone produces an
+ *   invalid_request at 413 or 422.
+ * - From membrane #56 (merged, not yet in a release), one table serves every
+ *   adapter: auth codes and context overflow are checked on a 400 or 422
+ *   first, a 404 is invalid_request, a 413 is context_length and so never
+ *   reaches this gate, and other 4xx are invalid_request. The 422 arm then
+ *   also covers an OpenAI-compatible server, such as a FastAPI one, that
+ *   answers a validation failure with 422.
  * An error with no status, from a membrane that reports none, keeps the rule
  * the breaker had before: the type alone.
  */
-export function rejectsHistory(errorType: string | undefined, httpStatus: number | undefined): boolean {
-  return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
+export function shedMayHelp(errorType: string | undefined, httpStatus: number | undefined): boolean {
+  return errorType === 'invalid_request' &&
+    (httpStatus === undefined || httpStatus === 400 || httpStatus === 413 || httpStatus === 422);
 }
 
 export class AgentFramework {
@@ -5125,9 +5134,10 @@ export class AgentFramework {
       ? `the model refused on them (content filter: ${category}). Their content is ` +
         `not reproduced here (so this note can't re-trigger the filter); the ` +
         `originals remain in the raw record`
-      : `the model API kept rejecting the conversation on them (${category}). ` +
-        `Their content is not reproduced here (so this note can't re-trigger the ` +
-        `rejection); the originals remain in the raw record`;
+      : `the model API kept refusing the requests that carried them (${category}), ` +
+        `so they were removed for the conversation to go on. Their content is not ` +
+        `reproduced here (so this note can't trigger the same refusal); the ` +
+        `originals remain in the raw record`;
     const text =
       `[refusal-rewind] The ${count} most recent turn(s) were set aside because ` +
       `${why}. You are clear to continue — if you ` +
@@ -9569,11 +9579,11 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
-          // Drives the poison-history breaker (rejectsHistory: an
-          // `invalid_request` at HTTP 400 or 422, or with no status, is taken
-          // as a rejection of the history itself — retrying the same context can
-          // never succeed; auth/abort/context_length are also non-retryable
-          // but must NOT cost history) and the OverBudget drain breaker
+          // Drives the poison-history breaker (shedMayHelp: an
+          // `invalid_request` at HTTP 400, 413 or 422, or with no status,
+          // suggests the provider refused the request's content, which a shed
+          // of the newest exchange may fix; auth/abort/context_length are also
+          // non-retryable but must NOT cost history) and the OverBudget drain breaker
           // (`over_budget`: compile refused to fit the hard budget — this is
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
@@ -10693,10 +10703,10 @@ export class AgentFramework {
                 error: err.message,
                 // Drives the poison-history breaker. `retryable` is kept for
                 // observability, but the breaker gates on
-                // rejectsHistory(errorType, httpStatus) — only an
-                // `invalid_request` at HTTP 400 or 422, or with no status, is
-                // taken as a rejection of the history itself, which retrying
-                // the same context can never get past.
+                // shedMayHelp(errorType, httpStatus): only an `invalid_request`
+                // at HTTP 400, 413 or 422, or with no status, suggests the
+                // provider refused the request's content, which a shed of the
+                // newest exchange may fix.
                 ...this.classifyInferenceError(err),
               });
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -12824,13 +12834,13 @@ export class AgentFramework {
    *      inference, so this never causes a retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
-   *   4. breaker — when a failure at or past the hard-down threshold is taken
-   *      as a rejection of the history itself (rejectsHistory: an
-   *      `invalid_request` at HTTP 400 or 422, or with no status, e.g.
-   *      corrupted tool_use/tool_result pairing or an oversized attachment),
-   *      retrying the same context can
-   *      never succeed: every new push event wakes the agent onto the same
-   *      poisoned history forever. At the hard-down threshold, automatically
+   *   4. breaker — when a failure at or past the hard-down threshold suggests
+   *      the provider refused the request's content (shedMayHelp: an
+   *      `invalid_request` at HTTP 400, 413 or 422, or with no status, such
+   *      as a provider's answer to a corrupted tool_use/tool_result pairing
+   *      or an oversized attachment), retrying the same context is likely to
+   *      fail the same way, and every new push event would wake the agent
+   *      onto that same history. At the hard-down threshold, automatically
    *      quarantine: shed the newest complete exchange (the same forced-rewind
    *      primitive `/unstick` uses — shedNewestTurn never orphans a
    *      tool_use/thinking block) and retry, bounded by the same rewind cap so
@@ -13005,9 +13015,11 @@ export class AgentFramework {
 
   /**
    * Classify a terminal inference error for the `inference:exhausted` trace.
-   * Single-sourced for every emit site: the downstream breakers (poison-history
-   * quarantine, OverBudget drain kick) gate on `errorType`, so classification
-   * drift between sites would silently disable a safety net.
+   * Single-sourced for every emit site: the downstream breakers gate on what
+   * it returns (the poison-history quarantine on `errorType` and
+   * `httpStatus`, through shedMayHelp; the OverBudget drain kick on
+   * `errorType`), so classification drift between sites would silently
+   * change when a safety net acts.
    *
    * context-manager's refusal errors are matched by a real `instanceof` since
    * CM exports them from its package root (context-manager#41 / #71; floor
@@ -13224,19 +13236,19 @@ export class AgentFramework {
         { skipLog: true },
       );
 
-      // (4) Poison-history breaker: ONLY when rejectsHistory(errorType,
-      // httpStatus) holds — an `invalid_request` at HTTP 400 or 422, or with
-      // no status, taken as a rejection of the history itself. The current
-      // failure decides, whatever failed before it in the streak.
-      // Deliberately NOT keyed on
-      // `retryable === false`, which membrane also returns for auth (expired
-      // key), abort (deliberate cancel), context_length (compression's job,
-      // and shedding newest is the wrong direction), safety and unsupported —
-      // none of which mean the history is poisoned, and all of which would
-      // otherwise shed good exchanges and stamp a false "the API kept
-      // rejecting your history" marker. `retryable` is kept only for the trace.
+      // (4) Poison-history breaker: ONLY when shedMayHelp(errorType,
+      // httpStatus) holds, for an `invalid_request` at HTTP 400, 413 or 422,
+      // or with no status, which suggests the provider refused the request's
+      // content. The current failure decides, whatever failed before it in
+      // the streak. Deliberately NOT keyed on `retryable === false`, which
+      // membrane also returns for auth (expired key), abort (deliberate
+      // cancel), context_length (compression's job, and shedding newest is
+      // the wrong direction), safety and unsupported. None of them is a
+      // refusal of the request's content, and each would otherwise shed good
+      // exchanges and stamp a rewind marker saying the API kept refusing them.
+      // `retryable` is kept only for the trace.
       void retryable;
-      if (agent && rejectsHistory(errorType, httpStatus)) {
+      if (agent && shedMayHelp(errorType, httpStatus)) {
         this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
@@ -13248,7 +13260,7 @@ export class AgentFramework {
    * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
    * the single consolidated episode marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next
-   * push event to wake the agent onto the same poisoned context.
+   * push event to wake the agent onto the same context.
    *
    * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
    * sheds per failure episode; the budget resets on any successful inference.

@@ -4,8 +4,10 @@
  * poisoned history — every new push event woke the agent onto a context the
  * API rejects, forever, until a manual /unstick.
  *
- * Now, at the hard-down threshold with a known NON-retryable failure, the
- * breaker auto-quarantines: sheds the newest complete exchange (the same
+ * Now, at the hard-down threshold, when the failure suggests the provider
+ * refused the request's content (shedMayHelp: an invalid_request at HTTP 400,
+ * 413 or 422, or with no status), the breaker auto-quarantines: sheds the
+ * newest complete exchange (the same
  * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
  * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
@@ -13,7 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentFramework, rejectsHistory } from '../src/framework.js';
+import { AgentFramework, shedMayHelp } from '../src/framework.js';
 
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const messages: any[] = opts?.messages ?? [
@@ -66,7 +68,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
 
-test('at the threshold, invalid_request failures trigger an automatic rewind + retry', () => {
+test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', () => {
   const { fw, removed, added, errs, restore } = makeHarness();
   try {
     fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 1
@@ -79,12 +81,14 @@ test('at the threshold, invalid_request failures trigger an automatic rewind + r
   // The poisoned tool exchange was shed as a COMPLETE pair (no orphans).
   assert.deepEqual([...removed].sort(), ['a1', 'r1']);
 
-  // One consolidated rewind marker, attributed to the API rejection.
+  // One consolidated rewind marker, saying the API kept refusing the requests
+  // that carried the shed turns, not that the conversation was at fault.
   const marker = added.find((m) => m.meta.kind === 'refusal-rewind');
   assert.ok(marker, 'rewind marker added');
   assert.equal(marker!.meta.cause, 'inference-failure');
-  assert.match(marker!.content[0].text, /set aside/);
-  assert.match(marker!.content[0].text, /rejecting/);
+  assert.match(marker!.content[0].text, /set aside because the model API kept refusing the requests that carried them \(/);
+  assert.match(marker!.content[0].text, /so they were removed for the conversation to go on/);
+  assert.doesNotMatch(marker!.content[0].text, /rejecting the conversation/);
 
   // A retry was queued so the rewound history is verified immediately.
   assert.equal(fw.pendingRequests.length, 1);
@@ -104,11 +108,12 @@ test('retryable / unknown-retryability failures NEVER shed history (outages cost
 });
 
 test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER shed history', () => {
-  // The breaker keys on the membrane error TYPE, not on `retryable`. membrane
-  // marks auth (expired key), context_length, abort, safety and unsupported all
-  // non-retryable — but none of them mean the history is poisoned. Shedding
-  // good exchanges + stamping a false "the API kept rejecting your history"
-  // marker on an expired API key is exactly the category error this guards.
+  // The breaker keys on the membrane error type and the HTTP status
+  // (shedMayHelp), not on `retryable`. membrane marks auth (expired key),
+  // context_length, abort, safety and unsupported all non-retryable, but none
+  // of them is a refusal of the request's content. Shedding good exchanges,
+  // with a rewind marker saying the API kept refusing them, on an expired API
+  // key is exactly the category error this guards.
   for (const errorType of ['auth', 'context_length', 'abort', 'safety', 'unsupported']) {
     const { fw, removed, added, restore } = makeHarness();
     try {
@@ -176,13 +181,14 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   assert.ok(errs.some((e) => e.includes('nothing left to shed')));
 });
 
-// Anarchid's review of membrane #56 (M3): from #56 (unreleased) one status
-// table serves every adapter, so `invalid_request` also reaches
-// agent-framework for an Anthropic 404 (a model that doesn't exist), which
-// no shed can fix. With 0.5.86 the raw-fetch Responses adapter already files
-// every status it doesn't list as invalid_request. The breaker runs only for
-// a 400 or 422, the statuses that reject a request's content; an error
-// without a status keeps the type-only rule.
+// Anarchid's review of membrane #56 (M3): from #56 (merged, not yet in a
+// release) one status table serves every adapter, so `invalid_request` also
+// reaches agent-framework for an Anthropic 404 (a model that doesn't exist),
+// which no shed can fix. With 0.5.86 the raw-fetch Responses adapter already
+// files every status it doesn't list as invalid_request. The breaker runs
+// only for a 400, 413 or 422, the statuses that suggest the provider refused
+// the request's content (a heuristic: other refusals come back the same
+// way); an error without a status keeps the type-only rule.
 test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', () => {
   const missingModel = makeHarness();
   const alerts: any[] = [];
@@ -209,6 +215,27 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
   assert.deepEqual([...rejected.removed].sort(), ['a1', 'r1'], 'a 400 at the threshold sheds, as before');
 });
 
+test('the current failure decides the shed, whatever failed before it in the streak', () => {
+  // 400, 400, then a 404 at the threshold: nothing is shed.
+  const ending404 = makeHarness();
+  try {
+    for (const httpStatus of [400, 400, 404]) {
+      ending404.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus });
+    }
+  } finally { ending404.restore(); }
+  assert.deepEqual(ending404.removed, [], '400, 400, 404: nothing is shed at the third failure');
+  assert.ok(ending404.errs.some((e) => e.includes('[inference-hard-down]')), 'though it is hard-down');
+
+  // 404, 404, then a 400 at the threshold: the 400 sheds.
+  const ending400 = makeHarness();
+  try {
+    for (const httpStatus of [404, 404, 400]) {
+      ending400.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus });
+    }
+  } finally { ending400.restore(); }
+  assert.deepEqual([...ending400.removed].sort(), ['a1', 'r1'], '404, 404, 400: the 400 sheds at the third failure');
+});
+
 test('the status reaches the breaker from the inference:exhausted trace', () => {
   const h = makeHarness();
   try {
@@ -221,7 +248,7 @@ test('the status reaches the breaker from the inference:exhausted trace', () => 
   assert.ok(h.errs.some((e) => e.includes('[inference-hard-down]')));
 });
 
-test('rejectsHistory: an invalid_request at 400 or 422, or with no status, and nothing else', () => {
+test('shedMayHelp: an invalid_request at 400, 413 or 422, or with no status, and nothing else', () => {
   // Every membrane error type (0.5.86), the framework's own two, and none.
   const types = ['invalid_request', 'rate_limit', 'context_length', 'auth', 'server', 'network', 'timeout', 'abort',
     'safety', 'unsupported', 'unknown', 'over_budget', 'context_refusal', undefined];
@@ -229,8 +256,8 @@ test('rejectsHistory: an invalid_request at 400 or 422, or with no status, and n
   for (let status = 100; status <= 599; status++) statuses.push(status);
   for (const type of types) {
     for (const status of statuses) {
-      const expected = type === 'invalid_request' && (status === undefined || status === 400 || status === 422);
-      assert.equal(rejectsHistory(type, status), expected, `${String(type)} at ${String(status)}`);
+      const expected = type === 'invalid_request' && (status === undefined || status === 400 || status === 413 || status === 422);
+      assert.equal(shedMayHelp(type, status), expected, `${String(type)} at ${String(status)}`);
     }
   }
 });
