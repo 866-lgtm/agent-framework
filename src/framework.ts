@@ -10183,7 +10183,8 @@ export class AgentFramework {
           this.proseHybridSuppressed.set(agent.name, 'failed');
           continue;
         }
-        if (usedClipboard) body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
+        // A function replacement: a draft's words go in exactly, `$&` and `$$` included.
+        if (usedClipboard) body = body.replaceAll('{{unsent}}', () => unsent.draft?.text ?? '');
         this.proseTargetPins.set(agent.name, resolved.channelId);
         this.proseHybridSuppressed.delete(agent.name);
         if (!body.trim()) {
@@ -10340,7 +10341,8 @@ export class AgentFramework {
     const unsent = usedClipboard ? this.takeUnsent(agent, body, hold, '>>') : {};
     if (unsent.refused) return;
     if (usedClipboard) {
-      body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
+      // A function replacement: a draft's words go in exactly, `$&` and `$$` included.
+      body = body.replaceAll('{{unsent}}', () => unsent.draft?.text ?? '');
     }
     if (!body.trim()) {
       console.error(`[prose] ${name}: empty body after prefix/substitution — nothing to send`);
@@ -10392,7 +10394,7 @@ export class AgentFramework {
       ? this.proseDrafts.get(name, substituted.id) ?? substituted
       : this.proseDrafts.latestBounce(name);
     if (previous && text.trim() === '{{unsent}}') return { draft: previous };
-    const expanded = text.replaceAll('{{unsent}}', previous?.text ?? '');
+    const expanded = text.replaceAll('{{unsent}}', () => previous?.text ?? '');
     if (!previous || !(draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`))) {
       return { text: expanded };
     }
@@ -10457,16 +10459,30 @@ export class AgentFramework {
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
     this.proseBounceStreaks.set(name, streak);
     const cand = candidates?.length ? ` Known channels it could mean: ${candidates.join(', ')}.` : '';
-    const kept = draft
-      ? `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, reply with a destination plus the ` +
-        `token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}", or use ` +
-        `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel"). ` +
-        `"${prefix}skip_reply {{unsent}}" sets it aside.`
-      : 'It could not be held as a draft; the words remain in your history.';
+    // A bare {{unsent}} whose send failed re-bounces the draft it sent, which
+    // a later bounce may have displaced as the latest; and {{unsent}} refuses
+    // a draft that may already have been posted. Then only the drafts tool
+    // reaches this one.
+    const ownRisk = !!draft && !inherited && draftState(draft) === 'unconfirmed';
+    const byToken = !!draft && !inherited && !ownRisk && this.proseDrafts.latestBounce(name)?.id === draft.id;
+    const kept = !draft
+      ? 'It could not be held as a draft; the words remain in your history.'
+      : byToken
+        ? `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, reply with a destination plus the ` +
+          `token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}", or use ` +
+          `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel"). ` +
+          `"${prefix}skip_reply {{unsent}}" sets it aside.`
+        : `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, use ` +
+          `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel"` +
+          `${inherited || ownRisk ? ', confirmDuplicate: true' : ''}); ` +
+          `drafts(action: "dismiss", draftIds: ["${draft.id}"]) sets it aside.`;
     const risky = inherited && draft
       ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
         'can be resent only with the drafts tool and confirmDuplicate: true, after checking that channel.'
-      : '';
+      : ownRisk
+        ? ` Its last send's outcome isn't known, so it may already have been posted: resend it only with ` +
+          'confirmDuplicate: true, after checking that channel.'
+        : '';
     const notice =
       `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ${kept}${risky}` +
       (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');

@@ -378,12 +378,13 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it('a failed {{unsent}} send that a later turn overtook holds the words it attempted, not the newer bounce', async () => {
+  for (const sent of ['{{unsent}} plus a line', '{{unsent}}'] as const) {
+  it(`a failed '${sent}' send that a later turn overtook holds the words it attempted, not the newer bounce`, async () => {
     // Turn one queues '>>#alpha {{unsent}} plus a line' and skip_reply ends
     // it while that publish is held. Turn two bounces new words. When turn
     // one's send then fails, its draft must hold what it attempted.
     membrane.pushResponse(createMockResponse([
-      { type: 'text', text: '>>#alpha {{unsent}} plus a line' },
+      { type: 'text', text: `>>#alpha ${sent}` },
       { type: 'tool_use', id: 'delayed-1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([
@@ -421,22 +422,37 @@ describe('explicit prose routing', () => {
       await framework.runUntilIdle();
       await reached;
       const firstChain = internals.proseSpeechChains.get('assistant')!;
-      assert.deepEqual(routed.map((r) => r.text), ['ORIGINAL WORDS plus a line']);
+      const attempted = sent === '{{unsent}}' ? 'ORIGINAL WORDS' : 'ORIGINAL WORDS plus a line';
+      assert.deepEqual(routed.map((r) => r.text), [attempted]);
       trigger(framework);
       await framework.runUntilIdle();
       assert.equal(store.latestBounce('assistant')?.text, 'NEW WORDS', 'the next turn bounced before the earlier send answered');
       release();
       await firstChain;
       const heldTexts = store.open('assistant').map((d) => d.text);
-      assert.ok(heldTexts.includes('ORIGINAL WORDS plus a line'), `the failed send holds the words it attempted: ${JSON.stringify(heldTexts)}`);
+      assert.ok(heldTexts.includes(attempted), `the failed send holds the words it attempted: ${JSON.stringify(heldTexts)}`);
       assert.ok(!heldTexts.includes('NEW WORDS plus a line'), 'not the newer bounce');
-      const copy = store.open('assistant').find((d) => d.text === 'ORIGINAL WORDS plus a line')!;
-      assert.notEqual(copy.id, original.id);
+      const copy = store.open('assistant').find((d) => d.text === attempted)!;
+      assert.equal(copy.inheritedRisk, undefined, 'a definite failure leaves no risk to inherit');
+      if (sent === '{{unsent}}') {
+        // The bare send re-bounces the draft it sent, which the newer bounce
+        // displaced as the latest: {{unsent}} now names that one, so the
+        // notice offers only the drafts tool for this one.
+        assert.equal(copy.id, original.id);
+        assert.equal(store.latestBounce('assistant')?.text, 'NEW WORDS');
+        const notice = context(framework).texts.filter((t) => t.startsWith('[prose-routing]') && t.includes(original.id)).at(-1)!;
+        assert.ok(notice.includes(`drafts(action: "resend", draftIds: ["${original.id}"]`), notice);
+        assert.ok(!notice.includes('{{unsent}}'), `the notice doesn't offer {{unsent}}, which names the newer bounce: ${notice}`);
+      } else {
+        assert.notEqual(copy.id, original.id);
+        assert.equal(store.latestBounce('assistant')?.id, copy.id, 'the re-held words are the latest bounce, as {{unsent}} names');
+      }
     } finally {
       release();
       await framework.stop();
     }
   });
+  }
 
   it('a thrown explicit unsent delivery re-bounces the authored body with its unresolved attempt risk', async () => {
     const framework = await createFramework();
@@ -455,6 +471,65 @@ describe('explicit prose routing', () => {
       assert.equal(copy.text, 'earlier words plus a line');
       assert.equal(copy.inheritedRisk?.draftId, original.id);
       assert.equal(draftState(copy), 'unconfirmed', 'a fresh draft cannot erase its source attempt risk');
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes(copy.id))!;
+      assert.ok(notice.includes(`draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true`), notice);
+      assert.ok(!notice.includes('{{unsent}}'), `{{unsent}} would refuse it, so the notice doesn't offer it: ${notice}`);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("{{unsent}} puts a draft's words in exactly, `$&` and `$$` included", async () => {
+    const framework = await createFramework();
+    try {
+      const routed = stubRegistry(framework);
+      const store = draftsOf(framework);
+      store.hold('assistant', [{ text: 'costs $$5, see $& and $1', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced');
+      const gateway = framework as unknown as {
+        deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      };
+      await gateway.deliverProse(framework.getAgent('assistant')!, '>>#alpha {{unsent}} (again)', { notice: 'later' });
+      assert.deepEqual(routed.map((r) => r.text), ['costs $$5, see $& and $1 (again)']);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a thrown bare {{unsent}} delivery says its draft may already have been posted', async () => {
+    const framework = await createFramework();
+    try {
+      stubRegistry(framework, ['throw']);
+      const store = draftsOf(framework);
+      const original = store.hold('assistant', [{
+        text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 },
+      }], 'bounced').held[0]!;
+      const gateway = framework as unknown as {
+        deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      };
+      await gateway.deliverProse(framework.getAgent('assistant')!, '>>#alpha {{unsent}}', { notice: 'later' });
+      assert.deepEqual(store.open('assistant').map((d) => d.id), [original.id], 'a bare {{unsent}} holds no copy');
+      assert.equal(draftState(store.get('assistant', original.id)!), 'unconfirmed');
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes(original.id))!;
+      assert.match(notice, /may already have been posted/);
+      assert.ok(notice.includes(`draftIds: ["${original.id}"], destination: "#channel", confirmDuplicate: true`), notice);
+      assert.ok(!notice.includes('{{unsent}}'), notice);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('hybrid: a >>> envelope whose {{unsent}} names no held bounce sends nothing, and holds its other words', async () => {
+    const framework = await createFramework('hybrid');
+    try {
+      const routed = stubRegistry(framework);
+      const store = draftsOf(framework);
+      const gateway = framework as unknown as {
+        deliverHybridProse(a: unknown, text: string, locus: string | null, allowLocus: boolean, hold: { notice: 'later' }): Promise<void>;
+      };
+      await gateway.deliverHybridProse(framework.getAgent('assistant')!, '>>>#alpha {{unsent}} and a note', null, true, { notice: 'later' });
+      assert.deepEqual(routed, [], 'no fragment goes out');
+      assert.deepEqual(store.open('assistant').map((d) => d.text), ['and a note']);
+      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing]') && t.includes('{{unsent}} names no held bounce draft')));
     } finally {
       await framework.stop();
     }
