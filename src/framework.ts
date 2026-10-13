@@ -546,6 +546,13 @@ interface TurnRouting {
   deliveries: string[];
   /** Plain-prose segments this turn suppressed, reported by its receipt. */
   suppressed: number;
+  /**
+   * The routing of the stream this one followed in the same logical turn,
+   * when beginAgentTurn starts that turn afresh (a framework retry, or a
+   * re-inference after unstreamed tool results): a ` !` asked for there
+   * still stands, even when its delivery runs after this stream began.
+   */
+  carriedFrom?: TurnRouting;
 }
 
 function freshTurnRouting(): TurnRouting {
@@ -8862,8 +8869,17 @@ export class AgentFramework {
    * abandoned by a quiesce asks for none.)
    */
   private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
-    if (!routing.continuation) return;
-    routing.continuation = false;
+    // This stream's own flag, or one an earlier stream of the same logical
+    // turn set (carriedFrom). Its deliveries are on the agent's chain ahead of
+    // this stream's, so by the time this check runs, they have run.
+    let asked = false;
+    for (let r: TurnRouting | undefined = routing; r; r = r.carriedFrom) {
+      if (r.continuation) {
+        asked = true;
+        r.continuation = false;
+      }
+    }
+    if (!asked) return;
     // An explicit turn's check can run after its stream has returned. A
     // stopped framework, or an agent no longer registered under its name (a
     // disposed fork or ephemeral run), takes no new turn from it.
@@ -9481,9 +9497,11 @@ export class AgentFramework {
       // A framework retry, or a re-inference after tool results that weren't
       // streamed, is the same logical turn on a new stream: a ` !` an earlier
       // stream asked for still stands, as it did when the flag was per agent.
+      // The new object links the earlier one rather than copying its flag,
+      // since a delivery queued there can still set it.
       const previous = this.turnRouting.get(agent.name);
-      if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous?.continuation) {
-        fresh.continuation = true;
+      if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous) {
+        fresh.carriedFrom = previous;
       }
       this.turnRouting.set(agent.name, fresh);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {

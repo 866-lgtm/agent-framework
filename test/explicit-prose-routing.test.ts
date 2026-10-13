@@ -680,35 +680,54 @@ describe('explicit prose routing', () => {
     });
   }
 
-  it("hybrid: a ' !' asked for before a re-inference after unstreamed tool results still starts its continuation", async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
-    const framework = await createFramework('hybrid');
-    const routed = stubRegistry(framework);
-    let turns = 0;
-    framework.onTrace((e) => {
-      if ((e as { type: string }).type === 'inference:started') turns++;
-    });
-    feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
-    const internals = framework as unknown as {
-      turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
-    };
-    try {
-      // The turn's earlier stream asked for a continuation; the turn goes on
-      // in a re-inference, which starts a new stream with a fresh routing
-      // state.
-      internals.turnRouting.set('assistant', { destination: null, hybridHold: false, continuation: true, deliveries: [], suppressed: 0 });
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
-      await framework.runUntilIdle();
-      for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 5));
-        await framework.runUntilIdle();
+  for (const when of ['already set', 'set late'] as const) {
+    it(`hybrid: a ' !' an earlier stream asked for (${when}) still starts its continuation after a re-inference on unstreamed tool results`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
+      const framework = await createFramework('hybrid');
+      const routed = stubRegistry(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
+      const internals = framework as unknown as {
+        turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
+        proseSpeechChains: Map<string, Promise<void>>;
+      };
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      try {
+        // The turn's earlier stream asked for a continuation, or will once
+        // its queued delivery runs; the turn goes on in a re-inference, which
+        // starts a new stream with a fresh routing state.
+        const earlier: RoutingState = { destination: null, hybridHold: false, continuation: when === 'already set', deliveries: [], suppressed: 0 };
+        internals.turnRouting.set('assistant', earlier);
+        if (when === 'set late') {
+          internals.proseSpeechChains.set('assistant', held.then(() => { earlier.continuation = true; }));
+        }
+        internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
+        const running = framework.runUntilIdle();
+        if (when === 'set late') {
+          for (const end = Date.now() + 5000; turns < 1 && Date.now() < end;) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          }
+          assert.equal(earlier.continuation, false, 'the earlier delivery has not run as the re-inference starts');
+          release();
+        }
+        await within(running, 'the re-inference to settle');
+        for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          await framework.runUntilIdle();
+        }
+        assert.deepEqual(routed.map((r) => r.text.trim()), ['carrying on']);
+        assert.equal(turns, 2, 'the re-inference completes, then the continuation it carried starts');
+        assert.equal(earlier.continuation, false, "the check took the earlier stream's flag");
+      } finally {
+        release();
+        await framework.stop();
       }
-      assert.deepEqual(routed.map((r) => r.text.trim()), ['carrying on']);
-      assert.equal(turns, 2, 'the re-inference completes, then the continuation it carried starts');
-    } finally {
-      await framework.stop();
-    }
-  });
+    });
+  }
 
   for (const boundary of ['stop', 'dispose'] as const) {
     it(`a tool-ended explicit turn's late ' !' takes no new turn after ${boundary === 'stop' ? 'stop()' : 'its agent is disposed'}`, async () => {
