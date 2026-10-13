@@ -539,22 +539,35 @@ export class ApiServer {
     const previousBranch = this.currentBranch;
 
     // The framework switches the store, reconciles the Discord awareness
-    // markers and re-materializes the config mount. Once stop() has begun it
-    // refuses, and stop() waits for a switch already running.
+    // markers and re-materializes the config mount. It refuses during a live
+    // turn or once stop() has begun, and stop() waits for one already running.
+    // The store has moved when the call returns, before its promise settles
+    // (a refusal moves nothing), so the current branch follows it through the
+    // awaited steps.
+    const switching = this.framework.switchBranch(params.name);
+    this.followStoreBranch();
+    let switched = false;
     try {
-      await this.framework.switchBranch(params.name);
+      await switching;
+      switched = true;
     } finally {
-      // A later step can fail after the store has moved.
-      const store = this.framework.getStore();
-      if (!store.isClosed()) this.currentBranch = store.currentBranch().name;
+      // A later step can fail after the store has moved: clients still hear
+      // where it is.
+      if (switched || this.currentBranch !== previousBranch) {
+        this.broadcast('branch:switched', {
+          from: previousBranch,
+          to: this.currentBranch,
+        });
+      }
     }
 
-    this.broadcast('branch:switched', {
-      from: previousBranch,
-      to: params.name,
-    });
-
     return { switched: true };
+  }
+
+  /** Take the current branch from the store, while it's open. */
+  private followStoreBranch(): void {
+    const store = this.framework.getStore();
+    if (!store.isClosed()) this.currentBranch = store.currentBranch().name;
   }
 
   private async cmdBranchCurrent(): Promise<{ name: string }> {

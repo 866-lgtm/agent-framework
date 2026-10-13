@@ -19,14 +19,15 @@
     `disconnectMcplServer()` and `restartMcplServer()` refuse with "<verb>
     refused: the framework is stopping" before they read or change
     anything, as a `host/command` already did.
-  - The exception is `syncDiscordAwarenessMarkers()`, which `stop()` admits
-    until it has finished waiting, because its callers have already changed
-    the store when they call it: the API server's undo and redo call it
-    after `undoLastTurn()` or `redo()`, sometimes from inside a trace
-    listener that started `stop()`. `stop()` waits for a sync admitted then,
-    and refuses one that starts once it can no longer wait for it. An
-    operation already admitted runs its own sync without that check, so a
-    surgery whose branch move outlasted a budget still finishes.
+  - The exception is `syncDiscordAwarenessMarkers()`, which each `stop()`
+    attempt admits until it has finished waiting, because its callers have
+    already changed the store when they call it: the API server's undo and
+    redo call it after `undoLastTurn()` or `redo()`, sometimes from inside a
+    trace listener that started `stop()`. `stop()` waits for a sync
+    admitted then, and refuses one that starts once it can no longer wait
+    for it. An operation already admitted runs its own sync without that
+    check, so a surgery whose branch move outlasted a budget still
+    finishes.
   - `stop()` also waits for what those operations start while it waits: the
     config materialization that undo, redo and the two surgeries start
     without waiting for it themselves. The framework now logs a failed

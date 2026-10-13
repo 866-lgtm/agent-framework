@@ -314,7 +314,7 @@ describe('stop() with an operator operation in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
-  it("stop() waits for an awareness sync, which an operator's undo or branch switch runs", async () => {
+  it('stop() waits for an awareness sync already running', async () => {
     const framework = await create();
     let deliver!: () => void;
     internals(framework).beginDiscordAwarenessBarrier = () => ({
@@ -334,8 +334,8 @@ describe('stop() with an operator operation in flight', () => {
   });
 
   it('an awareness sync called while stop() waits is not refused, and stop() waits for it too', { timeout: 20_000 }, async () => {
-    // The API server moves the branch on the store itself and then syncs, so
-    // a sync that arrives during stop() finishes a change already made.
+    // The API server's undo and redo change the store and then sync, so a
+    // sync that arrives during stop() finishes a change already made.
     const framework = await create();
     const fw = framework as unknown as Internals & { refreshMcplTools(): Promise<void>; emitMcplToolDiff(...args: unknown[]): void };
     let releaseFirst!: () => void;
@@ -371,6 +371,48 @@ describe('stop() with an operator operation in flight', () => {
     await syncing;
     await stopping;
     assert.deepEqual(order, ['server removed', 'awareness synced', 'modules stopped']);
+    assert.deepEqual(rejections, []);
+  });
+
+  it("a retried stop() admits an awareness sync during its own wait, and waits for it", { timeout: 20_000 }, async () => {
+    const framework = await create();
+    const fw = framework as unknown as Internals & {
+      getToolsForAgent(name: string): Array<{ name: string }>;
+      executeToolCall(call: unknown): Promise<ToolResult>;
+    };
+    // A puppet call held in its tool outlasts the first stop()'s budget.
+    let releaseTool!: () => void;
+    const toolHeld = new Promise<void>((resolve) => { releaseTool = resolve; });
+    let called = false;
+    fw.getToolsForAgent = () => [{ name: 'probe' }];
+    fw.executeToolCall = async () => { called = true; await toolHeld; return { success: true, data: 'done' }; };
+    const puppeting = framework.puppetToolCall('agent', 'probe', {});
+    void puppeting.catch(() => {});
+    await until(() => called, 'the puppet call to reach its tool');
+    let deliver: (() => void) | undefined;
+    fw.beginDiscordAwarenessBarrier = () => ({
+      requiresBarrier: true,
+      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 1, failed: 0 }); }),
+    });
+    let syncSettled = false;
+    try {
+      await assert.rejects(framework.stop(100), (error: unknown) => error instanceof ShutdownTimeoutError);
+      const readsBefore = waitReads;
+      const retrying = framework.stop();
+      void retrying.catch(() => {});
+      await until(() => waitReads > readsBefore, 'the retry to wait on the puppet call');
+      const syncing = framework.syncDiscordAwarenessMarkers().then(() => { syncSettled = true; });
+      await until(() => deliver !== undefined, 'the sync to wait on its barrier');
+      releaseTool();
+      await puppeting;
+      await until(() => waitReads > readsBefore + 1, 'the retry to wait on the sync');
+      assert.equal(framework.getStore().isClosed(), false, 'the retry waits for the sync');
+      deliver!();
+      await syncing;
+      await retrying;
+    } finally { releaseTool(); deliver?.(); }
+    assert.equal(syncSettled, true);
+    assert.equal(framework.getStore().isClosed(), true);
     assert.deepEqual(rejections, []);
   });
 
@@ -639,23 +681,71 @@ describe('stop() with an operator operation in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
-  it("the API server's current branch follows the store when a switch fails after moving it", async () => {
+  it("the API server's current branch follows the store when a switch fails after moving it, and clients hear of the move", async () => {
     const framework = await create();
-    const api = new ApiServer(framework) as unknown as {
-      cmdBranchCreate(params: { name: string }): Promise<unknown>;
-      cmdBranchSwitch(params: { name: string }): Promise<unknown>;
-      cmdBranchCurrent(): Promise<{ name: string }>;
-    };
-    await api.cmdBranchCreate({ name: 'side' });
-    const fw = internals(framework);
-    const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
-    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
-      materializeMount: async () => { throw new Error('disk full'); },
-    } : getModule(name);
-    await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /disk full/);
-    assert.equal(framework.getStore().currentBranch().name, 'side');
-    assert.equal((await api.cmdBranchCurrent()).name, 'side');
-    await framework.stop();
+    try {
+      const api = new ApiServer(framework) as unknown as {
+        cmdBranchCreate(params: { name: string }): Promise<unknown>;
+        cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+        cmdBranchCurrent(): Promise<{ name: string }>;
+        broadcast(event: string, data: unknown): void;
+      };
+      await api.cmdBranchCreate({ name: 'side' });
+      const broadcasts: Array<[string, unknown]> = [];
+      api.broadcast = (event, data) => { broadcasts.push([event, data]); };
+      const fw = internals(framework);
+      const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+      fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+        materializeMount: async () => { throw new Error('disk full'); },
+      } : getModule(name);
+      await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /disk full/);
+      assert.equal(framework.getStore().currentBranch().name, 'side');
+      assert.equal((await api.cmdBranchCurrent()).name, 'side');
+      assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'side' }]]);
+    } finally { await framework.stop(); }
+  });
+
+  it("the API server's current branch is the store's while a switch is still running", { timeout: 20_000 }, async () => {
+    const framework = await create();
+    try {
+      const api = new ApiServer(framework) as unknown as {
+        cmdBranchCreate(params: { name: string }): Promise<unknown>;
+        cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+        cmdBranchCurrent(): Promise<{ name: string }>;
+        cmdBranchDelete(params: { name: string }): Promise<unknown>;
+      };
+      await api.cmdBranchCreate({ name: 'side' });
+      const fw = internals(framework);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let mounting = false;
+      const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+      fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+        materializeMount: async () => { mounting = true; await held; },
+      } : getModule(name);
+      const switching = api.cmdBranchSwitch({ name: 'side' });
+      try {
+        await until(() => mounting, 'the switch to reach its config mount');
+        assert.equal((await api.cmdBranchCurrent()).name, 'side');
+        await assert.rejects(api.cmdBranchDelete({ name: 'side' }), /Cannot delete current branch/);
+      } finally { release(); }
+      await switching;
+    } finally { await framework.stop(); }
+  });
+
+  it('switchBranch() reconciles the awareness markers on the branch it moved to', async () => {
+    const framework = await create();
+    try {
+      const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
+      await api.cmdBranchCreate({ name: 'side' });
+      const reconciledOn: string[] = [];
+      internals(framework).beginDiscordAwarenessBarrier = () => {
+        reconciledOn.push(framework.getStore().currentBranch().name);
+        return { requiresBarrier: false, promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }) };
+      };
+      await framework.switchBranch('side');
+      assert.deepEqual(reconciledOn, ['side']);
+    } finally { await framework.stop(); }
   });
 
   it('a branch switch during a live turn is refused, and the branch stays', async () => {
@@ -699,6 +789,9 @@ describe('stop() with an operator operation in flight', () => {
       assert.equal(framework.getStore().currentBranch().name, 'main');
       assert.equal((await api.cmdBranchCurrent()).name, 'main');
     } finally { finishModules(); await stopping; }
+    // With the store closed too, the refusal is what the caller sees.
+    await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /^Error: switch branch refused: the framework is stopping$/);
+    assert.equal((await api.cmdBranchCurrent()).name, 'main');
   });
 
   for (const action of ['connect', 'disconnect', 'restart'] as const) {

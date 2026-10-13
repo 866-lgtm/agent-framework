@@ -1142,10 +1142,11 @@ export class AgentFramework {
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
-  /** Set once stop() has finished waiting on operatorOperations, whether the
-   * wait completed or timed out: an awareness sync, which is admitted after
-   * stop() has begun, is refused from here on (see syncDiscordAwarenessMarkers). */
-  private operatorWaitEnded = false;
+  /** True from the start of each stop() attempt until it has finished waiting
+   * on operatorOperations, whether the wait completed or timed out: the window
+   * in which an awareness sync is admitted although the queue is closed (see
+   * syncDiscordAwarenessMarkers). */
+  private stopWaitPending = false;
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -2191,27 +2192,37 @@ export class AgentFramework {
 
   /** Wait in rounds until the set is empty: admitted work can still start work
    * of its own, and an awareness sync can still join. All rounds share the
-   * caller's deadline rather than renewing its budget. */
+   * caller's deadline rather than renewing its budget. Ends the window in
+   * which a sync is admitted (stopWaitPending). */
   private async waitForOperatorOperations(timeoutMs: number | undefined): Promise<void> {
     const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
-    while (this.operatorOperations.size > 0) {
-      const remaining = deadline === undefined ? undefined : Math.ceil(deadline - performance.now());
-      const timedOut = () => new ShutdownTimeoutError(
-        [...this.operatorOperations].map(({ label }) => label), timeoutMs!, [],
-      );
-      if (remaining !== undefined && remaining < 1) throw timedOut();
-      try {
-        await waitForShutdown([...this.operatorOperations], remaining);
-      } catch (error) {
-        // Report the original budget and everything still pending, including
-        // child work added after this round's snapshot.
-        if (error instanceof ShutdownTimeoutError) throw timedOut();
-        throw error;
+    try {
+      while (this.operatorOperations.size > 0) {
+        const remaining = deadline === undefined ? undefined : Math.ceil(deadline - performance.now());
+        const timedOut = () => new ShutdownTimeoutError(
+          [...this.operatorOperations].map(({ label }) => label), timeoutMs!, [],
+        );
+        if (remaining !== undefined && remaining < 1) throw timedOut();
+        try {
+          await waitForShutdown([...this.operatorOperations], remaining);
+        } catch (error) {
+          // Report the original budget and everything still pending, including
+          // child work added after this round's snapshot.
+          if (error instanceof ShutdownTimeoutError) throw timedOut();
+          throw error;
+        }
       }
+    } finally {
+      // In the same step as the last look at the set, so no awareness sync
+      // can join it unseen.
+      this.stopWaitPending = false;
     }
   }
 
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
+    // An awareness sync is admitted until this attempt has finished waiting on
+    // the operator set (waitForOperatorOperations ends the window).
+    this.stopWaitPending = true;
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -2296,7 +2307,6 @@ export class AgentFramework {
     } catch (error) {
       operatorOperationsTimedOut = error;
     }
-    this.operatorWaitEnded = true;
 
     // Stop typing indicators
     this.channelRegistry?.stopAll();
@@ -6110,8 +6120,11 @@ export class AgentFramework {
   /**
    * Switch the store to an existing branch, reconcile Discord awareness
    * markers with it, and re-materialize the config mount from it. Resolves
-   * once all three have run. An operator's operation: refused once stop() has
-   * begun, and waited for by stop() while it runs.
+   * once all three have run; if the sync or the mount fails, it rejects with
+   * the store already moved. The store has moved by the time the call
+   * returns, before its promise settles, and a refusal moves nothing. An
+   * operator's operation: refused once stop() has begun, and waited for by
+   * stop() while it runs.
    *
    * The branch moves under every agent sharing the store, so the switch
    * reserves the store as a surgery does: every agent must be idle, or it is
@@ -14050,13 +14063,15 @@ export class AgentFramework {
    *  callers, such as the API server's undo and redo, have already changed the
    *  store and call it to finish that change, sometimes from inside a trace
    *  listener that started stop(). stop() waits for one admitted then. Once
-   *  stop() can no longer wait for it, it's refused. An operation already
+   *  stop() can no longer wait for it, it's refused, and so it is while no
+   *  stop() is running on a closed queue (after a failed or completed stop()),
+   *  as the other entry points are. An operation already
    *  admitted (a surgery, a host/command undo, a branch switch) calls
    *  runDiscordAwarenessSync() instead, which its own tracking covers, so a
    *  stop() whose budget ran out doesn't refuse it partway, after its branch
    *  has moved. */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
-    if (this.operatorWaitEnded) throw new Error('awareness sync refused: the framework is stopping');
+    if (this.queue?.isClosed && !this.stopWaitPending) throw new Error('awareness sync refused: the framework is stopping');
     return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
   }
 
