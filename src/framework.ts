@@ -13967,18 +13967,8 @@ export class AgentFramework {
     // protocol on a URL, a modern deadline of 0, MCPL policy on a modern
     // server. Every valid legacy shape resolves exactly as before.
     const family = AgentFramework.usableConfigFamily(config);
-    // One owner per id, across both engines (holdMcpServerId): a connect or
-    // disconnect in flight holds it, and so does a registered connection,
-    // including one kept because its launch couldn't be confirmed exited.
-    const op = this.mcpServerOps?.get(config.id);
-    if (op?.kind === 'disconnect') {
-      throw new Error(`MCP server "${config.id}" is still being disconnected; connect it once that has finished`);
-    }
-    const registered = this.modernServers().get(config.id) ?? this.mcplServerRegistry.getServer(config.id);
-    if (op || registered) {
-      const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
-      throw new Error(`MCPL server "${config.id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`);
-    }
+    const taken = this.mcpServerIdTaken(config.id);
+    if (taken) throw new Error(taken);
     const hold = this.holdMcpServerId(config.id, 'connect');
     try {
       await this.connectHeldMcplServer(config, family, deferAwareness, hold.displaced);
@@ -14554,18 +14544,43 @@ export class AgentFramework {
     id: string,
     newConfig?: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    // What the connect would refuse is refused here, before the running
+    // server is torn down for it: a framework whose stop() has begun, the
+    // configuration's binding and settings, a new id another server holds,
+    // and a tool prefix another server or a module already holds.
+    if (this.mcpServerAdmissionClosed) {
+      throw new Error(`MCP server "${id}" was not restarted: the framework is stopping or stopped`);
+    }
     const config = newConfig ?? this.mcplServerConfigs.get(id);
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
-    // A configuration the connect would refuse is refused here, before the
-    // running server is torn down for it: its binding and settings, and a
-    // tool prefix another server or a module already holds.
     AgentFramework.usableConfigFamily(config);
+    if (config.id !== id) {
+      const taken = this.mcpServerIdTaken(config.id);
+      if (taken) throw new Error(taken);
+    }
     const collision = this.mcplPrefixCollision(config, id);
     if (collision) throw new Error(collision);
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
+  }
+
+  /** Why a connect for this id is refused, or null when the id is free. One
+   *  owner per id, across both engines (holdMcpServerId): a connect or
+   *  disconnect in flight holds it, and so does a registered connection,
+   *  including one kept because its launch couldn't be confirmed exited. */
+  private mcpServerIdTaken(id: string): string | null {
+    const op = this.mcpServerOps?.get(id);
+    if (op?.kind === 'disconnect') {
+      return `MCP server "${id}" is still being disconnected; connect it once that has finished`;
+    }
+    const registered = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
+    if (op || registered) {
+      const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
+      return `MCPL server "${id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`;
+    }
+    return null;
   }
 
   /** The collision rules create() enforces at startup, as a runtime connect

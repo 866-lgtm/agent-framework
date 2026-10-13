@@ -14,7 +14,18 @@ import { WebSocketServer } from 'ws';
 import type { AddressInfo } from 'node:net';
 
 import { AgentFramework } from '../src/index.js';
+import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+
+/** A module with no tools: only a name, for a server's tool prefix to collide with. */
+class NamedModule implements Module {
+  constructor(readonly name: string) {}
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  async onProcess(): Promise<EventResponse> { return {}; }
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(): Promise<ToolResult> { return { success: true }; }
+}
 
 // A tiny stdio MCPL server (same shape as mcpl-ws-transport.test.ts): reads
 // NDJSON on stdin, answers initialize / tools/list / tools/call on stdout.
@@ -116,16 +127,55 @@ test('restartMcplServer accepts an updated config (new toolPrefix)', async () =>
   });
 });
 
-test('restartMcplServer refuses a toolPrefix another server holds before tearing anything down', async () => {
+test("restartMcplServer refuses what the connect would refuse before tearing anything down: another server's prefix or id, or a module's name", async () => {
   await withFramework(true, async (framework) => {
     await framework.connectMcplServer(serverConfig('second') as never);
+    await framework.addModule(new NamedModule('notes'));
+    const untouched = () => {
+      const live = framework.listMcplServers().filter(s => s.connected).map(s => s.id).sort();
+      assert.deepEqual(live, ['first', 'second'], 'both servers still connected');
+      const tools = framework.getAllTools().map(t => t.name);
+      assert.ok(tools.includes('mcpl--first--echo') && tools.includes('mcpl--second--echo'), 'and their tools still listed');
+    };
     await assert.rejects(
       framework.restartMcplServer('first', serverConfig('first', { toolPrefix: 'mcpl--second' }) as never),
       /collides with server "second"/,
     );
-    const first = framework.listMcplServers().find(s => s.id === 'first');
-    assert.equal(first?.connected, true, 'the server is still connected');
-    assert.ok(framework.getAllTools().some(t => t.name === 'mcpl--first--echo'), 'and its tools still listed');
+    untouched();
+    await assert.rejects(
+      framework.restartMcplServer('first', serverConfig('first', { toolPrefix: 'notes' }) as never),
+      /collides with module "notes"/,
+    );
+    untouched();
+    // Under another live server's id, whose prefix is that server's own, so
+    // only the id is taken.
+    await assert.rejects(
+      framework.restartMcplServer('first', serverConfig('second') as never),
+      /MCPL server "second" is already registered/,
+    );
+    untouched();
+  });
+});
+
+test('restartMcplServer under a new id may keep the tool prefix the restarted server frees', async () => {
+  await withFramework(true, async (framework) => {
+    await framework.restartMcplServer('first', serverConfig('renamed', { toolPrefix: 'mcpl--first' }) as never);
+    const servers = framework.listMcplServers();
+    assert.deepEqual(servers.map(s => [s.id, s.connected]), [['renamed', true]], 'first was replaced');
+    assert.ok(framework.getAllTools().some(t => t.name === 'mcpl--first--echo'), 'and the prefix it freed serves the new id');
+  });
+});
+
+test('restartMcplServer refuses once stop() has begun, before it disconnects anything', async (t) => {
+  await withFramework(true, async (framework) => {
+    const disconnect = t.mock.method(framework, 'disconnectMcplServer');
+    const stopping = framework.stop();
+    await assert.rejects(
+      framework.restartMcplServer('first'),
+      /MCP server "first" was not restarted: the framework is stopping or stopped/,
+    );
+    await stopping;
+    assert.equal(disconnect.mock.callCount(), 0, 'the restart disconnected nothing');
   });
 });
 
