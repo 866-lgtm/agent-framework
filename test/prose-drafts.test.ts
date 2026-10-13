@@ -1105,7 +1105,8 @@ describe('drafts resend ownership', () => {
     const internals = framework as unknown as {
       proseDrafts: ProseDraftStore;
       handleDraftsTool(agent: string, input: unknown): Promise<{ success: boolean; data?: Array<{ text: string }>; error?: string }>;
-      deliverProseEnvelope(agent: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      // The explicit gateway's entry: it admits the text's envelopes, then delivers each.
+      deliverProse(agent: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
     };
     const say = (r: { success: boolean; data?: Array<{ text: string }>; error?: string }) =>
       r.success ? r.data!.map((b) => b.text).join('') : r.error!;
@@ -1286,7 +1287,7 @@ describe('drafts resend ownership', () => {
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
-      await t.internals.deliverProseEnvelope(agent, '>>chan {{unsent}} and a postscript', { notice: 'later' });
+      await t.internals.deliverProse(agent, '>>chan {{unsent}} and a postscript', { notice: 'later' });
       assert.deepEqual(t.pending.map((p) => p.text), ['A words'], 'nothing more was sent');
       const fresh = t.internals.proseDrafts.latestBounce('scout')!;
       assert.notEqual(fresh.id, bounce!.id);
@@ -1319,12 +1320,12 @@ describe('drafts resend ownership', () => {
       // The journal refuses the dismissal: the bounce stays, and the resident is told.
       const dismiss = t.internals.proseDrafts.dismiss.bind(t.internals.proseDrafts);
       t.internals.proseDrafts.dismiss = () => { throw new Error('EIO'); };
-      await t.internals.deliverProseEnvelope(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
       assert.ok(words().includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which could not be set aside (EIO): ` +
         'it is still held, and {{unsent}} still names it.'), words().join('\n'));
       assert.equal(t.internals.proseDrafts.latestBounce('scout')?.id, bounce!.id);
       t.internals.proseDrafts.dismiss = dismiss;
-      await t.internals.deliverProseEnvelope(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
       assert.equal(draftState(t.internals.proseDrafts.get('scout', bounce!.id)!), 'dismissed');
       assert.ok(words().some((w) => w.startsWith(`[prose-routing] Draft ${bounce!.id} is set aside. Note that ${bounce!.id}'s attempt to (chan) at `) &&
         w.endsWith('may already have been posted: no receipt.')), words().join('\n'));
@@ -1340,7 +1341,7 @@ describe('drafts resend ownership', () => {
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
-      const envelope = (text: string) => t.internals.deliverProseEnvelope(agent, text, { notice: 'later' });
+      const envelope = (text: string) => t.internals.deliverProse(agent, text, { notice: 'later' });
       await envelope('>>skip_reply {{unsent}}');
       assert.equal(t.internals.proseDrafts.get('scout', bounce!.id)!.dismissedAt, undefined);
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
@@ -1360,7 +1361,7 @@ describe('drafts resend ownership', () => {
     try {
       const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
       const agent = t.framework.getAgent('scout')!;
-      const delivering = t.internals.deliverProseEnvelope(agent, '>>chan {{unsent}}', { notice: 'later' });
+      const delivering = t.internals.deliverProse(agent, '>>chan {{unsent}}', { notice: 'later' });
       await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['bounced words'], 'the bounce is out through {{unsent}}');
       const refused = t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [bounce!.id] }));
