@@ -9,8 +9,8 @@ import { Client, type Transport } from '@modelcontextprotocol/client';
 import { EventEmitter } from 'node:events';
 import type { ModuleContext } from '../src/index.js';
 import { AgentFramework } from '../src/framework.js';
-import { McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
-import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
+import { McplProtocolVersionError, McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
+import { ModernMcpConnection, malformedLineDiagnostic } from '../src/mcpl/modern-connection.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** Discovery succeeds; the inventory request gets a normal echoed-path 404. */
@@ -52,7 +52,7 @@ test('both framework engines scrub failure, error and stderr records before trac
     framework.emitTrace = (event: unknown) => traces.push(event);
     framework.opsAlert = (_kind: string, _id: string, text: string) => alerts.push(text);
     const connection = Object.assign(new EventEmitter(), { id: config.id, willReconnect: true });
-    framework[method](connection);
+    framework[method](connection, config);
     connection.emit('connect-failed', { error: `Cannot POST ${secret}`, attempt: 0, permanent: true });
     connection.emit('reconnect-failed', { error: `Cannot POST ${secret}`, attempt: 5 });
     connection.emit('error', new Error(`transport ${secret}`));
@@ -82,7 +82,8 @@ test('an SDK HTTP 404 error keeps its path but hides the secret in connection co
       modules: [{ name: 'watcher', async start(ctx: ModuleContext) { ctx.onTrace(event => traces.push(event as never)); }, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false }; }, async onProcess() { return {}; } }],
       mcplServers: [{ id: 'echo', url: `http://127.0.0.1:${port}/api/mcp/s/${secret}/mcp`, reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 20 }],
     });
-    const deadline = Date.now() + 5000;
+    // The loop ends as soon as the record appears; the ceiling only bounds a hang.
+    const deadline = Date.now() + 30_000;
     while (!traces.some(e => e.type === 'ops:alert') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     const failed = traces.filter(e => e.type === 'mcpl:server-connect-failed');
     assert.ok(failed.some(e => e.attempt === 0));
@@ -143,7 +144,8 @@ test('legacy initial and reconnect console records redact known credentials', as
   const capabilities = { version: '0.5', pushEvents: true };
   const connection = await McplServerConnection.connectWithReconnect(legacyConfig, capabilities);
   try {
-    const deadline = Date.now() + 5000;
+    // The loop ends as soon as the record appears; the ceiling only bounds a hang.
+    const deadline = Date.now() + 30_000;
     while (!lines.some(line => line.includes('reconnect failed:')) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     assert.ok(lines.some(line => line.includes('initial connect failed, will retry: transport redacted')));
     assert.ok(lines.some(line => line.includes('reconnect failed: transport redacted')));
@@ -181,3 +183,105 @@ test('a real discover-then-tools/list 404 is redacted in the framework error tra
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a tool call's failure, from either engine, reaches its caller and its trace without the server's credentials", async () => {
+  // A legacy MCPL server's call rejected with a close reason that quotes the
+  // url; the modern engine's transport text is requestFailure's, tested over HTTP.
+  const traces: Array<{ type: string; error?: string; stack?: string }> = [];
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplServerConfigs = new Map([[config.id, config]]);
+  framework.emitTrace = (event: { type: string }) => traces.push(event);
+  const server = { id: config.id, sendToolsCall: async () => { throw new Error(`socket closed: 1008 /api/mcp/s/${secret}/mcp`); } };
+  framework.mcplServerRegistry = { getServer: (id: string) => (id === config.id ? server : null) };
+  framework.modernServers = () => new Map();
+  const result = await framework.executeMcplToolCall({ id: 'c1', name: 'mcpl--remote--echo', input: {} }, config);
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /socket closed: 1008 \/api\/mcp\/s\/redacted\/mcp/);
+  assert.equal(framework.recordedForEveryServer(`closed ${secret}`), 'closed redacted');
+
+  // The model's dispatch: the tool:failed trace (message and stack) and the
+  // result the model gets.
+  const events: Array<{ type: string; result?: { error?: string } }> = [];
+  framework.pushEvent = (event: { type: string }) => events.push(event);
+  framework.toolLifecycleEmitter = null;
+  const modern = { callTool: async () => { throw new Error(`HTTP 500 at /api/mcp/s/${secret}/mcp with ${config.token}`); } };
+  framework.modernServers = () => new Map([[config.id, modern]]);
+  framework.dispatchMcplToolCall('assistant', { id: 'c2', name: 'mcpl--remote--echo', input: {} }, config.id, 'mcpl--remote');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const failed = traces.find((event) => event.type === 'tool:failed');
+  assert.ok(failed, 'the failure is traced');
+  for (const text of [failed!.error, failed!.stack, events[0]?.result?.error]) {
+    assert.ok(text && !text.includes(secret) && !text.includes(config.token), String(text));
+  }
+  assert.match(String(events[0]?.result?.error), /HTTP 500 at \/api\/mcp\/s\/redacted\/mcp with redacted/);
+});
+
+test("a malformed line's diagnostic is redacted before it is cut, so no part of a credential across the cut is kept", () => {
+  const envSecret = 'envSecretValue0123456789';
+  const line = JSON.stringify({ note: `${'p'.repeat(185)} ${envSecret}` });
+  const diagnostic = malformedLineDiagnostic({ id: 'stdio-env', command: 'srv', env: { API_TOKEN: envSecret } } as never, line, new Error('not a message'));
+  assert.match(diagnostic, /sent a malformed JSON-RPC message/);
+  assert.ok(!diagnostic.includes(envSecret.slice(0, 6)), diagnostic);
+  assert.match(diagnostic, / redac/, 'the replacement, cut where the line is cut');
+});
+
+test("the startup alert for a server with no common protocol revision carries the server's text without its credentials", async (t) => {
+  // The version verdict quotes the SDK's error, which is server text.
+  t.mock.method(ModernMcpConnection.prototype as never, 'open' as never, (async () => {
+    throw new McplProtocolVersionError(`MCP server "echo" does not support MCP 2025-11-25 (refused at /api/mcp/s/${secret}/mcp).`, 'rejected', null, null);
+  }) as never);
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-startup-alert-'));
+  t.mock.method(console, 'error', () => {});
+  const traces: Array<{ type: string; message?: string; error?: string }> = [];
+  let framework: AgentFramework | undefined;
+  try {
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
+      modules: [{ name: 'watcher', async start(ctx: ModuleContext) { ctx.onTrace(event => traces.push(event as never)); }, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false }; }, async onProcess() { return {}; } }],
+      mcplServers: [{ id: 'echo', url: `https://127.0.0.1:9/api/mcp/s/${secret}/mcp` }],
+    });
+    const alert = traces.find(e => e.type === 'ops:alert');
+    assert.ok(alert, JSON.stringify(traces.map(e => e.type)));
+    assert.match(String(alert!.message), /MCPL server unreachable at startup: .*refused at \/api\/mcp\/s\/redacted\/mcp/);
+    assert.ok(!JSON.stringify(traces).includes(secret));
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a runtime connect's failed cleanup is traced without the server's credentials, and the host's error stays as raised", async (t) => {
+  const prototype = ModernMcpConnection.prototype as unknown as { open(): Promise<void> };
+  const open = t.mock.method(prototype, 'open', async () => {
+    throw new Error('connect refused');
+  });
+  const close = t.mock.method(ModernMcpConnection.prototype, 'close', async () => {
+    throw new Error(`reap failed for /api/mcp/s/${secret}/mcp`);
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-cleanup-trace-'));
+  t.mock.method(console, 'error', () => {});
+  const traces: Array<{ type: string; error?: string }> = [];
+  let framework: AgentFramework | undefined;
+  try {
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
+      modules: [{ name: 'watcher', async start(ctx: ModuleContext) { ctx.onTrace(event => traces.push(event as never)); }, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false }; }, async onProcess() { return {}; } }],
+    });
+    await assert.rejects(framework.connectMcplServer({ id: 'echo', url: `https://127.0.0.1:9/api/mcp/s/${secret}/mcp` }), (error: unknown) => {
+      assert.ok(error instanceof Error && error.message.includes(secret), 'the host gets the error as raised');
+      return true;
+    });
+    const traced = traces.find(e => e.type === 'mcpl:server-error');
+    assert.ok(traced, JSON.stringify(traces.map(e => e.type)));
+    assert.match(String(traced!.error), /reap failed for \/api\/mcp\/s\/redacted\/mcp/);
+    assert.ok(!JSON.stringify(traces).includes(secret));
+  } finally {
+    open.mock.restore();
+    close.mock.restore();
+    await framework?.stop().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

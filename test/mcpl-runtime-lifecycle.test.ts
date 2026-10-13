@@ -179,6 +179,30 @@ test('restartMcplServer refuses once stop() has begun, before it disconnects any
   });
 });
 
+test('restartMcplServer of an id whose disconnect is in flight is refused before it tears anything down', async (t) => {
+  await withFramework(true, async (framework) => {
+    const disconnecting = framework.disconnectMcplServer('first');
+    const disconnect = t.mock.method(framework, 'disconnectMcplServer');
+    await assert.rejects(
+      framework.restartMcplServer('first'),
+      /MCP server "first" was not restarted: it is being disconnected; restart it once that has finished/,
+    );
+    assert.equal(disconnect.mock.callCount(), 0, 'the restart started no disconnect of its own');
+    disconnect.mock.restore();
+    await disconnecting;
+  });
+});
+
+test("a disconnect removes its server's prefix claim, and leaves one another server holds", async () => {
+  await withFramework(true, async (framework) => {
+    const internals = framework as unknown as { mcplPrefixMap: Map<string, string> };
+    // As after a restart under a new id: `second` holds the prefix `first` had.
+    internals.mcplPrefixMap.set('mcpl--first', 'second');
+    await framework.disconnectMcplServer('first');
+    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'second', "the other server's claim stands");
+  });
+});
+
 test('connectMcplServer rejects a duplicate id and a colliding prefix', async () => {
   await withFramework(true, async (framework) => {
     await assert.rejects(

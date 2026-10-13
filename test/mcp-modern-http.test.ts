@@ -22,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { AddressInfo } from 'node:net';
 
 import { createMcpHandler } from '@modelcontextprotocol/server';
+import { SdkErrorCode, SdkHttpError } from '@modelcontextprotocol/client';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 
@@ -236,3 +237,25 @@ test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-R
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("HTTP: a 403 refusal's response body, which can echo the url, stays out of the request error's data", () => {
+  // The SDK attaches the body as `text` to its step-up 403; staging step-up
+  // takes an OAuth provider, so the refusal is handed to the connection's
+  // reading of a failed request directly.
+  const connection = Object.create(ModernMcpConnection.prototype) as {
+    id: string; config: unknown;
+    requestFailure(what: string, record: unknown, error: unknown): Error;
+  };
+  connection.id = 'remote';
+  connection.config = { id: 'remote', url: 'https://h/api/mcp/s/pathSecret0123456789/mcp' };
+  const refusal = new SdkHttpError(SdkErrorCode.ClientHttpForbidden, 'Server returned 403 insufficient_scope', {
+    status: 403, statusText: 'Forbidden', text: 'denied for /api/mcp/s/pathSecret0123456789/mcp',
+  });
+  const err = connection.requestFailure('tools/call "echo"', { method: 'tools/call', handedOff: true, answer: 'none' }, refusal);
+  assert.ok(err instanceof McplRequestError);
+  assert.equal(err.outcome, 'error-response');
+  assert.equal((err.data as { httpStatus?: number }).httpStatus, 403);
+  assert.equal((err.data as { text?: unknown }).text, undefined);
+  assert.ok(!JSON.stringify(err.data).includes('pathSecret'), JSON.stringify(err.data));
+});
+

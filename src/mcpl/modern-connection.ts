@@ -224,6 +224,17 @@ class ObservedTransport implements Transport {
 }
 
 /**
+ * The diagnostic for a line that is JSON but not a JSON-RPC message: the
+ * line's first 200 characters, after the configuration's credentials are
+ * replaced, so a credential across the cut can't leave its first part.
+ */
+export function malformedLineDiagnostic(config: McplServerConfig, text: string, error: unknown): string {
+  const shown = redactServerText(text, config);
+  return `MCP server "${config.id}" sent a malformed JSON-RPC message (${shown.length > 200 ? `${shown.slice(0, 200)}…` : shown}): ` +
+    (error instanceof Error ? error.message.split('\n')[0] : String(error));
+}
+
+/**
  * SDK `Transport` over Connectome's stdio spawner. Framing is the same
  * newline-delimited JSON-RPC as legacy. Lines that are not JSON are ignored,
  * as the legacy engine ignores them. Because this is a custom transport, the
@@ -260,10 +271,7 @@ class SpawnerStdioTransport implements Transport {
       try {
         message = parseJSONRPCMessage(parsed);
       } catch (error) {
-        this.onerror?.(new Error(
-          `MCP server "${this.config.id}" sent a malformed JSON-RPC message (${text.length > 200 ? `${text.slice(0, 200)}…` : text}): ` +
-            (error instanceof Error ? error.message.split('\n')[0] : String(error)),
-        ));
+        this.onerror?.(new Error(malformedLineDiagnostic(this.config, text, error)));
         return;
       }
       this.onmessage?.(message);
@@ -921,7 +929,9 @@ export class ModernMcpConnection extends EventEmitter {
           'no-response',
         );
       }
-      const data = error.data && typeof error.data === 'object' ? error.data : {};
+      // The response body (the SDK's `text`) is the server's text and can
+      // echo the request's url, so it's left out; the status stays.
+      const { text: _body, ...data } = (error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
       return new McplRequestError(`${prefix} refused ${what}: HTTP ${error.status} (${message})`, 'error-response', undefined, { ...data, httpStatus: error.status });
     }
     if (deadline) {

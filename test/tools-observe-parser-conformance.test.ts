@@ -81,10 +81,10 @@ function wireHarness() {
   const connection = new Connection('observer', null, transport);
   const framework = Object.create(AgentFramework.prototype) as {
     mcplServerConfigs: Map<string, McplServerConfig>;
-    wireMcplEvents(connection: McplServerConnection): void;
+    wireMcplEvents(connection: McplServerConnection, config: McplServerConfig): void;
   };
   framework.mcplServerConfigs = new Map([['observer', { id: 'observer', command: 'unused' }]]);
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'observer', command: 'unused' });
   connection.establishGrant(new CapabilityGrant(new Set(['toolLifecycle.observe']), []));
   connection.ready();
   let nextId = 1;
