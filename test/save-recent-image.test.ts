@@ -817,6 +817,31 @@ describe('ToolImageLedger', () => {
   });
 });
 
+it('a write that throws before its tree entry names the images already saved', async () => {
+  const h = await startTurn({
+    prefix: 'sri-throw-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const write = workspace.writeBinary.bind(workspace);
+      let writes = 0;
+      workspace.writeBinary = async (...args) => {
+        if (++writes === 2) throw new Error('injected tree exception');
+        return write(...args);
+      };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    assert.equal(result.isError, true);
+    assert.match(result.content, /injected tree exception/);
+    assert.match(result.content, /already saved: files\/images-0.png/);
+  } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
 it('a save whose write fails after its tree entry, through the workspace itself, is reported saved with its failure', async () => {
   const h = await startTurn({
     prefix: 'sri-tree-real-',

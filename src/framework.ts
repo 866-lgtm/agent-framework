@@ -2132,8 +2132,8 @@ export class AgentFramework {
     // An annotation that starts after this point, such as one from a direct
     // Agent API call stop doesn't cancel, starts no write to the stopping
     // workspace: its stub names the audit record. A write that was past its
-    // deadline is not waited for, and may still finish or fail after the
-    // modules stop.
+    // deadline isn't waited for here, but the workspace's own stop waits for
+    // the mount turn it holds, bounded only by teardownTimeoutMs.
     this.guardSpillsClosedFor = stoppingGeneration;
 
     // Stop modules and MCPL servers in parallel
@@ -2873,13 +2873,18 @@ export class AgentFramework {
   private readonly stalledSpills = new Set<Promise<void>>();
   /** Withheld spills skipped since the current stall began. */
   private stallSkips = 0;
+  /** The deadline of the last batch whose exhausted skips were logged. */
+  private lastExhaustedDeadline: number | null = null;
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
   /** The lifecycle generation whose stop() has let the running annotations
    *  finish: a withheld original is then no longer written to a workspace
-   *  that is stopping, and its stub names the audit record. A later start()
-   *  has a generation of its own, so its spills are open whatever order the
-   *  earlier stop finishes in. */
+   *  that is stopping, and its stub names the audit record. A start() after
+   *  that stop() has finished has a generation of its own, so the spill gate
+   *  is open again for an instance kept with a store it doesn't own and that
+   *  is still open (start() doesn't restore stopped modules or MCPL
+   *  connections, and refuses an owned store that stop() closed). A start()
+   *  made while a stop() is still draining isn't a supported order. */
   private guardSpillsClosedFor: number | null = null;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
@@ -12116,7 +12121,9 @@ export class AgentFramework {
   /**
    * A withheld original uses the remaining time in its batch's deadline.
    * A write still under way at that deadline is reported as unfinished and
-   * continues independently, including after stop. From then until every
+   * goes on; the guard stops waiting for it, though stop() still waits for
+   * the workspace's turn it holds (bounded only by a teardown timeout). From
+   * then until every
    * overdue write settles, new withheld spills are workspace_unanswered.
    * Writes from other batches can start before the first deadline fires.
    * An exhausted batch starts no more writes even if none is overdue.
@@ -12137,7 +12144,11 @@ export class AgentFramework {
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      console.error(`[spill] ${place.path} skipped: batch_deadline`);
+      // Once per batch (its deadline is the batch's), not per result.
+      if (this.lastExhaustedDeadline !== deadline) {
+        this.lastExhaustedDeadline = deadline;
+        console.error(`[spill] a withheld batch used its deadline before all its originals were written; the rest are skipped as batch_deadline (first: ${place.path})`);
+      }
       return { skipped: 'batch_deadline' };
     }
     const write = this.writeToolResultFile(label, text, branch);
@@ -16346,18 +16357,27 @@ export class AgentFramework {
         for (const image of found) {
           const destination = pathFor(image.rangeOffset);
           const bytes = Buffer.from(image.data, 'base64');
-          const result = await workspace.writeBinary(destination, bytes, image.mediaType);
+          const failed = (why: unknown): void => finish({
+            success: false,
+            error:
+              `save_recent_image: failed writing "${destination}": ${why instanceof Error ? why.message : String(why)}` +
+              (savedFiles.length > 0
+                ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
+                : ''),
+            isError: true,
+          });
+          let result: Awaited<ReturnType<typeof workspace.writeBinary>>;
+          try {
+            result = await workspace.writeBinary(destination, bytes, image.mediaType);
+          } catch (error) {
+            // Thrown before its tree entry was set; the images before it
+            // are saved, and the failure says so, as a returned one does.
+            failed(error);
+            return;
+          }
           const inChronicle = (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
           if (!result.success && !inChronicle) {
-            finish({
-              success: false,
-              error:
-                `save_recent_image: failed writing "${destination}": ${result.error}` +
-                (savedFiles.length > 0
-                  ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
-                  : ''),
-              isError: true,
-            });
+            failed(result.error);
             return;
           }
           savedFiles.push({

@@ -473,7 +473,8 @@ export class ToolResultGuard {
     // The batch's deadline runs from when it's queued, not from when the
     // batches ahead of it finish, so a request waiting on a chain of batches
     // waits at most one deadline past the latest one's arrival.
-    const deadline = this.host?.deadline() ?? Infinity;
+    let deadline = Infinity;
+    try { deadline = this.host?.deadline() ?? Infinity; } catch { /* no bound rather than no record */ }
     const run = previous.then(async () => {
       // Set once the stub's edit is queued with the hold: the queue releases
       // it when the edit lands or is superseded.

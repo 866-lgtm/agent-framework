@@ -2732,6 +2732,7 @@ test("a batch's deadline is taken when it is queued, not when the batches ahead 
     assert.equal(taken, 2, "the second batch's deadline was taken when it was queued");
     first.open();
     await bounded(r.guard.whenAnnotated(), 'both annotations');
+    assert.equal(taken, 2, 'and not taken again when its annotation ran');
   } finally { r.cm.close(); }
 });
 
