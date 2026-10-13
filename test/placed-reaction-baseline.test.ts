@@ -22,6 +22,13 @@ function baseline(framework: AgentFramework): readonly string[] {
   return (framework as unknown as { getPlacedReactionBaseline(): readonly string[] }).getPlacedReactionBaseline();
 }
 
+// A refusal for an awareness ledger that can't be read, whichever read met it
+// first: the connect's or restart's own read, or a connect's awareness
+// barrier. The assertions after each refusal say what it left behind.
+function accountingRefusal(error: unknown): boolean {
+  return error instanceof Error && error.name === 'DiscordAwarenessAccountingError';
+}
+
 async function childEnv(framework: AgentFramework) {
   const registry = (framework as unknown as {
     mcplServerRegistry: { getServer(id: string): { sendToolsCall(name: string, args: {}): Promise<{ content: Array<{ text?: string }> }> } };
@@ -196,19 +203,44 @@ describe('placed-reaction baseline', () => {
     assert.equal((await childEnv(fw)).baseline, [...REFUSAL_REACTION_BASELINE, '💤'].join(','));
   });
 
-  for (const blank of ['', '  ', ',', ' , ']) {
-    it('a baseline with no tokens, declared or inherited, counts as unset ' + JSON.stringify(blank), async (t) => {
-      // The adapter splits on commas and drops empty tokens, so it reads each
-      // of these as "no tokens": inherited by accident (an empty variable, or
-      // `${A},${B}` with both empty), it would turn the protective default off.
+  // discord-mcpl's parser (`parseSuppressionEnvTokens`) splits a value on
+  // commas, trims each token, and keeps one when `normalizeReactionEmoji`
+  // (discord-mcpl `src/filters.ts`) leaves something of it: that strips
+  // U+FE0F, trims, and strips one leading and one trailing colon. A value it
+  // reads as no tokens turns suppression off, so inherited by accident (an
+  // empty variable, or `${A},${B}` or `:${NAME}:` with the variables empty)
+  // it would turn the protective default off: such a value counts as unset.
+  // A value it keeps a token of stays the operator's.
+  for (const [value, tokens] of [
+    ['', false],
+    ['  ', false],
+    [',', false],
+    [' , ', false],
+    [':', false],
+    ['::', false],
+    ['::,::', false],
+    [' : , :: ', false],
+    ['\uFE0F', false],
+    // The adapter trims again after stripping U+FE0F, and only then strips
+    // the colon.
+    ['\uFE0F :', false],
+    [':sigil:', true],
+    ['sigil', true],
+    ['🟪', true],
+    ['<:mark:123456789012345678>', true],
+    // One colon from each end leaves ':'.
+    [':::', true],
+  ] as const) {
+    const name = JSON.stringify(value).replace(/\uFE0F/g, '\\uFE0F');
+    it(`a baseline ${name}, declared or inherited, ${tokens ? 'stays the operator\'s' : 'has no tokens and counts as unset'}`, async (t) => {
       const previous = process.env[ENV_KEY];
-      process.env[ENV_KEY] = blank;
+      process.env[ENV_KEY] = value;
       t.after(() => {
         if (previous === undefined) delete process.env[ENV_KEY];
         else process.env[ENV_KEY] = previous;
       });
-      const expected = [...REFUSAL_REACTION_BASELINE, '💤'].join(',');
-      const fw = await create(undefined, [server({ env: { [ENV_KEY]: blank } })]);
+      const expected = tokens ? value : [...REFUSAL_REACTION_BASELINE, '💤'].join(',');
+      const fw = await create(undefined, [server({ env: { [ENV_KEY]: value } })]);
       assert.equal((await childEnv(fw)).baseline, expected, 'declared');
       await fw.disconnectMcplServer('probe');
       await fw.connectMcplServer(server({ inheritEnv: true }));
@@ -252,8 +284,9 @@ describe('placed-reaction baseline', () => {
       // with its own baseline can't come back either.
       const fw = await create(undefined, [server(own ? { env: { [ENV_KEY]: own } } : {})]);
       writeFileSync(outboxPath, '{broken');
-      await assert.rejects(() => fw.restartMcplServer('probe'), /Discord awareness.*ledger/i);
-      assert.ok(await childEnv(fw), 'the running child still answers');
+      await assert.rejects(() => fw.restartMcplServer('probe'), accountingRefusal);
+      // A restart that stopped the child leaves no server to ask.
+      assert.ok(await childEnv(fw).catch(() => undefined), 'the running child still answers');
     });
   }
 
@@ -293,7 +326,6 @@ describe('placed-reaction baseline', () => {
     writeFileSync(outboxPath, '{broken');
     assert.throws(() => baseline(fw), /Discord awareness.*ledger/i);
     await fw.disconnectMcplServer('probe');
-    await assert.rejects(() => fw.connectMcplServer(server()), /Discord awareness.*ledger/i);
     // Every connect reads the ledger before it registers anything: a
     // reconnecting server, with or without its own baseline, would otherwise
     // be left registered as a closed stub that blocks a retried connect.
@@ -301,8 +333,8 @@ describe('placed-reaction baseline', () => {
       mcplServerRegistry: { getServer(id: string): unknown };
       mcplServerConfigs: Map<string, unknown>;
     };
-    for (const config of [server({ reconnect: true }), server({ reconnect: true, env: { [ENV_KEY]: '🟪' } })]) {
-      await assert.rejects(() => fw.connectMcplServer(config), /Discord awareness.*ledger/i);
+    for (const config of [server(), server({ reconnect: true }), server({ reconnect: true, env: { [ENV_KEY]: '🟪' } })]) {
+      await assert.rejects(() => fw.connectMcplServer(config), accountingRefusal);
       assert.equal(internals.mcplServerRegistry.getServer('probe'), null, 'no connection is left registered');
       assert.equal(internals.mcplServerConfigs.has('probe'), false, 'no config is left registered');
     }

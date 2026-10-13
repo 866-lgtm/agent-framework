@@ -14699,11 +14699,13 @@ export class AgentFramework {
   /**
    * The reaction baseline an operator chose for a stdio server, if any: a
    * value declared in its env, or one inherited from the host with
-   * `inheritEnv`, the declared one first. A value with no tokens, blank or
-   * commas alone, counts as unset: the Discord adapter splits on commas and
-   * drops empty tokens, so such a value (an empty systemd `Environment=`, say,
-   * or `${A},${B}` with both empty) would otherwise turn the protective
-   * default off without anyone choosing that.
+   * `inheritEnv`, the declared one first. A value with no tokens, as
+   * discord-mcpl's parser reads them, counts as unset: the adapter splits on
+   * commas and keeps a token only when its normalizer leaves something of it
+   * (blank, `:`, `::` and a lone U+FE0F leave nothing), so such a value (an
+   * empty systemd `Environment=`, say, or `${A},${B}` or `:${NAME}:` with the
+   * variables empty) would otherwise turn the protective default off without
+   * anyone choosing that.
    *
    * Windows names are matched in both sources: Workers expose a case-
    * sensitive `process.env` copy. Within one source, Node's spawn keeps the
@@ -14719,6 +14721,14 @@ export class AgentFramework {
   private declaredReactionBaseline(
     config: import('./mcpl/types.js').McplServerConfig,
   ): { value: string; source: 'env' | 'inherited' } | undefined {
+    // A token as discord-mcpl's parser keeps one: `parseSuppressionEnvTokens`
+    // trims each comma-separated token and keeps it when
+    // `normalizeReactionEmoji` (discord-mcpl `src/filters.ts`) leaves
+    // something, after it strips U+FE0F, trims, and strips one leading and one
+    // trailing colon. The same steps in the same order, so the two can be
+    // compared when either changes.
+    const isToken = (token: string): boolean =>
+      token.trim().replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '') !== '';
     const valueIn = (env: NodeJS.ProcessEnv | undefined): string | undefined => {
       let raw: unknown;
       if (process.platform !== 'win32') raw = env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
@@ -14729,7 +14739,7 @@ export class AgentFramework {
       }
       if (raw === undefined || raw === null) return undefined;
       const value = String(raw);
-      return value.split(',').some((token) => token.trim() !== '') ? value : undefined;
+      return value.split(',').some(isToken) ? value : undefined;
     };
     const declared = valueIn(config.env);
     if (declared !== undefined) return { value: declared, source: 'env' };
