@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 
 import { AutobiographicalStrategy, ContextManager } from '@animalabs/context-manager';
-import { Agent, AgentFramework, BudgetPreflightError } from '../src/index.js';
+import { Agent, AgentFramework, BudgetPreflightError, type AgentRuntimeSettingsPatch } from '../src/index.js';
 
 const membrane = {} as any;
 
@@ -276,7 +276,11 @@ describe('a reached budget across a restart', () => {
       } finally {
         log.restore();
       }
-      assert.ok(log.lines.some((line) => line.includes('folded floor renders 70000 tokens against it now')), log.lines.join('\n'));
+      // One line, written once the restore is made, saying why and what it made.
+      assert.deepEqual(log.lines.filter((line) => line.includes('[agent-settings]')), [
+        '[agent-settings] agent: its last compile before the stop fit at contextBudgetTokens=60000, but the folded floor renders ' +
+          '70000 tokens against it now; restored it paced instead: contextBudgetTokens is 60000, and compiles plan at 100000 (converging)',
+      ]);
     });
   });
 
@@ -322,10 +326,12 @@ describe('a reached budget across a restart', () => {
 
   it('an invalid field is ignored with a bounded line, and a record holding only it still boots', async () => {
     await run(async ({ framework, restart }) => {
-      writeRecord(framework(), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 'yes'.repeat(100) });
       const log = quietErrors();
       try {
-        assert.equal(budgets(await restart()).transition, 'converging');
+        for (const invalid of ['yes'.repeat(100), [60_000], { budget: 60_000 }, null]) {
+          writeRecord(framework(), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: invalid });
+          assert.equal(budgets(await restart()).transition, 'converging', JSON.stringify(invalid));
+        }
         writeRecord(framework(), { contextBudgetReachedTokens: -5 });
         assert.deepEqual(budgets(await restart()), { target: 100_000, effective: 100_000, transition: 'stable' }, 'the recipe budget');
       } finally {
@@ -333,9 +339,13 @@ describe('a reached budget across a restart', () => {
       }
       // The line names the kind of value, never its content.
       const lines = log.lines.filter((l) => l.includes('ignoring an invalid persisted contextBudgetReachedTokens'));
+      const line = (kind: string) => `[agent-settings] ignoring an invalid persisted contextBudgetReachedTokens for agent "agent": ${kind}`;
       assert.deepEqual(lines, [
-        '[agent-settings] ignoring an invalid persisted contextBudgetReachedTokens for agent "agent": a string',
-        '[agent-settings] ignoring an invalid persisted contextBudgetReachedTokens for agent "agent": a number that isn\'t a positive safe integer',
+        line('a string'),
+        line('an array'),
+        line('an object'),
+        line('null'),
+        line('a number that isn\'t a positive safe integer'),
       ], log.lines.join('\n'));
     });
   });
@@ -424,8 +434,40 @@ describe('a reached budget across a restart', () => {
         return original.apply(this, args);
       }, () => compile(f));
       assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'the 100k compile proves nothing about 60k');
+      assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), undefined, 'and no proof stands for the live budget: that compile planned at 100k');
       await compile(f);
       assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
+    });
+  });
+
+  it('a compile refused after the budget changed under it withdraws its own budget\'s marker, and leaves the new budget\'s proof', async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(f);
+      assert.equal(persisted(f)?.contextBudgetReachedTokens, 60_000);
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      // The first compile plans at 60k and is refused only after the budget
+      // went to 80k, unpersisted, and a second compile fit there.
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        if (++calls === 1) {
+          await held;
+          throw refusal;
+        }
+        return original.apply(this, args);
+      }, async () => {
+        const first = compile(f);
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 }, { persist: false });
+        await compile(f);
+        release();
+        await assert.rejects(first, /over budget/);
+      });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'the record still holds 60k, now without its marker');
+      assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), 80_000, 'the refusal at 60k says nothing about 80k');
     });
   });
 
@@ -503,6 +545,18 @@ describe('a reached budget across a restart', () => {
       }, () => compile(f));
       assert.equal(persisted(f)?.contextBudgetReachedTokens, undefined, 'a descent armed again is another descent');
     });
+    // And armed again directly, to the same 60k, with nothing in between.
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+        return original.apply(this, args);
+      }, () => compile(f));
+      assert.deepEqual(budgets(f), { target: 60_000, effective: 60_000, transition: 'stable' }, 'the re-armed descent settled');
+      assert.equal(persisted(f)?.contextBudgetReachedTokens, undefined, 'a descent armed again to the same target is another descent');
+    });
   });
 
   it('a compile without a budget through compileWithInjections proves and records it too', async () => {
@@ -535,6 +589,32 @@ describe('a reached budget across a restart', () => {
     });
   });
 
+  it("a record the boot can't read is logged, and the agent boots at the recipe's", async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      // Only the boot's read of the record fails.
+      const proto = JsStore.prototype as unknown as { getStateJson: (...args: unknown[]) => unknown };
+      const original = proto.getStateJson;
+      proto.getStateJson = function (this: unknown, ...args: unknown[]) {
+        if (new Error().stack?.includes('readAgentRuntimeSettings')) throw new Error('store unreadable');
+        return original.apply(this, args);
+      };
+      const log = quietErrors();
+      let restarted: AgentFramework;
+      try {
+        restarted = await restart();
+      } finally {
+        proto.getStateJson = original;
+        log.restore();
+      }
+      assert.deepEqual(budgets(restarted), { target: 100_000, effective: 100_000, transition: 'stable' });
+      assert.ok(
+        log.lines.some((l) => l.includes("agent: its persisted settings can't be read (store unreadable); it boots at the recipe's")),
+        log.lines.join('\n'),
+      );
+    });
+  });
+
   it('after a withdrawal that failed and a persisting write without the marker, the next fit writes it again', async () => {
     await run(async ({ framework }) => {
       const f = framework();
@@ -561,62 +641,204 @@ describe('a reached budget across a restart', () => {
     });
   });
 
+  /** Apply `budget` at once and compile, so it's proven, then restart: the boot applies it at once. */
+  async function provenAtBoot(h: { framework: () => AgentFramework; restart: () => Promise<AgentFramework> }, budget: number) {
+    h.framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: budget, immediate: true });
+    await compile(h.framework());
+    const restarted = await h.restart();
+    assert.deepEqual(budgets(restarted), { target: budget, effective: budget, transition: 'stable' }, 'applied at once at boot');
+    return restarted;
+  }
+  /** A compile whose first plan the context manager refuses: the budget each plan was asked for, the record as the second began, the log, and what it threw. */
+  async function refusedFirst(f: AgentFramework) {
+    const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+    const planned: number[] = [];
+    let recordAtRetry: Record | undefined;
+    const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+    const log = quietErrors();
+    let thrown: unknown;
+    try {
+      await withPatched('compile', async function (this: unknown, budget?: { maxTokens: number }, ...rest: unknown[]) {
+        planned.push(budget?.maxTokens ?? -1);
+        if (planned.length === 1) throw refusal;
+        recordAtRetry = { ...persisted(f) };
+        return original.apply(this, [budget, ...rest]);
+      }, () => compile(f));
+    } catch (error) {
+      thrown = error;
+    } finally {
+      log.restore();
+    }
+    return { planned, recordAtRetry, lines: log.lines, thrown };
+  }
+
   it('a budget applied at once at boot whose first compile is refused is restored paced, and the compile goes on', async () => {
-    await run(async ({ framework, restart }) => {
-      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
-      await compile(framework());
-      const restarted = await restart();
-      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 60_000, transition: 'stable' });
-      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
-      const planned: number[] = [];
-      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
-      const log = quietErrors();
-      try {
-        await withPatched('compile', async function (this: unknown, budget?: { maxTokens: number }, ...rest: unknown[]) {
-          planned.push(budget?.maxTokens ?? -1);
-          if (planned.length === 1) throw refusal;
-          return original.apply(this, [budget, ...rest]);
-        }, () => compile(restarted));
-      } finally {
-        log.restore();
-      }
+    await run(async (h) => {
+      const restarted = await provenAtBoot(h, 60_000);
+      const { planned, recordAtRetry, lines, thrown } = await refusedFirst(restarted);
+      assert.equal(thrown, undefined);
       assert.deepEqual(planned, [60_000, 100_000], 'refused at the boot budget, then compiled from the recipe\'s');
-      assert.ok(log.lines.some((l) => l.includes('restored it as a paced descent')), log.lines.join('\n'));
+      assert.deepEqual(recordAtRetry, { contextBudgetTokens: 60_000 }, 'the refusal withdrew the marker before the compile went on');
+      assert.ok(lines.some((l) => l.includes('restored it as a paced descent from the recipe\'s budget')), lines.join('\n'));
       assert.equal(budgets(restarted).target, 60_000, 'the descent to it is armed (or settled)');
       assert.equal(persisted(restarted)?.contextBudgetTokens, 60_000);
     });
   });
 
-  it("a persisted budget the agent can't take now (maxTokens raised above it) boots at the recipe's, with a line", async () => {
+  it('a budget at or above the recipe\'s, applied at once at boot, has no paced restore to fall back to: its refusal is the compile\'s', async () => {
+    await run(async (h) => {
+      const restarted = await provenAtBoot(h, 120_000);
+      const { planned, lines, thrown } = await refusedFirst(restarted);
+      assert.equal((thrown as Error | undefined)?.message, 'over budget');
+      assert.deepEqual(planned, [120_000], 'no second compile');
+      assert.ok(!lines.some((l) => l.includes('paced')), lines.join('\n'));
+      assert.deepEqual(budgets(restarted), { target: 120_000, effective: 120_000, transition: 'stable' });
+      assert.deepEqual(persisted(restarted), { contextBudgetTokens: 120_000 }, 'the refusal withdrew the marker');
+    });
+  });
+
+  it("a refused budget the boot applied at once that can't be restored paced: the agent compiles at the recipe's, keeping the budget set", async () => {
+    await run(async (h) => {
+      const restarted = await provenAtBoot(h, 60_000);
+      // The strategy can't prepare a smaller window now.
+      const cm = restarted.getAgent('agent')!.getContextManager() as unknown as {
+        updateHotContextSettings: (update: { preparedWindowTokens?: number | null }) => unknown;
+      };
+      const hot = cm.updateHotContextSettings.bind(cm);
+      cm.updateHotContextSettings = (update) => {
+        if (typeof update.preparedWindowTokens === 'number') throw new Error('no smaller window here');
+        return hot(update);
+      };
+      const { planned, lines, thrown } = await refusedFirst(restarted);
+      assert.equal(thrown, undefined);
+      assert.deepEqual(planned, [60_000, 100_000]);
+      assert.ok(lines.some((l) => l.includes(
+        "couldn't restore it paced (no smaller window here), so it compiles at the recipe's budget, with contextBudgetTokens=60000 kept set",
+      )), lines.join('\n'));
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 100_000, transition: 'stable' }, 'set to 60k, live at the recipe\'s');
+      restarted.updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
+      assert.deepEqual(persisted(restarted), { contextBudgetTokens: 60_000, tailTokens: 20_000 }, 'a later write keeps the budget');
+    });
+  });
+
+  it('after the boot, a tail change keeps the fallback, and a paced change ends it', async () => {
+    await run(async (h) => {
+      h.framework().updateAgentRuntimeSettings('agent', { tailTokens: 15_000 });
+      const restarted = await provenAtBoot(h, 60_000);
+      restarted.updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
+      const { planned, thrown } = await refusedFirst(restarted);
+      assert.equal(thrown, undefined);
+      assert.deepEqual(planned, [60_000, 100_000], 'restored paced');
+      assert.equal(restarted.getAgentRuntimeSettings('agent').tailTokens, 20_000, 'the fallback re-applies only the budget, not the boot\'s tail');
+    });
+    await run(async (h) => {
+      const restarted = await provenAtBoot(h, 60_000);
+      restarted.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+      const { planned, thrown } = await refusedFirst(restarted);
+      assert.equal((thrown as Error | undefined)?.message, 'over budget');
+      assert.deepEqual(planned, [60_000], 'no fallback over the descent armed since');
+      assert.deepEqual(budgets(restarted), { target: 50_000, effective: 60_000, transition: 'converging' });
+    });
+  });
+
+  /** A writer at the usual maxTokens leaves `record`; the agent then boots with maxTokens raised to 70k, above a persisted 60k. */
+  async function bootRaised(record: Record, fn: (booted: AgentFramework, lines: string[]) => Promise<void> | void) {
     const { dir, config } = setup();
     const raised = () => ({ ...config(), agents: config().agents.map((a) => ({ ...a, maxTokens: 70_000 })) });
     try {
-      for (const record of [{ contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, { contextBudgetTokens: 60_000 }]) {
-        const writer = await AgentFramework.create(config());
-        writeRecord(writer, record);
-        await writer.stop();
-        const log = quietErrors();
-        let booted: AgentFramework | undefined;
-        try {
-          booted = await AgentFramework.create(raised());
-          assert.deepEqual(budgets(booted), { target: 100_000, effective: 100_000, transition: 'stable' }, JSON.stringify(record));
-        } finally {
-          log.restore();
-          await booted?.stop();
-        }
-        assert.ok(log.lines.some((l) => l.includes("its persisted settings can't be applied now")), log.lines.join('\n'));
+      const writer = await AgentFramework.create(config());
+      writeRecord(writer, record);
+      await writer.stop();
+      const log = quietErrors();
+      let booted: AgentFramework | undefined;
+      try {
+        booted = await AgentFramework.create(raised());
+      } finally {
+        log.restore();
+      }
+      try {
+        await fn(booted, log.lines);
+      } finally {
+        await booted.stop();
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  it("a persisted budget the agent can't take now (maxTokens raised above it) stays set but unapplied, and it runs at the recipe's, with a line", async () => {
+    for (const record of [{ contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, { contextBudgetTokens: 60_000 }]) {
+      await bootRaised(record, (booted, lines) => {
+        assert.deepEqual(budgets(booted), { target: 60_000, effective: 100_000, transition: 'stable' }, JSON.stringify(record));
+        // One line, whether or not the record carried a reached budget.
+        assert.deepEqual(lines.filter((l) => l.includes('[agent-settings]')), [
+          '[agent-settings] agent: contextBudgetTokens=60000 (contextBudgetTokens must be a safe integer greater than max response tokens (70000)) ' +
+            "can't be applied now, so it stays set but unapplied: contextBudgetTokens is 60000, and compiles plan at 100000",
+        ], JSON.stringify(record));
+      });
+    }
   });
 
-  it("an immediate patch's preview plans at the configured reach, and a paced one's at the pace", async () => {
-    await run(async ({ framework }) => {
-      const agent = framework().getAgent('agent')!;
-      assert.equal(agent.planRuntimeSettings({ contextBudgetTokens: 60_000, transitionPaceTokens: 4_000, immediate: true }).overrides.kvStableReachTokens, undefined);
-      assert.equal(agent.planRuntimeSettings({ contextBudgetTokens: 60_000, transitionPaceTokens: 4_000 }).overrides.kvStableReachTokens, 4_000);
+  it("each persisted setting is restored on its own: a private policy governs and a tail applies when the budget can't, and a later write keeps the budget", async () => {
+    await bootRaised({ contextBudgetTokens: 60_000, tailTokens: 20_000, sameRoundThinkTextPolicy: 'private' }, (booted) => {
+      const { contextBudgetTokens, effectiveContextBudgetTokens, tailTokens, sameRoundThinkTextPolicy, sameRoundThinkTextPolicySource } =
+        booted.getAgentRuntimeSettings('agent');
+      assert.deepEqual(
+        { contextBudgetTokens, effectiveContextBudgetTokens, tailTokens, sameRoundThinkTextPolicy, sameRoundThinkTextPolicySource },
+        { contextBudgetTokens: 60_000, effectiveContextBudgetTokens: 100_000, tailTokens: 20_000, sameRoundThinkTextPolicy: 'private', sameRoundThinkTextPolicySource: 'runtime_override' },
+      );
+      // The snapshot each request takes, which routes its same-round text and describes its think tool.
+      const request = (booted as unknown as { captureInferenceToolSnapshot: (agent: Agent) => { sameRoundThinkTextPolicy: string } })
+        .captureInferenceToolSnapshot(booted.getAgent('agent')!);
+      assert.equal(request.sameRoundThinkTextPolicy, 'private');
+      booted.updateAgentRuntimeSettings('agent', { tailTokens: 25_000 });
+      assert.deepEqual(persisted(booted), { contextBudgetTokens: 60_000, tailTokens: 25_000, sameRoundThinkTextPolicy: 'private' });
     });
+  });
+
+  it("a patch's preview plans at the reach its next compile plans at", async () => {
+    // The reach of every kv-stable plan, a preview's or a compile's, as the
+    // strategy hands it to the planner.
+    const proto = AutobiographicalStrategy.prototype as unknown as { buildPicker: (...args: unknown[]) => unknown };
+    const original = proto.buildPicker;
+    let reaches: Array<number | undefined> = [];
+    proto.buildPicker = function (this: { _lastKvStable?: { opts?: { reachTokens?: number } } }, ...args: unknown[]) {
+      const picker = original.apply(this, args);
+      reaches.push(this._lastKvStable?.opts?.reachTokens);
+      return picker;
+    };
+    // Preview `patch` after `before`, then apply it and compile: the reach both planned at.
+    const both = async (before: (f: AgentFramework) => void, patch: AgentRuntimeSettingsPatch) => {
+      let reach: number | undefined;
+      await run(async ({ framework }) => {
+        const f = framework();
+        before(f);
+        reaches = [];
+        f.previewAgentRuntimeSettings('agent', patch);
+        const previewed = reaches;
+        reaches = [];
+        f.updateAgentRuntimeSettings('agent', patch, { persist: false });
+        reaches = [];
+        await compile(f);
+        assert.ok(previewed.length > 0 && reaches.length > 0, `${JSON.stringify(patch)}: planned ${JSON.stringify({ previewed, reaches })}`);
+        assert.deepEqual([...new Set(previewed)], [...new Set(reaches)], JSON.stringify(patch));
+        reach = reaches[0];
+      });
+      return reach;
+    };
+    const none = () => {};
+    try {
+      // The recipe's reach is 8k; no descent is under way unless `before` arms one.
+      assert.equal(await both(none, { contextBudgetTokens: 60_000, transitionPaceTokens: 4_000, immediate: true }), 8_000, 'an immediate change: the configured reach');
+      assert.equal(await both(none, { contextBudgetTokens: 60_000, transitionPaceTokens: 4_000 }), 4_000, 'a paced decrease: its pace');
+      assert.equal(await both(none, { transitionPaceTokens: 4_000 }), 8_000, 'a pace with no descent: the configured reach');
+      const descending = (f: AgentFramework) => { f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }); };
+      assert.equal(await both(descending, { transitionPaceTokens: 4_000 }), 4_000, 'a pace during a descent: that pace');
+      const paced = (f: AgentFramework) => { f.updateAgentRuntimeSettings('agent', { transitionPaceTokens: 4_000 }); };
+      assert.equal(await both(paced, { contextBudgetTokens: 60_000 }), 4_000, 'a paced decrease without a pace: the live one');
+    } finally {
+      proto.buildPicker = original;
+    }
   });
 
   it('a descent ended by an immediate change to its own target is not credited to the compile that ran meanwhile', async () => {
