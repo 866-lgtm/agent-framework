@@ -529,8 +529,11 @@ describe('a reached budget across a restart', () => {
       return original.apply(this, args);
     }, async () => {
       const first = compile(f);
-      await between();
-      release();
+      try {
+        await between();
+      } finally {
+        release();
+      }
       if (firstFits) await first;
       else await assert.rejects(first, /over budget/);
     });
@@ -577,6 +580,93 @@ describe('a reached budget across a restart', () => {
       });
       assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'the later-started refusal stands');
       assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), undefined);
+    });
+  });
+
+  it("a later-started compile whose fit isn't credited still outranks an earlier-started refusal at its budget", async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(f);
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      let releaseFirst!: () => void;
+      let releaseSecond!: () => void;
+      const held = [
+        new Promise<void>((resolve) => { releaseFirst = resolve; }),
+        new Promise<void>((resolve) => { releaseSecond = resolve; }),
+      ];
+      let calls = 0;
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        const n = calls++;
+        await held[n];
+        if (n === 0) throw refusal;
+        return original.apply(this, args);
+      }, async () => {
+        // Both plan at 60k. The second fits while the budget moves to 70k
+        // unpersisted, so nothing credits it; the first is refused after it.
+        const first = compile(f);
+        const second = compile(f);
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 70_000 }, { persist: false });
+        releaseSecond();
+        await second;
+        releaseFirst();
+        await assert.rejects(first, /over budget/);
+      });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the earlier-started refusal is ignored');
+    });
+  });
+
+  it("a settle's credit outranks an earlier-started refusal at its target", async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        if (++calls === 1) {
+          await held;
+          throw refusal;
+        }
+        return original.apply(this, args);
+      }, async () => {
+        // The first plans at 60k and is refused only after the budget went to
+        // 80k and paced back down, and a compile at 80k settled that descent.
+        const first = compile(f);
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+        assert.equal(budgets(f).transition, 'converging');
+        await compile(f);
+        assert.deepEqual(budgets(f), { target: 60_000, effective: 60_000, transition: 'stable' });
+        assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the settle credited 60k');
+        release();
+        await assert.rejects(first, /over budget/);
+      });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the settle outranks the earlier-started refusal');
+    });
+  });
+
+  it('the start order keeps nothing once no compile runs, through descents and compiles at once', async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      const noted = () => (f.getAgent('agent') as unknown as { latestEndedStart: Map<number, number> }).latestEndedStart.size;
+      // Descents to three budgets, each settled by a compile.
+      for (const budget of [90_000, 75_000, 60_000]) {
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: budget });
+        await compile(f);
+        assert.deepEqual(budgets(f), { target: budget, effective: budget, transition: 'stable' });
+        assert.equal(noted(), 0, `after the descent to ${budget}`);
+      }
+      // Two at once: the later-started one's start is kept while the earlier one runs.
+      await twoCompilesAt60k(f, false, async () => {
+        await compile(f);
+        assert.equal(noted(), 1, 'kept while an earlier-started compile runs');
+      });
+      assert.equal(noted(), 0, 'and dropped once it ends');
     });
   });
 

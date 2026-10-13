@@ -4088,8 +4088,9 @@ export class AgentFramework {
    * change. The system prompt and tools are outside the context manager's
    * budget, so they don't enter it (context-manager #162). If a compile at a
    * budget applied at once this way is refused, the agent restores it paced
-   * then (Agent.restoreRuntimeSettings). A budget at or above the recipe's
-   * is applied at once with or without the marker, as an increase always is.
+   * then (armed by Agent.restoreRuntimeSettings, run in
+   * Agent.compileAtLiveBudget). A budget at or above the recipe's is applied
+   * at once with or without the marker, as an increase always is.
    *
    * When a marked budget isn't applied at once or a setting can't be
    * applied, one line says why, what couldn't be applied, and the budget set
@@ -4158,10 +4159,10 @@ export class AgentFramework {
 
   /**
    * What persists for an agent: its overrides, and `contextBudgetReachedTokens`
-   * when the agent's last compile fit at the overridden budget and neither
-   * the budget nor the descent has changed since (context-manager #162). A
+   * when the agent's proof stands for the overridden budget: a compile fit at
+   * it, and the live budget hasn't changed since (context-manager #162). A
    * change of budget, immediate or not, carries none until a compile at it
-   * fits.
+   * fits; arming or cancelling a descent leaves the proof as it was.
    */
   private persistedRuntimeSettingsOf(agent: Agent): AgentRuntimeSettingsOverrides {
     const overrides = agent.getRuntimeSettingsOverrides();

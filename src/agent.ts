@@ -159,12 +159,18 @@ export class Agent {
   private lastCompiledBudget?: { budget: number; fit: boolean; epoch: number };
   /** Counts compiles at the live budget as they start. */
   private compilesStarted = 0;
+  /** The start numbers of the compiles at the live budget still running. */
+  private readonly compilesRunning = new Set<number>();
   /**
-   * For each budget, when the latest-started compile whose outcome there is
-   * noted started. Of two compiles at one budget, the later-started one
-   * planned the newer context, so its outcome stands, whichever finishes last.
+   * For each budget, the start of the latest-started compile that has ended
+   * there, whether or not what it showed was credited. Of two compiles at one
+   * budget, the later-started one planned at the newer store, so an
+   * earlier-started one that ends after it is ignored, with or without
+   * injections. An entry is kept only while a compile that started before it
+   * is still running, the only kind it can turn away, so the map is empty
+   * whenever no compile runs.
    */
-  private readonly latestNotedStart = new Map<number, number>();
+  private readonly latestEndedStart = new Map<number, number>();
   /** The last outcome the listener recorded; a failed record is told again, and so is any after a change. */
   private recordedCompiledBudget?: { budget: number; fit: boolean; epoch: number };
   /**
@@ -380,17 +386,23 @@ export class Agent {
   }
 
   /**
-   * Note what a compile at `budget` showed, planned at the live budget's
-   * `epoch` and started as the `started`th. A compile that started before
-   * one already noted at that budget planned an older context, and is
-   * ignored. Otherwise it speaks for the live budget only if that hasn't
-   * changed since, and the listener is told either way, so a refusal
-   * withdraws the record's marker for the budget it planned at whatever
-   * changed meanwhile.
+   * Whether the compile that started as the `started`th is the latest to end
+   * at `budget`, taking that place if so: one that started before a compile
+   * that has already ended there is ignored, whichever finishes last.
    */
-  private noteCompiledBudget(budget: number, fit: boolean, epoch: number, started: number): void {
-    if (started < (this.latestNotedStart.get(budget) ?? 0)) return;
-    this.latestNotedStart.set(budget, started);
+  private endsLatestAt(budget: number, started: number): boolean {
+    if (started < (this.latestEndedStart.get(budget) ?? 0)) return false;
+    this.latestEndedStart.set(budget, started);
+    return true;
+  }
+
+  /**
+   * Note what a compile at `budget`, planned at the live budget's `epoch`,
+   * showed. It speaks for the live budget only if that hasn't changed since;
+   * the listener is told either way, so a refusal withdraws the record's
+   * marker for the budget it planned at whatever changed meanwhile.
+   */
+  private noteCompiledBudget(budget: number, fit: boolean, epoch: number): void {
     if (epoch === this.liveBudgetEpoch) this.lastCompiledBudget = { budget, fit, epoch };
     const recorded = this.recordedCompiledBudget;
     if (recorded?.budget === budget && recorded.fit === fit && recorded.epoch === epoch) return;
@@ -401,12 +413,26 @@ export class Agent {
 
   /** Compile at the live budget (no explicit one), noting whether it fit. */
   private async compileAtLiveBudget(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    const started = ++this.compilesStarted;
+    this.compilesRunning.add(started);
+    try {
+      return await this.compileAtLiveBudgetNoting(compile, started);
+    } finally {
+      this.compilesRunning.delete(started);
+      const earliest = Math.min(...this.compilesRunning);
+      for (const [budget, start] of this.latestEndedStart) {
+        if (start < earliest) this.latestEndedStart.delete(budget);
+      }
+    }
+  }
+
+  /** The compile at the live budget that started as the `started`th, and what it showed. */
+  private async compileAtLiveBudgetNoting(compile: () => Promise<CompileResult>, started: number): Promise<CompileResult> {
     // The budget this compile plans at, and the descent under way when it
     // started: a change of either while it runs is no part of what it shows.
     const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
     const epoch = this.liveBudgetEpoch;
     const descent = this.descentEpoch;
-    const started = ++this.compilesStarted;
     let result: CompileResult;
     try {
       result = await compile();
@@ -414,9 +440,9 @@ export class Agent {
       if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
       // A refusal shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
-      // nothing is credited, unless a compile that started later has shown
-      // what that budget does.
-      this.noteCompiledBudget(live, false, epoch, started);
+      // nothing is credited, unless a compile that started later has already
+      // ended at that budget.
+      if (this.endsLatestAt(live, started)) this.noteCompiledBudget(live, false, epoch);
       // A budget a boot restore applied at once, refused at its first test,
       // before anything wrote the budget: restore it paced instead, as the
       // boot would have without its proof, and compile again from the
@@ -448,11 +474,15 @@ export class Agent {
     // the compile proves the budget it planned at. Either only if the live
     // budget didn't change while it ran; a settle of a descent armed while it
     // ran proves nothing (the next compile at the target does).
+    // A compile that ends here takes its place in the start order at the
+    // budget it planned at, credited or not.
+    const latest = this.endsLatestAt(live, started);
     const sameLive = this.liveBudgetEpoch === epoch;
     const sameDescent = this.descentEpoch === descent;
     const settled = this.settleRuntimeSettingsTransition();
-    if (sameLive && settled && sameDescent) this.noteCompiledBudget(this.contextBudgetTokens!, true, this.liveBudgetEpoch, started);
-    else if (sameLive && !settled) this.noteCompiledBudget(live, true, epoch, started);
+    if (sameLive && settled && sameDescent && this.endsLatestAt(this.contextBudgetTokens!, started)) {
+      this.noteCompiledBudget(this.contextBudgetTokens!, true, this.liveBudgetEpoch);
+    } else if (latest && sameLive && !settled) this.noteCompiledBudget(live, true, epoch);
     return result;
   }
 
