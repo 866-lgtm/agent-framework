@@ -1147,8 +1147,8 @@ export class AgentFramework {
    * added as an attempt starts, and removed when its wait completes or times
    * out, or when the attempt fails before reaching it. While any is here, an
    * awareness sync is admitted although the queue is closed (see
-   * syncDiscordAwarenessMarkers). A set, because a trace listener can start a
-   * second attempt inside the first's synchronous start. */
+   * syncDiscordAwarenessMarkers). One attempt runs at a time; each has its own
+   * entry so that cleaning up after one can't close another's window. */
   private readonly openStopWaits = new Set<object>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
@@ -2158,7 +2158,12 @@ export class AgentFramework {
     if (this.stopPromise) return this.stopPromise;
     const stopWait = {};
     this.openStopWaits.add(stopWait);
-    const attempt = this.stopOwned(teardownTimeoutMs, stopWait);
+    // Claim the attempt before any of its body runs: stopOwned's synchronous
+    // start can emit traces (the push coalescer's suspend() does), and a
+    // listener that calls stop() there must get this attempt, not start a
+    // second teardown beside it.
+    let settle!: { resolve: () => void; reject: (error: unknown) => void };
+    const attempt = new Promise<void>((resolve, reject) => { settle = { resolve, reject }; });
     this.stopPromise = attempt;
     void attempt.then(() => { this.stopCompleted = true; }, () => {});
     // Failed cleanup can be retried while its original store is open. A
@@ -2168,6 +2173,9 @@ export class AgentFramework {
       this.openStopWaits.delete(stopWait);
       if (!this.ownedStoreClosed && this.stopPromise === attempt) this.stopPromise = null;
     });
+    // The body still starts in this call, so its synchronous steps (closing
+    // the queue among them) happen before stop() returns.
+    this.stopOwned(teardownTimeoutMs, stopWait).then(settle.resolve, settle.reject);
     return attempt;
   }
 

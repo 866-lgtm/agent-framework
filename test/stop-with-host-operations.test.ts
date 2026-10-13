@@ -416,6 +416,35 @@ describe('stop() with an operator operation in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
+  it("a stop() called from a trace inside stop()'s own start gets the same attempt, and one teardown runs", async () => {
+    const framework = await create();
+    const fw = framework as unknown as {
+      pushCoalescer: { suspend(): void } | null;
+      emitTrace(event: unknown): void;
+    };
+    // A coalescer with a render in flight reports it from suspend(), the first
+    // thing stop() does, as a trace.
+    let suspended = false;
+    fw.pushCoalescer = {
+      suspend: () => {
+        if (suspended) return;
+        suspended = true;
+        fw.emitTrace({ type: 'mcpl:coalescing', phase: 'suspended' });
+      },
+    };
+    let inner: Promise<void> | undefined;
+    framework.onTrace((event) => {
+      if ((event as { type?: string }).type === 'mcpl:coalescing' && !inner) inner = framework.stop();
+    });
+    const outer = framework.stop();
+    assert.equal(inner, outer, 'the reentrant stop() gets the attempt already running');
+    await outer;
+    assert.deepEqual(order, ['modules stopped'], 'one teardown');
+    assert.equal(framework.getStore().isClosed(), true);
+    await framework.stop();
+    assert.deepEqual(rejections, []);
+  });
+
   it('an awareness sync after a stop() that failed before its wait is refused', async () => {
     const framework = await create();
     const fw = framework as unknown as Internals & { codeExecutionRunners: Map<string, { dispose(): void }> };

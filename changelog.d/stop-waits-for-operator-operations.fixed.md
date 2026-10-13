@@ -52,6 +52,12 @@
     turn it was asked for.
   - `undoLastTurn()` and `redo()` refuse while a surgery or a branch switch
     holds the store, instead of moving the branch beneath it.
+  - A `stop()` called from a trace emitted inside `stop()`'s own start, as
+    the push coalescer's suspension emits for a render in flight, gets the
+    attempt already running. Before, it started a second teardown beside
+    the first, which then failed at its final sync, and every later
+    `stop()` rejected with "Store has been closed" for a framework that had
+    stopped.
   - While the host stops, an MCPL awareness barrier that fails no longer
     recycles the connections, which `stop()` is closing. The framework
     releases it as it releases a completed one, so nothing waits on a
