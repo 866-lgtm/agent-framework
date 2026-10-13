@@ -28,7 +28,7 @@ import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
 import { draftState, type ProseDraftStore } from '../src/prose-drafts.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import { MembraneError, type ContentBlock } from '@animalabs/membrane';
 
 class ToolboxModule implements Module {
   readonly name = 'robot';
@@ -1189,6 +1189,104 @@ describe('explicit prose routing', () => {
     }
   });
   }
+
+  it("hybrid: a capacity-held turn's later compile receipts the drafts its first stream held, and the catch-up leaves them to it", async () => {
+    // Stream one bounces an envelope into a draft, then its next request
+    // meets an organization acceleration 429: the turn is held and its later
+    // compile continues the same logical turn, whose receipt names the draft.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#nowhere held words' },
+      { type: 'tool_use', id: 'capacity-1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      providerAccelerationDefaultCooldownMs: number;
+      providerAccelerationJitterMs: number;
+      openLogical: Map<string, RoutingState['logical']>;
+    };
+    internals.providerAccelerationDefaultCooldownMs = 50;
+    internals.providerAccelerationJitterMs = 0;
+    let starts = 0;
+    framework.onTrace((event) => {
+      if (event.type !== 'inference:started') return;
+      starts++;
+      if (starts === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }]));
+      if (starts >= 3) membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }]));
+    });
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const index = ++streams;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && index === 1) {
+            yield {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'rate_limit', retryable: true, httpStatus: 429,
+                message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+                rawError: { status: 429 },
+              }),
+            };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    try {
+      trigger(framework);
+      await framework.runUntilIdle();
+      const draft = draftsOf(framework).open('assistant').find((d) => d.text === 'held words');
+      assert.ok(draft, 'the bounced envelope is held as a draft');
+      const open = internals.openLogical.get('assistant');
+      assert.ok(open?.drafts.some((d) => d.id === draft.id), "the held turn's logical turn is open, its draft unsettled");
+      for (const end = Date.now() + 5000; starts < 2 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        await framework.runUntilIdle();
+      }
+      assert.equal(starts, 2, 'the held turn was compiled again after its cooldown');
+      await framework.runUntilIdle();
+      const texts = context(framework).texts;
+      const receipts = texts.filter((t) => t.startsWith('[delivered]'));
+      assert.equal(receipts.length, 1, `one receipt for the logical turn: ${receipts.join(' | ')}`);
+      assert.match(receipts[0]!, /world:commons/, "it reports the later compile's delivery");
+      assert.ok(receipts[0]!.includes(draft.id), `and the draft the first stream held: ${receipts[0]}`);
+      assert.ok(!texts.some((t) => t.includes('unnamed on this branch')), 'the catch-up left the draft to the receipt');
+      assert.equal(internals.openLogical.has('assistant'), false, 'the logical turn settled');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("explicit: a draft bounced after a tool ended its turn is recorded from its notice, not named again by the catch-up", async () => {
+    // The ended turn's queued envelope bounces once the held post before it
+    // settles, after that turn's drafts were settled. Its bounce notice names
+    // it; the next turn's catch-up records that notice rather than naming
+    // the draft as unnamed.
+    await withQueuedTurns('explicit', '>>#nowhere late words', [
+      createMockResponse([{ type: 'text', text: '>>#cafe next' }]),
+    ], async ({ framework, release, drain, turns }) => {
+      release();
+      for (const end = Date.now() + 5000; turns() < 3 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      await drain();
+      assert.equal(turns(), 3, "the bounce's wake started a turn");
+      const store = draftsOf(framework);
+      const late = store.open('assistant').find((d) => d.text === 'late words');
+      assert.ok(late, 'the late envelope bounced into a draft');
+      const texts = context(framework).texts;
+      assert.ok(texts.some((t) => t.startsWith('[prose-routing]') && t.includes(late.id)), 'its bounce notice names it');
+      assert.ok(!texts.some((t) => t.includes('unnamed on this branch')), "the catch-up doesn't name it again");
+      assert.ok((store.get('assistant', late.id)?.noticedIn ?? []).length > 0, 'it is recorded as noticed');
+    });
+  });
 
   it("the non-streaming fallback leaves the scheduling turn's logical turn open for the re-inference", async () => {
     // Adapted from a reviewer's producer test: the agent's direct inference

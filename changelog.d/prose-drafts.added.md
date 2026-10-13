@@ -33,7 +33,9 @@
   stream presents mid-turn messages (a draft holding words copied from one
   that may already have been posted is named with that risk and the
   `confirmDuplicate` its resend needs), and the turn-end `[delivered]` receipt
-  names every draft held in the turn by its state at turn end: still held
+  names every draft held in the turn, in any of its streams (a framework
+  retry, or the compile a provider-capacity hold defers the turn to), by its
+  state at turn end: still held
   ("held as drafts d-… (not sent …)"), delivered by the resident's resend
   (listed where it landed), unconfirmed, or dismissed. A dismissed draft
   whose own attempt may already have been posted is named with that risk,

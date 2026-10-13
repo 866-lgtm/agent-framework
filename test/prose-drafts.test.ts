@@ -1127,6 +1127,64 @@ describe('draft notices and turn-end settlement', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  const catchUpFixture = async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-catchup-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    const internals = framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      routingOf(name: string): { logical: { drafts: unknown[] } };
+      openLogical: Map<string, unknown>;
+      noticeUnnoticedDrafts(agent: unknown): void;
+    };
+    const agent = framework.getAgent('scout')!;
+    const cm = agent.getContextManager();
+    const catchUps = () => cm.getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+      .filter((t) => t.includes('unnamed on this branch'));
+    return { framework, internals, agent, cm, catchUps, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
+  };
+
+  it("the catch-up records a draft a notice already names, rather than naming it again", async () => {
+    const t = await catchUpFixture();
+    try {
+      const [late, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'late', source }, { text: 'lost', source }], 'bounced').held;
+      // A bounce notice reached the history after its turn's drafts were
+      // settled, so nothing recorded it.
+      const notice = t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [late!.id] } as never);
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      assert.deepEqual(t.internals.proseDrafts.get('scout', late!.id)!.noticedIn, [String(notice)], 'recorded with the notice that names it');
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
+      assert.ok(!catchUp!.includes(late!.id), `the one its notice names is not: ${catchUp}`);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("the catch-up leaves the open logical turn's own drafts to its receipt", async () => {
+    const t = await catchUpFixture();
+    try {
+      const [own, other] = t.internals.proseDrafts.hold('scout', [{ text: 'own', source }, { text: 'other', source }], 'explicit-send').held;
+      // A later start continues this logical turn, whose receipt names its
+      // drafts at the turn's end.
+      const logical = t.internals.routingOf('scout').logical;
+      logical.drafts.push(own);
+      t.internals.openLogical.set('scout', logical);
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(other!.id), "another turn's unnamed draft is named");
+      assert.ok(!catchUp!.includes(own!.id), `the open turn's own draft is not: ${catchUp}`);
+      assert.equal(t.internals.proseDrafts.get('scout', own!.id)!.noticedIn, undefined, 'and stays for its settlement');
+    } finally {
+      await t.close();
+    }
+  });
 });
 
 describe('draft identity and risk evidence', () => {

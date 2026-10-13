@@ -9551,11 +9551,21 @@ export class AgentFramework {
    * move took the notices away. Every draft it marks is named by id, newest
    * first: the newest eight with their state and why each was held, the rest
    * by id. Like every notice, it quotes none of their words; the drafts tool
-   * shows them.
+   * shows them. A draft a recent message already names is recorded as
+   * noticed rather than named again: its notice landed after its turn ended,
+   * as a bounce does when a delivery runs after a tool ends an explicit turn.
+   * The open logical turn's own drafts are left to its receipt and its
+   * settlement (settleTurnDrafts).
    */
   private noticeUnnoticedDrafts(agent: Agent): void {
     const cm = agent.getContextManager();
-    const pending = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null);
+    const own = new Set(this.openLogical.get(agent.name)?.drafts.map((d) => d.id));
+    const unnoticed = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null)
+      .filter((d) => !own.has(d.id));
+    if (unnoticed.length === 0) return;
+    const named = this.draftsNamedInHistory(agent, unnoticed.map((d) => d.id));
+    this.recordDraftNotices(agent, named);
+    const pending = unnoticed.filter((d) => !named.has(d.id));
     if (pending.length === 0) return;
     const shown = pending.slice(0, 8).map((d) =>
       `${d.id} (${this.draftStateText(d)}; ${AgentFramework.DRAFT_REASON_SHORT[d.reason]})`);
@@ -9580,7 +9590,7 @@ export class AgentFramework {
     try {
       this.proseDrafts.markNoticed(agent.name, pending.map((d) => d.id), mid);
     } catch (err) {
-      // Named again by the next turn's catch-up.
+      // The next turn's catch-up finds this notice and records it.
       console.error('[drafts] could not record the catch-up notice:', err);
     }
   }
@@ -9598,15 +9608,21 @@ export class AgentFramework {
     logical.keptPrivate = 0;
     delete logical.draftFailures;
     if (held.length === 0) return;
+    this.recordDraftNotices(agent, this.draftsNamedInHistory(agent, held.map((d) => d.id)));
+  }
+
+  /** Record each named draft as noticed, with the message that names it
+   *  (draftsNamedInHistory). */
+  private recordDraftNotices(agent: Agent, named: Map<string, string>): void {
     const byMessage = new Map<string, string[]>();
-    for (const [draftId, messageId] of this.draftsNamedInHistory(agent, held.map((d) => d.id))) {
+    for (const [draftId, messageId] of named) {
       byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), draftId]);
     }
     for (const [messageId, ids] of byMessage) {
       try {
         this.proseDrafts.markNoticed(agent.name, ids, messageId);
       } catch (err) {
-        // Unmarked drafts are named again by the next turn's catch-up.
+        // The next turn's catch-up looks for their notices again.
         console.error('[drafts] could not record notice:', err);
       }
     }
@@ -12973,8 +12989,11 @@ export class AgentFramework {
       }
 
       // The logical turn has ended and its notices are written: record the
-      // drafts they name as noticed (the store is synced first).
-      if (frameReachedTerminal && ownsPhysicalStream) {
+      // drafts they name as noticed (the store is synced first). A stream
+      // whose logical turn is still open leaves its drafts to the stream
+      // that ends it (openLogical: the compile a provider-capacity hold
+      // defers the turn to), whose receipt names them.
+      if (frameReachedTerminal && ownsPhysicalStream && this.openLogical.get(agent.name) !== streamRouting.logical) {
         try {
           this.settleTurnDrafts(agent, streamRouting.logical);
         } catch (err) {
