@@ -515,6 +515,16 @@ interface AdmittedEnvelope {
   resolved?: { channelId: string } | { error: string; candidates?: string[] };
 }
 
+/**
+ * Whether a stream resumes its logical turn rather than starting one: a budget
+ * restart, or a tool-result-guard retry. Such a stream keeps the turn's
+ * routing state (the sticky destination, the turn's destination) and queues
+ * its deliveries behind the turn's earlier ones.
+ */
+function resumesLogicalTurn(reason: string | undefined): boolean {
+  return reason === 'context_budget_restart' || reason === 'tool_result_guard_retry';
+}
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -1114,8 +1124,9 @@ export class AgentFramework {
   // ---- Explicit prose routing (docs/explicit-prose-routing.md) ----------
   /** Latest bounced (undelivered) prose per agent — the `{{unsent}}` source. */
   private proseClipboards: Map<string, string> = new Map();
-  /** Sticky per-TURN delivery target set by the turn's first `>>` prefix.
-   *  Cleared at every non-restart turn start; survives context restarts. */
+  /** Sticky per-TURN delivery target, set by each `>>` prefix that resolves.
+   *  Cleared at every fresh turn start, and on a silent wake; a stream that
+   *  resumes the turn (resumesLogicalTurn) keeps it. */
   private proseTargetPins: Map<string, string> = new Map();
   /**
    * Explicit mode: the destination the turn's delivered rounds have set,
@@ -8818,9 +8829,14 @@ export class AgentFramework {
   private admitProse(rawText: string): AdmittedEnvelope[] {
     return splitExplicitEnvelopes(rawText).map((text) => {
       const parsed = parseProsePrefix(text);
-      return parsed.kind === 'target'
-        ? { text, resolved: this.channelRegistry!.resolveProseTarget(parsed.target!) }
-        : { text };
+      if (parsed.kind !== 'target') return { text };
+      try {
+        return { text, resolved: this.channelRegistry!.resolveProseTarget(parsed.target!) };
+      } catch (err) {
+        // Admission runs in the stream's event loop, so a resolver that
+        // throws makes the envelope bounce rather than stop the round.
+        return { text, resolved: { error: `the destination couldn't be resolved: ${err instanceof Error ? err.message : String(err)}` } };
+      }
     });
   }
 
@@ -8979,7 +8995,10 @@ export class AgentFramework {
     let targetChannel: string;
     let body: string;
     if (parsed.kind === 'target') {
-      const res = envelope.resolved ?? this.channelRegistry!.resolveProseTarget(parsed.target!);
+      // Resolved once, when the round was admitted (admitProse), never again
+      // here after the wait: a `>>` envelope without its resolution is a bug.
+      const res = envelope.resolved;
+      if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
         this.bounceProse(agent, parsed.body, res.error, res.candidates);
         return;
@@ -9220,8 +9239,7 @@ export class AgentFramework {
     turnToken: number,
     ownsProviderGate: boolean,
   ): Promise<boolean> {
-    const continuingTurn = trigger?.reason === 'context_budget_restart'
-      || trigger?.reason === 'tool_result_guard_retry';
+    const continuingTurn = resumesLogicalTurn(trigger?.reason);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
@@ -9672,8 +9690,7 @@ export class AgentFramework {
     // the turn's deliveries run in the order its text was written, and the
     // sticky destination moves in that order too, whichever stream wrote the
     // text and however long an earlier post takes.
-    const resumesTurn = trigger?.reason === 'context_budget_restart'
-      || trigger?.reason === 'tool_result_guard_retry';
+    const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let turnSpeechChain: Promise<void> = resumesTurn
       ? this.proseSpeechChains.get(agent.name) ?? Promise.resolve()
       : Promise.resolve();
@@ -9682,7 +9699,8 @@ export class AgentFramework {
     this.proseSpeechChains.set(agent.name, turnSpeechChain);
     const chainSpeech = (link: () => Promise<void>, failure: string): void => {
       turnSpeechChain = turnSpeechChain.then(link).catch((err) => console.error(failure, err));
-      this.proseSpeechChains.set(agent.name, turnSpeechChain);
+      // A stream another has replaced doesn't move the turn's latest link.
+      if (agent.streamId === myStreamId) this.proseSpeechChains.set(agent.name, turnSpeechChain);
     };
     const enqueueSpeech = (text: string, locus: string | null): void => {
       chainSpeech(async () => {
@@ -9798,6 +9816,8 @@ export class AgentFramework {
     // other trace consumers voice it). Hold both; release in order on a clean
     // round (tool-calls / non-guard completion), discard on a guard refusal.
     let guardHeld: Array<{ trace: Parameters<AgentFramework['emitTrace']>[0]; text?: string }> = [];
+    // The text block the stream's last text came from, within this round.
+    let lastTextBlock: number | undefined;
     const releaseGuardHeld = (): void => {
       const held = guardHeld;
       guardHeld = [];
@@ -9842,7 +9862,17 @@ export class AgentFramework {
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
             };
-            const text = event.meta.type === 'text' ? event.content : undefined;
+            // Delivery joins a round's text blocks with a newline
+            // (splitProseSegments), so a later block starts a new line for
+            // the stream too.
+            let text = event.meta.type === 'text' ? event.content : undefined;
+            if (text !== undefined) {
+              const block = event.meta.blockIndex;
+              if (block !== undefined) {
+                if (lastTextBlock !== undefined && block !== lastTextBlock) text = '\n' + text;
+                lastTextBlock = block;
+              }
+            }
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
               guardHeld.push({ trace, text });
             } else {
@@ -9875,6 +9905,11 @@ export class AgentFramework {
             outgoingIndex = 0;
             discardGuardHeld();
             proseStream?.reset();
+            lastTextBlock = undefined;
+            // Explicit mode's retried attempt starts where the turn's
+            // delivered rounds have set the destination, not at the stream's
+            // seed: rounds this stream delivered before the refusal stand.
+            if (turnProseRouting === 'explicit') proseStream?.retarget(this.proseTurnDestinations.get(agent.name) ?? null);
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -9907,6 +9942,7 @@ export class AgentFramework {
             // The round's text ends here: delivery parses each round's text
             // on its own, so the next round's text starts a new line.
             if (proseStream) emitOutgoing(proseStream.endSegment());
+            lastTextBlock = undefined;
             adoptInjectedRound();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
@@ -10053,6 +10089,12 @@ export class AgentFramework {
                         chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { keepPrivate }), 'mid-turn prose delivery failed:');
                       }
                     }
+                    // The stream's next round starts where delivery sends
+                    // unprefixed text: the turn's destination. The stream
+                    // followed this round's prefixes as it was written, but a
+                    // private round's, a >>skip_reply envelope's or a target
+                    // that didn't resolve leave the destination as it was.
+                    proseStream?.retarget(this.proseTurnDestinations.get(agent.name) ?? null);
                   } else if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
@@ -10101,6 +10143,7 @@ export class AgentFramework {
               // persisted as assistant speech, including a terminal refusal
               // after the single recovery retry.
               proseStream?.reset();
+              if (turnProseRouting === 'explicit') proseStream?.retarget(this.proseTurnDestinations.get(agent.name) ?? null);
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
@@ -10498,6 +10541,9 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
+                // Explicit text is admitted as its round ends, as a live
+                // round's is: its targets resolve now, not after the wait.
+                const admittedSpeech = turnProseRouting === 'explicit' ? this.admitProse(speechText) : null;
                 // A turn resumed after its earlier rounds delivers after
                 // them: their queued deliveries are this chain's.
                 await turnSpeechChain;
@@ -10522,7 +10568,7 @@ export class AgentFramework {
                 } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   try {
-                    await this.deliverProse(agent, speechText);
+                    await this.deliverAdmittedProse(agent, admittedSpeech!);
                   } catch (err) {
                     console.error('text-only prose delivery failed:', err);
                   }
@@ -10569,6 +10615,8 @@ export class AgentFramework {
                 : turnSilenced || toolNames.some(isSilencingTool);
 
               const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
+              // Explicit text is admitted as its round ends, before the wait.
+              const admittedSegments = turnProseRouting === 'explicit' ? segments.map((seg) => this.admitProse(seg)) : [];
 
               // Preserve in-channel ordering: everything enqueued live must
               // land before the trailing prose. Awaited even when silenced —
@@ -10600,9 +10648,9 @@ export class AgentFramework {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
                   );
-                  for (const seg of segments) {
+                  for (const envelopes of admittedSegments) {
                     try {
-                      await this.deliverProse(agent, seg);
+                      await this.deliverAdmittedProse(agent, envelopes);
                     } catch (err) {
                       console.error('trailing prose delivery failed:', err);
                     }

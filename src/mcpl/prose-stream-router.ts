@@ -19,8 +19,13 @@
  * emits NOTHING — the delivery path will bounce/retain it; a stream consumer
  * must never see text that delivery would refuse to send.
  *
- * Two modes, mirroring proseRouting:
- *  - explicit: parse `>>` prefixes; initial target null (suppressed).
+ * Three modes, mirroring proseRouting:
+ *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
+ *              one that resumes a turn starts at the turn's destination, and
+ *              each round's end returns the stream to it (retarget).
+ *  - hybrid:   parse `>>>` envelopes, with the frozen turn locus as the
+ *              fallback. An envelope with no target, or `>>>skip_reply`,
+ *              holds back what follows until a later `>>>` names a target.
  *  - locus:    NO prefix parsing (locus mode's `>>` lines are plain text);
  *              everything streams to the frozen turn locus.
  */
@@ -47,7 +52,9 @@ export class ProseStreamRouter {
     private opts: {
       /** explicit parses `>>`; hybrid parses `>>>` while retaining locus fallback. */
       mode: 'explicit' | 'hybrid' | 'locus';
-      /** Initial destination: the frozen turn locus (locus mode) or null. */
+      /** Initial destination: the frozen turn locus (locus and hybrid mode); in
+       *  explicit mode, null on a fresh turn, or the turn's destination on a
+       *  stream that resumes one. */
       initialTarget: string | null;
       /** Resolve a `>>spec` to a channelId, or null (unresolved/ambiguous). */
       resolve: (spec: string) => string | null;
@@ -60,6 +67,17 @@ export class ProseStreamRouter {
   /** Per-channel full text emitted so far (for outgoing/complete). */
   byChannel(): ReadonlyMap<string, string> {
     return this.accumulated;
+  }
+
+  /**
+   * Point the stream at a destination decided outside it. Explicit mode does
+   * this at each round's end, with the turn's destination: a private round's
+   * prefixes, a `>>skip_reply` envelope and a target that didn't resolve all
+   * leave that destination as it was, though the stream followed them while
+   * the round was written.
+   */
+  retarget(target: string | null): void {
+    this.target = target;
   }
 
   /**
@@ -176,9 +194,10 @@ export class ProseStreamRouter {
               // names a target.
               this.target = null;
             }
+            // The whitespace itself is body, a newline included.
             this.held = '';
-            this.state = ch === '\n' ? 'line-start' : 'body';
-            if (ch !== '\n') this.step(ch, out);
+            this.state = 'body';
+            this.step(ch, out);
             return;
           }
           this.state = 'prefix-token';

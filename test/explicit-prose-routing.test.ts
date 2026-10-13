@@ -538,6 +538,29 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it('admission turns a resolver that throws into an envelope that bounces', async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const internals = framework as unknown as {
+      channelRegistry: { resolveProseTarget: (spec: string) => unknown };
+      admitProse(text: string): Array<{ text: string; resolved?: { channelId?: string; error?: string } }>;
+      deliverAdmittedProse(agent: unknown, envelopes: unknown[]): Promise<void>;
+    };
+    const resolve = internals.channelRegistry.resolveProseTarget.bind(internals.channelRegistry);
+    internals.channelRegistry.resolveProseTarget = (spec: string) => {
+      if (spec === '#boom') throw new Error('directory unavailable');
+      return resolve(spec);
+    };
+    try {
+      const admitted = internals.admitProse('>>#boom one\n>>#alpha two');
+      assert.match(admitted[0]!.resolved?.error ?? '', /directory unavailable/);
+      await internals.deliverAdmittedProse(framework.getAgent('assistant')!, admitted);
+      assert.deepEqual(routed.map((r) => r.text), ['two'], 'the other envelope still goes out');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("' !' continuation starts another turn immediately after prose ends the current one", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#alpha ! step one done, continuing' },

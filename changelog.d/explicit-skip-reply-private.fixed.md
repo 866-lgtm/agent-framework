@@ -25,7 +25,12 @@
   does, rather than streaming such a line as text or dropping it. Each
   round's text starts a new line for the stream, as delivery parses each
   round on its own: a round that began with a `>>` prefix streamed it as
-  text to the previous round's destination.
+  text to the previous round's destination. A round's later text block
+  starts a new line too, as delivery joins a round's text blocks with a
+  newline. At each round's end, and when the membrane retries a refused
+  attempt, the stream returns to the turn's destination, so a private
+  round's prefix, a `>>skip_reply` envelope or a target that didn't resolve
+  no longer moves where later rounds stream.
 - A turn resumed by a tool-result-guard retry or a budget restart now queues
   its prose deliveries behind the turn's earlier ones, in every mode, so the
   turn delivers in the order it wrote. Before, a resumed reply could be

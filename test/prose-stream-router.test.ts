@@ -95,6 +95,12 @@ test('explicit: `>>` and then any whitespace is a quoted arrow', () => {
   assert.equal(textFor(out, 'discord:g:100'), 'look:\n>>\u00a0quoted');
 });
 
+test('explicit: a bare `>>` line is text, its newline included, as delivery sends it', () => {
+  const r = new ProseStreamRouter({ mode: 'explicit', initialTarget: 'discord:g:100', resolve: (spec) => RESOLVE[spec] ?? null });
+  const out = [...r.feed('>>\nhello'), ...r.finish()];
+  assert.equal(textFor(out, 'discord:g:100'), '>>\nhello');
+});
+
 test('explicit: each segment starts a new line, and a prefix with no body takes effect at its end', () => {
   // Delivery parses each round's text on its own: a round may begin with a
   // prefix, and a round that is only a prefix sets the sticky destination.
