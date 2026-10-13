@@ -10073,11 +10073,14 @@ export class AgentFramework {
     }
     const suppressedNote = notes.join(' · ');
     // Nothing is confirmed delivered, but an unconfirmed draft (or a dismissed
-    // one whose own attempt is uncertain) may have been.
+    // one whose own attempt is uncertain) may have been, and a draft let go
+    // since the turn held it may have had such an attempt: its state is
+    // unknown now.
+    const uncertain = unconfirmed.length > 0 || dismissedAtRisk.length > 0 || letGo.length > 0;
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing${unconfirmed.length > 0 || dismissedAtRisk.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
+        : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',

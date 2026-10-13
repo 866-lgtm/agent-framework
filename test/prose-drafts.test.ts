@@ -1204,6 +1204,11 @@ describe('draft notices and turn-end settlement', () => {
     const routing = h.internals.routingOf('scout');
     try {
       const old = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, turn: 1, round: 1, notice: 'later' })[0]!;
+      // An attempt whose outcome is unknown (Arthur-2378's second probe): once
+      // the draft is let go, nothing says whether it was posted.
+      const attempt = drafts.beginAttempt('scout', old.id, dest(), 'resend', false);
+      drafts.recordOutcome('scout', old.id, attempt, { status: 'unknown', reason: 'connection lost', at: Date.now(), destination: dest() });
+      assert.equal(draftState(drafts.get('scout', old.id)!), 'unconfirmed');
       t.mock.timers.tick(2);
       const newer = f.holdProseDrafts(h.agent, [{ text: 'later words' }], 'explicit-send', { routing, turn: 1, round: 2, notice: 'later' })[0]!;
       assert.equal(drafts.get('scout', old.id), undefined, 'the journal let the older draft go');
@@ -1215,6 +1220,7 @@ describe('draft notices and turn-end settlement', () => {
       assert.ok(held.includes(newer.id), `the draft still held is reported as held: ${receipt}`);
       assert.ok(!held.includes(old.id), `the let-go draft is not offered as held: ${receipt}`);
       assert.ok(receipt.includes(`draft ${old.id} held this turn and since let go by retention (no longer held, so not resendable)`), receipt);
+      assert.ok(receipt.startsWith('[delivered] nothing confirmed —'), `a let-go draft's unknown state makes no claim of non-delivery: ${receipt}`);
     } finally {
       t.mock.timers.reset();
       await h.close();
