@@ -196,10 +196,11 @@ describe('placed-reaction baseline', () => {
     assert.equal((await childEnv(fw)).baseline, [...REFUSAL_REACTION_BASELINE, '💤'].join(','));
   });
 
-  for (const blank of ['', '  ']) {
-    it('a blank baseline, declared or inherited, counts as unset ' + JSON.stringify(blank), async (t) => {
-      // The adapter reads an empty value as "no tokens": a blank inherited
-      // variable would otherwise turn the protective default off.
+  for (const blank of ['', '  ', ',', ' , ']) {
+    it('a baseline with no tokens, declared or inherited, counts as unset ' + JSON.stringify(blank), async (t) => {
+      // The adapter splits on commas and drops empty tokens, so it reads each
+      // of these as "no tokens": inherited by accident (an empty variable, or
+      // `${A},${B}` with both empty), it would turn the protective default off.
       const previous = process.env[ENV_KEY];
       process.env[ENV_KEY] = blank;
       t.after(() => {
@@ -245,12 +246,16 @@ describe('placed-reaction baseline', () => {
     assert.ok(env.baseline?.split(',').includes('🫥'), `the respawned child has the marker retained since: ${env.baseline}`);
   });
 
-  it('a restart that needs the default refuses on a corrupt ledger and leaves the child up', async () => {
-    const fw = await create(undefined, [server()]);
-    writeFileSync(outboxPath, '{broken');
-    await assert.rejects(() => fw.restartMcplServer('probe'), /Discord awareness.*ledger/i);
-    assert.ok(await childEnv(fw), 'the running child still answers');
-  });
+  for (const own of [undefined, '🟪']) {
+    it(`a restart refuses on a corrupt ledger and leaves the child up (${own ? 'its own baseline' : 'the default'})`, async () => {
+      // Every connect reads the ledger at its awareness barrier, so a server
+      // with its own baseline can't come back either.
+      const fw = await create(undefined, [server(own ? { env: { [ENV_KEY]: own } } : {})]);
+      writeFileSync(outboxPath, '{broken');
+      await assert.rejects(() => fw.restartMcplServer('probe'), /Discord awareness.*ledger/i);
+      assert.ok(await childEnv(fw), 'the running child still answers');
+    });
+  }
 
   it('passes a URL-only WebSocket config through unchanged', async () => {
     const fw = await create();
@@ -270,6 +275,8 @@ describe('placed-reaction baseline', () => {
     [`<:mark:${'1'.repeat(17)}>`, true],
     [`mark:${'2'.repeat(20)}`, true],
     [`<:mark:${'3'.repeat(21)}>`, false],
+    [`mark:${'4'.repeat(16)}`, false],
+    [`<:mark:${'5'.repeat(20)}>`, true],
     ['a:b:1', false],
   ] as const) {
     it(`a custom marker ${marker} is ${converted ? '' : 'not '}reduced to its ID`, async () => {
@@ -285,5 +292,10 @@ describe('placed-reaction baseline', () => {
     assert.throws(() => baseline(fw), /Discord awareness.*ledger/i);
     await fw.disconnectMcplServer('probe');
     await assert.rejects(() => fw.connectMcplServer(server()), /Discord awareness.*ledger/i);
+    // A reconnecting server is refused before it could leave a closed stub
+    // registered under its id, so the connect can simply be retried.
+    await assert.rejects(() => fw.connectMcplServer(server({ reconnect: true })), /Discord awareness.*ledger/i);
+    const registry = (fw as unknown as { mcplServerRegistry: { getServer(id: string): unknown } }).mcplServerRegistry;
+    assert.equal(registry.getServer('probe'), null, 'nothing is left registered');
   });
 });

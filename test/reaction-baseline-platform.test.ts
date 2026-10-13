@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import { buildChildEnv } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 
@@ -54,6 +55,15 @@ async function connectionEnv(
   return captured.env;
 }
 
+/** The value a Windows child gets: the composed env through buildChildEnv's
+ * win32 merge with the host env, which leaves one spelling of each name. */
+function windowsChildValue(composed: Record<string, string>, inheritEnv: boolean, host: NodeJS.ProcessEnv): string | undefined {
+  const child = buildChildEnv({ env: composed, inheritEnv }, host, 'win32');
+  const spellings = Object.keys(child).filter((key) => key.toUpperCase() === KEY);
+  assert.equal(spellings.length, 1, `one spelling reaches the child: ${spellings.join(', ')}`);
+  return child[spellings[0]!];
+}
+
 for (const inheritEnv of [false, true]) {
   test('Windows reaction baseline honors declared case variants, inheritEnv=' + inheritEnv, async () => {
     // A blank value counts as unset: where the spelling Node's spawn keeps is
@@ -68,10 +78,9 @@ for (const inheritEnv of [false, true]) {
     ];
     for (const { env, expected } of cases) {
       const composed = await connectionEnv('win32', env, inheritEnv);
-      // Node's Windows spawn sorts and keeps the first spelling of a folded
-      // name. The chosen value must survive that step as well as #205's merge.
-      const emittedKey = Object.keys(composed).sort().find((key) => key.toUpperCase() === KEY)!;
-      assert.equal(composed[emittedKey], expected);
+      // The chosen value must survive the spawn's own merge (#205), which
+      // keeps the first spelling of a folded name within each source.
+      assert.equal(windowsChildValue(composed, inheritEnv, process.env), expected);
       assert.equal(composed[KEY], expected, 'a generated default must not replace an explicit choice');
     }
   });
@@ -92,6 +101,7 @@ test('Windows inherited-only baseline lookup handles case-sensitive worker env c
     for (const { parent, expected } of cases) {
       const composed = await connectionEnv('win32', {}, true, parent);
       assert.equal(composed[KEY], expected);
+      assert.equal(windowsChildValue(composed, true, parent), expected);
     }
   }
 });
@@ -100,8 +110,10 @@ test('Windows chooses duplicate spellings within each source, then declared over
   const parent = { [KEY]: 'host-upper', [KEY.toLowerCase()]: 'host-lower' };
   const composed = await connectionEnv('win32', { [KEY.toLowerCase()]: '', [KEY]: 'declared-upper' }, true, parent);
   assert.equal(composed[KEY], 'declared-upper');
+  assert.equal(windowsChildValue(composed, true, parent), 'declared-upper');
   const singleDeclared = await connectionEnv('win32', { [KEY.toLowerCase()]: '' }, true, parent);
   assert.equal(singleDeclared[KEY], 'host-upper', 'a blank declared value is unset, so the inherited choice stands');
+  assert.equal(windowsChildValue(singleDeclared, true, parent), 'host-upper');
 });
 
 test('inherited-only baseline lookup remains opt-in and POSIX case-sensitive', async () => {

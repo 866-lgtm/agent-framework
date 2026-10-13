@@ -14267,8 +14267,9 @@ export class AgentFramework {
     // The default is derived at each spawn: the env below is a getter, which
     // the transport reads at first connect, at every automatic reconnect and
     // at a stub's retry, so retained markers added since the last spawn are
-    // covered. Deriving it once here first refuses the connect, before
-    // anything spawns, when the awareness ledger can't be read.
+    // covered. Deriving it once here first refuses the connect when the
+    // awareness ledger can't be read, before anything spawns and before a
+    // reconnecting server could leave a closed stub registered under its id.
     let connectionConfig = config;
     if (!isWebSocketTransport(config)) {
       const declared = this.declaredReactionBaseline(config);
@@ -14694,10 +14695,11 @@ export class AgentFramework {
   /**
    * The reaction baseline an operator chose for a stdio server, if any: a
    * value declared in its env, or one inherited from the host with
-   * `inheritEnv`, the declared one first. A blank value counts as unset: the
-   * Discord adapter reads an empty value as "no tokens", so a blank inherited
-   * variable (an empty systemd `Environment=`, say) would otherwise turn the
-   * protective default off without anyone choosing that.
+   * `inheritEnv`, the declared one first. A value with no tokens, blank or
+   * commas alone, counts as unset: the Discord adapter splits on commas and
+   * drops empty tokens, so such a value (an empty systemd `Environment=`, say,
+   * or `${A},${B}` with both empty) would otherwise turn the protective
+   * default off without anyone choosing that.
    *
    * Windows names are matched in both sources: Workers expose a case-
    * sensitive `process.env` copy. Within one source, Node's spawn keeps the
@@ -14723,7 +14725,7 @@ export class AgentFramework {
       }
       if (raw === undefined || raw === null) return undefined;
       const value = String(raw);
-      return value.trim() !== '' ? value : undefined;
+      return value.split(',').some((token) => token.trim() !== '') ? value : undefined;
     };
     const declared = valueIn(config.env);
     if (declared !== undefined) return { value: declared, source: 'env' };
@@ -14813,12 +14815,12 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
-    // A stdio child that will take the protective reaction default needs a
-    // readable awareness ledger. Check before disconnecting, so an
-    // unreadable ledger refuses the restart and leaves the running child up.
-    if (!isWebSocketTransport(config) && !this.declaredReactionBaseline(config)) {
-      this.getPlacedReactionBaseline();
-    }
+    // Every connect reads the awareness ledger: its awareness barrier
+    // reconciles it, and a stdio child taking the protective default derives
+    // that from it. Read it before disconnecting, so an unreadable ledger
+    // refuses the restart and leaves the running child up, whatever the
+    // server's baseline or transport. (No outbox configured: nothing to read.)
+    this.getPlacedReactionBaseline();
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
   }
