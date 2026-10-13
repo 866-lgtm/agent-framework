@@ -817,8 +817,32 @@ describe('ToolImageLedger', () => {
   });
 });
 
+it('a save whose write fails after its tree entry, through the workspace itself, is reported saved with its failure', async () => {
+  const h = await startTurn({
+    prefix: 'sri-tree-real-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 1 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const ws = workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown }> };
+      const intents = [...ws.intents.values()][0];
+      intents.update = () => { throw new Error('injected intent exception'); };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    const files = saved(result);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].inChronicle, true);
+    assert.match(String(files[0].diskCopyError), /the rest of the write failed: injected intent exception/);
+    assert.ok((await fileBytes(h, String(files[0].path)))?.equals(PNG));
+  } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
 for (const secondFails of [false, true]) {
-  it(`#281 round: a tree-only image save ${secondFails ? 'appears in a later failure receipt' : 'succeeds with a disk-copy warning'}`, async () => {
+  it(`a tree-only image save ${secondFails ? 'appears in a later failure receipt' : 'succeeds with a disk-copy warning'}`, async () => {
     const h = await startTurn({
       prefix: 'sri-tree-only-',
       responses: [

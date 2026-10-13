@@ -39,7 +39,7 @@ export type WithheldSpiller = (label: string, text: string, branch: string, dead
  *  guard says whether it has work left. */
 export interface WithheldHost {
   spill: WithheldSpiller;
-  /** Absolute deadline for one batch, captured when its annotation starts. */
+  /** Absolute deadline for one batch (Date.now() time), taken when the batch is queued. */
   deadline(): number;
   track(annotation: Promise<void>): void;
   /** Whether the guard is idle (see ToolResultGuard.idle), told after each
@@ -470,12 +470,15 @@ export class ToolResultGuard {
   private annotate(pending: PendingBatch): void {
     const previous = this.annotating ?? Promise.resolve();
     this.annotationsStarted += 1;
+    // The batch's deadline runs from when it's queued, not from when the
+    // batches ahead of it finish, so a request waiting on a chain of batches
+    // waits at most one deadline past the latest one's arrival.
+    const deadline = this.host?.deadline() ?? Infinity;
     const run = previous.then(async () => {
       // Set once the stub's edit is queued with the hold: the queue releases
       // it when the edit lands or is superseded.
       let holdQueued = false;
       try {
-        const deadline = this.host?.deadline() ?? Infinity;
         const date = new Date().toISOString().slice(0, 10);
         // A file is named by its batch and its place in the batch, ahead of
         // anything the writer may cut or substitute: results of one batch

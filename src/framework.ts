@@ -1988,7 +1988,10 @@ export class AgentFramework {
 
     this.running = true;
     this.providerAdmissionClosed = false;
-    this.guardSpillsClosed = false;
+    // A new lifecycle: a turn compiled before an earlier stop() never drives,
+    // and withheld spills, closed for the generation a stop ended, are open
+    // for this one.
+    this.lifecycleGeneration++;
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -2052,6 +2055,9 @@ export class AgentFramework {
     this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
     this.lifecycleGeneration++;
+    // The generation this stop ends; withheld spills close for it alone, so a
+    // start() made before this stop finishes reopens them for its own.
+    const stoppingGeneration = this.lifecycleGeneration;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
 
@@ -2128,7 +2134,7 @@ export class AgentFramework {
     // workspace: its stub names the audit record. A write that was past its
     // deadline is not waited for, and may still finish or fail after the
     // modules stop.
-    this.guardSpillsClosed = true;
+    this.guardSpillsClosedFor = stoppingGeneration;
 
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
@@ -2671,7 +2677,14 @@ export class AgentFramework {
           if (!mount) return null;
           const path = `${mount}/refs/${fileName}`;
           const res = await workspace.writeBinary(path, data, mimeType);
-          return res.success ? path : null;
+          if (res.success) return path;
+          // Stored, with its disk copy failed: the workspace's tools read it
+          // from the tree, so the reference is fetched to that path.
+          if ((res.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+            console.error(`[refs] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${res.error ?? 'unknown error'}`);
+            return path;
+          }
+          return null;
         },
       );
     }
@@ -2858,12 +2871,16 @@ export class AgentFramework {
    *  write is started. Several can be, when writes of different agents'
    *  batches stalled together. */
   private readonly stalledSpills = new Set<Promise<void>>();
+  /** Withheld spills skipped since the current stall began. */
+  private stallSkips = 0;
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
-  /** Set once stop() has let the running annotations finish: a withheld
-   *  original is then no longer written to a workspace that is stopping, and
-   *  its stub names the audit record. */
-  private guardSpillsClosed = false;
+  /** The lifecycle generation whose stop() has let the running annotations
+   *  finish: a withheld original is then no longer written to a workspace
+   *  that is stopping, and its stub names the audit record. A later start()
+   *  has a generation of its own, so its spills are open whatever order the
+   *  earlier stop finishes in. */
+  private guardSpillsClosedFor: number | null = null;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
    *  withheld originals are written to, and the set stop() waits on
@@ -8542,7 +8559,7 @@ export class AgentFramework {
         requests = [...providerCooldown.heldRequests, ...requests];
       }
 
-      // Skip if agent is busy (compiling, inferring, streaming, or waiting for tools) —
+      // Skip if agent is busy (inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
       // goes idle at endTurn's reset while driveStream teardown is still
       // pending, and a successor turn dequeued in that gap compiles while the
@@ -8608,7 +8625,7 @@ export class AgentFramework {
       // Truthiness, not `!== null`: prototype-built harnesses (and any field
       // added later) leave the slot undefined, which must read as "not held".
       const surgeryHeld = !!this.surgeryHold;
-      if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.isCompilingRequest || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+      if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long.
         // Suppressed while quiesced: a drain-phase busy requeue is expected,
         // not a wedge tell.
@@ -9667,6 +9684,10 @@ export class AgentFramework {
       // Membrane's yielding stream starts its request when it is first
       // iterated, so cancelling it here, before driveStream, sends nothing.
       if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        console.error(`[turn] ${agent.name}: a turn compiled while ${
+          this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
+            : this.providerAdmissionClosed ? 'the framework was stopping'
+              : 'the framework was stopped and started again'} is dropped before it sends anything`);
         stream.cancel();
         agent.cancelStream();
         if (this.agents.get(agent.name) === agent) {
@@ -12103,11 +12124,15 @@ export class AgentFramework {
    */
   private async spillWithheld(label: string, text: string, branch: string,
     deadline = Date.now() + this.withheldSpillDeadlineMs): Promise<WithheldSpill> {
-    if (this.guardSpillsClosed) return null;
+    if (this.guardSpillsClosedFor === this.lifecycleGeneration) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
     if (this.stalledSpills.size > 0) {
-      console.error(`[spill] ${place.path} skipped: workspace_unanswered (${this.stalledSpills.size} withheld write(s) past deadline)`);
+      // Said once per stall, with the count when it clears, so a stalled
+      // workspace doesn't write a line for every result it can't take.
+      if (this.stallSkips++ === 0) {
+        console.error(`[spill] withheld originals are skipped as workspace_unanswered while ${this.stalledSpills.size} write(s) past their deadline are under way (first: ${place.path})`);
+      }
       return { skipped: 'workspace_unanswered' };
     }
     const remaining = deadline - Date.now();
@@ -12121,7 +12146,13 @@ export class AgentFramework {
       timer = setTimeout(() => {
         // Marked as the deadline passes, before anything else runs, so no
         // spill that starts after it finds the workspace answering.
-        const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => this.stalledSpills.delete(stalled));
+        const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => {
+          this.stalledSpills.delete(stalled);
+          if (this.stalledSpills.size === 0 && this.stallSkips > 0) {
+            console.error(`[spill] the workspace answered again; ${this.stallSkips} withheld original(s) were skipped as workspace_unanswered meanwhile`);
+            this.stallSkips = 0;
+          }
+        });
         this.stalledSpills.add(stalled);
         console.error(`[spill] ${place.path} still being written at the withheld batch deadline`);
         resolve('late');
@@ -12161,13 +12192,15 @@ export class AgentFramework {
       const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain', { branch });
       if (result.success) return { path };
       // The file is in the workspace's Chronicle tree, where its tools read
-      // it, and only its copy on disk failed: it is written for every reader
-      // the stub or the truncation note sends there. The workspace
-      // reports the disk failure itself (workspace:materialize-failed).
+      // it, and the rest of the write failed (its copy on disk, or something
+      // after the entry was set): it is written for every reader the stub or
+      // the truncation note sends there. The workspace emits
+      // workspace:materialize-failed only for a refused push, so the failure
+      // is traced here too.
       if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
-        const error = (result.error ?? 'disk copy failed').slice(0, 200);
+        const error = (result.error ?? 'the rest of the write failed').slice(0, 200);
         this.emitTrace({ type: 'tool:spill_failed', label: safeLabel, path, contentLength: content.length, error });
-        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${error}`);
+        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${error}`);
         return { path };
       }
       // Declined, not failed: the store left the branch the file is for, so
