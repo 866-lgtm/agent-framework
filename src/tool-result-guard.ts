@@ -474,7 +474,7 @@ export class ToolResultGuard {
     // batches ahead of it finish, so a request waiting on a chain of batches
     // waits at most one deadline past the latest one's arrival.
     let deadline = Infinity;
-    try { deadline = this.host?.deadline() ?? Infinity; } catch { /* no bound rather than no record */ }
+    try { deadline = this.host?.deadline() ?? Infinity; } catch { /* the spill then takes its own deadline, rather than losing the record */ }
     const run = previous.then(async () => {
       // Set once the stub's edit is queued with the hold: the queue releases
       // it when the edit lands or is superseded.

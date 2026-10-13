@@ -2709,6 +2709,21 @@ test("an inline spill's failed disk copy is traced with its error, cut at 200 ch
   } finally { h.workspace.writeBinary = original; await h.framework.stop(); }
 });
 
+test('a withheld spill with no finite deadline takes its own, not a 1 ms timer', async () => {
+  const h = await workspaceHarness([]);
+  const f = h.framework as unknown as {
+    writeToolResultFile: () => Promise<unknown>;
+    spillWithheld: (label: string, text: string, branch: string, deadline: number) => Promise<unknown>;
+    stalledSpills: Set<unknown>;
+  };
+  f.writeToolResultFile = async () => { await new Promise((resolve) => setTimeout(resolve, 20)); return { path: 'work/tool-results/slow.txt' }; };
+  try {
+    const spilled = await f.spillWithheld('slow', 'original', h.framework.getStore().currentBranch().name, Infinity);
+    assert.deepEqual(spilled, { path: 'work/tool-results/slow.txt' }, 'a 20 ms write finishes within the default deadline');
+    assert.equal(f.stalledSpills.size, 0);
+  } finally { await h.framework.stop(); }
+});
+
 test("a batch's deadline is taken when it is queued, not when the batches ahead of it finish", async () => {
   const r = await compressionRig();
   try {

@@ -12131,6 +12131,9 @@ export class AgentFramework {
    */
   private async spillWithheld(label: string, text: string, branch: string,
     deadline = Date.now() + this.withheldSpillDeadlineMs): Promise<WithheldSpill> {
+    // A batch with no finite deadline (a host whose deadline() threw) gets
+    // this write's own, rather than a timer Node would cut to 1 ms.
+    if (!Number.isFinite(deadline)) deadline = Date.now() + this.withheldSpillDeadlineMs;
     if (this.guardSpillsClosedFor === this.lifecycleGeneration) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
