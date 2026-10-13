@@ -67,7 +67,7 @@ Chronicle's audit history.
   allowedTools: ['search', 'read', 'write'],   // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
-  maxStreamTokens: 150_000,  // input token budget before stream restart
+  maxStreamTokens: 150_000,  // per-call real prompt size before stream restart
 }
 ```
 
@@ -317,7 +317,7 @@ kept in the `mcpl/coalescing` state (retry window 1 h); audit lines are
 2. **Drive**: Framework iterates stream events (tokens, tool-calls, complete, error)
 3. **Tool yield**: Stream yields tool calls → framework dispatches concurrently → collects results
 4. **Resume**: All results in → stream resumes with tool results
-5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed, and a fresh stream starts
+5. **Budget restart**: If the most recent provider call's real prompt (fresh + cache write + cache read input) exceeds `maxStreamTokens`, the stream is cancelled at the tool boundary, context is recompressed, and a fresh stream starts
 6. **Complete**: Final response saved to context, agent returns to idle
 
 ### Abort / Cancellation

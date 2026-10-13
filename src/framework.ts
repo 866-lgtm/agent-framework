@@ -7157,10 +7157,16 @@ export class AgentFramework {
           const shouldEndTurn = thinkGuardEndTurn
             || currentState.toolResults.some(tc => tc.result.endTurn);
 
-          // Check if accumulated input tokens exceed the agent's budget
+          // Over budget when the CURRENT provider call's real prompt —
+          // fresh + cache write + cache read of the most recent call in this
+          // stream — exceeds maxStreamTokens. Membrane reports input
+          // cache-EXCLUDED, so the fresh figure alone is a few percent of a
+          // warm prompt and never trips; the usage handler keeps this
+          // per-call (not the stream's running total, which would trip on
+          // the sum of every earlier round instead of the window's size).
           const overBudget = currentState.stream
-            && agent.lastStreamInputTokens > 0
-            && agent.lastStreamInputTokens > agent.maxStreamTokens;
+            && agent.lastStreamRealInputTokens > 0
+            && agent.lastStreamRealInputTokens > agent.maxStreamTokens;
 
           // Physical-window projection (issue #92): a turn's continuation
           // rounds append to the compiled request without recompiling, so a
@@ -7330,7 +7336,7 @@ export class AgentFramework {
               // have let the doomed request through — overBudget keeps its
               // established label for existing consumers.
               reason: overBudget ? 'context_budget' : 'physical_window',
-              inputTokens: overBudget ? agent.lastStreamInputTokens : projectedRealTokens,
+              inputTokens: overBudget ? agent.lastStreamRealInputTokens : projectedRealTokens,
               budget: overBudget ? agent.maxStreamTokens : (agent.physicalWindowTokens ?? 0),
             });
             this.pendingRequests.push({
@@ -10774,7 +10780,7 @@ export class AgentFramework {
                 console.error(`[tool-result-guard] agent=${agent.name} withheld ${withheld.length} result(s); retrying inference`);
                 this.emitTrace({
                   type: 'inference:stream_restarted', agentName: agent.name,
-                  reason: 'tool_result_guard', inputTokens: agent.lastStreamInputTokens,
+                  reason: 'tool_result_guard', inputTokens: agent.lastStreamRealInputTokens,
                   budget: agent.maxStreamTokens,
                 });
                 await turnSpeechChain;
@@ -11552,13 +11558,6 @@ export class AgentFramework {
           }
 
           case 'usage': {
-            agent.lastStreamInputTokens = event.usage.inputTokens;
-            agent.lastStreamRealInputTokens =
-              (event.usage.inputTokens ?? 0) +
-              (event.usage.cacheCreationTokens ?? 0) +
-              (event.usage.cacheReadTokens ?? 0);
-            agent.lastStreamOutputTokens = event.usage.outputTokens ?? 0;
-
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
             // prefix size of THIS API call (fresh + cache write + cache read)
             // and hand it to the context strategy, which accepts exactly one
@@ -11588,6 +11587,21 @@ export class AgentFramework {
             };
             previousUsage = cumulativeUsage;
             outputTokensSinceStamp += perCallUsage.outputTokens;
+
+            // The agent's last-call counters describe the MOST RECENT
+            // provider call only — never the stream's running total. The
+            // over-budget restart and the physical-window projection both
+            // compare them against a window-sized cap; fed the running total
+            // they double-counted every earlier round (round 2 read ~2x its
+            // real prompt). The restart reads the cache-inclusive figure:
+            // fresh input alone misses the cached prefix that is most of a
+            // warm prompt.
+            agent.lastStreamInputTokens = perCallUsage.inputTokens;
+            agent.lastStreamRealInputTokens =
+              perCallUsage.inputTokens +
+              perCallUsage.cacheCreationTokens +
+              perCallUsage.cacheReadTokens;
+            agent.lastStreamOutputTokens = perCallUsage.outputTokens;
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
@@ -11602,11 +11616,7 @@ export class AgentFramework {
                 }
               | undefined;
             try {
-              const realTotal =
-                perCallUsage.inputTokens +
-                perCallUsage.cacheCreationTokens +
-                perCallUsage.cacheReadTokens;
-              strat?.reportRealInputTokens?.(realTotal);
+              strat?.reportRealInputTokens?.(agent.lastStreamRealInputTokens);
             } catch { /* calibration is best-effort */ }
 
             const kvSubmission = takeKvSubmission?.();

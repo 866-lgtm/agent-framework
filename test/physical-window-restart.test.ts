@@ -28,6 +28,11 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
+/** maxStreamTokens far above the window, so these tests isolate the
+ *  physical-window projection: the per-call budget restart compares the
+ *  same 200k real prefix and would otherwise fire first. */
+const ISOLATE_PROJECTION = 1_000_000;
+
 /** Each streamYielding call consumes exactly ONE queued response — the
  *  restart must open a fresh stream rather than continue the first. */
 class SequentialStreamMembrane extends MockMembrane {
@@ -75,8 +80,8 @@ class BlobToolModule implements Module {
 }
 
 /** Tool round whose usage reports a near-cap REAL prefix: only 5k fresh
- *  input (far under maxStreamTokens) but 195k cache-read — the projection
- *  must count cached tokens or it misses the window entirely. */
+ *  input but 195k cache-read — the projection must count cached tokens or
+ *  it misses the window entirely. */
 function nearCapToolResponse(): NormalizedResponse {
   const r = createMockResponse([
     { type: 'text', text: 'Working…' },
@@ -135,6 +140,7 @@ async function runTurn(
       systemPrompt: 'You are prime.',
       allowedTools: 'all',
       maxTokens: 4_000,
+      maxStreamTokens: ISOLATE_PROJECTION,
       ...(physicalWindowTokens !== undefined ? { physicalWindowTokens } : {}),
     }],
     modules: [new BlobToolModule()],
@@ -156,8 +162,9 @@ async function runTurn(
 describe('physical-window mid-turn restart (issue #92)', () => {
   it('restarts through a fresh compile instead of dispatching past the hard cap', async () => {
     // Projection: 200k real prefix (5k fresh + 195k cached) + appended tool
-    // result + 4k reserve > 200k window → restart. The fresh-input-only
-    // check (5k vs maxStreamTokens 150k) would have sent the doomed request.
+    // result + 4k reserve > 200k window → restart. A check on the prior
+    // prompt alone (200k, not over a 200k window) would have sent the
+    // doomed request.
     const h = await runTurn(200_000, new SequentialStreamMembrane());
     try {
       const done = await pollUntil(() => storedTexts(h.framework).includes('Recovered final answer'));
@@ -202,6 +209,7 @@ describe('physical-window mid-turn restart (issue #92)', () => {
         systemPrompt: 'You are prime.',
         allowedTools: 'all',
         maxTokens: 4_000,
+        maxStreamTokens: ISOLATE_PROJECTION,
         physicalWindowTokens: 200_000,
       }],
       modules: [new BlobToolModule()],

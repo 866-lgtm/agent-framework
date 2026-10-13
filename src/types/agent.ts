@@ -46,7 +46,9 @@ export interface AgentConfig {
   /** Temperature for inference */
   temperature?: number;
 
-  /** Max input tokens before framework breaks a yielding stream and
+  /** Max real prompt size of a single provider call (fresh + cache write +
+   *  cache read input of the most recent call in the stream) before the
+   *  framework breaks a yielding stream at the next tool boundary and
    *  restarts with recompiled (compressed) context. Default: 150000. */
   maxStreamTokens?: number;
 
