@@ -583,7 +583,7 @@ export class McplServerConnection extends EventEmitter {
       // had never been advertised (hooks, streaming, queries all read this).
       const { capabilities: scoped, dropped } = maskNegotiatedCapabilities(capabilities, config);
       if (dropped.length > 0) {
-        console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.join(', ')}`);
+        console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.map(logValue).join(', ')}`);
       }
 
       return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };

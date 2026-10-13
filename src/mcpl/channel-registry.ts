@@ -3098,7 +3098,7 @@ export class ChannelRegistry {
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
-          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
+          `[routeSpeech] ${conversationId}: locus ${logValue(channelId)} was closed — opened by delivery (speech implies engagement)`,
         );
         this.emitTraceFn({
           type: 'mcpl:channel-opened-by-send',

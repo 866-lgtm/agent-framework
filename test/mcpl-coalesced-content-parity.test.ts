@@ -333,7 +333,7 @@ test('a render error the server words itself prints as one field, so it can\'t a
   assert(f.context().includes('render_fallback'), 'the occurrence\'s own content is delivered');
   const line = lines.find((l) => l.startsWith('[push-render-failed]'));
   assert(line, lines.join('\n'));
-  assert(line.includes('bad\\u0020server=other\\u0020eventId=forged'), line);
+  assert(line.includes('bad\\u0020server\\u003dother\\u0020eventId\\u003dforged'), line);
   // The last field before the tail ends with its colon.
   const fields = line.split(' ').filter((word) => /^(server|eventId)=/.test(word)).map((word) => word.replace(/:$/, ''));
   assert.deepEqual(fields, ['server=editor', 'eventId=r2'], 'no field but the real ones');

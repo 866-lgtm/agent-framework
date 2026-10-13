@@ -4794,7 +4794,7 @@ export class AgentFramework {
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) {
         console.error(
-          `[inference-refusal] reaction skipped: no MCPL server for locus "${incoming.channelId}" (agent=${agentName})`,
+          `[inference-refusal] reaction skipped: no MCPL server for locus ${logValue(incoming.channelId)} (agent=${agentName})`,
         );
         return;
       }
@@ -7287,7 +7287,7 @@ export class AgentFramework {
         });
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Failed to spawn conversation agent for ${event.channelId}:`, err);
+        console.error(`Failed to spawn conversation agent for ${logValue(event.channelId)}:`, err);
         this.emitTrace({
           type: 'mcpl:conversation-spawn-failed',
           channelId: event.channelId,
@@ -8073,7 +8073,7 @@ export class AgentFramework {
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
       return true;
     } catch (err) {
-      console.error(`[coalescing] could not remove unread message ${logValue(p.messageId)} for ${agent.name}:`, err);
+      console.error(`[coalescing] could not remove unread message ${p.messageId} for ${agent.name}:`, err);
       return false;
     }
   }
@@ -8153,7 +8153,7 @@ export class AgentFramework {
       const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
-      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
+      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
 
     if (event.triggerInference) {

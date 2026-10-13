@@ -17,7 +17,7 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './mock-mem
 export const TS = '2026-09-30T00:00:00Z';
 export const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
 
-export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown> } = {}) {
+export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown>; mcpl?: Record<string, unknown> } = {}) {
   const wss = new WebSocketServer({ port: options.port ?? 0, host: '127.0.0.1' });
   await once(wss, 'listening');
   let online = true;
@@ -41,6 +41,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
           version: '0.5', pushEvents: true, inferenceRequest: true,
           channels: { incoming: true, register: true, lifecycle: true, publish: true },
           featureSets: options.featureSets ?? { doc: { description: 'doc', uses: ['pushEvents'] } },
+          ...options.mcpl,
         } } }, serverInfo: { name: 'editor', version: '1' } });
       } else if (m.method === 'featureSets/update') reply({ accepted: true });
       else if (m.method === 'tools/list') reply({ tools: [] });

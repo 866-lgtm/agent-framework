@@ -235,7 +235,7 @@ export class PushHandler {
         : 'Feature set validation failed';
       // Loud rejection — a rejected push event is an agent that silently
       // never hears the message. (2026-07-09 diagnosability pass.)
-      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId)} reason=${logValue(reason)}`);
+      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=${logValue(reason)}`);
       if (err instanceof McplFeatureSetError && responder?.respondError) {
         responder.respondError(err.code, reason, { featureSet: err.featureSet });
       } else {
@@ -281,7 +281,7 @@ export class PushHandler {
     // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
     // gets its original result, which this set could not return).
     if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
-      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId)} reason=duplicate`);
+      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=duplicate`);
       responder?.respond({ accepted: false, reason: 'duplicate' });
       return;
     }
@@ -386,13 +386,14 @@ export class PushHandler {
     });
   }
 
-  /** Loud, like every other push rejection: the producer's wake went nowhere. */
+  /** Loud, like every other push rejection: the producer's wake went nowhere.
+   *  A missing eventId prints as `""` and traces as `''`, as on every push line. */
   private traceEmptyRejection(serverId: string, params: PushEventParams): void {
-    console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId)} reason=empty-content`);
+    console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=empty-content`);
     this.emitTraceFn({
       type: 'mcpl:push-event-rejected',
       serverId,
-      eventId: params.eventId,
+      eventId: typeof params.eventId === 'string' ? params.eventId : '',
       featureSet: params.featureSet,
       reason: 'empty-content',
     });
