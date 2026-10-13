@@ -24,6 +24,7 @@ import type {
   TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 
 const MODULE_STATE_PREFIX = 'modules/';
 
@@ -47,6 +48,15 @@ export function isStateExistsError(err: unknown): boolean {
 const MAX_CONTEXT_TIMEOUT_MS = 30_000;
 
 /**
+ * Bound on each module's onToolBatchComplete. The hook runs inside the
+ * framework's sequential event loop, so a wedged module would stall every
+ * agent's events, not just its own round; past this the round goes on without
+ * it. A module with its own semantic deadline (the workspace scan's) sets it
+ * below this one, so it can record the miss itself.
+ */
+export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
+
+/**
  * Registered speech handler.
  */
 interface SpeechHandler {
@@ -60,7 +70,11 @@ interface SpeechHandler {
  * Registry for managing modules.
  */
 export class ModuleRegistry {
+  /** Each module's tool-batch hook still running, past its bound or not. */
+  private batchHooksRunning = new Map<string, Promise<unknown>>();
+
   private modules: Map<string, Module> = new Map();
+  private stopping = new Map<Module, Promise<void>>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
@@ -173,9 +187,7 @@ export class ModuleRegistry {
       throw new Error(`Module not found: ${name}`);
     }
 
-    await module.stop();
-    this.modules.delete(name);
-    this.moduleContexts.delete(name);
+    await this.stopModule(module);
   }
 
   /**
@@ -306,14 +318,32 @@ export class ModuleRegistry {
   }
 
   /**
-   * Stop all modules.
+   * Stop all modules. A caller may bound its wait without cancelling cleanup.
+   * The default waits for each module's own shutdown contract.
    */
-  async stopAll(): Promise<void> {
-    const stopPromises = Array.from(this.modules.values()).map((m) => m.stop());
-    await Promise.all(stopPromises);
-    this.modules.clear();
-    this.moduleContexts.clear();
-    this.speechHandlers = [];
+  async stopAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    validateShutdownTimeout(timeoutMs);
+    await waitForShutdown(Array.from(this.modules.values(), module => ({
+      label: `module:${module.name}`, promise: this.stopModule(module),
+    })), timeoutMs);
+  }
+
+  private stopModule(module: Module): Promise<void> {
+    const existing = this.stopping.get(module);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => module.stop()).then(() => {
+      if (this.modules.get(module.name) === module) {
+        this.modules.delete(module.name);
+        this.moduleContexts.delete(module.name);
+        this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+      }
+      this.stopping.delete(module);
+    }, error => {
+      this.stopping.delete(module);
+      throw error;
+    });
+    this.stopping.set(module, attempt);
+    return attempt;
   }
 
   /**
@@ -395,6 +425,57 @@ export class ModuleRegistry {
 
     await Promise.all(promises);
     return injections;
+  }
+
+  /**
+   * Tell modules an agent's tool batch completed (see
+   * Module.onToolBatchComplete). Hooks run in parallel, each awaited up to
+   * `timeoutMs`; a hook that throws or times out is logged and skipped, so a
+   * wedged module can't hold the round. Returns the modules that didn't
+   * finish, for the caller's trace.
+   */
+  async notifyToolBatchComplete(
+    agentName: string,
+    timeoutMs = TOOL_BATCH_HOOK_TIMEOUT_MS,
+  ): Promise<Array<{ module: string; error: string }>> {
+    const failures: Array<{ module: string; error: string }> = [];
+    const promises: Promise<void>[] = [];
+    for (const module of this.modules.values()) {
+      if (!module.onToolBatchComplete) continue;
+      // A hook still running from an earlier batch (it outlasted its bound)
+      // isn't called again or waited for: a wedged module costs one bound,
+      // not one per batch.
+      if (this.batchHooksRunning.has(module.name)) {
+        failures.push({ module: module.name, error: 'still running from an earlier batch' });
+        continue;
+      }
+      // Called from a promise, so a hook that throws synchronously, before
+      // returning its promise, is caught below like any other failure
+      // instead of escaping the round (the result would never be provided).
+      const call = Promise.resolve().then(() => module.onToolBatchComplete!(agentName));
+      this.batchHooksRunning.set(module.name, call);
+      const settled = (): void => {
+        if (this.batchHooksRunning.get(module.name) === call) this.batchHooksRunning.delete(module.name);
+      };
+      call.then(settled, settled);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      promises.push(
+        Promise.race([
+          call,
+          new Promise<void>((_, rej) => {
+            timer = setTimeout(() => rej(new Error(`onToolBatchComplete timed out after ${timeoutMs}ms`)), timeoutMs);
+          }),
+        ])
+          .catch((err: unknown) => {
+            const error = err instanceof Error ? err.message : String(err);
+            failures.push({ module: module.name, error });
+            console.error(`[${module.name}] onToolBatchComplete:`, err);
+          })
+          .finally(() => clearTimeout(timer)),
+      );
+    }
+    await Promise.all(promises);
+    return failures;
   }
 
   /**
