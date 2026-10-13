@@ -165,6 +165,13 @@ export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt' | 're
   return referenceExpiry(t, nowMs) !== null;
 }
 
+/** Each expiry case as the stub and the fetcher's refusal both say it. */
+export const EXPIRY_REASON = {
+  passed: 'expired: its expiresAt has passed',
+  unparseable: 'treated as expired: its expiresAt does not parse (fail closed)',
+  rejected: `treated as expired: its expiresAt was rejected as a field, over ${REFERENCE_LIMITS.expiresAt} characters or not a string (fail closed)`,
+} as const;
+
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
  *  embeddings, overrides, isolates, and the Arabic letter mark); bound length.
  *  Labels are labels — storage naming is host-generated elsewhere (§7.3). */
@@ -276,6 +283,12 @@ export const referenceRegistry = new ReferenceRegistry();
 // Stub building (§5)
 // ============================================================================
 
+/** A reference's claimed type as its stub shows it, or '' when nothing is
+ *  left of it once sanitized (the stub then leaves it out). */
+export function referenceTypeLabel(t: Pick<ReferenceTestimony, 'mimeType'>): string {
+  return t.mimeType ? sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) : '';
+}
+
 /**
  * Build the model-visible stub for a reference. Output length is bounded by
  * host constants and independent of every server-supplied field length.
@@ -290,7 +303,7 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
   if (name) parts.push(name);
   const meta: string[] = [];
-  const mimeType = t.mimeType ? sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) : '';
+  const mimeType = referenceTypeLabel(t);
   if (mimeType) meta.push(mimeType);
   if (t.sizeBytes !== undefined) meta.push(`${formatSizeBytes(t.sizeBytes)} claimed`);
   if (meta.length) parts.push(meta.join(', '));
@@ -301,7 +314,10 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
     // workspace path (host-generated, §7.3) so existing tools just work.
     parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
   } else {
-    parts.push('fetch with fetch_reference');
+    // An expired reference says so rather than inviting a fetch_reference
+    // call the fetcher can only refuse.
+    const expiry = referenceExpiry(record.testimony);
+    parts.push(expiry ? EXPIRY_REASON[expiry] : 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
 }

@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -2535,14 +2535,17 @@ export class AgentFramework {
    *  says fetch_reference instead of a path. */
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
-    const fetcher = this.getReferenceFetcher();
-    const eligible: import('./mcpl/references.js').ReferenceRecord[] = [];
+    // Register every block first. The registry keys records by uri, so a uri
+    // the result repeats is one record, judged once, on the testimony its
+    // last block left.
+    const records = new Set<import('./mcpl/references.js').ReferenceRecord>();
     for (const block of content) {
       const c = classifyBlock(block);
-      if (c.kind !== 'reference') continue;
-      const record = referenceRegistry.register(c.testimony, serverId);
-      if (eager && fetcher.isEagerEligible(record)) eligible.push(record);
+      if (c.kind === 'reference') records.add(referenceRegistry.register(c.testimony, serverId));
     }
+    if (!eager) return;
+    const fetcher = this.getReferenceFetcher();
+    const eligible = [...records].filter((record) => fetcher.isEagerEligible(record));
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -15565,6 +15568,7 @@ export class AgentFramework {
       | {
         kind: 'reference';
         refId: string;
+        /** The type as the stub shows it (a label), lowercased: `image/…`. */
         mediaType: string;
         toolCallId: string;
         toolName: string;
@@ -15618,10 +15622,16 @@ export class AgentFramework {
             };
           }
           if (candidate.kind === 'reference') {
+            // As the stub does, an unfetched reference the fetcher would
+            // refuse as expired says so instead of pointing at fetch_reference.
+            const record = referenceRegistry.get(candidate.refId);
+            const expiry = record && !record.fetchedPath ? referenceExpiry(record.testimony) : null;
             throw new Error(
-              `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${sanitizeLabel(candidate.mediaType, 120)}, ` +
+              `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
-              'Fetch it with fetch_reference and save the materialized file instead.',
+              (expiry
+                ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
+                : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }
           if (candidate.ref === null) {
@@ -15734,12 +15744,16 @@ export class AgentFramework {
               continue;
             }
             // Reference stub: the registry's testimony (when this process
-            // still has the record) says whether it was an image; the
-            // sniffed stub text is the fallback. Non-image references
-            // are not slots.
-            const testimony = referenceRegistry.get(ph.refId)?.testimony.mimeType?.toLowerCase() ?? ph.mediaType;
-            if (!testimony || !testimony.startsWith('image/')) continue;
-            consider({ kind: 'reference', refId: ph.refId, mediaType: testimony, toolCallId, toolName, messagesBack });
+            // still has the record) says whether it was an image, read as
+            // the stub shows it, since the stub's text is all a restart
+            // leaves; the sniffed stub text is the fallback. Non-image
+            // references are not slots.
+            const record = referenceRegistry.get(ph.refId);
+            const mediaType = record?.testimony.mimeType !== undefined
+              ? referenceTypeLabel(record.testimony).toLowerCase()
+              : ph.mediaType;
+            if (!mediaType || !mediaType.startsWith('image/')) continue;
+            consider({ kind: 'reference', refId: ph.refId, mediaType, toolCallId, toolName, messagesBack });
           }
         };
 
@@ -15792,10 +15806,14 @@ export class AgentFramework {
               };
               if (block?.type === 'image') {
                 const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
+                // The sender's word, shown in the receipt and stored with the
+                // file, so it's taken as a label; with nothing left of it, it
+                // counts as absent.
+                const claimed = block.source?.mediaType;
                 consider({
                   kind: 'attachment',
                   data: inline ? block.source!.data! : null,
-                  mediaType: block.source?.mediaType ?? 'image/png',
+                  mediaType: (typeof claimed === 'string' ? sanitizeLabel(claimed, REFERENCE_LIMITS.mimeType) : '') || 'image/png',
                   messagesBack,
                 });
               } else if (block?.type === 'tool_result' && typeof block.content === 'string') {

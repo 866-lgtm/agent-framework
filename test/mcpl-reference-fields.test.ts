@@ -107,6 +107,32 @@ test('the stub shows every server label without controls, and leaves out one tha
   assert.ok(buildReferenceStub(testimony).includes('saved: scratch/refs/evil.bin'));
 });
 
+test('the stub leaves out a type, or a provenance, that sanitizes to nothing', () => {
+  const typeGone = reference('resource', { uri: 'https://example.test/stub-type-gone', mimeType: '\u202E\u061C', sizeBytes: 10 }).testimony;
+  const typeStub = buildReferenceStub(typeGone, 'from a tool');
+  assert.equal(typeStub, `[${referenceRegistry.findByUri(typeGone.uri)!.refId}] 10B claimed — from a tool — fetch with fetch_reference`);
+  const originGone = reference('resource', { uri: 'https://example.test/stub-origin-gone', mimeType: 'image/png' }).testimony;
+  const originStub = buildReferenceStub(originGone, '\u2066\u0085\u2069');
+  assert.equal(originStub, `[${referenceRegistry.findByUri(originGone.uri)!.refId}] image/png — fetch with fetch_reference`);
+});
+
+test("an expired reference's stub says why, where a live one's advises fetch_reference", () => {
+  const cases = [['2001-01-01T00:00:00Z', /expired: its expiresAt has passed/], ['not-a-date', /treated as expired: its expiresAt does not parse/],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /treated as expired: its expiresAt was rejected as a field/]] as const;
+  for (const [i, [expiresAt, why]] of cases.entries()) {
+    const { testimony } = reference('resource', { uri: `https://example.test/stub-expired-${i}`, expiresAt });
+    const stub = buildReferenceStub(testimony);
+    assert.match(stub, why);
+    assert.ok(!stub.includes('fetch_reference'), stub);
+  }
+  const live = reference('resource', { uri: 'https://example.test/stub-live', expiresAt: '2999-01-01T00:00:00Z' }).testimony;
+  assert.match(buildReferenceStub(live), /\] fetch with fetch_reference$/);
+  // A copy saved before its expiry passed is still served, and its stub says where.
+  const saved = reference('resource', { uri: 'https://example.test/stub-expired-0', expiresAt: '2001-01-01T00:00:00Z' }).testimony;
+  referenceRegistry.findByUri(saved.uri)!.fetchedPath = 'scratch/refs/kept.png';
+  assert.match(buildReferenceStub(saved), /\] saved: scratch\/refs\/kept\.png$/);
+});
+
 test('display labels lose every bidi control, the Arabic letter mark included', () => {
   const controls = ['\u061C', '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069'];
   for (const ch of controls) {

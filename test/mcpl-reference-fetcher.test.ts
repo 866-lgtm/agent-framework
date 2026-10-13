@@ -9,7 +9,8 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { ReferenceFetcher, normalizedOrigin } from '../src/mcpl/reference-fetcher.js';
-import { ReferenceRegistry, classifyBlock } from '../src/mcpl/references.js';
+import { ReferenceRegistry, classifyBlock, referenceExpiry, referenceRegistry } from '../src/mcpl/references.js';
+import { AgentFramework } from '../src/framework.js';
 
 const PAYLOAD = Buffer.from('RIFF-not-really-a-wav-'.repeat(100));
 const DIGEST = 'sha256:' + createHash('sha256').update(PAYLOAD).digest('base64url');
@@ -27,6 +28,13 @@ const server = createServer((req, res) => {
   } else if (url.pathname === '/untyped') {
     // no content-type header, and bytes no sniffer recognizes
     res.writeHead(200); res.end(Buffer.from('plain bytes, nothing to sniff'));
+  } else if (url.pathname === '/octet-untyped') {
+    // a header type with no extension of its own, over bytes no sniffer recognizes
+    res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(Buffer.from('plain bytes, nothing to sniff'));
+  } else if (url.pathname === '/c1-typed') {
+    // a header type carrying a C1 control (sent as the Latin-1 byte 0x85),
+    // over bytes no sniffer recognizes
+    res.writeHead(200, { 'content-type': 'text/pl\u0085ain; charset=utf-8' }); res.end(Buffer.from('plain bytes, nothing to sniff'));
   } else if (url.pathname === '/liar') {
     // claims small in testimony, streams big (vector 10)
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
@@ -123,11 +131,13 @@ test('third-party origin refused (v1 policy: dialed origin only)', async () => {
   assert.match(out.error!, /third-party origin/);
 });
 
-test('vector 16: expired (and unparseable-expiry) references refuse locally', async () => {
+test('vector 16: expired (and unparseable-expiry) references refuse locally, and take no eager slot', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: ORIGIN } });
   for (const [expiresAt, why] of [['2001-01-01T00:00:00Z', /has passed/], ['not-a-date', /does not parse/]] as const) {
-    const rec = makeRecord(reg, `${ORIGIN}/ok?e=${expiresAt}`, { expiresAt });
+    // Small, sized and from the dialed origin: only its expiry keeps it from the eager default.
+    const rec = makeRecord(reg, `${ORIGIN}/ok?e=${expiresAt}`, { expiresAt, sizeBytes: PAYLOAD.length });
+    assert.equal(f.isEagerEligible(rec), false, `${expiresAt}: the eager default would only be refused`);
     const out = await f.fetch(rec);
     assert.equal(out.ok, false);
     assert.match(out.error!, /expired/);
@@ -170,6 +180,114 @@ test('a claimed type that neither the bytes nor a header override reaches the re
   assert.equal(out.ok, true, out.error);
   assert.equal(out.mimeType, 'text/plain', 'fetch_reference shows it as a label is shown');
   assert.equal(saved.at(-1)!.mime, 'text/plain');
+});
+
+test('a claimed type that sanitizes to nothing counts as absent: octet-stream, saved as .bin', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/untyped?claim=empty`, { mimeType: '\u202E\u061C' });
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.mimeType, 'application/octet-stream');
+  assert.equal(saved.at(-1)!.mime, 'application/octet-stream');
+  assert.equal(rec.fetchedPath, `scratch/refs/${rec.refId}.bin`);
+});
+
+test('the response header type is shown as a label is shown, wherever it names the saved type', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/c1-typed`);
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.mimeType, 'text/plain', "fetch_reference's mime_type");
+  assert.equal(saved.at(-1)!.mime, 'text/plain', 'the saved type');
+  assert.equal(rec.verifiedMimeType, 'text/plain', "the record's verified type, which a later fetch serves");
+  assert.equal(rec.fetchedPath, `scratch/refs/${rec.refId}.txt`, 'its extension comes from the label');
+});
+
+test("where the bytes and header name no extension, the claimed type names it as its label reads", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/octet-untyped`, { mimeType: 'text/\u202Eplain' });
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.mimeType, 'application/octet-stream', 'the header names the type');
+  assert.equal(rec.fetchedPath, `scratch/refs/${rec.refId}.txt`);
+});
+
+test("a server's type naming an Object.prototype member saves as .bin, not as inherited text", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/untyped?claim=constructor`, { mimeType: 'constructor' });
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(rec.fetchedPath, `scratch/refs/${rec.refId}.bin`);
+});
+
+test('a copy saved earlier is still served once its expiry has passed or reads as rejected', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const readings = {
+    passed: { expiresAt: '2001-01-01T00:00:00Z' },
+    rejected: { expiresAt: undefined, rejectedFields: ['expiresAt'] },
+  };
+  for (const [reading, testimony] of Object.entries(readings)) {
+    const rec = makeRecord(reg, `${ORIGIN}/ok?saved=${reading}`, { expiresAt: '2999-01-01T00:00:00Z' });
+    const first = await f.fetch(rec);
+    assert.equal(first.ok, true, first.error);
+    // Its expiry now reads as one the fetcher refuses: the clock passed it,
+    // or the record's testimony changed while its fetch was in flight.
+    Object.assign(rec.testimony, testimony);
+    assert.equal(referenceExpiry(rec.testimony), reading);
+    lastAuth = 'untouched';
+    const again = await f.fetch(rec);
+    assert.equal(again.ok, true, `${reading}: ${again.error}`);
+    assert.equal(again.path, first.path, reading);
+    assert.equal(lastAuth, 'untouched', `${reading}: served from the saved copy, with nothing dialed`);
+  }
+});
+
+/** The framework's eager default, autoFetchReferences, run over `content`
+ *  as a tool result from server `srv`, with this file's fetcher. It
+ *  registers in the process-wide referenceRegistry, so each test's uris are
+ *  its own. */
+async function eagerFetch(content: unknown[]): Promise<void> {
+  const fetcher = makeFetcher({ srv: { url: ORIGIN } });
+  const framework = Object.create(AgentFramework.prototype) as {
+    getReferenceFetcher(): ReferenceFetcher;
+    autoFetchReferences(content: unknown[], serverId: string, eager: boolean): Promise<void>;
+  };
+  framework.getReferenceFetcher = () => fetcher;
+  await framework.autoFetchReferences(content, 'srv', true);
+}
+
+test('the eager default skips expired references, so the live ones after them get its slots', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  // Nine small references from the dialed origin, the first three expired:
+  // passed, unparseable and rejected as a field.
+  const expired = ['2001-01-01T00:00:00Z', 'not-a-date', 'x'.repeat(65)].map((expiresAt, i) => (
+    { type: 'resource', uri: `${ORIGIN}/ok?eager-expired=${i}`, sizeBytes: PAYLOAD.length, expiresAt }));
+  const live = Array.from({ length: 6 }, (_, i) => (
+    { type: 'resource', uri: `${ORIGIN}/ok?eager-live=${i}`, sizeBytes: PAYLOAD.length }));
+  await eagerFetch([...expired, ...live]);
+  for (const block of live) {
+    assert.ok(referenceRegistry.findByUri(block.uri)?.fetchedPath, `${block.uri} took an eager slot`);
+  }
+  for (const block of expired) {
+    assert.equal(referenceRegistry.findByUri(block.uri)?.fetchedPath, undefined, `${block.uri} took none`);
+  }
+  const refusals = errors.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('[rfc005]'));
+  assert.deepEqual(refusals, [], 'no refused fetch is logged');
+});
+
+test('a uri the result repeats takes one eager slot', async () => {
+  // Eight distinct small references, the first sent twice: nine blocks.
+  const blocks = Array.from({ length: 8 }, (_, i) => (
+    { type: 'resource', uri: `${ORIGIN}/ok?eager-distinct=${i}`, sizeBytes: PAYLOAD.length }));
+  await eagerFetch([blocks[0], ...blocks]);
+  for (const block of blocks) {
+    assert.ok(referenceRegistry.findByUri(block.uri)?.fetchedPath, `${block.uri} took an eager slot`);
+  }
 });
 
 test('per-server budget exhausts cumulatively', async () => {
