@@ -7880,7 +7880,7 @@ export class AgentFramework {
         this.persistConversationRouterState();
         return [decision.agentName];
       } catch (err) {
-        console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
+        console.error(`[coalescing] could not spawn a conversation agent for ${logValue(occ.scope.id)}:`, err);
         return [];
       }
     }

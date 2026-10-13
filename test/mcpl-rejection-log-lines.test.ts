@@ -279,6 +279,23 @@ test('a conversation agent that fails to spawn names its channel as one field', 
   assert.deepEqual(traces.map((e) => e.type), ['mcpl:conversation-spawn-failed']);
 });
 
+test('a coalesced batch whose conversation agent fails to spawn names its channel as one field', async (t) => {
+  const lines = captureConsoleError(t);
+  const fakeThis = {
+    agents: new Map(),
+    conversationRouter: {
+      getBinding: () => undefined,
+      route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }),
+    },
+    channelRegistry: { getDescriptor: () => undefined },
+    createConversationAgent: async () => { throw new Error('no room'); },
+  };
+  const audience = (AgentFramework.prototype as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> }).coalescedAudience;
+  const occ = { scope: { kind: 'channel', id: FORGED_CHANNEL }, event: { lane: 'channel', event: { metadata: {} } } };
+  assert.deepEqual(await audience.call(fakeThis, occ), []);
+  assert.deepEqual(lines, [`[coalescing] could not spawn a conversation agent for ${field(FORGED_CHANNEL)}: Error: no room`]);
+});
+
 test('a refusal line prints for a channel\'s first refusal, then at most once a minute with how many were held back', () => {
   let now = 1_000;
   const lines = new RefusalLines(() => now);
