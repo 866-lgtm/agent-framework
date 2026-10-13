@@ -163,7 +163,8 @@ export class Agent {
   private readonly compilesRunning = new Set<number>();
   /**
    * For each budget, the start of the latest-started compile that has ended
-   * there, whether or not what it showed was credited. Of two compiles at one
+   * there with a fit or a refusal, whether or not what it showed was
+   * credited. Of two compiles at one
    * budget, the later-started one planned at the newer store, so an
    * earlier-started one that ends after it is ignored, with or without
    * injections. An entry is kept only while a compile that started before it
@@ -386,11 +387,12 @@ export class Agent {
   }
 
   /**
-   * Whether the compile that started as the `started`th is the latest to end
-   * at `budget`, taking that place if so: one that started before a compile
-   * that has already ended there is ignored, whichever finishes last.
+   * Claim the place of the latest compile to end at `budget` for the one that
+   * started as the `started`th, and say whether it got it: a compile that
+   * started before one that has already ended there is ignored, whichever
+   * finishes last.
    */
-  private endsLatestAt(budget: number, started: number): boolean {
+  private claimLatestAt(budget: number, started: number): boolean {
     if (started < (this.latestEndedStart.get(budget) ?? 0)) return false;
     this.latestEndedStart.set(budget, started);
     return true;
@@ -442,7 +444,7 @@ export class Agent {
       // changed while it ran: the record's marker for it is withdrawn, and
       // nothing is credited, unless a compile that started later has already
       // ended at that budget.
-      if (this.endsLatestAt(live, started)) this.noteCompiledBudget(live, false, epoch);
+      if (this.claimLatestAt(live, started)) this.noteCompiledBudget(live, false, epoch);
       // A budget a boot restore applied at once, refused at its first test,
       // before anything wrote the budget: restore it paced instead, as the
       // boot would have without its proof, and compile again from the
@@ -474,13 +476,14 @@ export class Agent {
     // the compile proves the budget it planned at. Either only if the live
     // budget didn't change while it ran; a settle of a descent armed while it
     // ran proves nothing (the next compile at the target does).
-    // A compile that ends here takes its place in the start order at the
-    // budget it planned at, credited or not.
-    const latest = this.endsLatestAt(live, started);
+    // A compile that ends here with a fit takes its place in the start order
+    // at the budget it planned at, credited or not; a settle credits its
+    // target only from the latest compile to end there.
+    const latest = this.claimLatestAt(live, started);
     const sameLive = this.liveBudgetEpoch === epoch;
     const sameDescent = this.descentEpoch === descent;
     const settled = this.settleRuntimeSettingsTransition();
-    if (sameLive && settled && sameDescent && this.endsLatestAt(this.contextBudgetTokens!, started)) {
+    if (latest && sameLive && settled && sameDescent && this.claimLatestAt(this.contextBudgetTokens!, started)) {
       this.noteCompiledBudget(this.contextBudgetTokens!, true, this.liveBudgetEpoch);
     } else if (latest && sameLive && !settled) this.noteCompiledBudget(live, true, epoch);
     return result;
