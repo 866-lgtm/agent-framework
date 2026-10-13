@@ -1630,14 +1630,16 @@ export class AgentFramework {
     });
 
     // Initialize module registry with callbacks
-    this.moduleRegistry = new ModuleRegistry(store, this.queue, {
+    // A module's events, through pushEvent() or its deprecated queue handle,
+    // go through pushModuleEvent(), which names the module.
+    this.moduleRegistry = new ModuleRegistry(store, { push: (event, moduleName) => this.pushModuleEvent(event, moduleName, false) }, {
       getAgents: () => Array.from(this.agents.values()),
       addMessage: (p, c, m) => this.addMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter) => this.queryMessages(filter),
-      pushEvent: (event) => this.pushEvent(event),
+      pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
@@ -2665,6 +2667,23 @@ export class AgentFramework {
     }
     this.queue.push(event);
     this.emitTrace({ type: 'process:received', processEvent: event });
+  }
+
+  /**
+   * A module's event. stop() closes the queue before it stops modules, so a
+   * module's event can arrive after that: from a listener that fires while
+   * stop() runs, or from the module's own stop(). Nothing will process it, and
+   * where it comes from nothing could catch a throw, so it's dropped with a
+   * log line naming the module. Otherwise it's queued as pushEvent() queues
+   * it, or, through the deprecated queue handle, without the trace.
+   */
+  private pushModuleEvent(event: ProcessEvent, moduleName: string | undefined, traced: boolean): void {
+    if (this.queue.isClosed) {
+      console.error(`[framework] a '${event.type}' event from module ${moduleName ?? '(unnamed)'} arrived after stop() began — dropped`);
+      return;
+    }
+    if (traced) this.pushEvent(event);
+    else this.queue.push(event);
   }
 
   /**

@@ -26,6 +26,12 @@ import type {
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 
+/** How the registry queues a module's event: its push names the module. A
+ * `ProcessQueue` serves too, ignoring the name. */
+export interface ModuleQueue {
+  push(event: ProcessEvent, moduleName?: string): void;
+}
+
 const MODULE_STATE_PREFIX = 'modules/';
 
 /**
@@ -78,7 +84,7 @@ export class ModuleRegistry {
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
-  private queue: ProcessQueue;
+  private queue: ModuleQueue;
   private getAgents: () => Agent[];
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
@@ -86,7 +92,7 @@ export class ModuleRegistry {
   private getMessageFn: (id: MessageId) => StoredMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
 
-  private pushEventFn: (event: ProcessEvent) => void;
+  private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
   /** Framework ops-alert channel, surfaced to modules via
@@ -101,7 +107,7 @@ export class ModuleRegistry {
 
   constructor(
     store: JsStore,
-    queue: ProcessQueue,
+    queue: ModuleQueue,
     options: {
       getAgents: () => Agent[];
       addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
@@ -109,7 +115,8 @@ export class ModuleRegistry {
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => StoredMessage | null;
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
-      pushEvent: (event: ProcessEvent) => void;
+      /** Called with the pushing module's name. */
+      pushEvent: (event: ProcessEvent, moduleName?: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
@@ -528,7 +535,7 @@ class ModuleContextImpl implements ModuleContext {
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => StoredMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
-  private pushEventFn: (event: ProcessEvent) => void;
+  private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
 
@@ -539,7 +546,7 @@ class ModuleContextImpl implements ModuleContext {
     moduleName: string,
     store: JsStore,
     stateId: string,
-    queue: ProcessQueue,
+    queue: ModuleQueue,
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
@@ -548,14 +555,15 @@ class ModuleContextImpl implements ModuleContext {
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => StoredMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
-    pushEvent: (event: ProcessEvent) => void,
+    pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
     callTool: (call: ToolCall) => Promise<ToolResult>
   ) {
     this.moduleName = moduleName;
     this.store = store;
     this.stateId = stateId;
-    this.queue = queue;
+    // The deprecated handle: a push names this module, as pushEvent() does.
+    this.queue = { push: (event) => queue.push(event, moduleName) };
     this.registry = registry;
     this.isRestart = isRestart;
     this.getAgentsFn = getAgents;
@@ -738,7 +746,7 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   pushEvent(event: ProcessEvent): void {
-    this.pushEventFn(event);
+    this.pushEventFn(event, this.moduleName);
   }
 
   private persistExternalIdMap(): void {
