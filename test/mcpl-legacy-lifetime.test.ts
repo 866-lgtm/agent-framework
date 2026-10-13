@@ -139,7 +139,7 @@ test('a close that cannot reap fails, and so do concurrent ones; a later close r
   assert.deepEqual(settled, [], 'neither resolves while the teardown is pending');
   await Promise.all([first, second]);
   assert.equal(settled.length, 2);
-  assert.match(settled[0]!, /^first:stdio child \d+ did not exit within \d+ms of SIGKILL; it could not be reaped/);
+  assert.match(settled[0]!, /^first:stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped/);
   assert.match(settled[1]!, /^second:.*could not be reaped/, 'the second shares the attempt and its verdict, rather than claiming success');
   await killAndWait(stuck[0]!);
   await connection.close();
@@ -355,7 +355,7 @@ test('a WebSocket dial whose connection is closed meanwhile ends at once, not at
 test("a write to a stdio child that has just exited is reported, never thrown", (t) => {
   const child = Object.assign(new EventEmitter(), { stdin: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null });
   const rl = new EventEmitter();
-  const transport = new (StdioTransport as unknown as new (c: unknown, r: unknown) => StdioTransport)(child, rl);
+  const transport = new (StdioTransport as unknown as new (id: string, c: unknown, r: unknown) => StdioTransport)('legacy', child, rl);
   const logged: unknown[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args); });
   const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });

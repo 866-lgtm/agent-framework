@@ -324,7 +324,7 @@ test('a child that cannot be reaped fails close() explicitly, never a claimed ex
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
   cleanups.push(() => { realKill('SIGKILL'); });
-  await assert.rejects(transport.close(), /did not exit within 2000ms of SIGKILL; it could not be reaped/);
+  await assert.rejects(transport.close(), /^Error: stdio child \d+ of MCP server "stuck" did not exit within 2000ms of SIGKILL; it could not be reaped$/);
   // Calls share the one attempt and its verdict.
   await assert.rejects(transport.close(), /could not be reaped/);
 });
@@ -571,16 +571,17 @@ test('close() during a connect waits for that connect\'s own cleanup, and report
   const statics = ModernMcpConnection as unknown as { closeSession: (session: unknown) => Promise<Error | null> };
   const real = statics.closeSession;
   let closes = 0;
+  const unconfirmed = new Error('the child could not be confirmed gone (simulated)');
   // close() closes the generation first; the connect's own cleanup closes it
   // again, and that second close is the one that can't confirm the exit.
   statics.closeSession = async (session: unknown) => {
     const verdict = await real.call(ModernMcpConnection, session);
-    return ++closes === 2 ? new Error('the child could not be confirmed gone (simulated)') : verdict;
+    return ++closes === 2 ? unconfirmed : verdict;
   };
   cleanups.push(() => { statics.closeSession = real; });
   const starting = connection.start();
   await until(() => wire(log).some((e) => e.method === 'server/discover'), 'the launch waiting on discover');
-  await assert.rejects(connection.close(), /did not close cleanly: the child could not be confirmed gone \(simulated\)/);
+  await assert.rejects(connection.close(), (error) => error === unconfirmed, 'the failure itself, as the MCPL engine rethrows one');
   assert.equal(closes, 2, 'close() resolved only after the connect\'s own cleanup');
   await starting;
   statics.closeSession = real;

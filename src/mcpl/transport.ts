@@ -172,6 +172,8 @@ export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
 
   private constructor(
+    /** The server this child serves, named in what its reaping reports. */
+    private readonly serverId: string,
     private readonly child: ChildProcess,
     private readonly rl: ReadlineInterface,
   ) {
@@ -215,7 +217,7 @@ export class StdioTransport extends McplTransport {
       env: buildChildEnv(config),
     });
     const rl = createInterface({ input: child.stdout! });
-    return new StdioTransport(child, rl);
+    return new StdioTransport(config.id, child, rl);
   }
 
   writeLine(json: string): void {
@@ -261,11 +263,12 @@ export class StdioTransport extends McplTransport {
     });
     child.kill('SIGTERM');
     if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
-    console.error(`[mcpl] stdio child ${child.pid} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
+    const named = `stdio child ${child.pid} of MCP server "${this.serverId}"`;
+    console.error(`[mcpl] ${named} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
     child.kill('SIGKILL');
     if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
     throw new Error(
-      `stdio child ${child.pid} did not exit within ${STDIO_EXIT_GRACE_MS}ms of SIGKILL; it could not be reaped`,
+      `${named} did not exit within ${STDIO_EXIT_GRACE_MS}ms of SIGKILL; it could not be reaped`,
     );
   }
 }

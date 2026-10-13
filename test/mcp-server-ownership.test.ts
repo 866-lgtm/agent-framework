@@ -302,8 +302,8 @@ test('stop() closes every connection, keeps the ones it cannot reap registered, 
   await assert.rejects(framework.stop(), (error) => {
     assert.ok(error instanceof AggregateError, String(error));
     assert.equal(error.errors.length, 2, 'one failure from each engine');
-    assert.match(error.message, /MCP server "m" did not close cleanly: .*could not be reaped/);
-    assert.match(error.message, /stdio child \d+ did not exit within \d+ms of SIGKILL; it could not be reaped/);
+    assert.match(error.message, /stdio child \d+ of MCP server "m" did not exit within \d+ms of SIGKILL; it could not be reaped/);
+    assert.match(error.message, /stdio child \d+ of MCP server "l" did not exit within \d+ms of SIGKILL; it could not be reaped/);
     return true;
   });
   const internals = framework as unknown as {
@@ -318,6 +318,25 @@ test('stop() closes every connection, keeps the ones it cannot reap registered, 
   await framework.stop();
   assert.equal(internals.modernServers().has('m'), false);
   assert.equal(internals.mcplServerRegistry.getServer('l'), null);
+});
+
+test('a teardown that cannot confirm the exit traces no close; the retry that confirms it traces one, on both engines', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const closed: string[] = [];
+    framework.onTrace((event) => { if (event.type === 'mcpl:server-closed') closed.push(event.serverId); });
+    const reaping = unreapable();
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
+    await Promise.all(['m', 'l'].map((id) => assert.rejects(
+      framework.disconnectMcplServer(id),
+      new RegExp(`stdio child \\d+ of MCP server "${id}" did not exit .*stays registered, closed`),
+    )));
+    assert.deepEqual(closed, [], 'neither is traced closed while its child may still be running');
+    for (const stuck of reaping.stuck) await killAndWait(stuck);
+    await framework.disconnectMcplServer('m');
+    await framework.disconnectMcplServer('l');
+    assert.deepEqual(closed.sort(), ['l', 'm'], 'each is traced closed once, by the retry that confirms its exit');
+  });
 });
 
 test("stop()'s teardown budget bounds a modern server's close too, and the server stays registered while its close is pending", async () => {

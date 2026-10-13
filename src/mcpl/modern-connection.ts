@@ -786,12 +786,19 @@ export class ModernMcpConnection extends EventEmitter {
   /** The close in flight, which later calls wait behind. */
   private closing: Promise<void> | null = null;
 
+  /** Set when the host closes a live session; cleared, with the one
+   *  'close', by the close that confirms its teardown. */
+  private closeIncomplete = false;
+
   /**
    * Close for good: no reconnect, no reopened subscription, no connect left
-   * in flight. Awaits the in-flight connect's end, and rejects if a child
-   * could not be reaped. Calls queue behind the one in flight, so none
-   * resolves while teardown is still pending. A call after a failed close
-   * re-checks what wasn't reaped.
+   * in flight. Awaits the in-flight connect's end, and rejects while a child
+   * can't be confirmed exited: with that failure itself, the transport's
+   * own error, or an AggregateError when there are several, as the MCPL
+   * engine does. Calls queue behind the one in flight, so none resolves
+   * while teardown is still pending. A call after a failed close re-checks
+   * what wasn't reaped. 'close' is emitted once, when the teardown of a
+   * session the host closed while live completes, not on a failed close.
    */
   close(): Promise<void> {
     const previous = this.closing;
@@ -808,6 +815,7 @@ export class ModernMcpConnection extends EventEmitter {
     const opening = this.opening;
     const session = this.session;
     this.session = null;
+    if (session) this.closeIncomplete = true;
     // Every generation this connection still owns: a connect in flight, the
     // live one, and any a failed cleanup couldn't reap.
     const targets: Session[] = [];
@@ -832,9 +840,13 @@ export class ModernMcpConnection extends EventEmitter {
       await opening.done;
       for (const held of this.unreaped) if (!failures.includes(held.failure)) failures.push(held.failure);
     }
-    if (session) this.emit('close', { reason: 'closed by host' });
-    if (failures.length > 0) {
-      throw new Error(`MCP server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `MCP server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
+    }
+    if (this.closeIncomplete) {
+      this.closeIncomplete = false;
+      this.emit('close', { reason: 'closed by host' });
     }
   }
 

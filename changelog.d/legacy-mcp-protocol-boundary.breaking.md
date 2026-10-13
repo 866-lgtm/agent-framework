@@ -28,10 +28,10 @@
   about 1 ms, so every request timed out at once. Every value that worked,
   `0` included, passes.
 - **Hosts:** `stop()` now rejects, after its whole teardown, when an MCP
-  server's child couldn't be confirmed exited, naming each such child.
-  Before, closing a stdio server returned as soon as a signal was sent, so
-  `stop()` never failed for this. Code that chains work on `stop()`, such as
-  exiting a TUI or switching sessions, should catch that rejection: the
-  framework is stopped either way. As with any failed teardown, an owned
-  store stays open, and a later `stop()` retries the reap, completing once
-  the child has exited.
+  server's child couldn't be confirmed exited, naming each such child and
+  its server. Before, closing a stdio server returned as soon as a signal
+  was sent, so `stop()` never failed for this. Code that chains work on
+  `stop()`, such as exiting a TUI or switching sessions, should catch that
+  rejection: the framework is stopped either way. As with any failed
+  teardown, an owned store stays open, and a later `stop()` retries the
+  reap, completing once the child has exited.
