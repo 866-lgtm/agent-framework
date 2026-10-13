@@ -314,6 +314,8 @@ supports, or its error text when it lists none, and when the list includes
 `2026-07-28` it says to configure the server with `protocol: 'modern'` (stdio)
 or reach it over http(s).
 
+Server and transport diagnostics recorded by the framework remove known credentials from the configured URL and static `token`. This covers connection traces, console errors, stderr traces and ops alerts, plus transport failures returned by modern tool calls. Credential-like URL path segments and query names, credential-shaped or credential-named query values, and WebSocket userinfo are replaced in their encoded and decoded forms. Other non-empty query parameters are replaced as whole `name=value` strings. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. The cached token from an `accessProvider` and secrets the framework does not know remain outside this filtering. JSON-RPC tool answers and direct host connection errors pass through as sent.
+
 #### Feature sets
 
 `enabledFeatureSets` and `disabledFeatureSets` select which of a server's

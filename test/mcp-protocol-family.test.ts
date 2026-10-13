@@ -13,6 +13,7 @@ import {
   serverConfigWarnings,
   checkServerConfig,
   redactUrl,
+  redactServerText,
   describeCredentialError,
   MCPL_ONLY_POLICY_FIELDS,
   MAX_TIMER_MS,
@@ -293,4 +294,37 @@ test('both engines admit a configuration through checkServerConfig, which logs i
   } finally {
     console.warn = realWarn;
   }
+});
+
+test('recorded server text removes encoded and decoded URL credentials as exact strings', () => {
+  const config = cfg({ url: 'https://h/api/s/secret%2B0123456789/mcp?password=p%2Bassw0rd%21&bare%2Bsecret0123456789&plain=value0123456789abcdef&region=eu&label=a%20b' });
+  const secrets = ['secret%2B0123456789', 'secret+0123456789', 'p%2Bassw0rd%21', 'p+assw0rd!', 'bare%2Bsecret0123456789', 'bare+secret0123456789', 'value0123456789abcdef', 'region=eu', 'label=a%20b', 'label=a b'];
+  for (const secret of secrets) assert.equal(redactServerText(`queue full: ${secret}; eu`, config), 'queue full: redacted; eu', secret);
+});
+
+test('recorded server text removes WebSocket userinfo and the static token, escaping regex characters', () => {
+  const config = cfg({ url: 'wss://user%2B12345678:pass%2B12345678@h/mcp', token: 'token.[1234]' });
+  for (const secret of ['user%2B12345678', 'user+12345678', 'pass%2B12345678', 'pass+12345678', config.token!]) {
+    assert.equal(redactServerText(`error: ${secret}`, config), 'error: redacted');
+  }
+  assert.equal(redactServerText('tokenX11234]', config), 'tokenX11234]');
+  assert.equal(redactServerText('static-token123', cfg({ token: 'static-token123' })), 'redacted');
+  assert.equal(redactServerText('static-token123', cfg({ url: 'invalid', token: 'static-token123' })), 'redacted');
+});
+
+test('recorded server text keeps short standalone values and unrelated words, but removes whole query pairs', () => {
+  const config = cfg({ url: 'https://h/mcp?auth=x&token=auth&region=eu&debug', token: 'x' });
+  assert.equal(redactServerText('auth x eu queue full debug', config), 'auth x eu queue full debug');
+  assert.equal(redactServerText('auth=x token=auth region=eu', config), 'redacted redacted redacted');
+  assert.equal(redactServerText('1234567 12345678', cfg({token:'1234567'})), '1234567 12345678');
+  assert.equal(redactServerText('12345678', cfg({token:'12345678'})), 'redacted');
+});
+
+test('recorded server text uses longest-first, one-pass replacements and is idempotent', () => {
+  const config = cfg({ url: 'https://h/mcp?secret=token0123456789-tail&redacted=eu', token: 'token0123456789' });
+  const original = 'secret=token0123456789-tail token0123456789 redacted=eu queue full';
+  const clean = redactServerText(original, config);
+  assert.equal(clean, 'redacted redacted redacted queue full');
+  assert.equal(redactServerText('token0123456789-tail', config), 'redacted');
+  assert.equal(redactServerText(clean, config), clean);
 });

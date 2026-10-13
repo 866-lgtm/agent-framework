@@ -14,6 +14,10 @@ import assert from 'node:assert/strict';
 import { createServer as createHttpServer, type Server, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { join, dirname } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { AgentFramework } from '../src/framework.js';
+import { MockMembrane } from './helpers/mock-membrane.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { AddressInfo } from 'node:net';
 
@@ -180,4 +184,55 @@ test('HTTP: an auth wall on a later round of a call is a no-response, since the 
   });
   assert.equal(states[0], undefined, 'the first round carried no state');
   assert.ok(states.length >= 2 && states.slice(1).every((s) => s === 'state-1'), `each later round carried it: ${JSON.stringify(states)}`);
+});
+
+test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-RPC error is the server answer', async (t) => {
+  const consoleLines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
+  const secret = 'pathSecret0123456789';
+  let rpc = true;
+  const { url, server } = await startServer(() => true, (message, res) => {
+    if (message.method !== 'tools/call') return false;
+    if (rpc) {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: secret } }));
+    } else {
+      res.writeHead(500, { 'content-type': 'text/plain' }).end(`Cannot POST /api/mcp/s/${secret}/mcp`);
+    }
+    return true;
+  });
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  const connection = await ModernMcpConnection.connect({ id: 'remote', url: url.replace('/mcp', `/api/mcp/s/${secret}/mcp`) });
+  cleanups.push(() => connection.close());
+  await assert.rejects(connection.callTool('echo', {}), (error: unknown) => {
+    assert.ok(error instanceof McplRequestError);
+    assert.match(error.message, new RegExp(secret));
+    assert.equal(error.outcome, 'error-response');
+    return true;
+  });
+  rpc = false;
+  await assert.rejects(connection.callTool('echo', {}), (error: unknown) => {
+    assert.ok(error instanceof McplRequestError);
+    assert.match(error.message, /Cannot POST \/api\/mcp\/s\/redacted\/mcp/);
+    assert.ok(!error.message.includes(secret));
+    assert.equal(error.outcome, 'no-response');
+    return true;
+  });
+  assert.ok(consoleLines.some(line => line.includes('Cannot POST /api/mcp/s/redacted/mcp')));
+  assert.ok(!consoleLines.join('\n').includes(secret));
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-tool-transport-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
+    modules: [],
+    mcplServers: [{ id: 'remote', url: url.replace('/mcp', `/api/mcp/s/${secret}/mcp`) }],
+  });
+  try {
+    const result = await framework.executeToolCall({ id: 'echo-failed', name: 'mcpl--remote--echo', input: {} });
+    assert.equal(result.success, false);
+    assert.match(result.error!, /Cannot POST \/api\/mcp\/s\/redacted\/mcp/);
+    assert.ok(!JSON.stringify(result).includes(secret), 'the model-facing tool result contains no path credential');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -19,6 +19,7 @@ import {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
   checkServerConfig,
+  redactServerText,
 } from './protocol-family.js';
 
 import type {
@@ -870,12 +871,12 @@ export class McplServerConnection extends EventEmitter {
       // not lost in the window before wireMcplEvents runs.
       if (error instanceof McplUnreapedLaunchError) {
         const halted = error.connection;
-        console.error(`MCPL server "${config.id}" initial connect failed, not retrying:`, error.message);
+        console.error(`MCPL server "${config.id}" initial connect failed, not retrying:`, redactServerText(error.message, config));
         halted.emit('connect-failed', { error: `${(error.cause as Error).message}; ${halted.unreapedFailure()}`, attempt: 0, permanent: true });
         return halted;
       }
       // Non-blocking start: create a disconnected stub that will reconnect in background
-      console.error(`MCPL server "${config.id}" initial connect failed, will retry:`, (error as Error).message);
+      console.error(`MCPL server "${config.id}" initial connect failed, will retry:`, redactServerText((error as Error).message, config));
       const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
       stub.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
       stub.scheduleReconnect();
@@ -1331,7 +1332,7 @@ export class McplServerConnection extends EventEmitter {
       // Closed by the host meanwhile: not a failed attempt.
       if (signal.aborted) return;
       const failure = unreaped ? error.failure : errorOf(error);
-      console.error(`MCPL server "${this.id}" reconnect failed:`, failure.message);
+      console.error(`MCPL server "${this.id}" reconnect failed:`, redactServerText(failure.message, this.config ?? {}));
       this.reconnectAttempts = attempt + 1;
       // No common protocol revision: every further attempt would restart the
       // server to hear the same answer. Stop retrying; the configuration is

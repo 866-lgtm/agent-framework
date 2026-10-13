@@ -60,7 +60,7 @@ import {
 
 import { StdioTransport, type McplTransport } from './transport.js';
 import { McplProtocolVersionError, McplRequestError } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, redactServerText } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -365,7 +365,7 @@ export class ModernMcpConnection extends EventEmitter {
     // An 'error' with no listener would throw out of an SDK callback and take
     // the host down; out-of-band errors here are diagnostics, never fatal.
     this.on('error', (error: Error) => {
-      if (this.listenerCount('error') === 1) console.error(`[mcp] ${this.id}: ${error.message}`);
+      if (this.listenerCount('error') === 1) console.error(`[mcp] ${this.id}: ${redactServerText(error.message, this.config)}`);
     });
     this.on('newListener', (event: string | symbol) => {
       if (event !== 'stderr' || this.stderrBacklog.length === 0) return;
@@ -463,7 +463,7 @@ export class ModernMcpConnection extends EventEmitter {
         this.emit('connect-failed', { error: `${(error as Error).message}; ${halted}`, attempt: 0, permanent: true });
         return;
       }
-      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, (error as Error).message);
+      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, redactServerText((error as Error).message, this.config));
       this.reconnectAttempts = 1;
       this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
       this.scheduleReconnect();
@@ -884,7 +884,7 @@ export class ModernMcpConnection extends EventEmitter {
    */
   private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number): Error {
     const prefix = `MCP server "${this.id}"`;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = redactServerText(error instanceof Error ? error.message : String(error), this.config);
     const advice = record.method === 'tools/list'
       ? 'Listing changes nothing on the server, so it is safe to retry.'
       : 'Verify state before retrying; a blind retry of a side-effecting tool may duplicate it.';

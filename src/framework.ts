@@ -394,7 +394,7 @@ import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { redactUrl, resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
+import { redactUrl, redactServerText, resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import type {
   McplServerConfig,
@@ -13479,7 +13479,8 @@ export class AgentFramework {
         }
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Failed to connect MCPL server "${config.id}":`, err.message);
+        const message = redactServerText(err.message, config);
+        console.error(`Failed to connect MCPL server "${config.id}":`, message);
         // Reaching this catch means no stub was created, so nothing will
         // retry — except in the edge case where addServer succeeded (with a
         // reconnecting stub) and a later setup step threw; config.reconnect
@@ -13487,7 +13488,7 @@ export class AgentFramework {
         this.emitTrace({
           type: 'mcpl:server-connect-failed',
           serverId: config.id,
-          error: err.message,
+          error: message,
           attempt: 0,
           // A protocol-version verdict is never retried (no common revision;
           // only configuration can fix it), and neither is a configuration
@@ -13498,7 +13499,7 @@ export class AgentFramework {
         // So the server doesn't vanish quietly: alert at once, as the
         // reconnect path does for the same verdict, since no attempt follows.
         if (error instanceof McplProtocolVersionError) {
-          this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${err.message}`);
+          this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${message}`);
         }
       }
     }
@@ -14026,7 +14027,7 @@ export class AgentFramework {
         // and holds the id: nothing launches beside it, and a disconnect
         // retries the reap.
         const message = cleanup instanceof Error ? cleanup.message : String(cleanup);
-        this.emitTrace({ type: 'mcpl:server-error', serverId: config.id, error: message });
+        this.emitTrace({ type: 'mcpl:server-error', serverId: config.id, error: redactServerText(message, config) });
         if (this.modernServers().get(config.id) === modern) {
           throw AgentFramework.unreapedConnectFailure(config.id, new Error(`${reason.message}; its cleanup also failed: ${message}`, { cause: reason }));
         }
@@ -14750,10 +14751,12 @@ export class AgentFramework {
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection): void {
+    const config = this.mcplServerConfigs.get(connection.id) ?? {};
+    const recorded = (text: string): string => redactServerText(text, config);
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.
     connection.on('stderr', (params: { line: string }) => {
-      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: params.line });
+      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });
 
     // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
@@ -14971,21 +14974,21 @@ export class AgentFramework {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
-        error: params.error,
+        error: recorded(params.error),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
       // `permanent`: the failed launch couldn't be reaped, so no retry will
       // start beside it. Alert now, as for a permanent reconnect failure.
       if (params.permanent) {
-        this.opsAlert('mcpl-down', connection.id, `MCPL server unreachable (attempt ${params.attempt}): ${params.error}`);
+        this.opsAlert('mcpl-down', connection.id, `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
       }
     });
     connection.on('reconnect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
-        error: params.error,
+        error: recorded(params.error),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
@@ -15000,7 +15003,7 @@ export class AgentFramework {
         this.opsAlert(
           'mcpl-down',
           connection.id,
-          `MCPL server unreachable (attempt ${params.attempt}): ${params.error}`,
+          `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`,
         );
       }
     });
@@ -15032,7 +15035,7 @@ export class AgentFramework {
       this.emitTrace({
         type: 'mcpl:server-error',
         serverId: connection.id,
-        error: err.message,
+        error: recorded(err.message),
       });
     });
 
@@ -15077,8 +15080,10 @@ export class AgentFramework {
    * MCPL data-plane traffic, which this family doesn't carry.
    */
   private wireModernEvents(connection: ModernMcpConnection): void {
+    const config = this.mcplServerConfigs.get(connection.id) ?? {};
+    const recorded = (text: string): string => redactServerText(text, config);
     connection.on('stderr', (params: { line: string }) => {
-      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: params.line });
+      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });
     connection.on('tools-list-changed', () => {
       this.handleToolsListChanged(connection.id);
@@ -15092,20 +15097,20 @@ export class AgentFramework {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
-        error: params.error,
+        error: recorded(params.error),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
       // `permanent`: reconnecting halted on a launch that couldn't be reaped.
       // No later attempt will come, so alert now.
       if (params.permanent || params.attempt >= 5) {
-        this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${params.error}`);
+        this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
       }
     };
     connection.on('connect-failed', failed);
     connection.on('reconnect-failed', failed);
     connection.on('error', (err: Error) => {
-      this.emitTrace({ type: 'mcpl:server-error', serverId: connection.id, error: err.message });
+      this.emitTrace({ type: 'mcpl:server-error', serverId: connection.id, error: recorded(err.message) });
     });
     connection.on('close', () => {
       // A closed provider's class hints are stale (RFC-008), as for MCPL.
@@ -15224,7 +15229,7 @@ export class AgentFramework {
         this.emitTrace({
           type: 'mcpl:server-error',
           serverId: server.id,
-          error: `tools/list failed: ${error instanceof Error ? error.message : String(error)}`,
+          error: `tools/list failed: ${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}`,
         });
       }
     }

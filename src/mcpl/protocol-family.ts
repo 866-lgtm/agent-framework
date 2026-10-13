@@ -108,6 +108,65 @@ export function redactUrl(url: string | undefined): string {
 }
 
 /**
+ * Server/transport diagnostics as the framework records them. Replace only
+ * known URL credential strings and the configured static token, in their
+ * encoded and decoded forms. Short standalone strings (under 8 characters)
+ * are indistinguishable from ordinary words; short query values are removed
+ * as name=value instead. A single longest-first replacement never scans its
+ * own replacement text. Unknown secrets, including accessProvider's cached
+ * bearer token, are outside this contract. JSON-RPC tool answers and errors
+ * thrown directly to a host caller keep their separate pass-through contract.
+ */
+export function redactServerText(text: string, config: Pick<McplServerConfig, 'url' | 'token'>): string {
+  const secrets = new Set<string>();
+  const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
+  const decode = (value: string, query = false): string => {
+    try { return decodeURIComponent(query ? value.replace(/\+/g, ' ') : value); }
+    catch { return value; }
+  };
+  standalone(config.token ?? '');
+  let url: URL | undefined;
+  try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
+  if (url) {
+    for (const segment of url.pathname.split('/')) {
+      if (credentialLikeSegment(segment)) {
+        standalone(segment);
+        standalone(decode(segment));
+      }
+    }
+    for (const parameter of url.search.slice(1).split('&')) {
+      const equals = parameter.indexOf('=');
+      const encodedName = equals < 0 ? parameter : parameter.slice(0, equals);
+      const encodedValue = equals < 0 ? '' : parameter.slice(equals + 1);
+      const name = decode(encodedName, true);
+      const value = decode(encodedValue, true);
+      if (credentialLikeQueryName(name, value)) {
+        standalone(encodedName);
+        standalone(name);
+      }
+      if (CREDENTIAL_PARAM.test(name) || credentialLikeSegment(value)) {
+        standalone(encodedValue);
+        standalone(value);
+      }
+      if (value !== '') {
+        secrets.add(`${encodedName}=${encodedValue}`);
+        secrets.add(`${name}=${value}`);
+      }
+    }
+    if (url.protocol === 'ws:' || url.protocol === 'wss:') {
+      for (const value of [url.username, url.password]) {
+        standalone(value);
+        standalone(decode(value));
+      }
+    }
+  }
+  if (secrets.size === 0) return text;
+  const alternatives = [...secrets].sort((a, b) => b.length - a.length)
+    .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return text.replace(new RegExp(alternatives.join('|'), 'g'), 'redacted');
+}
+
+/**
  * A credential provider's failure as a log line may show it: the error's
  * class and its message's length, never the text, which may quote the
  * credential it failed to refresh.
