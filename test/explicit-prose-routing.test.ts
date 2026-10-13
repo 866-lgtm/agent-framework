@@ -192,6 +192,9 @@ describe('explicit prose routing', () => {
     assert.equal(routed.length, 1, 'only the prefixed resend delivered');
     assert.equal(routed[0]!.locus, 'discord:dm:99', 'delivered to the DM the model named');
     assert.equal(routed[0]!.text, original, '{{unsent}} substitution is verbatim');
+    const notices = context(framework).texts.filter((t) => t.startsWith('[prose-routing]'));
+    assert.ok(notices.length > 0, 'the bounce notice is in the context');
+    assert.ok(notices.every((t) => !t.includes('Two words through the keyhole')), `the bounce notice quotes none of the words: ${notices.join(' | ')}`);
 
     await framework.stop();
   });
