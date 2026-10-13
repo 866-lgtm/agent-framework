@@ -293,7 +293,8 @@ export function validateCoalescedContent(
  * channel-registry.ts) show a block as itself, its text or its image or
  * audio source, or as a reference stub, and not as a placeholder: an
  * unrecognized block, a no-data or no-media-type one, or withheld inline
- * data. This follows their branches in their order.
+ * data. A text block whose text isn't a string, which they show as no text,
+ * is refused too. This follows their branches in their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';

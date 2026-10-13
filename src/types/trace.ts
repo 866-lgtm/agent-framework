@@ -217,16 +217,17 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
-  /** A push/event refused at the MCPL boundary for visibly-empty content
-   *  (`empty-content`, answered -32602), or a coalesced occurrence the host
-   *  refused. A refused occurrence's reason follows the code the producer
-   *  was answered with: `coalesce-invalid` when the occurrence was the
-   *  producer's to fix (-32602 malformed; -32017 or -32023 for a channel not
-   *  permitted or not registered), `coalesce-failed` when the host itself
-   *  failed (-32000, -32603). It carries the error's message in `detail`, and
-   *  the failing `field` when the error names one. A missing `eventId` is
-   *  traced as `''`. A push refused for its feature set, or as a duplicate,
-   *  gets a `[push-event-rejected]` line and no trace. */
+  /** A push/event refused at the MCPL boundary: visibly-empty content
+   *  (`empty-content`, answered -32602, with no `field` or `detail`), or a
+   *  coalesced occurrence the host refused. A refused occurrence's reason
+   *  follows the code the producer was answered with: `coalesce-invalid` when
+   *  the occurrence was the producer's to fix (-32602 malformed; -32017 or
+   *  -32023 for a channel not permitted or not registered), `coalesce-failed`
+   *  when the host itself failed (-32000, -32603). Its trace carries the
+   *  error's message in `detail`, and the failing `field` when the error
+   *  names one. An `eventId` that is missing or isn't a string is traced as
+   *  `''`. A push refused for its feature set, or as a duplicate, gets a
+   *  `[push-event-rejected]` line and no trace. */
   | (TraceEventBase & {
       type: 'mcpl:push-event-rejected';
       serverId: string;
