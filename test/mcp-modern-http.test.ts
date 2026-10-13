@@ -6,11 +6,12 @@
  * - credentials: a cached bearer from `accessProvider`, refreshed once on 401;
  * - the required headers reach the server;
  * - a deadline aborts the request stream, which the server sees as cancellation;
- * - an auth wall is an `error-response` carrying the HTTP status.
+ * - an auth wall is an `error-response` carrying the HTTP status, unless an
+ *   earlier round of the call was answered, when it is a `no-response`.
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer as createHttpServer, type Server } from 'node:http';
+import { createServer as createHttpServer, type Server, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -24,7 +25,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 interface Seen { method: string; auth: string | null; version: string | null; mcpMethod: string | null; mcpName: string | null }
 
-async function startServer(accepted: (token: string | null) => boolean): Promise<{ url: string; seen: Seen[]; events: string[]; server: Server }> {
+/** A JSON-RPC request a test answers itself, at the HTTP layer, where an SDK
+ *  server can't be made to answer as the case needs. True once answered. */
+type HandAnswer = (message: { method?: unknown; id?: unknown; params?: Record<string, unknown> }, res: ServerResponse) => boolean;
+
+async function startServer(accepted: (token: string | null) => boolean, answer?: HandAnswer): Promise<{ url: string; seen: Seen[]; events: string[]; server: Server }> {
   const { createServer } = await import(pathToFileURL(join(here, 'fixtures', 'modern-tools.mjs')).href) as {
     createServer: (opts: { log: (line: string) => void }) => unknown;
   };
@@ -46,6 +51,11 @@ async function startServer(accepted: (token: string | null) => boolean): Promise
     }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (answer && req.method === 'POST') {
+      let message: unknown;
+      try { message = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { message = undefined; }
+      if (message !== null && typeof message === 'object' && !Array.isArray(message) && answer(message as never, res)) return;
+    }
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
       if (typeof value === 'string') headers.set(key, value);
@@ -137,4 +147,37 @@ test('HTTP: an auth wall on a call is an error-response with the status in data'
     assert.equal((err.data as { httpStatus?: number }).httpStatus, 401);
     return true;
   });
+});
+
+test('HTTP: an auth wall on a later round of a call is a no-response, since the first round may have acted', async () => {
+  // The SDK server can't be made to ask for another round, so `cont`, which
+  // it doesn't list, is answered here: a state-only input_required for the
+  // first round, then 401 for every later one.
+  const states: unknown[] = [];
+  const { url, server } = await startServer(() => true, (message, res) => {
+    if (message.method !== 'tools/call' || message.params?.name !== 'cont') return false;
+    const state = message.params.requestState;
+    states.push(state);
+    if (state === undefined) {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        jsonrpc: '2.0', id: message.id, result: { resultType: 'input_required', requestState: 'state-1' },
+      }));
+    } else {
+      res.writeHead(401, { 'content-type': 'text/plain' }).end('unauthorized');
+    }
+    return true;
+  });
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  const connection = await ModernMcpConnection.connect({ id: 'remote', url, token: 't' });
+  cleanups.push(() => connection.close());
+  await assert.rejects(connection.callTool('cont', {}), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError);
+    // Not the error-response a refused first round gets: the server took
+    // the first round, and may have acted on it.
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /asked for another round \(input_required\), and the server refused a later one: HTTP 401/);
+    return true;
+  });
+  assert.equal(states[0], undefined, 'the first round carried no state');
+  assert.ok(states.length >= 2 && states.slice(1).every((s) => s === 'state-1'), `each later round carried it: ${JSON.stringify(states)}`);
 });
