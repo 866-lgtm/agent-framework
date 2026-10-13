@@ -57,7 +57,10 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   fw.opsAlertLastSent = new Map<string, number>();
   fw.opsAlertCooldownMs = 15 * 60_000;
   const traces: any[] = [];
-  fw.traceListeners = [(e: any) => traces.push(e)];
+  // Subscribed as a caller does, so the harness holds whatever form the
+  // framework keeps its listeners in.
+  fw.traceListeners = [];
+  fw.onTrace((e: any) => traces.push(e));
   const logged: Array<Record<string, unknown>> = [];
   fw.logFailure = (r: Record<string, unknown>) => logged.push(r);
   const markers: Array<{ text: string; meta: any }> = [];
