@@ -352,12 +352,84 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it(`${mode}: prose a turn leaves queued follows that turn's destination, and the next turn's posts wait behind it`, async () => {
+      // Round one names #alpha, and its post is held. Round two's unprefixed
+      // text queues behind it, following #alpha. skip_reply then ends the
+      // turn before either has posted, and the next turn starts at once and
+      // writes to #alpha too.
+      const arrows = mode === 'explicit' ? '>>' : '>>>';
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: `${arrows}#alpha first` },
+        { type: 'tool_use', id: 'q1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'and then this' },
+        { type: 'tool_use', id: 'q2', name: 'robot--move', input: { dir: 'south' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'q3', name: 'skip_reply', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+
+      const framework = await createFramework(mode);
+      feedTurn(framework, 2, [{ type: 'text', text: `${arrows}#alpha next` }] as ContentBlock[]);
+      const routed = stubRegistry(framework);
+      const skip = answerSkipReply(framework);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      const route = registry.routeSpeech as (agent: string, text: string, locus?: string | null) => Promise<unknown>;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      registry.routeSpeech = async (agent: string, text: string, locus?: string | null) => {
+        const outcome = await route(agent, text, locus);
+        if (text.trim() === 'first') await held;
+        return outcome;
+      };
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      // The scheduler runs on timers, so wait in time, polling.
+      const waitFor = async (done: () => boolean, ms: number) => {
+        for (const end = Date.now() + ms; !done() && Date.now() < end;) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        }
+      };
+
+      try {
+        trigger(framework);
+        // The first turn ends at skip_reply while 'first' is still held, so
+        // wait for that end rather than for the framework to go idle.
+        await waitFor(() => skip.calls >= 1, 5000);
+        await waitFor(() => false, 100);
+        assert.equal(skip.calls, 1, 'skip_reply ended the first turn');
+        trigger(framework);
+        await waitFor(() => turns >= 2, 5000);
+        assert.equal(turns, 2, 'the next turn starts without waiting');
+        await waitFor(() => false, 200);
+        assert.deepEqual(routed.map((r) => r.text.trim()), ['first'],
+          "the next turn's post waits behind the earlier turn's queued prose");
+
+        release();
+        await framework.runUntilIdle();
+        assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), [
+          { text: 'first', locus: 'chan-alpha' },
+          { text: 'and then this', locus: 'chan-alpha' },
+          { text: 'next', locus: 'chan-alpha' },
+        ], "the queued text follows its own turn's destination, and the posts keep their order");
+        assert.equal(context(framework).bounces, 0, 'nothing bounces into the next turn');
+      } finally {
+        release();
+        await framework.stop();
+      }
+    });
+  }
+
   it("a private round's ' !' leaves no continuation request behind", async () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
     const internals = framework as unknown as {
       deliverProse(agent: unknown, text: string, round?: { keepPrivate?: boolean }): Promise<void>;
-      proseContinuations: Set<string>;
+      turnRouting: Map<string, { continuation: boolean }>;
     };
     const agent = framework.getAgent('assistant')!;
 
@@ -365,12 +437,12 @@ describe('explicit prose routing', () => {
     // so the round's delivery can run once the next turn has begun.
     await internals.deliverProse(agent, '>>#alpha ! kept private', { keepPrivate: true });
     assert.equal(routed.length, 0, 'nothing is delivered');
-    assert.equal(internals.proseContinuations.has('assistant'), false, 'and no continuation is asked for');
+    assert.equal(internals.turnRouting.get('assistant')?.continuation ?? false, false, 'and no continuation is asked for');
 
     // The same envelope outside a private round asks for one.
     await internals.deliverProse(agent, '>>#alpha ! sent');
     assert.equal(routed.length, 1);
-    assert.equal(internals.proseContinuations.has('assistant'), true);
+    assert.equal(internals.turnRouting.get('assistant')?.continuation, true);
 
     await framework.stop();
   });
@@ -459,7 +531,7 @@ describe('explicit prose routing', () => {
       deliverProse(agent: unknown, text: string): Promise<void>;
       admitProse(text: string): unknown[];
       roundDestination(current: string | null, envelopes: unknown[]): string | null;
-      proseTargetPins: Map<string, string>;
+      turnRouting: Map<string, { pin?: string; destination: string | null; hybridHold: boolean; continuation: boolean }>;
     };
     const agent = framework.getAgent('assistant')!;
     const rounds: string[][] = [
@@ -472,11 +544,10 @@ describe('explicit prose routing', () => {
     try {
       for (const segments of rounds) {
         for (const start of [null, 'chan-alpha']) {
-          internals.proseTargetPins.clear();
-          if (start) internals.proseTargetPins.set('assistant', start);
+          internals.turnRouting.set('assistant', { pin: start ?? undefined, destination: null, hybridHold: false, continuation: false });
           for (const segment of segments) await internals.deliverProse(agent, segment);
           const admitted = segments.flatMap((segment) => internals.admitProse(segment));
-          assert.equal(internals.roundDestination(start, admitted), internals.proseTargetPins.get('assistant') ?? null,
+          assert.equal(internals.roundDestination(start, admitted), internals.turnRouting.get('assistant')?.pin ?? null,
             `${JSON.stringify(segments)} from ${start}`);
         }
       }

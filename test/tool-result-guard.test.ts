@@ -850,19 +850,22 @@ test("a fresh turn that delivers nothing still replaces an earlier turn's speech
   }
 });
 
-test("a fresh turn clears the sticky destination and the turn's destination in every mode", async () => {
+test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    const internals = h.framework as unknown as {
-      proseTurnDestinations: Map<string, string | null>;
-      proseTargetPins: Map<string, string>;
-    };
-    internals.proseTurnDestinations.set('assistant', 'chan-earlier');
-    internals.proseTargetPins.set('assistant', 'chan-earlier');
+    type Routing = { pin?: string; destination: string | null; hybridHold: boolean; continuation: boolean };
+    const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
+    const earlier: Routing = { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true, continuation: true };
+    internals.turnRouting.set('assistant', earlier);
     try {
       await h.run();
-      assert.equal(internals.proseTurnDestinations.has('assistant'), false, `${mode}: the turn's destination`);
-      assert.equal(internals.proseTargetPins.has('assistant'), false, `${mode}: the sticky destination`);
+      const now = internals.turnRouting.get('assistant');
+      assert.notEqual(now, earlier, `${mode}: the new turn has its own routing state`);
+      assert.equal(now?.pin, undefined, `${mode}: no sticky destination`);
+      assert.equal(now?.destination, null, `${mode}: no turn destination`);
+      assert.equal(now?.hybridHold, false, `${mode}: no hybrid hold`);
+      assert.equal(now?.continuation, false, `${mode}: no continuation`);
+      assert.equal(earlier.pin, 'chan-earlier', `${mode}: the earlier turn's state is left for its queued prose`);
     } finally {
       await h.framework.stop();
     }
