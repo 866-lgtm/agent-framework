@@ -397,6 +397,37 @@ describe('stop() with an operator operation in flight', () => {
     assert.equal(barriers, 0);
   });
 
+  for (const action of ['rollback', 'suppress'] as const) it('a ' + action + " whose branch move outlasts stop()'s budget still finishes, its awareness sync included", { timeout: 20_000 }, async () => {
+    // A stop() whose budget ran out has finished waiting, and a sync called
+    // from outside is refused from then on; one inside an operation already
+    // admitted isn't, since its branch has moved.
+    const framework = await create();
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: 'm' + n }]));
+    let finishMove!: () => void;
+    const moveHold = new Promise<void>((resolve) => { finishMove = resolve; });
+    if (action === 'rollback') {
+      const switchBranch = cm.switchBranch.bind(cm);
+      cm.switchBranch = async (...args: Parameters<typeof cm.switchBranch>) => { await moveHold; return switchBranch(...args); };
+    } else {
+      const fork = cm.fork.bind(cm);
+      cm.fork = async (...args: Parameters<typeof cm.fork>) => { await moveHold; return fork(...args); };
+    }
+    const surgery = action === 'rollback'
+      ? framework.rollbackToMessage('agent', { messageId: ids[0]! })
+      : framework.suppressMessages('agent', { messageIds: [ids[1]!] });
+    void surgery.catch(() => {});
+    try {
+      await assert.rejects(framework.stop(100), (error: unknown) =>
+        error instanceof ShutdownTimeoutError && error.pending.includes('surgery:' + (action === 'rollback' ? 'roll back' : 'suppress')));
+    } finally { finishMove(); }
+    const result = await surgery;
+    assert.ok(result.messagesRemoved > 0, JSON.stringify(result));
+    await framework.stop();
+    assert.equal(framework.getStore().isClosed(), true);
+    assert.deepEqual(rejections, []);
+  });
+
   it("an operation that outlasts stop()'s budget fails the stop and keeps the store open for a retry", async () => {
     const framework = await create();
     let deliver: (() => void) | undefined;
@@ -624,6 +655,26 @@ describe('stop() with an operator operation in flight', () => {
     await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /disk full/);
     assert.equal(framework.getStore().currentBranch().name, 'side');
     assert.equal((await api.cmdBranchCurrent()).name, 'side');
+    await framework.stop();
+  });
+
+  it('a branch switch during a live turn is refused, and the branch stays', async () => {
+    const framework = await create();
+    const api = new ApiServer(framework) as unknown as {
+      cmdBranchCreate(params: { name: string }): Promise<unknown>;
+      cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+      cmdBranchCurrent(): Promise<{ name: string }>;
+    };
+    await api.cmdBranchCreate({ name: 'side' });
+    // A turn holds its token from dequeue, before its stream registers.
+    const tokens = internals(framework).activeTurnTokens;
+    tokens.set('agent', -1);
+    try {
+      await assert.rejects(framework.switchBranch('side'), /^OperatorActionError: Cannot switch branch while agent is idle\+turn-alive/);
+      await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /Cannot switch branch while agent is idle\+turn-alive/);
+      assert.equal(framework.getStore().currentBranch().name, 'main');
+      assert.equal((await api.cmdBranchCurrent()).name, 'main');
+    } finally { tokens.delete('agent'); }
     await framework.stop();
   });
 

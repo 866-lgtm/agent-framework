@@ -5800,7 +5800,7 @@ export class AgentFramework {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
 
-    await this.syncDiscordAwarenessMarkers();
+    await this.runDiscordAwarenessSync();
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -6112,21 +6112,26 @@ export class AgentFramework {
    * markers with it, and re-materialize the config mount from it. Resolves
    * once all three have run. An operator's operation: refused once stop() has
    * begun, and waited for by stop() while it runs.
+   *
+   * The branch moves under every agent sharing the store, so the switch
+   * reserves the store as a surgery does: every agent must be idle, or it is
+   * refused (OperatorActionError 'agent-busy'), and no turn starts until all
+   * three steps are done.
    */
   async switchBranch(name: string): Promise<void> {
     this.refuseOperatorAfterStop('switch branch');
-    return this.trackOperatorOperation('branch:switch', () => this.runSwitchBranch(name));
-  }
-
-  /** switchBranch's work, run where stop() can wait for it. */
-  private async runSwitchBranch(name: string): Promise<void> {
-    this.store.switchBranch(name);
-    // Reversible Discord awareness markers are part of the branch projection.
-    // Don't acknowledge the switch until add/remove operations were attempted.
-    await this.syncDiscordAwarenessMarkers();
-    const ws = this.moduleRegistry.getModule('workspace');
-    if (ws && 'materializeMount' in ws) {
-      await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
+    const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    try {
+      this.store.switchBranch(name);
+      // Reversible Discord awareness markers are part of the branch projection.
+      // Don't acknowledge the switch until add/remove operations were attempted.
+      await this.runDiscordAwarenessSync();
+      const ws = this.moduleRegistry.getModule('workspace');
+      if (ws && 'materializeMount' in ws) {
+        await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
+      }
+    } finally {
+      release();
     }
   }
 
@@ -6512,7 +6517,7 @@ export class AgentFramework {
           );
         }
         if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-        await this.syncDiscordAwarenessMarkers();
+        await this.runDiscordAwarenessSync();
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6685,7 +6690,7 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        await this.syncDiscordAwarenessMarkers();
+        await this.runDiscordAwarenessSync();
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -14045,7 +14050,11 @@ export class AgentFramework {
    *  callers, such as the API server's undo and redo, have already changed the
    *  store and call it to finish that change, sometimes from inside a trace
    *  listener that started stop(). stop() waits for one admitted then. Once
-   *  stop() can no longer wait for it, it's refused. */
+   *  stop() can no longer wait for it, it's refused. An operation already
+   *  admitted (a surgery, a host/command undo, a branch switch) calls
+   *  runDiscordAwarenessSync() instead, which its own tracking covers, so a
+   *  stop() whose budget ran out doesn't refuse it partway, after its branch
+   *  has moved. */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
     if (this.operatorWaitEnded) throw new Error('awareness sync refused: the framework is stopping');
     return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));

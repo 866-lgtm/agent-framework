@@ -24,7 +24,9 @@
     the store when they call it: the API server's undo and redo call it
     after `undoLastTurn()` or `redo()`, sometimes from inside a trace
     listener that started `stop()`. `stop()` waits for a sync admitted then,
-    and refuses one that starts once it can no longer wait for it.
+    and refuses one that starts once it can no longer wait for it. An
+    operation already admitted runs its own sync without that check, so a
+    surgery whose branch move outlasted a budget still finishes.
   - `stop()` also waits for what those operations start while it waits: the
     config materialization that undo, redo and the two surgeries start
     without waiting for it themselves. The framework now logs a failed
