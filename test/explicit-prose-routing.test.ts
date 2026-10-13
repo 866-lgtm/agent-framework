@@ -22,9 +22,11 @@ import type {
   ToolDefinition,
   ToolCall,
   ToolResult,
+  InferenceRequest,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 class ToolboxModule implements Module {
@@ -223,6 +225,340 @@ describe('explicit prose routing', () => {
     assert.equal(bounceNotices.length, 0, 'skip_reply text never bounces');
 
     await framework.stop();
+  });
+
+  /** The registry stub answers skip_reply as the real registry does: the turn ends, and nothing is sent. */
+  function answerSkipReply(framework: AgentFramework): { calls: number } {
+    const answered = { calls: 0 };
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.handleChannelToolCall = async (name: string) => {
+      if (name === 'skip_reply') answered.calls++;
+      return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };
+    };
+    return answered;
+  }
+
+  /** What the registry stub's streaming surface receives (MCPL Spec 14.3 chunk and complete). */
+  function captureStream(framework: AgentFramework) {
+    const chunks: Array<{ channelId: string; delta: string }> = [];
+    const completes: Array<{ channelId: string; text: string }> = [];
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.sendOutgoingChunk = (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      chunks.push({ channelId, delta });
+    };
+    registry.sendOutgoingComplete = (channelId: string, _agent: string, _id: string, text: string) => {
+      completes.push({ channelId, text });
+    };
+    return { chunks, completes };
+  }
+
+  /** The texts of the agent's context, and the bounce notices among them. */
+  function context(framework: AgentFramework): { texts: string[]; bounces: number } {
+    const messages = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{
+      content: Array<{ type: string; text?: string }>;
+      metadata?: { kind?: string };
+    }>;
+    return {
+      texts: messages.flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '')),
+      bounces: messages.filter((m) => m.metadata?.kind === 'prose-bounce').length,
+    };
+  }
+
+  const clipboardOf = (framework: AgentFramework): string | undefined =>
+    (framework as unknown as { proseClipboards: Map<string, string> }).proseClipboards.get('assistant');
+
+  it('a round that calls skip_reply keeps its unprefixed prose private: nothing delivered, bounced, retained or woken for', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Weighing whether this needs an answer from me.' },
+      { type: 'tool_use', id: 'sr1', name: 'skip_reply', input: { reason: 'nothing to add' } },
+    ] as ContentBlock[], 'tool_use'));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+    // Were the text bounced, its wake would start a second turn: give that
+    // turn a response, so the test fails on its count instead of hanging.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the skip_reply round ran');
+    assert.equal(routed.length, 0, 'nothing is delivered');
+    const seen = context(framework);
+    assert.equal(seen.bounces, 0, 'no bounce notice reaches the context');
+    assert.ok(seen.texts.some((t) => t.includes('Weighing whether this needs an answer')), 'the text stays in the context');
+    assert.equal(clipboardOf(framework), undefined, 'nothing is retained for {{unsent}}');
+    assert.equal(turns, 1, 'no bounce wake starts another turn');
+
+    await framework.stop();
+  });
+
+  it('a round that calls skip_reply keeps its unprefixed prose from a sticky destination', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first, deliberately' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Second thoughts I keep to myself.' },
+      { type: 'tool_use', id: 'sr2', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the skip_reply round ran');
+    assert.deepEqual(routed, [{ text: 'first, deliberately', locus: 'chan-alpha' }],
+      'only the earlier, deliberately addressed segment goes out');
+    assert.ok(context(framework).texts.some((t) => t.includes('Second thoughts I keep to myself.')), 'the text stays in the context');
+
+    await framework.stop();
+  });
+
+  it('a round that calls skip_reply sends nothing, a prefixed segment included, and asks for no continuation', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha ! addressed, then thought better of' },
+      { type: 'tool_use', id: 'sr3', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+    // A continuation would start a second turn: give it a response, so the
+    // test fails on its count instead of hanging.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the skip_reply round ran');
+    assert.equal(routed.length, 0, 'skip_reply ends the turn without sending anything');
+    assert.equal(context(framework).bounces, 0);
+    assert.equal(turns, 1, "the round's ' !' starts no continuation after skip_reply ended the turn");
+
+    await framework.stop();
+  });
+
+  it("a private round's ' !' leaves no continuation request behind", async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const internals = framework as unknown as {
+      deliverProse(agent: unknown, text: string, round?: { keepPrivate?: boolean }): Promise<void>;
+      proseContinuations: Set<string>;
+    };
+    const agent = framework.getAgent('assistant')!;
+
+    // When skip_reply ends an explicit turn, the speech chain isn't awaited,
+    // so the round's delivery can run once the next turn has begun.
+    await internals.deliverProse(agent, '>>#alpha ! kept private', { keepPrivate: true });
+    assert.equal(routed.length, 0, 'nothing is delivered');
+    assert.equal(internals.proseContinuations.has('assistant'), false, 'and no continuation is asked for');
+
+    // The same envelope outside a private round asks for one.
+    await internals.deliverProse(agent, '>>#alpha ! sent');
+    assert.equal(routed.length, 1);
+    assert.equal(internals.proseContinuations.has('assistant'), true);
+
+    await framework.stop();
+  });
+
+  it('a skip_reply round that sets the retained text aside with >>skip_reply {{unsent}} clears it', async () => {
+    // Turn 1 bounces its text, which retains it and wakes turn 2.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'An answer with nowhere to go.' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+    feedTurn(framework, 2, [
+      { type: 'text', text: '>>skip_reply {{unsent}}' },
+      { type: 'tool_use', id: 'sr4', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use');
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 1, 'the bounce wake ran the skip_reply round');
+    assert.equal(routed.length, 0);
+    assert.equal(clipboardOf(framework), undefined, 'the retained text is set aside, as >>skip_reply {{unsent}} says');
+
+    await framework.stop();
+  });
+
+  it('explicit mode streams nothing before a destination: unprefixed text never reaches the trigger channel', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Unprefixed musing.\n>>#alpha streamed after the prefix' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubRegistry(framework);
+    const stream = captureStream(framework);
+    // The unprefixed line bounces, and its wake starts a second turn.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+
+    // A turn the trigger channel woke: chan-alpha is where its typing shows.
+    const internals = framework as unknown as {
+      pendingRequests: InferenceRequest[];
+      processInferenceRequests(): Promise<void>;
+    };
+    internals.pendingRequests.push({
+      agentName: 'assistant', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
+      channelId: 'chan-alpha', addressed: true,
+    });
+    await internals.processInferenceRequests();
+    await framework.runUntilIdle();
+
+    const streamed = stream.chunks.map((c) => c.delta).join('');
+    assert.ok(streamed.includes('streamed after the prefix'), 'prefixed text streams to its destination');
+    assert.equal(streamed.includes('Unprefixed musing.'), false, 'unprefixed text is never streamed');
+    assert.equal(stream.completes.some((c) => c.text.includes('Unprefixed musing.')), false,
+      'nor finalized by the stream complete');
+
+    await framework.stop();
+  });
+
+  it('the stream reads leading whitespace and a token\'s end as delivery does', async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as { deliverProse(agent: unknown, text: string): Promise<void> };
+    const agent = framework.getAgent('assistant')!;
+    const cases = ['  >>#alpha hello', '\u00a0>>#alpha hello', '\u2003>>#alpha hello', '\r>>#alpha hello', '\t>>#alpha\r\nhello'];
+    try {
+      for (const text of cases) {
+        routed.length = 0;
+        await gateway.deliverProse(agent, text);
+        const router = new ProseStreamRouter({
+          mode: 'explicit', initialTarget: null, resolve: (spec) => (spec === '#alpha' ? 'chan-alpha' : null),
+        });
+        const streamed = [...router.feed(text), ...router.finish()];
+        assert.deepEqual(routed.map((r) => r.locus), ['chan-alpha'], `delivery sends ${JSON.stringify(text)} to #alpha`);
+        assert.ok(streamed.length > 0 && streamed.every((d) => d.channelId === 'chan-alpha'),
+          `the stream sends ${JSON.stringify(text)} there too`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a round's destination, decided at its boundary, is the sticky destination its delivery leaves", async () => {
+    const framework = await createFramework();
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      deliverProse(agent: unknown, text: string): Promise<void>;
+      admitProse(text: string): unknown[];
+      roundDestination(current: string | null, envelopes: unknown[]): string | null;
+      proseTargetPins: Map<string, string>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const rounds: string[][] = [
+      ['>>#alpha first\n>>#alpha'],
+      ['  >>#alpha indented'],
+      ['>>#nowhere bounced'],
+      ['>>skip_reply kept\nand unprefixed'],
+      ['unprefixed', '>>#alpha second segment'],
+    ];
+    try {
+      for (const segments of rounds) {
+        for (const start of [null, 'chan-alpha']) {
+          internals.proseTargetPins.clear();
+          if (start) internals.proseTargetPins.set('assistant', start);
+          for (const segment of segments) await internals.deliverProse(agent, segment);
+          const admitted = segments.flatMap((segment) => internals.admitProse(segment));
+          assert.equal(internals.roundDestination(start, admitted), internals.proseTargetPins.get('assistant') ?? null,
+            `${JSON.stringify(segments)} from ${start}`);
+        }
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('hybrid: a `>>>` envelope with no target streams nothing, as delivery bounces it', async () => {
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as {
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean): Promise<void>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    // The registry's resolver trims its argument, as the router's must here.
+    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
+    const cases = ['>>>\r\nsecret', '>>>\nsecret', '>>>\u00a0#alpha secret', '>>> \u00a0#alpha secret'];
+    try {
+      for (const text of cases) {
+        routed.length = 0;
+        await gateway.deliverHybridProse(agent, text, 'chan-locus', true);
+        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
+        const streamed = [...router.feed(text), ...router.finish()];
+        assert.equal(routed.length, 0, `delivery bounces ${JSON.stringify(text)}`);
+        assert.deepEqual(streamed, [], `and the stream sends none of ${JSON.stringify(text)}`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('hybrid: a segment that is only `>>>`, or `>>>` and a gap, holds back the next segment, as delivery does', async () => {
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as {
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean): Promise<void>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
+    try {
+      for (const prefix of ['>>>', '>>> ', '>>>\t']) {
+        routed.length = 0;
+        await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true);
+        await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true);
+        await gateway.deliverHybridProse(agent, 'secret', 'chan-locus', true);
+        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
+        const streamed = [
+          ...router.feed('>>>#alpha first'), ...router.endSegment(),
+          ...router.feed(prefix), ...router.endSegment(),
+          ...router.feed('secret'), ...router.finish(),
+        ];
+        assert.deepEqual(routed.map((r) => r.text), ['first'], `delivery sends only first, after ${JSON.stringify(prefix)}`);
+        assert.equal(streamed.filter((d) => d.delta.includes('secret')).length, 0,
+          `and the stream holds secret back after ${JSON.stringify(prefix)}`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('admission turns a resolver that throws into an envelope that bounces', async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const internals = framework as unknown as {
+      channelRegistry: { resolveProseTarget: (spec: string) => unknown };
+      admitProse(text: string): Array<{ text: string; resolved?: { channelId?: string; error?: string } }>;
+      deliverAdmittedProse(agent: unknown, envelopes: unknown[]): Promise<void>;
+    };
+    const resolve = internals.channelRegistry.resolveProseTarget.bind(internals.channelRegistry);
+    internals.channelRegistry.resolveProseTarget = (spec: string) => {
+      if (spec === '#boom') throw new Error('directory unavailable');
+      return resolve(spec);
+    };
+    try {
+      const admitted = internals.admitProse('>>#boom one\n>>#alpha two');
+      assert.match(admitted[0]!.resolved?.error ?? '', /directory unavailable/);
+      await internals.deliverAdmittedProse(framework.getAgent('assistant')!, admitted);
+      assert.deepEqual(routed.map((r) => r.text), ['two'], 'the other envelope still goes out');
+    } finally {
+      await framework.stop();
+    }
   });
 
   it("' !' continuation starts another turn immediately after prose ends the current one", async () => {
