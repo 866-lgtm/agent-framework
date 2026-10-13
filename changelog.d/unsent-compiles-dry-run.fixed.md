@@ -46,18 +46,25 @@
   refused (inferred from probes of other requests, not observed on a fork).
   Unsigned reasoning, from text-only providers or XML mode, goes by the same
   rule. On models that don't bind thinking to its prefix (by probes, Fable 5
-  and Sonnet 5), the fork loses the template's reasoning, as
-  context-manager#160 renders no unstamped thinking. That a provider accepts
-  the stripped seed, including one that ends on a completed tool round with
-  a `tool_use` and no thinking before it, rests on probes of Opus 5.5, Haiku
-  5.5, Sonnet 5.5, Fable 5.1, Fable 5 and Sonnet 5; other thinking models
-  weren't probed.
+  and Sonnet 5), a copy would have been kept, so there the fork loses the
+  template's reasoning. That a provider accepts the stripped seed rests on
+  probes of two shapes, each sent without its thinking: an assistant text
+  turn followed by a new user turn, on Sonnet 5.5, Fable 5.1, Fable 5 and
+  Sonnet 5; and a tool round, a `tool_use` with no thinking before it and
+  its result, continued by the model, on those four, Opus 5.5 and Haiku 5.5.
+  Other thinking models weren't probed.
 - On the OpenAI Responses path, the seed's items that were paired with a
   reasoning item it left out (the message's text, a function call) lose
   their provider-native raw item and render from their fields, so the fork
   replays no item id whose reasoning is gone. Opaque items, such as a
-  compaction, keep theirs.
-- A fork's seed no longer ends on a call whose result was never stored. A
-  fork spawned while the template was between a tool round's call and its
-  results (the coalescer can spawn one outside the event loop) gave the
-  fork's first request an unanswered call under the passthrough strategies.
+  compaction or a hosted tool's call, keep theirs.
+- A fork's seed keeps no tool call whose result isn't in it, and no result
+  whose call isn't (context-manager's `stripUnpairedToolBlocks`): the rest of
+  their messages stays, and a message left with nothing becomes
+  `[tool call omitted]`. A fork spawned while the template was between a
+  tool round's call and its results (the coalescer can spawn one outside the
+  event loop) gave the fork's first request an unanswered call under the
+  passthrough strategies.
+- A fork's spawn logs one line when its seed left something out:
+  `[conversation] <fork>: seeded from <template> without N thinking
+  block(s), N unanswered tool call(s) and N orphaned tool result(s)`.

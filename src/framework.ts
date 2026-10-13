@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -530,24 +530,31 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  *  template's prefix, which the fork's doesn't promise to match; unsigned
  *  reasoning (text-only providers, XML mode) goes by the same rule. On the
  *  OpenAI Responses path a removed block also carried the reasoning item
- *  (`rawItem`) the message's other items were paired with by id, so those
- *  lose their `rawItem` and render from their fields, without ids; an opaque
- *  carrier (a text block whose raw item isn't a `message`, such as a
- *  compaction) keeps it, since the raw item is its whole content. A message
- *  with no content left, whether the filter emptied it or it was already
- *  empty, is left out, since a request can't carry an empty message; any
- *  other message is kept as it was. */
+ *  (`rawItem`) the message's other items were paired with by id, so in a
+ *  message that lost its thinking those items lose their `rawItem` and render
+ *  from their fields, without ids; an opaque carrier (a text block whose raw
+ *  item isn't a `message`, such as a compaction) keeps it, since the raw item
+ *  is its whole content. An Anthropic or XML-mode message's thinking carries
+ *  no raw item, and its only raw items are such carriers (membrane keeps a
+ *  block it has no type for, such as a `server_tool_use`, that way), so it
+ *  loses only its thinking. A message with no content left, whether
+ *  the filter emptied it or it was already empty, is left out, since a
+ *  request can't carry an empty message; any other message without thinking
+ *  is kept as it was. */
 function withoutThinking<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
   const out: M[] = [];
   for (const message of messages) {
-    const isThinking = (b: ContentBlock) => b.type === 'thinking' || b.type === 'redacted_thinking';
-    let content: ContentBlock[] = message.content.filter((b) => !isThinking(b));
-    const pairedReasoningRemoved = message.content.some((b) => isThinking(b) && rawItemOf(b) !== undefined);
-    if (pairedReasoningRemoved) content = content.map(releasePairedRawItem);
+    const content = message.content.filter((b) => !isThinkingBlock(b));
     if (content.length === 0) continue;
-    out.push(content.length === message.content.length && !pairedReasoningRemoved ? message : { ...message, content });
+    out.push(content.length === message.content.length
+      ? message
+      : { ...message, content: content.map(releasePairedRawItem) });
   }
   return out;
+}
+
+function isThinkingBlock(block: ContentBlock): boolean {
+  return block.type === 'thinking' || block.type === 'redacted_thinking';
 }
 
 function rawItemOf(block: ContentBlock): unknown {
@@ -567,20 +574,28 @@ function releasePairedRawItem(block: ContentBlock): ContentBlock {
   return rest as ContentBlock;
 }
 
-/** A seed without a trailing message that calls a tool whose result never
- *  follows it: one spawned while the template is between a round's
- *  `tool_use` row and its results (the coalescer can spawn a fork outside
- *  the event loop) would otherwise give the fork's first request an
- *  unanswered call. The adaptive strategy already drops such a row from its
- *  compile; the passthrough strategies don't. */
-function withoutUnansweredToolUse<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
-  const out = [...messages];
-  while (out.length > 0) {
-    const last = out[out.length - 1]!.content;
-    if (!last.some((b) => b.type === 'tool_use') || last.some((b) => b.type === 'tool_result')) break;
-    out.pop();
-  }
-  return out;
+/** One log line for a fork's seed that left something out, so an operator who
+ *  sees a fork answer differently from its template has something to check:
+ *  the template's thinking blocks, and the tool blocks the pairing pass
+ *  dropped (calls with no result in the seed, results whose call isn't in
+ *  it). `withoutReasoning` is the seed before that pass, `seed` after it. */
+function logSeedOmissions(
+  fork: string,
+  template: string,
+  compiled: readonly { content: ContentBlock[] }[],
+  withoutReasoning: readonly { content: ContentBlock[] }[],
+  seed: readonly { content: ContentBlock[] }[],
+): void {
+  const count = (messages: readonly { content: ContentBlock[] }[], test: (b: ContentBlock) => boolean) =>
+    messages.reduce((n, m) => n + m.content.filter(test).length, 0);
+  const thinking = count(compiled, isThinkingBlock);
+  const calls = count(withoutReasoning, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
+  const results = count(withoutReasoning, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
+  if (thinking + calls + results === 0) return;
+  console.log(
+    `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
+    `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
+  );
 }
 
 class DiscordAwarenessAccountingError extends Error {
@@ -7427,9 +7442,10 @@ export class AgentFramework {
   /**
    * Spawn a persistent per-channel conversation agent ("fork") from the
    * template agent: own ContextManager under `conversations/{name}`, seeded
-   * with the template's compiled context without its thinking (the
-   * SubagentModule wholesale-copy pattern; see `withoutThinking`),
-   * registered in the event loop like any agent — but never primary.
+   * with the template's compiled context without its thinking or its unpaired
+   * tool blocks (the SubagentModule wholesale-copy pattern; see the seeding
+   * comment below), registered in the event loop like any agent — but never
+   * primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
     const router = this.conversationRouter!;
@@ -7466,27 +7482,49 @@ export class AgentFramework {
       //
       // Both compiles are dry runs: neither is sent, and the template's runs
       // while the template may be mid-stream, where a committing compile
-      // would commit fold resolutions and queue compression work for it (and
-      // with context-manager's thinking binding, fence its stream's replies).
-      // A dry run whose fold plan doesn't fit returns the render rather than
-      // throwing, so a template whose context doesn't fit the budget compiled
-      // here (context-manager's default: none is passed) seeds the fork
-      // instead of failing the spawn; the fork's own compiles fit its window
-      // or refuse (its first compile folds to fit, or throws over_budget for
-      // the drain breaker).
+      // would commit fold resolutions and queue the compression its fold plan
+      // calls for (and, once context-manager's thinking binding ships, fence
+      // its stream's replies). A dry run still leaves what context-manager
+      // 0.13 leaves on any compile (see Agent.compileWithInjections). Among
+      // that, its adaptive select replaces the template's compile estimate
+      // and re-arms its calibration sample, so a usage report for a request
+      // the template has in flight is judged against this compile's estimate
+      // rather than its own request's.
+      // The template's compile runs at context-manager's default budget (none
+      // is passed), and a dry run still refuses a budget it can't fit: it
+      // skips only the post-pick check, and an adaptive fold plan that
+      // doesn't fit then overruns at the middle's emission. So a template
+      // whose fold plan doesn't fit that budget fails the spawn with
+      // context-manager's refusal, which names the tokens and the limit, as
+      // a committing compile failed it. Only a windowed-passthrough template
+      // whose newest message alone exceeds it seeds that message, larger than
+      // the budget. The fork's own compiles meet its window by its strategy's
+      // rule: passthrough, the fork's default, keeps the newest messages that
+      // fit; an adaptive strategy folds to fit or throws over_budget for the
+      // drain breaker.
       // The seed leaves out the template's thinking (withoutThinking): a
       // signed block verifies only while everything before it is what it was
       // minted under, and a fork's system, tools and scoped injections don't
       // promise that, while its own namespace holds no stamps that could
-      // vouch for the copies. Models that don't bind thinking to its prefix
-      // would have kept it, so there the fork loses the template's reasoning,
-      // as context-manager#160 renders no unstamped thinking. Nor does the
-      // seed end on a call whose result never follows it
-      // (withoutUnansweredToolUse).
+      // vouch for the copies. On models that don't bind thinking to its
+      // prefix a copy would have been kept, so there the fork loses the
+      // template's reasoning.
+      // Then context-manager's stripUnpairedToolBlocks drops each call whose
+      // result isn't in the seed and each result whose call isn't, keeping
+      // the rest of their messages (a message left with nothing becomes its
+      // "[tool call omitted]" placeholder). A fork spawned while the template
+      // is between a round's call and its results (the coalescer can spawn
+      // one outside the event loop) would otherwise give the fork's first
+      // request an unanswered call: the passthrough strategies have no
+      // pairing pass, and an adaptive template's compile has been through its
+      // own.
       const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
       if (existing.length === 0) {
         const { messages: compiled } = await template.getContextManager().compile(undefined, undefined, { dryRun: true });
-        for (const msg of withoutUnansweredToolUse(withoutThinking(compiled))) {
+        const withoutReasoning = withoutThinking(compiled);
+        const seed = stripUnpairedToolBlocks(withoutReasoning);
+        logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
+        for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
         }
