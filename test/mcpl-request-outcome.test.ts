@@ -102,6 +102,11 @@ test('a synchronous write rejection is not-sent, leaves no pending request, and 
   let unwrittenId: unknown;
   const lateRenders: unknown[] = [];
   connection.on('orphaned-render-response', (event) => lateRenders.push(event));
+  // connect() buffers data-plane events until the caller has wired listeners.
+  connection.ready();
+  connection.emit('orphaned-render-response', { params: { featureSet: 'test', key: 'observer-probe', eventId: 'probe' }, result: { content: [] } });
+  assert.equal(lateRenders.length, 1, 'the observer is armed, so absence of a later event is meaningful');
+  lateRenders.length = 0;
   state.transport.writeLine = (json) => { unwrittenId = JSON.parse(json).id; throw new Error('synthetic write rejection'); };
   const err = await rejectsWith(connection.sendPushRender({ featureSet: 'test', key: 'unwritten', eventId: 'e1', notices: [], dropped: 0 }), 'not-sent');
   assert.match(err.message, /synthetic write rejection/);
