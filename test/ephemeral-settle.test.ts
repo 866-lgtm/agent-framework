@@ -110,11 +110,18 @@ async function runStartedEphemeral(
   framework: AgentFramework,
   agent: Awaited<ReturnType<typeof createEphemeral>>['agent'],
   contextManager: Awaited<ReturnType<typeof createEphemeral>>['contextManager'],
+  watchdogs?: Parameters<AgentFramework['runEphemeralToCompletion']>[2],
 ) {
-  const promise = framework.runEphemeralToCompletion(agent, contextManager);
+  const promise = framework.runEphemeralToCompletion(agent, contextManager, watchdogs);
   framework.start();
   return promise;
 }
+
+// For a run that stop() is to end: its turn has started inference, so if the
+// refusal didn't end it, only the idle watchdog would, after fifteen minutes.
+// A short one turns that into a "stalled" rejection, which the refusal's
+// pattern doesn't match.
+const STOPPED_RUN_WATCHDOGS = { idleTimeoutMs: 20_000, idlePollMs: 50 };
 
 async function stopAndRemove(framework: AgentFramework, tempDir: string): Promise<void> {
   await framework.stop();
@@ -147,12 +154,10 @@ describe('runEphemeralToCompletion settle signal', () => {
         await released;
         return start(...args);
       };
-      const run = runStartedEphemeral(framework, agent, contextManager);
+      const run = runStartedEphemeral(framework, agent, contextManager, STOPPED_RUN_WATCHDOGS);
       await inCompile;
       const stopped = framework.stop();
       release();
-      // Ended by the refusal, not by its startup watchdog, whose rejection
-      // names a zombie instead.
       await assert.rejects(run, /refused: the framework is stopping/);
       await stopped;
       await assert.rejects(
@@ -193,7 +198,7 @@ describe('runEphemeralToCompletion settle signal', () => {
         compiles++;
         throw new Error('boom');
       };
-      const run = runStartedEphemeral(framework, agent, contextManager);
+      const run = runStartedEphemeral(framework, agent, contextManager, STOPPED_RUN_WATCHDOGS);
       await inDelay;
       const stopped = framework.stop();
       await assert.rejects(run, /refused: the framework is stopping/);
