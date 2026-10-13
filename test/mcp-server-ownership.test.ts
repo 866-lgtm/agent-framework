@@ -436,6 +436,33 @@ test("a refresh in flight when a server is disconnected doesn't bring its tools 
   });
 });
 
+test("a server connected while a refresh waits keeps its own tool prefix in that refresh's list", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    const internals = framework as unknown as {
+      modernServers(): Map<string, { listTools(): Promise<unknown[]> }>;
+      refreshMcplTools(): Promise<void>;
+    };
+    const connection = internals.modernServers().get('m')!;
+    const realList = connection.listTools.bind(connection);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let listed = false;
+    connection.listTools = async () => { const tools = await realList(); listed = true; await gate; return tools; };
+    const refreshing = internals.refreshMcplTools();
+    await until(() => listed, "the refresh holds the first server's list");
+    connection.listTools = realList;
+    // Connected while the first refresh waits, under a prefix of its own.
+    await framework.connectMcplServer({ ...modern('n', '', join(dir, 'raw-n.jsonl')), toolPrefix: 'custom' });
+    // The held refresh finishes last, so its list is the one that stands.
+    release();
+    await refreshing;
+    const names = framework.getAllTools().map((t) => t.name);
+    assert.ok(names.some((n) => n.startsWith('custom--')), names.join(', '));
+    assert.ok(!names.some((n) => n.startsWith('mcpl--n--')), names.join(', '));
+  });
+});
+
 test('a server lost for good, legacy or modern, leaves the tool list', async () => {
   await withFramework(async ({ framework, dir }) => {
     await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
