@@ -52,8 +52,27 @@ export function toolResultDataToHistoryString(
   options?: HistorySerializeOptions,
 ): string {
   const fromArray = tryHistoryStringFromContentArray(data, options);
-  const str = fromArray ?? JSON.stringify(data);
+  // JSON leaves out undefined, a function and a symbol: a result with no data
+  // is stored as no text, as an empty content array is.
+  const str = fromArray ?? (JSON.stringify(data) as string | undefined) ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
+}
+
+/**
+ * The text of a tool result that isn't an error result: its data, as history
+ * stores it, or, when it has no data, its error text. A tool can answer
+ * `{ success: false, error, isError: false }`, a failure it doesn't flag as
+ * an error for the model, and the model still reads what failed.
+ */
+export function nonErrorResultText(
+  result: { data?: unknown; error?: string },
+  maxChars?: number,
+  options?: HistorySerializeOptions,
+): string {
+  if ((result.data === undefined || result.data === null) && typeof result.error === 'string' && result.error) {
+    return maxChars ? truncateForHistory(result.error, maxChars) : result.error;
+  }
+  return toolResultDataToHistoryString(result.data, maxChars, options);
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice.

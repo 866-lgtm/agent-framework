@@ -12,7 +12,7 @@ import {
   type StoredRowLike,
 } from './silent-heartbeat.js';
 import {
-  toolResultDataToHistoryString,
+  nonErrorResultText,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
@@ -1277,7 +1277,7 @@ export class Agent {
       toolUseId: r.id,
       content: r.result.isError
         ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
       isError: r.result.isError,
     }));
 

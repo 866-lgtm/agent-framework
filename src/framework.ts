@@ -64,7 +64,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry, isStateExistsError } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -90,6 +90,7 @@ import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './m
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
+  nonErrorResultText,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -11151,13 +11152,15 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      const result = await this.executeToolCall({
-        id: toolUseId,
-        name: toolName,
-        input,
-        callerAgentName: agentName,
-      });
+      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName };
+      const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
+      // The pair is stored as a model's call would be, so the result stored,
+      // traced and logged is its checked form. The caller gets the tool's
+      // own result back, as an in-process caller does, unless nothing
+      // usable could be stored: then it gets the error result stored.
+      const checked = checkedToolResult(call, returned);
+      const result = checked.result;
 
       // Store the pair through the same shapes the ordinary path uses. Build
       // the result blocks BEFORE storing the tool_use: the spill path awaits.
@@ -11205,7 +11208,7 @@ export class AgentFramework {
         `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
         `in ${durationMs}ms (${toolUseId})${ownedToEnd ? '' : ' — deferred behind a live turn'}`,
       );
-      return { toolUseId, result };
+      return { toolUseId, result: checked.usable ? returned : result };
     } finally {
       if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
       // Messages deferred while we held the token land now, after the pair
@@ -11268,10 +11271,11 @@ export class AgentFramework {
     // ephemerals, ModuleContext.callTool) reach utilities the same way the
     // model does.
     if (call.name === 'utils') {
-      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call);
+      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true });
     }
 
-    // Module tools
+    // Module tools. The caller uses the result in process, so it gets the
+    // module's own result, as the module returned it.
     return this.moduleRegistry.handleToolCall(call);
   }
 
@@ -11773,7 +11777,7 @@ export class AgentFramework {
       // stays reachable by provenance after the bytes leave the wire.
       const raw = tc.result.isError
         ? tc.result.error ?? 'Unknown error'
-        : toolResultDataToHistoryString(tc.result.data, undefined, {
+        : nonErrorResultText(tc.result, undefined, {
           imageRef: (blockIndex, image) => ledger.retain({
             toolCallId: tc.id,
             toolName: tc.name,
@@ -11921,7 +11925,7 @@ export class AgentFramework {
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
-    if (result.data === undefined) return '';
+    if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse) — materialize every referenced payload now, so the stub
@@ -12527,7 +12531,7 @@ export class AgentFramework {
     const startTime = Date.now();
 
     this.moduleRegistry
-      .handleToolCall({ ...call, callerAgentName: agentName })
+      .storableToolCall({ ...call, callerAgentName: agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -15526,7 +15530,11 @@ export class AgentFramework {
           typeof workspace.getTools === 'function' &&
           workspace.getTools().some((tool) => tool.name === 'read_image')
         ) {
-          const result = await workspace.handleToolCall({ ...call, name: 'read_image' });
+          // The workspace module's own handler, called directly: its result
+          // gets the same check a module's result gets in the registry. The
+          // agent's name is for the check's log line, not the handler.
+          const moduleCall = { ...call, name: 'read_image' };
+          const result = storableToolResult({ ...moduleCall, callerAgentName: agentName }, await workspace.handleToolCall(moduleCall));
           if (result.success && Array.isArray(result.data)) {
             const image = result.data.find(
               (block): block is { type: 'image'; data: string; mimeType: string } =>
@@ -15571,11 +15579,7 @@ export class AgentFramework {
           ],
         });
       } catch (error) {
-        finish({
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          isError: true,
-        });
+        finish(thrownResult(error));
       }
     })();
   }
@@ -15978,7 +15982,7 @@ export class AgentFramework {
    *  (Module.getUtilities). Shared by the model-facing dispatcher and the
    *  programmatic path (executeToolCall), so code_execution scripts and
    *  ephemerals reach utilities too. */
-  private async handleUtilsToolCall(agentName: string, call: ToolCall): Promise<ToolResult> {
+  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean } = {}): Promise<ToolResult> {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
     const utilities = this.moduleRegistry.getAllUtilities();
     const available = (): string =>
@@ -16013,13 +16017,12 @@ export class AgentFramework {
           };
         }
         // Same dispatch as a first-class tool call — the module cannot tell
-        // which surface the call came through.
-        return this.moduleRegistry.handleToolCall({
-          id: call.id,
-          name: def.name,
-          input: args,
-          callerAgentName: agentName,
-        });
+        // which surface the call came through. An in-process caller gets the
+        // module's own result; the model's path takes its checked form.
+        const utilityCall = { id: call.id, name: def.name, input: args, callerAgentName: agentName };
+        return options.inProcess
+          ? this.moduleRegistry.handleToolCall(utilityCall)
+          : this.moduleRegistry.storableToolCall(utilityCall);
       }
       default:
         return { success: false, isError: true, error: 'action must be "list", "describe", or "run"' };
