@@ -1172,15 +1172,20 @@ export class AgentFramework {
    * Each agent's open logical turn (LogicalTurn). It stays open from the
    * fresh start that opens it until the turn settles (settleAgent: it
    * completes, a tool ends it, or it fails or is abandoned), and every fresh
-   * start while it is open continues it: a framework retry, the start that
-   * consumes tool results the non-streaming fallback left (whichever wake
-   * the scheduler starts it with), the later compile a provider-capacity
-   * hold defers a turn to. A stream that ends without settling needs to do
-   * nothing to carry its turn. A turn that settles has written its receipt
-   * and taken its ` !`, and a tool-ended turn settles before the next turn
-   * can start, so the queued deliveries it leaves keep writing to its own.
-   * Only the stream that holds the open turn closes it; disposal drops it,
-   * and stop() clears every agent's.
+   * start that routes prose while it is open continues it: a framework
+   * retry, the start that consumes tool results the non-streaming fallback
+   * left (whichever wake the scheduler starts it with), the later compile a
+   * provider-capacity hold defers a turn to. A silent start neither
+   * continues nor opens one. A stream that ends without settling needs to do
+   * nothing to carry its turn. Settling only detaches the turn from future
+   * starts: the settling stream keeps its own object, which its remaining
+   * deliveries, its receipt and its ` !` check go on using (a completion
+   * settles before it awaits its chain and writes its receipt). So every
+   * logical end must close inheritance once, before the next fresh start:
+   * a turn left open would hand its object, late writes and all, to an
+   * unrelated turn. A tool-ended turn settles before the next turn can
+   * start. Only the stream that holds the open turn closes it; disposal
+   * drops it, and stop() clears every agent's.
    */
   private openLogical: Map<string, LogicalTurn> = new Map();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
@@ -4369,6 +4374,8 @@ export class AgentFramework {
      *  A settle from a stream a newer one replaced closes nothing. */
     closes: LogicalTurn | undefined,
   ): void {
+    // This identity check is the only guard against a stale settle closing
+    // a newer turn (no test reaches one); keep it when editing call sites.
     if (closes && this.openLogical.get(agentName) === closes) this.openLogical.delete(agentName);
     const run = this.ephemeralRuns.get(agentName);
     if (!run) return;
@@ -9526,10 +9533,14 @@ export class AgentFramework {
       // A start while the agent's logical turn is open continues it: it
       // shares the earlier stream's ` !` and receipt tallies, which a
       // delivery still queued there can write after this stream begins
-      // (openLogical). Otherwise this start opens one.
-      const open = this.openLogical.get(agent.name);
-      if (open) fresh.logical = open;
-      else this.openLogical.set(agent.name, fresh.logical);
+      // (openLogical). Otherwise this start opens one. A silent start does
+      // neither: it routes no prose, so it keeps a logical turn of its own,
+      // and an open turn waits for the next start that routes prose.
+      if (!trigger?.suppressProse) {
+        const open = this.openLogical.get(agent.name);
+        if (open) fresh.logical = open;
+        else this.openLogical.set(agent.name, fresh.logical);
+      }
       this.turnRouting.set(agent.name, fresh);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
         // Explicit and disabled prose routing have no inferred locus.
@@ -9551,8 +9562,8 @@ export class AgentFramework {
     // opened/pinned a channel mid-turn.
     if (trigger?.suppressProse) {
       this.turnLocusPins.delete(agent.name);
-      // Silent: no routing state, but the logical turn the start took or
-      // shares (a ` !`, receipt tallies) stays with it.
+      // Silent: no routing state. A continuing silent start keeps its turn's
+      // logical turn; a fresh one keeps the one of its own it was given.
       const silent = freshTurnRouting();
       const logical = this.turnRouting.get(agent.name)?.logical;
       if (logical) silent.logical = logical;

@@ -897,21 +897,37 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it('a silent start that continues an open logical turn keeps it', async () => {
+  it('a silent start leaves an open logical turn to the next start that routes prose', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'quiet' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
     const internals = framework as unknown as {
       turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
       openLogical: Map<string, RoutingState['logical']>;
     };
     try {
-      const carried: RoutingState['logical'] = { continuation: false, deliveries: ['chan-alpha'], suppressed: 0 };
-      internals.openLogical.set('assistant', carried);
+      const open: RoutingState['logical'] = { continuation: true, deliveries: [], suppressed: 0 };
+      internals.openLogical.set('assistant', open);
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true } as InferenceRequest);
       await framework.runUntilIdle();
-      assert.equal(internals.turnRouting.get('assistant')?.logical, carried, "the silent start's routing kept that logical turn");
-      assert.equal(internals.openLogical.has('assistant'), false, 'and it closed when the turn settled');
+      assert.equal(turns, 1);
+      assert.notEqual(internals.turnRouting.get('assistant')?.logical, open, 'the silent start kept a logical turn of its own');
+      assert.equal(internals.openLogical.get('assistant'), open, 'and neither took nor closed the open one');
+      assert.equal(open.continuation, true, "the open turn's ' !' is untouched");
+      // The next start that routes prose continues it, and its ' !' runs.
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]));
+      feedTurn(framework, 3, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      for (const end = Date.now() + 5000; turns < 3 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await framework.runUntilIdle();
+      }
+      assert.equal(turns, 3, "the next prose turn continued the open turn and took its ' !'");
     } finally {
       await framework.stop();
     }
