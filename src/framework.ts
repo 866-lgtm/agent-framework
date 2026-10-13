@@ -7317,10 +7317,10 @@ export class AgentFramework {
             //
             // Fork exception, ahead of BOTH signals: a bot message that did
             // NOT wake the agent (`chat:from-bot` without `triggered: true`)
-            // never moves the pin. Parity with the live 2026-07-28 fix
+            // never moves the pin. Parity with the fork's 2026-07-28 fix
             // (20b2c7c, "only a WAKING mid-turn injection may move the reply
-            // locus"): an unaddressed bot message in #residency-hall arrived
-            // while Polaris was answering Helen in #the-apartment and pulled
+            // locus"): an unaddressed bot message in one channel arrived
+            // while the agent was answering a person in another and pulled
             // the whole reply into the bot's channel. Bot chatter is still
             // heard mid-turn (it is injected above); it just cannot capture
             // the reply. A bot message the gate DID wake on qualifies like

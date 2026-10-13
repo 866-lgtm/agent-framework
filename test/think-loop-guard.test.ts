@@ -51,7 +51,7 @@ class ToolsModule implements Module {
     if (event.type !== 'external-message') return {};
     const text = String((event as { content?: unknown }).content ?? '');
     return {
-      addMessages: [{ participant: 'Helen', content: [{ type: 'text', text }] }],
+      addMessages: [{ participant: 'User', content: [{ type: 'text', text }] }],
       requestInference: text === 'go',
     };
   }

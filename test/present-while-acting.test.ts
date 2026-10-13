@@ -442,7 +442,7 @@ describe('present while acting', () => {
     //
     // Fork change: upstream's version of this test sent the bot message
     // WITHOUT `triggered` and expected a re-pin ("no author-kind filter").
-    // The fork keeps Helen's 2026-07-28 live protection (20b2c7c): a bot
+    // The fork keeps its 2026-07-28 protection (20b2c7c): a bot
     // message that did not wake the agent must never pull the reply (see
     // the next two tests). A resident message the gate DID wake on
     // (`triggered: true`) still re-pins like anyone's — the upstream intent
@@ -482,8 +482,8 @@ describe('present while acting', () => {
   });
 
   it('an UNTRIGGERED bot follow-up in an engaged channel does NOT re-pin (fork 2026-07-28 parity)', async () => {
-    // 2026-07-28 (live): an unaddressed bot message arrived mid-turn while
-    // Polaris was answering Helen elsewhere, and the whole reply was
+    // 2026-07-28: an unaddressed bot message arrived mid-turn while the
+    // agent was answering a person elsewhere, and the whole reply was
     // published into the bot's channel. Bot chatter the gate did not wake
     // on is heard (injected) but cannot capture the reply — even in a
     // channel the agent engaged this turn.
@@ -499,7 +499,7 @@ describe('present while acting', () => {
     module.toolDelayMs = 25;
     module.interjection = 'unrelated bot chatter in the engaged channel';
     module.interjectionMetadata = {
-      channelId: 'discord:guild:residency-hall',
+      channelId: 'discord:guild:bot-lounge',
       tags: ['chat:ambient', 'chat:from-bot'],
       triggered: false,
     };
@@ -507,7 +507,7 @@ describe('present while acting', () => {
     module.handleToolCall = async (call) => {
       (framework as unknown as {
         turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:residency-hall']));
+      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:bot-lounge']));
       return origHandle(call);
     };
 

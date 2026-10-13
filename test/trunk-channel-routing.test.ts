@@ -335,7 +335,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
         serverId: 'discord',
         featureSet: 'discord.messaging',
         eventId: `discord_msg_${Math.random().toString(36).slice(2)}`,
-        content: [{ type: 'text', text: 'Antra: can you look at this?' }],
+        content: [{ type: 'text', text: 'Alice: can you look at this?' }],
         origin: { source: 'discord', messageId: 'm9', mcplChannelId: 'discord:G1:C7', channelName: 'portables' },
         tags: ['chat:mention', 'chat:addressed'],
         timestamp: new Date().toISOString(),
