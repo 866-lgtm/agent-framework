@@ -59,6 +59,7 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentSettingsExtension,
   SameRoundThinkTextPolicy,
+  GatherContextScope,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
@@ -530,16 +531,25 @@ function strictUnstamped(fields: Record<string, unknown> | undefined): Record<st
   return rest;
 }
 
-/** ROUTING_STRICT: one MCPL tool call made by a turn whose place is not the
- *  home place — the free text it passed and the ids the server answered
- *  with (see strictArmedPlace). */
+/** ROUTING_STRICT: one MCPL tool call that passed content to a server (a
+ *  reminder it set, a job it started), made by a turn of `place` — the free
+ *  text it passed and the NEW ids the server answered with (see
+ *  strictArmedPlace). */
 interface StrictArming {
   serverId: string;
   place: string;
   callId: string;
   texts: string[];
   ids: string[];
+  /** When it was noted, or last matched a push (eviction is oldest first). */
   at: number;
+}
+
+/** A noted call awaiting the server's answer, with the ids its own
+ *  arguments named (an answer repeating them names what already exists). */
+interface StrictPendingArming {
+  arming: StrictArming;
+  argIds: Set<string>;
 }
 
 /** ROUTING_STRICT: prose state of one logical turn (strictProseTurns). */
@@ -555,20 +565,28 @@ interface StrictProseTurn {
   locusServer?: string;
 }
 
-const STRICT_ARMINGS_CAP = 100;
+/** Armings kept PER SERVER (oldest evicted first): one server's ordinary
+ *  traffic (history reads, sends) never ages out what was armed on another. */
+const STRICT_ARMINGS_PER_SERVER = 100;
 const STRICT_ARMING_TEXT_MIN = 12;
 const STRICT_ARMING_TEXT_MAX = 200;
+/** An echo may carry the armed text under a short label ("Reminder: …"); a
+ *  push that is mostly other material (a scheduled heartbeat that embeds its
+ *  configured message after a timestamp) is not an echo of that text. */
+const STRICT_ARMING_WRAPPER_MAX = 24;
+/** Format of strict-armings.json. Version 1 (every call of a non-home turn,
+ *  every id-like token of its answer) is normalized on restore. */
+const STRICT_ARMINGS_VERSION = 2;
 
 const normalizeArmingText = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
 
-/** Free-text string leaves of a tool call's arguments (bounded). */
-function armingTexts(args: unknown): string[] {
+/** String leaves of a tool call's arguments (bounded). */
+function argumentStrings(args: unknown): string[] {
   const out: string[] = [];
   const visit = (value: unknown, depth: number): void => {
-    if (out.length >= 4 || depth > 4) return;
+    if (out.length >= 16 || depth > 4) return;
     if (typeof value === 'string') {
-      const text = normalizeArmingText(value);
-      if (text.length >= STRICT_ARMING_TEXT_MIN) out.push(text.slice(0, STRICT_ARMING_TEXT_MAX));
+      if (value.trim() !== '') out.push(value);
     } else if (Array.isArray(value)) {
       for (const item of value) visit(item, depth + 1);
     } else if (value && typeof value === 'object') {
@@ -579,19 +597,77 @@ function armingTexts(args: unknown): string[] {
   return out;
 }
 
-/** Id-like tokens (letters and digits, 6+ chars) in a tool result's text. */
+/** Free-text string leaves of a tool call's arguments (bounded). */
+function armingTexts(args: unknown): string[] {
+  const out: string[] = [];
+  for (const value of argumentStrings(args)) {
+    if (out.length >= 4) break;
+    const text = normalizeArmingText(value);
+    if (text.length >= STRICT_ARMING_TEXT_MIN) out.push(text.slice(0, STRICT_ARMING_TEXT_MAX));
+  }
+  return out;
+}
+
+/** Id-like tokens (letters and digits, 6+ chars) in a text. */
+function idLikeTokens(text: string, limit = 20): string[] {
+  const ids = new Set<string>();
+  for (const token of text.match(/[A-Za-z0-9][A-Za-z0-9_.:-]{5,}/g) ?? []) {
+    const id = token.replace(/[.:-]+$/, '');
+    if (id.length >= 6 && /\d/.test(id) && /[A-Za-z]/.test(id)) ids.add(id);
+    if (ids.size >= limit) break;
+  }
+  return [...ids];
+}
+
+/** Id-like tokens in a tool result's text. */
 function armingIds(content: unknown): string[] {
   const text = (Array.isArray(content) ? content : [content])
     .map((b) => (typeof b === 'string' ? b : (b as { text?: unknown } | null)?.text))
     .filter((t): t is string => typeof t === 'string')
     .join('\n');
-  const ids = new Set<string>();
-  for (const token of text.match(/[A-Za-z0-9][A-Za-z0-9_.:-]{5,}/g) ?? []) {
-    const id = token.replace(/[.:-]+$/, '');
-    if (id.length >= 6 && /\d/.test(id) && /[A-Za-z]/.test(id)) ids.add(id);
-    if (ids.size >= 20) break;
+  return idLikeTokens(text);
+}
+
+/** Whether a channel-less push body (normalized) echoes an armed text: the
+ *  same text, a quoted part of it (12+ chars), or the text under a short
+ *  label. A text cut at the length cap may run on past its end. */
+function echoesArmedText(body: string, text: string): boolean {
+  if (body.length === 0) return false;
+  if (body.length >= STRICT_ARMING_TEXT_MIN && text.includes(body)) return true;
+  const at = body.indexOf(text);
+  if (at < 0) return false;
+  const after = body.length - at - text.length;
+  return at + (text.length >= STRICT_ARMING_TEXT_MAX ? 0 : after) <= STRICT_ARMING_WRAPPER_MAX;
+}
+
+/** ROUTING_STRICT: restored armings in today's form — an id belongs to the
+ *  OLDEST arming on its server that answered it (a later answer naming it
+ *  again, a listing, claims nothing), then the per-server cap. */
+function normalizeStrictArmings(armings: StrictArming[]): StrictArming[] {
+  const claimed = new Map<string, Set<string>>();
+  const out: StrictArming[] = [];
+  for (const arming of armings) {
+    let seen = claimed.get(arming.serverId);
+    if (!seen) claimed.set(arming.serverId, seen = new Set());
+    const ids = arming.ids.filter((id) => !seen!.has(id));
+    for (const id of ids) seen.add(id);
+    if (ids.length === 0 && arming.texts.length === 0) continue;
+    out.push({ ...arming, ids });
   }
-  return [...ids];
+  return capStrictArmings(out);
+}
+
+/** Keep the newest STRICT_ARMINGS_PER_SERVER armings of each server. */
+function capStrictArmings(armings: StrictArming[]): StrictArming[] {
+  const counts = new Map<string, number>();
+  const keep: boolean[] = new Array(armings.length).fill(false);
+  for (let i = armings.length - 1; i >= 0; i--) {
+    const n = counts.get(armings[i]!.serverId) ?? 0;
+    if (n >= STRICT_ARMINGS_PER_SERVER) continue;
+    counts.set(armings[i]!.serverId, n + 1);
+    keep[i] = true;
+  }
+  return armings.filter((_, i) => keep[i]);
 }
 
 /** ROUTING_STRICT arrival time of a wake: the earliest arrival it absorbed,
@@ -1172,12 +1248,12 @@ export class AgentFramework {
   /** ROUTING_STRICT: the place of the turn that started each background
    *  script, so its later wake continues that conversation. */
   private strictScriptPlaces: Map<string, string> = new Map();
-  /** ROUTING_STRICT: what turns away from the home place armed on MCPL
-   *  servers (strictArmedPlace). Newest last, bounded, mirrored to a
-   *  recovery file next to the deferred-writes file. */
+  /** ROUTING_STRICT: what turns armed on MCPL servers (strictArmedPlace),
+   *  home turns included. Least recently noted or matched first, bounded per
+   *  server, mirrored to a recovery file next to the deferred-writes file. */
   private strictArmings: StrictArming[] = [];
   /** ROUTING_STRICT: noted calls awaiting the server's answer, by call id. */
-  private strictPendingArmings: Map<string, StrictArming> = new Map();
+  private strictPendingArmings: Map<string, StrictPendingArming> = new Map();
   /** ROUTING_STRICT: agents whose dequeued wake is parked behind an
    *  auxiliary call and was braked by a privileged message meanwhile — the
    *  parked wake goes back to the queue instead of starting first. */
@@ -4037,7 +4113,7 @@ export class AgentFramework {
 
     // Module gatherContext (fail-open, matches startAgentStream)
     try {
-      const moduleInjections = await this.moduleRegistry.gatherContext(agentName);
+      const moduleInjections = await this.moduleRegistry.gatherContext(agentName, undefined, this.strictGatherScope(agentName));
       const scopedModuleInjections = this.scopeInjectionsForAgent(agentName, moduleInjections);
       if (scopedModuleInjections.length > 0) {
         injections = scopedModuleInjections;
@@ -8653,13 +8729,19 @@ export class AgentFramework {
       metadata.channelId = triggerChannel.channelId;
     } else if (routingStrict()) {
       // ROUTING_STRICT: a channel-less push echoing what a turn armed on this
-      // server (a reminder it set) belongs to that turn's place.
+      // server (a reminder it set) belongs to that turn's place. Any other
+      // channel-less push that wakes the agent is the input of the
+      // channel-less turn it wakes (the home place, else nowhere): held from
+      // turns of other places like that place's messages, never heard inside
+      // them (a reminder's text is words the agent wrote for that place).
       const armed = this.strictArmedPlace(
         event.serverId,
         event.content.filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text').map((b) => b.text).join('\n'),
         strictUnstamped(event.origin),
+        true,
       );
-      if (armed !== null) metadata.strictPlace = armed;
+      const place = armed ?? (event.triggerInference ? this.strictChannelLessPlace() : undefined);
+      if (place !== undefined) metadata.strictPlace = place;
     }
 
     const content = [...event.content];
@@ -10119,7 +10201,7 @@ export class AgentFramework {
       try {
         const moduleInjections = this.scopeInjectionsForAgent(
           agent.name,
-          await this.moduleRegistry.gatherContext(agent.name),
+          await this.moduleRegistry.gatherContext(agent.name, undefined, this.strictGatherScope(agent.name)),
         );
         if (moduleInjections.length > 0) {
           injections = moduleInjections;
@@ -13582,11 +13664,11 @@ export class AgentFramework {
       if (samePlace(place, this.strictTurnPlaces?.get(agentName) ?? STRICT_NOWHERE)) return false;
       return ownGateWake() ? 'gate-wake' : 'hold';
     }
+    // A wake dequeued and parked behind an auxiliary call holds every other
+    // place's messages; its own place's follow the arrival-order rule below
+    // (the message that woke it may still be held for its turn start).
     const parked = this.strictParkedPlaces?.get(agentName);
-    if (parked !== undefined) {
-      if (samePlace(place, parked)) return false;
-      return ownGateWake() ? 'gate-wake' : 'hold';
-    }
+    if (parked !== undefined && !samePlace(place, parked)) return ownGateWake() ? 'gate-wake' : 'hold';
     const gateWake = ownGateWake();
     for (const msg of this.deferredMessages ?? []) {
       if ((msg.forAgent ?? this.primaryAgentName) !== agentName) continue;
@@ -13813,54 +13895,84 @@ export class AgentFramework {
 
   /**
    * ROUTING_STRICT: a channel-less push from `serverId` (a reminder firing, a
-   * job finishing) that echoes what a turn armed on that server — an id the
-   * server answered that turn's call with (in the push's origin), or free
-   * text the turn passed to it (in the push's content) — belongs to that
-   * turn's place: words the agent wrote for a DM come back to the DM, never
-   * to the home channel. Several matching places are ambiguous: NOWHERE (kept
-   * private). Null when nothing matches (the channel-less fallback applies).
+   * job finishing) that echoes what a turn armed on that server belongs to
+   * that turn's place: words the agent wrote for a DM come back to the DM,
+   * never to the home channel, and a reminder set at home stays at home.
+   *  - An id the server answered the arming call with (named in the push's
+   *    origin) identifies that call exactly and wins.
+   *  - Else the free text the call passed (the push's content: the same
+   *    text, a part of it, or the text under a short label).
+   * Several matching places are ambiguous: NOWHERE (kept private). Null when
+   * nothing matches (the channel-less fallback applies). `touch` marks the
+   * matched armings as just used (a recurring reminder never ages out while
+   * it keeps firing).
    */
-  private strictArmedPlace(serverId: string, text: string, origin: Record<string, unknown> | undefined): string | null {
+  private strictArmedPlace(
+    serverId: string,
+    text: string,
+    origin: Record<string, unknown> | undefined,
+    touch = false,
+  ): string | null {
     if (!routingStrict() || !this.strictArmings?.length) return null;
     const originIds = new Set(
       Object.values(origin ?? {}).filter((v): v is string => typeof v === 'string' && v.length >= 6),
     );
     const body = normalizeArmingText(text);
-    const places: string[] = [];
+    const byId: StrictArming[] = [];
+    const byText: StrictArming[] = [];
     for (const arming of this.strictArmings) {
       if (arming.serverId !== serverId) continue;
-      const byId = arming.ids.some((id) => originIds.has(id));
-      const byText = body.length > 0 && arming.texts.some((t) =>
-        body.includes(t) || (body.length >= STRICT_ARMING_TEXT_MIN && t.includes(body)));
-      if (byId || byText) places.push(arming.place);
+      if (arming.ids.some((id) => originIds.has(id))) byId.push(arming);
+      else if (arming.texts.some((t) => echoesArmedText(body, t))) byText.push(arming);
     }
-    if (places.length === 0) return null;
-    return places.every((p) => samePlace(p, places[0]!)) ? places[0]! : STRICT_NOWHERE;
+    const matched = byId.length > 0 ? byId : byText;
+    if (matched.length === 0) return null;
+    const place = matched[0]!.place;
+    if (!matched.every((a) => samePlace(a.place, place))) return STRICT_NOWHERE;
+    if (touch) {
+      const now = Date.now();
+      this.strictArmings = [
+        ...this.strictArmings.filter((a) => !matched.includes(a)),
+        ...matched.map((a) => ({ ...a, at: now })),
+      ];
+      this.persistStrictArmings();
+    }
+    return place;
   }
 
-  /** ROUTING_STRICT: note an MCPL tool call made by `agentName`'s turn when
-   *  that turn's place is not the home place (the channel-less fallback would
-   *  answer its echo elsewhere). Kept once the server has answered
-   *  (strictNoteArmingResult). */
+  /** ROUTING_STRICT: note an MCPL tool call made by `agentName`'s turn, in
+   *  whatever place it runs (the home place too: a reminder armed at home
+   *  is held for home like any other place's). A call that passes no content
+   *  (a listing, a status read) sets nothing up and is not noted. Kept once
+   *  the server has answered (strictNoteArmingResult). */
   private strictNoteArming(agentName: string, serverId: string, callId: string, args: unknown): void {
     if (!routingStrict()) return;
     const place = this.strictTurnPlaces?.get(agentName);
-    if (place === undefined || samePlace(place, this.strictHomePlace())) return;
-    this.strictPendingArmings.set(callId, { serverId, place, callId, texts: armingTexts(args), ids: [], at: Date.now() });
+    if (place === undefined) return;
+    const strings = argumentStrings(args);
+    if (strings.length === 0) return;
+    this.strictPendingArmings.set(callId, {
+      arming: { serverId, place, callId, texts: armingTexts(args), ids: [], at: Date.now() },
+      argIds: new Set(strings.flatMap((value) => idLikeTokens(value))),
+    });
   }
 
-  /** ROUTING_STRICT: the server's answer to a noted call: its ids are kept
-   *  with the call's text (nothing to match → dropped), durably. */
+  /** ROUTING_STRICT: the server's answer to a noted call. Only ids it names
+   *  for the first time are the call's own: an id the call passed, or one an
+   *  earlier arming on the server already holds (an answer that lists what
+   *  exists), claims nothing. Kept with the call's text (nothing to match →
+   *  dropped), durably. */
   private strictNoteArmingResult(callId: string, content: unknown): void {
-    const arming = this.strictPendingArmings?.get(callId);
-    if (!arming) return;
+    const pending = this.strictPendingArmings?.get(callId);
+    if (!pending) return;
     this.strictPendingArmings.delete(callId);
-    arming.ids = armingIds(content);
+    const { arming, argIds } = pending;
+    const claimed = new Set(
+      this.strictArmings.filter((a) => a.serverId === arming.serverId).flatMap((a) => a.ids),
+    );
+    arming.ids = armingIds(content).filter((id) => !claimed.has(id) && !argIds.has(id));
     if (arming.ids.length === 0 && arming.texts.length === 0) return;
-    this.strictArmings.push(arming);
-    if (this.strictArmings.length > STRICT_ARMINGS_CAP) {
-      this.strictArmings.splice(0, this.strictArmings.length - STRICT_ARMINGS_CAP);
-    }
+    this.strictArmings = capStrictArmings([...this.strictArmings, arming]);
     this.persistStrictArmings();
   }
 
@@ -13879,7 +13991,7 @@ export class AgentFramework {
     try {
       mkdirSync(dirname(path), { recursive: true });
       const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-      writeFileSync(temporary, JSON.stringify({ version: 1, armings: this.strictArmings }), { mode: 0o600 });
+      writeFileSync(temporary, JSON.stringify({ version: STRICT_ARMINGS_VERSION, armings: this.strictArmings }), { mode: 0o600 });
       renameSync(temporary, path);
     } catch (err) {
       console.error('[strict-routing] failed to persist armed places:', err);
@@ -13890,12 +14002,15 @@ export class AgentFramework {
     const path = this.strictArmingsPath();
     if (!path) return;
     try {
-      const doc = this.readRecoveryFile(path) as { armings?: unknown } | undefined;
+      const doc = this.readRecoveryFile(path) as { version?: unknown; armings?: unknown } | undefined;
       if (!Array.isArray(doc?.armings)) return;
-      this.strictArmings = (doc.armings as StrictArming[])
+      let armings = (doc.armings as StrictArming[])
         .filter((a) => a && typeof a.serverId === 'string' && typeof a.place === 'string'
-          && Array.isArray(a.texts) && Array.isArray(a.ids))
-        .slice(-STRICT_ARMINGS_CAP);
+          && Array.isArray(a.texts) && Array.isArray(a.ids));
+      // Version 1 noted calls that passed no text (a listing), with every id
+      // of the answer: such an entry may claim reminders set elsewhere.
+      if (doc.version !== STRICT_ARMINGS_VERSION) armings = armings.filter((a) => a.texts.length > 0);
+      this.strictArmings = normalizeStrictArmings(armings);
     } catch (err) {
       console.error('[strict-routing] failed to restore armed places:', err);
     }
@@ -13936,23 +14051,58 @@ export class AgentFramework {
    * (CLI / IPC / API messages) belongs to the place a channel-less wake is
    * answered in — the home channel, else nowhere — so it is held like any
    * other place's message instead of being heard inside a turn running
-   * elsewhere, whether or not it wakes the agent. The place rides in
-   * metadata (`strictPlace`, plus `strictWake` when it requested a wake) so
-   * it survives deferral, persistence and boot recovery. No-op without the
-   * flag.
+   * elsewhere, whether or not it wakes the agent. So does channel-less
+   * module content that comes with a wake request (a file dropped into a
+   * mount that wakes on change): it is the input of the channel-less turn it
+   * wakes. The place rides in metadata (`strictPlace`, plus `strictWake` when
+   * it requested a wake) so it survives deferral, persistence and boot
+   * recovery. No-op without the flag.
    */
   private stampStrictPlace(event: ProcessEvent, response: EventResponse, metadata: MessageMetadata | undefined): MessageMetadata | undefined {
     if (!routingStrict()) return metadata;
-    if (event.type !== 'external-message' && event.type !== 'api:message') return metadata;
+    const operatorInput = event.type === 'external-message' || event.type === 'api:message';
+    // A module's own wake events ('inference-request': a subagent's return,
+    // heard mid-turn per spec S2) and MCPL deliveries are placed elsewhere.
+    const wakingModuleContent = !operatorInput && !!response.requestInference
+      && event.type !== 'inference-request' && event.type !== 'mcpl:push-event'
+      && event.type !== 'mcpl:channel-incoming';
+    if (!operatorInput && !wakingModuleContent) return metadata;
     const channelId = (metadata as Record<string, unknown> | undefined)?.channelId;
     if (typeof channelId === 'string' && channelId !== '') return metadata;
-    const target = this.primaryAgentName ?? this.agents.keys().next().value;
-    if (!target) return metadata;
+    const stamped = (metadata as Record<string, unknown> | undefined)?.strictPlace;
+    if (wakingModuleContent && typeof stamped === 'string' && stamped !== '') return metadata;
+    const place = this.strictChannelLessPlace();
+    if (place === undefined) return metadata;
     return {
       ...(metadata ?? {}),
-      strictPlace: this.strictWakePlace(target, undefined),
+      strictPlace: place,
       ...(response.requestInference ? { strictWake: true } : {}),
     } as MessageMetadata;
+  }
+
+  /** ROUTING_STRICT: the place of `agentName`'s turn as modules see it in
+   *  gatherContext (the turn being compiled; for a preview outside a turn,
+   *  the place its next channel-less turn would have). Undefined without the
+   *  flag — modules are then called exactly as upstream. */
+  private strictGatherScope(agentName: string): GatherContextScope | undefined {
+    if (!routingStrict()) return undefined;
+    const place = this.strictTurnPlaces?.get(agentName) ?? this.strictWakePlace(agentName, undefined);
+    const target = placePublishTarget(place);
+    return {
+      place,
+      ...(target ? { channelId: target.channelId, ...(target.serverId ? { serverId: target.serverId } : {}) } : {}),
+      includes: (metadata) => {
+        const own = this.strictMessagePlace(metadata as MessageMetadata | undefined);
+        return own !== null && samePlace(own, place);
+      },
+    };
+  }
+
+  /** ROUTING_STRICT: the place a channel-less wake of the primary agent is
+   *  answered in (the home channel, else NOWHERE); undefined with no agent. */
+  private strictChannelLessPlace(): string | undefined {
+    const target = this.primaryAgentName ?? this.agents.keys().next().value;
+    return target ? this.strictWakePlace(target, undefined) : undefined;
   }
 
   /** ROUTING_STRICT wake fields of a module's `inference-request` event: the

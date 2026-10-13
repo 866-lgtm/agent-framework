@@ -17,11 +17,19 @@
  *   - a framework follow-up (retry, bounce, continuation, self-wake, sleep
  *     expiry, background script) continues its own turn's place, and so
  *     does a channel-less push echoing what a turn armed on that server (a
- *     reminder it set);
+ *     reminder it set — in any place, the home place included): matched by
+ *     the new id the server answered the arming call with, else by the text
+ *     the call passed; a call that passes nothing (a listing) arms nothing;
+ *   - any other channel-less push that wakes the agent, and channel-less
+ *     module content that comes with a wake request (a watched mount), is
+ *     the input of the channel-less turn it wakes: held from other places'
+ *     turns, never heard inside them;
  *   - content a module adds on its own with no channel is a non-channel
  *     framework message (heard mid-turn); a module's own wake is a
  *     channel-less wake; a module relaying a place's material names that
  *     place (channelId + serverId) and is held and answered with it;
+ *   - modules' gatherContext() receives the turn's place, so context derived
+ *     from one place's messages stays in that place's turns;
  *   - an ephemeral run's prose belongs to no channel: published nowhere;
  *   - the privileged-human brake also reaches a turn that is alive but not
  *     streaming (waiting out a retry backoff, or parked behind an auxiliary

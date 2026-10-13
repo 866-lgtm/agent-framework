@@ -695,7 +695,9 @@ describe('strict routing hunt — flag hygiene & durability (ROUTING_STRICT=true
     assert.equal(windowTexts(h.fw).filter((t) => /BRAKE stop that/.test(t)).length, 1);
   });
 
-  it('heartbeat (control): a channel-less heartbeat mid-DM-turn is heard, and its own turn speaks only at home', async () => {
+  // A waking channel-less push is the input of the home turn it wakes: held
+  // from the DM turn (not heard inside it), then that turn's new input.
+  it('heartbeat (control): a channel-less heartbeat mid-DM-turn is held for its own turn, which speaks only at home', async () => {
     const h = await makeHarness(join(dir, 'store'));
     live.push(h.fw);
     h.membrane
@@ -714,6 +716,12 @@ describe('strict routing hunt — flag hygiene & durability (ROUTING_STRICT=true
     assert.deepEqual(h.turnLoci, [DM, HOME]);
     assert.deepEqual(publishedTo(h, DM), ['Looking.', 'DM reply.']);
     assert.deepEqual(publishedTo(h, HOME), ['Home check-in.']);
+    const heardInDm = (h.membrane.streams[0]?.receivedToolResultOptions ?? [])
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .map((m) => blockText(m.content))
+      .join('\n');
+    assert.doesNotMatch(heardInDm, /HB-TICK/);
+    assert.match(requestText(h.membrane.calls[1]!), /HB-TICK/);
   });
 
   it('MG-rollback-dedupe: a rollback while a place is held leaves ONE durable copy of each released message (no duplicate after a crash)', async () => {

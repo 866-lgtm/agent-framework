@@ -106,8 +106,12 @@ export interface Module {
    * that should be injected into the compiled context.
    * Complementary to MCPL push-based hooks — modules pull via gatherContext.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   *
+   * With ROUTING_STRICT the framework also passes the place of the turn being
+   * compiled (`scope`): content a module derives from one place's messages
+   * belongs in that place's turns only. Without the flag it is not passed.
    */
-  gatherContext?(agentName: string): Promise<ContextInjection[]>;
+  gatherContext?(agentName: string, scope?: GatherContextScope): Promise<ContextInjection[]>;
 
   /**
    * Declare extra settings for the synthesized `agent_settings` tool.
@@ -118,6 +122,26 @@ export interface Module {
    * routes get/update/reset for the declared keys back to the extension.
    */
   getAgentSettingsExtension?(): AgentSettingsExtension;
+}
+
+/**
+ * ROUTING_STRICT: the place (one conversation: a channel on a server, a
+ * private exchange on a shared channel, or nowhere) of the turn a module's
+ * gatherContext() runs for.
+ */
+export interface GatherContextScope {
+  /** The turn's place (opaque; compare places only through `includes`). */
+  place: string;
+  /** The channel the turn publishes into, when it has one. */
+  channelId?: string;
+  /** That channel's server, when known. */
+  serverId?: string;
+  /**
+   * Whether a stored message (by its metadata) belongs to the turn's place —
+   * the test the framework holds and releases messages by. False for a
+   * message of no place (a framework note, a module's own channel-less note).
+   */
+  includes(metadata: Record<string, unknown> | undefined): boolean;
 }
 
 /**

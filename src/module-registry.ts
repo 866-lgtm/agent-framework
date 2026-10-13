@@ -22,6 +22,7 @@ import type {
   SpeechHandlerOptions,
   ProcessEvent,
   TraceEventListener,
+  GatherContextScope,
 } from './types/index.js';
 import type { Agent } from './agent.js';
 
@@ -359,9 +360,11 @@ export class ModuleRegistry {
    * declare a larger `contextTimeoutMs` rather than silently losing their
    * injection every turn to the shared default. The declared value is clamped
    * to MAX_CONTEXT_TIMEOUT_MS so no single module can hold every turn hostage.
+   * `scope` (ROUTING_STRICT only) is the place of the turn being compiled;
+   * modules are called with it only when it is given.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
+  async gatherContext(agentName: string, timeoutMs = 15_000, scope?: GatherContextScope): Promise<ContextInjection[]> {
     const injections: ContextInjection[] = [];
     const promises: Promise<void>[] = [];
 
@@ -379,7 +382,8 @@ export class ModuleRegistry {
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => injections.push(...r)),
+        (scope ? module.gatherContext(agentName, scope) : module.gatherContext(agentName))
+          .then(r => injections.push(...r)),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
             () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
