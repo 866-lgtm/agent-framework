@@ -17,9 +17,10 @@
 - In explicit and hybrid mode, a ` !` continuation that an earlier round
   asked for now starts when a tool ends the turn, once that turn's
   deliveries have run, unless the framework has stopped or the agent has
-  been disposed by then. Before, hybrid mode started it only after the
-  next turn, and explicit mode dropped it, or, when its delivery ran late,
-  started it after the next turn.
+  been disposed by then. In explicit mode a turn that another event
+  started meanwhile runs first. Before, hybrid mode started it only after
+  the next turn, and explicit mode dropped it, or, when its delivery ran
+  late, started it after the next turn.
 - In hybrid and locus mode, a turn whose last response is empty writes its
   receipt, and checks for a continuation, after its last rounds' queued
   deliveries. Before, those deliveries were never receipted, or were
