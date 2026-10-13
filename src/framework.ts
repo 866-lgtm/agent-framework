@@ -1031,25 +1031,27 @@ function failureJson(value: unknown): string | undefined {
 /**
  * The whole text describeFailure cuts. For an Error, its head (name,
  * classification, status, provider code, each bounded) and its whole
- * message. For anything else, its String when that's text of its own (a
- * string, a Buffer, an Error from another realm, a class with its own
- * toString). An object whose String is only its tag, such as
- * `[object Object]`, is its JSON instead (failureJson), so a plain object
- * keeps its fields; the tag stands when JSON can't write it or finds no
- * fields to write.
+ * message. For a primitive, its String. For another object, its String when
+ * that's text of its own (a Buffer, an Error from another realm, a class
+ * with its own toString). An array, or an object whose String is empty or
+ * only its tag, such as `[object Object]`, is its JSON instead
+ * (failureJson), so its fields and elements are kept; its tag stands when
+ * JSON can't write it or finds nothing in it.
  */
 function failureDescription(error: unknown): string {
   try {
     if (!(error instanceof Error)) {
       if (typeof error !== 'object' || error === null) return String(error);
-      let text: string | undefined;
-      try { text = String(error); } catch { /* no String: its JSON, below */ }
-      if (text !== undefined && !/^\[object [^\]]*\]$/.test(text)) return text;
+      if (!Array.isArray(error)) {
+        let text: string | undefined;
+        try { text = String(error); } catch { /* no String of its own: its JSON, below */ }
+        if (text && !/^\[object [^\]]*\]$/.test(text)) return text;
+      }
       try {
         const json = failureJson(error);
         if (json !== undefined && json !== '{}') return json;
-      } catch { /* the tag, below */ }
-      return text ?? '[failure could not be described]';
+      } catch { /* its tag, below */ }
+      return Object.prototype.toString.call(error);
     }
     const fields = error as Error & {
       type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
@@ -2424,7 +2426,7 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
-      const reason = boundFailureText(error instanceof Error ? error.message : String(error));
+      const reason = boundFailureText(error instanceof Error ? error.message : failureDescription(error));
       console.error(
         '[context-maintenance] pass failed:',
         reason,
@@ -2491,7 +2493,7 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          record.error = boundFailureText(error instanceof Error ? error.message : String(error));
+          record.error = boundFailureText(error instanceof Error ? error.message : failureDescription(error));
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
@@ -12881,8 +12883,9 @@ export class AgentFramework {
     opts?: { data?: Record<string, unknown>; skipLog?: boolean },
   ): void {
     // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
-    // that isn't a string; it's recorded as its String rather than thrown on.
-    const wholeMessage = String(rawMessage);
+    // that isn't a string; it's described as a thrown value is, rather than
+    // thrown on.
+    const wholeMessage = typeof rawMessage === 'string' ? rawMessage : failureDescription(rawMessage);
     const message = boundFailureText(wholeMessage);
     // The caller's data goes to failures.log and to trace listeners, bounded
     // the same way for both. A JavaScript caller's null is no data, and data

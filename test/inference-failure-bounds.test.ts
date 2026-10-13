@@ -400,8 +400,14 @@ test("a thrown value that isn't an Error logs its own text, or its JSON when its
     ['an Error from another realm', vm.runInNewContext("new Error('zz-realm')"), 'Error: zz-realm'],
     ['a plain object', { code: 'zz_plain', count: 1 }, '{"code":"zz_plain","count":1}'],
     ['a class instance without toString', new Payload(), '{"code":"zz_code","detail":"zz-detail"}'],
+    // An array's String joins its elements' Strings; its JSON keeps them.
+    ['an array', [{ code: 'zz_a' }, new Error('zz-item')], '[{"code":"zz_a"},"Error: zz-item"]'],
+    ['an empty array', [], '[]'],
+    ['an object with no String of its own', Object.assign(Object.create(null), { code: 'zz_bare' }), '{"code":"zz_bare"}'],
     ['an object JSON cannot write', cyclic, '[object Object]'],
     ['an object with no fields but its tag', { [Symbol.toStringTag]: 'ZzTagged' }, '[object ZzTagged]'],
+    ['an object whose String is empty', { toString: () => '' }, '[object Object]'],
+    ['an object with neither a String nor fields', Object.create(null), '[object Object]'],
   ];
   for (const [what, thrown, logged] of cases) {
     assert.equal(await kickedWith(thrown), `${prefix}${logged}`, what);
@@ -565,6 +571,18 @@ test('a failed maintenance pass logs and alerts a bounded reason', async () => {
   const alert = traces.find((t) => t.type === 'ops:alert' && t.kind === 'context-maintenance-failed');
   assert.ok(alert && alert.message.length <= 2_000);
   assert.deepEqual(alert.data, { scope: 'pass' });
+
+  // A thrown value that isn't an Error is described as the other logs
+  // describe one, with no String() to throw on it.
+  const bare = makeHarness();
+  bare.fw.running = true;
+  bare.fw.maintenancePass = null;
+  bare.fw.runQueuedMaintenance = async () => { throw Object.assign(Object.create(null), { code: 'zz_bare' }); };
+  try {
+    bare.fw.startQueuedMaintenance();
+    await settle();
+  } finally { bare.restore(); }
+  assert.match(assertBoundedStrings(bare.rawArgs, '[context-maintenance] pass failed:'), /pass failed: \{"code":"zz_bare"\}$/);
 });
 
 test('emitTrace: listeners get bounded error and stack; the marker still learns the full length', () => {
@@ -606,13 +624,33 @@ test('alert data of null, from a JavaScript caller, is no data: the alert is sti
   assert.deepEqual(logged, [{ agent: 'cairn', kind: 'zz-detector', reason: 'short message' }]);
 });
 
-test('an alert message that is not a string, from a JavaScript caller, is recorded as its String', () => {
+test('an alert message that is not a string, from a JavaScript caller, is described as a thrown value is', async () => {
+  const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+  const realFetch = globalThis.fetch;
+  const posted: string[] = [];
+  process.env.CONNECTOME_OPS_WEBHOOK = 'http://zz.invalid/hook';
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    posted.push(JSON.parse(String(init?.body)).content);
+    return new Response(null);
+  }) as typeof fetch;
   const { fw, traces, logged, restore } = makeHarness();
   try {
     fw.notifyOpsAlert('zz-untyped', 'cairn', undefined, { count: 1 });
-  } finally { restore(); }
-  assert.equal(traces.find((t) => t.type === 'ops:alert')?.message, 'undefined');
-  assert.deepEqual(logged, [{ agent: 'cairn', kind: 'zz-untyped', reason: 'undefined', count: 1 }]);
+    // One with no String of its own, which String() throws on.
+    fw.notifyOpsAlert('zz-bare', 'cairn', Object.assign(Object.create(null), { code: 'zz_bare' }));
+    await settle();
+  } finally {
+    restore();
+    globalThis.fetch = realFetch;
+    if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK;
+    else process.env.CONNECTOME_OPS_WEBHOOK = hook;
+  }
+  assert.deepEqual(traces.filter((t) => t.type === 'ops:alert').map((t) => t.message), ['undefined', '{"code":"zz_bare"}']);
+  assert.deepEqual(logged, [
+    { agent: 'cairn', kind: 'zz-untyped', reason: 'undefined', count: 1 },
+    { agent: 'cairn', kind: 'zz-bare', reason: '{"code":"zz_bare"}' },
+  ]);
+  assert.deepEqual(posted, ['\u{1F6A8} **cairn** zz-untyped: undefined', '\u{1F6A8} **cairn** zz-bare: {"code":"zz_bare"}']);
 });
 
 test('alert data that is not a plain object is one bounded field, not a field per character or element', () => {
