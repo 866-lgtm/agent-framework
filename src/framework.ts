@@ -2679,6 +2679,12 @@ export class AgentFramework {
    */
   private pushModuleEvent(event: ProcessEvent, moduleName: string | undefined, traced: boolean): void {
     if (this.queue.isClosed) {
+      // A tool result takes pushEvent()'s own drop, whose line names the
+      // call, the tool and its outcome.
+      if (event.type === 'tool-result') {
+        this.pushEvent(event);
+        return;
+      }
       console.error(`[framework] a '${event.type}' event from module ${moduleName ?? '(unnamed)'} arrived after stop() began — dropped`);
       return;
     }

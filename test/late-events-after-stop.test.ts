@@ -17,14 +17,14 @@ import type { Module, ModuleContext, ProcessEvent } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** A module that records the probe events it processes and keeps its context. */
-function recorder(onStop?: (ctx: ModuleContext) => void): { module: Module; seen: string[]; context: () => ModuleContext } {
+function recorder(onStop?: (ctx: ModuleContext) => void, name = 'recorder'): { module: Module; seen: string[]; context: () => ModuleContext } {
   let context: ModuleContext | undefined;
   const seen: string[] = [];
   return {
     seen,
     context: () => context!,
     module: {
-      name: 'recorder',
+      name,
       async start(ctx) { context = ctx; },
       async stop() { onStop?.(context!); },
       async onProcess(event) { if (event.type.startsWith('probe:')) seen.push(event.type); return {}; },
@@ -81,18 +81,38 @@ test("a module's events are queued through pushEvent() and its deprecated queue 
   assert.deepEqual(traced.filter((type) => type.startsWith('probe:')), ['probe:through-push-event'], 'only pushEvent() traces, as before');
 });
 
-test("a module's event from its own stop() is dropped with a log line, and stop() completes", async (t) => {
-  const probe = recorder((ctx) => {
+test("a module's event from its own stop() is dropped with a log line naming that module, and stop() completes", async (t) => {
+  const pushes = (ctx: ModuleContext) => {
     ctx.pushEvent({ type: 'probe:from-stop' } as ProcessEvent);
     ctx.queue.push({ type: 'probe:from-stop-queue' } as ProcessEvent);
-  });
+  };
+  const first = recorder(pushes, 'first');
+  const second = recorder(pushes, 'second');
+  const framework = await makeFramework(t, [first.module, second.module]);
+  const logged = captureErrors(t);
+  await within(framework.stop(), 'stop()');
+  for (const name of ['first', 'second']) {
+    for (const type of ['probe:from-stop', 'probe:from-stop-queue']) {
+      assert.ok(logged.some((line) => line.includes(dropped(type, name))), `${name}'s ${type} drop is logged:\n${logged.join('\n')}`);
+    }
+  }
+  assert.equal(logged.some((line) => /Queue is closed/.test(line)), false, logged.join('\n'));
+});
+
+test("a module's tool result after stop() began keeps the drop line that names the call, the tool and its outcome", async (t) => {
+  const probe = recorder();
   const framework = await makeFramework(t, [probe.module]);
   const logged = captureErrors(t);
   await within(framework.stop(), 'stop()');
-  for (const type of ['probe:from-stop', 'probe:from-stop-queue']) {
-    assert.ok(logged.some((line) => line.includes(dropped(type, 'recorder'))), `${type}'s drop is logged:\n${logged.join('\n')}`);
+  const result = { type: 'tool-result', callId: 'c7', toolName: 'fetch', agentName: 'trunk', moduleName: 'recorder', result: { success: true } };
+  probe.context().pushEvent(result as ProcessEvent);
+  probe.context().queue.push({ ...result, callId: 'c8' } as ProcessEvent);
+  for (const callId of ['c7', 'c8']) {
+    assert.ok(
+      logged.some((line) => line.includes(`[framework] trunk: result of tool call ${callId} (fetch, recorder) arrived after stop — dropped; the tool succeeded`)),
+      logged.join('\n'),
+    );
   }
-  assert.equal(logged.some((line) => /Queue is closed/.test(line)), false, logged.join('\n'));
 });
 
 test("a module's event after stop() finished is dropped with a log line, not thrown into its callback", async (t) => {
