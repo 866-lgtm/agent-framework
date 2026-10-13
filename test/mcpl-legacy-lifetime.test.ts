@@ -139,8 +139,8 @@ test('a close that cannot reap fails, and so do concurrent ones; a later close r
   assert.deepEqual(settled, [], 'neither resolves while the teardown is pending');
   await Promise.all([first, second]);
   assert.equal(settled.length, 2);
-  assert.match(settled[0]!, /^first:MCPL server "legacy" did not close cleanly: .*could not be reaped/);
-  assert.match(settled[1]!, /^second:.*could not be reaped/, 'the second re-checked, rather than claiming success');
+  assert.match(settled[0]!, /^first:stdio child \d+ did not exit within \d+ms of SIGKILL; it could not be reaped/);
+  assert.match(settled[1]!, /^second:.*could not be reaped/, 'the second shares the attempt and its verdict, rather than claiming success');
   await killAndWait(stuck[0]!);
   await connection.close();
 });
@@ -301,13 +301,13 @@ test('registry: a connection whose reap fails stays registered, through close() 
   assert.equal(registry.getServer('legacy'), null);
 });
 
-test('registry: closeAll closes every connection, removes the ones it reaped, and names each it could not', async () => {
+test('registry: closeAll closes every connection, removes the ones it reaped, and keeps and reports the one it could not', async () => {
   const log = scratchLog();
   const registry = new McplServerRegistry();
   const stuck = unreapableFrom(2);
   const fine = await registry.addServer({ ...config('ok', log), id: 'fine' }, HOST_CAPS);
   const held = await registry.addServer({ ...config('ok', log), id: 'held' }, HOST_CAPS);
-  await assert.rejects(registry.closeAll(), /"held" did not close cleanly/);
+  await assert.rejects(registry.closeAll(), /could not be reaped/);
   assert.equal(registry.getServer('fine'), null, 'the one it reaped is removed');
   assert.equal(fine.isConnected, false);
   assert.equal(registry.getServer('held'), held, 'the one it could not reap stays');

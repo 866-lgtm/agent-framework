@@ -6,6 +6,7 @@
 
 import type { McplServerConfig, McplHostCapabilities } from './types.js';
 import { McplServerConnection, McplUnreapedLaunchError } from './server-connection.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from '../shutdown.js';
 
 /**
  * Capability keys that can be queried via `getServersWithCapability`.
@@ -29,6 +30,7 @@ export class McplServerRegistry {
    *  refused, so a failed launch's closed connection can always be registered
    *  as the owner of a child it couldn't reap. */
   private adding = new Set<string>();
+  private closing = new Map<McplServerConnection, Promise<void>>();
 
   /**
    * Connect to an MCPL server and register it.
@@ -95,8 +97,7 @@ export class McplServerRegistry {
     }
     // The id stays held until the close settles, so nothing launches beside
     // a child still being reaped; it's freed only once the exit is confirmed.
-    await connection.close();
-    if (this.servers.get(id) === connection) this.servers.delete(id);
+    await this.closeServer(id, connection);
   }
 
   /**
@@ -161,22 +162,29 @@ export class McplServerRegistry {
 
   /**
    * Close every server connection. Each one whose close confirms its exit
-   * is removed. One whose child couldn't be confirmed exited stays
-   * registered, holding its id, and every such failure is thrown together;
-   * removeServer retries a reap.
+   * is removed. One whose close fails or is still pending stays registered,
+   * holding its id, and every failure is thrown; removeServer or a later
+   * closeAll retries it. An explicit timeout bounds the caller's wait
+   * without cancelling cleanup.
    */
-  async closeAll(): Promise<void> {
-    const entries = Array.from(this.servers.entries());
-    const outcomes = await Promise.allSettled(entries.map(([, connection]) => connection.close()));
-    const failures: string[] = [];
-    outcomes.forEach((outcome, index) => {
-      const [id, connection] = entries[index]!;
-      if (outcome.status === 'fulfilled') {
-        if (this.servers.get(id) === connection) this.servers.delete(id);
-      } else {
-        failures.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
-      }
+  async closeAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    validateShutdownTimeout(timeoutMs);
+    await waitForShutdown(Array.from(this.servers, ([id, connection]) => ({
+      label: `mcpl:${id}`, promise: this.closeServer(id, connection),
+    })), timeoutMs);
+  }
+
+  private closeServer(id: string, connection: McplServerConnection): Promise<void> {
+    const existing = this.closing.get(connection);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => connection.close()).then(() => {
+      if (this.servers.get(id) === connection) this.servers.delete(id);
+      this.closing.delete(connection);
+    }, error => {
+      this.closing.delete(connection);
+      throw error;
     });
-    if (failures.length > 0) throw new Error(failures.join('; '));
+    this.closing.set(connection, attempt);
+    return attempt;
   }
 }

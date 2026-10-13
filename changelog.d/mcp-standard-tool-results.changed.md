@@ -86,7 +86,7 @@
   - `McplServerRegistry` holds an id until its child is confirmed exited:
     `removeServer` frees it only once the close succeeds, a second
     `addServer` for an id still connecting is refused, and `closeAll()`
-    keeps each connection it couldn't reap, naming every failure.
+    keeps each connection it couldn't reap, reporting every failure.
   - In the framework, a disconnect or failed connect whose cleanup can't
     reap the child keeps the server registered, closed and listed as
     disconnected, and its error says so. A connect for that id is refused

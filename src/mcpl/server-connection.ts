@@ -348,6 +348,12 @@ export class McplServerConnection extends EventEmitter {
    * observable even though its original promise has already been rejected. */
   private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
   private closed = false;
+  /** The host's close attempt: in flight, or done. A failed one is cleared,
+   *  so the next close() tries again. */
+  private closePromise: Promise<void> | null = null;
+  /** The host closed this connection while it was live, and its teardown
+   *  hasn't completed yet: 'close' is emitted once it has. */
+  private closeIncomplete = false;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
@@ -388,8 +394,6 @@ export class McplServerConnection extends EventEmitter {
    * one that's still alive. close() retries their reap.
    */
   private unreaped: Array<{ transport: McplTransport; failure: Error }> = [];
-  /** The teardown in flight, which later close() calls wait behind. */
-  private closing: Promise<void> | null = null;
 
   /** Whether a background reconnect loop will revive this connection after a
    *  drop. False once close() has been called (explicit close stops retrying),
@@ -1145,12 +1149,15 @@ export class McplServerConnection extends EventEmitter {
    * process, and clean up resources. At once, as before, reconnecting stops
    * and pending requests fail; a reconnect handshake in flight is aborted.
    *
-   * The teardown is shared. Calls queue behind the one in flight, so none
-   * resolves while it is pending. Each waits for the aborted attempt's own
-   * cleanup, closes the transport (its close is the reaping verdict, and a
-   * transport the host is already closing shares it), and re-checks every
-   * launch an earlier cleanup couldn't reap. It rejects, naming them, while
-   * any child still can't be confirmed exited; a later call re-checks.
+   * Calls share one attempt: while it is pending, and once it has
+   * succeeded, close() returns it. The attempt waits for the aborted
+   * reconnect's own cleanup, closes the transport (its close is the reaping
+   * verdict) and retries each launch an earlier cleanup couldn't reap. It
+   * rejects while any child can't be confirmed exited, with that failure
+   * itself, or an AggregateError when there are several. A failed attempt is
+   * cleared, so the next close() retries what it couldn't reap. 'close' is
+   * emitted once, when the teardown of a connection the host closed while
+   * live completes.
    */
   close(): Promise<void> {
     // Disable reconnect before closing — explicit close means stop retrying
@@ -1160,10 +1167,11 @@ export class McplServerConnection extends EventEmitter {
       this.reconnectTimer = null;
     }
     this.reconnecting?.abort.abort();
+    if (this.closePromise) return this.closePromise;
 
-    const live = !this.closed;
-    if (live) {
+    if (!this.closed) {
       this.closed = true;
+      this.closeIncomplete = true;
       this.resetPolicyForTransportBoundary();
 
       // Reject all pending requests
@@ -1175,19 +1183,27 @@ export class McplServerConnection extends EventEmitter {
       this.orphanedRequests.clear();
     }
 
-    const transport = this.transport;
-    const previous = this.closing;
-    const step = (previous ? previous.catch(() => {}) : Promise.resolve()).then(() => this.closeStep(transport, live));
-    this.closing = step;
-    return step;
+    const attempt = this.closeStep(this.transport, this.unreaped.map((held) => held.transport));
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
   }
 
-  private async closeStep(transport: McplTransport | null, live: boolean): Promise<void> {
+  /** One close attempt. `heldBefore` are the launches earlier cleanups
+   *  couldn't reap, which it retries. */
+  private async closeStep(transport: McplTransport | null, heldBefore: McplTransport[]): Promise<void> {
     // An aborted reconnect cleans up its own launch, holding it if it can't.
+    // That cleanup was this attempt's try at it, so its failure is this
+    // attempt's, not retried here.
     await this.reconnecting?.done;
-    const targets = transport ? [transport] : [];
-    for (const held of this.unreaped) if (!targets.includes(held.transport)) targets.push(held.transport);
-    const failures: Error[] = [];
+    const heldMeanwhile = this.unreaped.filter((held) => !heldBefore.includes(held.transport));
+    const failures: Error[] = heldMeanwhile.map((held) => held.failure);
+    const targets: McplTransport[] = [];
+    for (const target of [transport, ...heldBefore]) {
+      if (target && !targets.includes(target) && !heldMeanwhile.some((held) => held.transport === target)) targets.push(target);
+    }
     for (const target of targets) {
       try {
         // Kills the child / closes the socket.
@@ -1199,12 +1215,16 @@ export class McplServerConnection extends EventEmitter {
         if (!this.unreaped.some((held) => held.transport === target)) this.unreaped.push({ transport: target, failure });
       }
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `MCPL server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
+    }
     // The transport's own 'close' event is short-circuited by `this.closed`
     // in setupLifecycle, so this is the single source of the connection
     // 'close' when the host tears down a live transport.
-    if (live) this.emit('close');
-    if (failures.length > 0) {
-      throw new Error(`MCPL server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
+    if (this.closeIncomplete) {
+      this.closeIncomplete = false;
+      this.emit('close');
     }
   }
 
@@ -1265,7 +1285,10 @@ export class McplServerConnection extends EventEmitter {
    * close()'s ownership of the first (Iris-1827, room-293 #55410).
    */
   private async attemptReconnect(): Promise<void> {
-    if (this.reconnecting || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
+    // A queued recovery timer may outlive an earlier successful handshake:
+    // only a connection that is down reconnects, so it never replaces a live
+    // transport.
+    if (this.reconnecting || !this.closed || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
     const abort = new AbortController();
     const done = this.reconnectOnce(this.config, this.hostCapabilities, abort.signal);
     this.reconnecting = { abort, done };

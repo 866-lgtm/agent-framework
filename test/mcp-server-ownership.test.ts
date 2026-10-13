@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -287,7 +287,7 @@ test('legacy: a failed connect whose cleanup cannot reap stays registered until 
   });
 });
 
-test('stop() closes every connection, keeps the ones it cannot reap registered, and then rejects naming them', async () => {
+test('stop() closes every connection, keeps the ones it cannot reap registered, and rejects with each failure; once they have exited, a retry completes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const framework = await AgentFramework.create({
@@ -299,7 +299,13 @@ test('stop() closes every connection, keeps the ones it cannot reap registered, 
   const reaping = unreapable();
   await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
   await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
-  await assert.rejects(framework.stop(), /stop\(\) finished, but not cleanly: .*could not be reaped/);
+  await assert.rejects(framework.stop(), (error) => {
+    assert.ok(error instanceof AggregateError, String(error));
+    assert.equal(error.errors.length, 2, 'one failure from each engine');
+    assert.match(error.message, /MCP server "m" did not close cleanly: .*could not be reaped/);
+    assert.match(error.message, /stdio child \d+ did not exit within \d+ms of SIGKILL; it could not be reaped/);
+    return true;
+  });
   const internals = framework as unknown as {
     modernServers(): Map<string, unknown>;
     mcplServerRegistry: { getServer(id: string): unknown };
@@ -307,6 +313,33 @@ test('stop() closes every connection, keeps the ones it cannot reap registered, 
   assert.ok(internals.modernServers().has('m'), 'the modern one it could not reap keeps its id');
   assert.ok(internals.mcplServerRegistry.getServer('l'), 'and so does the legacy one');
   for (const stuck of reaping.stuck) await killAndWait(stuck);
+  // The failed stop left its store open, so it can be retried: the retry
+  // confirms both exits and frees the ids.
+  await framework.stop();
+  assert.equal(internals.modernServers().has('m'), false);
+  assert.equal(internals.mcplServerRegistry.getServer('l'), null);
+});
+
+test("stop()'s teardown budget bounds a modern server's close too, and the server stays registered while its close is pending", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const pending = { close: async () => { await released; } };
+  const modernServers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
+  modernServers.set('m', pending);
+  await assert.rejects(framework.stop(50), (error) =>
+    error instanceof ShutdownTimeoutError && error.pending.includes('mcp:m'));
+  assert.equal(modernServers.get('m'), pending, 'still registered while its close is pending');
+  release();
+  await framework.stop();
+  assert.equal(modernServers.has('m'), false, 'removed once its close completed');
 });
 
 test("a failed startup's cleanup closes both engines' connections, each whatever the other's close did", async () => {

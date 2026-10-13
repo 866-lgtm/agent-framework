@@ -32,4 +32,6 @@
   Before, closing a stdio server returned as soon as a signal was sent, so
   `stop()` never failed for this. Code that chains work on `stop()`, such as
   exiting a TUI or switching sessions, should catch that rejection: the
-  framework is stopped either way.
+  framework is stopped either way. As with any failed teardown, an owned
+  store stays open, and a later `stop()` retries the reap, completing once
+  the child has exited.
