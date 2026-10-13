@@ -214,9 +214,10 @@ const MAX_RECORDS = 2000;
 /**
  * Host-private store of received references. Raw URIs live here and in stubs
  * never (under `never`) or by policy only (`ref`/absent). Ids are stable and
- * never reused within the process (vector 20); eviction is FIFO past
- * MAX_RECORDS and a stale lookup returns undefined — a defined miss, never a
- * different record.
+ * never reused within the process (vector 20). Past MAX_RECORDS the record
+ * registered least recently is evicted (registering a uri the registry holds
+ * makes its record the newest), and a stale lookup returns undefined — a
+ * defined miss, never a different record.
  *
  * Process-wide singleton by design: ids are host-local *names*, not
  * capabilities, and the record itself carries serverId for any future
@@ -249,6 +250,9 @@ export class ReferenceRegistry {
         // describes verified bytes on disk and keeps the testimony they were
         // verified against.
         if (!existing.fetchedPath) existing.testimony = testimony;
+        // Newest again, so a uri just mentioned is the last to be evicted.
+        this.records.delete(existingId);
+        this.records.set(existingId, existing);
         return existing;
       }
     }

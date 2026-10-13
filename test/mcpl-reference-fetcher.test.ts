@@ -327,29 +327,44 @@ test('within one result, a uri that any block calls expired takes no eager slot;
   assert.ok(referenceRegistry.findByUri(refreshed)?.fetchedPath, 'the later result\'s fresh testimony stands');
 });
 
-// Found by Beatrice-2379's read of this change; these adapt her probe.
+// The registry holds 2000 records. Found by Beth-2389's and Beatrice-2379's
+// reads of this change; these adapt their probes.
+const REGISTRY_RECORDS = 2000;
+const registerResource = (uri: string, sizeBytes?: number) => {
+  const c = classifyBlock({ type: 'resource', uri, ...(sizeBytes !== undefined ? { sizeBytes } : {}) });
+  if (c.kind !== 'reference') throw new Error('fixture: not a reference');
+  return referenceRegistry.register(c.testimony, 'srv');
+};
+
+test("a uri a result mentions isn't evicted by the result's later blocks, so its eager copy lands in the record its stub names", async () => {
+  const target = '/ok?registered=again';
+  // Fill the registry so that the target's record is its oldest.
+  const first = registerResource(`${ORIGIN}${target}`, PAYLOAD.length);
+  for (let i = 1; i < REGISTRY_RECORDS; i++) registerResource(`${ORIGIN}/history?registered=again&i=${i}`);
+  await eagerFetch([
+    { type: 'resource', uri: `${ORIGIN}${target}`, sizeBytes: PAYLOAD.length },
+    { type: 'resource', uri: `${ORIGIN}/ok?registered=again-new`, sizeBytes: PAYLOAD.length }, // a new uri, which evicts one record
+  ]);
+  assert.equal(hits.get(target) ?? 0, 1, 'requests for the target');
+  assert.equal(referenceRegistry.findByUri(`${ORIGIN}${target}`), first, 'the registry still holds the target');
+  assert.ok(first.fetchedPath, 'and its record holds the copy');
+});
+
 for (const expired of [true, false]) {
-  test(`within one result, a repeated uri ${expired ? 'that a block calls expired still takes no eager slot' : 'still takes one eager slot'} when the registry evicts its record mid-result`, async () => {
-    const block = (uri: string, expiresAt?: string) => ({ type: 'resource', uri, sizeBytes: PAYLOAD.length, ...(expiresAt ? { expiresAt } : {}) });
-    const register = (uri: string) => {
-      const c = classifyBlock(block(uri));
-      if (c.kind !== 'reference') throw new Error('fixture: not a reference');
-      return referenceRegistry.register(c.testimony, 'srv');
-    };
+  test(`past the registry's bound, a repeated uri ${expired ? 'that a block calls expired still takes no eager slot' : 'still takes one eager slot'} when the result itself evicts its record`, async () => {
     const tag = expired ? 'expired' : 'fresh';
-    const target = `/ok?evicted=${tag}`;
-    // Fill the registry, which holds 2000 records, so that the target's
-    // record is its oldest: the next new uri evicts it.
-    const first = register(`${ORIGIN}${target}`);
-    for (let i = 0; i < 1999; i++) register(`${ORIGIN}/history?evicted=${tag}&i=${i}`);
-    assert.equal(referenceRegistry.findByUri(`${ORIGIN}${target}`), first, 'the target is the oldest record');
+    const target = `/ok?past-bound=${tag}`;
+    const first = registerResource(`${ORIGIN}${target}`, PAYLOAD.length);
+    // The target, then as many new uris as the registry holds (sizes
+    // unclaimed, so none is eager-eligible), then the target again: the new
+    // uris evict its first record, and its last block registers a second.
     await eagerFetch([
-      block(`${ORIGIN}${target}`, expired ? '2001-01-01T00:00:00Z' : undefined),
-      block(`${ORIGIN}/ok?evicted=${tag}-new`), // evicts the target's record
-      block(`${ORIGIN}${target}`), // registers the target again, as a second record
+      { type: 'resource', uri: `${ORIGIN}${target}`, sizeBytes: PAYLOAD.length, ...(expired ? { expiresAt: '2001-01-01T00:00:00Z' } : {}) },
+      ...Array.from({ length: REGISTRY_RECORDS }, (_, i) => ({ type: 'resource', uri: `${ORIGIN}/filler?past-bound=${tag}&i=${i}` })),
+      { type: 'resource', uri: `${ORIGIN}${target}`, sizeBytes: PAYLOAD.length },
     ]);
     const current = referenceRegistry.findByUri(`${ORIGIN}${target}`);
-    assert.notEqual(current?.refId, first.refId, 'the target was evicted and registered again');
+    assert.notEqual(current?.refId, first.refId, 'the result evicted the target\'s record, and its last block registered a second');
     assert.equal(hits.get(target) ?? 0, expired ? 0 : 1, 'requests for the target');
     if (!expired) assert.ok(current?.fetchedPath, "the uri's current record, the one its stub names, holds the copy");
   });
