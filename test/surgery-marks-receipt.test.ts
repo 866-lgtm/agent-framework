@@ -92,10 +92,10 @@ describe('surgery marker receipt', () => {
   };
 
   /** With `appStore`, the framework gets an app-owned store and no storePath, so its outbox is disabled. */
-  async function start(withDiscord: boolean, appStore?: unknown): Promise<void> {
+  async function start(withDiscord: boolean, appStore?: unknown, membrane = new MockMembrane()): Promise<void> {
     framework = await AgentFramework.create({
       ...(appStore ? { store: appStore as never } : { storePath }),
-      membrane: new MockMembrane().asMembrane(),
+      membrane: membrane.asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
       modules: [],
       maintenanceIntervalMs: 0,
@@ -504,6 +504,40 @@ describe('surgery marker receipt', () => {
         'add_reaction:amb-0', 'add_reaction:amb-1',
       ],
       'the redo\'s adds were sent again, before channel traffic was released',
+    );
+  });
+
+  it('a turn for channel traffic admitted before the gate may start before the drain completes', async () => {
+    // Accepted, and stated in the changelog: the surgery's store reservation
+    // ends once the gate is up, and the gate holds only traffic that arrives
+    // after it. Before this change the reservation held such a turn until the
+    // whole drain had finished.
+    const membrane = new MockMembrane();
+    await start(true, undefined, membrane);
+    framework.start();
+    const { tail } = seed(3);
+    // The switch the rollback awaits goes on only once one ordinary channel
+    // message has been admitted and answered, before any gate is up.
+    const switchBranch = cm().switchBranch.bind(cm());
+    (cm() as unknown as { switchBranch: (name: string) => Promise<void> }).switchBranch = async (name: string) => {
+      writeFileSync(probePath, '1');
+      await waitFor('the channel message answered during the switch', () => probeAnswer() !== undefined);
+      return switchBranch(name);
+    };
+    const turnsBefore = membrane.calls.length;
+
+    await settlesWithin(framework.rollbackToMessage('resident', { messageId: tail }), 3_000, 'rollbackToMessage with reactions held');
+    assert.equal(probeAnswer()?.error, null, 'the channel message was admitted');
+    await waitFor('a turn for the channel message', () => membrane.calls.length > turnsBefore);
+
+    // The turn started while the drain still runs: the first reaction request
+    // is on the wire, but every reply is still held and the gate is still up.
+    await waitFor('the first reaction request to reach the server', () => jsonl(callsPath).length >= 1);
+    assert.equal(jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length, 0, 'no reaction reply has been answered');
+    assertGateUp('while that turn runs');
+    assert.ok(
+      JSON.stringify(membrane.calls[turnsBefore]).includes('ordinary traffic while marks are delivered'),
+      'the turn carries the channel message',
     );
   });
 
