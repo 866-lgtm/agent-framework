@@ -82,6 +82,9 @@ test('logValue: a value that is not a string prints as its JSON text, and conver
   assert.equal(logValue({ a: 'b c' }), '"{\\"a\\":\\"b\\u0020c\\"}"');
   assert.equal(logValue(10n), '10');
   assert.equal(logValue({ toJSON() { throw new Error('no'); }, toString: 1 }), '"[object\\u0020Object]"');
+  const { proxy, revoke } = Proxy.revocable({}, {});
+  revoke();
+  assert.equal(logValue(proxy), '[unprintable]', 'a value no reader can read');
   // JSON writes these as null, which would read as a missing id.
   assert.equal(logValue(NaN), 'NaN');
   assert.equal(logValue(Infinity), 'Infinity');

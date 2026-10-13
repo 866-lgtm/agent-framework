@@ -38,7 +38,8 @@
  * as `"{\"toString\":1}"`. So the number 5 and the string "5" print alike, as
  * they name the same message. A number JSON writes as `null` (NaN, Infinity)
  * prints as `String()` of it. Converting a value never throws: one JSON can't
- * write prints as `String()` of it, or else as its object tag.
+ * write prints as `String()` of it, or else as its object tag, and one none
+ * of those can read (a revoked Proxy) as `[unprintable]`.
  */
 export function logValue(value: unknown): string {
   return printed(textOf(value), FIELD);
@@ -93,15 +94,19 @@ function textOf(value: unknown): string {
   if (typeof value === 'string') return value;
   // JSON writes a non-finite number as null, which reads as a missing value.
   if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
-  try {
-    return JSON.stringify(value) ?? String(value);
-  } catch {
+  const readers = [
+    () => JSON.stringify(value) ?? String(value),
+    () => String(value),
+    () => Object.prototype.toString.call(value),
+  ];
+  for (const read of readers) {
     try {
-      return String(value);
+      return read();
     } catch {
-      return Object.prototype.toString.call(value);
+      // the next reader
     }
   }
+  return '[unprintable]';
 }
 
 function escapeUnits(chars: string): string {
