@@ -2672,8 +2672,8 @@ export class AgentFramework {
   /**
    * A module's event. stop() closes the queue before it stops modules, so a
    * module's event can arrive after that: from a listener that fires while
-   * stop() runs, or from the module's own stop(). Nothing will process it, and
-   * where it comes from nothing could catch a throw, so it's dropped with a
+   * stop() runs, or from the module's own stop(). Nothing will process it,
+   * and a throw there can go unhandled or fail stop(), so it's dropped with a
    * log line naming the module. Otherwise it's queued as pushEvent() queues
    * it, or, through the deprecated queue handle, without the trace.
    */
