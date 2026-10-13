@@ -1189,6 +1189,38 @@ describe('draft notices and turn-end settlement', () => {
     }
   });
 
+  // Arthur-2378's probe: with retention shortened, the journal lets the
+  // turn's older draft go before the receipt is written.
+  it('the receipt reports a draft that retention let go during the turn as let go, not as held', async (t) => {
+    const h = await catchUpFixture();
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+    const drafts = new ProseDraftStore(h.framework.getStore(), { keepNewest: 1, keepIdleMs: 1, checkpointEvery: 1 });
+    const f = h.framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      holdProseDrafts(agent: unknown, texts: Array<{ text: string }>, reason: string, options: unknown): Array<{ id: string }>;
+      appendProseDeliveryReceipt(agent: unknown, routing: unknown): void;
+    };
+    f.proseDrafts = drafts;
+    const routing = h.internals.routingOf('scout');
+    try {
+      const old = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, turn: 1, round: 1, notice: 'later' })[0]!;
+      t.mock.timers.tick(2);
+      const newer = f.holdProseDrafts(h.agent, [{ text: 'later words' }], 'explicit-send', { routing, turn: 1, round: 2, notice: 'later' })[0]!;
+      assert.equal(drafts.get('scout', old.id), undefined, 'the journal let the older draft go');
+      f.appendProseDeliveryReceipt(h.agent, routing);
+      const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
+        .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+        .find((text) => text.startsWith('[delivered]'))!;
+      const held = receipt.match(/held as drafts? ([^(]+)\(not sent/)?.[1] ?? '';
+      assert.ok(held.includes(newer.id), `the draft still held is reported as held: ${receipt}`);
+      assert.ok(!held.includes(old.id), `the let-go draft is not offered as held: ${receipt}`);
+      assert.ok(receipt.includes(`draft ${old.id} held this turn and since let go by retention (no longer held, so not resendable)`), receipt);
+    } finally {
+      t.mock.timers.reset();
+      await h.close();
+    }
+  });
+
   it('the catch-up leaves out a draft that a notice still waiting to be written names', async () => {
     const t = await catchUpFixture();
     const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;

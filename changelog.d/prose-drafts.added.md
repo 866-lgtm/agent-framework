@@ -13,8 +13,7 @@
   the rest private until a destination is named), a same-round private
   `think` in a native round (where that policy applies: XML tool mode routes
   such prose as ordinary speech, so a send holds it as a draft), silent turns
-  and `proseRouting: disabled` narration stay private. The turn's receipt
-  counts them, except a silent turn's: a silent turn writes no receipt.
+  and `proseRouting: disabled` narration stay private.
 - In hybrid mode a send withholds publication, not what an envelope does: a
   held `>>>` envelope moves the routing state as live routing would (a
   destination it names becomes the sticky target), `>>>skip_reply {{unsent}}`

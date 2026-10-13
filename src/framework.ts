@@ -10007,7 +10007,16 @@ export class AgentFramework {
     // Each of the turn's drafts as it stands now: a mid-turn notice lets the
     // resident resend or dismiss one before the turn ends, so "not sent" is
     // said only of drafts still held.
-    const current = drafts.map((d) => this.proseDrafts.get(agent.name, d.id) ?? d);
+    // Each draft as the journal holds it now. One that retention let go
+    // since the turn held it is reported as let go: the copy the turn
+    // captured says nothing about its state now.
+    const current: Draft[] = [];
+    const letGo: Draft[] = [];
+    for (const d of drafts) {
+      const now = this.proseDrafts.get(agent.name, d.id);
+      if (now) current.push(now);
+      else letGo.push(d);
+    }
     const inState = (state: DraftState): Draft[] => current.filter((d) => draftState(d) === state);
     // Every draft by id: the receipt's metadata names them all, so
     // settleTurnDrafts records each one as noticed, and no later catch-up
@@ -10018,6 +10027,12 @@ export class AgentFramework {
       notes.push(
         `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
         '(not sent — drafts can resend them unchanged, or dismiss them)',
+      );
+    }
+    if (letGo.length > 0) {
+      notes.push(
+        `draft${letGo.length === 1 ? '' : 's'} ${idList(letGo)} held this turn and since let go by retention ` +
+        '(no longer held, so not resendable)',
       );
     }
     const unconfirmed = inState('unconfirmed');
