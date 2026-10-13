@@ -733,21 +733,32 @@ describe('explicit prose routing', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
     const internals = framework as unknown as {
       turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
       proseSpeechChains: Map<string, Promise<void>>;
+      toolResultsLogical: Map<string, RoutingState['logical']>;
     };
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     try {
-      // The earlier stream's delivery lands only after the re-inference has
-      // begun; it records into the logical turn the new stream shares.
+      // The earlier stream left its tool results pending (the record the
+      // non-streaming fallback writes); its delivery lands only after the
+      // re-inference has begun, into the logical turn the two share.
       const earlier: RoutingState = { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } };
       internals.turnRouting.set('assistant', earlier);
+      internals.toolResultsLogical.set('assistant', earlier.logical);
       internals.proseSpeechChains.set('assistant', held.then(() => { earlier.logical.deliveries.push('chan-alpha'); }));
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
       const running = framework.runUntilIdle();
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      for (const end = Date.now() + 5000; turns < 1 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(turns, 1, 'the re-inference has started');
+      assert.deepEqual(earlier.logical.deliveries, [], 'the earlier delivery has not landed yet');
       release();
       await within(running, 'the re-inference to settle');
       assert.deepEqual(routed.map((r) => r.text.trim()), ['carrying on']);
@@ -844,39 +855,42 @@ describe('explicit prose routing', () => {
   });
   }
 
-  it("hybrid: a re-inference continues the logical turn that scheduled it, though another turn ran first", async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
-    const framework = await createFramework('hybrid');
-    stubRegistry(framework);
-    let turns = 0;
-    framework.onTrace((e) => {
-      if ((e as { type: string }).type === 'inference:started') turns++;
-    });
-    feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
-    const internals = framework as unknown as {
-      turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
-      toolResultsLogical: Map<string, RoutingState['logical']>;
-    };
-    try {
-      // The scheduling turn asked for a continuation; another turn then ran
-      // and left its own routing as the agent's latest.
-      const scheduling: RoutingState = { destination: null, hybridHold: false, logical: { continuation: true, deliveries: [], suppressed: 0 } };
-      const between: RoutingState = { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } };
-      internals.toolResultsLogical.set('assistant', scheduling.logical);
-      internals.turnRouting.set('assistant', between);
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
-      await framework.runUntilIdle();
-      for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it(`${mode}: the wake that consumes unstreamed tool results continues the turn that scheduled them`, async () => {
+      const p = mode === 'explicit' ? '>>' : '>>>';
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${p}skip_reply carrying on` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      stubRegistry(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      feedTurn(framework, 2, [{ type: 'text', text: `${p}skip_reply` }] as ContentBlock[]);
+      const internals = framework as unknown as {
+        turnRouting: Map<string, RoutingState>;
+        toolResultsLogical: Map<string, RoutingState['logical']>;
+      };
+      try {
+        // The scheduling turn asked for a continuation and left its tool
+        // results pending; the scheduler then starts the agent with another
+        // wake, which consumes them.
+        const scheduling: RoutingState = { destination: null, hybridHold: false, logical: { continuation: true, deliveries: [], suppressed: 0 } };
+        internals.toolResultsLogical.set('assistant', scheduling.logical);
+        internals.turnRouting.set('assistant', { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } });
+        trigger(framework);
         await framework.runUntilIdle();
+        for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          await framework.runUntilIdle();
+        }
+        assert.equal(turns, 2, "the consuming turn took the scheduling turn's ' !'");
+        assert.equal(scheduling.logical.continuation, false);
+        assert.equal(internals.toolResultsLogical.has('assistant'), false, 'the record is taken once');
+      } finally {
+        await framework.stop();
       }
-      assert.equal(turns, 2, "the re-inference took the scheduling turn's ' !'");
-      assert.equal(scheduling.logical.continuation, false);
-      assert.equal(internals.toolResultsLogical.has('assistant'), false, 'the record is taken once');
-    } finally {
-      await framework.stop();
-    }
-  });
+    });
+  }
 
   for (const boundary of ['stop', 'dispose'] as const) {
     it(`a tool-ended explicit turn's late ' !' takes no new turn after ${boundary === 'stop' ? 'stop()' : 'its agent is disposed'}`, async () => {

@@ -1168,10 +1168,11 @@ export class AgentFramework {
    */
   private proseSpeechChains: Map<string, Promise<void>> = new Map();
   /**
-   * The logical turn a scheduled `tool_results_ready` re-inference
-   * continues, per agent: set when the non-streaming fallback schedules it,
-   * taken when it starts, so a turn that another event starts in between
-   * doesn't stand in for it (LogicalTurn).
+   * The logical turn whose unstreamed tool results are pending, per agent:
+   * set when the non-streaming fallback schedules their re-inference, and
+   * taken by the agent's next fresh start, whatever wake starts it. That
+   * turn consumes the tool results, since the scheduler batches the
+   * re-inference with the agent's other pending wakes (LogicalTurn).
    */
   private toolResultsLogical: Map<string, LogicalTurn> = new Map();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
@@ -9507,18 +9508,19 @@ export class AgentFramework {
       // tallies start empty. The previous turn's object isn't cleared: prose
       // it left queued still reads and writes its own.
       const fresh = freshTurnRouting();
-      // A framework retry, or a re-inference after tool results that weren't
-      // streamed, is the same logical turn on a new stream (LogicalTurn): it
+      // A framework retry, or the start that consumes unstreamed tool
+      // results, is the same logical turn on a new stream (LogicalTurn): it
       // shares the earlier stream's ` !` and receipt tallies, which a
       // delivery still queued there can write after this stream begins. A
-      // retry follows its stream at once; a re-inference takes the logical
-      // turn its scheduling recorded, since another turn may have run first.
+      // retry follows its stream at once; tool results pending from the
+      // non-streaming fallback go to the next fresh start, whichever wake
+      // starts it, with the logical turn recorded when they were scheduled.
       const previous = this.turnRouting.get(agent.name);
-      const scheduled = trigger?.reason === 'tool_results_ready' ? this.toolResultsLogical.get(agent.name) : undefined;
-      if (trigger?.reason === 'tool_results_ready') this.toolResultsLogical.delete(agent.name);
+      const scheduled = this.toolResultsLogical.get(agent.name);
       if (scheduled) {
+        this.toolResultsLogical.delete(agent.name);
         fresh.logical = scheduled;
-      } else if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous) {
+      } else if (attempt > 0 && previous) {
         fresh.logical = previous.logical;
       }
       this.turnRouting.set(agent.name, fresh);
