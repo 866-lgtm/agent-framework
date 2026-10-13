@@ -1165,16 +1165,16 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  * validation, as a history it can't accept does, but other refusals come
  * back the same way, such as Anthropic's 400 for a credit balance that's too
  * low. A 413 is the request's size. When the newest exchange made it too
- * large, as an oversized attachment does, shedding that exchange brings the
- * request back under the limit, and nothing else in the framework recovers a
- * 413; when the history as a whole is too large, the shed doesn't help, and
- * the breaker stops at its rewind cap. The 413 arm takes both labels a 413
- * arrives under, invalid_request and context_length, because membrane's
- * label for a 413 differs by version and adapter. Other statuses keep the
- * history, since shed history can't be got back and no shed fixes them: a
- * 404 is a model or an endpoint that doesn't exist, and 405, 409, 410 and
- * 415 are about the HTTP request or the resource rather than the
- * conversation.
+ * large, as an oversized attachment does, shedding that exchange may bring
+ * the request back under the limit, and nothing else in the framework
+ * recovers a 413; when the history as a whole is too large, the shed doesn't
+ * help, and the breaker stops at its rewind cap. The 413 arm takes both
+ * labels a 413 arrives under, invalid_request and context_length, because
+ * membrane's label for a 413 differs by version and adapter. Other statuses
+ * keep the history, since shed history can't be got back and the status
+ * gives no sign that a shed would help: a 404 is a model or an endpoint that
+ * doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the
+ * resource, as a rule, rather than the conversation.
  *
  * Which failures reach the gate with which label depends on the membrane:
  * - As membrane 0.5.86 classifies them: Anthropic files a 400 as
