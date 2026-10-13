@@ -555,8 +555,8 @@ function freshTurnRouting(): TurnRouting {
 /** How a round's prose is delivered: kept private, and under which turn's routing. */
 interface ProseRound {
   keepPrivate?: boolean;
-  /** The routing state of the turn that queued the round; the live turn's when left out. */
-  routing?: TurnRouting;
+  /** The routing state of the turn that queued the round. */
+  routing: TurnRouting;
 }
 
 function isTurnContinuation(reason: string): boolean {
@@ -8854,6 +8854,24 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * A `!` continuation the turn asked for (`>>#x !`, `>>>#x !`): start another
+   * turn now instead of pausing until the next external event. It reads the
+   * object of the turn that asked, once its deliveries have run, however the
+   * turn ended.
+   */
+  private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
+    if (!routing.continuation) return;
+    routing.continuation = false;
+    console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
+    this.pendingRequests.push({
+      agentName: agent.name,
+      reason: 'prose-continuation',
+      source: 'framework',
+      timestamp: Date.now(),
+    });
+  }
+
   /** The agent's routing state for its current turn, made when it has none. */
   private routingOf(agentName: string): TurnRouting {
     let routing = this.turnRouting.get(agentName);
@@ -8872,8 +8890,12 @@ export class AgentFramework {
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
-  private async deliverProse(agent: Agent, rawText: string, round?: ProseRound): Promise<void> {
-    await this.deliverAdmittedProse(agent, this.admitProse(rawText), round);
+  private async deliverProse(agent: Agent, rawText: string, round?: { keepPrivate?: boolean }): Promise<void> {
+    // The direct entry delivers under the live turn's routing.
+    await this.deliverAdmittedProse(agent, this.admitProse(rawText), {
+      keepPrivate: round?.keepPrivate,
+      routing: this.routingOf(agent.name),
+    });
   }
 
   /**
@@ -8899,7 +8921,7 @@ export class AgentFramework {
   private async deliverAdmittedProse(
     agent: Agent,
     envelopes: AdmittedEnvelope[],
-    round?: ProseRound,
+    round: ProseRound,
   ): Promise<void> {
     // Multi-envelope: a single prose block may address SEVERAL destinations,
     // each envelope routed independently (sticky/bounce as usual).
@@ -9018,10 +9040,10 @@ export class AgentFramework {
   private async deliverProseEnvelope(
     agent: Agent,
     envelope: AdmittedEnvelope,
-    round?: ProseRound,
+    round: ProseRound,
   ): Promise<void> {
     const name = agent.name;
-    const routing = round?.routing ?? this.routingOf(name);
+    const routing = round.routing;
     const rawText = envelope.text;
     const parsed = parseProsePrefix(rawText);
     // A private round (one that called skip_reply) asks for no publication
@@ -10602,8 +10624,10 @@ export class AgentFramework {
             if (speechContent.length > 0 && this.channelRegistry) {
               const speechText = finalSpeechText;
               if (speechText) {
-                // A turn resumed after its earlier rounds delivers after
-                // them: their queued deliveries are this chain's.
+                // After the agent's earlier deliveries: every stream's chain
+                // starts from the agent's latest link, so this waits for the
+                // turn's earlier rounds and for an earlier turn's posts still
+                // queued.
                 await turnSpeechChain;
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
@@ -10748,29 +10772,21 @@ export class AgentFramework {
             // doesn't depend on the status field, so it correctly runs after.
 
             // Logical turn end (normal completion): drop the `[delivered]`
-            // receipt. All deliveries are settled — the live chain was
-            // awaited before trailing dispatch, and trailing/text-only
-            // segments were awaited in-loop. Locus mode only; explicit-mode
-            // envelopes acknowledge themselves through the prose gateway.
+            // receipt, once every delivery has settled. The text-only and
+            // trailing paths awaited the chain when there was final text; a
+            // turn whose last response is empty awaits it here, so the
+            // receipt and the continuation see its last rounds' deliveries.
+            // Locus mode only; explicit-mode envelopes acknowledge themselves
+            // through the prose gateway.
+            await turnSpeechChain;
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent, streamRouting);
             }
 
-            // Explicit-prose `!` continuation: a prose segment this turn asked
-            // to keep going (`>>#x !` / `>>private !`) — start another turn
-            // now instead of pausing until the next external event. This gives
-            // prose the same continuation ability tool rounds have (wanted for
+            // A `!` continuation this turn asked for. This gives prose the
+            // same continuation ability tool rounds have (wanted for
             // robotics-style loops where an end-of-turn pause is harmful).
-            if (finalRouting.continuation) {
-              finalRouting.continuation = false;
-              console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-              this.pendingRequests.push({
-                agentName: agent.name,
-                reason: 'prose-continuation',
-                source: 'framework',
-                timestamp: Date.now(),
-              });
-            }
+            this.requestProseContinuation(agent, finalRouting);
 
             break;
           }
@@ -10923,6 +10939,17 @@ export class AgentFramework {
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
                   this.appendProseDeliveryReceipt(agent, streamRouting);
+                }
+                // A `!` an earlier round asked for still starts its
+                // continuation when a tool ends the turn, once the turn's
+                // deliveries have run. Explicit mode doesn't hold the turn
+                // for them, so it checks at the end of its chain.
+                if (cancelKind === 'turn_ended') {
+                  if (turnProseRouting === 'explicit') {
+                    void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
+                  } else {
+                    this.requestProseContinuation(agent, streamRouting);
+                  }
                 }
                 return;
               }

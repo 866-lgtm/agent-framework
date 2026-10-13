@@ -564,19 +564,64 @@ describe('explicit prose routing', () => {
     });
   }
 
-  it("a queued round's late continuation stays with the tool-ended turn", async () => {
+  it("a queued round's late continuation starts once its tool-ended turn's deliveries have run", async () => {
     await withQueuedTurns('explicit', '>>#alpha ! late', [
       createMockResponse([{ type: 'text', text: '>>#cafe next' }]),
     ], async ({ earlier, next, turns, release, drain }) => {
       assert.equal(earlier.continuation, false, 'the continuation has not run before release');
       release();
+      for (const end = Date.now() + 5000; turns() < 3 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
       await drain();
-      assert.equal(earlier.continuation, true, 'the late continuation belongs to the earlier turn');
+      assert.equal(turns(), 3, 'the continuation starts its own turn, once');
+      assert.equal(earlier.continuation, false, "the earlier turn's request was taken from its own object");
       assert.equal(next.continuation, false, 'the next turn never receives that continuation');
-      assert.equal(turns(), 2, 'no continuation follows the next turn');
     });
   });
 
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it(`${mode}: a ' !' an earlier round asked for starts its continuation when skip_reply ends the turn`, async () => {
+      const arrows = mode === 'explicit' ? '>>' : '>>>';
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: arrows + '#alpha ! keep going' },
+        { type: 'tool_use', id: 'k1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'k2', name: 'skip_reply', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      const skip = answerSkipReply(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: arrows + 'skip_reply' }] as ContentBlock[]);
+      const reasons: string[] = [];
+      const internals = framework as unknown as { pendingRequests: InferenceRequest[]; processInferenceRequests(): Promise<void> };
+      const process = internals.processInferenceRequests.bind(framework);
+      internals.processInferenceRequests = async () => {
+        for (const request of internals.pendingRequests) reasons.push(request.reason);
+        await process();
+      };
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+
+      trigger(framework);
+      await framework.runUntilIdle();
+      for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await framework.runUntilIdle();
+      }
+
+      assert.equal(skip.calls, 1, 'skip_reply ended the first turn');
+      assert.deepEqual(routed.map((r) => r.text.trim()), ['keep going']);
+      assert.ok(reasons.includes('prose-continuation'), 'the continuation was requested');
+      assert.equal(turns, 2, 'and it started one more turn');
+
+      await framework.stop();
+    });
+  }
 
   it("hybrid: a held callback's late malformed envelope holds only its supplied turn", async () => {
     await withHeldHybridCallback('>>>', async ({ earlier, next, routed, gateway, agent, pending, release }) => {

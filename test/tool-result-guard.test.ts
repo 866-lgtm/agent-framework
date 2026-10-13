@@ -871,6 +871,54 @@ test("a fresh turn and its restart wait behind the earlier turn's speech chain",
   }
 });
 
+test("hybrid: a restarted turn whose last response is empty writes its receipt after the earlier stream's queued delivery", { timeout: 15000 }, async () => {
+  // Stream one names #alpha, and its post is held. Its round crosses the
+  // budget, so the turn restarts, and the restart's response is empty.
+  const quiet = createMockResponse([
+    { type: 'text', text: '>>>#alpha first' },
+    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  quiet.usage = { inputTokens: 100, outputTokens: 5 };
+  const empty = createMockResponse([] as ContentBlock[], 'end_turn');
+  const h = await harness([[quiet], [empty]], { proseRouting: 'hybrid', maxStreamTokens: 20 });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const routed: string[] = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
+    resolveLocus: () => 'chan-locus',
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push(text);
+      if (text.trim() === 'first') await held;
+      return { delivered: true, channelId };
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  const receipts = () => h.framework.getAgent('assistant')!.getContextManager().getAllMessages()
+    .flatMap((message) => message.content)
+    .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text' && (block as { text: string }).text.startsWith('[delivered]'))
+    .map((block) => block.text);
+  try {
+    const run = h.run();
+    for (const end = Date.now() + 5000; h.membrane.requests.length < 2 && Date.now() < end;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(h.membrane.requests.length, 2, 'the turn restarted for its budget');
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(receipts(), [], 'no receipt while the earlier post is still held');
+    release();
+    await run;
+    assert.deepEqual(routed.map((text) => text.trim()), ['first']);
+    const written = receipts();
+    assert.equal(written.length, 1, 'one receipt for the turn');
+    assert.match(written[0]!, /chan-alpha/, 'and it names the post that was still queued');
+  } finally {
+    release();
+    await h.framework.stop();
+  }
+});
+
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
