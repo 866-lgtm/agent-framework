@@ -2536,10 +2536,10 @@ export class AgentFramework {
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
     // Register every block first. The registry keys records by uri, so a uri
-    // the result repeats is one record, judged once. Within this result the
-    // most restrictive testimony holds: a uri that any of its blocks calls
-    // expired takes no slot, whichever block registered last. A later
-    // result's fresh expiry still supersedes, through register().
+    // the result repeats is one record, judged once. A uri that any of this
+    // result's blocks calls expired takes no slot, whichever block registered
+    // last. A later result's fresh expiry still supersedes, through
+    // register().
     const records = new Map<import('./mcpl/references.js').ReferenceRecord, boolean>();
     for (const block of content) {
       const c = classifyBlock(block);
@@ -15638,8 +15638,9 @@ export class AgentFramework {
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
               (!record
-                ? 'This process holds no record of it (a restart or an eviction drops them), so fetch_reference ' +
-                  "can't fetch it either. Re-run the tool for a fresh reference."
+                ? 'This process holds no record of it (a restart or an eviction drops records, and a stub quoted ' +
+                  "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
+                  'it again, re-run that tool for a fresh reference.'
                 : expiry
                   ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
                   : 'Fetch it with fetch_reference and save the materialized file instead.'),
@@ -15755,11 +15756,10 @@ export class AgentFramework {
               continue;
             }
             // Reference stub: the registry's claimed type (when this process
-            // still has the record), else the image type sniffed from the
-            // stub's text, says whether it was an image. Either is taken as
-            // the stub shows a type (sanitized and bounded), so a record
-            // agrees with the stub a restart leaves. Non-image references
-            // are not slots.
+            // still has the record), else the first image/ token in the
+            // stub's text, which can come from its name, says whether it was
+            // an image. Either is read as the stub shows a type, sanitized
+            // and bounded. Non-image references are not slots.
             const claimed = referenceRegistry.get(ph.refId)?.testimony.mimeType ?? ph.mediaType ?? undefined;
             const mediaType = referenceTypeLabel(claimed).toLowerCase();
             if (!mediaType.startsWith('image/')) continue;

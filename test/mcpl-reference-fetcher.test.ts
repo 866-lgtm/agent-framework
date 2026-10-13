@@ -192,6 +192,8 @@ test('a header type that sanitizes to nothing counts as absent, so the claimed t
   const out = await f.fetch(rec);
   assert.equal(out.ok, true, out.error);
   assert.equal(out.mimeType, 'text/plain');
+  assert.equal(saved.at(-1)!.mime, 'text/plain', 'the saved type');
+  assert.equal(rec.verifiedMimeType, 'text/plain', "the record's verified type");
   assert.equal(rec.fetchedPath, `scratch/refs/${rec.refId}.txt`);
 });
 

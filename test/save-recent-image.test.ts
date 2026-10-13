@@ -407,9 +407,10 @@ describe('save_recent_image provenance (issue #104)', () => {
   });
 
   it("a reference whose claimed type carries bidi controls is the image its stub shows, and its refusal shows the type without them", async () => {
-    // The stub shows `image/png`, so after a restart the stub's text alone
-    // makes this a slot; the record must say the same, or the index slides.
-    const c = classifyBlock({ type: 'image', uri: 'https://example.invalid/sri-label.png', mimeType: '\u202Eimage/png\u061C' });
+    // The stub shows `Image/PNG`, so after a restart the stub's text alone
+    // makes this a slot (matched without regard to case); the record must
+    // say the same, or the index slides.
+    const c = classifyBlock({ type: 'image', uri: 'https://example.invalid/sri-label.png', mimeType: '\u202EImage/PNG\u061C' });
     assert.strictEqual(c.kind, 'reference');
     const record = referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony);
     const h = await startTurn({
@@ -420,7 +421,7 @@ describe('save_recent_image provenance (issue #104)', () => {
           type: 'tool_result',
           toolUseId: 'call_cam',
           toolName: 'mcpl--vst--camera',
-          content: `[${record.refId}] label.png — image/png, 1.2MB claimed — from tool result — fetch with fetch_reference`,
+          content: `[${record.refId}] label.png — Image/PNG, 1.2MB claimed — from tool result — fetch with fetch_reference`,
           isError: false,
         }] as ContentBlock[]);
       },
@@ -532,7 +533,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.ok(result.content.includes(`(ref_3_cc02, image/${'x'.repeat(113)}…, from`), result.content);
-      assert.match(result.content, /holds no record of it .*Re-run the tool for a fresh reference\./);
+      assert.match(result.content, /holds no record of it .*If its tool can produce it again, re-run that tool for a fresh reference\./);
       assert.ok(!result.content.includes('Fetch it with fetch_reference'), result.content);
     } finally {
       await h.framework.stop();
