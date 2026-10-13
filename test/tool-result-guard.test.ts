@@ -899,12 +899,12 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
     getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const internals = h.framework as unknown as {
-    requestProseContinuation(agent: unknown, routing: { continuation: { requested: boolean } }): void;
+    requestProseContinuation(agent: unknown, routing: { logical: { continuation: boolean } }): void;
   };
   const check = internals.requestProseContinuation.bind(h.framework);
   const seen: boolean[] = [];
   internals.requestProseContinuation = (agent, routing) => {
-    seen.push(routing.continuation.requested);
+    seen.push(routing.logical.continuation);
     check(agent, routing);
   };
   try {
@@ -981,11 +981,11 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    type Routing = { pin?: string; destination: string | null; hybridHold: boolean; continuation: { requested: boolean };
-      deliveries: string[]; suppressed: number };
+    type Routing = { pin?: string; destination: string | null; hybridHold: boolean;
+      logical: { continuation: boolean; deliveries: string[]; suppressed: number } };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlier: Routing = { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true, continuation: { requested: true },
-      deliveries: ['chan-earlier'], suppressed: 2 };
+    const earlier: Routing = { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
+      logical: { continuation: true, deliveries: ['chan-earlier'], suppressed: 2 } };
     internals.turnRouting.set('assistant', earlier);
     try {
       await h.run();
@@ -994,12 +994,12 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.pin, undefined, `${mode}: no sticky destination`);
       assert.equal(now?.destination, null, `${mode}: no turn destination`);
       assert.equal(now?.hybridHold, false, `${mode}: no hybrid hold`);
-      assert.equal(now?.continuation.requested, false, `${mode}: no continuation`);
-      assert.notEqual(now?.continuation, earlier.continuation, `${mode}: a fresh turn's continuation isn't shared with the earlier turn's`);
-      assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
-      assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
+      assert.equal(now?.logical.continuation, false, `${mode}: no continuation`);
+      assert.notEqual(now?.logical, earlier.logical, `${mode}: a fresh turn's logical state isn't shared with the earlier turn's`);
+      assert.deepEqual(now?.logical.deliveries, [], `${mode}: no deliveries carried into the new turn`);
+      assert.equal(now?.logical.suppressed, 0, `${mode}: no suppression carried into the new turn`);
       assert.deepEqual(earlier, { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
-        continuation: { requested: true }, deliveries: ['chan-earlier'], suppressed: 2 },
+        logical: { continuation: true, deliveries: ['chan-earlier'], suppressed: 2 } },
         `${mode}: all earlier-turn routing and receipt state stays with its queued prose`);
     } finally {
       await h.framework.stop();

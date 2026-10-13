@@ -14,18 +14,22 @@
   across turns: every stream queues its deliveries behind the agent's
   earlier ones, a fresh turn's included (apart from a stream that a later
   one replaced). A turn's reply, and its completion, can therefore wait for
-  an earlier turn's posts: up to their request timeout, or for good when
-  `requestTimeoutMs` is 0 and a post is never answered.
+  an earlier turn's posts: up to their request timeouts, one after another,
+  or for good when `requestTimeoutMs` is 0 and a post is never answered.
 - In explicit and hybrid mode, a ` !` continuation that an earlier round
   asked for now starts when a tool ends the turn, once that turn's
   deliveries have run, unless the framework has stopped or the agent has
-  been disposed by then (a dropped one is logged). One asked for before a
-  framework retry or a re-inference after unstreamed tool results still
-  stands. In explicit mode a turn
-  that another event
-  started meanwhile runs first. Before, hybrid mode started it only after
-  the next turn, and explicit mode dropped it, or, when its delivery ran
-  late, started it after the next turn.
+  been disposed by then (a dropped one is logged). In explicit mode a turn
+  that another event started meanwhile runs first. Before, hybrid mode
+  started it only after the next turn, and explicit mode dropped it, or,
+  when its delivery ran late, started it after the next turn.
+- A framework retry, or a re-inference after unstreamed tool results, starts
+  the turn's sticky destination and hybrid's hold afresh, as before, but
+  continues its logical turn: a ` !` asked for before it still stands, in
+  explicit mode too, and the receipt at the turn's end reports the earlier
+  stream's deliveries, including ones that land after the new stream began.
+  Before, explicit mode dropped that ` !`, and the receipt counted only the
+  deliveries that landed after the new start.
 - A turn that completes now waits for its queued deliveries before its
   receipt and its continuation check, in every mode, whatever its last
   response. Before, only a completion with final text waited, so in hybrid

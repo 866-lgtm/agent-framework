@@ -540,22 +540,28 @@ interface TurnRouting {
   destination: string | null;
   /** Hybrid: held back after a malformed or unresolved envelope, until a later `>>>` names a target. */
   hybridHold: boolean;
-  /**
-   * Whether the turn asked for a `!` continuation. A holder, so that a
-   * framework retry or a re-inference after unstreamed tool results, which
-   * beginAgentTurn starts with fresh routing, can share it with the stream
-   * it follows: a ` !` asked for there still stands, even when its delivery
-   * runs after the new stream began.
-   */
-  continuation: { requested: boolean };
+  /** What the logical turn keeps across a new stream (LogicalTurn). */
+  logical: LogicalTurn;
+}
+
+/**
+ * What a framework retry, or a re-inference after unstreamed tool results,
+ * shares with the stream it follows. beginAgentTurn starts those with fresh
+ * routing, but they are the same logical turn: a ` !` asked for there still
+ * stands, and the receipt at the turn's end reports every stream's
+ * deliveries, even ones that land after the new stream began.
+ */
+interface LogicalTurn {
+  /** The turn asked for a ` !` continuation; taken once. */
+  continuation: boolean;
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: string[];
-  /** Plain-prose segments this turn suppressed, reported by its receipt. */
+  /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
 }
 
 function freshTurnRouting(): TurnRouting {
-  return { destination: null, hybridHold: false, continuation: { requested: false }, deliveries: [], suppressed: 0 };
+  return { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } };
 }
 
 /** How a round's prose is delivered: kept private, and under which turn's routing. */
@@ -1161,6 +1167,13 @@ export class AgentFramework {
    * posts go out in the order they were written, across streams and turns.
    */
   private proseSpeechChains: Map<string, Promise<void>> = new Map();
+  /**
+   * The logical turn a scheduled `tool_results_ready` re-inference
+   * continues, per agent: set when the non-streaming fallback schedules it,
+   * taken when it starts, so a turn that another event starts in between
+   * doesn't stand in for it (LogicalTurn).
+   */
+  private toolResultsLogical: Map<string, LogicalTurn> = new Map();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
@@ -4482,6 +4495,7 @@ export class AgentFramework {
         this.pendingAssistantBlocks.delete(agent.name);
         this.turnRouting.delete(agent.name);
         this.proseSpeechChains.delete(agent.name);
+        this.toolResultsLogical.delete(agent.name);
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
@@ -7092,7 +7106,10 @@ export class AgentFramework {
               ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
             });
           } else {
-            // Non-streaming fallback: schedule re-inference
+            // Non-streaming fallback: schedule re-inference, which continues
+            // this stream's logical turn.
+            const logical = this.turnRouting.get(agent.name)?.logical;
+            if (logical) this.toolResultsLogical.set(agent.name, logical);
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
@@ -7590,6 +7607,7 @@ export class AgentFramework {
     this.agents.delete(agentName);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
+    this.toolResultsLogical.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
@@ -8702,7 +8720,7 @@ export class AgentFramework {
   /** Record plain-prose segments this turn suppressed. */
   private recordProseSuppression(routing: TurnRouting, count: number): void {
     if (count <= 0) return;
-    routing.suppressed += count;
+    routing.logical.suppressed += count;
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
@@ -8711,7 +8729,7 @@ export class AgentFramework {
     outcome: { delivered: boolean; channelId: string } | null | undefined,
   ): void {
     if (!outcome?.delivered) return;
-    routing.deliveries.push(outcome.channelId);
+    routing.logical.deliveries.push(outcome.channelId);
   }
 
   /**
@@ -8728,11 +8746,11 @@ export class AgentFramework {
    * ([discord-send-failed]); this is the success half.
    */
   private appendProseDeliveryReceipt(agent: Agent, routing: TurnRouting): void {
-    const list = routing.deliveries;
-    const suppressed = routing.suppressed;
+    const list = routing.logical.deliveries;
+    const suppressed = routing.logical.suppressed;
     if (list.length === 0 && suppressed === 0) return;
-    routing.deliveries = [];
-    routing.suppressed = 0;
+    routing.logical.deliveries = [];
+    routing.logical.suppressed = 0;
     const seen = new Set<string>();
     const shown: string[] = [];
     for (const id of list ?? []) {
@@ -8863,16 +8881,18 @@ export class AgentFramework {
   /**
    * A `!` continuation the turn asked for (`>>#x !`, `>>>#x !`): start another
    * turn now instead of pausing until the next external event. It reads the
-   * object of the turn that asked, once its deliveries have run, when the
-   * turn completes or a tool ends it. (A turn that ends in an error or is
-   * abandoned by a quiesce asks for none.)
+   * logical turn of the stream that asked (shared with a retry or a
+   * re-inference that continues it), once its deliveries have run, when the
+   * turn completes or a tool ends it. A stream that ends in an error asks for
+   * none itself, but a framework retry that follows it carries the request;
+   * a turn abandoned by a quiesce asks for none.
    */
   private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
-    // The holder may be shared with an earlier stream of the same logical
-    // turn; its deliveries are on the agent's chain ahead of this stream's,
-    // so by the time this check runs, they have run.
-    if (!routing.continuation.requested) return;
-    routing.continuation.requested = false;
+    // The flag may be shared with an earlier stream of the same logical
+    // turn (LogicalTurn); its deliveries are on the agent's chain ahead of
+    // this stream's, so by the time this check runs, they have run.
+    if (!routing.logical.continuation) return;
+    routing.logical.continuation = false;
     // An explicit turn's check can run after its stream has returned. A
     // stopped framework, or an agent no longer registered under its name (a
     // disposed fork or ephemeral run), takes no new turn from it.
@@ -8987,7 +9007,7 @@ export class AgentFramework {
       const normalized = envelope.replace(/^\s+(?=>>>)/, '');
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
-      if (parsed.continueTurn) routing.continuation.requested = true;
+      if (parsed.continueTurn) routing.logical.continuation = true;
       if (parsed.kind === 'private') {
         delete routing.pin;
         routing.hybridHold = true;
@@ -9065,7 +9085,7 @@ export class AgentFramework {
     const parsed = parseProsePrefix(rawText);
     // A private round (one that called skip_reply) asks for no publication
     // or continuation, even when delivery runs after that turn has ended.
-    if (parsed.continueTurn && !round.keepPrivate) routing.continuation.requested = true;
+    if (parsed.continueTurn && !round.keepPrivate) routing.logical.continuation = true;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -9488,13 +9508,18 @@ export class AgentFramework {
       // it left queued still reads and writes its own.
       const fresh = freshTurnRouting();
       // A framework retry, or a re-inference after tool results that weren't
-      // streamed, is the same logical turn on a new stream: a ` !` an earlier
-      // stream asked for still stands, as it did when the flag was per agent.
-      // The new object shares the earlier one's continuation holder, since a
-      // delivery still queued there can set it after this stream begins.
+      // streamed, is the same logical turn on a new stream (LogicalTurn): it
+      // shares the earlier stream's ` !` and receipt tallies, which a
+      // delivery still queued there can write after this stream begins. A
+      // retry follows its stream at once; a re-inference takes the logical
+      // turn its scheduling recorded, since another turn may have run first.
       const previous = this.turnRouting.get(agent.name);
-      if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous) {
-        fresh.continuation = previous.continuation;
+      const scheduled = trigger?.reason === 'tool_results_ready' ? this.toolResultsLogical.get(agent.name) : undefined;
+      if (trigger?.reason === 'tool_results_ready') this.toolResultsLogical.delete(agent.name);
+      if (scheduled) {
+        fresh.logical = scheduled;
+      } else if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous) {
+        fresh.logical = previous.logical;
       }
       this.turnRouting.set(agent.name, fresh);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
