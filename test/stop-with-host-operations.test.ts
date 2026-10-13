@@ -2,9 +2,10 @@
  * stop() and an operator's operations.
  *
  * Once stop() has begun, an operator's entry points refuse: quiesce, resume,
- * the store surgeries, undo, redo, maintain, puppet and the MCPL lifecycle
- * calls (a host/command is refused by its listener). The awareness sync is
- * the exception, since its callers have already changed the store. These
+ * the store surgeries, a branch switch, undo, redo, maintain, puppet and the
+ * MCPL lifecycle calls (a host/command is refused by its listener). The
+ * awareness sync is the exception: it's admitted until stop() has finished
+ * waiting, since its callers have already changed the store. These
  * tests cover those refusals and the operations admitted before them, over
  * MCPL or from a direct call: stop() waits for each, and for what each starts
  * while it waits, before the event gate, the modules, the MCPL connections
@@ -24,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
+import { ApiServer } from '../src/api/server.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds; fail, naming `what`, after `ms`. */
@@ -372,6 +374,29 @@ describe('stop() with an operator operation in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
+  it('an awareness sync called once stop() has finished waiting is refused, and installs no barrier', async () => {
+    const framework = await create();
+    let barriers = 0;
+    internals(framework).beginDiscordAwarenessBarrier = () => {
+      barriers++;
+      return { requiresBarrier: false, promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }) };
+    };
+    let finishModules!: () => void;
+    const hold = new Promise<void>((resolve) => { finishModules = resolve; });
+    framework.getModule('teardown-probe')!.stop = async () => {
+      order.push('modules stopped');
+      await hold;
+    };
+    const stopping = framework.stop();
+    try {
+      await until(() => order.includes('modules stopped'), 'module teardown');
+      await assert.rejects(framework.syncDiscordAwarenessMarkers(), /^Error: awareness sync refused: the framework is stopping$/);
+      assert.equal(barriers, 0);
+    } finally { finishModules(); await stopping; }
+    await assert.rejects(framework.syncDiscordAwarenessMarkers(), /^Error: awareness sync refused: the framework is stopping$/);
+    assert.equal(barriers, 0);
+  });
+
   it("an operation that outlasts stop()'s budget fails the stop and keeps the store open for a retry", async () => {
     const framework = await create();
     let deliver: (() => void) | undefined;
@@ -409,6 +434,7 @@ describe('stop() with an operator operation in flight', () => {
     ['redo', (f) => f.redo('agent')],
     ['maintain', (f) => f.maintenanceTick()],
     ['puppet', (f) => f.puppetToolCall('agent', 'unused', {})],
+    ['switch branch', (f) => f.switchBranch('main')],
     ['connect MCPL server', (f) => f.connectMcplServer({ id: 'late', command: 'unused' })],
     ['disconnect MCPL server', (f) => f.disconnectMcplServer('late')],
     ['restart MCPL server', (f) => f.restartMcplServer('late')],
@@ -536,6 +562,14 @@ describe('stop() with an operator operation in flight', () => {
       order.push('tool returned');
       return { success: true, data: 'done' };
     };
+    // The pair's two writes are what the wait protects.
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const addMessage = cm.addMessage.bind(cm);
+    cm.addMessage = ((...args: Parameters<typeof cm.addMessage>) => {
+      const id = addMessage(...args);
+      order.push('message stored');
+      return id;
+    }) as typeof cm.addMessage;
     const puppeting = framework.puppetToolCall('agent', 'probe', {});
     void puppeting.catch(() => {});
     await until(() => called, 'the puppet call to reach its tool');
@@ -544,8 +578,76 @@ describe('stop() with an operator operation in flight', () => {
     const { toolUseId } = await puppeting;
     await stopping;
     assert.match(toolUseId, /^toolu_01/);
-    assert.deepEqual(order, ['tool returned', 'modules stopped']);
+    assert.deepEqual(order, ['tool returned', 'message stored', 'message stored', 'modules stopped']);
     assert.deepEqual(rejections, []);
+  });
+
+  it("stop() waits for a branch switch from the API server, its config mount included", { timeout: 20_000 }, async () => {
+    const framework = await create();
+    const api = new ApiServer(framework) as unknown as {
+      cmdBranchCreate(params: { name: string }): Promise<unknown>;
+      cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+    };
+    await api.cmdBranchCreate({ name: 'side' });
+    const fw = internals(framework);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let mounting = false;
+    const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+      materializeMount: async () => { mounting = true; await held; order.push('config materialized'); },
+    } : getModule(name);
+    const switching = api.cmdBranchSwitch({ name: 'side' });
+    void switching.catch(() => {});
+    await until(() => mounting, 'the switch to reach its config mount');
+    const stopping = framework.stop();
+    await releaseWhenStopWaits(release);
+    await switching;
+    await stopping;
+    assert.deepEqual(order, ['config materialized', 'modules stopped']);
+    assert.deepEqual(rejections, []);
+  });
+
+  it("the API server's current branch follows the store when a switch fails after moving it", async () => {
+    const framework = await create();
+    const api = new ApiServer(framework) as unknown as {
+      cmdBranchCreate(params: { name: string }): Promise<unknown>;
+      cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+      cmdBranchCurrent(): Promise<{ name: string }>;
+    };
+    await api.cmdBranchCreate({ name: 'side' });
+    const fw = internals(framework);
+    const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+      materializeMount: async () => { throw new Error('disk full'); },
+    } : getModule(name);
+    await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /disk full/);
+    assert.equal(framework.getStore().currentBranch().name, 'side');
+    assert.equal((await api.cmdBranchCurrent()).name, 'side');
+    await framework.stop();
+  });
+
+  it('a branch switch from the API server once stop() has begun is refused, and the branch stays', async () => {
+    const framework = await create();
+    const api = new ApiServer(framework) as unknown as {
+      cmdBranchCreate(params: { name: string }): Promise<unknown>;
+      cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+      cmdBranchCurrent(): Promise<{ name: string }>;
+    };
+    await api.cmdBranchCreate({ name: 'side' });
+    let finishModules!: () => void;
+    const hold = new Promise<void>((resolve) => { finishModules = resolve; });
+    framework.getModule('teardown-probe')!.stop = async () => {
+      order.push('modules stopped');
+      await hold;
+    };
+    const stopping = framework.stop();
+    try {
+      await until(() => order.includes('modules stopped'), 'module teardown');
+      await assert.rejects(api.cmdBranchSwitch({ name: 'side' }), /^Error: switch branch refused: the framework is stopping$/);
+      assert.equal(framework.getStore().currentBranch().name, 'main');
+      assert.equal((await api.cmdBranchCurrent()).name, 'main');
+    } finally { finishModules(); await stopping; }
   });
 
   for (const action of ['connect', 'disconnect', 'restart'] as const) {

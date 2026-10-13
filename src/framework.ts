@@ -1142,6 +1142,10 @@ export class AgentFramework {
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
+  /** Set once stop() has finished waiting on operatorOperations, whether the
+   * wait completed or timed out: an awareness sync, which is admitted after
+   * stop() has begun, is refused from here on (see syncDiscordAwarenessMarkers). */
+  private operatorWaitEnded = false;
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -2278,19 +2282,21 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
-    // Closing the queue closed admission, except for an awareness sync (see
-    // syncDiscordAwarenessMarkers). What admitted operations start now, such
-    // as a surgery's config materialization, joins the set, and so does such
-    // a sync, so wait until the set is empty. This comes after the streams and
-    // the event loop, which a quiesce or a surgery may be waiting on. If the
-    // budget runs out, teardown goes on while the operation may still act on
-    // what it tears down, and the store stays open for another stop().
+    // Closing the queue closed admission, except for an awareness sync, which
+    // is admitted until this wait ends (see syncDiscordAwarenessMarkers). What
+    // admitted operations start now, such as a surgery's config
+    // materialization, joins the set, and so does such a sync, so wait until
+    // the set is empty. This comes after the streams and the event loop, which
+    // a quiesce or a surgery may be waiting on. If the budget runs out,
+    // teardown goes on while the operation may still act on what it tears
+    // down, and the store stays open for another stop().
     let operatorOperationsTimedOut: unknown;
     try {
       await this.waitForOperatorOperations(teardownTimeoutMs);
     } catch (error) {
       operatorOperationsTimedOut = error;
     }
+    this.operatorWaitEnded = true;
 
     // Stop typing indicators
     this.channelRegistry?.stopAll();
@@ -4010,8 +4016,9 @@ export class AgentFramework {
     // A pass already running is stop()'s to wait for; a new one isn't started.
     this.refuseOperatorAfterStop('maintain');
     if (!this.running) {
-      // startQueuedMaintenance no-ops on a stopped/never-started framework —
-      // a bare snapshot would masquerade as a completed pass, so say so.
+      // startQueuedMaintenance no-ops on a framework that was never started
+      // (a stopping one is refused above): a bare snapshot would masquerade
+      // as a completed pass, so say so.
       console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
       return { ...this.getContextMaintenanceSnapshot(), ran: false };
     }
@@ -5793,7 +5800,7 @@ export class AgentFramework {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
 
-    await this.runDiscordAwarenessSync();
+    await this.syncDiscordAwarenessMarkers();
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -6097,8 +6104,31 @@ export class AgentFramework {
   }
 
   // ==========================================================================
-  // Undo / Redo
+  // Branch switch, Undo / Redo
   // ==========================================================================
+
+  /**
+   * Switch the store to an existing branch, reconcile Discord awareness
+   * markers with it, and re-materialize the config mount from it. Resolves
+   * once all three have run. An operator's operation: refused once stop() has
+   * begun, and waited for by stop() while it runs.
+   */
+  async switchBranch(name: string): Promise<void> {
+    this.refuseOperatorAfterStop('switch branch');
+    return this.trackOperatorOperation('branch:switch', () => this.runSwitchBranch(name));
+  }
+
+  /** switchBranch's work, run where stop() can wait for it. */
+  private async runSwitchBranch(name: string): Promise<void> {
+    this.store.switchBranch(name);
+    // Reversible Discord awareness markers are part of the branch projection.
+    // Don't acknowledge the switch until add/remove operations were attempted.
+    await this.syncDiscordAwarenessMarkers();
+    const ws = this.moduleRegistry.getModule('workspace');
+    if (ws && 'materializeMount' in ws) {
+      await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
+    }
+  }
 
   /**
    * Undo the last inference turn for an agent.
@@ -6482,7 +6512,7 @@ export class AgentFramework {
           );
         }
         if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-        await this.runDiscordAwarenessSync();
+        await this.syncDiscordAwarenessMarkers();
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6655,7 +6685,7 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        await this.runDiscordAwarenessSync();
+        await this.syncDiscordAwarenessMarkers();
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -14010,12 +14040,14 @@ export class AgentFramework {
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work.
-   *  Unlike the other operator entry points, this one isn't refused once stop()
-   *  has begun: its callers, such as the API server's branch switch, have
-   *  already changed the store and call it to finish that change. stop() waits
-   *  for one that starts while stop() is waiting. One that starts later can
-   *  fail to deliver, and the outbox keeps that work for the next start. */
-  syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+   *  Unlike the other operator entry points, this one is admitted after stop()
+   *  has begun, until stop() has finished waiting on the operator set: its
+   *  callers, such as the API server's undo and redo, have already changed the
+   *  store and call it to finish that change, sometimes from inside a trace
+   *  listener that started stop(). stop() waits for one admitted then. Once
+   *  stop() can no longer wait for it, it's refused. */
+  async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+    if (this.operatorWaitEnded) throw new Error('awareness sync refused: the framework is stopping');
     return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
   }
 

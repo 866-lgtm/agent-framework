@@ -536,20 +536,17 @@ export class ApiServer {
       throw new Error('name is required');
     }
 
-    const store = this.framework.getStore();
     const previousBranch = this.currentBranch;
 
-    store.switchBranch(params.name);
-    this.currentBranch = params.name;
-
-    // Reversible Discord awareness markers are part of the branch projection.
-    // Do not acknowledge the switch until add/remove operations were attempted.
-    await this.framework.syncDiscordAwarenessMarkers();
-
-    // Materialize config files from the new branch
-    const ws = this.framework.getModule('workspace');
-    if (ws && 'materializeMount' in ws) {
-      await (ws as any).materializeMount('_config');
+    // The framework switches the store, reconciles the Discord awareness
+    // markers and re-materializes the config mount. Once stop() has begun it
+    // refuses, and stop() waits for a switch already running.
+    try {
+      await this.framework.switchBranch(params.name);
+    } finally {
+      // A later step can fail after the store has moved.
+      const store = this.framework.getStore();
+      if (!store.isClosed()) this.currentBranch = store.currentBranch().name;
     }
 
     this.broadcast('branch:switched', {
