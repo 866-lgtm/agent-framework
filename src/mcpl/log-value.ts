@@ -18,18 +18,20 @@
  * selectors) and the blank Braille pattern. So it stays one field on one line,
  * a reader that splits on whitespace keeps it whole, no field holds a raw
  * `=` (so every `=` before a line's free-text tail, `logDetail`, belongs to
- * a real field), and `JSON.parse` of a value that isn't cut gives back
- * exactly what was sent. Escaping rather than stripping keeps two identifiers
- * that differ in invisible characters from printing alike; canonically
- * equivalent or lookalike identifiers still can.
+ * a real field), and `JSON.parse` of a quoted value that isn't cut gives
+ * back exactly what was sent. Escaping rather than stripping keeps two
+ * identifiers that differ in invisible characters within the units a line
+ * prints from printing alike; canonically equivalent or lookalike
+ * identifiers still can.
  *
  * A value longer than 256 UTF-16 units is cut, so one value can't make a line
  * long: it prints quoted, as its first 256 units (255 when the 256th would
  * split a surrogate pair), each at most six characters once escaped, followed
  * by `…(N)`, N being its full length. `JSON.parse` of the quoted part gives
  * back those first units. A cut value always opens with a quote, and its
- * marker follows the closing quote; a plain token never holds a quote, so no
- * value a sender sends prints as a cut one.
+ * marker follows the closing quote. A plain token never holds a quote, and a
+ * quoted value that isn't cut ends at its closing quote, so only a value
+ * that was cut prints as one.
  *
  * A value that isn't a string prints as its JSON text, quoted as any text is
  * that isn't a plain token: the number 5 prints as `5`, and `{"toString":1}`
