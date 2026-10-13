@@ -520,6 +520,79 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
   }
 });
 
+test("explicit mode: a resumed stream's deliveries queue behind the turn's earlier ones", { timeout: 15000 }, async () => {
+  // From a review's probe. Delivery of 'first' is held until after the
+  // resumed stream has finished, so '>>#cafe second' is still queued behind
+  // it when the resumed turn delivers 'continued'. Queued behind them, it
+  // goes to #cafe, where the turn last addressed, as the stream sends it.
+  const secondRound = createMockResponse([
+    { type: 'text', text: '>>#cafe second' },
+    { type: 'tool_use', id: 'two', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  secondRound.usage = { inputTokens: 100, outputTokens: 5 };
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: '>>#alpha first\n' },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      secondRound,
+    ],
+    [answer()],
+  ], { proseRouting: 'explicit', maxStreamTokens: 20 });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    if (h.membrane.requests.length === 2) {
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+        const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string; content?: unknown }>;
+        for await (const event of events) {
+          if (event.type === 'tokens' && event.content === 'continued') setTimeout(releaseFirst, 50);
+          yield event;
+        }
+      };
+    }
+    return stream;
+  };
+  const restarts: string[] = [];
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
+  });
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, channelId });
+      if (text.trim() === 'first') await firstHeld;
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), channelId: r.channelId })), [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+      { text: 'continued', channelId: 'chan-cafe' },
+    ], 'the turn delivers in the order it wrote');
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe']);
+  } finally {
+    releaseFirst();
+    await h.framework.stop();
+  }
+});
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];

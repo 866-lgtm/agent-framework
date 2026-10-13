@@ -1116,6 +1116,11 @@ export class AgentFramework {
    * the sticky destination.
    */
   private proseTurnDestinations: Map<string, string | null> = new Map();
+  /**
+   * The latest link of each agent's chain of queued prose deliveries, so a
+   * stream that resumes the turn queues behind the earlier streams' ones.
+   */
+  private proseSpeechChains: Map<string, Promise<void>> = new Map();
   /** Hybrid router is fail-closed after a malformed/unresolved envelope until a new valid target. */
   private proseHybridSuppressed: Set<string> = new Set();
   /** Agents whose current turn requested `!` continuation — re-woken when the
@@ -9631,14 +9636,27 @@ export class AgentFramework {
     // awaits the chain before routing trailing prose, so in-channel ordering
     // is preserved end-to-end. Each link catches its own error: one failed
     // post must not silence the rest of the turn.
-    let turnSpeechChain: Promise<void> = Promise.resolve();
+    //
+    // A stream that resumes its turn (as beginAgentTurn's continuingTurn: a
+    // budget restart, a tool-result-guard retry) keeps the turn's routing
+    // state, and queues its deliveries behind the earlier streams' ones. So
+    // the turn's deliveries run in the order its text was written, and the
+    // sticky destination moves in that order too, whichever stream wrote the
+    // text and however long an earlier post takes.
+    const resumesTurn = trigger?.reason === 'context_budget_restart'
+      || trigger?.reason === 'tool_result_guard_retry';
+    let turnSpeechChain: Promise<void> = resumesTurn
+      ? this.proseSpeechChains.get(agent.name) ?? Promise.resolve()
+      : Promise.resolve();
+    const chainSpeech = (link: () => Promise<void>, failure: string): void => {
+      turnSpeechChain = turnSpeechChain.then(link).catch((err) => console.error(failure, err));
+      this.proseSpeechChains.set(agent.name, turnSpeechChain);
+    };
     const enqueueSpeech = (text: string, locus: string | null): void => {
-      turnSpeechChain = turnSpeechChain
-        .then(async () => {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
-          this.recordProseDelivery(agent.name, outcome);
-        })
-        .catch((err) => console.error('mid-turn speech routing failed:', err));
+      chainSpeech(async () => {
+        const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+        this.recordProseDelivery(agent.name, outcome);
+      }, 'mid-turn speech routing failed:');
     };
 
     // Sticky explicit-send suppression: prose after send_message stays quiet
@@ -9712,11 +9730,6 @@ export class AgentFramework {
     // an exact invocation-shaped body from ordinary XML/prose. Buffer guarded
     // turns until completion: otherwise speculative outgoing chunks could
     // expose the wrapper before the fail-closed classifier runs.
-    // A stream that resumes its turn, as beginAgentTurn's continuingTurn: the
-    // turn-scoped routing state (sticky destination, turn destination) was
-    // kept for it.
-    const resumesTurn = trigger?.reason === 'context_budget_restart'
-      || trigger?.reason === 'tool_result_guard_retry';
     const proseStream = this.channelRegistry &&
       turnProseRouting !== 'disabled' &&
       !agent.toolWrapperProseGuard
@@ -9977,9 +9990,7 @@ export class AgentFramework {
                     } else if (!hasSameRoundPrivateThink) {
                       const locus = resolveTurnLocus();
                       for (const seg of roundSegments) {
-                        turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverHybridProse(agent, seg, locus, true))
-                          .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
+                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, true), 'mid-turn hybrid prose delivery failed:');
                       }
                     }
                   } else if (turnProseRouting === 'explicit') {
@@ -10003,9 +10014,7 @@ export class AgentFramework {
                         `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                       );
                       for (const seg of roundSegments) {
-                        turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverProse(agent, seg, { keepPrivate }))
-                          .catch((err) => console.error('mid-turn prose delivery failed:', err));
+                        chainSpeech(() => this.deliverProse(agent, seg, { keepPrivate }), 'mid-turn prose delivery failed:');
                       }
                     }
                   } else if (turnSilenced) {

@@ -26,3 +26,8 @@
   round's text starts a new line for the stream, as delivery parses each
   round on its own: a round that began with a `>>` prefix streamed it as
   text to the previous round's destination.
+- A turn resumed by a tool-result-guard retry or a budget restart now queues
+  its prose deliveries behind the turn's earlier ones, in every mode, so the
+  turn delivers in the order it wrote. Before, a resumed reply could be
+  delivered ahead of an earlier round's queued envelope, to the destination
+  that envelope was about to change.

@@ -159,13 +159,18 @@ export class ProseStreamRouter {
             this.state = 'prefix-gap';
             return;
           }
-          // Explicit: `>>` and then whitespace is a quoted arrow, since
-          // delivery's prefix needs a non-whitespace token right after the
-          // arrows. Hybrid: `>>>` before a newline is a quoted arrow too, but
-          // before other whitespace it is an attempted envelope, which
-          // delivery bounces: its token can't resolve, so nothing streams.
-          if (this.opts.mode === 'explicit' ? isSpace(ch) : ch === '\n') {
-            if (this.opts.mode === 'explicit') this.emit(this.held, out);
+          if (isSpace(ch)) {
+            if (this.opts.mode === 'explicit') {
+              // `>>` and then whitespace is a quoted arrow: body text, since
+              // delivery's prefix needs a target right after the arrows.
+              this.emit(this.held, out);
+            } else {
+              // `>>>` and then whitespace other than a space or tab (a
+              // newline included) is an envelope with no target. Delivery
+              // bounces it and holds back what follows until a later `>>>`
+              // names a target.
+              this.target = null;
+            }
             this.held = '';
             this.state = ch === '\n' ? 'line-start' : 'body';
             if (ch !== '\n') this.step(ch, out);
@@ -186,6 +191,9 @@ export class ProseStreamRouter {
       case 'prefix-gap':
         if (ch === ' ' || ch === '\t') return;
         if (ch === '\n') { this.target = null; this.state = 'line-start'; return; }
+        // Other whitespace can't start hybrid's target (`[ \t]*\S+`): an
+        // envelope with no target, as above.
+        if (isSpace(ch)) { this.target = null; this.state = 'body'; return; }
         this.state = 'prefix-token';
         this.token = ch;
         return;

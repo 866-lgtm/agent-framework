@@ -483,22 +483,25 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("hybrid: a `>>>` envelope with no target before a CR streams nothing, as delivery bounces it", async () => {
+  it('hybrid: a `>>>` envelope with no target streams nothing, as delivery bounces it', async () => {
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
       deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean): Promise<void>;
     };
     const agent = framework.getAgent('assistant')!;
-    const text = '>>>\r\nsecret';
+    // The registry's resolver trims its argument, as the router's must here.
+    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
+    const cases = ['>>>\r\nsecret', '>>>\nsecret', '>>>\u00a0#alpha secret', '>>> \u00a0#alpha secret'];
     try {
-      await gateway.deliverHybridProse(agent, text, 'chan-alpha', true);
-      const router = new ProseStreamRouter({
-        mode: 'hybrid', initialTarget: 'chan-alpha', resolve: (spec) => (spec === '#alpha' ? 'chan-alpha' : null),
-      });
-      const streamed = [...router.feed(text), ...router.finish()];
-      assert.equal(routed.length, 0, 'delivery bounces the envelope');
-      assert.deepEqual(streamed, [], 'and the stream sends none of it');
+      for (const text of cases) {
+        routed.length = 0;
+        await gateway.deliverHybridProse(agent, text, 'chan-locus', true);
+        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
+        const streamed = [...router.feed(text), ...router.finish()];
+        assert.equal(routed.length, 0, `delivery bounces ${JSON.stringify(text)}`);
+        assert.deepEqual(streamed, [], `and the stream sends none of ${JSON.stringify(text)}`);
+      }
     } finally {
       await framework.stop();
     }
