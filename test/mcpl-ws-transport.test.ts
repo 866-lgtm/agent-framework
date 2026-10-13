@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplServerConnection, type McplConnectionCloseInfo } from '../src/mcpl/server-connection.js';
 import { buildWebSocketUrl, isWebSocketTransport } from '../src/mcpl/transport.js';
 import type { McplHostCapabilities } from '../src/mcpl/types.js';
 
@@ -189,6 +189,68 @@ test('reconnect: an unexpected socket drop triggers a background reconnect', asy
     assert.equal(block.text, 'after reconnect');
 
     await conn.close();
+  } finally {
+    wss.close();
+  }
+});
+
+test("a server-side close with code 4001 surfaces on the connection 'close' event before the reconnect", async () => {
+  const sockets: WebSocket[] = [];
+  const wss = startMockMcplWsServer((ws) => sockets.push(ws));
+  await waitListening(wss);
+  try {
+    // The provider runs on every dial; after a 4001 a host would refresh what
+    // it hands out. Count dials to prove the reconnect path still runs it.
+    let dials = 0;
+    const conn = await McplServerConnection.connect(
+      {
+        id: 'editor',
+        url: wsUrl(wss),
+        reconnect: true,
+        reconnectIntervalMs: 100,
+        accessProvider: async () => { dials++; return `token-${dials}`; },
+      },
+      HOST_CAPS,
+    );
+    const closes: Array<{ code: number | null; signal: string | null; info: McplConnectionCloseInfo | undefined }> = [];
+    conn.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) =>
+      closes.push({ code: code ?? null, signal: signal ?? null, info }));
+    const reconnected = new Promise<void>((resolve) => conn.once('reconnect', () => resolve()));
+    conn.ready();
+    assert.equal(dials, 1);
+
+    // The server refuses/expires the credential: an application close code.
+    assert.equal(sockets.length, 1);
+    sockets[0].close(4001, 'token expired');
+
+    await reconnected;
+    // Positional (code, signal) unchanged for existing listeners; the third
+    // argument carries the full close info.
+    assert.equal(closes.length, 1);
+    assert.equal(closes[0].code, 4001);
+    assert.equal(closes[0].signal, null);
+    assert.deepEqual(closes[0].info, {
+      transport: 'websocket',
+      code: 4001,
+      signal: null,
+      reason: 'token expired',
+      byHost: false,
+    });
+    // The reconnect redialed through the provider and the new socket works.
+    assert.equal(dials, 2);
+    assert.equal(sockets.length, 2);
+    const result = await conn.sendToolsCall('echo', { text: 'after 4001' });
+    const block = (result.content as Array<{ type: string; text?: string }>)[0];
+    assert.equal(block.text, 'after 4001');
+
+    // A host-initiated close reports byHost with no transport code.
+    const hostClose = new Promise<McplConnectionCloseInfo | undefined>((resolve) =>
+      conn.once('close', (_code?: number | null, _signal?: string | null, info?: McplConnectionCloseInfo) => resolve(info)));
+    await conn.close();
+    const info = await hostClose;
+    assert.equal(info?.byHost, true);
+    assert.equal(info?.code, null);
+    assert.equal(info?.transport, 'websocket');
   } finally {
     wss.close();
   }
