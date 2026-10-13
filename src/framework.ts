@@ -587,17 +587,19 @@ interface TurnRouting {
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
   /**
-   * When the turn's first start began. A wake whose event comes later arrived
-   * during the turn: at a start that continues the turn it can re-pin the
-   * locus, as a mid-turn injection does (AgentFramework.repinTurnLocus).
+   * The time up to which the turn's re-pin has weighed arriving input: when
+   * the turn began, then each tool boundary that weighed its injected
+   * messages. A wake whose event comes later arrived since: at a start that
+   * continues the turn, it can re-pin the locus as a mid-turn message does
+   * (repinTurnLocus).
    */
-  openedAt: number;
+  consideredUntil: number;
 }
 
-function freshTurnRouting(openedAt = Date.now()): TurnRouting {
+function freshTurnRouting(consideredUntil = Date.now()): TurnRouting {
   return {
     engaged: new Set(), destination: null, hybridHold: false,
-    continuation: false, deliveries: [], suppressed: 0, openedAt,
+    continuation: false, deliveries: [], suppressed: 0, consideredUntil,
   };
 }
 
@@ -7187,6 +7189,8 @@ export class AgentFramework {
               const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed');
               if (notice) midTurnInjections.push(notice);
             }
+            // This boundary has weighed every message that arrived before it.
+            routing.consideredUntil = Date.now();
           }
 
           if (shouldEndTurn) {
@@ -9733,15 +9737,17 @@ export class AgentFramework {
       }
     } else if (!resumesTurn && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
       // A start that continues the turn keeps its locus. Wakes that arrived
-      // after the turn opened can still move it, by the addressed re-pin a
-      // mid-turn boundary applies: that boundary sees only the messages it
-      // drains, and these were stored without one (during a capacity hold no
-      // turn is alive, so nothing defers them). The newest one that addressed
-      // the agent, or that came from a channel the turn engaged, moves the
-      // locus; ambient chatter and the turn's own held trigger don't.
+      // since the turn last weighed its input can still move it, by the
+      // addressed re-pin a mid-turn boundary applies: that boundary sees only
+      // the messages it drains, and these were stored without one (during a
+      // capacity hold no turn is alive, so nothing defers them). The newest
+      // one that addressed the agent, or that came from a channel the turn
+      // engaged, moves the locus. Ambient chatter doesn't, and neither does a
+      // wake the turn has already weighed, such as its own held trigger or
+      // the wake of a message a boundary drained.
       let arrival: InferenceRequest | undefined;
       for (const request of batch) {
-        if (!request.channelId || wakeEventAt(request) <= routing.openedAt) continue;
+        if (!request.channelId || wakeEventAt(request) <= routing.consideredUntil) continue;
         if (!request.addressed && !routing.engaged.has(request.channelId)) continue;
         if (!arrival || wakeEventAt(request) >= wakeEventAt(arrival)) arrival = request;
       }

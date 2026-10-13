@@ -983,11 +983,11 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
     const h = await harness([[answer()]], { proseRouting: mode });
     type Routing = { pin?: string; destination: string | null; hybridHold: boolean;
       continuation: boolean; deliveries: string[]; suppressed: number;
-      triggerChannel?: string; locus?: string; engaged: Set<string>; openedAt: number };
+      triggerChannel?: string; locus?: string; engaged: Set<string>; consideredUntil: number };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
     const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
       continuation: true, deliveries: ['chan-earlier'], suppressed: 2,
-      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), openedAt: 1 });
+      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), consideredUntil: 1 });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
     try {

@@ -357,12 +357,12 @@ describe('explicit prose routing', () => {
   type RoutingState = {
     pin?: string; destination: string | null; hybridHold: boolean;
     continuation: boolean; deliveries: string[]; suppressed: number;
-    triggerChannel?: string; locus?: string; engaged: Set<string>; openedAt: number;
+    triggerChannel?: string; locus?: string; engaged: Set<string>; consideredUntil: number;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
     destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
-    engaged: new Set(), openedAt: Date.now(), ...fields,
+    engaged: new Set(), consideredUntil: Date.now(), ...fields,
   });
 
   async function within<T>(promise: Promise<T>, label: string, ms = 5000): Promise<T> {
@@ -943,7 +943,7 @@ describe('explicit prose routing', () => {
       // Everything the open turn has decided about where its speech goes.
       const decided = (): RoutingState => routingState({
         continuation: true, pin: 'chan-alpha', hybridHold: true, triggerChannel: 'chan-alpha',
-        locus: 'world:commons', engaged: new Set(['discord:g:cafe']), openedAt: 1,
+        locus: 'world:commons', engaged: new Set(['discord:g:cafe']), consideredUntil: 1,
       });
       const open = decided();
       internals.openLogical.set('assistant', open);

@@ -362,6 +362,26 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
+  it("the channel registry resolves and reports the current turn's trigger channel", async () => {
+    const framework = await makeFramework();
+    const i = framework as unknown as {
+      initializeMcpl(servers: unknown[]): Promise<void>;
+      channelRegistry: {
+        resolveLocus(agentName: string): string | null;
+        buildChannelContext(agentName?: string): { defaultOutgoing?: { channelId: string } } | undefined;
+      };
+      turnRouting: Map<string, { triggerChannel?: string }>;
+    };
+    // The real registry, with no servers: its resolver reads the framework's turn state.
+    await i.initializeMcpl([]);
+    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:chanA' });
+    assert.equal(i.channelRegistry.resolveLocus('scout'), 'discord:guild:chanA',
+      'the locus a turn freezes comes from its trigger channel');
+    assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:guild:chanA',
+      'and the agent is told the same channel');
+    await framework.stop();
+  });
+
   it('startAgentStream clears the triggering channel for a no-channel (heartbeat) turn', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
     const framework = await makeFramework();

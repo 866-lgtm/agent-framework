@@ -573,6 +573,13 @@ describe('present while acting', () => {
     });
   }
 
+  /** An organization acceleration 429, which holds the turn for a later compile. */
+  const accelerationLimit = (request: NormalizedRequest): MembraneError => new MembraneError({
+    type: 'rate_limit', retryable: true, httpStatus: 429,
+    message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+    rawError: { status: 429 }, rawRequest: request,
+  });
+
   const routingNotices = (framework: AgentFramework): string[] =>
     framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
@@ -624,11 +631,7 @@ describe('present while acting', () => {
         providerAccelerationCooldowns: Map<string, unknown>;
         releaseProviderAccelerationCooldown(agentName: string): void;
       };
-      failStream(1, (request) => new MembraneError({
-        type: 'rate_limit', retryable: true, httpStatus: 429,
-        message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
-        rawError: { status: 429 }, rawRequest: request,
-      }));
+      failStream(1, accelerationLimit);
       feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
 
       trigger(framework);
@@ -658,6 +661,61 @@ describe('present while acting', () => {
     });
   }
 
+  it("a wake whose message a tool boundary already weighed doesn't take the locus back at a later start", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'east' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    const internals = framework as unknown as {
+      pendingRequests: InferenceRequest[];
+      turnRouting: Map<string, { engaged: Set<string> }>;
+      providerAccelerationCooldowns: Map<string, unknown>;
+      releaseProviderAccelerationCooldown(agentName: string): void;
+    };
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      if (call.id === 'c1') {
+        // Someone addresses the agent from a DM: the first boundary re-pins
+        // there, and the message's wake waits behind the turn.
+        module.interjection = 'quick question for you';
+        module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+        internals.pendingRequests.push({
+          agentName: 'assistant', reason: 'channel-message', source: 'test', timestamp: Date.now(),
+          channelId: 'discord:dm:antra', addressed: true,
+        } as InferenceRequest);
+      } else {
+        // The turn sent into #portables, and a follow-up there re-pins the
+        // second boundary (seeded: this module's tools aren't MCPL sends).
+        internals.turnRouting.get('assistant')!.engaged.add('discord:guild:portables');
+        module.interjection = 'replying on portables';
+        module.interjectionMetadata = { channelId: 'discord:guild:portables', tags: ['chat:ambient', 'chat:from-human'] };
+      }
+      return origHandle(call);
+    };
+    failStream(1, accelerationLimit);
+    feedStart(framework, 2, [{ type: 'text', text: 'Back now.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.ok(internals.providerAccelerationCooldowns.has('assistant'), 'the turn is held');
+    internals.releaseProviderAccelerationCooldown('assistant');
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'one deferred compile');
+    assert.deepEqual(routed, [
+      { text: 'Back now.', locus: 'discord:guild:portables' },
+    ], "the DM's wake, weighed at the first boundary, doesn't move the locus back from #portables");
+
+    await framework.stop();
+  });
+
   for (const [label, arrivals, expected] of [
     ['keeps the turn\'s locus', [], 'chan-turn'],
     ['moves it to the newest addressed arrival', [
@@ -667,7 +725,7 @@ describe('present while acting', () => {
     ['moves it to a follow-up in a channel the turn engaged', [
       { channelId: 'discord:guild:portables', addressed: false, at: 1 },
     ], 'discord:guild:portables'],
-    ['leaves it for an addressed wake from before the turn opened', [
+    ['leaves it for an addressed wake the turn has already weighed', [
       { channelId: 'discord:dm:antra', addressed: true, at: -1 },
     ], 'chan-turn'],
   ] as const) {
@@ -675,16 +733,17 @@ describe('present while acting', () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
       const framework = await createFramework();
       const routed = stubChannelRegistry(framework);
-      type Routing = { locus?: string; engaged: Set<string>; openedAt: number; [field: string]: unknown };
+      type Routing = { locus?: string; engaged: Set<string>; consideredUntil: number; [field: string]: unknown };
       const internals = framework as unknown as {
         turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
       };
       // The turn's earlier stream left its tool results pending for the
-      // non-streaming fallback's re-inference. The turn opened at `openedAt`,
-      // froze `chan-turn` as its locus, and sent into #portables.
-      const openedAt = Date.now() - 10_000;
+      // non-streaming fallback's re-inference. The turn froze `chan-turn` as
+      // its locus, sent into #portables, and last weighed arriving input at
+      // `consideredUntil`.
+      const consideredUntil = Date.now() - 10_000;
       const open: Routing = {
-        locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']), openedAt,
+        locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']), consideredUntil,
         destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
       };
       internals.turnRouting.set('assistant', open);
@@ -692,7 +751,7 @@ describe('present while acting', () => {
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
       for (const { at, ...wake } of arrivals) {
         internals.pendingRequests.push({
-          agentName: 'assistant', reason: 'channel-message', source: 'test', timestamp: openedAt + at * 1000, ...wake,
+          agentName: 'assistant', reason: 'channel-message', source: 'test', timestamp: consideredUntil + at * 1000, ...wake,
         } as InferenceRequest);
       }
 
