@@ -386,12 +386,20 @@ test("the initial policy's other records keep the credentials out too", async ()
     return { lines: capture.lines, traces };
   };
   // An unanswered request whose error quotes the url.
-  await run(async () => { throw new Error(`timed out talking to wss://h/mcp/${secret}`); });
+  const unanswered = await run(async () => { throw new Error(`timed out talking to wss://h/mcp/${secret}`); });
+  assert.ok(unanswered.lines.some((l) => l.includes('did not answer the initial policy Request') && l.includes('timed out talking to wss://h/mcp/redacted')), unanswered.lines.join('\n'));
   // A refusal whose fallback isn't one the host knows: it logs what it does.
   const odd = await run(async () => ({ accepted: false, fallback: `close-${secret}`, reason: 'no' }));
   assert.ok(odd.lines.some((l) => l.includes('refused initial policy (no) — fallback: mcp-only')), odd.lines.join('\n'));
-  // A degraded acceptance whose effect quotes the url.
-  await run(async () => ({ accepted: true, mode: 'degraded', unavailableFeatures: [{ featureSet: 'fs', effect: `see ${secret}`, missingCapabilities: ['x'] }] }));
+  // A degraded acceptance whose effect quotes the url, and an entry with no
+  // capability list, which is logged rather than read as an unanswered request.
+  const degraded = await run(async () => ({ accepted: true, mode: 'degraded', unavailableFeatures: [
+    { featureSet: 'fs', effect: `see ${secret}`, missingCapabilities: ['x'] },
+    { featureSet: 'odd', effect: 'none' },
+  ] }));
+  assert.ok(degraded.lines.some((l) => l.includes('srv degraded: fs (see redacted; missing x)')), degraded.lines.join('\n'));
+  assert.ok(degraded.lines.some((l) => l.includes('srv degraded: odd (none; missing unknown)')), degraded.lines.join('\n'));
+  assert.ok(!degraded.lines.some((l) => l.includes('did not answer')), degraded.lines.join('\n'));
   // A refusal's reason, recorded with the derivation the operation began with.
   await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }));
 });

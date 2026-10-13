@@ -214,8 +214,9 @@ export interface McplChannelCapabilities {
  *
  * Treat a submitted configuration and its nested values as immutable for as
  * long as the server uses them. Apply changed settings with
- * `restartMcplServer(id, newConfig)`; use `accessProvider` for rotating
- * credentials.
+ * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+ * server's rotating credentials (a stdio server's changed `env` goes through
+ * a restart with the new configuration).
  */
 export interface McplServerConfig {
   /** Unique server identifier */

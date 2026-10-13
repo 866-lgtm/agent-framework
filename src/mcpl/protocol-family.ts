@@ -164,7 +164,8 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
   // word only begins or sits inside a part (GIT_AUTHOR_NAME, KEYBOARD_LAYOUT,
   // TOKENIZERS_PARALLELISM).
   for (const [name, value] of Object.entries(config.env ?? {})) {
-    if (name.split(/[_\-.]/).some((part) => CREDENTIAL_NAME_PART.test(part))) withEncoded(value);
+    // A JavaScript host can pass a value that isn't a string; only strings are derived.
+    if (typeof value === 'string' && name.split(/[_\-.]/).some((part) => CREDENTIAL_NAME_PART.test(part))) withEncoded(value);
   }
   let url: URL | undefined;
   try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
@@ -218,7 +219,7 @@ export function asText(text: unknown): string {
 }
 
 /** A part of an environment variable's name that ends with a credential word, in the singular or plural, with any digits after it. */
-const CREDENTIAL_NAME_PART = /(?:tokens?|keys?|secrets?|passwords?|passwd|pass|passphrases?|pat|auth|authorization|authentication|signatures?|credentials?)\d*$/i;
+const CREDENTIAL_NAME_PART = /(?:tokens?|keys?|secrets?|passwords?|passwd|pass|passphrases?|passcodes?|pat|auth|authorization|authentication|bearer|cookies?|creds|signatures?|credentials?)\d*$/i;
 
 /**
  * A credential provider's failure as a log line may show it: the error's

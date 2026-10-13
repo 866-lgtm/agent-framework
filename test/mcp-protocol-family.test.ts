@@ -335,11 +335,16 @@ test('recorded server text: the token as a url carries it, credential-named env 
     GITHUB_TOKEN: 'ghp_abcdef123456', API_KEY: 'k3y-abcdefgh', PGPASSWORD: 'pgpass-abcdefgh', ACCESSTOKEN: 'acc-abcdefgh12',
     DB_PASS: 'dbpass-abcdefgh', SSH_KEY_PASSPHRASE: 'phrase-abcdefgh',
     AUTHORIZATION: 'Bearer-abcdefgh', API_KEYS: 'k1-abcdefgh9', TOKEN2: 'tok2-abcdefgh', API_KEY_ID: 'keyid-abcdefgh', GITHUB_PAT: 'pat-abcdefgh12',
+    SESSION_COOKIE: 'cookie-abcdefgh', CLOUD_CREDS: 'creds-abcdefgh',
     PATH: '/usr/local/bin', GIT_AUTHOR_NAME: 'Somebody Longname', KEYBOARD_LAYOUT: 'dvorak-programmer', TOKENIZERS_PARALLELISM: 'parallel-false',
   } });
   assert.equal(
-    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 dbpass-abcdefgh phrase-abcdefgh Bearer-abcdefgh k1-abcdefgh9 tok2-abcdefgh keyid-abcdefgh pat-abcdefgh12 /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
-    'auth redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
+    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 dbpass-abcdefgh phrase-abcdefgh Bearer-abcdefgh k1-abcdefgh9 tok2-abcdefgh keyid-abcdefgh pat-abcdefgh12 cookie-abcdefgh creds-abcdefgh /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
+    'auth redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
+  // A credential env value as a url would carry it, percent-encoded.
+  assert.equal(redactServerText('GET /x?pw=p%40ss%2Fw0rd!x', cfg({ command: 'srv', env: { DB_PASSWORD: 'p@ss/w0rd!x' } })), 'GET /x?pw=redacted');
+  // A value that isn't a string (a JavaScript host can pass one) is skipped, not thrown on.
+  assert.equal(redactServerText('fine', cfg({ command: 'srv', env: { API_TOKEN: null as unknown as string, OTHER_KEY: 7 as unknown as string } })), 'fine');
   // A short pair only where no letter or digit adjoins it; any other string
   // wherever it occurs, after a percent escape, an ANSI code or a JSON escape too.
   const pair = cfg({ url: 'https://h/api/s/pathSecret0123456789/mcp?v=2' });

@@ -14191,9 +14191,6 @@ export class AgentFramework {
 
     st.inFlight = true;
     try {
-      const config = this.mcplServerConfigs.get(connection.id);
-      if (!config) return;
-
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -14415,7 +14412,7 @@ export class AgentFramework {
       if (receipt?.accepted === true && receipt.mode === 'degraded') {
         for (const uf of receipt.unavailableFeatures ?? []) {
           console.error(recorded(
-            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${uf.missingCapabilities.join(', ')})`,
+            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${Array.isArray(uf.missingCapabilities) ? uf.missingCapabilities.join(', ') : 'unknown'})`,
           ));
         }
       }
@@ -14565,8 +14562,9 @@ export class AgentFramework {
    *
    * Treat a submitted configuration and its nested values as immutable for
    * as long as the server uses them. Apply changed settings with
-   * `restartMcplServer(id, newConfig)`; use `accessProvider` for rotating
-   * credentials.
+   * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+   * server's rotating credentials (a stdio server's changed `env` goes
+   * through a restart with the new configuration).
    */
   async restartMcplServer(
     id: string,
@@ -14604,9 +14602,10 @@ export class AgentFramework {
 
   /**
    * A redactor for text that may come from any configured server, with every
-   * server's credentials replaced. It is built from the configurations as
-   * they are when it's made, so an operation makes it before it waits, and a
-   * server removed meanwhile still has its credentials replaced.
+   * server's credentials replaced: those of the configurations present when
+   * it's made, then those present when it's used. An operation makes it
+   * before it waits, so a server removed meanwhile, and one connected
+   * meanwhile, both have their credentials replaced.
    */
   private everyServerRedactor(): (text: unknown) => string {
     const snapshot = [...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config));
@@ -15254,9 +15253,12 @@ export class AgentFramework {
     // Modern servers: the same namespacing, tool policy and RFC-008 class
     // hints. Feature sets are MCPL and don't apply. A server whose listing
     // fails stays unlisted (unknown), never "listed nothing".
+    // Each server's configuration as the refresh began, so a server removed
+    // while an earlier listing waited still has its record redacted.
+    const configsAtStart = new Map(this.mcplServerConfigs);
     for (const server of this.modernServers().values()) {
       if (!server.isConnected) continue;
-      const config = this.mcplServerConfigs.get(server.id);
+      const config = configsAtStart.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       try {
         const listed = await server.listTools();
