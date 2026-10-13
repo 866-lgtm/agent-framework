@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -2536,16 +2536,22 @@ export class AgentFramework {
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
     // Register every block first. The registry keys records by uri, so a uri
-    // the result repeats is one record, judged once, on the testimony its
-    // last block left.
-    const records = new Set<import('./mcpl/references.js').ReferenceRecord>();
+    // the result repeats is one record, judged once. Within this result the
+    // most restrictive testimony holds: a uri that any of its blocks calls
+    // expired takes no slot, whichever block registered last. A later
+    // result's fresh expiry still supersedes, through register().
+    const records = new Map<import('./mcpl/references.js').ReferenceRecord, boolean>();
     for (const block of content) {
       const c = classifyBlock(block);
-      if (c.kind === 'reference') records.add(referenceRegistry.register(c.testimony, serverId));
+      if (c.kind !== 'reference') continue;
+      const record = referenceRegistry.register(c.testimony, serverId);
+      records.set(record, records.get(record) === true || isReferenceExpired(c.testimony));
     }
     if (!eager) return;
     const fetcher = this.getReferenceFetcher();
-    const eligible = [...records].filter((record) => fetcher.isEagerEligible(record));
+    const eligible = [...records]
+      .filter(([record, expiredHere]) => !expiredHere && fetcher.isEagerEligible(record))
+      .map(([record]) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -15622,16 +15628,21 @@ export class AgentFramework {
             };
           }
           if (candidate.kind === 'reference') {
-            // As the stub does, an unfetched reference the fetcher would
-            // refuse as expired says so instead of pointing at fetch_reference.
+            // Point at fetch_reference only where it can deliver: not for a
+            // reference this process holds no record of (fetch_reference
+            // looks the id up in the same registry), nor, as the stub does,
+            // for an unfetched one the fetcher would refuse as expired.
             const record = referenceRegistry.get(candidate.refId);
             const expiry = record && !record.fetchedPath ? referenceExpiry(record.testimony) : null;
             throw new Error(
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
-              (expiry
-                ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
-                : 'Fetch it with fetch_reference and save the materialized file instead.'),
+              (!record
+                ? 'This process holds no record of it (a restart or an eviction drops them), so fetch_reference ' +
+                  "can't fetch it either. Re-run the tool for a fresh reference."
+                : expiry
+                  ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
+                  : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }
           if (candidate.ref === null) {
@@ -15743,16 +15754,15 @@ export class AgentFramework {
               consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
               continue;
             }
-            // Reference stub: the registry's testimony (when this process
-            // still has the record) says whether it was an image, read as
-            // the stub shows it, since the stub's text is all a restart
-            // leaves; the sniffed stub text is the fallback. Non-image
-            // references are not slots.
-            const record = referenceRegistry.get(ph.refId);
-            const mediaType = record?.testimony.mimeType !== undefined
-              ? referenceTypeLabel(record.testimony).toLowerCase()
-              : ph.mediaType;
-            if (!mediaType || !mediaType.startsWith('image/')) continue;
+            // Reference stub: the registry's claimed type (when this process
+            // still has the record), else the image type sniffed from the
+            // stub's text, says whether it was an image. Either is taken as
+            // the stub shows a type (sanitized and bounded), so a record
+            // agrees with the stub a restart leaves. Non-image references
+            // are not slots.
+            const claimed = referenceRegistry.get(ph.refId)?.testimony.mimeType ?? ph.mediaType ?? undefined;
+            const mediaType = referenceTypeLabel(claimed).toLowerCase();
+            if (!mediaType.startsWith('image/')) continue;
             consider({ kind: 'reference', refId: ph.refId, mediaType, toolCallId, toolName, messagesBack });
           }
         };

@@ -31,6 +31,9 @@ const server = createServer((req, res) => {
   } else if (url.pathname === '/octet-untyped') {
     // a header type with no extension of its own, over bytes no sniffer recognizes
     res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(Buffer.from('plain bytes, nothing to sniff'));
+  } else if (url.pathname === '/c1-only-typed') {
+    // a header type that is nothing but a C1 control, over bytes no sniffer recognizes
+    res.writeHead(200, { 'content-type': '\u0085' }); res.end(Buffer.from('plain bytes, nothing to sniff'));
   } else if (url.pathname === '/c1-typed') {
     // a header type carrying a C1 control (sent as the Latin-1 byte 0x85),
     // over bytes no sniffer recognizes
@@ -182,10 +185,21 @@ test('a claimed type that neither the bytes nor a header override reaches the re
   assert.equal(saved.at(-1)!.mime, 'text/plain');
 });
 
+test('a header type that sanitizes to nothing counts as absent, so the claimed type names the result', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const rec = makeRecord(reg, `${ORIGIN}/c1-only-typed`, { mimeType: 'text/plain' });
+  const out = await f.fetch(rec);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.mimeType, 'text/plain');
+  assert.equal(rec.fetchedPath, `scratch/refs/${rec.refId}.txt`);
+});
+
 test('a claimed type that sanitizes to nothing counts as absent: octet-stream, saved as .bin', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: ORIGIN } });
-  const rec = makeRecord(reg, `${ORIGIN}/untyped?claim=empty`, { mimeType: '\u202E\u061C' });
+  // Bidi controls between spaces: nothing is left once they're stripped and the ends trimmed.
+  const rec = makeRecord(reg, `${ORIGIN}/untyped?claim=empty`, { mimeType: ' \u202E \u061C ' });
   const out = await f.fetch(rec);
   assert.equal(out.ok, true, out.error);
   assert.equal(out.mimeType, 'application/octet-stream');
@@ -280,14 +294,32 @@ test('the eager default skips expired references, so the live ones after them ge
   assert.deepEqual(refusals, [], 'no refused fetch is logged');
 });
 
-test('a uri the result repeats takes one eager slot', async () => {
-  // Eight distinct small references, the first sent twice: nine blocks.
-  const blocks = Array.from({ length: 8 }, (_, i) => (
+test('a uri the result repeats takes one eager slot, and the slots stop at eight', async () => {
+  // Nine distinct small references, the first sent twice: ten blocks.
+  const blocks = Array.from({ length: 9 }, (_, i) => (
     { type: 'resource', uri: `${ORIGIN}/ok?eager-distinct=${i}`, sizeBytes: PAYLOAD.length }));
   await eagerFetch([blocks[0], ...blocks]);
-  for (const block of blocks) {
+  for (const block of blocks.slice(0, 8)) {
     assert.ok(referenceRegistry.findByUri(block.uri)?.fetchedPath, `${block.uri} took an eager slot`);
   }
+  assert.equal(referenceRegistry.findByUri(blocks[8].uri)?.fetchedPath, undefined, 'the ninth stays lazy');
+});
+
+test('within one result, a uri that any block calls expired takes no eager slot; a later result can refresh it', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const block = (uri: string, expiresAt?: string) => ({ type: 'resource', uri, sizeBytes: PAYLOAD.length, ...(expiresAt ? { expiresAt } : {}) });
+  for (const order of ['expired-first', 'expired-last']) {
+    const uri = `${ORIGIN}/ok?eager-mixed=${order}`;
+    const expired = block(uri, '2001-01-01T00:00:00Z');
+    await eagerFetch(order === 'expired-first' ? [expired, block(uri)] : [block(uri), expired]);
+    assert.equal(referenceRegistry.findByUri(uri)?.fetchedPath, undefined, `${order}: no slot`);
+  }
+  const refusals = errors.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('[rfc005]'));
+  assert.deepEqual(refusals, [], 'no refused fetch is logged');
+  // A later result re-issues the uri with a fresh expiry, as a re-signed URL would.
+  const refreshed = `${ORIGIN}/ok?eager-mixed=expired-first`;
+  await eagerFetch([block(refreshed, '2999-01-01T00:00:00Z')]);
+  assert.ok(referenceRegistry.findByUri(refreshed)?.fetchedPath, 'the later result\'s fresh testimony stands');
 });
 
 test('per-server budget exhausts cumulatively', async () => {

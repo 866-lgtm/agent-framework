@@ -511,7 +511,36 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it('an image-typed RFC-005 reference stub occupies a failing slot that points at fetch_reference', async () => {
+  it('a reference with no record shows its type bounded as a stub would, and says to re-run the tool', async () => {
+    // A stub line the registry has no record of (after a restart, or quoted
+    // text), whose type is far longer than a stub would show.
+    const longType = `image/${'x'.repeat(300)}`;
+    const h = await startTurn({
+      prefix: 'sri-reference-unknown-',
+      responses: [[saveCall('call_save', { path: 'files/long.png', index: 0 })], done],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_cam',
+          toolName: 'mcpl--vst--camera',
+          content: `[ref_3_cc02] long.png — ${longType} — from tool result — fetch with fetch_reference`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      assert.strictEqual(result.isError, true);
+      assert.ok(result.content.includes(`(ref_3_cc02, image/${'x'.repeat(113)}…, from`), result.content);
+      assert.match(result.content, /holds no record of it .*Re-run the tool for a fresh reference\./);
+      assert.ok(!result.content.includes('Fetch it with fetch_reference'), result.content);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an image-typed RFC-005 reference stub with no record still occupies a failing slot', async () => {
     const h = await startTurn({
       prefix: 'sri-reference-',
       responses: [
@@ -534,7 +563,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.match(result.content, /index 0 is a reference \(ref_1_ab3d, image\/png, from mcpl--vst--camera \(call call_cam\)\)/);
-      assert.match(result.content, /fetch_reference/);
+      assert.match(result.content, /holds no record of it/, 'no record here: fetch_reference could only call it unknown');
       assert.strictEqual(await fileBytes(h, 'files/cam.png'), null);
       // The text/plain reference is not an image slot: index 1 is the GIF.
       const gif = saved(await waitForToolResult(h.framework, 'call_save_gif'));

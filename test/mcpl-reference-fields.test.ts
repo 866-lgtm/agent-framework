@@ -142,6 +142,12 @@ test('display labels lose every bidi control, the Arabic letter mark included', 
   assert.equal(sanitizeLabel('\u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u05E2\u05D1\u05E8\u05D9\u05EA', 100), '\u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u05E2\u05D1\u05E8\u05D9\u05EA', 'right-to-left text itself is kept');
 });
 
+test('display labels are trimmed, so a label of whitespace is nothing', () => {
+  assert.equal(sanitizeLabel(' \uFEFFimage/png \u202E', 100), 'image/png', 'whitespace and a BOM left at either end');
+  assert.equal(sanitizeLabel('a b', 100), 'a b', 'inner whitespace is kept');
+  assert.equal(sanitizeLabel(' \u00A0 ', 100), '');
+});
+
 test('large invalid labels cannot change the bounded model-visible stub', () => {
   const { testimony } = reference('audio', {
     name: 'x'.repeat(1024 * 1024), mimeType: 'y'.repeat(1024 * 1024), sizeBytes: 1024,

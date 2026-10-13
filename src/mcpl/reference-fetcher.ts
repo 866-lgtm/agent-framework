@@ -224,7 +224,7 @@ export class ReferenceFetcher {
       // the saved type and the record's verified type, so each is shown as a
       // label is. One left empty once sanitized counts as absent.
       const header = resp.headers.get('content-type');
-      const headerMime = header !== null ? sanitizeLabel(header.split(';')[0], REFERENCE_LIMITS.mimeType).trim() || null : null;
+      const headerMime = header !== null ? sanitizeLabel(header.split(';')[0], REFERENCE_LIMITS.mimeType) || null : null;
       const claimedMime = t.mimeType !== undefined ? sanitizeLabel(t.mimeType, REFERENCE_LIMITS.mimeType) || undefined : undefined;
       const observedMime = sniffMime(data) ?? headerMime ?? claimedMime ?? 'application/octet-stream';
       const ext = EXT_BY_MIME.get(observedMime) ?? EXT_BY_MIME.get(headerMime ?? '') ?? EXT_BY_MIME.get(claimedMime ?? '') ?? 'bin';

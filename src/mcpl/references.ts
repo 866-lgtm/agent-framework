@@ -173,10 +173,11 @@ export const EXPIRY_REASON = {
 } as const;
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
- *  embeddings, overrides, isolates, and the Arabic letter mark); bound length.
+ *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
+ *  whitespace (a BOM included) left at either end, and bound the length.
  *  Labels are labels — storage naming is host-generated elsewhere (§7.3). */
 export function sanitizeLabel(s: string, maxChars: number): string {
-  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '');
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '').trim();
   if (cleaned.length <= maxChars) return cleaned;
   let cut = cleaned.slice(0, Math.max(0, maxChars - 1));
   // never split a surrogate pair at the truncation boundary
@@ -283,10 +284,10 @@ export const referenceRegistry = new ReferenceRegistry();
 // Stub building (§5)
 // ============================================================================
 
-/** A reference's claimed type as its stub shows it, or '' when nothing is
- *  left of it once sanitized (the stub then leaves it out). */
-export function referenceTypeLabel(t: Pick<ReferenceTestimony, 'mimeType'>): string {
-  return t.mimeType ? sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) : '';
+/** A reference's type as its stub shows one, or '' when nothing is left of
+ *  it once sanitized (the stub then leaves it out). */
+export function referenceTypeLabel(mimeType: string | undefined): string {
+  return mimeType ? sanitizeLabel(mimeType, STUB_FIELD_CHARS) : '';
 }
 
 /**
@@ -303,7 +304,7 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
   if (name) parts.push(name);
   const meta: string[] = [];
-  const mimeType = referenceTypeLabel(t);
+  const mimeType = referenceTypeLabel(t.mimeType);
   if (mimeType) meta.push(mimeType);
   if (t.sizeBytes !== undefined) meta.push(`${formatSizeBytes(t.sizeBytes)} claimed`);
   if (meta.length) parts.push(meta.join(', '));
