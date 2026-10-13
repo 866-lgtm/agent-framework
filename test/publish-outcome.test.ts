@@ -208,6 +208,20 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(traces.find((e) => e.type === 'mcpl:speech-route-failed')?.detail, info.detail);
   });
 
+  it('unrenderable connector data keeps an unknown speech failure visible rather than throwing', async () => {
+    const data: Record<string, unknown> = { posted: ['111'] };
+    data.self = data;
+    const failures: unknown[] = [];
+    const { registry, seed } = registryWith({
+      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', -32000, data); } },
+    }, failures);
+    seed('discord', 'c', '#c');
+    const outcome = await registry.deliverSpeech('agent', 'words', 'c');
+    assert.equal(outcome.status, 'unknown');
+    assert.equal(outcome.detail, data, 'the formatter does not change the source value');
+    assert.equal((failures[0] as { detail?: string }).detail, '[unserializable connector value]');
+  });
+
   it('treats a timeout or a lost connection as unknown', async () => {
     const { registry, seed } = registryWith({
       discord: { publish: async () => { throw new McplRequestError('MCPL server "discord" did not respond to channels/publish (id=7) within 10ms', 'no-response'); } },
