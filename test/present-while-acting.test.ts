@@ -793,13 +793,20 @@ describe('present while acting', () => {
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
     module.toolDelayMs = 25;
-    // Stream one is held at its end; the start after the first release is
-    // held before its stream exists; the third start answers.
+    // The host holds the agent once when its stream can't be set up. (Asked
+    // again at the release, it lets the hold go.)
+    let hostHolds = 0;
+    (framework as unknown as { providerHoldHook: (error: Error) => { holdMs: number; reason: string } | undefined })
+      .providerHoldHook = (error) => error.message === 'stream setup failed' && hostHolds++ === 0
+        ? { holdMs: 60_000, reason: 'host hold' } : undefined;
+    // Stream one is held at its end; the start after the first release
+    // fails before its stream exists, and the host holds it; the third start
+    // answers.
     const makeStream = membrane.streamYielding.bind(membrane);
     let calls = 0;
     membrane.streamYielding = (request, options) => {
       const n = ++calls;
-      if (n === 2) throw accelerationLimit(request);
+      if (n === 2) throw new Error('stream setup failed');
       const stream = makeStream(request, options);
       const iterate = stream[Symbol.asyncIterator].bind(stream);
       stream[Symbol.asyncIterator] = async function* () {
@@ -946,6 +953,56 @@ describe('present while acting', () => {
     } finally {
       await framework.stop();
     }
+  });
+
+  it('a start that throws before its stream ends its logical turn, so the next start opens its own', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hello there.' }] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    // The registry is unavailable for the first start, which throws after it
+    // has opened its turn, outside the stream's own failure handling.
+    const registry = (framework as unknown as { channelRegistry: Record<string, (agent: string) => string> }).channelRegistry;
+    const resolve = registry.resolveLocus;
+    let failed = false;
+    registry.resolveLocus = (agent) => {
+      if (!failed) { failed = true; throw new Error('registry unavailable'); }
+      return resolve(agent);
+    };
+    const internals = framework as unknown as { openLogical: Map<string, unknown> };
+
+    trigger(framework);
+    await assert.rejects(framework.runUntilIdle(), /registry unavailable/);
+    assert.equal(internals.openLogical.has('assistant'), false, 'the failed start left no turn open');
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Hello there.', locus: 'chan-live-1' }],
+      'the next start resolved a locus of its own');
+
+    await framework.stop();
+  });
+
+  it("a silent turn's tool boundary doesn't re-pin its locus or tell it the conversation moved", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'quiet' }] as ContentBlock[]));
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question for you';
+    module.interjectionMetadata = addressed('discord:dm:antra');
+    const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
+
+    internals.pendingRequests.push({
+      agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true,
+    } as InferenceRequest);
+    await framework.runUntilIdle();
+
+    assert.equal(module.interjection, null, 'the silent turn ran its tool round, and the DM arrived during it');
+    assert.deepEqual(movedTo(framework), [], 'no routing notice in a turn that routes no prose');
+
+    await framework.stop();
   });
 
   // A tool's late write lands in the turn that called it: a send's engaged

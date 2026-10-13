@@ -906,11 +906,10 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears every turn's routing", async () => {
+  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears open turns", async () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {
       openLogical: Map<string, RoutingState>;
-      turnRouting: Map<string, RoutingState>;
       settleAgent(name: string, outcome: { stopReason: 'completed'; speech: string }, closes: RoutingState | undefined): void;
     };
     const open: RoutingState = routingState({ continuation: true });
@@ -924,10 +923,8 @@ describe('explicit prose routing', () => {
     internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, open);
     assert.equal(internals.openLogical.has('assistant'), false, "the turn's own settle closes it");
     internals.openLogical.set('assistant', open);
-    internals.turnRouting.set('assistant', open);
     await framework.stop();
     assert.equal(internals.openLogical.size, 0, 'stop() clears every open logical turn');
-    assert.equal(internals.turnRouting.size, 0, 'and every live routing state, so a resume after a restart starts afresh');
   });
 
   it('a silent start neither takes nor disturbs an open logical turn, and leaves it to the next start that routes prose', async () => {
@@ -1761,6 +1758,36 @@ describe('explicit prose routing', () => {
       }
     });
   }
+
+  it('explicit: an addressed message between the turn\'s streams moves nothing, since explicit mode has no locus', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    const routed = stubRegistry(framework);
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    const internals = framework as unknown as {
+      turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
+      openLogical: Map<string, RoutingState>;
+      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
+    };
+    try {
+      const earlier = routingState({ pin: 'chan-alpha', destination: 'chan-alpha' });
+      internals.turnRouting.set('assistant', earlier);
+      internals.openLogical.set('assistant', earlier);
+      // Someone addresses the agent from another channel while the turn waits.
+      internals.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[],
+        { channelId: 'discord:g:cafe', tags: ['chat:addressed'] });
+      assert.equal(earlier.arrival, 'discord:g:cafe', 'it is the turn\'s arrival');
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
+      await within(framework.runUntilIdle(), 'the re-inference', 10000);
+
+      assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), [{ text: 'carrying on', locus: 'chan-alpha' }]);
+      assert.equal(earlier.locus, undefined, 'no locus');
+      assert.equal(earlier.arrival, undefined, 'the arrival is used up');
+      assert.ok(!context(framework).texts.some((t) => t.includes('The conversation moved to')), 'and no routing notice');
+    } finally {
+      await framework.stop();
+    }
+  });
 
   for (const mode of ['explicit', 'hybrid'] as const) {
     it(`${mode}: a retried turn's text waits for the replaced stream's late deliveries, and follows what they set`, async () => {

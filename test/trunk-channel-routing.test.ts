@@ -432,6 +432,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.ok(held.providerAccelerationCooldowns.has('scout'), 'the turn is held');
     framework.pushEvent(channelIncoming('discord:guild:chanB', 'B: unrelated chatter'));
     await framework.runUntilIdle();
+    const waiting = (held.providerAccelerationCooldowns.get('scout') as { heldRequests: Array<{ channelId?: string }> }).heldRequests;
+    assert.ok(waiting.some((r) => r.channelId === 'discord:guild:chanB'), "chanB's wake waits in the hold with the turn's");
     held.releaseProviderAccelerationCooldown('scout');
     await framework.runUntilIdle();
 
