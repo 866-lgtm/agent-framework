@@ -3,8 +3,7 @@
   state. Such a turn settles before its earlier rounds' queued deliveries
   have posted, and in explicit mode the next turn can start at once. That
   start cleared the sticky destination those deliveries read when they
-  post, so a queued unprefixed segment bounced into the next turn, and a
-  late delivery was counted in the next turn's `[delivered]` receipt. Each
+  post, so a queued unprefixed segment bounced into the next turn. Each
   turn now has its own routing state and receipt tallies (the sticky
   destination, the turn's destination, hybrid's hold, a ` !` continuation,
   and the destinations and suppressed segments its receipt reports), and a
@@ -16,8 +15,12 @@
   earlier ones, a fresh turn's included. A turn's text-only reply can
   therefore wait for an earlier turn's posts, up to their request timeout.
 - A ` !` continuation that an earlier round asked for now starts when a
-  tool ends the turn, once that turn's deliveries have run, in every mode.
+  tool ends the turn, once that turn's deliveries have run, in every mode,
+  unless the framework has stopped or the agent has been disposed by then.
   Before, hybrid and locus mode started it only after the next turn, and
-  explicit mode dropped it unless its delivery ran late.
+  explicit mode dropped it, or, when its delivery ran late, started it
+  after the next turn.
 - A turn whose last response is empty writes its receipt, and checks for a
-  continuation, after its last rounds' queued deliveries, not before.
+  continuation, after its last rounds' queued deliveries. Before, those
+  deliveries were never receipted, or were counted in the next turn's
+  receipt.

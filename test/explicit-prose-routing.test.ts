@@ -594,6 +594,12 @@ describe('explicit prose routing', () => {
       const framework = await createFramework(mode);
       const routed = stubRegistry(framework);
       const skip = answerSkipReply(framework);
+      // Count turns before feedTurn subscribes: a listener that unsubscribes
+      // during an event hides that event from the listener after it.
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
       feedTurn(framework, 2, [{ type: 'text', text: arrows + 'skip_reply' }] as ContentBlock[]);
       const reasons: string[] = [];
       const internals = framework as unknown as { pendingRequests: InferenceRequest[]; processInferenceRequests(): Promise<void> };
@@ -602,10 +608,6 @@ describe('explicit prose routing', () => {
         for (const request of internals.pendingRequests) reasons.push(request.reason);
         await process();
       };
-      let turns = 0;
-      framework.onTrace((e) => {
-        if ((e as { type: string }).type === 'inference:started') turns++;
-      });
 
       trigger(framework);
       await framework.runUntilIdle();
@@ -620,6 +622,50 @@ describe('explicit prose routing', () => {
       assert.equal(turns, 2, 'and it started one more turn');
 
       await framework.stop();
+    });
+  }
+
+  for (const boundary of ['stop', 'dispose'] as const) {
+    it(`a tool-ended explicit turn's late ' !' takes no new turn after ${boundary === 'stop' ? 'stop()' : 'its agent is disposed'}`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: '>>#alpha ! first' },
+        { type: 'tool_use', id: 'p1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'p2', name: 'skip_reply', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+      const framework = await createFramework();
+      stubRegistry(framework);
+      answerSkipReply(framework);
+      const internals = framework as unknown as {
+        channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
+        proseSpeechChains: Map<string, Promise<void>>;
+        pendingRequests: InferenceRequest[];
+        disposeConversationAgent(name: string): void;
+      };
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      internals.channelRegistry.routeSpeech = async () => {
+        await held;
+        return { delivered: true, channelId: 'chan-alpha' };
+      };
+      try {
+        trigger(framework);
+        await within(framework.runUntilIdle(), 'the tool-ended turn to settle');
+        const chain = internals.proseSpeechChains.get('assistant');
+        assert.ok(chain, "the turn's delivery is still queued");
+        assert.equal(internals.pendingRequests.length, 0);
+        if (boundary === 'stop') await framework.stop();
+        else internals.disposeConversationAgent('assistant');
+        release();
+        await within(chain, 'the queued delivery');
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(internals.pendingRequests.filter((r) => r.reason === 'prose-continuation').length, 0,
+          'the late check adds no request');
+      } finally {
+        release();
+        await framework.stop();
+      }
     });
   }
 
@@ -865,7 +911,8 @@ describe('explicit prose routing', () => {
     const internals = framework as unknown as {
       channelRegistry: { resolveProseTarget: (spec: string) => unknown };
       admitProse(text: string): Array<{ text: string; resolved?: { channelId?: string; error?: string } }>;
-      deliverAdmittedProse(agent: unknown, envelopes: unknown[]): Promise<void>;
+      deliverAdmittedProse(agent: unknown, envelopes: unknown[], round: { routing: RoutingState }): Promise<void>;
+      routingOf(name: string): RoutingState;
     };
     const resolve = internals.channelRegistry.resolveProseTarget.bind(internals.channelRegistry);
     internals.channelRegistry.resolveProseTarget = (spec: string) => {
@@ -875,7 +922,7 @@ describe('explicit prose routing', () => {
     try {
       const admitted = internals.admitProse('>>#boom one\n>>#alpha two');
       assert.match(admitted[0]!.resolved?.error ?? '', /directory unavailable/);
-      await internals.deliverAdmittedProse(framework.getAgent('assistant')!, admitted);
+      await internals.deliverAdmittedProse(framework.getAgent('assistant')!, admitted, { routing: internals.routingOf('assistant') });
       assert.deepEqual(routed.map((r) => r.text), ['two'], 'the other envelope still goes out');
     } finally {
       await framework.stop();

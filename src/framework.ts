@@ -8863,6 +8863,10 @@ export class AgentFramework {
   private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
     if (!routing.continuation) return;
     routing.continuation = false;
+    // An explicit turn's check can run after its stream has returned. A
+    // stopped framework, or an agent no longer registered under its name (a
+    // disposed fork or ephemeral run), takes no new turn from it.
+    if (this.providerAdmissionClosed || this.agents.get(agent.name) !== agent) return;
     console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
     this.pendingRequests.push({
       agentName: agent.name,
