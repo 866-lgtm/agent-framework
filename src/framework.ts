@@ -10040,9 +10040,11 @@ export class AgentFramework {
               const withheld = agent.toolResultGuard.withhold(category);
               // Nothing from the abandoned physical attempt is published or
               // persisted as assistant speech, including a terminal refusal
-              // after the single recovery retry.
+              // after the single recovery retry. The destination noted for
+              // the stream that resumes the turn stays as the accepted rounds
+              // left it: the refused round's text was held, so the router
+              // never read it.
               proseStream?.reset();
-              noteStreamTarget();
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
