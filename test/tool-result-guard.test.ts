@@ -869,6 +869,52 @@ test("a fresh turn clears the sticky destination and the turn's destination in e
   }
 });
 
+for (const shape of ['text-only', 'trailing'] as const) {
+  test(`explicit mode: a turn's ${shape} text is admitted before a module's speech callback runs`, { timeout: 15000 }, async () => {
+    // From a review's probe: a speech callback that rebinds #cafe can't move
+    // where the turn's final text goes, since that text was admitted first.
+    const scripts = shape === 'text-only'
+      ? [[createMockResponse([{ type: 'text', text: '>>#cafe final' }] as ContentBlock[])]]
+      : [[
+        createMockResponse([
+          { type: 'text', text: '>>#alpha first\n' },
+          { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+        ] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: '>>#cafe final' }] as ContentBlock[]),
+      ]];
+    const h = await harness(scripts, { proseRouting: 'explicit' });
+    let cafe = 'chan-cafe';
+    const routed: Array<{ text: string; channelId: string }> = [];
+    const streamed: Array<{ channelId: string; delta: string }> = [];
+    (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+        : spec === '#cafe' ? { channelId: cafe } : { error: `no channel ${spec}` },
+      routeSpeech: async (_agent: string, text: string, channelId: string) => {
+        routed.push({ text: text.trim(), channelId });
+        return { delivered: true, channelId };
+      },
+      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+        streamed.push({ channelId, delta });
+      },
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+      getDescriptor: () => undefined, getChannelTools: () => [],
+    }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+    const modules = (h.framework as unknown as { moduleRegistry: { dispatchSpeech: (...args: unknown[]) => Promise<void> } }).moduleRegistry;
+    const dispatch = modules.dispatchSpeech.bind(modules);
+    modules.dispatchSpeech = async (...args: unknown[]) => {
+      cafe = 'chan-rebound';
+      await dispatch(...args);
+    };
+    try {
+      await h.run();
+      assert.deepEqual(routed.at(-1), { text: 'final', channelId: 'chan-cafe' });
+      assert.ok(streamed.some((d) => d.channelId === 'chan-cafe' && d.delta.includes('final')));
+    } finally {
+      await h.framework.stop();
+    }
+  });
+}
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];

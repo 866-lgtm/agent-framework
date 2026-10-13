@@ -10324,6 +10324,17 @@ export class AgentFramework {
             const speechContent = hadToolCalls ? [] : allText;
             const thoughts = hadToolCalls ? allText : [];
 
+            // Explicit text is admitted as its round ends, before anything
+            // below waits (a module's speech callback, the turn's earlier
+            // deliveries): its targets resolve now, as a live round's do.
+            const finalSpeechText = speechContent.map((b) => b.text).join('\n').trim();
+            const finalSegments = hadToolCalls && allText.length > 0
+              ? splitProseSegments(liveProseRouting ? terminalContent : response.content)
+              : [];
+            const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
+            const admittedSpeech = admitFinal && finalSpeechText ? this.admitProse(finalSpeechText) : null;
+            const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg)) : [];
+
             const du = response.details?.usage;
             const tokenUsage = du
               ? {
@@ -10536,14 +10547,8 @@ export class AgentFramework {
             // they are never routed here — which is precisely how the `think`
             // tool (and any explicit send tool) yields a silent turn.
             if (speechContent.length > 0 && this.channelRegistry) {
-              const speechText = speechContent
-                .map((b) => (b as ContentBlock & { type: 'text' }).text)
-                .join('\n')
-                .trim();
+              const speechText = finalSpeechText;
               if (speechText) {
-                // Explicit text is admitted as its round ends, as a live
-                // round's is: its targets resolve now, not after the wait.
-                const admittedSpeech = turnProseRouting === 'explicit' ? this.admitProse(speechText) : null;
                 // A turn resumed after its earlier rounds delivers after
                 // them: their queued deliveries are this chain's.
                 await turnSpeechChain;
@@ -10614,9 +10619,7 @@ export class AgentFramework {
                 ? turnSilenced
                 : turnSilenced || toolNames.some(isSilencingTool);
 
-              const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
-              // Explicit text is admitted as its round ends, before the wait.
-              const admittedSegments = turnProseRouting === 'explicit' ? segments.map((seg) => this.admitProse(seg)) : [];
+              const segments = finalSegments;
 
               // Preserve in-channel ordering: everything enqueued live must
               // land before the trailing prose. Awaited even when silenced —
