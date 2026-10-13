@@ -21,6 +21,9 @@ async function harness(config: Partial<AgentConfig>) {
     getTools: () => ['allowed', 'denied'].map((name) => ({
       name, description: 'Inert dispatch counter', inputSchema: { type: 'object', properties: {} },
     })),
+    getUtilities: () => ['allowed_util', 'denied_util'].map((name) => ({
+      name, description: 'Inert utility counter', inputSchema: { type: 'object', properties: {} },
+    })),
     async handleToolCall(call) {
       effects.push(call);
       return { success: true, data: 'executed' };
@@ -176,6 +179,13 @@ test('model-issued Python cannot forge unlisted inner generic or builtin calls',
     assert.equal((execution.stdout.match(/not permitted.*allowedTools/g) ?? []).length, 2);
     assert.deepEqual(h.effects.map((c) => c.name), ['allowed']);
     assert.deepEqual(h.framework.getAgentRuntimeSettings('assistant'), before);
+    assert.deepEqual(h.lifecycle.filter(event => ['probe--denied', 'agent_settings'].includes(event.tool)), []);
+    for (const tool of ['code_execution', 'probe--allowed']) {
+      assert.deepEqual(h.lifecycle.filter(event => event.tool === tool).map(event => event.phase), ['started', 'completed']);
+    }
+    assert.equal(h.emitter.openCount, 0);
+    assert.equal((h.emitter as unknown as { calls: Map<string, unknown> }).calls.size, 0);
+    assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
   } finally { await h.close(); }
 });
 
@@ -310,3 +320,126 @@ for (const name of ['set_tool_visibility', 'set_tool_description']) {
     } finally { await h.close(); }
   });
 }
+
+for (const route of ['model', 'public', 'script'] as const) {
+  test(`utility run checks the utility name on the ${route} route`, async () => {
+    const h = await harness({ allowedTools: ['utils', 'probe--allowed_util'] });
+    const input = { action: 'run', name: 'probe--denied_util', args: {} };
+    try {
+      if (route === 'model') {
+        const [result] = await h.turn([{ id: 'utility-denied', name: 'utils', input }]);
+        assert.equal(result.isError, true); assert.match(result.content, /not permitted.*allowedTools/);
+        const terminals = h.traces.filter(event => event.callId === 'utility-denied' &&
+          ['tool:failed', 'tool:completed'].includes(event.type as string));
+        assert.deepEqual(terminals.map(event => event.tool), ['utils']);
+        assert.deepEqual(h.lifecycle.map(event => [event.tool, event.phase]), [['utils', 'started'], ['utils', 'completed']]);
+        assert.equal(h.emitter.openCount, 0);
+        assert.equal((h.emitter as unknown as { calls: Map<string, unknown> }).calls.size, 0);
+        assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
+      } else if (route === 'public') {
+        const result = await h.framework.executeToolCall({ id: 'utility-denied', name: 'utils', input, callerAgentName: 'assistant' });
+        assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
+      } else {
+        const pending = h.internal.dispatchScriptToolCall('assistant', 'utils', input);
+        const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
+        try {
+          const result = await pending;
+          assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
+        } finally { clearInterval(processing); }
+      }
+      assert.deepEqual(h.effects, []);
+    } finally { await h.close(); }
+  });
+}
+
+for (const allowedTools of [['utils', 'probe--allowed_util'], ['utils'], 'all'] as AgentConfig['allowedTools'][]) {
+  test(`utility list and describe expose only executable names: ${JSON.stringify(allowedTools)}`, async () => {
+    const h = await harness({ allowedTools });
+    const call = (input: unknown) => h.framework.executeToolCall({ id: 'utility', name: 'utils', input, callerAgentName: 'assistant' });
+    try {
+      const listed = await call({ action: 'list' }); assert.equal(listed.success, true);
+      const expected = allowedTools === 'all' ? ['probe--allowed_util', 'probe--denied_util'] : (allowedTools as string[]).filter(n => n !== 'utils');
+      assert.deepEqual((listed.data as Array<{ name: string }>).map(v => v.name), expected);
+      const described = await call({ action: 'describe', name: 'probe--denied_util' });
+      assert.equal(described.success, allowedTools === 'all');
+      if (allowedTools !== 'all') assert.ok(!JSON.stringify(described).includes('Inert utility counter'));
+      for (const name of expected) assert.equal((await call({ action: 'run', name, args: {} })).success, true);
+      assert.deepEqual(h.effects.map(c => 'probe--' + c.name), expected);
+    } finally { await h.close(); }
+  });
+}
+
+test('trusted module utility call retains its authority with a restricted caller name', async () => {
+  const h = await harness({ allowedTools: [] });
+  try {
+    const result = await h.moduleCall({ id: 'trusted-utility', name: 'utils', input: { action: 'run', name: 'probe--denied_util', args: {} }, callerAgentName: 'assistant' });
+    assert.equal(result.success, true); assert.deepEqual(h.effects.map(c => c.name), ['denied_util']);
+  } finally { await h.close(); }
+});
+
+test('refused inner script call clears lifecycle and its waiter without execution', async () => {
+  const h = await harness({ allowedTools: [] });
+  try {
+    const pending = h.internal.dispatchScriptToolCall('assistant', generic.name, {});
+    await h.framework.runUntilIdle(); assert.equal((await pending).isError, true);
+    assert.deepEqual(h.lifecycle, []); assert.equal(h.emitter.openCount, 0);
+    assert.equal((h.emitter as unknown as { calls: Map<string, unknown> }).calls.size, 0);
+    assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
+    assert.deepEqual(h.effects, []);
+  } finally { await h.close(); }
+});
+
+for (const name of ['skip_reply', 'think'] as const) {
+  test(`mixed refused call and allowed ${name} preserve independent results and prose`, async () => {
+    const h = await harness({ allowedTools: [name], sameRoundThinkTextPolicy: 'private' });
+    try {
+      const routed = captureRouting(h.framework);
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Round prose' },
+        { type: 'tool_use', id: 'denied', name: generic.name, input: {} },
+        { type: 'tool_use', id: 'allowed', name, input: { reason: 'test' } }], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run', metadata: {} }); await h.framework.runUntilIdle();
+      const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ toolUseId: string; isError?: boolean }>;
+      assert.equal(results.length, 2); assert.equal(results.find(r => r.toolUseId === 'denied')!.isError, true);
+      assert.ok(!results.find(r => r.toolUseId === 'allowed')!.isError); assert.deepEqual(h.effects, []);
+      assert.deepEqual(routed, name === 'skip_reply' ? [] : ['Trailing prose']);
+    } finally { await h.close(); }
+  });
+}
+
+for (const permitted of [false, true]) {
+  test(`explicit prose primer and bounce advertise help only when permitted: ${permitted}`, async () => {
+    const h = await harness({ allowedTools: permitted ? ['prose_help'] : [], proseRouting: 'explicit' });
+    try {
+      const agent = h.framework.getAgent('assistant')!;
+      const internal = h.framework as unknown as { maybePrimeProseMode(value: typeof agent): void; bounceProse(value: typeof agent, text: string, reason: string): void };
+      internal.maybePrimeProseMode(agent); internal.bounceProse(agent, 'Unrouted prose', 'no destination');
+      const compiled = await agent.compileContext(); const text = JSON.stringify(compiled.messages);
+      assert.equal(text.includes('The prose_help tool shows the full syntax.'), permitted);
+      assert.ok(text.includes('destination prefix') && text.includes('To deliver it unchanged'));
+    } finally { await h.close(); }
+  });
+}
+
+test('script in flight cannot gain legacy permissions when its ephemeral run disposes', async () => {
+  const h = await harness({ allowedTools: [] });
+  try {
+    const created = await h.framework.createEphemeralAgent({ name: 'retiring-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['code_execution', 'probe--allowed'] });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete once.' }]);
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
+    const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    const script = h.framework.executeToolCall({ id: 'in-flight', name: 'code_execution', callerAgentName: created.agent.name, input: { code: [
+      'import asyncio', 'await asyncio.sleep(0.25)',
+      'make = probe__allowed.__globals__["_make_tool_fn"]',
+      'try:', '    print(await make("probe--denied", "late")({}))',
+      'except Exception as error:', '    print(str(error))',
+    ].join('\n') } });
+    h.framework.start(); await run;
+    assert.equal(h.framework.getAgent(created.agent.name), null);
+    const result = await script; assert.equal(result.success, true);
+    assert.match((result.data as { stdout: string }).stdout, /not permitted.*allowedTools/);
+    assert.deepEqual(h.effects, []);
+    assert.equal(h.emitter.openCount, 0);
+    assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
+  } finally { await h.close(); }
+});
