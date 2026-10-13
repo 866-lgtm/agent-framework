@@ -32,10 +32,10 @@
   add re-pended during the drain (a rollback, its undo, then a redo).
   Inbound MCPL handlers wait out a generation installed while they wait, not
   only the one they first saw, and a reconnect's gate opens only once both
-  its drain and the server's re-registration have finished. So a
+  its drain and the server's re-registration attempt have settled. So a
   reconnect's `mcpl:server-reconnected` and `module:added` traces now come
-  once the server is re-registered, where they came at once when no marks
-  were pending.
+  once that attempt has settled, granted or not, where they came at once
+  when no marks were pending.
 - The result's new `markers` field (`none` | `queued` | `not-scheduled` |
   `unresolved`, the exported `SurgeryMarkerReceipt` type) says whether marks
   were scheduled, never that Discord accepted them. The `[operator]` stderr

@@ -6664,7 +6664,7 @@ export class AgentFramework {
    * activated is retired, so no later reconciliation can deliver it behind a
    * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
    * too, the receipt says only that the outcome is `unresolved`: the batch is
-   * still prepared, and it may still be delivered. A rollback's batch
+   * retained, and it may still be delivered. A rollback's batch
    * (activated by target branch) may be promoted by the very next
    * reconciliation, the one the delivery it starts runs; a suppression's
    * (activated explicitly) waits for the next start.
@@ -6696,7 +6696,7 @@ export class AgentFramework {
       console.error(
         `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
           `could not be activated (${detail}); ` +
-          (retired ? 'batch retired' : `batch left prepared${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
+          (retired ? 'batch retired' : `batch retained${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
       );
       if (batch.refs.length === 0) return { status: 'none', queued: 0 };
       this.opsAlert(

@@ -509,9 +509,11 @@ describe('surgery marker receipt', () => {
 
   it('a turn for channel traffic admitted before the gate may start before the drain completes', async () => {
     // Accepted, and stated in the changelog: the surgery's store reservation
-    // ends once the gate is up, and the gate holds only traffic that arrives
-    // after it. Before this change the reservation held such a turn until the
-    // whole drain had finished.
+    // ends once the gate is up, so no operator command waits on Discord, and
+    // the gate holds only traffic that arrives after it. Before this change
+    // the reservation held such a turn until the whole drain had finished.
+    // This pins that accepted boundary: holding pre-gate work by some other
+    // means would be a deliberate change to it, made together with the text.
     const membrane = new MockMembrane();
     await start(true, undefined, membrane);
     framework.start();
