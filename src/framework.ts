@@ -10202,13 +10202,13 @@ export class AgentFramework {
             // not bounced, so its words are not re-held as a fresh draft that
             // invites a duplicate.
             if (outcome.status === 'failed') {
-              this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>>', hold);
+              this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>>', hold, unsent.draft);
             }
           }
         } catch (err) {
           this.proseTargetPins.delete(agent.name);
           this.proseHybridSuppressed.set(agent.name, 'failed');
-          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', hold);
+          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', hold, unsent.draft);
         }
         continue;
       }
@@ -10354,10 +10354,10 @@ export class AgentFramework {
       } else if (outcome.status === 'failed') {
         // Unknown deliveries are marker-only: offering a fresh draft would
         // invite a duplicate. Keep the authored body for the re-bounce rule.
-        this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>', hold);
+        this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>', hold, unsent.draft);
       }
     } catch (err) {
-      this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>', hold);
+      this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>', hold, unsent.draft);
     }
   }
 
@@ -10377,10 +10377,20 @@ export class AgentFramework {
    * the risk that draft itself inherited, else (truly) that it was in flight
    * when copied.
    */
-  private unsentWords(agent: Agent, text: string): { draft: Draft } | { text: string; inheritedRisk?: InheritedRisk } {
+  private unsentWords(
+    agent: Agent,
+    text: string,
+    /** The draft `{{unsent}}` was substituted with, when the words are held
+     *  after that send: the latest bounce may have changed while it waited. */
+    substituted?: Draft,
+  ): { draft: Draft } | { text: string; inheritedRisk?: InheritedRisk } {
     if (!text.includes('{{unsent}}')) return { text };
     const name = agent.name;
-    const previous = this.proseDrafts.latestBounce(name);
+    // A substituted draft is read again here, so its risk is its state after
+    // the attempt, not before it.
+    const previous = substituted
+      ? this.proseDrafts.get(name, substituted.id) ?? substituted
+      : this.proseDrafts.latestBounce(name);
     if (previous && text.trim() === '{{unsent}}') return { draft: previous };
     const expanded = text.replaceAll('{{unsent}}', previous?.text ?? '');
     if (!previous || !(draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`))) {
@@ -10425,9 +10435,11 @@ export class AgentFramework {
     candidates?: string[],
     prefix: '>>' | '>>>' = '>>',
     hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
+    /** The draft a failed send substituted for `{{unsent}}` (unsentWords). */
+    substituted?: Draft,
   ): void {
     const name = agent.name;
-    const words = this.unsentWords(agent, text);
+    const words = this.unsentWords(agent, text, substituted);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;
     if ('draft' in words) {

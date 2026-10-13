@@ -378,6 +378,66 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it('a failed {{unsent}} send that a later turn overtook holds the words it attempted, not the newer bounce', async () => {
+    // Turn one queues '>>#alpha {{unsent}} plus a line' and skip_reply ends
+    // it while that publish is held. Turn two bounces new words. When turn
+    // one's send then fails, its draft must hold what it attempted.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha {{unsent}} plus a line' },
+      { type: 'tool_use', id: 'delayed-1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'delayed-2', name: 'skip_reply', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    const framework = await createFramework();
+    const routed = stubRegistry(framework, ['false']);
+    answerSkipReply(framework);
+    const store = draftsOf(framework);
+    const original = store.hold('assistant', [{ text: 'ORIGINAL WORDS', source: { branch: 'main', turn: 0, round: 0, segment: 0 } }], 'bounced').held[0]!;
+    const internals = framework as unknown as {
+      channelRegistry: { deliverSpeech: (...args: unknown[]) => Promise<unknown> };
+      proseSpeechChains: Map<string, Promise<void>>;
+    };
+    const deliver = internals.channelRegistry.deliverSpeech;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    internals.channelRegistry.deliverSpeech = async (...args: unknown[]) => {
+      const outcome = await deliver(...args);
+      entered();
+      await held;
+      return outcome;
+    };
+    let starts = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:started') return;
+      starts++;
+      if (starts === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere NEW WORDS' }]));
+      if (starts >= 3) membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
+    });
+    try {
+      trigger(framework);
+      await framework.runUntilIdle();
+      await reached;
+      const firstChain = internals.proseSpeechChains.get('assistant')!;
+      assert.deepEqual(routed.map((r) => r.text), ['ORIGINAL WORDS plus a line']);
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.equal(store.latestBounce('assistant')?.text, 'NEW WORDS', 'the next turn bounced before the earlier send answered');
+      release();
+      await firstChain;
+      const heldTexts = store.open('assistant').map((d) => d.text);
+      assert.ok(heldTexts.includes('ORIGINAL WORDS plus a line'), `the failed send holds the words it attempted: ${JSON.stringify(heldTexts)}`);
+      assert.ok(!heldTexts.includes('NEW WORDS plus a line'), 'not the newer bounce');
+      const copy = store.open('assistant').find((d) => d.text === 'ORIGINAL WORDS plus a line')!;
+      assert.notEqual(copy.id, original.id);
+    } finally {
+      release();
+      await framework.stop();
+    }
+  });
+
   it('a thrown explicit unsent delivery re-bounces the authored body with its unresolved attempt risk', async () => {
     const framework = await createFramework();
     try {
