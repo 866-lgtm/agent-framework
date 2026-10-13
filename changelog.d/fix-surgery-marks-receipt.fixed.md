@@ -7,8 +7,9 @@
   marks would take roughly 15 minutes; the household's client timed out
   after 60 seconds. Delivery now continues in the background, behind the
   same MCPL data-plane gate as before, which holds channel traffic until the
-  marks are attempted. A turn that carries no channel traffic, such as a
-  scheduler timer or a provider admission, may run during delivery.
+  marks are attempted, or deferred when their server isn't connected. A
+  turn that carries no channel traffic, such as a scheduler timer or a
+  provider admission, may run during delivery.
 - The other branch moves no longer wait for Discord either: the web API's
   `branch.switch`, `undo` and `redo`, and `host/command` turn undo, return
   once the branch has moved, and their marks follow behind the same gate. A
@@ -18,13 +19,13 @@
   acknowledged only after its marks were attempted.)
 - A gate installed while a drain is still running (restoring the source
   branch mid-delivery, say) waits for that drain and then drains again from
-  the ledger, so every mark pending when the gate was armed is attempted
-  before traffic is released: the drain's remaining reactions, the removals
-  they need, and an add re-pended during the drain (a rollback, its undo,
-  then a redo). A mark whose server isn't connected is deferred until it
-  is, as before. Inbound MCPL handlers wait out a generation installed while
-  they wait, not only the one they first saw, and a reconnect's gate opens
-  only once both its drain and the server's re-registration have finished.
+  the ledger. So before traffic is released, every mark pending when the
+  gate was armed is attempted, or deferred until its server is connected,
+  as before: the drain's remaining reactions, the removals they need, and an
+  add re-pended during the drain (a rollback, its undo, then a redo).
+  Inbound MCPL handlers wait out a generation installed while they wait, not
+  only the one they first saw, and a reconnect's gate opens only once both
+  its drain and the server's re-registration have finished.
 - The result's new `markers` field (`none` | `queued` | `not-scheduled` |
   `unresolved`) says whether marks were scheduled, never that Discord
   accepted them. The `[operator]` stderr line gains `marks=…` and the

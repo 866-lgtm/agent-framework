@@ -6731,9 +6731,11 @@ export class AgentFramework {
    * caller's response and any store reservation stop waiting on remote
    * reactions. A wake that carries no channel traffic (a scheduler timer, a
    * provider admission) may run during delivery. A failure is accounted by
-   * the gate itself (connections recycled); here it is logged and raised as
-   * an ops alert, and the next sync, reconnect or start delivers what is
-   * still pending.
+   * the gate itself: the current generation's failure recycles the
+   * connections, and a superseded one leaves that to the newer generation,
+   * whose own pass meets the same ledger. Here it is logged and raised as an
+   * ops alert, and the next sync, reconnect or start delivers what is still
+   * pending.
    *
    * @param after What moved the branch, for the log and the alert
    *   ("rollback", "branch switch", "undo" …).

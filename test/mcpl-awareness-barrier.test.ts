@@ -908,7 +908,7 @@ test('an inbound handler waiting on a generation that fails refuses its request 
   }
 
   failing.reject(new Error('injected accounting failure'));
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitFor('every request to be answered', () => answers.length === 4);
   assert.deepEqual(handled, [], 'nothing runs behind a failed generation');
   assert.deepEqual(
     answers.sort((a, b) => a.event.localeCompare(b.event)),
