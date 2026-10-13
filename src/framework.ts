@@ -10442,6 +10442,23 @@ export class AgentFramework {
     after: { substituted?: Draft; outcome?: 'unknown' } = {},
   ): void {
     const name = agent.name;
+    if (after.outcome === 'unknown' && !after.substituted) {
+      // Words with no draft behind them, whose send threw, may have gone
+      // out. Like an unknown outcome, that is marker-only: holding them as a
+      // draft would invite a duplicate post.
+      const notice =
+        `[prose-routing] Your text (${text.length} chars) may not have been delivered — ${reason}. ` +
+        "It isn't held as a draft, since a resend could post it twice; the words remain in your history. " +
+        'Check that channel before writing them again.';
+      try {
+        const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, { forAgent: name });
+        this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
+      } catch (err) {
+        console.error('bounceProse: failed to record the unknown-send notice:', err);
+      }
+      console.error(`[prose] ${name}: ${text.length} chars may not have been delivered — ${reason}`);
+      return;
+    }
     const words = this.unsentWords(agent, text, after.substituted);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;

@@ -287,7 +287,7 @@ describe('explicit prose routing', () => {
     (framework as unknown as { proseDrafts: DraftsView }).proseDrafts;
 
   for (const failure of ['false', 'throw'] as const) {
-    it('an explicit ' + failure + ' delivery holds its body as a bounce and names it privately', async () => {
+    it('an explicit ' + failure + ' delivery holds its body as a bounce and names it privately, unless the send threw', async () => {
       const framework = await createFramework();
       try {
         const routed = stubRegistry(framework, [failure]);
@@ -298,6 +298,16 @@ describe('explicit prose routing', () => {
         await gateway.deliverProse(agent, '>>#alpha keep these words', { notice: 'later' });
         assert.deepEqual(routed, [{ text: 'keep these words', locus: 'chan-alpha' }]);
         const held = draftsOf(framework).open('assistant');
+        if (failure === 'throw') {
+          // The send threw, so the words may have gone out: marker-only, as
+          // an unknown outcome is, with no draft to resend.
+          assert.deepEqual(held, [], 'words whose send threw are not held');
+          const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]'))!;
+          assert.match(notice, /may not have been delivered/);
+          assert.match(notice, /isn't held as a draft, since a resend could post it twice/);
+          assert.doesNotMatch(notice, /\{\{unsent\}\}|was not delivered/);
+          return;
+        }
         assert.equal(held.length, 1, 'the failed envelope became one draft');
         assert.equal(held[0]!.reason, 'bounced');
         assert.equal(held[0]!.text, 'keep these words');
