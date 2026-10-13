@@ -935,7 +935,9 @@ describe('explicit prose routing', () => {
       const open: RoutingState['logical'] = { continuation: true, deliveries: [], suppressed: 0 };
       internals.openLogical.set('assistant', open);
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true } as InferenceRequest);
-      await framework.runUntilIdle();
+      // Bounded: a silent start that took the open turn's ' !' would start a
+      // continuation with no response queued, and this would wait for good.
+      await within(framework.runUntilIdle(), 'the silent turn to settle', 3000);
       assert.equal(turns, 1);
       assert.notEqual(internals.turnRouting.get('assistant')?.logical, open, 'the silent start kept a logical turn of its own');
       assert.equal(internals.openLogical.get('assistant'), open, 'and neither took nor closed the open one');
