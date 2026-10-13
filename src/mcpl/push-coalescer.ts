@@ -18,6 +18,7 @@
  * bookkeeping and is unit-tested without a framework.
  */
 import type { McplContentBlock, PushEventResult } from './types.js';
+import { classifyBlock, isInlineContradiction } from './references.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 
 export const PUSH_COALESCING_SUPPORT = {
@@ -244,22 +245,30 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  * Validate wire content before it is stored, rendered or converted.
  *
  * Its shape and its visible emptiness, nothing else. An incoming coalesced
- * occurrence meets the rules an uncoalesced message meets, since it reaches
- * context through the same converters: a plain occurrence the moment it is
- * admitted (the coalescer only remembers where it landed), a deferred one
- * when its render settles or falls back to it. So: an array of objects, which
- * the converters turn into blocks, a block they can't render (a video, an
- * unknown type, an image with neither uri nor data) becoming a placeholder
- * there as here. The converters take any object without throwing: a type,
- * text, data, mimeType or uri that isn't a string is treated as absent, so a
- * malformed block is a placeholder too (or, for a text block, no text).
+ * occurrence reaches context through the converters an uncoalesced message
+ * goes through: a plain occurrence the moment it is admitted (the coalescer
+ * only remembers where it landed), a deferred one when its render settles or
+ * falls back to it. Its content must be an array of objects. A block the
+ * converters can't render (a video, an unknown type, an image with neither
+ * uri nor data) becomes a placeholder, as it does uncoalesced, and so does a
+ * malformed one, since the converters take any object without throwing: a
+ * type, text, data, mimeType or uri that isn't a string counts as absent, a
+ * text block's as no text. The uncoalesced lane doesn't check the array:
+ * there a member that isn't an object becomes the untyped placeholder, and a
+ * null member or content that isn't an array throws in conversion
+ * (agent-framework#297 brings that lane to this rule).
  * Nor does the uncoalesced path set a byte budget on content:
  * an inline image is admitted here as it is there (agent-framework#266: a
  * 1 MiB serialized-content budget here dropped every coalesced message
  * carrying a screenshot). A deferred occurrence's content is held, until then,
- * in the coalescer's state and its persisted snapshot and receipts. A render
- * result, which the host delivers in the occurrence's place, also gets each
- * block's shape checked (`checkBlockShapes`), as RFC-006 §5.2 asks.
+ * in the coalescer's state and its persisted snapshot and receipts.
+ *
+ * A render result, which the host delivers in the occurrence's place, gets
+ * these checks, as RFC-006 §5.2 gives it every check a pushed payload gets,
+ * and one more (`checkBlockShapes`): each block must be one the converters
+ * show as itself or as a reference stub, not as a placeholder. A malformed
+ * render falls back to the occurrence's own content; a pushed payload has
+ * nothing to fall back to, and gets its placeholders.
  *
  * Visibly-empty content is refused unless `allowEmpty`: an admitted
  * occurrence with nothing to show would wake the model with no visible cause.
@@ -274,14 +283,30 @@ export function validateCoalescedContent(
   if (!Array.isArray(content)) throw new CoalesceError('payload.content', 'content must be an array');
   for (const b of content as Array<Record<string, unknown>>) {
     if (!b || typeof b !== 'object' || Array.isArray(b)) throw new CoalesceError('payload.content', 'invalid content block');
-    if (!options.checkBlockShapes) continue;
-    if (b.type === 'text' && typeof b.text === 'string') continue;
-    if (b.type === 'resource' && typeof b.uri === 'string') continue;
-    if ((b.type === 'image' || b.type === 'audio')
-      && (typeof b.uri === 'string' || (typeof b.data === 'string' && typeof b.mimeType === 'string'))) continue;
-    throw new CoalesceError('payload.content', 'invalid content block');
+    if (options.checkBlockShapes && !showsAsItself(b)) throw new CoalesceError('payload.content', 'invalid content block');
   }
   if (!options.allowEmpty && isVisiblyEmptyContent(content)) throw new EmptyContentError();
+}
+
+/**
+ * Whether the converters (`convertBlock` in push-handler.ts and
+ * channel-registry.ts) show a block as itself, its text or its image or
+ * audio source, or as a reference stub, and not as a placeholder: an
+ * unrecognized block, a no-data or no-media-type one, or withheld inline
+ * data. This follows their branches in their order.
+ */
+function showsAsItself(b: Record<string, unknown>): boolean {
+  if (b.type === 'text') return typeof b.text === 'string';
+  if (b.type === 'resource') return classifyBlock(b).kind === 'reference';
+  if (b.type !== 'image' && b.type !== 'audio') return false;
+  if (isInlineContradiction(b)) return false;
+  if (isFilledString(b.uri) && b.disposition) return classifyBlock(b).kind === 'reference';
+  if (isFilledString(b.data) && isFilledString(b.mimeType)) return true;
+  return b.type === 'image' && isFilledString(b.uri);
+}
+
+function isFilledString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
 }
 
 /** Validate the `coalesce` member of either lane (§13). */

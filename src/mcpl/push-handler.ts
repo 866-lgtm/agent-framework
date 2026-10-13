@@ -56,8 +56,10 @@ export interface McplPushEvent {
 // ============================================================================
 
 /**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- * Same logic as hook-orchestrator.ts.
+ * Convert a single MCPL wire-format content block to a membrane ContentBlock,
+ * as the channel lane's convertBlock (channel-registry.ts) does, apart from
+ * the provenance its reference stubs name. Hook context injections convert
+ * through hook-orchestrator.ts's own.
  */
 export function convertBlock(block: McplContentBlock): ContentBlock {
   switch (block.type) {
@@ -72,7 +74,7 @@ export function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
@@ -89,7 +91,7 @@ export function convertBlock(block: McplContentBlock): ContentBlock {
           source: { type: 'url', url: block.uri },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Image: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
 
     case 'audio':
       if (isInlineContradiction(block)) {
@@ -97,7 +99,7 @@ export function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
@@ -108,7 +110,7 @@ export function convertBlock(block: McplContentBlock): ContentBlock {
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Audio: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
 
     case 'resource':
       // RFC-005: reference blocks become bounded stubs — never raw URIs
@@ -127,8 +129,9 @@ export function convertBlock(block: McplContentBlock): ContentBlock {
 }
 
 /** A string with something in it: the only data, mimeType or uri a block's
- *  source is built from. Anything else a sender puts there leaves the block
- *  without it, so conversion never throws and never copies a non-string. */
+ *  source is built from, and the only uri that makes it a reference. Anything
+ *  else a sender puts there leaves the block without it, so conversion never
+ *  throws and never copies a non-string. */
 function isFilledString(value: unknown): value is string {
   return typeof value === 'string' && value !== '';
 }

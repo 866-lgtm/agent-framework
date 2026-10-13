@@ -232,14 +232,26 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
   f.alwaysRespond();
   // What isn't a string is left out of the block. An object whose toString
   // isn't a function throws when converted to text, as a placeholder would.
-  // `shows` is what the context then holds for it.
+  // `shows` is what the context then holds for it. Each of text, data,
+  // mimeType and uri also takes an array, a number and null.
+  const odd = (marker: string) => [{ toString: 1 }, [marker], 424242, null];
   const malformed: Array<{ content: unknown[]; shows: string }> = [
     { content: [{ type: { toString: 1 } }], shows: '[unrecognized content block: untyped]' },
     { content: [{ type: 7 }], shows: '[unrecognized content block: untyped]' },
-    { content: [{ type: 'image', data: { toString: 1 }, mimeType: 'image/png' }], shows: '[Image: no data]' },
-    { content: [{ type: 'image', uri: { toString: 1 } }], shows: '[Image: no data]' },
-    { content: [{ type: 'audio', data: 'AAAA', mimeType: { toString: 1 } }], shows: '[Audio: no data]' },
-    { content: [{ type: 'text', text: { toString: 1 } }, { type: 'text', text: 'beside_text_without_text' }], shows: 'beside_text_without_text' },
+    ...odd('array_data').map((data) => ({ content: [{ type: 'image', data, mimeType: 'image/png' }], shows: '[Image: no data]' })),
+    ...odd('array_uri').map((uri) => ({ content: [{ type: 'image', uri }], shows: '[Image: no data]' })),
+    // Data whose media type is unusable is named as such, not as no data.
+    ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'image', data: 'AAAA', mimeType }], shows: '[Image: no media type]' })),
+    ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'audio', data: 'AAAA', mimeType }], shows: '[Audio: no media type]' })),
+    ...odd('array_text').map((text, i) => ({
+      content: [{ type: 'text', text }, { type: 'text', text: `beside_text_without_text_${i}` }], shows: `beside_text_without_text_${i}`,
+    })),
+    // Reference-shaped: a uri that isn't a non-empty string never makes a
+    // reference, with a disposition or without.
+    { content: [{ type: 'resource', uri: 424242 }], shows: '[unrecognized content block: reference without string uri]' },
+    { content: [{ type: 'image', uri: 424242, disposition: 'ref' }], shows: '[Image: no data]' },
+    { content: [{ type: 'image', uri: '', disposition: 'ref' }], shows: '[Image: no data]' },
+    { content: [{ type: 'audio', uri: { toString: 1 }, disposition: 'ref' }], shows: '[Audio: no data]' },
   ];
   const messages: unknown[] = malformed.flatMap(({ content }, i) => [
     { ...f.channel(`e${i}`, '', { initial: true }, 'chat', `coalesced${i}`), content },
@@ -267,7 +279,7 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
     const expected = malformed.filter((m) => m.shows === shows).length * 4;
     assert.equal(occurrences(context, JSON.stringify(shows)), expected, shows);
   }
-  assert(!context.includes('toString'), 'nothing that was not a string reaches the context');
+  for (const leaked of ['toString', 'array_', '424242']) assert(!context.includes(leaked), `nothing that was not a string reaches the context (${leaked})`);
 });
 
 test('a text block whose text isn\'t a string is no text, so alone it is refused as empty on both lanes, coalesced or not', async (t) => {
@@ -287,11 +299,14 @@ test('a text block whose text isn\'t a string is no text, so alone it is refused
   assert.equal(coalesced.error?.message, plain.error?.message);
 });
 
-test('an inference filter reads a text block whose text isn\'t a string as no text, on both lanes, coalesced or not', async (t) => {
+test('an inference filter reads the text conversion stores, a placeholder included, on both lanes, coalesced or not', async (t) => {
   const seen: string[] = [];
   const f = await fixture({ server: { shouldTriggerInference: (text: string) => { seen.push(text); return false; } } });
   t.after(f.close); await f.register();
-  const content = [{ type: 'text', text: { toString: 1 } }, { type: 'text', text: 'visible_text' }];
+  // A text block whose text isn't a string, which reads as no text; a block
+  // that converts to a placeholder; and visible text.
+  const content = [{ type: 'text', text: { toString: 1 } }, { type: 'video', uri: 'https://example.invalid/v.mp4' }, { type: 'text', text: 'visible_text' }];
+  const shown = '\n[unrecognized content block: video]\nvisible_text';
   const r = await f.send('channels/incoming', { messages: [
     { ...f.channel('e1', '', { initial: true }, 'chat', 'coalesced'), content },
     { channelId: 'chat', messageId: 'plain', timestamp: TS, author: { id: 'u', name: 'User' }, content },
@@ -305,9 +320,9 @@ test('an inference filter reads a text block whose text isn\'t a string as no te
   const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
   assert.equal(coalesced.result?.accepted, true);
   assert.equal(plain.result?.accepted, true);
-  // Each lane joins its text blocks with a line break, the non-string one as
-  // empty text, as conversion stores it.
-  assert.deepEqual(seen, ['\nvisible_text', '\nvisible_text', 'sibling_text', '\nvisible_text', '\nvisible_text'],
+  // Each lane joins its converted text blocks with a line break, the
+  // non-string one as empty text and the video as its placeholder.
+  assert.deepEqual(seen, [shown, shown, 'sibling_text', shown, shown],
     'the filter gets the same text on both lanes, and is reached for every message');
 });
 
@@ -322,6 +337,43 @@ test('a render result with a malformed block falls back, and the host names it o
   const line = lines.find((l) => l.startsWith('[push-render-failed]'));
   assert(line, lines.join('\n'));
   assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "CoalesceError:\\u0020invalid\\u0020content\\u0020block" \(the occurrence's own content is delivered instead\)$/);
+});
+
+test('a render result is delivered only when the converters show each block as itself or as a reference stub', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const lines = captureConsoleError(t);
+  f.alwaysRespond();
+  const cases: Array<{ block: Record<string, unknown>; delivered: boolean }> = [
+    { block: { type: 'image', data: 'AAAA', mimeType: 'image/png' }, delivered: true },
+    { block: { type: 'image', uri: 'https://example.invalid/i.png' }, delivered: true },
+    { block: { type: 'audio', data: 'AAAA', mimeType: 'audio/wav' }, delivered: true },
+    { block: { type: 'audio', uri: 'https://example.invalid/a.wav', disposition: 'ref' }, delivered: true },
+    { block: { type: 'resource', uri: 'https://example.invalid/doc' }, delivered: true },
+    // Each of these converts to a placeholder, so the occurrence's own
+    // content is delivered instead.
+    { block: { type: 'image', data: '', mimeType: 'image/png' }, delivered: false },
+    { block: { type: 'image', data: 'AAAA', mimeType: '' }, delivered: false },
+    { block: { type: 'image', data: 'AAAA', mimeType: 'image/png', uri: 'https://example.invalid/i.png' }, delivered: false },
+    { block: { type: 'audio', data: '', mimeType: 'audio/wav' }, delivered: false },
+    { block: { type: 'audio', uri: 'https://example.invalid/a.wav' }, delivered: false },
+    { block: { type: 'resource', uri: '' }, delivered: false },
+    { block: { type: 'resource', uri: `https://example.invalid/${'x'.repeat(4096)}` }, delivered: false },
+  ];
+  f.renderer(async (params) => {
+    const i = Number(String(params.eventId).slice(1));
+    return { content: [{ type: 'text', text: `rendered_${i}` }, cases[i].block] };
+  });
+  for (const [i] of cases.entries()) await f.send('push/event', f.params(`r${i}`, `fallback_${i}`, { deferred: true, key: `doc${i}` }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, cases.length);
+  const context = f.context();
+  for (const [i, { block, delivered }] of cases.entries()) {
+    assert.equal(context.includes(JSON.stringify(`rendered_${i}`)), delivered, `rendered: ${JSON.stringify(block)}`);
+    assert.equal(context.includes(JSON.stringify(`fallback_${i}`)), !delivered, `fell back: ${JSON.stringify(block)}`);
+  }
+  // Each fallback is named on the host.
+  const failed = lines.filter((l) => l.startsWith('[push-render-failed]')).map((l) => /eventId=(\S+)/.exec(l)?.[1]).sort();
+  assert.deepEqual(failed, cases.flatMap(({ delivered }, i) => (delivered ? [] : [`r${i}`])).sort());
 });
 
 test('a render error the server words itself prints as one field, so it can\'t add fields to the line', async (t) => {

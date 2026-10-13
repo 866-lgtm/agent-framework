@@ -260,7 +260,7 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
@@ -277,7 +277,7 @@ function convertBlock(block: McplContentBlock): ContentBlock {
           source: { type: 'url', url: block.uri },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Image: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
 
     case 'audio':
       if (isInlineContradiction(block)) {
@@ -285,7 +285,7 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
@@ -296,7 +296,7 @@ function convertBlock(block: McplContentBlock): ContentBlock {
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Audio: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
 
     case 'resource':
       // RFC-005: reference blocks become bounded stubs — never raw URIs
@@ -315,8 +315,9 @@ function convertBlock(block: McplContentBlock): ContentBlock {
 }
 
 /** A string with something in it: the only data, mimeType or uri a block's
- *  source is built from. Anything else a sender puts there leaves the block
- *  without it, so conversion never throws and never copies a non-string. */
+ *  source is built from, and the only uri that makes it a reference. Anything
+ *  else a sender puts there leaves the block without it, so conversion never
+ *  throws and never copies a non-string. */
 function isFilledString(value: unknown): value is string {
   return typeof value === 'string' && value !== '';
 }
@@ -1043,13 +1044,12 @@ export class ChannelRegistry {
       // Determine whether to trigger inference
       let triggerInference = true;
       if (this.shouldTriggerInference) {
-        // Text that isn't a string is empty text here too, as conversion
-        // stores it (the push lane's filter reads the converted text):
-        // joining an object could throw, or invent text the agent's context
-        // never gets.
-        const textContent = message.content
-          .filter((b) => b.type === 'text')
-          .map((b) => { const text: unknown = (b as { text?: unknown }).text; return typeof text === 'string' ? text : ''; })
+        // The text the agent's context gets, as the push lane's filter reads
+        // it: the converted text blocks, a placeholder or reference stub
+        // among them, and a text block's non-string text as empty text.
+        const textContent = convertedContent
+          .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
+          .map((b) => b.text)
           .join('\n');
         triggerInference = this.shouldTriggerInference(
           textContent,
