@@ -334,6 +334,8 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     assert.ok(partial.length < 2500, 'the resident receives a bounded display, not the whole error object');
     const trace = traces.find((event) => event.type === 'mcpl:speech-route-failed' && event.detail !== undefined);
     assert.ok(trace?.detail, 'the same connector account reaches the failure trace');
+    const marker = framework.getAgent('scout')!.getContextManager().getAllMessages().find((m) => (m.content[0] as { text: string }).text === partial);
+    assert.equal((marker?.metadata as { detail?: unknown } | undefined)?.detail, trace?.detail, 'the persisted marker metadata carries the same bounded display');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

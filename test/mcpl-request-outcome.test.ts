@@ -91,17 +91,25 @@ test('McplRequestError is an Error that keeps its message and name', () => {
   assert.equal(err.message, 'boom');
 });
 
-test('a synchronous write rejection is not-sent, leaves no pending request, and does not poison the next request', async () => {
+test('a synchronous write rejection is not-sent, leaves no pending request, and does not poison the next request', async (t) => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   const state = connection as unknown as {
-    transport: { writeLine(json: string): void };
+    transport: { writeLine(json: string): void; emit(event: string, line: string): boolean };
     pendingRequests: Map<unknown, unknown>;
   };
   const write = state.transport.writeLine.bind(state.transport);
-  state.transport.writeLine = () => { throw new Error('synthetic write rejection'); };
-  const err = await rejectsWith(connection.sendToolsCall('fail', {}), 'not-sent');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let unwrittenId: unknown;
+  const lateRenders: unknown[] = [];
+  connection.on('orphaned-render-response', (event) => lateRenders.push(event));
+  state.transport.writeLine = (json) => { unwrittenId = JSON.parse(json).id; throw new Error('synthetic write rejection'); };
+  const err = await rejectsWith(connection.sendPushRender({ featureSet: 'test', key: 'unwritten', eventId: 'e1', notices: [], dropped: 0 }), 'not-sent');
   assert.match(err.message, /synthetic write rejection/);
   assert.equal(state.pendingRequests.size, 0, 'nothing remains awaiting an unwritten request');
+  t.mock.timers.tick(5000);
+  state.transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: unwrittenId, result: { content: [] } }));
+  assert.deepEqual(lateRenders, [], 'an unwritten render cannot surface a late-response event after its old watchdog deadline');
+  t.mock.timers.reset();
   state.transport.writeLine = write;
   const next = await rejectsWith(connection.sendToolsCall('fail', {}), 'error-response');
   assert.deepEqual(next.data, { posted: ['111'] }, 'a subsequent written request still reaches the real server');
