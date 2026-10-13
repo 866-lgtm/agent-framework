@@ -350,6 +350,30 @@ describe('a reached budget across a restart', () => {
     });
   });
 
+  it('a malformed persisted budget, tail or pace is ignored with a line naming its kind, and the rest restores', async () => {
+    await run(async ({ framework, restart }) => {
+      writeRecord(framework(), { contextBudgetTokens: 'x'.repeat(100), tailTokens: -1, transitionPaceTokens: 4_000 });
+      const log = quietErrors();
+      let restarted: AgentFramework;
+      try {
+        restarted = await restart();
+      } finally {
+        log.restore();
+      }
+      const { contextBudgetTokens, effectiveContextBudgetTokens, tailTokens, transitionPaceTokens } = restarted.getAgentRuntimeSettings('agent');
+      assert.deepEqual(
+        { contextBudgetTokens, effectiveContextBudgetTokens, tailTokens, transitionPaceTokens },
+        { contextBudgetTokens: 100_000, effectiveContextBudgetTokens: 100_000, tailTokens: 30_000, transitionPaceTokens: 4_000 },
+      );
+      assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [
+        '[agent-settings] ignoring an invalid persisted contextBudgetTokens for agent "agent": a string',
+        '[agent-settings] ignoring an invalid persisted tailTokens for agent "agent": a number that isn\'t a non-negative safe integer',
+      ]);
+      restarted.updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
+      assert.deepEqual(persisted(restarted), { transitionPaceTokens: 4_000, tailTokens: 20_000 }, 'a later write leaves them out');
+    });
+  });
+
   it('a patch cannot set the field', async () => {
     await run(async ({ framework }) => {
       framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 } as never);
@@ -471,6 +495,37 @@ describe('a reached budget across a restart', () => {
     });
   });
 
+  it('a refusal planned before the budget came back to it leaves the marker a newer compile wrote there', async () => {
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      // The first compile plans at 60k and is refused only after the budget
+      // went to 80k and came back to 60k, and a second compile fit at 60k.
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        if (++calls === 1) {
+          await held;
+          throw refusal;
+        }
+        return original.apply(this, args);
+      }, async () => {
+        const first = compile(f);
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+        await compile(f);
+        assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the second compile fit at 60k');
+        release();
+        await assert.rejects(first, /over budget/);
+      });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the newer fit outweighs the older refusal');
+      assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), 60_000);
+    });
+  });
+
   it('of two compiles in flight across a settle, the one that finishes later proves nothing it planned before it', async () => {
     await run(async ({ framework }) => {
       const f = framework();
@@ -556,6 +611,22 @@ describe('a reached budget across a restart', () => {
       }, () => compile(f));
       assert.deepEqual(budgets(f), { target: 60_000, effective: 60_000, transition: 'stable' }, 'the re-armed descent settled');
       assert.equal(persisted(f)?.contextBudgetReachedTokens, undefined, 'a descent armed again to the same target is another descent');
+    });
+    // And armed again by a reset to the recipe's budget, below the live one.
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 120_000 });
+      f.resetAgentRuntimeSettings('agent', ['contextBudgetTokens']);
+      assert.deepEqual(budgets(f), { target: 100_000, effective: 120_000, transition: 'converging' });
+      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+        f.resetAgentRuntimeSettings('agent', ['contextBudgetTokens']);
+        return original.apply(this, args);
+      }, () => compile(f));
+      assert.deepEqual(budgets(f), { target: 100_000, effective: 100_000, transition: 'stable' }, 'the re-armed descent settled');
+      // Setting the budget it now runs at keeps any proof the settle gave it.
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 100_000, immediate: true });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 100_000 }, 'a descent armed again by a reset is another descent');
     });
   });
 
@@ -649,8 +720,12 @@ describe('a reached budget across a restart', () => {
     assert.deepEqual(budgets(restarted), { target: budget, effective: budget, transition: 'stable' }, 'applied at once at boot');
     return restarted;
   }
-  /** A compile whose first plan the context manager refuses: the budget each plan was asked for, the record as the second began, the log, and what it threw. */
-  async function refusedFirst(f: AgentFramework) {
+  /**
+   * A compile whose first plan the context manager refuses, after `meanwhile`
+   * ran while that plan was under way: the budget each plan was asked for,
+   * the record as the second began, the log, and what it threw.
+   */
+  async function refusedFirst(f: AgentFramework, meanwhile?: () => void) {
     const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
     const planned: number[] = [];
     let recordAtRetry: Record | undefined;
@@ -660,7 +735,10 @@ describe('a reached budget across a restart', () => {
     try {
       await withPatched('compile', async function (this: unknown, budget?: { maxTokens: number }, ...rest: unknown[]) {
         planned.push(budget?.maxTokens ?? -1);
-        if (planned.length === 1) throw refusal;
+        if (planned.length === 1) {
+          meanwhile?.();
+          throw refusal;
+        }
         recordAtRetry = { ...persisted(f) };
         return original.apply(this, [budget, ...rest]);
       }, () => compile(f));
@@ -721,7 +799,7 @@ describe('a reached budget across a restart', () => {
     });
   });
 
-  it('after the boot, a tail change keeps the fallback, and a paced change ends it', async () => {
+  it('after the boot, a tail change keeps the fallback, and any write of the budget ends it', async () => {
     await run(async (h) => {
       h.framework().updateAgentRuntimeSettings('agent', { tailTokens: 15_000 });
       const restarted = await provenAtBoot(h, 60_000);
@@ -731,13 +809,37 @@ describe('a reached budget across a restart', () => {
       assert.deepEqual(planned, [60_000, 100_000], 'restored paced');
       assert.equal(restarted.getAgentRuntimeSettings('agent').tailTokens, 20_000, 'the fallback re-applies only the budget, not the boot\'s tail');
     });
+    // Each write of the budget, before the first compile or while it runs,
+    // is the operator's decision: the refusal is that compile's own.
+    const writes: Array<[string, (f: AgentFramework) => void, boolean, number, ReturnType<typeof budgets>]> = [
+      ['a paced decrease', (f) => { f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 }); }, false, 60_000,
+        { target: 50_000, effective: 60_000, transition: 'converging' }],
+      ['the same budget at once', (f) => { f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true }); }, false, 60_000,
+        { target: 60_000, effective: 60_000, transition: 'stable' }],
+      ['the same budget, unpersisted', (f) => { f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }, { persist: false }); }, false, 60_000,
+        { target: 60_000, effective: 60_000, transition: 'stable' }],
+      ['a reset of the budget', (f) => { f.resetAgentRuntimeSettings('agent', ['contextBudgetTokens']); }, false, 100_000,
+        { target: 100_000, effective: 100_000, transition: 'stable' }],
+      ['an increase while the first compile runs', (f) => { f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 }); }, true, 60_000,
+        { target: 80_000, effective: 80_000, transition: 'stable' }],
+    ];
+    for (const [what, write, meanwhile, refusedAt, after] of writes) {
+      await run(async (h) => {
+        const restarted = await provenAtBoot(h, 60_000);
+        if (!meanwhile) write(restarted);
+        const { planned, thrown } = await refusedFirst(restarted, meanwhile ? () => write(restarted) : undefined);
+        assert.equal((thrown as Error | undefined)?.message, 'over budget', what);
+        assert.deepEqual(planned, [refusedAt], `${what}: no fallback`);
+        assert.deepEqual(budgets(restarted), after, what);
+      });
+    }
+    // And a compile that fits at it ends the fallback too.
     await run(async (h) => {
       const restarted = await provenAtBoot(h, 60_000);
-      restarted.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+      await compile(restarted);
       const { planned, thrown } = await refusedFirst(restarted);
       assert.equal((thrown as Error | undefined)?.message, 'over budget');
-      assert.deepEqual(planned, [60_000], 'no fallback over the descent armed since');
-      assert.deepEqual(budgets(restarted), { target: 50_000, effective: 60_000, transition: 'converging' });
+      assert.deepEqual(planned, [60_000], 'once a compile has fit at it, a refusal is the compile\'s own');
     });
   });
 
@@ -767,15 +869,89 @@ describe('a reached budget across a restart', () => {
   }
 
   it("a persisted budget the agent can't take now (maxTokens raised above it) stays set but unapplied, and it runs at the recipe's, with a line", async () => {
-    for (const record of [{ contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, { contextBudgetTokens: 60_000 }]) {
+    const refused = 'contextBudgetTokens must be a safe integer greater than max response tokens (70000)';
+    const kept = `contextBudgetTokens=60000 (${refused}) can't be applied now, so it stays set but unapplied: ` +
+      'contextBudgetTokens is 60000, and compiles plan at 100000';
+    const cases: Array<[Record, string]> = [
+      // One line, which keeps why a reached budget wasn't applied at once.
+      [{ contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 },
+        `[agent-settings] agent: its last compile before the stop fit at contextBudgetTokens=60000, but whether it fits now can't be checked (${refused}); ${kept}`],
+      [{ contextBudgetTokens: 60_000 }, `[agent-settings] agent: ${kept}`],
+    ];
+    for (const [record, line] of cases) {
       await bootRaised(record, (booted, lines) => {
         assert.deepEqual(budgets(booted), { target: 60_000, effective: 100_000, transition: 'stable' }, JSON.stringify(record));
-        // One line, whether or not the record carried a reached budget.
-        assert.deepEqual(lines.filter((l) => l.includes('[agent-settings]')), [
-          '[agent-settings] agent: contextBudgetTokens=60000 (contextBudgetTokens must be a safe integer greater than max response tokens (70000)) ' +
-            "can't be applied now, so it stays set but unapplied: contextBudgetTokens is 60000, and compiles plan at 100000",
-        ], JSON.stringify(record));
+        assert.deepEqual(lines.filter((l) => l.includes('[agent-settings]')), [line], JSON.stringify(record));
       });
+    }
+  });
+
+  it('a reached budget applies at once on its own, though a tail beside it can\'t be applied', async () => {
+    await run(async ({ framework, restart }) => {
+      framework().updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
+      framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(framework());
+      assert.deepEqual(persisted(framework()), { tailTokens: 20_000, contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 });
+      // The strategy refuses a live tail now; it takes a budget as before.
+      const proto = ContextManager.prototype as unknown as { updateHotContextSettings: (update: { tailTokens?: number }) => unknown };
+      const original = proto.updateHotContextSettings;
+      proto.updateHotContextSettings = function (this: unknown, update: { tailTokens?: number }) {
+        if (update.tailTokens !== undefined) throw new Error('no live tail here');
+        return original.call(this, update);
+      };
+      const log = quietErrors();
+      let restarted: AgentFramework;
+      try {
+        restarted = await restart();
+      } finally {
+        proto.updateHotContextSettings = original;
+        log.restore();
+      }
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 60_000, transition: 'stable' }, 'the budget applied at once');
+      assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [
+        "[agent-settings] agent: tailTokens=20000 (no live tail here) can't be applied now, so it stays set but unapplied: " +
+          'contextBudgetTokens is 60000, and compiles plan at 60000',
+      ]);
+    });
+  });
+
+  it("on a strategy without live settings, a tail and a lower budget stay set but unapplied, a later write keeps them, and a reset clears the tail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-settings-no-hot-'));
+    // The context manager's default strategy has no live settings.
+    const config = () => ({
+      storePath: join(dir, 'store'), membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', contextBudgetTokens: 100_000, maxTokens: 10_000 }],
+      modules: [],
+    });
+    let framework = await AgentFramework.create(config());
+    try {
+      writeRecord(framework, { contextBudgetTokens: 60_000, tailTokens: 20_000 });
+      await framework.stop();
+      const log = quietErrors();
+      try {
+        framework = await AgentFramework.create(config());
+      } finally {
+        log.restore();
+      }
+      assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
+        contextBudgetTokens: 60_000,
+        effectiveContextBudgetTokens: 100_000,
+        sameRoundThinkTextPolicy: 'public',
+        sameRoundThinkTextPolicySource: 'compatibility_default',
+        transition: 'stable',
+      });
+      assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [
+        '[agent-settings] agent: tailTokens=20000 (The active context strategy does not support live tail/transition settings), ' +
+          'contextBudgetTokens=60000 (The active context strategy cannot prepare a smaller window live) ' +
+          "can't be applied now, so they stay set but unapplied: contextBudgetTokens is 60000, and compiles plan at 100000",
+      ]);
+      framework.updateAgentRuntimeSettings('agent', { sameRoundThinkTextPolicy: 'private' });
+      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000, tailTokens: 20_000, sameRoundThinkTextPolicy: 'private' });
+      framework.resetAgentRuntimeSettings('agent', ['tailTokens']);
+      assert.deepEqual(persisted(framework), { contextBudgetTokens: 60_000, sameRoundThinkTextPolicy: 'private' }, 'the reset clears the kept tail');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

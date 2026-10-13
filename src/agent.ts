@@ -160,11 +160,12 @@ export class Agent {
   /** The last outcome the listener recorded; a failed record is told again, and so is any after a change. */
   private recordedCompiledBudget?: { budget: number; fit: boolean; epoch: number };
   /**
-   * A boot restore that applied a proven budget below the live one at once:
-   * the live budget's and the descent's epochs then. While neither has moved,
-   * a refusal of the first compile at that budget restores it paced instead.
+   * A boot restore applied a proven budget below the live one at once. Until
+   * the budget is next written (an update that carries one, or a reset of
+   * it) or a compile at it fits, a refusal of a compile at it restores it
+   * paced instead.
    */
-  private restoredAtOnce?: { epoch: number; descent: number };
+  private restoredAtOnce = false;
   /** Told when that changes (the framework records it beside the persisted budget). */
   private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
@@ -307,7 +308,8 @@ export class Agent {
     return {
       // The budget it's set to: the override, where there is one. That is
       // the target of a descent toward it, or else the live budget, except
-      // while it's kept unapplied (keepRuntimeSettings).
+      // while it's kept unapplied: at boot (keepRuntimeSettings), or after a
+      // refused at-once budget couldn't be restored paced (compileAtLiveBudget).
       contextBudgetTokens:
         this.runtimeSettingsOverrides.contextBudgetTokens ??
         this.contextBudgetTargetTokens ??
@@ -398,15 +400,19 @@ export class Agent {
       if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
       // A refusal shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
-      // nothing is credited.
-      this.noteCompiledBudget(live, false, epoch);
-      // A budget a boot restore applied at once, refused at its first test
-      // with nothing about the budget or the descent changed since: restore
-      // it paced instead, as the boot would have without its proof, and
-      // compile again from the recipe's budget.
-      const restored = this.restoredAtOnce;
-      if (restored?.epoch !== epoch || this.liveBudgetEpoch !== epoch || this.descentEpoch !== restored.descent) throw error;
-      this.restoredAtOnce = undefined;
+      // nothing is credited. Only a newer compile that fit at that same
+      // budget, proven at the live budget's epoch since, outweighs it.
+      if (epoch === this.liveBudgetEpoch || this.getProvenContextBudgetTokens() !== live) {
+        this.noteCompiledBudget(live, false, epoch);
+      }
+      // A budget a boot restore applied at once, refused at its first test,
+      // before anything wrote the budget: restore it paced instead, as the
+      // boot would have without its proof, and compile again from the
+      // recipe's budget. (While restoredAtOnce holds, the live budget is the
+      // one the boot applied: every write of the budget clears it, and no
+      // compile runs before the boot's restore.)
+      if (!this.restoredAtOnce) throw error;
+      this.restoredAtOnce = false;
       // The persisted budget stays in the overrides, so if it can't be
       // restored paced, no later write erases it.
       this.setContextBudget(this.configuredContextBudgetTokens, undefined);
@@ -424,7 +430,7 @@ export class Agent {
       );
       return this.compileAtLiveBudget(compile);
     }
-    if (this.restoredAtOnce?.epoch === epoch) this.restoredAtOnce = undefined;
+    this.restoredAtOnce = false;
     // A settle, here, of the descent this compile began under proves its
     // target: the frontier fits the window prepared for it. Without a settle,
     // the compile proves the budget it planned at. Either only if the live
@@ -575,6 +581,9 @@ export class Agent {
       this.updateHotContextSettings(hotPatch);
     }
     this.setContextBudget(nextContextBudget, nextContextTarget, armed);
+    // A budget written here is a decision about it, whatever its value: the
+    // boot's at-once fallback (restoredAtOnce) no longer speaks for it.
+    if (patch.contextBudgetTokens !== undefined) this.restoredAtOnce = false;
     if (appliedDefaultPace) {
       this.runtimeSettingsOverrides.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
     }
@@ -630,7 +639,10 @@ export class Agent {
     }
     if (Object.keys(hotPatch).length > 0) this.updateHotContextSettings(hotPatch);
     this.setContextBudget(nextContextBudget, nextContextTarget, armed);
-    if (reset.has('contextBudgetTokens')) delete this.runtimeSettingsOverrides.contextBudgetTokens;
+    if (reset.has('contextBudgetTokens')) {
+      delete this.runtimeSettingsOverrides.contextBudgetTokens;
+      this.restoredAtOnce = false;
+    }
     if (reset.has('tailTokens')) delete this.runtimeSettingsOverrides.tailTokens;
     if (reset.has('transitionPaceTokens')) {
       delete this.runtimeSettingsOverrides.transitionPaceTokens;
@@ -660,9 +672,9 @@ export class Agent {
    * caller has shown fits (the framework, from the record and a preflight),
    * applied at once: it stands as the last compile's until a compile here
    * says otherwise. When it's below the live budget, where the proof is what
-   * took the restore off the paced path, a refusal of the first compile at it
-   * restores it paced instead, while neither the budget nor the descent has
-   * changed since; at or above the live budget, the restore is at once either
+   * took the restore off the paced path, a refusal of a compile at it
+   * restores it paced instead, until the budget is next written or a compile
+   * at it fits. At or above the live budget, the restore is at once either
    * way, and a refusal has nothing to fall back to.
    */
   restoreRuntimeSettings(
@@ -673,27 +685,22 @@ export class Agent {
     const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
     const snapshot = this.updateRuntimeSettings(settings);
     if (opts?.provenBudget !== undefined) {
-      const epoch = this.liveBudgetEpoch;
-      this.lastCompiledBudget = { budget: opts.provenBudget, fit: true, epoch };
-      if (opts.provenBudget < live) this.restoredAtOnce = { epoch, descent: this.descentEpoch };
+      this.lastCompiledBudget = { budget: opts.provenBudget, fit: true, epoch: this.liveBudgetEpoch };
+      this.restoredAtOnce = opts.provenBudget < live;
     }
     return snapshot;
   }
 
   /**
-   * Keep persisted settings that couldn't be applied at construction: they
-   * stay in the override map, unapplied, so a later persisting write keeps
-   * them in the record. A think-text policy governs from there; a budget is
-   * reported as the one set (`contextBudgetTokens`) beside the one compiles
-   * plan at (`effectiveContextBudgetTokens`), and a tail or pace stays the
-   * strategy's.
+   * Keep a persisted budget, tail or pace that couldn't be applied at
+   * construction: it stays in the override map, unapplied, so a later
+   * persisting write keeps it in the record. A budget is reported as the one
+   * set (`contextBudgetTokens`) beside the one compiles plan at
+   * (`effectiveContextBudgetTokens`); a tail or pace stays the strategy's.
    */
-  keepRuntimeSettings(settings: AgentRuntimeSettingsPatch): void {
+  keepRuntimeSettings(settings: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>): void {
     for (const key of ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens'] as const) {
       if (settings[key] !== undefined) this.runtimeSettingsOverrides[key] = settings[key];
-    }
-    if (settings.sameRoundThinkTextPolicy !== undefined) {
-      this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = settings.sameRoundThinkTextPolicy;
     }
   }
 
