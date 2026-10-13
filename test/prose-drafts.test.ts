@@ -1106,16 +1106,18 @@ describe('draft notices and turn-end settlement', () => {
     try {
       const internals = framework as unknown as {
         proseDrafts: ProseDraftStore;
-        turnDrafts: Map<string, unknown[]>;
-        settleTurnDrafts(agent: unknown): void;
+        routingOf(name: string): { logical: { drafts: unknown[] } };
+        settleTurnDrafts(agent: unknown, logical: unknown): void;
       };
       const agent = framework.getAgent('scout')!;
       const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named', source }, { text: 'lost', source }], 'explicit-send').held;
       // Only the first draft's notice reached the history.
       const cm = agent.getContextManager();
       const notice = cm.addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
-      internals.turnDrafts.set('scout', [named, lost]);
-      internals.settleTurnDrafts(agent);
+      const logical = internals.routingOf('scout').logical;
+      logical.drafts.push(named, lost);
+      internals.settleTurnDrafts(agent, logical);
+      assert.deepEqual(logical.drafts, [], "the turn's draft tally is spent");
       assert.deepEqual(internals.proseDrafts.get('scout', named!.id)!.noticedIn, [String(notice)], 'recorded with the message that names it');
       assert.equal(internals.proseDrafts.get('scout', lost!.id)!.noticedIn, undefined, 'left for the catch-up');
       const onBranch = (id: string) => cm.getMessage(id as never) !== null;
@@ -1138,9 +1140,9 @@ describe('draft identity and risk evidence', () => {
     });
     const internals = framework as unknown as {
       proseDrafts: ProseDraftStore;
-      turnDrafts: Map<string, unknown[]>;
-      settleTurnDrafts(agent: unknown): void;
-      bounceProse(agent: unknown, text: string, reason: string): void;
+      routingOf(name: string): { logical: { drafts: unknown[] } };
+      settleTurnDrafts(agent: unknown, logical: unknown): void;
+      bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: { routing: unknown; notice: 'later' }): void;
       riskText(draft: unknown): string;
     };
     return { dir, framework, internals, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
@@ -1155,8 +1157,9 @@ describe('draft identity and risk evidence', () => {
       // Only the OTHER resident's notice for "d-same2" is in the shared history.
       t.framework.getAgent('other')!.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] other: …' }],
         { system: true, kind: 'prose-drafts', draftOwner: 'other', draftIds: ['d-same2'] } as never);
-      t.internals.turnDrafts.set('scout', [mine]);
-      t.internals.settleTurnDrafts(t.framework.getAgent('scout')!);
+      const logical = t.internals.routingOf('scout').logical;
+      logical.drafts.push(mine);
+      t.internals.settleTurnDrafts(t.framework.getAgent('scout')!, logical);
       assert.equal(t.internals.proseDrafts.get('scout', 'd-same2')!.noticedIn, undefined);
     } finally {
       await t.close();
@@ -1169,10 +1172,11 @@ describe('draft identity and risk evidence', () => {
       const agent = t.framework.getAgent('scout')!;
       const [original] = t.internals.proseDrafts.hold('scout', [{ text: 'first', source }], 'bounced').held;
       t.internals.proseDrafts.beginAttempt('scout', original!.id, dest(), 'unsent-token', false); // never resolved
-      t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel');
+      const round = { routing: t.internals.routingOf('scout'), notice: 'later' as const };
+      t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel', undefined, '>>', round);
       const copy = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second')!;
       assert.equal(copy.inheritedRisk?.draftId, original!.id);
-      t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel');
+      t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel', undefined, '>>', round);
       const again = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second third')!;
       assert.equal(again.inheritedRisk?.draftId, copy.id);
       assert.equal(again.inheritedRisk?.sourceDraftId, original!.id);
@@ -1536,7 +1540,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         ['words for the room', `written for >>>${ROOM}`],
         ['more for the room', undefined],
       ]);
-      assert.equal((h.framework as unknown as { proseTargetPins: Map<string, string> }).proseTargetPins.get('scout'), ROOM,
+      assert.equal((h.framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('scout')?.pin, ROOM,
         'the named destination is the sticky target again, as live routing would leave it');
       assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply\)$/);
 
