@@ -40,6 +40,7 @@ import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
+import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -60,12 +61,6 @@ const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
  * `resolveProseTargetDurable`.
  */
 const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
-
-/** A channel's refusals for being unregistered print at most one host line
- *  this often (each is still traced); the throttle tracks this many channels
- *  before it starts over. */
-const UNKNOWN_CHANNEL_LINE_EVERY_MS = 60_000;
-const UNKNOWN_CHANNEL_LINE_KEYS = 1_000;
 
 type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
@@ -598,9 +593,9 @@ export class ChannelRegistry {
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
 
-  /** For each `{serverId}:{channelId}` refused as unregistered: when its last
-   *  host line printed, and how many refusals it has had since. */
-  private unknownChannelLines = new Map<string, { at: number; since: number }>();
+  /** Holds back repeats of the line for a message refused because its
+   *  channel isn't registered (RefusalLines). */
+  private unknownChannelLines = new RefusalLines();
 
   /**
    * Most-recently-known label per channelId, replayed from
@@ -974,22 +969,16 @@ export class ChannelRegistry {
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
         // Loud, coalesced or not, like every other refusal of a message, but
-        // throttled per channel: a server that never registered a busy
-        // channel would otherwise print a line for every message in it. Its
-        // first refusal prints; after that, at most one line a minute, with
-        // how many were refused since the last. Every refusal is traced.
-        const now = Date.now();
-        const last = this.unknownChannelLines.get(incomingKey);
-        if (!last || now - last.at >= UNKNOWN_CHANNEL_LINE_EVERY_MS) {
-          if (!last && this.unknownChannelLines.size >= UNKNOWN_CHANNEL_LINE_KEYS) this.unknownChannelLines.clear();
-          this.unknownChannelLines.set(incomingKey, { at: now, since: 0 });
+        // at most once a minute per channel (RefusalLines): a server that
+        // never registered a busy channel would otherwise print a line for
+        // every message in it. Every refusal is traced.
+        const held = this.unknownChannelLines.admit(serverId, message.channelId);
+        if (held !== null) {
           console.error(
             `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
             `messageId=${logValue(message.messageId)} reason=unknown-channel ` +
-            `(not registered, §14.5${last?.since ? `; ${last.since} more since the last line` : ''})`,
+            `(not registered, §14.5${held ? `; ${held} more since the last line` : ''})`,
           );
-        } else {
-          last.since++;
         }
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',

@@ -20,6 +20,7 @@ import { logDetail, logValue } from '../src/mcpl/log-value.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { parseDeclaredClasses } from '../src/mcpl/tool-classes.js';
+import { RefusalLines } from '../src/mcpl/refusal-lines.js';
 import { AgentFramework } from '../src/framework.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -276,6 +277,42 @@ test('a conversation agent that fails to spawn names its channel as one field', 
   await route.call(fakeThis, { serverId: 'editor', channelId: FORGED_CHANNEL, messageId: 'm1', author: { id: 'u', name: 'User' }, content: [] }, {});
   assert.deepEqual(lines, [`Failed to spawn conversation agent for ${field(FORGED_CHANNEL)}: Error: no room`]);
   assert.deepEqual(traces.map((e) => e.type), ['mcpl:conversation-spawn-failed']);
+});
+
+test('a refusal line prints for a channel\'s first refusal, then at most once a minute with how many were held back', () => {
+  let now = 1_000;
+  const lines = new RefusalLines(() => now);
+  assert.equal(lines.admit('editor', 'nowhere'), 0, 'the first prints');
+  assert.equal(lines.admit('editor', 'nowhere'), null, 'a repeat within the minute is held back');
+  assert.equal(lines.admit('editor', 'elsewhere'), 0, 'another channel\'s first prints');
+  assert.equal(lines.admit('other', 'nowhere'), 0, 'so does another server\'s');
+  now += 59_999;
+  assert.equal(lines.admit('editor', 'nowhere'), null, 'still within the minute');
+  now += 1;
+  assert.equal(lines.admit('editor', 'nowhere'), 2, 'a minute on, it prints with the two held back');
+  assert.equal(lines.admit('editor', 'nowhere'), null, 'and its next minute starts');
+});
+
+test('a refusal line keeps servers and channels apart, and a channel by the 256 units its line prints', () => {
+  const lines = new RefusalLines(() => 0);
+  assert.equal(lines.admit('a:b', 'c'), 0);
+  assert.equal(lines.admit('a', 'b:c'), 0, 'a colon doesn\'t merge two server and channel pairs');
+  const head = 'x'.repeat(256);
+  assert.equal(lines.admit('editor', `${head}one`), 0);
+  assert.equal(lines.admit('editor', `${head}two`), null, 'two ids alike in their first 256 units, which their lines print alike, share a record');
+});
+
+test('refusal lines cover at most 1,000 channels, evicting the least recently refused', () => {
+  const lines = new RefusalLines(() => 0);
+  assert.equal(lines.admit('editor', 'busy'), 0);
+  assert.equal(lines.admit('editor', 'quiet'), 0);
+  for (let i = 0; i < 997; i++) assert.equal(lines.admit('editor', `c${i}`), 0);
+  // 999 channels; busy, refused again, is now the most recent and quiet the least.
+  assert.equal(lines.admit('editor', 'busy'), null);
+  assert.equal(lines.admit('editor', 'c997'), 0, 'the thousandth channel');
+  assert.equal(lines.admit('editor', 'c998'), 0, 'one more evicts quiet');
+  assert.equal(lines.admit('editor', 'busy'), null, 'busy keeps its record');
+  assert.equal(lines.admit('editor', 'quiet'), 0, 'quiet, evicted, prints again as new');
 });
 
 test('a silent heartbeat names its eventId as one field', async (t) => {

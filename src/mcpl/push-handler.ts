@@ -21,6 +21,7 @@ import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
+import { RefusalLines } from './refusal-lines.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -188,6 +189,9 @@ export class PushHandler {
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private dedup = new DedupSet(1000);
+  /** Holds back repeats of the line for a channel-scoped push refused because
+   *  its channel isn't declared (-32023) or may not be used (-32017). */
+  private channelRefusalLines = new RefusalLines();
 
   constructor(
     featureSetManager: FeatureSetManager,
@@ -365,6 +369,9 @@ export class PushHandler {
    * `coalesce-invalid` when the producer's occurrence was refused, with the
    * failing `field` and the error's message as `detail`. A missing eventId
    * prints as `""` and traces as `''`, as the channel lane's missing id does.
+   * A channel-scoped push refused because its channel isn't declared or may
+   * not be used is refused for as long as that lasts, so its line prints at
+   * most once a minute per channel (RefusalLines); every refusal is traced.
    */
   private traceCoalesceRejection(
     serverId: string,
@@ -374,10 +381,17 @@ export class PushHandler {
   ): void {
     const reason = coalesceRejectionReason(answered);
     const field = typeof error.field === 'string' && error.field ? error.field : undefined;
-    console.error(
-      `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet ?? '')} eventId=${logValue(params.eventId ?? '')} ` +
-      `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}`,
-    );
+    const channelId = params.coalesce?.channelId;
+    const held = (answered === -32023 || answered === -32017) && typeof channelId === 'string'
+      ? this.channelRefusalLines.admit(serverId, channelId)
+      : 0;
+    if (held !== null) {
+      console.error(
+        `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet ?? '')} eventId=${logValue(params.eventId ?? '')} ` +
+        `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}` +
+        (held ? ` (${held} more since the last line)` : ''),
+      );
+    }
     this.emitTraceFn({
       type: 'mcpl:push-event-rejected',
       serverId,

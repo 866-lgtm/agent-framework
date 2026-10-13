@@ -17,6 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, TS } from './helpers/coalescing-fixture.js';
+import { RefusalLines } from '../src/mcpl/refusal-lines.js';
 
 /** Base64 for an image well over 1 MiB once serialized (a Retina screenshot). */
 const BIG_IMAGE = { type: 'image', data: 'A'.repeat(1_600_000), mimeType: 'image/png' };
@@ -436,6 +437,8 @@ test('a message for an unregistered channel is traced with its message id, coale
   const lines = captureConsoleError(t);
   const rejected: Rejection[] = [];
   f.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
+  let now = 0;
+  (f.framework as unknown as { channelRegistry: { unknownChannelLines: RefusalLines } }).channelRegistry.unknownChannelLines = new RefusalLines(() => now);
   const plain = (channelId: string, messageId: string) => ({
     channelId, messageId, timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'hi' }],
   });
@@ -444,13 +447,8 @@ test('a message for an unregistered channel is traced with its message id, coale
   ] });
   assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [false, false, false, false]);
   // A minute on, the channel's next refusal prints again, with how many came since.
-  const now = Date.now;
-  Date.now = () => now() + 60_000;
-  try {
-    await f.send('channels/incoming', { messages: [plain('nowhere', 'p3')] });
-  } finally {
-    Date.now = now;
-  }
+  now += 60_000;
+  await f.send('channels/incoming', { messages: [plain('nowhere', 'p3')] });
   assert.deepEqual(rejected.map(({ messageId, reason }) => [messageId, reason]), [
     ['p1', 'unknown-channel'], ['c1', 'unknown-channel'], ['p2', 'unknown-channel'], ['q1', 'unknown-channel'], ['p3', 'unknown-channel'],
   ]);
@@ -458,6 +456,40 @@ test('a message for an unregistered channel is traced with its message id, coale
     '[channel-incoming-rejected] server=editor channel=nowhere messageId=p1 reason=unknown-channel (not registered, §14.5)',
     '[channel-incoming-rejected] server=editor channel=elsewhere messageId=q1 reason=unknown-channel (not registered, §14.5)',
     '[channel-incoming-rejected] server=editor channel=nowhere messageId=p3 reason=unknown-channel (not registered, §14.5; 2 more since the last line)',
+  ]);
+});
+
+test('a channel-scoped push refused for its channel (-32023, -32017) is traced each time and named on the host at most once a minute per channel', async (t) => {
+  let now = 0;
+  const throttle = (g: Awaited<ReturnType<typeof fixture>>) => {
+    (g.framework as unknown as { pushHandler: { channelRefusalLines: RefusalLines } }).pushHandler.channelRefusalLines = new RefusalLines(() => now);
+  };
+  const lines = captureConsoleError(t);
+  const rejected: Rejection[] = [];
+  // -32023: a channel the server never declared.
+  const f = await fixture(); t.after(f.close); throttle(f);
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
+  for (const id of ['u1', 'u2', 'u3']) {
+    const r = await f.send('push/event', f.params(id, 'to_nowhere', { initial: true, channelId: 'nope', key: id }));
+    assert.equal(r.error?.code, -32023);
+  }
+  // -32017: a server with no channels.incoming grant.
+  const g = await fixture({ server: { disabledCapabilities: ['channels.incoming'] } }); t.after(g.close); throttle(g);
+  g.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
+  for (const id of ['d1', 'd2']) {
+    const r = await g.send('push/event', g.params(id, 'not_permitted', { initial: true, channelId: 'chat', key: id }));
+    assert.equal(r.error?.code, -32017);
+  }
+  now += 60_000;
+  await f.send('push/event', f.params('u4', 'to_nowhere', { initial: true, channelId: 'nope', key: 'u4' }));
+  assert.deepEqual(rejected.map(({ eventId, reason }) => [eventId, reason]), [
+    ['u1', 'coalesce-invalid'], ['u2', 'coalesce-invalid'], ['u3', 'coalesce-invalid'],
+    ['d1', 'coalesce-invalid'], ['d2', 'coalesce-invalid'], ['u4', 'coalesce-invalid'],
+  ]);
+  assert.deepEqual(lines.filter((l) => l.startsWith('[push-event-rejected]')), [
+    '[push-event-rejected] server=editor featureSet=doc eventId=u1 reason=coalesce-invalid field=coalesce.channelId: "Unknown channel"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=d1 reason=coalesce-invalid field=coalesce.channelId: "Channel not permitted"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=u4 reason=coalesce-invalid field=coalesce.channelId: "Unknown channel" (2 more since the last line)',
   ]);
 });
 
