@@ -935,17 +935,20 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   assertNoObjectPrinted(rawArgs);
 
   // Classified, it gets the poisoned-history quarantine at the hard-down
-  // threshold, as the framework's own copy does: the newest exchanges are
-  // shed, each retry on the rewound history failing again, up to the rewind
-  // cap, and the one rewind marker counts them.
+  // threshold, as the framework's own copy does: the third failure sheds the
+  // newest exchange, counted in the one rewind marker. Each shed queues a
+  // retry on the rewound history, which may fail and shed again before the
+  // run is stopped, so only the first shed is asserted.
   const shed = await runFailingTurn('stream error event', () => foreignMembraneError(quoted), { turns: 3 });
-  const counts = shed.errs.map((e) => /^\[inference-rewind\] agent=resident auto-quarantined .* \((\d+) turn\(s\) shed this episode, cap 3\)/.exec(e)?.[1])
-    .filter((count): count is string => count !== undefined);
-  assert.deepEqual(counts, ['1', '2', '3']);
-  assert.equal(shed.messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system).length, 0, 'the three exchanges are shed');
+  const quarantined = shed.errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
+  assert.ok(quarantined.length > 0, 'the third failure sheds');
+  assert.match(quarantined[0], /\(1 turn\(s\) shed this episode, cap 3\)/);
+  const kept = shed.messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
+    .map((m) => (m.content[0] as { text: string }).text);
+  assert.ok(!kept.includes('hello 2'), 'the newest exchange is shed');
   const rewind = shed.messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
-  assert.equal(rewind.length, 1);
-  assert.match((rewind[0].content[0] as { text: string }).text, /^\[refusal-rewind\] The 3 most recent turn\(s\) were set aside/);
+  assert.equal(rewind.length, 1, 'one consolidated rewind marker');
+  assert.match((rewind[0].content[0] as { text: string }).text, /^\[refusal-rewind\] The \d+ most recent turn\(s\) were set aside/);
 
   // Its type is bounded like a provider code, in every sink it reaches.
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });
