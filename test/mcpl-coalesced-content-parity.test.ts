@@ -359,6 +359,8 @@ test('a render result is delivered only when the converters show each block as i
     { block: { type: 'audio', uri: 'https://example.invalid/a.wav' }, delivered: false },
     { block: { type: 'resource', uri: '' }, delivered: false },
     { block: { type: 'resource', uri: `https://example.invalid/${'x'.repeat(4096)}` }, delivered: false },
+    { block: { type: 'audio', uri: `https://example.invalid/${'x'.repeat(4096)}`, disposition: 'ref' }, delivered: false },
+    { block: { type: 'image', uri: '' }, delivered: false },
   ];
   f.renderer(async (params) => {
     const i = Number(String(params.eventId).slice(1));
