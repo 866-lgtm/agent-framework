@@ -526,8 +526,8 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
 }
 
 /**
- * One turn's routing state (AgentFramework.turnRouting). A fresh turn gets a
- * new one; a queued delivery keeps the one of the turn that queued it.
+ * One turn's routing and delivery receipts (AgentFramework.turnRouting).
+ * A fresh turn gets a new object; a queued delivery keeps its own turn's.
  */
 interface TurnRouting {
   /** The sticky destination, set by each `>>` (hybrid: `>>>`) prefix that resolves. */
@@ -542,10 +542,14 @@ interface TurnRouting {
   hybridHold: boolean;
   /** The turn asked for a `!` continuation. */
   continuation: boolean;
+  /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
+  deliveries: string[];
+  /** Plain-prose segments this turn suppressed, reported by its receipt. */
+  suppressed: number;
 }
 
 function freshTurnRouting(): TurnRouting {
-  return { destination: null, hybridHold: false, continuation: false };
+  return { destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0 };
 }
 
 /** How a round's prose is delivered: kept private, and under which turn's routing. */
@@ -1120,26 +1124,6 @@ export class AgentFramework {
    *  keeps unrelated channels from moving the pin. Cleared at every fresh
    *  turn's start; budget restarts keep it. */
   private turnEngagedChannels: Map<string, Set<string>> = new Map();
-  /** Channels this turn's PLAIN PROSE was actually delivered to, in delivery
-   *  order (deduped at render). Feeds the `[delivered]` receipt appended at
-   *  logical turn end: explicit sends receipt themselves via their
-   *  tool_result, but auto-routed prose previously vanished into the router
-   *  with no in-window record — the agent could never see where its own
-   *  words landed (2026-07-31 misroute series; antra: minimal receipts).
-   *  Cleared at every fresh turn's start; budget restarts keep it (same
-   *  logical turn, receipt covers the whole turn). */
-  private turnProseDeliveries: Map<string, string[]> = new Map();
-  /** Count of plain-prose segments SUPPRESSED this turn by sticky
-   *  explicit-send silencing. The suppression rule itself is untouched
-   *  (antra, 2026-07-31: visibility is enough) — but it must never be a
-   *  silent black hole: Mythos multiplexed two threads in one round (prose
-   *  for the lane + explicit send for another channel, textbook per the
-   *  routing doc), the silencing ate the prose reply, and his own record
-   *  ("scene delivered to #mythos via plain speech — routing confirmed")
-   *  believed it delivered. The receipt now reports suppression, so the
-   *  author sees the segment's fate one turn later. Cleared each fresh
-   *  turn; budget restarts keep it. */
-  private turnProseSuppressed: Map<string, number> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -1157,7 +1141,7 @@ export class AgentFramework {
   /**
    * Each agent's routing state for its current turn (TurnRouting): the
    * sticky destination, the turn's destination for a resumed stream,
-   * hybrid's hold and a `!` continuation. A fresh turn starts a new object
+   * hybrid's hold, a `!` continuation and receipt tallies. A fresh turn starts a new object
    * instead of clearing the old one, and a stream that resumes the turn
    * (resumesLogicalTurn) keeps it. A queued delivery holds the object of the
    * turn that queued it, so prose a turn leaves queued when it ends (a
@@ -4490,6 +4474,8 @@ export class AgentFramework {
         // generation mismatch and leave any future owner untouched.
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
+        this.turnRouting.delete(agent.name);
+        this.proseSpeechChains.delete(agent.name);
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
@@ -7596,6 +7582,8 @@ export class AgentFramework {
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
     this.agents.delete(agentName);
+    this.turnRouting.delete(agentName);
+    this.proseSpeechChains.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
@@ -8705,24 +8693,19 @@ export class AgentFramework {
     return stamp ? { silentHeartbeat: stamp } : undefined;
   }
 
-  /** Record prose segments suppressed by explicit-send silencing. */
-  private recordProseSuppression(agentName: string, count: number): void {
+  /** Record plain-prose segments this turn suppressed. */
+  private recordProseSuppression(routing: TurnRouting, count: number): void {
     if (count <= 0) return;
-    this.turnProseSuppressed.set(agentName, (this.turnProseSuppressed.get(agentName) ?? 0) + count);
+    routing.suppressed += count;
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
   private recordProseDelivery(
-    agentName: string,
+    routing: TurnRouting,
     outcome: { delivered: boolean; channelId: string } | null | undefined,
   ): void {
     if (!outcome?.delivered) return;
-    let list = this.turnProseDeliveries.get(agentName);
-    if (!list) {
-      list = [];
-      this.turnProseDeliveries.set(agentName, list);
-    }
-    list.push(outcome.channelId);
+    routing.deliveries.push(outcome.channelId);
   }
 
   /**
@@ -8738,12 +8721,12 @@ export class AgentFramework {
    * delivered nothing. Failures are already marked separately
    * ([discord-send-failed]); this is the success half.
    */
-  private appendProseDeliveryReceipt(agent: Agent): void {
-    const list = this.turnProseDeliveries.get(agent.name);
-    const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
-    if ((!list || list.length === 0) && suppressed === 0) return;
-    this.turnProseDeliveries.delete(agent.name);
-    this.turnProseSuppressed.delete(agent.name);
+  private appendProseDeliveryReceipt(agent: Agent, routing: TurnRouting): void {
+    const list = routing.deliveries;
+    const suppressed = routing.suppressed;
+    if (list.length === 0 && suppressed === 0) return;
+    routing.deliveries = [];
+    routing.suppressed = 0;
     const seen = new Set<string>();
     const shown: string[] = [];
     for (const id of list ?? []) {
@@ -8871,14 +8854,6 @@ export class AgentFramework {
     }
   }
 
-  /**
-   * Explicit-prose-routing delivery gateway (docs/explicit-prose-routing.md).
-   * Every prose segment of an `explicit`-mode agent flows through here:
-   * parse the `>>` prefix, resolve the target, deliver — or bounce to the
-   * clipboard with a resend notice. Misdelivery is structurally impossible:
-   * nothing is ever sent to a destination the model did not name (directly
-   * or via the turn's sticky target).
-   */
   /** The agent's routing state for its current turn, made when it has none. */
   private routingOf(agentName: string): TurnRouting {
     let routing = this.turnRouting.get(agentName);
@@ -8889,6 +8864,14 @@ export class AgentFramework {
     return routing;
   }
 
+  /**
+   * Explicit-prose-routing delivery gateway (docs/explicit-prose-routing.md).
+   * Every prose segment of an `explicit`-mode agent flows through here:
+   * parse the `>>` prefix, resolve the target, deliver — or bounce to the
+   * clipboard with a resend notice. Misdelivery is structurally impossible:
+   * nothing is ever sent to a destination the model did not name (directly
+   * or via the turn's sticky target).
+   */
   private async deliverProse(agent: Agent, rawText: string, round?: ProseRound): Promise<void> {
     await this.deliverAdmittedProse(agent, this.admitProse(rawText), round);
   }
@@ -8945,11 +8928,9 @@ export class AgentFramework {
     rawText: string,
     locus: string | null,
     allowLocus: boolean,
-    turnRouting?: TurnRouting,
+    turnRouting: TurnRouting,
   ): Promise<void> {
-    // The routing state of the turn that queued this text; the live turn's
-    // when left out.
-    const routing = turnRouting ?? this.routingOf(agent.name);
+    const routing = turnRouting;
     const lines = rawText.split('\n');
     const envelopes: string[] = [];
     let current: string[] = [];
@@ -8993,7 +8974,7 @@ export class AgentFramework {
         }
         try {
           const outcome = await this.channelRegistry!.routeSpeech(agent.name, body, resolved.channelId);
-          this.recordProseDelivery(agent.name, outcome);
+          this.recordProseDelivery(routing, outcome);
           if (outcome?.delivered) {
             this.proseBounceStreaks.delete(agent.name);
             if (usedClipboard) this.proseClipboards.delete(agent.name);
@@ -9016,18 +8997,18 @@ export class AgentFramework {
         continue;
       }
       if (routing.hybridHold) {
-        this.recordProseSuppression(agent.name, 1);
+        this.recordProseSuppression(routing, 1);
         continue;
       }
       const sticky = routing.pin;
       if (!allowLocus && !sticky) {
-        this.recordProseSuppression(agent.name, 1);
+        this.recordProseSuppression(routing, 1);
         continue;
       }
       const target = sticky ?? locus;
       try {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
-        this.recordProseDelivery(agent.name, outcome);
+        this.recordProseDelivery(routing, outcome);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
       }
@@ -9043,10 +9024,8 @@ export class AgentFramework {
     const routing = round?.routing ?? this.routingOf(name);
     const rawText = envelope.text;
     const parsed = parseProsePrefix(rawText);
-    // A private round (one that called skip_reply) asks for no continuation.
-    // Its turn ends at the round's tool results, and explicit mode doesn't
-    // await the speech chain there, so this delivery can run after the next
-    // turn has begun: a flag set here would reach that turn.
+    // A private round (one that called skip_reply) asks for no publication
+    // or continuation, even when delivery runs after that turn has ended.
     if (parsed.continueTurn && !round?.keepPrivate) routing.continuation = true;
 
     if (parsed.kind === 'private') {
@@ -9461,12 +9440,9 @@ export class AgentFramework {
         // A framework retry is a new physical stream in the same logical turn.
         this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
       }
-      // Fresh turn: forget the previous turn's explicit-send engagements and
-      // prose deliveries — both are strictly turn-scoped (a restart continues
-      // the same logical turn and keeps them).
+      // Fresh turn: forget the previous turn's explicit-send engagements.
+      // A restart continues the same logical turn and keeps them.
       this.turnEngagedChannels.delete(agent.name);
-      this.turnProseDeliveries.delete(agent.name);
-      this.turnProseSuppressed.delete(agent.name);
       // A new routing state for the new turn, in every mode: the sticky
       // destination, the turn's destination, hybrid's hold and a continuation
       // start empty. The previous turn's object isn't cleared: prose it left
@@ -9736,6 +9712,9 @@ export class AgentFramework {
     // from the map here: the turn-alive busy check in processInferenceRequests
     // means no successor turn can have replaced it while we compiled.
     const myTurnToken = this.activeTurnTokens.get(agent.name);
+    // The turn-alive guard also keeps this turn's routing current at entry.
+    // Retain it for queued deliveries and receipts after a tool ends the turn.
+    const streamRouting = this.routingOf(agent.name);
     let hadToolCalls = false;
     let generationLost = false;
 
@@ -9775,7 +9754,7 @@ export class AgentFramework {
     const enqueueSpeech = (text: string, locus: string | null): void => {
       chainSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
-        this.recordProseDelivery(agent.name, outcome);
+        this.recordProseDelivery(streamRouting, outcome);
       }, 'mid-turn speech routing failed:');
     };
 
@@ -9863,7 +9842,7 @@ export class AgentFramework {
           // deliveries needn't have run. The trigger channel is only where
           // explicit mode's typing indicator shows.
           initialTarget: turnProseRouting === 'explicit'
-            ? (resumesTurn ? this.routingOf(agent.name).destination : null)
+            ? (resumesTurn ? streamRouting.destination : null)
             : typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
@@ -9979,7 +9958,7 @@ export class AgentFramework {
             // Explicit mode's retried attempt starts where the turn's
             // delivered rounds have set the destination, not at the stream's
             // seed: rounds this stream delivered before the refusal stand.
-            if (turnProseRouting === 'explicit') proseStream?.retarget(this.routingOf(agent.name).destination);
+            if (turnProseRouting === 'explicit') proseStream?.retarget(streamRouting.destination);
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -10121,14 +10100,14 @@ export class AgentFramework {
                     console.error(
                       `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
                     );
-                    this.recordProseSuppression(agent.name, roundSegments.length);
+                    this.recordProseSuppression(streamRouting, roundSegments.length);
                   } else if (turnProseRouting === 'hybrid') {
                     if (turnSilenced) {
-                      this.recordProseSuppression(agent.name, roundSegments.length);
+                      this.recordProseSuppression(streamRouting, roundSegments.length);
                     } else if (!hasSameRoundPrivateThink) {
                       const locus = resolveTurnLocus();
                       // Queued under this turn's routing, whenever it posts.
-                      const routing = this.routingOf(agent.name);
+                      const routing = streamRouting;
                       for (const seg of roundSegments) {
                         chainSpeech(() => this.deliverHybridProse(agent, seg, locus, true, routing), 'mid-turn hybrid prose delivery failed:');
                       }
@@ -10149,7 +10128,7 @@ export class AgentFramework {
                       // delivery alike.
                       const admitted = roundSegments.map((seg) => this.admitProse(seg));
                       // Queued under this turn's routing, whenever it posts.
-                      const routing = this.routingOf(agent.name);
+                      const routing = streamRouting;
                       if (!keepPrivate) {
                         routing.destination = this.roundDestination(routing.destination, admitted.flat());
                       }
@@ -10165,14 +10144,14 @@ export class AgentFramework {
                     // followed this round's prefixes as it was written, but a
                     // private round's, a >>skip_reply envelope's or a target
                     // that didn't resolve leave the destination as it was.
-                    proseStream?.retarget(this.routingOf(agent.name).destination);
+                    proseStream?.retarget(streamRouting.destination);
                   } else if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
                     );
                     // Visible in the turn-end receipt — silencing must never
                     // be a silent black hole (n=8: the flying-scene reply).
-                    this.recordProseSuppression(agent.name, roundSegments.length);
+                    this.recordProseSuppression(streamRouting, roundSegments.length);
                   } else if (hasSameRoundPrivateThink) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -10214,7 +10193,7 @@ export class AgentFramework {
               // persisted as assistant speech, including a terminal refusal
               // after the single recovery retry.
               proseStream?.reset();
-              if (turnProseRouting === 'explicit') proseStream?.retarget(this.routingOf(agent.name).destination);
+              if (turnProseRouting === 'explicit') proseStream?.retarget(streamRouting.destination);
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
@@ -10405,7 +10384,7 @@ export class AgentFramework {
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.
-            const finalRouting = this.routingOf(agent.name);
+            const finalRouting = streamRouting;
             const admittedSpeech = admitFinal && finalSpeechText ? this.admitProse(finalSpeechText) : null;
             const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg)) : [];
 
@@ -10628,14 +10607,14 @@ export class AgentFramework {
                 await turnSpeechChain;
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
-                  this.recordProseSuppression(agent.name, 1);
+                  this.recordProseSuppression(streamRouting, 1);
                 } else if (turnSilenced && turnProseRouting !== 'explicit') {
                   // Only reachable on a guard recovery that carried the
                   // same-turn send suppression, or a suppressProse trigger
                   // (a fresh text-only turn starts unsilenced). Explicit
                   // mode is exempt, as mid-turn.
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (turn silenced)`);
-                  this.recordProseSuppression(agent.name, 1);
+                  this.recordProseSuppression(streamRouting, 1);
                 } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
@@ -10664,7 +10643,7 @@ export class AgentFramework {
                   );
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
-                    this.recordProseDelivery(agent.name, outcome);
+                    this.recordProseDelivery(streamRouting, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -10705,11 +10684,11 @@ export class AgentFramework {
                   console.error(
                     `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
                   );
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.recordProseSuppression(streamRouting, segments.length);
                 }
               } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.recordProseSuppression(streamRouting, segments.length);
                 } else if (segments.length > 0) {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
@@ -10739,7 +10718,7 @@ export class AgentFramework {
                   `(${silenced ? 'silencing tool / explicit send' : 'no trailing prose'})`,
                 );
                 if (silenced && segments.length > 0) {
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.recordProseSuppression(streamRouting, segments.length);
                 }
               } else {
                 // Reuse the locus pinned at the turn's first live-routed
@@ -10757,7 +10736,7 @@ export class AgentFramework {
                 for (const seg of segments) {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
-                    this.recordProseDelivery(agent.name, outcome);
+                    this.recordProseDelivery(streamRouting, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -10774,7 +10753,7 @@ export class AgentFramework {
             // segments were awaited in-loop. Locus mode only; explicit-mode
             // envelopes acknowledge themselves through the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
-              this.appendProseDeliveryReceipt(agent);
+              this.appendProseDeliveryReceipt(agent, streamRouting);
             }
 
             // Explicit-prose `!` continuation: a prose segment this turn asked
@@ -10782,9 +10761,8 @@ export class AgentFramework {
             // now instead of pausing until the next external event. This gives
             // prose the same continuation ability tool rounds have (wanted for
             // robotics-style loops where an end-of-turn pause is harmful).
-            const turnRouting = this.turnRouting.get(agent.name);
-            if (turnRouting?.continuation) {
-              turnRouting.continuation = false;
+            if (finalRouting.continuation) {
+              finalRouting.continuation = false;
               console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
               this.pendingRequests.push({
                 agentName: agent.name,
@@ -10940,13 +10918,11 @@ export class AgentFramework {
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
                 // so settle the delivery chain and drop the receipt. A
-                // budget restart continues the same logical turn: the
-                // deliveries map persists (cleared only at fresh turn
-                // start) and the continuation stream's end writes ONE
-                // receipt for the whole turn.
+                // budget restart keeps the same turn's routing and tallies;
+                // the continuation stream's end writes one receipt for it.
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
-                  this.appendProseDeliveryReceipt(agent);
+                  this.appendProseDeliveryReceipt(agent, streamRouting);
                 }
                 return;
               }

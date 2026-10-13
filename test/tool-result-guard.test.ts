@@ -811,51 +811,74 @@ test("explicit mode: a round's targets are resolved once, when it ends, for its 
   }
 });
 
-test("a fresh turn that delivers nothing still replaces an earlier turn's speech chain for its restart", { timeout: 15000 }, async () => {
-  // An earlier turn's delivery that never settles: a stream resuming this
-  // turn must not queue behind it.
+
+test("a fresh turn and its restart wait behind the earlier turn's speech chain", { timeout: 15000 }, async () => {
+  const fresh = createMockResponse([
+    { type: 'text', text: '>>#alpha fresh' },
+    { type: 'tool_use', id: 'fresh', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  fresh.usage = { inputTokens: 1, outputTokens: 1 };
   const quiet = createMockResponse([
-    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+    { type: 'tool_use', id: 'restart', name: 'test--read', input: {} },
   ] as ContentBlock[], 'tool_use');
   quiet.usage = { inputTokens: 100, outputTokens: 5 };
-  // The reply names its destination, so nothing bounces into another turn.
-  const reply = createMockResponse([{ type: 'text', text: '>>#alpha continued' }] as ContentBlock[], 'end_turn');
-  const h = await harness([[quiet], [reply]], { proseRouting: 'explicit', maxStreamTokens: 20 });
-  (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
-    .proseSpeechChains.set('assistant', new Promise<void>(() => {}));
+  const reply = createMockResponse([{ type: 'text', text: 'continued' }], 'end_turn');
+  const h = await harness([[fresh, quiet], [reply]], { proseRouting: 'explicit', maxStreamTokens: 20 });
   const routed: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const routeSpeech = async (_agent: string, text: string, channelId: string) => {
+    routed.push(text.trim());
+    if (text.trim() === 'earlier') await held;
+    return { delivered: true, channelId };
+  };
   (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
-    routeSpeech: async (_agent: string, text: string, channelId: string) => {
-      routed.push(text);
-      return { delivered: true, channelId };
-    },
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: 'unknown channel' },
+    routeSpeech,
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
-  try {
-    const run = h.run();
+  const prior = routeSpeech('assistant', 'earlier', 'chan-alpha').then(() => {});
+  (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
+    .proseSpeechChains.set('assistant', prior);
+  let resolveCompleted!: () => void;
+  const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+  const off = h.framework.onTrace((event) => {
+    if (event.type === 'inference:completed') resolveCompleted();
+  });
+  const bounded = async (promise: Promise<void>, label: string) => {
     let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), 10000); });
     try {
-      assert.notEqual(await Promise.race([run.then(() => 'done' as const), timeout]), 'timeout',
-        'the resumed turn finishes');
-    } finally {
-      clearTimeout(timer);
-    }
-    assert.equal(h.membrane.requests.length, 2);
-    assert.deepEqual(routed.map((text) => text.trim()), ['continued']);
+      await Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Timed out waiting for ' + label)), 5000);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  let run: Promise<void> | undefined;
+  try {
+    run = h.run();
+    void run.catch(() => {});
+    await bounded(completed, 'the resumed inference');
+    assert.equal(h.membrane.requests.length, 2, 'a budget restart followed the fresh stream');
+    assert.deepEqual(routed, ['earlier'], 'both fresh-turn and resumed posts await the prior delivery');
+    release();
+    await bounded(run, 'the resumed turn to drain');
+    assert.deepEqual(routed, ['earlier', 'fresh', 'continued'], 'all three posts keep their order');
   } finally {
-    await h.framework.stop();
+    off();
+    release();
+    try { if (run) await bounded(run, 'cleanup'); } finally { await h.framework.stop(); }
   }
 });
 
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    type Routing = { pin?: string; destination: string | null; hybridHold: boolean; continuation: boolean };
+    type Routing = { pin?: string; destination: string | null; hybridHold: boolean; continuation: boolean;
+      deliveries: string[]; suppressed: number };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlier: Routing = { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true, continuation: true };
+    const earlier: Routing = { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true, continuation: true,
+      deliveries: ['chan-earlier'], suppressed: 2 };
     internals.turnRouting.set('assistant', earlier);
     try {
       await h.run();
@@ -865,7 +888,11 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.destination, null, `${mode}: no turn destination`);
       assert.equal(now?.hybridHold, false, `${mode}: no hybrid hold`);
       assert.equal(now?.continuation, false, `${mode}: no continuation`);
-      assert.equal(earlier.pin, 'chan-earlier', `${mode}: the earlier turn's state is left for its queued prose`);
+      assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
+      assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
+      assert.deepEqual(earlier, { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
+        continuation: true, deliveries: ['chan-earlier'], suppressed: 2 },
+        `${mode}: all earlier-turn routing and receipt state stays with its queued prose`);
     } finally {
       await h.framework.stop();
     }
