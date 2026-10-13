@@ -452,6 +452,58 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it("a round's destination, decided at its boundary, is the sticky destination its delivery leaves", async () => {
+    const framework = await createFramework();
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      deliverProse(agent: unknown, text: string): Promise<void>;
+      roundDestination(current: string | null, segments: string[]): string | null;
+      proseTargetPins: Map<string, string>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const rounds: string[][] = [
+      ['>>#alpha first\n>>#alpha'],
+      ['  >>#alpha indented'],
+      ['>>#nowhere bounced'],
+      ['>>skip_reply kept\nand unprefixed'],
+      ['unprefixed', '>>#alpha second segment'],
+    ];
+    try {
+      for (const segments of rounds) {
+        for (const start of [null, 'chan-alpha']) {
+          internals.proseTargetPins.clear();
+          if (start) internals.proseTargetPins.set('assistant', start);
+          for (const segment of segments) await internals.deliverProse(agent, segment);
+          assert.equal(internals.roundDestination(start, segments), internals.proseTargetPins.get('assistant') ?? null,
+            `${JSON.stringify(segments)} from ${start}`);
+        }
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("hybrid: a `>>>` envelope with no target before a CR streams nothing, as delivery bounces it", async () => {
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as {
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean): Promise<void>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const text = '>>>\r\nsecret';
+    try {
+      await gateway.deliverHybridProse(agent, text, 'chan-alpha', true);
+      const router = new ProseStreamRouter({
+        mode: 'hybrid', initialTarget: 'chan-alpha', resolve: (spec) => (spec === '#alpha' ? 'chan-alpha' : null),
+      });
+      const streamed = [...router.feed(text), ...router.finish()];
+      assert.equal(routed.length, 0, 'delivery bounces the envelope');
+      assert.deepEqual(streamed, [], 'and the stream sends none of it');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("' !' continuation starts another turn immediately after prose ends the current one", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#alpha ! step one done, continuing' },

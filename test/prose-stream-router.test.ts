@@ -107,7 +107,6 @@ test('explicit: each segment starts a new line, and a prefix with no body takes 
   assert.equal(textFor(out, 'discord:g:100'), 'first');
   assert.equal(textFor(out, 'discord:g:200'), 'second');
   assert.equal(textFor(out, 'discord:dm:300'), 'to sol');
-  assert.equal(r.currentTarget, 'discord:dm:300');
 });
 
 test('` !` continuation modifier is swallowed; `!` as body survives', () => {

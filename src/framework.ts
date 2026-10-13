@@ -481,6 +481,31 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
+/**
+ * A prose block's envelopes, as explicit mode routes them: every line whose
+ * text, after its leading whitespace, is `>>` and then a non-space opens a
+ * new envelope (first live use: Tilde 2026-07-24, one block carrying a
+ * letter to #tilde-mythos AND a `>>#tilde` aside; the single-envelope
+ * parser delivered the aside literally into the first destination — exactly
+ * the leak class this mode exists to kill). Text before the first `>>` is
+ * its own unprefixed envelope. A quoted `>> arrow` (space after) stays body
+ * text. Blank envelopes are dropped, and an envelope's whitespace before its
+ * `>>` is trimmed.
+ */
+function splitExplicitEnvelopes(rawText: string): string[] {
+  const envelopes: string[] = [];
+  let current: string[] = [];
+  for (const line of rawText.split('\n')) {
+    if (/^>>\S/.test(line.trimStart()) && current.length > 0) {
+      envelopes.push(current.join('\n'));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) envelopes.push(current.join('\n'));
+  return envelopes.filter((envelope) => envelope.trim()).map((envelope) => envelope.replace(/^\s+(?=>>)/, ''));
+}
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -1084,11 +1109,13 @@ export class AgentFramework {
    *  Cleared at every non-restart turn start; survives context restarts. */
   private proseTargetPins: Map<string, string> = new Map();
   /**
-   * Explicit mode: where a turn's outgoing stream had routed when it ended,
-   * so a stream that resumes the turn (a tool-result-guard retry, a budget
-   * restart) carries on there. Turn-scoped, like the sticky destination.
+   * Explicit mode: the destination the turn's delivered rounds have set,
+   * decided at each round boundary (roundDestination). A stream that resumes
+   * the turn (a tool-result-guard retry, a budget restart) starts there,
+   * however far the gateway's queued deliveries have got. Turn-scoped, like
+   * the sticky destination.
    */
-  private proseStreamTargets: Map<string, string | null> = new Map();
+  private proseTurnDestinations: Map<string, string | null> = new Map();
   /** Hybrid router is fail-closed after a malformed/unresolved envelope until a new valid target. */
   private proseHybridSuppressed: Set<string> = new Set();
   /** Agents whose current turn requested `!` continuation — re-woken when the
@@ -8765,31 +8792,31 @@ export class AgentFramework {
    * or via the turn's sticky target).
    */
   private async deliverProse(agent: Agent, rawText: string, round?: { keepPrivate?: boolean }): Promise<void> {
-    // Multi-envelope: a single prose block may address SEVERAL destinations —
-    // every line beginning with `>>` opens a new envelope, routed
-    // independently (first live use: Tilde 2026-07-24, one block carrying a
-    // letter to #tilde-mythos AND a `>>#tilde` aside; the single-envelope
-    // parser delivered the aside literally into the first destination —
-    // exactly the leak class this mode exists to kill). Text before the
-    // first `>>` is its own unprefixed envelope (sticky/bounce as usual).
-    const lines = rawText.split('\n');
-    const envelopes: string[] = [];
-    let current: string[] = [];
-    for (const line of lines) {
-      // Only a REAL prefix line opens an envelope: `>>` immediately followed
-      // by a target token. A quoted `>> arrow` (space after) stays body text.
-      if (/^>>\S/.test(line.trimStart()) && current.length > 0) {
-        envelopes.push(current.join('\n'));
-        current = [];
-      }
-      current.push(line);
+    // Multi-envelope: a single prose block may address SEVERAL destinations,
+    // each envelope routed independently (sticky/bounce as usual).
+    for (const envelope of splitExplicitEnvelopes(rawText)) {
+      await this.deliverProseEnvelope(agent, envelope, round);
     }
-    if (current.length > 0) envelopes.push(current.join('\n'));
+  }
 
-    for (const envelope of envelopes) {
-      if (!envelope.trim()) continue;
-      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''), round);
+  /**
+   * Where a delivered round leaves its turn's sticky destination, decided at
+   * the round boundary, as the explicit gateway sets it once the round's
+   * envelopes run: each `>>` envelope whose target resolves becomes the
+   * destination. One that doesn't resolve bounces and leaves it, as do
+   * `>>skip_reply` and unprefixed text.
+   */
+  private roundDestination(current: string | null, segments: string[]): string | null {
+    let destination = current;
+    for (const segment of segments) {
+      for (const envelope of splitExplicitEnvelopes(segment)) {
+        const parsed = parseProsePrefix(envelope);
+        if (parsed.kind !== 'target') continue;
+        const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
+        if ('channelId' in resolved) destination = resolved.channelId;
+      }
     }
+    return destination;
   }
 
   /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */
@@ -9319,7 +9346,7 @@ export class AgentFramework {
         // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
         // prose target at all. Neither mode freezes or announces a locus.
         this.proseTargetPins.delete(agent.name);
-        this.proseStreamTargets.delete(agent.name);
+        this.proseTurnDestinations.delete(agent.name);
         this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
@@ -9338,7 +9365,7 @@ export class AgentFramework {
     if (trigger?.suppressProse) {
       this.turnLocusPins.delete(agent.name);
       this.proseTargetPins.delete(agent.name);
-      this.proseStreamTargets.delete(agent.name);
+      this.proseTurnDestinations.delete(agent.name);
       this.proseContinuations.delete(agent.name);
     }
 
@@ -9686,7 +9713,7 @@ export class AgentFramework {
     // turns until completion: otherwise speculative outgoing chunks could
     // expose the wrapper before the fail-closed classifier runs.
     // A stream that resumes its turn, as beginAgentTurn's continuingTurn: the
-    // turn-scoped routing state (sticky destination, stream destination) was
+    // turn-scoped routing state (sticky destination, turn destination) was
     // kept for it.
     const resumesTurn = trigger?.reason === 'context_budget_restart'
       || trigger?.reason === 'tool_result_guard_retry';
@@ -9697,14 +9724,13 @@ export class AgentFramework {
           mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
           // Explicit text has no destination until a `>>` prefix names one,
           // so a fresh turn's stream starts suppressed. One that resumes the
-          // turn (a tool-result-guard retry, a budget restart) carries on
-          // where the previous stream's prefixes had routed. That is the
-          // destination the text has authored, which delivery's sticky
-          // destination reaches only once its queued envelopes have run.
-          // The trigger channel is only where explicit mode's typing
-          // indicator shows.
+          // turn (a tool-result-guard retry, a budget restart) starts at the
+          // destination the turn's delivered rounds have set: a private
+          // round's prefixes don't count, and the gateway's queued
+          // deliveries needn't have run. The trigger channel is only where
+          // explicit mode's typing indicator shows.
           initialTarget: turnProseRouting === 'explicit'
-            ? (resumesTurn ? this.proseStreamTargets.get(agent.name) ?? null : null)
+            ? (resumesTurn ? this.proseTurnDestinations.get(agent.name) ?? null : null)
             : typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
@@ -9719,20 +9745,6 @@ export class AgentFramework {
         );
       }
     };
-    // Explicit mode keeps the stream's destination as it changes, so a stream
-    // that resumes this turn starts there, however soon after this one it
-    // starts: a guard retry can begin before this stream's teardown runs. A
-    // stream another has since replaced keeps nothing.
-    const noteStreamTarget = (): void => {
-      if (proseStream && turnProseRouting === 'explicit' && agent.streamId === myStreamId) {
-        this.proseStreamTargets.set(agent.name, proseStream.currentTarget);
-      }
-    };
-    const feedStream = (text: string): void => {
-      if (!proseStream) return;
-      emitOutgoing(proseStream.feed(text));
-      noteStreamTarget();
-    };
 
     // Tool-result-guard publication boundary. While a SUBMITTED batch is
     // pending (or a guard recovery is running), a refusal can still abandon
@@ -9746,7 +9758,7 @@ export class AgentFramework {
       guardHeld = [];
       for (const item of held) {
         this.emitTrace(item.trace);
-        if (item.text !== undefined) feedStream(item.text);
+        if (proseStream && item.text !== undefined) emitOutgoing(proseStream.feed(item.text));
       }
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
@@ -9790,7 +9802,7 @@ export class AgentFramework {
               guardHeld.push({ trace, text });
             } else {
               this.emitTrace(trace);
-              if (text !== undefined) feedStream(text);
+              if (proseStream && text !== undefined) emitOutgoing(proseStream.feed(text));
             }
             break;
           }
@@ -9818,7 +9830,6 @@ export class AgentFramework {
             outgoingIndex = 0;
             discardGuardHeld();
             proseStream?.reset();
-            noteStreamTarget();
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -9850,10 +9861,7 @@ export class AgentFramework {
             releaseGuardHeld();
             // The round's text ends here: delivery parses each round's text
             // on its own, so the next round's text starts a new line.
-            if (proseStream) {
-              emitOutgoing(proseStream.endSegment());
-              noteStreamTarget();
-            }
+            if (proseStream) emitOutgoing(proseStream.endSegment());
             adoptInjectedRound();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
@@ -9985,6 +9993,12 @@ export class AgentFramework {
                     // round's tool results.
                     if (!hasSameRoundPrivateThink) {
                       const keepPrivate = roundToolNames.some((n) => bareToolName(n) === 'skip_reply');
+                      if (!keepPrivate) {
+                        this.proseTurnDestinations.set(
+                          agent.name,
+                          this.roundDestination(this.proseTurnDestinations.get(agent.name) ?? null, roundSegments),
+                        );
+                      }
                       console.error(
                         `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                       );
@@ -10040,10 +10054,7 @@ export class AgentFramework {
               const withheld = agent.toolResultGuard.withhold(category);
               // Nothing from the abandoned physical attempt is published or
               // persisted as assistant speech, including a terminal refusal
-              // after the single recovery retry. The destination noted for
-              // the stream that resumes the turn stays as the accepted rounds
-              // left it: the refused round's text was held, so the router
-              // never read it.
+              // after the single recovery retry.
               proseStream?.reset();
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;

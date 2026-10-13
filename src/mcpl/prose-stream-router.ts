@@ -62,11 +62,6 @@ export class ProseStreamRouter {
     return this.accumulated;
   }
 
-  /** Where text goes now: the destination the stream's prefixes have set, or null. */
-  get currentTarget(): string | null {
-    return this.target;
-  }
-
   /**
    * Drop everything routed so far and return to the constructed state.
    *
@@ -164,9 +159,12 @@ export class ProseStreamRouter {
             this.state = 'prefix-gap';
             return;
           }
-          // `>>` and then whitespace is a quoted arrow: delivery's prefix
-          // needs a non-whitespace token right after the arrows.
-          if (isSpace(ch)) {
+          // Explicit: `>>` and then whitespace is a quoted arrow, since
+          // delivery's prefix needs a non-whitespace token right after the
+          // arrows. Hybrid: `>>>` before a newline is a quoted arrow too, but
+          // before other whitespace it is an attempted envelope, which
+          // delivery bounces: its token can't resolve, so nothing streams.
+          if (this.opts.mode === 'explicit' ? isSpace(ch) : ch === '\n') {
             if (this.opts.mode === 'explicit') this.emit(this.held, out);
             this.held = '';
             this.state = ch === '\n' ? 'line-start' : 'body';

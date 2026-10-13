@@ -16,12 +16,13 @@
   channel. The MCPL outgoing stream (`channels/outgoing/chunk` and
   `complete`) started with the trigger channel as its destination, so a
   streaming-capable server there received text that delivery would bounce.
-  It now starts with no destination on a fresh turn, since explicit text
-  has none until a `>>` prefix names one. When a tool-result-guard retry or
-  a budget restart resumes the turn, it starts where the turn's earlier
-  stream had routed. The stream also reads a `>>` prefix after any leading
-  whitespace, and ends its target at any whitespace, as delivery does,
-  rather than streaming such a line as text or dropping it. Each round's
-  text starts a new line for the stream, as delivery parses each round on
-  its own: a round that began with a `>>` prefix streamed it as text to the
-  previous round's destination.
+  It now starts with no destination on a fresh turn, since explicit text has
+  none until a `>>` prefix names one. When a tool-result-guard retry or a
+  budget restart resumes the turn, it starts at the destination the turn's
+  delivered rounds have set, decided at each round's end, so a private
+  round's prefix doesn't count. The stream also reads a `>>` prefix after
+  any leading whitespace, and ends its target at any whitespace, as delivery
+  does, rather than streaming such a line as text or dropping it. Each
+  round's text starts a new line for the stream, as delivery parses each
+  round on its own: a round that began with a `>>` prefix streamed it as
+  text to the previous round's destination.

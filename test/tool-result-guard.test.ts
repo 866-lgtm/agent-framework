@@ -467,6 +467,59 @@ test('explicit mode: a budget restart streams on to the destination the turn las
   }
 });
 
+test("explicit mode: a private round's prefix doesn't move where a budget restart resumes", { timeout: 15000 }, async () => {
+  // A same-round private think keeps its round's text out of delivery, so
+  // its `>>#cafe` sets no destination: the resumed reply goes to #alpha.
+  const privateRound = createMockResponse([
+    { type: 'text', text: '>>#cafe private plan' },
+    { type: 'tool_use', id: 'two', name: 'think', input: { content: 'plan privately' } },
+  ] as ContentBlock[], 'tool_use');
+  privateRound.usage = { inputTokens: 100, outputTokens: 5 };
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: '>>#alpha first\n' },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      privateRound,
+    ],
+    [answer()],
+  ], { proseRouting: 'explicit', maxStreamTokens: 20, sameRoundThinkTextPolicy: 'private' });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  const restarts: string[] = [];
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
+  });
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, channelId });
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
+    getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'continued', channelId: 'chan-alpha' },
+    ], 'the private round moves no destination');
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-alpha'],
+      'the resumed reply streams where it is delivered');
+  } finally {
+    await h.framework.stop();
+  }
+});
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];
