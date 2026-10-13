@@ -130,8 +130,8 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
  *   (`discordRefs` in the operator log) say whether any was.
  * - `queued` — the outbox batch is durably active, and its delivery was
  *   started in the background. If starting it fails (reconciliation reading
- *   or writing the ledger), the batch stays durably active, the
- *   `discord-awareness-delivery` ops alert says so, and the next sync,
+ *   or writing the ledger), a `discord-awareness-delivery` ops alert reports
+ *   the failure, the batch stays durably active, and the next sync,
  *   reconnect or start delivers it. It is not a delivery claim: per-message
  *   outcomes stay in the outbox ledger.
  * - `not-scheduled` — the body change landed, but recording the batch as

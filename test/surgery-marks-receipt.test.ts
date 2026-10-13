@@ -68,7 +68,7 @@ describe('surgery marker receipt', () => {
   const outboxPath = () => join(storePath, 'recovery', 'discord-awareness-outbox.json');
   const ledger = () => new DiscordAwarenessOutbox(outboxPath()).batches();
   type Internals = {
-    discordAwarenessBarrier: { requiresBarrier: boolean } | null;
+    discordAwarenessBarrier: { generation: number; requiresBarrier: boolean } | null;
     mcplServerRegistry: { getServer(id: string): { dataPlaneReady: boolean } | undefined } | null;
     reserveStoreForSurgery(verb: string, agentName: string): () => void;
     recordTurnCheckpoint(agentName: string): void;
@@ -81,6 +81,15 @@ describe('surgery marker receipt', () => {
     assert.equal(internals().mcplServerRegistry?.getServer('discord')?.dataPlaneReady, false, `${when}: discord's data plane is paused`);
   };
   const probeAnswer = () => jsonl<{ event: string; error?: unknown }>(eventsPath).find((e) => e.event === 'probe-answered');
+  /** The kinds of the Discord-awareness ops alerts raised from now on, in order. */
+  const awarenessAlerts = (): string[] => {
+    const kinds: string[] = [];
+    framework.onTrace((event) => {
+      const alert = event as unknown as { type: string; kind?: string };
+      if (alert.type === 'ops:alert' && alert.kind?.startsWith('discord-awareness')) kinds.push(alert.kind);
+    });
+    return kinds;
+  };
 
   /** With `appStore`, the framework gets an app-owned store and no storePath, so its outbox is disabled. */
   async function start(withDiscord: boolean, appStore?: unknown): Promise<void> {
@@ -290,6 +299,7 @@ describe('surgery marker receipt', () => {
   it('a rollback whose marker bookkeeping fails after the switch reports the body as applied', async () => {
     await start(true);
     const { tail } = seed(2);
+    const alerts = awarenessAlerts();
     const original = DiscordAwarenessOutbox.prototype.activate;
     DiscordAwarenessOutbox.prototype.activate = function () {
       throw new Error('injected ledger failure');
@@ -308,6 +318,7 @@ describe('surgery marker receipt', () => {
     const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'rollback');
     assert.equal(entry?.error, undefined, 'logged as an applied rollback, not a failure');
     assert.equal((entry?.result?.markers as { status?: string } | undefined)?.status, 'not-scheduled');
+    assert.deepEqual(alerts, ['discord-awareness-not-scheduled'], 'the operator is told its marks were not scheduled');
 
     // "Not scheduled" holds across the reconciliation delivery runs and
     // across a restart: the batch was retired, so nothing can promote it.
@@ -324,6 +335,7 @@ describe('surgery marker receipt', () => {
   it('reports unresolved bookkeeping when the batch can be neither activated nor retired', async () => {
     await start(false);
     const { tail } = seed(2);
+    const alerts = awarenessAlerts();
     const activate = DiscordAwarenessOutbox.prototype.activate;
     const discard = DiscordAwarenessOutbox.prototype.discard;
     DiscordAwarenessOutbox.prototype.activate = function () {
@@ -347,11 +359,13 @@ describe('surgery marker receipt', () => {
     assert.equal(batches.length, 1);
     assert.equal(result.markers.status === 'unresolved' && result.markers.batchId, batches[0].id);
     assert.match(result.markers.status === 'unresolved' ? result.markers.error : '', /injected ledger failure/);
+    assert.deepEqual(alerts, ['discord-awareness-unresolved'], 'the operator is told the batch may still be delivered');
   });
 
   it('a suppression whose marker bookkeeping fails after the last redaction stands', async () => {
     await start(false);
     const { removed } = seed(3);
+    const alerts = awarenessAlerts();
     const original = DiscordAwarenessOutbox.prototype.activate;
     DiscordAwarenessOutbox.prototype.activate = function () {
       throw new Error('injected ledger failure');
@@ -371,6 +385,7 @@ describe('surgery marker receipt', () => {
     const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'suppress');
     assert.equal(entry?.error, undefined, 'logged as an applied suppression');
     assert.deepEqual(entry?.result?.markers, result.markers);
+    assert.deepEqual(alerts, ['discord-awareness-not-scheduled']);
   });
 
   it('installs the delivery gate before the surgery releases the store', async () => {
@@ -390,7 +405,7 @@ describe('surgery marker receipt', () => {
     assert.deepEqual(atRelease, [{ installed: true, requires: true }]);
   });
 
-  it('a switch, an undo, a redo and a turn undo during a running drain return while replies are held', async () => {
+  it('a switch, an undo, a redo and a turn undo during a running drain each start delivery and return while replies are held', async () => {
     await start(true);
     internals().recordTurnCheckpoint('resident');
     const { tail } = seed(3);
@@ -407,26 +422,38 @@ describe('surgery marker receipt', () => {
       cmdUndo(params: { agentName: string }): Promise<{ undone?: boolean }>;
       cmdRedo(params: { agentName: string }): Promise<{ redone?: boolean }>;
     };
+    // Each command starts delivery of the marks it moved before it returns: it
+    // arms a newer generation, which holds traffic, and doesn't wait for it.
+    let generation = internals().discordAwarenessBarrier!.generation;
+    const startedDelivery = (when: string) => {
+      assertGateUp(when);
+      const current = internals().discordAwarenessBarrier!.generation;
+      assert.ok(current > generation, `${when}: a newer generation, the delivery the command started`);
+      generation = current;
+    };
     const switched = await settlesWithin(server.cmdBranchSwitch({ name: rollback.sourceBranch }), 3_000, 'web branch switch');
     assert.equal(switched.switched, true);
-    assertGateUp('after the switch');
+    startedDelivery('after the switch');
     const undone = await settlesWithin(server.cmdUndo({ agentName: 'resident' }), 3_000, 'web undo');
     assert.equal(undone.undone, true);
+    startedDelivery('after the undo');
     const redone = await settlesWithin(server.cmdRedo({ agentName: 'resident' }), 3_000, 'web redo');
     assert.equal(redone.redone, true);
+    startedDelivery('after the redo');
     const turnUndo = await settlesWithin(
       internals().handleHostCommand('discord', { command: 'undo', agentName: 'resident', turns: 1 }),
       3_000,
       'host/command turn undo',
     );
     assert.equal(turnUndo.undone, 1);
+    startedDelivery('after the turn undo');
 
-    // None of them waited for Discord: no reaction has been answered, and the
-    // gate still holds traffic for the marks they moved.
+    // None of them waited for Discord: no reaction has been answered.
     assert.equal(jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length, 0);
-    assertGateUp('after every command returned');
+    // Once Discord answers, the deliveries the commands started finish on
+    // their own, with no further sync, and leave nothing pending.
     writeFileSync(holdPath, '1');
-    await framework.syncDiscordAwarenessMarkers();
+    await waitFor('the deliveries the commands started to finish', () => internals().discordAwarenessBarrier === null);
     assert.equal(new DiscordAwarenessOutbox(outboxPath()).pending().length, 0, 'every mark the moves needed was delivered');
   });
 
@@ -540,6 +567,7 @@ describe('surgery marker receipt', () => {
 
   it('a suppression with nothing addressable reports none, whether or not its journal can be closed', async () => {
     await start(false);
+    const alerts = awarenessAlerts();
     const local = String(cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {}));
     const other = String(cm().addMessage('resident', [{ type: 'text', text: 'also local' }], {}));
     cm().addMessage('resident', [{ type: 'text', text: 'after' }], {});
@@ -565,11 +593,13 @@ describe('surgery marker receipt', () => {
     }
     assert.deepEqual(stuck.markers, { status: 'none', queued: 0 });
     assert.equal(ledger().filter((batch) => batch.status === 'prepared').length, 1, 'its journal is left prepared');
+    assert.deepEqual(alerts, [], 'no marks were at stake, so no alert');
   });
 
   it('a suppression whose batch can be neither activated nor retired reports unresolved', async () => {
     await start(false);
     const { removed } = seed(3);
+    const alerts = awarenessAlerts();
     const activate = DiscordAwarenessOutbox.prototype.activate;
     const discard = DiscordAwarenessOutbox.prototype.discard;
     DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected ledger failure'); };
@@ -588,6 +618,7 @@ describe('surgery marker receipt', () => {
     assert.equal(result.markers.status === 'unresolved' && result.markers.batchId, batch.id);
     const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'suppress');
     assert.deepEqual(entry?.result?.markers, result.markers);
+    assert.deepEqual(alerts, ['discord-awareness-unresolved']);
   });
 
   it('a surgery that removes nothing addressable schedules no marks', async () => {

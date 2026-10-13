@@ -21,7 +21,8 @@
   the ledger, so every mark pending when the gate was armed is attempted
   before traffic is released: the drain's remaining reactions, the removals
   they need, and an add re-pended during the drain (a rollback, its undo,
-  then a redo). Inbound MCPL handlers wait out a generation installed while
+  then a redo). A mark whose server isn't connected is deferred until it
+  is, as before. Inbound MCPL handlers wait out a generation installed while
   they wait, not only the one they first saw, and a reconnect's gate opens
   only once both its drain and the server's re-registration have finished.
 - The result's new `markers` field (`none` | `queued` | `not-scheduled` |

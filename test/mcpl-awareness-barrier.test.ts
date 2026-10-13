@@ -590,6 +590,10 @@ test('a reconnect gate opens only after re-registration, even when the awareness
 
     await waitFor('the reconnect generation\'s policy held', () =>
       records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'policy-held'));
+    assert.ok(
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'data-request-sent'),
+      'the reconnected server has already sent the data its grant must hold',
+    );
     await waitFor('discord\'s mark delivered while re-registration is held', () =>
       outbox.batches()[0]?.refs[0]?.deliveryStatus === 'applied');
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -877,6 +881,40 @@ test('inbound handlers wait out a generation installed while they wait', async (
   second.resolve({ status: 'delivered', delivered: 0, failed: 0 });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
+});
+
+test('an inbound handler waiting on a generation that fails refuses its request and never runs it', async () => {
+  // A generation fails when the awareness ledger can't be read or written, so
+  // its marks were not all attempted: nothing that waited behind it may run,
+  // and each request is answered with the failure rather than left waiting.
+  const framework = Object.create(AgentFramework.prototype) as any;
+  const failing = deferred<any>();
+  framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: failing.promise };
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const answers: Array<{ event: string; code?: number; result?: unknown }> = [];
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, {
+      id: 1,
+      respond: (result: unknown) => { answers.push({ event, result }); },
+      respondError: (code: number) => { answers.push({ event, code }); },
+    });
+  }
+
+  failing.reject(new Error('injected accounting failure'));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(handled, [], 'nothing runs behind a failed generation');
+  assert.deepEqual(
+    answers.sort((a, b) => a.event.localeCompare(b.event)),
+    ['channels-incoming', 'host-command', 'inference-request', 'push-event'].map((event) => ({ event, code: -32603 })),
+    'each request is refused with the failure',
+  );
 });
 
 test('with no generation current, an inbound event is handled in the turn it arrives', () => {

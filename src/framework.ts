@@ -6608,10 +6608,11 @@ export class AgentFramework {
         // Every redaction committed: the body change has landed and the fork
         // is safe to serve from. Activating the marker batch is bookkeeping
         // about a world-side effect; if it fails, the suppression still
-        // stands and the receipt says the marks were not scheduled. (The
-        // batch's resume journal has nothing left to do, since every interval
-        // has committed, so retiring the batch gives up only the marks, and
-        // the receipt says so.)
+        // stands, and the receipt says what became of the marks: not
+        // scheduled once the batch is retired, or unresolved if it can't be.
+        // (The batch's resume journal has nothing left to do, since every
+        // interval has committed, so retiring the batch gives up only the
+        // marks.)
         markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
         // Installs the MCPL data-plane gate synchronously, before the store is
         // released, and starts delivery without awaiting it (the first
@@ -6723,14 +6724,16 @@ export class AgentFramework {
    * traffic until they are attempted. `syncDiscordAwarenessMarkers` installs
    * that gate synchronously, before its first await, so calling this while a
    * surgery still holds the store keeps MCPL-borne wakes behind the gate
-   * exactly as before. The drain starts in the same synchronous run (the
-   * first reaction request can be written before this returns) and continues
-   * independently; the caller's response and any store reservation stop
-   * waiting on remote reactions. A wake that carries no channel traffic (a
-   * scheduler timer, a provider admission) may run during delivery. A failure
-   * is accounted by the gate itself (connections recycled); here it is
-   * logged and raised as an ops alert, and the next sync, reconnect or start
-   * delivers what is still pending.
+   * exactly as before. With no drain running, the drain starts in the same
+   * synchronous run (the first reaction request can be written before this
+   * returns); with one running, this generation's pass follows it
+   * (drainForGeneration). Either way delivery continues independently: the
+   * caller's response and any store reservation stop waiting on remote
+   * reactions. A wake that carries no channel traffic (a scheduler timer, a
+   * provider admission) may run during delivery. A failure is accounted by
+   * the gate itself (connections recycled); here it is logged and raised as
+   * an ops alert, and the next sync, reconnect or start delivers what is
+   * still pending.
    *
    * @param after What moved the branch, for the log and the alert
    *   ("rollback", "branch switch", "undo" …).
