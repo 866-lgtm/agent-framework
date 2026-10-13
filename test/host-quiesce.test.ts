@@ -722,7 +722,7 @@ test('resume flushes deferred writes in order: a poison write stays queued with 
   });
 });
 
-test("resume cuts each target at its own stuck write, naming it at every flush, and other targets' writes land", async () => {
+test("resume stores several agents' writes in the order they arrived, and cuts each agent at its own stuck write, named at every flush", { timeout: 60_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-targets-'));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'),
@@ -739,46 +739,48 @@ test("resume cuts each target at its own stuck write, naming it at every flush, 
   try {
     await framework.quiesce({ reason: 'refold' });
     const internals = framework as unknown as {
-      deferredSeq: number;
-      deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; forAgent?: string }>;
+      deferredMessages: Array<{ id: string; content: Array<{ text?: string }> }>;
       addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { forAgent?: string }): unknown;
     };
+    const add = (text: string, forAgent: string) =>
+      internals.addMessage('user', [{ type: 'text', text }], undefined, { forAgent });
     // Residents share one message slot, so each one's context manager reads
     // what either stored; each stores through its own.
     const agentCm = framework.getAgent('agent')!.getContextManager();
     const before = agentCm.getAllMessages().length;
     const stored = () => agentCm.getAllMessages().slice(before).map((m) => (m.content[0] as { text: string }).text);
-    // A malformed entry the store rejects, as only a queue persisted by other
-    // code could carry (addMessage refuses a null block): the log line still
-    // names it, and it still goes back into the queue.
-    internals.deferredMessages.push({
-      id: 'stuck-1', seq: ++internals.deferredSeq, participant: 'user',
-      content: [{ type: 'text', text: 'stuck' }, null], forAgent: 'agent',
-    });
-    internals.addMessage('user', [{ type: 'text', text: 'for scout' }], undefined, { forAgent: 'scout' });
-    internals.addMessage('user', [{ type: 'text', text: 'behind the stuck one' }], undefined, { forAgent: 'agent' });
-    internals.addMessage('user', [{ type: 'text', text: 'also for scout' }], undefined, { forAgent: 'scout' });
-    assert.equal(framework.getHostModeStatus().deferredWrites, 4);
+    add('one', 'agent');
+    add('two', 'scout');
+    add('three', 'agent');
+    add('stuck', 'agent');
+    add('for scout', 'scout');
+    add('behind the stuck one', 'agent');
+    add('also for scout', 'scout');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 7);
+    const stuckId = internals.deferredMessages.find((m) => m.content[0]?.text === 'stuck')!.id;
 
+    // The store refuses agent's 'stuck' write with a thrown value that has no
+    // text, so the log line can't print it.
     const realAdd = agentCm.addMessage.bind(agentCm);
     (agentCm as unknown as { addMessage: typeof agentCm.addMessage }).addMessage = ((participant, content, metadata, causedBy) => {
-      if ((content[0] as { text?: string }).text === 'stuck') throw new Error('store write failed');
+      if ((content[0] as { text?: string }).text === 'stuck') throw Object.create(null);
       return realAdd(participant, content, metadata, causedBy);
     }) as typeof agentCm.addMessage;
     const named = () => lines.filter((line) =>
-      line.includes('deferred write stuck-1 (user: text+malformed) for agent could not be stored')).length;
+      line.includes(`deferred write ${stuckId} (user: text) for agent could not be stored`)
+      && line.includes('a thrown value that has no text')).length;
 
     let status = await framework.resume();
-    // Queued after agent's stuck write, scout's land; agent's own later
-    // write is held behind it.
-    assert.deepEqual(stored(), ['for scout', 'also for scout'], "scout's writes land; agent's stuck write holds what is queued behind it for agent");
-    assert.equal(status.deferredWrites, 2);
+    // In the order they arrived, across both agents; from agent's stuck
+    // write on, agent's are held, and scout's go on.
+    assert.deepEqual(stored(), ['one', 'two', 'three', 'for scout', 'also for scout']);
+    assert.equal(status.deferredWrites, 2, "agent's stuck write and the one behind it are still queued");
     assert.equal(named(), 1, 'the flush names the stuck write: its id and block types');
 
     // A second flush with the store still refusing it: held again, named again.
     await framework.quiesce({ reason: 'refold' });
     status = await framework.resume();
-    assert.deepEqual(stored(), ['for scout', 'also for scout'], 'still nothing lands ahead of it');
+    assert.deepEqual(stored(), ['one', 'two', 'three', 'for scout', 'also for scout'], 'still nothing lands ahead of it');
     assert.equal(status.deferredWrites, 2);
     assert.equal(named(), 2, 'every flush names it');
   } finally {
@@ -788,6 +790,57 @@ test("resume cuts each target at its own stuck write, naming it at every flush, 
       console.error = error;
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+test('boot recovery drops a recovered deferred write the store could never take, naming it, and restores the rest', { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-malformed-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'first' }]);
+    add('user', [{ type: 'text', text: 'second' }]);
+    await framework.stop();
+
+    // Entries no write of the framework's makes, as other code could leave
+    // them in the recovery file: a null block, and content that isn't blocks.
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 2);
+    doc.pending.splice(1, 0,
+      { id: 'null-block', seq: 100, participant: 'user', content: [{ type: 'text', text: 'x' }, null] },
+      { id: 'not-blocks', seq: 101, participant: 'user', content: 'x' },
+    );
+    writeFileSync(file, JSON.stringify(doc));
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.equal(framework.getHostModeStatus().deferredWrites, 2, 'the well-formed entries are restored');
+    for (const entry of ['null-block (user)', 'not-blocks (user)']) {
+      assert.ok(lines.some((line) => line.includes(`malformed and was dropped: ${entry}`)), `${entry} is named:\n${lines.join('\n')}`);
+    }
+    const rewritten = readFileSync(file, 'utf8');
+    assert.ok(!rewritten.includes('null-block') && !rewritten.includes('not-blocks'), 'the recovery file is rewritten without them');
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second']);
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

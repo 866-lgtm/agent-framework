@@ -22,43 +22,56 @@
   content. That happens while its target's own turn, stream or tool cycle is
   alive, or the host is quiesced. A `tool_result` used to land regardless,
   apart from the `tool_use` it answers, which went back into the queue.
-- Every write now waits on its own target's state: the target's turn, stream
-  and tool cycle, or a quiesced host. Before, a write for the primary agent
-  waited out every agent's tool cycle, while one addressed to an agent waited
-  only on that agent's. So a turn's end could store a later addressed message
-  ahead of an earlier one for the primary, and a fork's, subagent's or the
+- A write that waits now waits on its own target's state: the target's
+  turn, stream and tool cycle, or a quiesced host. (A fresh `tool_result`
+  still doesn't wait.) Before, a write for the primary agent waited out every
+  agent's tool cycle, while one addressed to an agent waited only on that
+  agent's. So a turn's end could store a later addressed message ahead of an
+  earlier one for the primary, and a fork's, subagent's or the
   subconscious's tools held the primary's writes, which protected nothing in
   the primary's window. Each flush, at a turn's end, after surgery, after a
   withdrawn turn and after a puppet call, now delivers the agent's deferred
   messages while another agent's tool cycle is pending; only the agent's own
-  cycle holds them.
+  cycle holds them. The flush after surgery stores several agents' entries in
+  the order they arrived, where it went agent by agent: residents share one
+  message slot, so that reordered their shared transcript.
 - `stop()` now stores what is still deferred for each registered agent
-  before the store closes; before, a memory-only queue lost it. Once `stop()`
-  begins, no agent turn starts and no stream registers: a turn that was
-  mid-compile when the streams were cancelled, or one waiting to retry, is
-  refused rather than left running, and an ephemeral run refused this way
-  ends at once rather than at its startup watchdog. Since no reply can then
-  follow a stored entry in a stream, `stop()` stores each one even while a
-  frame it doesn't wait for still holds its target's turn: a turn started
-  outside the event loop, or a puppet call. `stop()` neither refuses nor
-  waits for a puppet call, as before, so one still running stores its pair
-  when its tool returns, after those entries, and on a store `stop()` has
-  closed that write fails. A quiesced host keeps what is deferred in its
-  persisted queue for boot recovery. An entry for a target no longer
-  registered (a disposed fork) is dropped from a memory-only queue at exit,
-  as before.
+  before the store closes, in the order it arrived; before, a memory-only
+  queue lost it. Once `stop()` begins, no agent turn starts and no stream
+  registers: a turn that was mid-compile when the streams were cancelled, or
+  one waiting to retry, is refused rather than left running, and an ephemeral
+  run refused this way ends at once rather than waiting for a watchdog. Since
+  no reply can then follow a stored entry in a stream, `stop()` stores each
+  one even while a frame it doesn't wait for still holds its target's turn:
+  a turn started outside the event loop, or a puppet call. `stop()` neither
+  refuses nor waits for a puppet call, as before. One still running stores
+  its pair when its tool returns. If that's before `stop()` stores the
+  deferred entries, the pair lands first and the puppet's own flush stores
+  what was deferred behind it; if it's later, the pair lands after them, and
+  on a store `stop()` has closed that write fails. A quiesced host keeps what
+  is deferred in its persisted queue for boot recovery. An entry for a target
+  no longer registered (a disposed fork) is dropped from a memory-only queue
+  at exit, as before.
 - A deferred write whose store throws goes back into the queue under its
   id, and so does every entry queued behind it for that agent, so none of
   them lands ahead of an earlier one, and a queued `tool_use` that can't be
-  stored keeps its `tool_result` from being stored alone. The log line names
-  the entry at each flush, and one that keeps throwing holds what is deferred
-  behind it for that agent until it can be stored. The hold is the queue's:
-  a write that arrives while the agent is idle isn't deferred, so it is
-  stored at once and can land ahead of a held entry, and an entry that keeps
-  throwing holds only what is deferred during the agent's turns (or while the
-  host is quiesced). Before, it stayed in
-  the un-acked set and the next acknowledgement dropped it from the
-  persisted queue (at a turn start or a flush it was lost even from memory).
-  At a tool boundary, nothing from it on is injected. While the framework
-  runs it is kept; a memory-only queue still loses it when the process
-  exits.
+  stored keeps the `tool_result` queued behind it from being stored alone. (A
+  stored `tool_use` whose `tool_result` then can't be stored stays alone
+  until the result lands at a later flush.) Other agents' entries go on, in
+  the order they arrived. The log line names the entry at each flush, and one
+  that keeps throwing holds what is deferred behind it for that agent until
+  it can be stored. The hold is the queue's: a write that isn't deferred is
+  stored at once and can land ahead of a held entry. That's a fresh
+  `tool_result`, and any write while the agent's turn, stream and tool cycle
+  are idle and the host isn't quiesced. So an entry that keeps throwing holds
+  only what is deferred while the agent's turn, stream or tool cycle is
+  alive, or the host is quiesced. Before, it stayed in the un-acked set and
+  the next acknowledgement dropped it from the persisted queue (at a turn
+  start or a flush it was lost even from memory). At a tool boundary,
+  nothing from it on is injected. While the framework runs it is kept; a
+  memory-only queue still loses it when the process exits.
+- Boot recovery drops a recovered deferred write whose content isn't an
+  array of block objects, which the store could never take, and logs it by
+  id and participant, rather than holding it in the queue. Before, an entry
+  whose content wasn't an array was dropped without a line, and one with a
+  null block was kept, where it could never be stored.

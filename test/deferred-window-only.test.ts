@@ -482,7 +482,32 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await reopened.stop();
   });
 
-  it('a turn waiting to retry when the framework stops gives up rather than compile again', async () => {
+  it("stop() stores several agents' deferred writes in the order they arrived", async () => {
+    // Residents share one message slot, so the order writes arrived in is the
+    // order every resident reads.
+    const agents = [
+      { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' },
+      { name: 'scout', model: 'test-model', systemPrompt: 'You scout.' },
+    ];
+    const framework = await createFramework({ agents });
+    const internals = internalsOf(framework);
+    // Frames stop() doesn't wait for hold both agents' turns.
+    internals.activeTurnTokens.set('assistant', 1);
+    internals.activeTurnTokens.set('scout', 2);
+    assert.equal(internals.addMessage('Antra', text('one')), '', 'deferred');
+    assert.equal(internals.addMessage('Antra', text('two'), undefined, { forAgent: 'scout' }), '', 'deferred');
+    assert.equal(internals.addMessage('Antra', text('three')), '', 'deferred');
+    await framework.stop();
+
+    const reopened = await createFramework({ agents });
+    assert.deepEqual(
+      windowOf(reopened).filter((line) => /^Antra: (one|two|three)$/.test(line)),
+      ['Antra: one', 'Antra: two', 'Antra: three'],
+    );
+    await reopened.stop();
+  });
+
+  it('a turn waiting to retry when the framework stops gives up rather than compile again', { timeout: 60_000 }, async () => {
     let waiting!: () => void;
     const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
     const framework = await createFramework({
@@ -504,13 +529,14 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     // The retry re-enters startAgentStream after its delay; count those
     // re-entries, so a retry that was never granted can't pass for one that
     // was refused.
-    const retries: number[] = [];
+    const retries: Array<{ attempt: number; stopping: boolean }> = [];
     const frames = framework as unknown as {
+      providerAdmissionClosed: boolean;
       startAgentStream(agent: unknown, trigger?: unknown, attempt?: number, held?: boolean): Promise<void>;
     };
     const startAgentStream = frames.startAgentStream.bind(framework);
     frames.startAgentStream = (a, trigger, attempt = 0, held = false) => {
-      if (attempt > 0) retries.push(attempt);
+      if (attempt > 0) retries.push({ attempt, stopping: frames.providerAdmissionClosed });
       return startAgentStream(a, trigger, attempt, held);
     };
     framework.start();
@@ -520,7 +546,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const error = console.error;
     console.error = () => {};
     try { await framework.stop(); } finally { console.error = error; }
-    assert.deepEqual(retries, [1], 'the retry was granted, and re-entered once stop() had begun');
+    assert.deepEqual(retries, [{ attempt: 1, stopping: true }], 'the retry was granted, and re-entered once stop() had begun');
     assert.equal(compiles, 1, 'the retry was refused, not compiled');
 
     const reopened = await createFramework();

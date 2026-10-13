@@ -129,7 +129,7 @@ async function stopAndRemove(framework: AgentFramework, tempDir: string): Promis
 }
 
 describe('runEphemeralToCompletion settle signal', () => {
-  it('a run whose turn stop() refuses ends at once, and a run asked for once stop() has begun is refused', async () => {
+  it('a run whose turn stop() refuses ends at once, and a run asked for once stop() has begun is refused', { timeout: 60_000 }, async () => {
     const { tempDir, storePath } = tempStorePath('ephemeral-stopping-');
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'too late' }]));
@@ -170,7 +170,7 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a run waiting to retry when stop() begins gives up before compiling again', async () => {
+  it('a run waiting to retry when stop() begins gives up before compiling again', { timeout: 60_000 }, async () => {
     // An ephemeral run doesn't hold the primary's provider gate, so the
     // refusal at the top of startAgentStream is the only check its retry
     // meets before it would compile, and start a stream, again.

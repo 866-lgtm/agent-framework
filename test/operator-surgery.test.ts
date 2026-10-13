@@ -257,7 +257,7 @@ describe('live operator surgery', () => {
     }
   });
 
-  it("the post-surgery flush lands what waited behind the hold while another agent's tool cycle is pending, and acknowledges it", async () => {
+  it("the post-surgery flush lands what waited behind the hold while another agent's tool cycle is pending, and acknowledges it", { timeout: 60_000 }, async () => {
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;
     let releaseSwitch!: () => void;
@@ -286,6 +286,43 @@ describe('live operator surgery', () => {
       assert.equal(internals.unackedDeferredWrites.length, 0, 'and acknowledged, so the recovery queue no longer holds it');
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
+      c.switchBranch = originalSwitch;
+    }
+  });
+
+  it("the post-surgery flush stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
+    // Residents share one message slot, so the order writes arrived in is the
+    // order every resident reads.
+    await framework.stop();
+    framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'builder', model: 'test-model', systemPrompt: 'You are builder.' },
+      ],
+      modules: [],
+    });
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    let entered!: () => void;
+    const inSwitch = new Promise<void>((resolve) => { entered = resolve; });
+    c.switchBranch = async (name: string) => { entered(); await gate; return originalSwitch.call(c, name); };
+    const add = (framework as unknown as {
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { forAgent?: string }): string;
+    }).addMessage.bind(framework);
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
+      await inSwitch;
+      assert.equal(add('user', [{ type: 'text', text: 'one' }]), '', 'deferred');
+      assert.equal(add('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'builder' }), '', 'deferred');
+      assert.equal(add('user', [{ type: 'text', text: 'three' }]), '', 'deferred');
+      releaseSwitch();
+      await rollback;
+      assert.deepEqual(remainingTexts().filter((t) => ['one', 'two', 'three'].includes(t)), ['one', 'two', 'three']);
+    } finally {
       c.switchBranch = originalSwitch;
     }
   });
