@@ -508,8 +508,12 @@ describe('explicit prose routing', () => {
             ? internals.deliverProse(agent, '>>#alpha {{unsent}} plus a line', { notice: 'later' })
             : internals.deliverHybridProse(agent, '>>>#alpha {{unsent}} plus a line', null, true, { notice: 'later' });
           await reached;
-          // A newer bounce becomes the latest while the send waits.
+          // A newer bounce becomes the latest while the send waits, and the
+          // store reloads its projection (as after an ambiguous append), so
+          // the draft captured before the send is no longer the stored one.
           store.hold('assistant', [{ text: 'NEW WORDS', source: { branch: 'main', turn: 2, round: 1, segment: 0 } }], 'bounced');
+          store.reload();
+          assert.notEqual(store.get('assistant', original.id), original, 'the reload replaced the stored draft');
           release();
           await sending;
           const texts = store.open('assistant').map((d) => d.text);
@@ -517,7 +521,7 @@ describe('explicit prose routing', () => {
           assert.ok(!texts.includes('NEW WORDS plus a line'), 'not the newer bounce');
           const copy = store.open('assistant').find((d) => d.text === 'ORIGINAL WORDS plus a line')!;
           if (failure === 'throw') assert.equal(copy.inheritedRisk?.draftId, original.id, "a thrown send's copy carries its source's risk");
-          else assert.equal(copy.inheritedRisk, undefined);
+          else assert.equal(copy.inheritedRisk, undefined, 'read after the attempt, the failed draft carries no risk to inherit');
         } finally {
           await framework.stop();
         }
