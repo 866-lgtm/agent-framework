@@ -693,15 +693,18 @@ describe('explicit prose routing', () => {
       const internals = framework as unknown as {
         turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
         proseSpeechChains: Map<string, Promise<void>>;
+        toolResultsLogical: Map<string, RoutingState['logical']>;
       };
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
       try {
         // The turn's earlier stream asked for a continuation, or will once
         // its queued delivery runs; the turn goes on in a re-inference, which
-        // starts a new stream with a fresh routing state.
+        // starts a new stream with a fresh routing state. The non-streaming
+        // fallback that schedules it records the earlier stream's logical turn.
         const earlier: RoutingState = { destination: null, hybridHold: false, logical: { continuation: when === 'already set', deliveries: [], suppressed: 0 } };
         internals.turnRouting.set('assistant', earlier);
+        internals.toolResultsLogical.set('assistant', earlier.logical);
         if (when === 'set late') {
           internals.proseSpeechChains.set('assistant', held.then(() => { earlier.logical.continuation = true; }));
         }
