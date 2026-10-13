@@ -157,6 +157,8 @@ test('every rejection line of the ingress handlers stays one line, whatever the 
   await f.send('push/event', { ...push, payload: { content: [] } });
   await f.send('push/event', push);
   await f.send('push/event', push);
+  // A coalesced push to a channel the server never declared names it.
+  await f.send('push/event', f.params('u1', 'hi', { initial: true, channelId: FORGED_SET, key: 'u1' }));
 
   const rejected = lines.filter((l) => /^\[(channel-incoming|push-event)-rejected\]/.test(l));
   assert(rejected.every((l) => !/[\n\r\u0085\u2028\u2029]/.test(l)), 'no rejection line breaks');
@@ -169,6 +171,7 @@ test('every rejection line of the ingress handlers stays one line, whatever the 
     `[push-event-rejected] server=editor featureSet=${field(FORGED_SET)} eventId=${SHOWN} reason=coalesce-invalid field=payload.content: "invalid content block"`,
     `[push-event-rejected] server=editor eventId=${SHOWN} reason=empty-content`,
     `[push-event-rejected] server=editor eventId=${SHOWN} reason=duplicate`,
+    `[push-event-rejected] server=editor featureSet=doc eventId=u1 channel=${field(FORGED_SET)} reason=coalesce-invalid field=coalesce.channelId: "Unknown channel"`,
   ]);
   // Each line names its server and its reason once: the forged ids hold neither.
   for (const line of rejected) {
@@ -319,6 +322,8 @@ test('a refusal line keeps servers and channels apart, and keys a channel as its
   assert.equal(lines.admit('a', 'b:c'), 0, 'a colon doesn\'t merge two server and channel pairs');
   assert.equal(lines.admit('a\u0000b', 'c'), 0);
   assert.equal(lines.admit('a', 'b\u0000c'), 0, 'nor does a NUL');
+  assert.equal(lines.admit('ab', 'c'), 0);
+  assert.equal(lines.admit('a', 'bc'), 0, 'nor do two pairs that run together alike');
   const head = 'x'.repeat(256);
   assert.equal(lines.admit('editor', `${head}one`), 0);
   assert.equal(lines.admit('editor', `${head}two`), null, 'ids cut to the same 256 units at the same length print alike, and share a record');
