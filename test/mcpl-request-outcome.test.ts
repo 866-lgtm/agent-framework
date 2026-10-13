@@ -90,3 +90,19 @@ test('McplRequestError is an Error that keeps its message and name', () => {
   assert.equal(err.name, 'McplRequestError');
   assert.equal(err.message, 'boom');
 });
+
+test('a synchronous write rejection is not-sent, leaves no pending request, and does not poison the next request', async () => {
+  connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  const state = connection as unknown as {
+    transport: { writeLine(json: string): void };
+    pendingRequests: Map<unknown, unknown>;
+  };
+  const write = state.transport.writeLine.bind(state.transport);
+  state.transport.writeLine = () => { throw new Error('synthetic write rejection'); };
+  const err = await rejectsWith(connection.sendToolsCall('fail', {}), 'not-sent');
+  assert.match(err.message, /synthetic write rejection/);
+  assert.equal(state.pendingRequests.size, 0, 'nothing remains awaiting an unwritten request');
+  state.transport.writeLine = write;
+  const next = await rejectsWith(connection.sendToolsCall('fail', {}), 'error-response');
+  assert.deepEqual(next.data, { posted: ['111'] }, 'a subsequent written request still reaches the real server');
+});

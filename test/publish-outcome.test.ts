@@ -27,6 +27,7 @@ type Publish = (params: { channelId: string }) => Promise<unknown>;
 function registryWith(
   servers: Record<string, { publish: Publish; grant?: boolean | { without: string[] }; open?: () => Promise<unknown> }>,
   failures: unknown[] = [],
+  traces: Array<{ type: string; [key: string]: unknown }> = [],
 ) {
   const published: Array<{ serverId: string; channelId: string }> = [];
   const opened: Array<{ serverId: string; channelId: string }> = [];
@@ -51,7 +52,7 @@ function registryWith(
     { getServer: (id: string) => mocks.get(id) } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
     () => {},
-    () => {},
+    (event) => { traces.push(event); },
     { onRouteFailure: (info) => { failures.push(info); } },
   );
   const channels = (registry as unknown as {
@@ -176,6 +177,37 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(outcome.destination?.channelId, 'c');
   });
 
+  for (const id of ['message-' + 'x'.repeat(10_000), { malformed: 'x'.repeat(10_000) }]) {
+    it('bounds a contradictory ' + (typeof id === 'string' ? 'string' : 'object') + ' message id in the reason, preserving the receipt', async () => {
+      const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: false, messageId: id }) } });
+      seed('discord', 'c', '#c');
+      const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
+      assert.equal(outcome.status, 'unknown');
+      assert.ok(outcome.reason!.length < 2300, 'the diagnostic is bounded');
+      assert.match(outcome.reason!, /\[truncated\]/);
+      assert.match(outcome.reason!, /delivery uncertain/);
+      assert.equal(outcome.messageId, typeof id === 'string' ? id : undefined, 'diagnostic clipping does not rewrite a connector id');
+    });
+  }
+
+  it('speech failure forwards bounded connector data to both notice and trace, preserving the original outcome', async () => {
+    const data = { posted: ['111'], note: 'x'.repeat(10_000) };
+    const failures: unknown[] = [];
+    const traces: Array<{ type: string; [key: string]: unknown }> = [];
+    const { registry, seed } = registryWith({
+      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', -32000, data); } },
+    }, failures, traces);
+    seed('discord', 'c', '#c');
+    const outcome = await registry.deliverSpeech('agent', 'words', 'c');
+    assert.equal(outcome.status, 'unknown');
+    assert.deepEqual(outcome.detail, data, 'the outcome still carries the complete structured data');
+    const info = failures[0] as { detail?: string };
+    assert.ok(info.detail && info.detail.length <= 2000);
+    assert.match(info.detail, /"posted":\["111"\]/);
+    assert.match(info.detail, /\[truncated\]$/);
+    assert.equal(traces.find((e) => e.type === 'mcpl:speech-route-failed')?.detail, info.detail);
+  });
+
   it('treats a timeout or a lost connection as unknown', async () => {
     const { registry, seed } = registryWith({
       discord: { publish: async () => { throw new McplRequestError('MCPL server "discord" did not respond to channels/publish (id=7) within 10ms', 'no-response'); } },
@@ -263,8 +295,10 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     const markers = () => framework.getAgent('scout')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'discord-send-failed')
       .map((m) => (m.content[0] as { text: string }).text);
-    const turn = async (mode: string, n: number) => {
-      appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode }) + '\n');
+    const traces: Array<{ type: string; detail?: unknown }> = [];
+    framework.onTrace((event) => traces.push(event));
+    const turn = async (mode: string, n: number, detail?: unknown) => {
+      appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode, detail }) + '\n');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply ${n}` }]));
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: 'discord:g1:room', messageId: `m-${n}`, mode: 'addressed', text: 'hello?' }) + '\n');
       await until(() => markers().length === n, `marker ${n}`);
@@ -278,6 +312,14 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted/);
     assert.match(failed!, /could not be delivered/);
     assert.match(failed!, /Nothing was posted/);
+    await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) });
+    const partial = markers()[2]!;
+    assert.match(partial, /was not confirmed/);
+    assert.match(partial, /Connector detail:.*"posted":\["111"\]/);
+    assert.match(partial, /\[truncated\]$/);
+    assert.ok(partial.length < 2500, 'the resident receives a bounded display, not the whole error object');
+    const trace = traces.find((event) => event.type === 'mcpl:speech-route-failed' && event.detail !== undefined);
+    assert.ok(trace?.detail, 'the same connector account reaches the failure trace');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

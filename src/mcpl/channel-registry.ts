@@ -460,6 +460,19 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // Constructor Options
 // ============================================================================
 
+/** Bound connector values for notices/logs; the PublishOutcome keeps the original. */
+function connectorText(value: unknown): string {
+  let text: string;
+  try {
+    text = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
+  } catch {
+    return '[unserializable connector value]';
+  }
+  const limit = 2000;
+  const suffix = '… [truncated]';
+  return text.length > limit ? text.slice(0, limit - suffix.length) + suffix : text;
+}
+
 /** Where a publish was resolved to go — named by the registry, never by
  *  the caller's spelling. */
 export interface PublishDestination {
@@ -534,6 +547,8 @@ interface ChannelRegistryOptions {
     /** `failed`: nothing was posted; `unknown`: the request was dispatched
      *  and no valid receipt came back, so it may or may not have been. */
     outcome?: 'failed' | 'unknown';
+    /** Bounded display of the connector's structured error data, when present. */
+    detail?: string;
   }) => void;
   /**
    * Called when channels were opened WITHOUT the agent asking (subscription
@@ -3208,9 +3223,9 @@ export class ChannelRegistry {
         destination,
         ...(messageId ? { messageId } : {}),
         reason: messageId
-          ? `server "${entry.serverId}" reported delivered:false but named posted message ${messageId} (delivery uncertain)`
+          ? `server "${entry.serverId}" reported delivered:false but named posted message ${connectorText(messageId)} (delivery uncertain)`
           : `server "${entry.serverId}" reported delivered:false beside a malformed message id ` +
-            `${JSON.stringify(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
+            `${connectorText(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
         at: at(),
       };
     }
@@ -3246,7 +3261,9 @@ export class ChannelRegistry {
   ): Promise<PublishOutcome> {
     const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
-      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
+      const detail = outcome.detail !== undefined ? connectorText(outcome.detail) : undefined;
+      const detailText = detail !== undefined ? `; connector detail: ${detail}` : '';
+      console.error(`[routeSpeech] ${conversationId}: ${reason}${detailText} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
@@ -3254,8 +3271,9 @@ export class ChannelRegistry {
         reason,
         textLen: text.length,
         outcome: status,
+        ...(detail !== undefined ? { detail } : {}),
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status });
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}) });
       return outcome;
     };
 

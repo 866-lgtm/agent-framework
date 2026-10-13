@@ -38,9 +38,9 @@
  * host, and its outcome after: an attempt with no recorded outcome (a crash
  * mid-send) reads as unknown, never as unsent. A delivered draft carries a
  * historical receipt — confirmed at a time, to a destination, with the
- * connector's message id — not a claim that the message still exists.
- * Nothing here publishes anything: every send is the resident's explicit
- * resend, and nothing replays at boot or on a branch move.
+ * connector's message id when it names one — not a claim that the message
+ * still exists. A draft is sent only by its resident's explicit resend or
+ * an envelope's {{unsent}}; nothing replays at boot or on a branch move.
  */
 
 import { randomInt } from 'node:crypto';
@@ -66,8 +66,9 @@ export type DraftReason =
 export interface DraftSource {
   /** Chronicle branch current when the words were held. */
   branch: string;
-  /** The resident's logical turn (process-local counter) and the round in it. */
+  /** The resident's logical turn (process-local counter). */
   turn: number;
+  /** Round within this stream; numbering restarts at a budget restart. */
   round: number;
   /** Position of the segment within its round's speech. */
   segment: number;
@@ -137,9 +138,11 @@ export interface Draft {
 }
 
 /**
- * - `held`: never attempted, or every attempt definitely failed — resend freely;
- * - `unconfirmed`: some attempt's outcome is unknown (or was never
- *   recorded), and none was confirmed: it may have been posted, so a resend
+ * - `held`: no inherited risk, and never attempted or every attempt
+ *   definitely failed — resend freely;
+ * - `unconfirmed`: no attempt was confirmed and the draft is not dismissed;
+ *   either an attempt's outcome is unknown (or was never recorded), or the
+ *   words carry inherited risk regardless of their own attempts. A resend
  *   needs explicit confirmation. A later attempt that fails does not resolve
  *   an earlier one that may have landed — the uncertainty stays;
  * - `delivered`: an attempt was confirmed — its receipt is historical;

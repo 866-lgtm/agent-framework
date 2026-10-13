@@ -27,6 +27,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
+import { draftState, type ProseDraftStore } from '../src/prose-drafts.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 class ToolboxModule implements Module {
@@ -67,7 +68,7 @@ class ToolboxModule implements Module {
 }
 
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
-function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'throw'> = []) {
+function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'unknown' | 'throw'> = []) {
   const routed: Array<{ text: string; locus: string | null }> = [];
   const known: Record<string, { channelId: string; label: string }> = {
     '#alpha': { channelId: 'chan-alpha', label: '#alpha' },
@@ -78,21 +79,27 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     '@laria': { channelId: 'discord:dm:99', label: 'DM: laria' },
     'discord:dm:99': { channelId: 'discord:dm:99', label: 'DM: laria' },
   };
+  const deliverSpeech = async (_agent: string, text: string, locus?: string | null) => {
+    routed.push({ text, locus: locus ?? null });
+    const behavior = plan.shift() ?? 'delivered';
+    if (behavior === 'throw') throw new Error('synthetic publication failure');
+    const destination = { serverId: 'stub', channelId: locus ?? '' };
+    if (behavior === 'unknown') {
+      return { status: 'unknown' as const, destination, reason: 'stub delivery uncertain', at: Date.now() };
+    }
+    return behavior === 'delivered'
+      ? { status: 'delivered' as const, destination, at: Date.now() }
+      : { status: 'failed' as const, destination, reason: 'stub reported delivered:false', at: Date.now() };
+  };
   const explicit: Record<string, unknown> = {
     resolveProseTarget: (spec: string) =>
-      known[spec] ?? { error: `no channel matches "${spec}"` },
-    routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
-      routed.push({ text, locus: locus ?? null });
-      const behavior = plan.shift() ?? 'delivered';
-      if (behavior === 'throw') throw new Error('synthetic publication failure');
-      return { delivered: behavior === 'delivered', channelId: locus ?? '' };
-    },
-    // The registry's outcome-returning form of routeSpeech, over the same plan.
-    deliverSpeech: async (agent: string, text: string, locus?: string | null) => {
-      const result = await (explicit.routeSpeech as (a: string, t: string, l?: string | null) => Promise<{ delivered: boolean; channelId: string }>)(agent, text, locus);
-      return result.delivered
-        ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId }, at: Date.now() }
-        : { status: 'failed', destination: { serverId: 'stub', channelId: result.channelId }, reason: 'stub reported delivered:false', at: Date.now() };
+      known[spec] ?? { error: 'no channel matches "' + spec + '"' },
+    deliverSpeech,
+    routeSpeech: async (agent: string, text: string, locus?: string | null) => {
+      const outcome = await deliverSpeech(agent, text, locus);
+      return outcome.status === 'delivered'
+        ? { delivered: true, channelId: outcome.destination.channelId }
+        : null;
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => 'world:commons',
@@ -272,9 +279,74 @@ describe('explicit prose routing', () => {
     };
   }
 
-  type DraftsView = { open(agent: string): unknown[]; latestBounce(agent: string): unknown };
+  type DraftsView = ProseDraftStore;
   const draftsOf = (framework: AgentFramework): DraftsView =>
     (framework as unknown as { proseDrafts: DraftsView }).proseDrafts;
+
+  for (const failure of ['false', 'throw'] as const) {
+    it('an explicit ' + failure + ' delivery holds its body as a bounce and names it privately', async () => {
+      const framework = await createFramework();
+      try {
+        const routed = stubRegistry(framework, [failure]);
+        const agent = framework.getAgent('assistant')!;
+        const gateway = framework as unknown as {
+          deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+        };
+        await gateway.deliverProse(agent, '>>#alpha keep these words', { notice: 'later' });
+        assert.deepEqual(routed, [{ text: 'keep these words', locus: 'chan-alpha' }]);
+        const held = draftsOf(framework).open('assistant');
+        assert.equal(held.length, 1, 'the failed envelope became one draft');
+        assert.equal(held[0]!.reason, 'bounced');
+        assert.equal(held[0]!.text, 'keep these words');
+        assert.ok(context(framework).texts.some((t) => t.includes('[prose-routing]') && t.includes(held[0]!.id)));
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it('an unknown ' + mode + ' delivery is not offered as a fresh bounce draft', async () => {
+      const framework = await createFramework(mode);
+      try {
+        const routed = stubRegistry(framework, ['unknown']);
+        const agent = framework.getAgent('assistant')!;
+        const gateway = framework as unknown as {
+          deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+          deliverHybridProse(a: unknown, text: string, locus: null, allowLocus: boolean, hold: { notice: 'later' }): Promise<void>;
+        };
+        if (mode === 'explicit') await gateway.deliverProse(agent, '>>#alpha uncertain words', { notice: 'later' });
+        else await gateway.deliverHybridProse(agent, '>>>#alpha uncertain words', null, true, { notice: 'later' });
+        assert.deepEqual(routed, [{ text: 'uncertain words', locus: 'chan-alpha' }], 'the uncertain attempt was made');
+        assert.deepEqual(draftsOf(framework).open('assistant'), []);
+        assert.equal(context(framework).bounces, 0);
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
+  it('a thrown explicit unsent delivery re-bounces the authored body with its unresolved attempt risk', async () => {
+    const framework = await createFramework();
+    try {
+      stubRegistry(framework, ['throw']);
+      const store = draftsOf(framework);
+      const original = store.hold('assistant', [{
+        text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 },
+      }], 'bounced').held[0]!;
+      const gateway = framework as unknown as {
+        deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      };
+      await gateway.deliverProse(framework.getAgent('assistant')!, '>>#alpha {{unsent}} plus a line', { notice: 'later' });
+      const copy = store.open('assistant').find((d) => d.id !== original.id)!;
+      assert.ok(copy, 'the failed envelope is retained');
+      assert.equal(copy.text, 'earlier words plus a line');
+      assert.equal(copy.inheritedRisk?.draftId, original.id);
+      assert.equal(draftState(copy), 'unconfirmed', 'a fresh draft cannot erase its source attempt risk');
+    } finally {
+      await framework.stop();
+    }
+  });
 
   it('a round that calls skip_reply keeps its unprefixed prose private: nothing delivered, bounced, retained or woken for', async () => {
     membrane.pushResponse(createMockResponse([
@@ -392,6 +464,14 @@ describe('explicit prose routing', () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
     const skip = answerSkipReply(framework);
+    const retained: Array<NonNullable<ReturnType<DraftsView['latestBounce']>>> = [];
+    let turns = 0;
+    framework.onTrace((event) => {
+      if (event.type === 'inference:started' && ++turns === 2) {
+        const draft = draftsOf(framework).latestBounce('assistant');
+        if (draft) retained.push(draft);
+      }
+    });
     feedTurn(framework, 2, [
       { type: 'text', text: '>>skip_reply {{unsent}}' },
       { type: 'tool_use', id: 'sr4', name: 'skip_reply', input: {} },
@@ -402,6 +482,9 @@ describe('explicit prose routing', () => {
 
     assert.equal(skip.calls, 1, 'the bounce wake ran the skip_reply round');
     assert.equal(routed.length, 0);
+    assert.equal(retained.length, 1, 'turn one really held a bounce before the dismissal');
+    assert.equal(retained[0]!.text, 'An answer with nowhere to go.');
+    assert.equal(draftState(draftsOf(framework).get('assistant', retained[0]!.id)!), 'dismissed');
     assert.equal(draftsOf(framework).latestBounce('assistant'), undefined, 'the bounced draft is set aside, as >>skip_reply {{unsent}} says');
 
     await framework.stop();

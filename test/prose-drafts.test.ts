@@ -583,6 +583,79 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it('through the real connection, unknown ' + mode + ' speech is marked but not held for an ordinary resend', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        h.command({ op: 'publish-mode', mode: 'no-receipt' });
+        await h.turn([createMockResponse([text((mode === 'explicit' ? '>>' : '>>>') + ROOM + ' uncertain words')])]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['uncertain words'], 'one request may already have posted');
+        assert.deepEqual(h.drafts(), [], 'uncertainty is not a fresh resendable bounce');
+        const markers = h.texts().filter((t) => t.startsWith('[discord-send-failed]'));
+        assert.equal(markers.length, 1);
+        assert.match(markers[0]!, /was not confirmed.*may or may not have been posted/);
+        assert.ok(!h.messages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce'), 'no bounce notice offers a retry');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  for (const privateThink of [false, true]) {
+    it('hybrid skip_reply unsent ' + (privateThink ? 'stays uninterpreted beside a private think' : 'dismisses the bounce while keeping the round private'), async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        const original = h.store().hold('scout', [{ text: 'held bounce', source }], 'bounced').held[0]!;
+        assert.equal(draftState(original), 'held');
+        const blocks = [text('>>>skip_reply {{unsent}}'), call('skip1', 'skip_reply', {})];
+        if (privateThink) blocks.push(call('think1', 'think', { thought: 'private reasoning' }));
+        await h.turn([createMockResponse(blocks, 'tool_use'), createMockResponse([])]);
+        assert.equal(draftState(h.store().get('scout', original.id)!), privateThink ? 'held' : 'dismissed');
+        assert.deepEqual(h.publishes(), [], 'deliberate privacy posts nothing');
+        assert.equal(h.store().open('scout').length, privateThink ? 1 : 0, 'no fresh draft was made from private words');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('an empty completion waits for earlier queued speech and holds before writing their receipt', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    let release: (() => void) | undefined;
+    try {
+      const registry = (h.framework as unknown as { channelRegistry: { deliverSpeech: (...args: unknown[]) => Promise<unknown> } }).channelRegistry;
+      const deliver = registry.deliverSpeech.bind(registry);
+      let entered = false;
+      registry.deliverSpeech = async (...args: unknown[]) => {
+        if (args[1] === 'slow queued words') {
+          entered = true;
+          await new Promise<void>((resolve) => { release = resolve; });
+        }
+        return deliver(...args);
+      };
+      // Deliberately not rounds(): the last response has no prior content.
+      const running = h.turn([
+        createMockResponse([text('>>>' + ROOM + ' slow queued words'), call('list1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('held behind the slow delivery'), explicitSend('send1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      await h.until(() => entered && (h.membrane.lastStream?.receivedToolResults.length ?? 0) >= 2, 'both tool rounds behind the pending delivery');
+      assert.deepEqual(h.drafts(), [], 'the hold is still queued');
+      release!();
+      await running;
+      await h.until(() => h.publishes().some((p) => p.text === 'slow queued words') && h.drafts().length === 1, 'the earlier delivery and queued hold');
+      const draft = h.drafts()[0]!;
+      assert.equal(draft.text, 'held behind the slow delivery');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]'));
+      assert.ok(receipt, 'the completed turn receipts the queued work');
+      assert.ok(receipt.includes(ROOM), 'the delayed delivery is in the receipt');
+      assert.ok(receipt.includes(draft.id), 'so is the hold settled behind it');
+    } finally {
+      release?.();
+      await h.close();
+    }
+  });
+
   it('through the real connection, a server that never answers is unconfirmed once the request times out', async () => {
     const h = await harness({ requestTimeoutMs: 1_000 });
     try {
@@ -597,7 +670,7 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it("a silent turn's prose stays private beside a send: counted, never held or named", async () => {
+  it("a silent turn's prose stays private beside a send: never held, named or receipted", async () => {
     const h = await harness();
     try {
       await h.turn([
@@ -607,6 +680,7 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(h.drafts(), [], 'nothing was held as a draft');
       assert.ok(!h.texts().some((t) => t.includes('held as draft')), 'and no notice names one');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
+      assert.ok(!h.texts().some((t) => t.startsWith('[delivered]')), 'a silent turn receives no plain-speech receipt');
     } finally {
       await h.close();
     }

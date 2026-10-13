@@ -30,11 +30,12 @@ const log = (event, extra = {}) => {
 };
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
 const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
-const replyError = (id, message) => send({ jsonrpc: '2.0', id, error: { code: -32000, message } });
+const replyError = (id, message, data) => send({ jsonrpc: '2.0', id, error: { code: -32000, message, ...(data !== undefined ? { data } : {}) } });
 
 let nextId = 500;
 let processedCommands = 0;
 let publishMode = 'delivered';
+let publishErrorData;
 let posted = 0;
 const histories = new Map();
 
@@ -122,6 +123,7 @@ function pollCommands() {
       log('renamed', { channelId: c.channelId, label: c.label });
     } else if (c.op === 'publish-mode') {
       publishMode = c.mode;
+      publishErrorData = c.detail;
       log('publish-mode', { mode: c.mode });
     } else if (c.op === 'history') {
       histories.set(c.channelId, c.history);
@@ -202,7 +204,7 @@ rl.on('line', (line) => {
     }
     if (publishMode === 'error') {
       log('publish-error', { channelId, text });
-      if (msg.id !== undefined && msg.id !== null) replyError(msg.id, 'connector exploded');
+      if (msg.id !== undefined && msg.id !== null) replyError(msg.id, 'connector exploded', publishErrorData);
       return;
     }
     if (publishMode === 'not-delivered') {

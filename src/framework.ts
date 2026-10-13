@@ -351,9 +351,9 @@ const PROSE_ROUTING_HELP =
   '  immediately when this one ends, instead of pausing until the next event.\n' +
   '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
   'Text without a destination is not delivered: it is held as a draft, and a notice\n' +
-  'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest held text\n' +
+  'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest bounce draft\n' +
   'unchanged, or use the drafts tool to list, resend or dismiss any draft by id.\n' +
-  '">>skip_reply {{unsent}}" sets the latest one aside. Send tools (send_message,\n' +
+  '">>skip_reply {{unsent}}" sets the latest bounce aside. Send tools (send_message,\n' +
   'send_dm, …) are unaffected.';
 
 const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
@@ -9059,6 +9059,16 @@ export class AgentFramework {
   ): void {
     if (segments.length === 0) return;
     if (cause === 'private' || privateThink) {
+      // Match explicit mode: skip_reply keeps publication private but can
+      // still set a bounce aside. A private-think round interprets no text.
+      if (cause === 'private' && !privateThink && agent.proseRouting === 'hybrid') {
+        for (const segment of segments) {
+          for (const envelope of splitHybridEnvelopes(segment)) {
+            const parsed = parseHybridProsePrefix(envelope);
+            if (parsed.kind === 'private' && parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+          }
+        }
+      }
       this.turnProsePrivate.set(agent.name, (this.turnProsePrivate.get(agent.name) ?? 0) + segments.length);
       return;
     }
@@ -10297,6 +10307,7 @@ export class AgentFramework {
       body = rawText;
     }
 
+    const envelopeBody = body;
     const usedClipboard = body.includes('{{unsent}}');
     const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
     if (unsent.refused) return;
@@ -10310,9 +10321,15 @@ export class AgentFramework {
 
     try {
       const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);
-      if (outcome.status === 'delivered') this.proseBounceStreaks.delete(name);
+      if (outcome.status === 'delivered') {
+        this.proseBounceStreaks.delete(name);
+      } else if (outcome.status === 'failed') {
+        // Unknown deliveries are marker-only: offering a fresh draft would
+        // invite a duplicate. Keep the authored body for the re-bounce rule.
+        this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>', hold);
+      }
     } catch (err) {
-      console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
+      this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>', hold);
     }
   }
 
@@ -11947,6 +11964,11 @@ export class AgentFramework {
               );
             }
 
+            // Queued deliveries and hybrid holds belong to this turn even
+            // when its final response is empty. Settle them before final
+            // dispatch, the receipt and the turn-end draft settlement.
+            await turnSpeechChain;
+
             // Host-owned output routing (see LOCUS-ROUTING-DESIGN). On a
             // text-only turn (no tool calls => speechContent populated),
             // publish the agent's speech to the conversational locus — the
@@ -11960,9 +11982,6 @@ export class AgentFramework {
               const speechSegments = finalSpeechSegments;
               const textOnlyHold = { round: draftRound + 1, notice: 'later' as const };
               if (speechSegments.length > 0) {
-                // A turn resumed after its earlier rounds delivers after
-                // them: their queued deliveries are this chain's.
-                await turnSpeechChain;
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(agent.name, speechSegments.length);
@@ -12044,11 +12063,6 @@ export class AgentFramework {
               const runs = finalRuns;
               const segments = finalSegments;
 
-              // Preserve in-channel ordering: everything enqueued live must
-              // land before the trailing prose. Awaited even when silenced —
-              // the chain may still be flushing earlier rounds' posts.
-              await turnSpeechChain;
-
               if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
@@ -12118,9 +12132,9 @@ export class AgentFramework {
             // doesn't depend on the status field, so it correctly runs after.
 
             // Logical turn end (normal completion): drop the `[delivered]`
-            // receipt. All deliveries are settled — the live chain was
-            // awaited before trailing dispatch, and trailing/text-only
-            // segments were awaited in-loop. Locus mode only; explicit-mode
+            // receipt. Queued deliveries and holds settled before final
+            // dispatch; trailing/text-only segments were awaited in-loop.
+            // Locus and hybrid modes only; explicit-mode
             // envelopes acknowledge themselves through the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent);
@@ -14915,7 +14929,7 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen, outcome }) => {
+        onRouteFailure: ({ channelId, reason, textLen, outcome, detail }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
@@ -14934,13 +14948,14 @@ export class AgentFramework {
               'user',
               [{
                 type: 'text',
-                text: outcome === 'unknown'
+                text: (outcome === 'unknown'
                   // A request went out and no valid receipt came back: it may
                   // have been posted (in part or whole). Never claim it wasn't.
                   ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the channel before sending it again. It is saved in your archive.`
-                  : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
+                  : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`) +
+                  (detail !== undefined ? ` Connector detail: ${detail}` : ''),
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason, ...(outcome ? { outcome } : {}) },
+              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason, ...(outcome ? { outcome } : {}), ...(detail !== undefined ? { detail } : {}) },
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);

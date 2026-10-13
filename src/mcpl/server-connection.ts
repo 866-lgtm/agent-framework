@@ -1077,7 +1077,18 @@ export class McplServerConnection extends EventEmitter {
         pending.timer.unref?.();
       }
       this.pendingRequests.set(id, pending);
-      this.transport!.writeLine(JSON.stringify(request));
+      try {
+        this.transport!.writeLine(JSON.stringify(request));
+      } catch (err) {
+        // A synchronous write rejection sent no request. Remove its pending
+        // state and watchdog before reporting that it is safe to retry.
+        this.pendingRequests.delete(id);
+        if (pending.timer) clearTimeout(pending.timer);
+        reject(new McplRequestError(
+          `Cannot send ${method} to MCPL server "${this.id}": ${err instanceof Error ? err.message : String(err)}`,
+          'not-sent',
+        ));
+      }
     });
   }
 
