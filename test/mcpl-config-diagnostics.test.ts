@@ -361,7 +361,7 @@ test("a refused initial policy's reason is recorded without the server's configu
   assert.ok(!capture.lines.join('\n').includes(secret));
 });
 
-test("the initial policy's other records keep the credentials out too, with the configuration as it was when the request went", async () => {
+test("the initial policy's other records keep the credentials out too", async () => {
   const secret = 'srvSecret0123456789';
   const run = async (answer: () => Promise<unknown>, mutate?: (config: McplServerConfig) => void) => {
     const fw = Object.create(AgentFramework.prototype) as any;
@@ -392,9 +392,8 @@ test("the initial policy's other records keep the credentials out too, with the 
   assert.ok(odd.lines.some((l) => l.includes('refused initial policy (no) — fallback: mcp-only')), odd.lines.join('\n'));
   // A degraded acceptance whose effect quotes the url.
   await run(async () => ({ accepted: true, mode: 'degraded', unavailableFeatures: [{ featureSet: 'fs', effect: `see ${secret}`, missingCapabilities: ['x'] }] }));
-  // The host replaces the url while the request waits: the record still
-  // knows the credential the request went with.
-  await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }), (config) => { (config as { url?: string }).url = 'wss://h/mcp/rotatedSecret0123456789'; });
+  // A refusal's reason, recorded with the derivation the operation began with.
+  await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }));
 });
 
 test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {

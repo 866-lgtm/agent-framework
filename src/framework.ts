@@ -14350,9 +14350,9 @@ export class AgentFramework {
     connection: McplServerConnection,
   ): Promise<void> {
     if (!connection.capabilities) return;
-    // The server's configuration as it is now, before any await: every
-    // record of what the server says below keeps it, whatever the host
-    // changes in the configuration meanwhile.
+    // Taken before any await, so every record of what the server says below
+    // uses one derivation, whatever becomes of the server meanwhile (removed,
+    // or replaced by a restart).
     const recorded = serverTextRedactor(config);
 
     // §5.4: compute the effective grant from the (config-masked)
@@ -14558,6 +14558,11 @@ export class AgentFramework {
    * same (or an updated) config. This actually respawns a stdio child —
    * unlike `reconnect: true`, which only retries after transport-level
    * failures. Throws if the server has no stored config and none is given.
+   *
+   * Treat a submitted configuration and its nested values as immutable for
+   * as long as the server uses them. Apply changed settings with
+   * `restartMcplServer(id, newConfig)`; use `accessProvider` for rotating
+   * credentials.
    */
   async restartMcplServer(
     id: string,

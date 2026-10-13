@@ -332,11 +332,12 @@ test('recorded server text: the token as a url carries it, credential-named env 
   // part of it, and no other (GIT_AUTHOR_NAME holds 'auth' inside a word).
   const env = cfg({ command: 'srv', env: {
     GITHUB_TOKEN: 'ghp_abcdef123456', API_KEY: 'k3y-abcdefgh', PGPASSWORD: 'pgpass-abcdefgh', ACCESSTOKEN: 'acc-abcdefgh12',
+    DB_PASS: 'dbpass-abcdefgh', SSH_KEY_PASSPHRASE: 'phrase-abcdefgh',
     PATH: '/usr/local/bin', GIT_AUTHOR_NAME: 'Somebody Longname', KEYBOARD_LAYOUT: 'dvorak-programmer', TOKENIZERS_PARALLELISM: 'parallel-false',
   } });
   assert.equal(
-    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
-    'auth redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
+    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 dbpass-abcdefgh phrase-abcdefgh /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
+    'auth redacted redacted redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
   // A short pair only where no letter or digit adjoins it; any other string
   // wherever it occurs, after a percent escape, an ANSI code or a JSON escape too.
   const pair = cfg({ url: 'https://h/api/s/pathSecret0123456789/mcp?v=2' });

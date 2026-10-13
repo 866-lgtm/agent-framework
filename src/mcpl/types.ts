@@ -211,6 +211,11 @@ export interface McplChannelCapabilities {
 /**
  * Configuration for connecting to a single MCPL server.
  * Provided in FrameworkConfig.mcplServers[].
+ *
+ * Treat a submitted configuration and its nested values as immutable for as
+ * long as the server uses them. Apply changed settings with
+ * `restartMcplServer(id, newConfig)`; use `accessProvider` for rotating
+ * credentials.
  */
 export interface McplServerConfig {
   /** Unique server identifier */

@@ -213,7 +213,7 @@ function asText(text: unknown): string {
 }
 
 /** A part of an environment variable's name that ends with a credential word. */
-const CREDENTIAL_NAME_PART = /(?:token|key|secret|password|passwd|auth|signature|credentials?)$/i;
+const CREDENTIAL_NAME_PART = /(?:token|key|secret|password|passwd|pass|passphrase|auth|signature|credentials?)$/i;
 
 /**
  * A credential provider's failure as a log line may show it: the error's
