@@ -6721,21 +6721,24 @@ export class AgentFramework {
    * Start awareness delivery after a branch move (a surgery, a switch, an
    * undo or redo) without the caller awaiting it. No operator response waits
    * for Discord to accept marks: the MCPL data-plane gate alone holds channel
-   * traffic until they are attempted. `syncDiscordAwarenessMarkers` installs
-   * that gate synchronously, before its first await, so calling this while a
-   * surgery still holds the store keeps MCPL-borne wakes behind the gate
-   * exactly as before. With no drain running, the drain starts in the same
-   * synchronous run (the first reaction request can be written before this
-   * returns); with one running, this generation's pass follows it
-   * (drainForGeneration). Either way delivery continues independently: the
-   * caller's response and any store reservation stop waiting on remote
-   * reactions. A wake that carries no channel traffic (a scheduler timer, a
-   * provider admission) may run during delivery. A failure is accounted by
-   * the gate itself: the current generation's failure recycles the
-   * connections, and a superseded one leaves that to the newer generation,
-   * whose own pass meets the same ledger. Here it is logged and raised as an
-   * ops alert, and the next sync, reconnect or start delivers what is still
-   * pending.
+   * traffic that arrives after it until they are attempted.
+   * `syncDiscordAwarenessMarkers` installs that gate synchronously, before
+   * its first await, so calling this while a surgery still holds the store
+   * puts the gate up before the store is released. With no drain running, the
+   * drain starts in the same synchronous run (the first reaction request can
+   * be written before this returns); with one running, this generation's pass
+   * follows it (drainForGeneration). Either way delivery continues
+   * independently: the caller's response and any store reservation stop
+   * waiting on remote reactions. A turn may run during delivery when its wake
+   * carries no channel traffic (a scheduler timer, a provider admission), and
+   * also when its channel traffic was admitted before the gate went up
+   * (queued when a surgery began, or arriving during its switch or fork): the
+   * surgery's store reservation, which used to hold such a turn through the
+   * drain, now ends once the gate is up. A failure is accounted by the gate
+   * itself: the current generation's failure recycles the connections, and a
+   * superseded one leaves that to the newer generation, whose own pass meets
+   * the same ledger. Here it is logged and raised as an ops alert, and the
+   * next sync, reconnect or start delivers what is still pending.
    *
    * @param after What moved the branch, for the log and the alert
    *   ("rollback", "branch switch", "undo" …).
@@ -14059,7 +14062,8 @@ export class AgentFramework {
 
   /**
    * Reconcile the durable ledger with Chronicle, then deliver every server's
-   * work, joining any drain still running.
+   * work. A drain still running is waited for and then followed by a fresh
+   * pass (drainForGeneration).
    */
   async syncDiscordAwarenessMarkers(_onlyServerId?: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
