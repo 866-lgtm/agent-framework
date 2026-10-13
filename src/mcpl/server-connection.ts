@@ -243,8 +243,8 @@ export class McplServerConnection extends EventEmitter {
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
-  /** The deadline a channels/publish request keeps when requestTimeoutMs is 0
-   *  (see sendChannelsPublish). */
+  /** The deadline a channels/publish or channels/open request keeps when
+   *  requestTimeoutMs is 0 (see sendChannelsPublish). */
   private publishDeadlineMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
   // Event buffering: control-plane traffic can be released independently from
@@ -754,9 +754,13 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.StateRollback, params as unknown as Record<string, unknown>) as Promise<StateRollbackResult>;
   }
 
-  /** Send `channels/open` request and await result. */
+  /** Send `channels/open` request and await result. It keeps a deadline as
+   *  channels/publish does: a delivery opens a closed channel before it
+   *  publishes, so an open that is never answered would hold the delivery,
+   *  and the turn that waits for it, for good. */
   sendChannelsOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
-    return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>) as Promise<ChannelsOpenResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsOpenResult>;
   }
 
   /** Send `channels/close` request and await result. */

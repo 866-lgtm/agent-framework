@@ -76,6 +76,21 @@ test('a connection lost while awaiting is no-response', async () => {
   await rejectsWith(connection.sendToolsCall('exit', {}), 'no-response');
 });
 
+test('closing the connection while a request awaits its answer rejects it as no-response', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 10_000 }), HOST_CAPS);
+  const pending = connection.sendToolsCall('stuck', {});
+  await connection.close();
+  await rejectsWith(pending, 'no-response');
+  connection = null;
+});
+
+test('channels/open keeps a deadline when requestTimeoutMs is 0, as channels/publish does', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 200;
+  const err = await rejectsWith(connection.sendChannelsOpen({ type: 'channel', address: { id: 'nowhere' } } as never), 'no-response');
+  assert.match(err.message, /did not respond to channels\/open/);
+});
+
 test('a request on a closed connection is not-sent', async () => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   await connection.close();

@@ -8,7 +8,8 @@
  * unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
- * the exact words until the resident resends or dismisses them.
+ * the exact words until the resident resends or dismisses them, or the
+ * retention below lets it go.
  *
  * The boundary is publication and agency, not visibility: a draft is never
  * published except by its resident's explicit resend (or `{{unsent}}`), and
@@ -28,11 +29,12 @@
  * rollback or branch move has left unnamed is named again.
  *
  * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
- * are always kept; an older one is let go once nothing has happened to it
- * (held, named, attempted, answered, dismissed) for KEEP_IDLE_MS. The words
- * stay in the resident's history either way. The journal checkpoints what
- * it keeps every CHECKPOINT_EVERY entries, so opening it replays only what
- * came after.
+ * are always kept; an older one, in any state, is let go at the journal's
+ * next checkpoint once nothing has happened to it (held, named, attempted,
+ * answered, dismissed) for KEEP_IDLE_MS. The journal checkpoints what it
+ * keeps every CHECKPOINT_EVERY entries, so opening it replays only what came
+ * after, and a resident whose drafts change rarely keeps its older ones
+ * until then. The words stay in the resident's history either way.
  *
  * A delivery attempt is journaled durably BEFORE its request leaves the
  * host, and its outcome after: an attempt with no recorded outcome (a crash
@@ -357,7 +359,10 @@ export class ProseDraftStore {
    * already written stand and the rest are reported as not held: their words
    * remain in the resident's history only. A draft whose record reached the
    * store before its write failed (its sync did) is in the reconciled
-   * journal, so it is held, and counted so.
+   * journal, so it is held, and counted so. When the store's append itself
+   * threw, the record may still be in its log: the draft is reported as not
+   * held, and the journal refuses further writes until a reload, which
+   * replays it as held if it is there.
    */
   hold(
     agent: string,

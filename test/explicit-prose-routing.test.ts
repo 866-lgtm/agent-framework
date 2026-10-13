@@ -326,6 +326,53 @@ describe('explicit prose routing', () => {
     });
   }
 
+  it('{{unsent}} that names no held draft sends nothing, and holds the envelope\'s other words', async () => {
+    const framework = await createFramework();
+    try {
+      const routed = stubRegistry(framework);
+      const store = draftsOf(framework);
+      const gateway = framework as unknown as {
+        deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      };
+      const agent = framework.getAgent('assistant')!;
+      // Nothing was ever bounced: a bare {{unsent}} sends nothing and says so.
+      await gateway.deliverProse(agent, '>>#alpha {{unsent}}', { notice: 'later' });
+      assert.deepEqual(routed, [], 'nothing is sent');
+      assert.deepEqual(store.open('assistant'), [], 'and nothing is held');
+      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing] {{unsent}} names no held draft') && t.includes('nothing was sent')));
+      // With words of its own, those are held as a bounce draft rather than
+      // posted as a fragment.
+      await gateway.deliverProse(agent, '>>#alpha Here it is again: {{unsent}}', { notice: 'later' });
+      assert.deepEqual(routed, [], 'still nothing is sent');
+      const [held] = store.open('assistant');
+      assert.equal(held?.text, 'Here it is again:');
+      assert.equal(store.latestBounce('assistant')?.id, held?.id);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('{{unsent}} after its draft was sent names nothing, so the envelope sends nothing', async () => {
+    const framework = await createFramework();
+    try {
+      const routed = stubRegistry(framework);
+      const store = draftsOf(framework);
+      const gateway = framework as unknown as {
+        deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      };
+      const agent = framework.getAgent('assistant')!;
+      await gateway.deliverProse(agent, '>>#nowhere the words', { notice: 'later' });
+      const bounce = store.latestBounce('assistant')!;
+      assert.equal(bounce.text, 'the words');
+      await gateway.deliverProse(agent, '>>#alpha {{unsent}}', { notice: 'later' });
+      assert.deepEqual(routed.map((r) => r.text), ['the words'], 'the first {{unsent}} sends the bounce');
+      await gateway.deliverProse(agent, '>>#alpha {{unsent}}', { notice: 'later' });
+      assert.deepEqual(routed.map((r) => r.text), ['the words'], 'a second one, with the draft delivered, sends nothing');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('a thrown explicit unsent delivery re-bounces the authored body with its unresolved attempt risk', async () => {
     const framework = await createFramework();
     try {

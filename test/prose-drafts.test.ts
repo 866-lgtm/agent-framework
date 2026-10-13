@@ -584,6 +584,24 @@ describe('held prose drafts, end to end', () => {
   });
 
   for (const mode of ['explicit', 'hybrid'] as const) {
+    it('through the real connection, failed ' + mode + ' speech is held as a bounce draft with one notice, not a second marker', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        h.command({ op: 'publish-mode', mode: 'not-delivered' });
+        await h.turn([createMockResponse([text((mode === 'explicit' ? '>>' : '>>>') + ROOM + ' refused words')])]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['refused words']);
+        const [draft] = h.drafts();
+        assert.ok(draft, 'the words are held');
+        assert.equal(draft!.text, 'refused words');
+        assert.ok(h.texts().some((t) => t.startsWith('[prose-routing]') && t.includes(`It is held as draft ${draft!.id}`)), 'the bounce notice names it');
+        assert.deepEqual(h.texts().filter((t) => t.startsWith('[discord-send-failed]')), [], 'no second notice for the same failure');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  for (const mode of ['explicit', 'hybrid'] as const) {
     it('through the real connection, unknown ' + mode + ' speech is marked but not held for an ordinary resend', async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
       try {
@@ -778,9 +796,10 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours are unnamed on this branch of your history: /);
-      assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); held .*"orphaned words"\)/);
-      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*"half-sent words"`));
+      assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); explicit send in the same round\)/);
+      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in the same round\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
+      assert.ok(!notice.includes('orphaned words') && !notice.includes('half-sent words'), `the notice quotes no draft's words: ${notice}`);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'named once');
     } finally {
@@ -788,18 +807,19 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it('the catch-up names every draft it marks: the newest eight with previews, the rest by id', async () => {
+  it('the catch-up names every draft it marks: the newest eight with their state, the rest by id, and no words', async () => {
     const h = await harness();
     try {
       const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}`, source }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 10 held drafts of yours are unnamed on this branch of your history: /);
-      // Newest first: orphan 9 down to orphan 2 with their previews, then the
-      // two oldest by id alone.
-      const previews = [...notice.matchAll(/"(orphan \d)"/g)].map((m) => m[1]);
-      assert.deepEqual(previews, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => `orphan ${i}`));
+      // Newest first: the eight newest with their state, then the two oldest
+      // by id alone. No draft's words appear.
+      const named = [...notice.matchAll(/(d-[a-z2-9]{5}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
+      assert.deepEqual(named, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => held[i]!.id));
       assert.ok(notice.includes(` · and 2 more: ${held[1]!.id}, ${held[0]!.id}.`), notice);
+      assert.ok(!/orphan \d/.test(notice), `the notice quotes no draft's words: ${notice}`);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'all ten named, so none is named again');
     } finally {
@@ -826,7 +846,8 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`a held draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\);.*"words a send held back"`));
+      assert.match(catchUps()[0]!, new RegExp(`a held draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
+      assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
     } finally {

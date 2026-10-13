@@ -3172,7 +3172,7 @@ export class ChannelRegistry {
         return {
           status: 'failed',
           destination,
-          reason: `channel is closed and open failed: ${(err as Error).message}`,
+          reason: `channel is closed and open failed: ${connectorText(err instanceof Error ? err.message : String(err))}`,
           at: at(),
         };
       }
@@ -3186,7 +3186,8 @@ export class ChannelRegistry {
         content: [{ type: 'text', text }],
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // The connector's error message is its own words: bounded, as its data is.
+      const message = connectorText(err instanceof Error ? err.message : String(err));
       // Only a request that never left the host proves nothing was posted.
       // An error response may follow a partial post (a multi-part send whose
       // later part failed), so it is unknown, with the connector's own words
@@ -3258,6 +3259,10 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
+    /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
+     *  draft with its own notice, so no failure marker is written for it.
+     *  An `unknown` outcome still gets its marker. */
+    opts?: { heldOnFailure?: boolean },
   ): Promise<PublishOutcome> {
     const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
@@ -3273,7 +3278,9 @@ export class ChannelRegistry {
         outcome: status,
         ...(detail !== undefined ? { detail } : {}),
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}) });
+      if (status === 'unknown' || !opts?.heldOnFailure) {
+        this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}) });
+      }
       return outcome;
     };
 

@@ -41,7 +41,9 @@
   counts as named while a message naming it is on the current branch, so one
   no notice reached (a crash, an aborted turn), or whose notices a rollback
   or branch move took away, is named at the next turn's start: every such
-  draft by id, the newest eight with a preview.
+  draft by id, the newest eight with its state and why it was held. Notices
+  name drafts and say how to resend or dismiss them, and quote none of their
+  words; the `drafts` tool's `list` and `read` show the words.
 - A draft is never published except by its resident's explicit resend (or
   `{{unsent}}`), and only that resident can list or act on it. Its notices go
   into the resident's own history, which residents sharing one message slot

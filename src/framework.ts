@@ -9044,8 +9044,8 @@ export class AgentFramework {
 
   /**
    * Silenced plain speech: an explicit send holds it as resendable drafts; a
-   * deliberate silence (skip_reply, a silent turn, a same-round private
-   * think in a native round, where that policy applies) keeps it private —
+   * deliberate silence (skip_reply, a silent turn, or a private think in
+   * the same tool round, where that policy applies) keeps it private —
    * counted for the receipt, never drafted. `segments` are the runs exactly
    * as written (splitProseRuns), so a draft keeps the resident's words byte
    * for byte.
@@ -9249,8 +9249,7 @@ export class AgentFramework {
       `[drafts] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
       `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
-      `Nothing publishes drafts but your own resend, and they stay until you act: ${resend.join('; ')}; ` +
-      `drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
+      `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
     );
   }
 
@@ -9259,6 +9258,7 @@ export class AgentFramework {
     return formatZonedDateTime(t, this.timeZone).replace(/:\d\d\.\d{3}/, '');
   }
 
+  /** A draft's opening words, for the drafts tool's listing only. */
   private static draftPreview(text: string, max = 80): string {
     const flat = text.replace(/\s+/g, ' ').trim();
     return JSON.stringify(flat.length > max ? `${flat.slice(0, max)}…` : flat);
@@ -9338,15 +9338,16 @@ export class AgentFramework {
    * compile, any open drafts no notice on the current branch names: none
    * reached the history (a crash, an aborted turn), or a rollback or branch
    * move took the notices away. Every draft it marks is named by id, newest
-   * first: the newest eight with their state and a preview, the rest by id.
+   * first: the newest eight with their state and why each was held, the rest
+   * by id. Like every notice, it quotes none of their words; the drafts tool
+   * shows them.
    */
   private noticeUnnoticedDrafts(agent: Agent): void {
     const cm = agent.getContextManager();
     const pending = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null);
     if (pending.length === 0) return;
     const shown = pending.slice(0, 8).map((d) =>
-      `${d.id} (${this.draftStateText(d)}; held ${this.draftTime(d.heldAt)}, ` +
-      `${AgentFramework.DRAFT_REASON_SHORT[d.reason]}, ${d.text.length} chars: ${AgentFramework.draftPreview(d.text, 60)})`);
+      `${d.id} (${this.draftStateText(d)}; ${AgentFramework.DRAFT_REASON_SHORT[d.reason]})`);
     const rest = pending.slice(shown.length).map((d) => d.id);
     const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
     const text =
@@ -9996,9 +9997,32 @@ export class AgentFramework {
     agent: Agent,
     body: string,
     hold: { round?: number; notice: 'now' | 'later' },
+    prefix: '>>' | '>>>',
   ): { draft?: Draft; refused?: true } {
     const draft = this.proseDrafts.latestBounce(agent.name);
-    if (!draft) return {};
+    if (!draft) {
+      // {{unsent}} names nothing now: the latest bounce draft was sent, set
+      // aside or let go, or there never was one. Send nothing rather than a
+      // fragment. The envelope's own words, if it has any, are held as a
+      // bounce draft, with its notice; otherwise a short notice says so.
+      const own = body.replaceAll('{{unsent}}', '').trim();
+      const reason = '{{unsent}} names no held draft: your latest bounce draft has been sent, set aside or let go';
+      if (own) {
+        this.bounceProse(agent, own, reason, undefined, prefix, hold);
+      } else {
+        try {
+          this.addMessage(
+            'user',
+            [{ type: 'text', text: `[prose-routing] ${reason}, so nothing was sent. drafts(action: "list") shows your open drafts.` }],
+            { system: true, kind: 'prose-bounce' },
+            { forAgent: agent.name },
+          );
+        } catch (err) {
+          console.error('[drafts] empty-unsent notice failed:', err);
+        }
+      }
+      return { refused: true };
+    }
     const key = `${agent.name}\u0000${draft.id}`;
     let why: string;
     let next: string;
@@ -10072,7 +10096,9 @@ export class AgentFramework {
     }
     let outcome: PublishOutcome;
     try {
-      outcome = await registry.deliverSpeech(agent.name, body, channelId);
+      // Both callers hold a failed delivery's words as a bounce draft, whose
+      // notice says what happened, so the registry writes no second marker.
+      outcome = await registry.deliverSpeech(agent.name, body, channelId, { heldOnFailure: true });
     } finally {
       if (flight) {
         this.draftsInFlight.delete(flight);
@@ -10149,7 +10175,7 @@ export class AgentFramework {
         }
         let body = parsed.body;
         const usedClipboard = body.includes('{{unsent}}');
-        const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
+        const unsent = usedClipboard ? this.takeUnsent(agent, body, hold, '>>>') : {};
         if (unsent.refused) {
           this.proseTargetPins.delete(agent.name);
           this.proseHybridSuppressed.set(agent.name, 'failed');
@@ -10309,7 +10335,7 @@ export class AgentFramework {
 
     const envelopeBody = body;
     const usedClipboard = body.includes('{{unsent}}');
-    const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
+    const unsent = usedClipboard ? this.takeUnsent(agent, body, hold, '>>') : {};
     if (unsent.refused) return;
     if (usedClipboard) {
       body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
@@ -11965,8 +11991,10 @@ export class AgentFramework {
             }
 
             // Queued deliveries and hybrid holds belong to this turn even
-            // when its final response is empty. Settle them before final
-            // dispatch, the receipt and the turn-end draft settlement.
+            // when its final response is empty. Settle them before the
+            // host's own final routing below, the receipt and the turn-end
+            // draft settlement. (The modules above hear the turn's speech
+            // itself; they publish nothing of the queue's.)
             await turnSpeechChain;
 
             // Host-owned output routing (see LOCUS-ROUTING-DESIGN). On a
