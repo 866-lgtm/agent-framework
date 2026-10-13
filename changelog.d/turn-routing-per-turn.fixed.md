@@ -12,16 +12,22 @@
   receipt is written, as before.
 - The agent's prose deliveries go out in the order they were written,
   across turns: every stream queues its deliveries behind the agent's
-  earlier ones, a fresh turn's included. A turn's text-only reply can
-  therefore wait for an earlier turn's posts, up to their request timeout.
+  earlier ones, a fresh turn's included (apart from a stream that a later
+  one replaced). A turn's reply, and its completion, can therefore wait for
+  an earlier turn's posts: up to their request timeout, or for good when
+  `requestTimeoutMs` is 0 and a post is never answered.
 - In explicit and hybrid mode, a ` !` continuation that an earlier round
   asked for now starts when a tool ends the turn, once that turn's
   deliveries have run, unless the framework has stopped or the agent has
-  been disposed by then. In explicit mode a turn that another event
+  been disposed by then (a dropped one is logged). In explicit mode a turn
+  that another event
   started meanwhile runs first. Before, hybrid mode started it only after
   the next turn, and explicit mode dropped it, or, when its delivery ran
   late, started it after the next turn.
-- In hybrid and locus mode, a turn whose last response is empty writes its
-  receipt, and checks for a continuation, after its last rounds' queued
-  deliveries. Before, those deliveries were never receipted, or were
-  counted in the next turn's receipt.
+- A turn that completes now waits for its queued deliveries before its
+  receipt and its continuation check, in every mode, whatever its last
+  response. Before, only a completion with final text waited, so in hybrid
+  and locus mode a stream whose last response was empty (a budget
+  restart's, say) wrote its receipt first: those deliveries were never
+  receipted, or were counted in the next turn's receipt. A ` !` they carried
+  was missed too.

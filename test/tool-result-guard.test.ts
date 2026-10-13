@@ -871,6 +871,65 @@ test("a fresh turn and its restart wait behind the earlier turn's speech chain",
   }
 });
 
+test("explicit: a restarted turn whose last response is empty checks for its ' !' after the earlier stream's queued delivery", { timeout: 15000 }, async () => {
+  // Stream one's round holds its first envelope's post, with a ' !' envelope
+  // queued behind it. The round crosses the budget, the turn restarts, and
+  // the restart's response is empty, so nothing but the completion's own
+  // wait orders the continuation check after that envelope.
+  const quiet = createMockResponse([
+    { type: 'text', text: '>>#alpha first\n>>#alpha ! second' },
+    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  quiet.usage = { inputTokens: 100, outputTokens: 5 };
+  const empty = createMockResponse([] as ContentBlock[], 'end_turn');
+  const after = createMockResponse([{ type: 'text', text: '>>skip_reply' }] as ContentBlock[], 'end_turn');
+  const h = await harness([[quiet], [empty], [after]], { proseRouting: 'explicit', maxStreamTokens: 20 });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const routed: string[] = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
+    resolveLocus: () => 'chan-locus',
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push(text);
+      if (text.trim() === 'first') await held;
+      return { delivered: true, channelId };
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  const internals = h.framework as unknown as {
+    requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void;
+  };
+  const check = internals.requestProseContinuation.bind(h.framework);
+  const seen: boolean[] = [];
+  internals.requestProseContinuation = (agent, routing) => {
+    seen.push(routing.continuation);
+    check(agent, routing);
+  };
+  try {
+    const run = h.run();
+    for (const end = Date.now() + 5000; h.membrane.requests.length < 2 && Date.now() < end;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(h.membrane.requests.length, 2, 'the turn restarted for its budget');
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(seen, [], 'no continuation check while the earlier post is held');
+    release();
+    await run;
+    for (const end = Date.now() + 5000; h.membrane.requests.length < 3 && Date.now() < end;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      await h.framework.runUntilIdle();
+    }
+    assert.deepEqual(routed.map((text) => text.trim()), ['first', 'second']);
+    assert.equal(seen[0], true, "the completion's check saw the ' !' the queued envelope set");
+    assert.equal(h.membrane.requests.length, 3, 'and the continuation ran');
+  } finally {
+    release();
+    await h.framework.stop();
+  }
+});
+
 test("hybrid: a restarted turn whose last response is empty writes its receipt after the earlier stream's queued delivery", { timeout: 15000 }, async () => {
   // Stream one names #alpha, and its post is held. Its round crosses the
   // budget, so the turn restarts, and the restart's response is empty.

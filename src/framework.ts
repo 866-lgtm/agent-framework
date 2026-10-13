@@ -8857,8 +8857,9 @@ export class AgentFramework {
   /**
    * A `!` continuation the turn asked for (`>>#x !`, `>>>#x !`): start another
    * turn now instead of pausing until the next external event. It reads the
-   * object of the turn that asked, once its deliveries have run, however the
-   * turn ended.
+   * object of the turn that asked, once its deliveries have run, when the
+   * turn completes or a tool ends it. (A turn that ends in an error or is
+   * abandoned by a quiesce asks for none.)
    */
   private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
     if (!routing.continuation) return;
@@ -8866,7 +8867,10 @@ export class AgentFramework {
     // An explicit turn's check can run after its stream has returned. A
     // stopped framework, or an agent no longer registered under its name (a
     // disposed fork or ephemeral run), takes no new turn from it.
-    if (this.providerAdmissionClosed || this.agents.get(agent.name) !== agent) return;
+    if (this.providerAdmissionClosed || this.agents.get(agent.name) !== agent) {
+      console.error(`[prose] ${agent.name}: '!' continuation dropped — ${this.providerAdmissionClosed ? 'the framework is stopping' : 'the agent is no longer registered'}`);
+      return;
+    }
     console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
     this.pendingRequests.push({
       agentName: agent.name,
@@ -9052,7 +9056,7 @@ export class AgentFramework {
     const parsed = parseProsePrefix(rawText);
     // A private round (one that called skip_reply) asks for no publication
     // or continuation, even when delivery runs after that turn has ended.
-    if (parsed.continueTurn && !round?.keepPrivate) routing.continuation = true;
+    if (parsed.continueTurn && !round.keepPrivate) routing.continuation = true;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -9063,7 +9067,7 @@ export class AgentFramework {
       return;
     }
 
-    if (round?.keepPrivate) {
+    if (round.keepPrivate) {
       // skip_reply's promise: "Any plain text you wrote this turn stays
       // private and is NOT posted". Every envelope of the round stays in the
       // context, as a >>skip_reply envelope does: it isn't sent, doesn't

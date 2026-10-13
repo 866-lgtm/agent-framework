@@ -625,6 +625,61 @@ describe('explicit prose routing', () => {
     });
   }
 
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it(`${mode}: a tool-ended turn's ' !' queued behind a held post starts its continuation once that post settles`, async () => {
+      const arrows = mode === 'explicit' ? '>>' : '>>>';
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: `${arrows}#alpha first\n${arrows}#alpha ! second` },
+        { type: 'tool_use', id: 'w1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'w2', name: 'skip_reply', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      answerSkipReply(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      feedTurn(framework, 2, [{ type: 'text', text: arrows + 'skip_reply' }] as ContentBlock[]);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      const route = registry.routeSpeech as (agent: string, text: string, locus?: string | null) => Promise<unknown>;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => { entered = resolve; });
+      registry.routeSpeech = async (agent: string, text: string, locus?: string | null) => {
+        const outcome = await route(agent, text, locus);
+        if (text.trim() === 'first') { entered(); await held; }
+        return outcome;
+      };
+      const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
+      const ended = nextTrace(framework, 'inference:turn_ended');
+      trigger(framework);
+      const running = framework.runUntilIdle();
+      try {
+        await within(reached, "the first envelope's post to start");
+        await within(ended.promise, 'skip_reply to end the turn');
+        assert.equal(turns, 1);
+        assert.ok(!internals.pendingRequests.some((r) => r.reason === 'prose-continuation'),
+          "no continuation while the ' !' envelope waits behind the held post");
+        release();
+        await within(running, 'the turn to settle');
+        for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          await framework.runUntilIdle();
+        }
+        assert.deepEqual(routed.map((r) => r.text.trim()), ['first', 'second']);
+        assert.equal(turns, 2, 'the continuation starts once the queued envelope has run');
+      } finally {
+        ended.dispose();
+        release();
+        await framework.stop();
+      }
+    });
+  }
+
   for (const boundary of ['stop', 'dispose'] as const) {
     it(`a tool-ended explicit turn's late ' !' takes no new turn after ${boundary === 'stop' ? 'stop()' : 'its agent is disposed'}`, async () => {
       membrane.pushResponse(createMockResponse([
@@ -640,20 +695,26 @@ describe('explicit prose routing', () => {
       const internals = framework as unknown as {
         channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
         proseSpeechChains: Map<string, Promise<void>>;
+        turnRouting: Map<string, RoutingState>;
         pendingRequests: InferenceRequest[];
         disposeConversationAgent(name: string): void;
       };
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => { entered = resolve; });
       internals.channelRegistry.routeSpeech = async () => {
+        entered();
         await held;
         return { delivered: true, channelId: 'chan-alpha' };
       };
       try {
         trigger(framework);
         await within(framework.runUntilIdle(), 'the tool-ended turn to settle');
-        const chain = internals.proseSpeechChains.get('assistant');
-        assert.ok(chain, "the turn's delivery is still queued");
+        await within(reached, 'the queued delivery to reach routing');
+        const chain = internals.proseSpeechChains.get('assistant')!;
+        const routing = internals.turnRouting.get('assistant')!;
+        assert.equal(routing.continuation, true, "the held delivery's ' !' is on its turn's object");
         assert.equal(internals.pendingRequests.length, 0);
         if (boundary === 'stop') await framework.stop();
         else internals.disposeConversationAgent('assistant');
@@ -662,6 +723,7 @@ describe('explicit prose routing', () => {
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(internals.pendingRequests.filter((r) => r.reason === 'prose-continuation').length, 0,
           'the late check adds no request');
+        assert.equal(routing.continuation, false, 'it took the flag and dropped it');
       } finally {
         release();
         await framework.stop();
