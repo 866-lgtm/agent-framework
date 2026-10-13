@@ -1170,20 +1170,21 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  * 413; when the history as a whole is too large, the shed doesn't help, and
  * the breaker stops at its rewind cap. The 413 arm takes both labels a 413
  * arrives under, invalid_request and context_length, because membrane's
- * label for a 413 differs by version and adapter. Other statuses keep the history, since shed history
- * can't be got back and no shed fixes them: a 404 is a model or an endpoint
- * that doesn't exist, and 405, 409, 410 and 415 are about the HTTP request
- * or the resource rather than the conversation.
+ * label for a 413 differs by version and adapter. Other statuses keep the
+ * history, since shed history can't be got back and no shed fixes them: a
+ * 404 is a model or an endpoint that doesn't exist, and 405, 409, 410 and
+ * 415 are about the HTTP request or the resource rather than the
+ * conversation.
  *
  * Which failures reach the gate with which label depends on the membrane:
  * - As membrane 0.5.86 classifies them: Anthropic files a 400 as
  *   invalid_request (after its context check) and its other 4xx as unknown.
  *   The chat adapters never file one as invalid_request, since they classify
  *   by the error's message text, and a context_length they file that way
- *   carries status 400 whatever the response's was. The raw-fetch Responses adapter files every status it doesn't
- *   list (404, 405, 409, 410, 413, 415, 422 …) as invalid_request, so it
- *   alone produces an invalid_request at 413 or 422, and no 0.5.86 adapter
- *   produces a context_length at 413.
+ *   carries status 400 whatever the response's was. The raw-fetch Responses
+ *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
+ *   415, 422 …) as invalid_request, so it alone produces an invalid_request
+ *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
  * - From membrane #56 (merged, not yet in a release), one table serves every
  *   adapter. Auth codes and context overflow are checked on a 400 or 422
  *   first, a 404 is invalid_request, a 413 is context_length, and other 4xx
@@ -12850,13 +12851,14 @@ export class AgentFramework {
    *      the provider refused the request's content or size (shedMayHelp:
    *      an `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
    *      `context_length` at 413, such as a provider's answer to a corrupted
-   *      tool_use/tool_result pairing or an oversized attachment), retrying the same context is likely to
-   *      fail the same way, and every new push event would wake the agent
-   *      onto that same history. At the hard-down threshold, automatically
-   *      quarantine: shed the newest complete exchange (the same forced-rewind
-   *      primitive `/unstick` uses — shedNewestTurn never orphans a
-   *      tool_use/thinking block) and retry, bounded by the same rewind cap so
-   *      the breaker can never eat the whole history.
+   *      tool_use/tool_result pairing or an oversized attachment), retrying
+   *      the same context is likely to fail the same way, and every new push
+   *      event would wake the agent onto that same history. At the hard-down
+   *      threshold, automatically quarantine: shed the newest complete
+   *      exchange (the same forced-rewind primitive `/unstick` uses —
+   *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
+   *      bounded by the same rewind cap so the breaker can never eat the
+   *      whole history.
    */
   /**
    * Live health snapshot for /healthz and doctor tooling: gate state, queued

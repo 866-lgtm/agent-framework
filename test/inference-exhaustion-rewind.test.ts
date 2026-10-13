@@ -194,7 +194,7 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
 test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', () => {
   const missingModel = makeHarness();
   const alerts: any[] = [];
-  missingModel.fw.traceListeners.push((e: any) => { if (e.type === 'ops:alert') alerts.push(e); });
+  missingModel.fw.onTrace((e: any) => { if (e.type === 'ops:alert') alerts.push(e); });
   try {
     for (let i = 0; i < 5; i++) {
       missingModel.fw.noteInferenceExhausted('cairn', '404 model: claude-typo not found', false, 'invalid_request',
