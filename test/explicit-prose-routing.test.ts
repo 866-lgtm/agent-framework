@@ -354,7 +354,7 @@ describe('explicit prose routing', () => {
 
 
   type RoutingState = {
-    pin?: string; destination: string | null; hybridHold: boolean; continuation: boolean;
+    pin?: string; destination: string | null; hybridHold: boolean; continuation: { requested: boolean };
     deliveries: string[]; suppressed: number;
   };
 
@@ -512,7 +512,7 @@ describe('explicit prose routing', () => {
       appendProseDeliveryReceipt(agent: unknown, routing: RoutingState): void;
     };
     const agent = framework.getAgent('assistant')!;
-    const earlier: RoutingState = { destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0 };
+    const earlier: RoutingState = { destination: null, hybridHold: false, continuation: { requested: false }, deliveries: [], suppressed: 0 };
     const next: RoutingState = { ...earlier, deliveries: [] };
     gateway.turnRouting.set('assistant', earlier);
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
@@ -568,15 +568,15 @@ describe('explicit prose routing', () => {
     await withQueuedTurns('explicit', '>>#alpha ! late', [
       createMockResponse([{ type: 'text', text: '>>#cafe next' }]),
     ], async ({ earlier, next, turns, release, drain }) => {
-      assert.equal(earlier.continuation, false, 'the continuation has not run before release');
+      assert.equal(earlier.continuation.requested, false, 'the continuation has not run before release');
       release();
       for (const end = Date.now() + 5000; turns() < 3 && Date.now() < end;) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
       }
       await drain();
       assert.equal(turns(), 3, 'the continuation starts its own turn, once');
-      assert.equal(earlier.continuation, false, "the earlier turn's request was taken from its own object");
-      assert.equal(next.continuation, false, 'the next turn never receives that continuation');
+      assert.equal(earlier.continuation.requested, false, "the earlier turn's request was taken from its own object");
+      assert.equal(next.continuation.requested, false, 'the next turn never receives that continuation');
     });
   });
 
@@ -700,10 +700,10 @@ describe('explicit prose routing', () => {
         // The turn's earlier stream asked for a continuation, or will once
         // its queued delivery runs; the turn goes on in a re-inference, which
         // starts a new stream with a fresh routing state.
-        const earlier: RoutingState = { destination: null, hybridHold: false, continuation: when === 'already set', deliveries: [], suppressed: 0 };
+        const earlier: RoutingState = { destination: null, hybridHold: false, continuation: { requested: when === 'already set' }, deliveries: [], suppressed: 0 };
         internals.turnRouting.set('assistant', earlier);
         if (when === 'set late') {
-          internals.proseSpeechChains.set('assistant', held.then(() => { earlier.continuation = true; }));
+          internals.proseSpeechChains.set('assistant', held.then(() => { earlier.continuation.requested = true; }));
         }
         internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
         const running = framework.runUntilIdle();
@@ -711,7 +711,7 @@ describe('explicit prose routing', () => {
           for (const end = Date.now() + 5000; turns < 1 && Date.now() < end;) {
             await new Promise<void>((resolve) => setTimeout(resolve, 5));
           }
-          assert.equal(earlier.continuation, false, 'the earlier delivery has not run as the re-inference starts');
+          assert.equal(earlier.continuation.requested, false, 'the earlier delivery has not run as the re-inference starts');
           release();
         }
         await within(running, 'the re-inference to settle');
@@ -721,13 +721,93 @@ describe('explicit prose routing', () => {
         }
         assert.deepEqual(routed.map((r) => r.text.trim()), ['carrying on']);
         assert.equal(turns, 2, 'the re-inference completes, then the continuation it carried starts');
-        assert.equal(earlier.continuation, false, "the check took the earlier stream's flag");
+        assert.equal(earlier.continuation.requested, false, "the check took the earlier stream's flag");
       } finally {
         release();
         await framework.stop();
       }
     });
   }
+
+  it("hybrid: an error retry keeps a ' !' whose envelope is delivered after the retry starts", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha first\n>>>#alpha ! second' },
+      { type: 'tool_use', id: 'retry-held', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    const internals = framework as unknown as {
+      proseSpeechChains: Map<string, Promise<void>>;
+      channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const entered = new Promise<void>((resolve) => { reached = resolve; });
+    const route = internals.channelRegistry.routeSpeech;
+    internals.channelRegistry.routeSpeech = async (...args: unknown[]) => {
+      const result = await route(...args);
+      if (String(args[1]).trim() === 'first') { reached(); await held; }
+      return result;
+    };
+    let firstChain: Promise<void> | undefined;
+    let restarted!: () => void;
+    const retryStarted = new Promise<void>((resolve) => { restarted = resolve; });
+    let starts = 0;
+    framework.onTrace((event) => {
+      if (event.type === 'inference:failed') firstChain = internals.proseSpeechChains.get('assistant');
+      if (event.type === 'inference:started') {
+        starts++;
+        if (starts === 2) {
+          membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply retry done' }]));
+          restarted();
+        }
+        if (starts === 3) membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply continuation done' }]));
+      }
+    });
+    // The first stream ends in a retryable error instead of completing; the
+    // retry's own end waits for the first stream's queued deliveries, so the
+    // held ' !' envelope runs after the retry has started.
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const index = ++streams;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && index === 1) {
+            yield { type: 'error' as const, error: new Error('synthetic transient stream error') };
+            return;
+          }
+          if (event.type === 'complete' && index === 2) {
+            assert.ok(firstChain, 'the first stream queued a delivery chain');
+            await firstChain;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    let running: Promise<void> | undefined;
+    try {
+      trigger(framework);
+      running = framework.runUntilIdle();
+      void running.catch(() => {});
+      await within(entered, 'the held first post');
+      await within(retryStarted, 'the error retry to start', 10000);
+      assert.equal(starts, 2);
+      release();
+      await within(running, 'the retry and continuation to finish', 10000);
+      assert.deepEqual(routed.map((r) => r.text.trim()), ['first', 'second']);
+      assert.equal(membrane.calls.length, 3, "the late ' !' survives the error retry and starts a continuation");
+    } finally {
+      release();
+      if (running) await running;
+      await framework.stop();
+    }
+  });
 
   for (const boundary of ['stop', 'dispose'] as const) {
     it(`a tool-ended explicit turn's late ' !' takes no new turn after ${boundary === 'stop' ? 'stop()' : 'its agent is disposed'}`, async () => {
@@ -763,7 +843,7 @@ describe('explicit prose routing', () => {
         await within(reached, 'the queued delivery to reach routing');
         const chain = internals.proseSpeechChains.get('assistant')!;
         const routing = internals.turnRouting.get('assistant')!;
-        assert.equal(routing.continuation, true, "the held delivery's ' !' is on its turn's object");
+        assert.equal(routing.continuation.requested, true, "the held delivery's ' !' is on its turn's object");
         assert.equal(internals.pendingRequests.length, 0);
         if (boundary === 'stop') await framework.stop();
         else internals.disposeConversationAgent('assistant');
@@ -772,7 +852,7 @@ describe('explicit prose routing', () => {
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(internals.pendingRequests.filter((r) => r.reason === 'prose-continuation').length, 0,
           'the late check adds no request');
-        assert.equal(routing.continuation, false, 'it took the flag and dropped it');
+        assert.equal(routing.continuation.requested, false, 'it took the flag and dropped it');
       } finally {
         release();
         await framework.stop();
@@ -819,7 +899,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const internals = framework as unknown as {
       deliverProse(agent: unknown, text: string, round?: { keepPrivate?: boolean }): Promise<void>;
-      turnRouting: Map<string, { continuation: boolean }>;
+      turnRouting: Map<string, { continuation: { requested: boolean } }>;
     };
     const agent = framework.getAgent('assistant')!;
 
@@ -827,12 +907,12 @@ describe('explicit prose routing', () => {
     // so the round's delivery can run once the next turn has begun.
     await internals.deliverProse(agent, '>>#alpha ! kept private', { keepPrivate: true });
     assert.equal(routed.length, 0, 'nothing is delivered');
-    assert.equal(internals.turnRouting.get('assistant')?.continuation ?? false, false, 'and no continuation is asked for');
+    assert.equal(internals.turnRouting.get('assistant')?.continuation.requested ?? false, false, 'and no continuation is asked for');
 
     // The same envelope outside a private round asks for one.
     await internals.deliverProse(agent, '>>#alpha ! sent');
     assert.equal(routed.length, 1);
-    assert.equal(internals.turnRouting.get('assistant')?.continuation, true);
+    assert.equal(internals.turnRouting.get('assistant')?.continuation.requested, true);
 
     await framework.stop();
   });
@@ -935,7 +1015,7 @@ describe('explicit prose routing', () => {
       for (const segments of rounds) {
         for (const start of [null, 'chan-alpha']) {
           internals.turnRouting.set('assistant', { pin: start ?? undefined, destination: null, hybridHold: false,
-            continuation: false, deliveries: [], suppressed: 0 });
+            continuation: { requested: false }, deliveries: [], suppressed: 0 });
           for (const segment of segments) await internals.deliverProse(agent, segment);
           const admitted = segments.flatMap((segment) => internals.admitProse(segment));
           assert.equal(internals.roundDestination(start, admitted), internals.turnRouting.get('assistant')?.pin ?? null,
@@ -961,7 +1041,7 @@ describe('explicit prose routing', () => {
     try {
       for (const text of cases) {
         routed.length = 0;
-        const queued: RoutingState = { destination: null, hybridHold: false, continuation: false,
+        const queued: RoutingState = { destination: null, hybridHold: false, continuation: { requested: false },
           deliveries: [], suppressed: 0 };
         const live: RoutingState = { ...queued, deliveries: [] };
         gateway.turnRouting.set('assistant', live);
@@ -990,7 +1070,7 @@ describe('explicit prose routing', () => {
     try {
       for (const prefix of ['>>>', '>>> ', '>>>\t']) {
         routed.length = 0;
-        const queued: RoutingState = { destination: null, hybridHold: false, continuation: false,
+        const queued: RoutingState = { destination: null, hybridHold: false, continuation: { requested: false },
           deliveries: [], suppressed: 0 };
         const live: RoutingState = { ...queued, deliveries: [] };
         gateway.turnRouting.set('assistant', live);

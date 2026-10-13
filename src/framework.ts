@@ -540,23 +540,22 @@ interface TurnRouting {
   destination: string | null;
   /** Hybrid: held back after a malformed or unresolved envelope, until a later `>>>` names a target. */
   hybridHold: boolean;
-  /** The turn asked for a `!` continuation. */
-  continuation: boolean;
+  /**
+   * Whether the turn asked for a `!` continuation. A holder, so that a
+   * framework retry or a re-inference after unstreamed tool results, which
+   * beginAgentTurn starts with fresh routing, can share it with the stream
+   * it follows: a ` !` asked for there still stands, even when its delivery
+   * runs after the new stream began.
+   */
+  continuation: { requested: boolean };
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: string[];
   /** Plain-prose segments this turn suppressed, reported by its receipt. */
   suppressed: number;
-  /**
-   * The routing of the stream this one followed in the same logical turn,
-   * when beginAgentTurn starts that turn afresh (a framework retry, or a
-   * re-inference after unstreamed tool results): a ` !` asked for there
-   * still stands, even when its delivery runs after this stream began.
-   */
-  carriedFrom?: TurnRouting;
 }
 
 function freshTurnRouting(): TurnRouting {
-  return { destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0 };
+  return { destination: null, hybridHold: false, continuation: { requested: false }, deliveries: [], suppressed: 0 };
 }
 
 /** How a round's prose is delivered: kept private, and under which turn's routing. */
@@ -8869,17 +8868,11 @@ export class AgentFramework {
    * abandoned by a quiesce asks for none.)
    */
   private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
-    // This stream's own flag, or one an earlier stream of the same logical
-    // turn set (carriedFrom). Its deliveries are on the agent's chain ahead of
-    // this stream's, so by the time this check runs, they have run.
-    let asked = false;
-    for (let r: TurnRouting | undefined = routing; r; r = r.carriedFrom) {
-      if (r.continuation) {
-        asked = true;
-        r.continuation = false;
-      }
-    }
-    if (!asked) return;
+    // The holder may be shared with an earlier stream of the same logical
+    // turn; its deliveries are on the agent's chain ahead of this stream's,
+    // so by the time this check runs, they have run.
+    if (!routing.continuation.requested) return;
+    routing.continuation.requested = false;
     // An explicit turn's check can run after its stream has returned. A
     // stopped framework, or an agent no longer registered under its name (a
     // disposed fork or ephemeral run), takes no new turn from it.
@@ -8994,7 +8987,7 @@ export class AgentFramework {
       const normalized = envelope.replace(/^\s+(?=>>>)/, '');
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
-      if (parsed.continueTurn) routing.continuation = true;
+      if (parsed.continueTurn) routing.continuation.requested = true;
       if (parsed.kind === 'private') {
         delete routing.pin;
         routing.hybridHold = true;
@@ -9072,7 +9065,7 @@ export class AgentFramework {
     const parsed = parseProsePrefix(rawText);
     // A private round (one that called skip_reply) asks for no publication
     // or continuation, even when delivery runs after that turn has ended.
-    if (parsed.continueTurn && !round.keepPrivate) routing.continuation = true;
+    if (parsed.continueTurn && !round.keepPrivate) routing.continuation.requested = true;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -9497,11 +9490,11 @@ export class AgentFramework {
       // A framework retry, or a re-inference after tool results that weren't
       // streamed, is the same logical turn on a new stream: a ` !` an earlier
       // stream asked for still stands, as it did when the flag was per agent.
-      // The new object links the earlier one rather than copying its flag,
-      // since a delivery queued there can still set it.
+      // The new object shares the earlier one's continuation holder, since a
+      // delivery still queued there can set it after this stream begins.
       const previous = this.turnRouting.get(agent.name);
       if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous) {
-        fresh.carriedFrom = previous;
+        fresh.continuation = previous.continuation;
       }
       this.turnRouting.set(agent.name, fresh);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
