@@ -1417,9 +1417,11 @@ export class WorkspaceModule implements Module {
    * withheld original this way, for the branch its stub is on
    * (agent-framework #277).
    *
-   * A write whose tree entry is set but whose copy on disk fails returns
-   * success false with `data: { inChronicle: true }`: the workspace's tools
-   * read the file from the tree, so it is there for them.
+   * A write whose tree entry is set but that then fails returns success
+   * false with `data: { inChronicle: true }`: its copy on disk was refused, or
+   * something after the entry (recording its intent, the event, the push)
+   * threw. The workspace's tools read the file from the tree, so it is there
+   * for them, on the branch that was current when the entry was set.
    */
   async writeBinary(
     mountPrefixedPath: string,
@@ -1455,18 +1457,22 @@ export class WorkspaceModule implements Module {
         return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
       }
       const blobHash = store.storeBlob(data, mimeType);
-      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
-      if (materializeError) {
+      let committed = false;
+      let failure: string | null;
+      try {
+        const materializeError = await this.commitToolChange(mount, relativePath,
+          { kind: 'set', blobHash, size: data.byteLength }, () => { committed = true; });
+        failure = materializeError === null ? null
+          : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`;
+      } catch (error) {
+        if (!committed) throw error;
+        failure = `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
+      }
+      if (failure !== null) {
         // The file is in the Chronicle tree, where the workspace's tools read
-        // it; only its copy on disk failed. `inChronicle` lets a caller that
-        // needs the file readable tell this from a write that never happened
-        // (agent-framework #281).
-        return {
-          success: false,
-          error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
-          isError: true,
-          data: { inChronicle: true },
-        };
+        // it. `inChronicle` lets a caller that needs the file readable tell
+        // this from a write that never happened (agent-framework #281).
+        return { success: false, error: failure, isError: true, data: { inChronicle: true } };
       }
       return {
         success: true,
@@ -1918,6 +1924,7 @@ export class WorkspaceModule implements Module {
     mount: MountState,
     relativePath: string,
     change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
+    onCommitted?: () => void,
   ): Promise<string | null> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
@@ -1927,6 +1934,11 @@ export class WorkspaceModule implements Module {
     const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
     if (change.kind === 'set') {
       store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+      // A later intent update or disk push can throw; the tree entry is
+      // already set, on the branch current now. If the active branch changes
+      // during the push, that branch's tree has the file and the new one may
+      // not.
+      onCommitted?.();
       intents.update(relativePath, (cur) => {
         const next = { ...cur };
         delete next.tombstone;

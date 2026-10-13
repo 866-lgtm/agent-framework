@@ -96,7 +96,7 @@ edits in the final content first and then releases the hold: an accepted
 batch's payload, or a withheld batch's stub, which is edited once the host
 has reported where each of its originals went, including a failed, skipped
 or unfinished write, so a withheld batch stays held meanwhile.
-Audit-only failures cannot keep a settled message held. If an acceptance
+Once a history edit succeeds, its own audit-only failure does not retain that message's hold. If an acceptance
 edit or a stub's edit fails, the guard keeps the content and its hold in a
 separate retry queue; it does not re-arm provider submission or refusal
 handling. Compression sees only the settled message: accepted output, or a
@@ -119,6 +119,9 @@ Failed edits and audit writes are retried in order before the next real
 activation, compile of a request that is sent, or guard audit write, during
 maintenance, and after stream teardown at shutdown, including those of an
 ephemeral run or a closed conversation fork that has left the agent map.
+
+With `maintenanceIntervalMs: 0`, periodic retries are disabled; stop still retries retained guards. The queue is ordered: a failing audit write blocks later queued history edits and their compression holds until the write succeeds. Shutdown retries the same queue and reports an error if it still fails.
+
 Previews do not flush the queue. A history edit is retried only on its
 original branch and only if the message still contains the guard's
 placeholder or the content the edit writes; later operator edits, removals,
@@ -164,16 +167,11 @@ Otherwise the stub names the guard's audit record, for an operator:
 - when the write failed: "Writing its result to workspace file … failed, so it
   is kept only in the guard's audit record …". The error itself stays in the
   audit record and the logs;
-- when the write was still under way after 30 seconds, as on a stalled mount:
-  "Its result was still being written to workspace file … when this note was
-  made; if that file is missing, it is kept in the guard's audit record …".
-  Nothing waits for that write after that, stop included: it goes on by itself
-  and may finish or fail after the workspace has stopped. Until it settles, no
-  other withheld original is written, for any agent; their stubs name the audit
-  record, so a stalled mount costs one 30-second wait however many batches
-  queue behind it. Writes already under way when it stalled each run to their
-  own deadline, and a write that never settles keeps the others from being
-  written for the life of the process.
+- when the write is still under way at its batch's deadline: "Its result was still being written to workspace file … when this note was made; if that file is missing, it is kept in the guard's audit record …".
+
+Each batch has one 30-second deadline, starting when the batch is queued, so a request waiting on a chain of batches waits at most one deadline past the latest one's arrival. Each successive write uses the remaining time. Once the deadline passes, the request can carry the unfinished-write notice; later results in the batch name the audit record. The underlying write continues, and may finish or fail later. The guard stops waiting for it at the deadline, but `stop()` still waits for the workspace's own turns, which such a write holds, bounded only by a teardown timeout passed to `stop()`, and indefinitely without one. A deadline that fires logs the file's path to stderr. While any write remains overdue, new withheld spills are skipped as `workspace_unanswered`, logged once for the stall and counted when it clears. A write that never settles keeps that gate closed for the process lifetime. Other batches can start writes before the first deadline fires, each within its own deadline. This bound covers withheld spills; the inline cap's original spill has no deadline.
+
+A file whose tree entry was set is readable through the workspace's tools, on the branch that was current when the entry was set, even if the rest of its write fails: its disk copy refused, or a throw after the entry. `WorkspaceModule.writeBinary` reports `data: { inChronicle: true }` for that outcome. Both withheld stubs and inline truncation notes name the tree file, while stderr and `tool:spill_failed` report the failure (the workspace's own `workspace:materialize-failed` event is emitted only for a refused push). `save_recent_image` also counts that file as saved, with its path, size, MIME type, `inChronicle` and `diskCopyError` (the failure after the tree entry, whichever it was) in the saved receipt, and an RFC-005 reference fetched to such a file names it. A write that throws before its tree entry is set fails the call, naming the images already saved.
 
 When saving the staged audit record itself had failed as the result arrived,
 the stub says the result went to the audit record "though saving that record
@@ -221,8 +219,9 @@ Two audit records describe it, each with `batchId`, `messageId` and
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
   `no_workspace_file` (no writable workspace, or the framework was stopping),
   `workspace_unanswered` (an earlier write was still under way past its
-  deadline) or `branch_changed` (the branch changed before or while it was
-  written).
+  deadline), `batch_deadline` (the batch had no time left to start another write), or `branch_changed` (the workspace declined the write before its tree entry was set).
+
+The `annotated` record describes what each spill reported when the batch's annotation finished. An `unfinished` entry is not updated when the underlying write later settles.
 - `stub_updated`: the stub's edit, with `historyUpdate: "superseded"` when an
   operator's edit, removal, rollback or branch change came first.
 
@@ -233,12 +232,11 @@ compiled while it is failing, as the refusal retry is, carries the bare
 notice, and the `annotated` record, once saved, names the file. An activation
 or a direct API call retries the queue first, and fails while the edit keeps
 failing, as it does for a failing acceptance edit.
-Every request that is sent is compiled once each annotation started so far
-has finished, including the refusal retry and the seed of a conversation fork
-from its template. A request preview (rollback, undo, redo) doesn't wait, and
-can show a stub before its place is added. At stop, the framework lets
-running annotations finish while the workspace is up; one that starts after
-that writes no file and is saved before the store closes.
+Requests sent by the framework or the direct Agent inference API are compiled after the guard's annotations finish, including the refusal retry. A conversation fork also waits before compiling its template's seed. A preview, including public `compileContext()`, does not wait and can show a stub before its place is added.
+
+Concurrent starts on one Agent, a direct inference call beside a framework-driven turn, are not made safe here: an Agent compiles its request while its status still reads idle (or ready), as before this change, and the wait for annotations lengthens that window, by up to the batch's deadline. `abortInference()` returns false during a direct call's initial assembly; a caller's own abort signal is checked before the request is sent, and again after the refusal retry's annotation wait. The direct API reads its unguarded tool results once, after the first compile, and sends the same ones with the refusal retry.
+
+At stop, the framework lets running annotations finish while the workspace is up. An annotation that starts after that drain writes no file and is saved before the store closes. A framework-driven turn that compiled across stop is discarded before its stream is driven, even if the same framework has since restarted. A `start()` after a finished `stop()` starts a new lifecycle, with the spill gate open again; a `start()` made while a `stop()` is still draining isn't a supported order. These lifecycle gates cover framework-driven turns; direct Agent calls use their caller's abort signal.
 
 For example, an operator can inspect records without changing the agent's
 view:

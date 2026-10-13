@@ -673,19 +673,21 @@ export class Agent {
         DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
 
-    // Pending tool results the guard isn't holding follow the compiled context.
-    const unguardedResults = this._state.status === 'ready' && !guardedResults
-      ? this.buildToolResultMessages(this._state.toolResults) : [];
-
     // Compile the context (with optional injections) into a request. The
     // guard's refusal retry is assembled the same way, afresh. It is compiled
     // only once each withheld stub's annotation has finished, including one
     // that began during the compile, and after a stub edit that failed has
     // been retried; one whose store still fails is compiled as the bare
     // notice.
+    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
     const assemble = async (): Promise<NormalizedRequest> => {
       const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections));
+      // Read once, after the first compile, since results may have become
+      // ready while it ran; the refusal retry, assembled while the agent is
+      // inferring, sends the same ones.
+      unguardedResults ??= this._state.status === 'ready' && !guardedResults
+        ? this.buildToolResultMessages(this._state.toolResults) : [];
       messages.push(...unguardedResults);
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
@@ -1201,7 +1203,9 @@ export class Agent {
     /** Compiles the context into a request again, for the guard's retry. */
     reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
-    let response = await this.membrane.stream(request, { signal });
+    let response = signal?.aborted
+      ? { aborted: true as const, reason: 'user' as const }
+      : await this.membrane.stream(request, { signal });
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -1215,7 +1219,10 @@ export class Agent {
         // annotation has finished (agent-framework #277), and against the
         // budget without the batch's reservation, so a stub longer than its
         // original can't carry the request past the budget.
-        response = await this.membrane.stream(await reassemble(), { signal });
+        const retry = await reassemble();
+        response = signal?.aborted
+          ? { aborted: true, reason: 'user', partialUsage: response.usage }
+          : await this.membrane.stream(retry, { signal });
       }
     }
 

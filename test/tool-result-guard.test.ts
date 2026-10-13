@@ -1371,7 +1371,7 @@ for (const failedType of ['staged', 'linked']) {
     try {
       await assert.doesNotReject(h.run(), 'storage failure must not strand the live tool loop');
       const agent = h.framework.getAgent('assistant')!;
-      assert.equal(agent.state.status, 'idle');
+      assert.equal(String(agent.state.status), 'idle');
       assert.equal(agent.toolResultGuard.hasPending, false);
       assert.equal(agent.getContextManager().getCompressionHolds().size, 0);
       assert.match(JSON.stringify(h.membrane.streams[0].receivedToolResults), /Tool result withheld/);
@@ -1403,7 +1403,7 @@ test('storage recovery: failed accepted edit is retried before the next activati
   };
   try {
     await h.run();
-    assert.equal(agent.state.status, 'idle');
+    assert.equal(String(agent.state.status), 'idle');
     assert.equal(agent.toolResultGuard.hasPending, false, 'an accepted batch cannot claim another refusal');
     assert.equal(cm.getCompressionHolds().size, 1, 'keep provisional history out of compression until repaired');
     assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
@@ -1740,7 +1740,7 @@ test("#277: an operator's edit made before the stub is annotated stands, and the
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let entered = false;
-    r.guard.setHost({ spill: async () => { entered = true; await gate; return null; }, track: () => {}, idle: () => {} });
+    r.guard.setHost({ deadline: () => Infinity, spill: async () => { entered = true; await gate; return null; }, track: () => {}, idle: () => {} });
     r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
     assert.ok(r.guard.withhold('test-category'));
     for (let i = 0; i < 100 && !entered; i++) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -2244,7 +2244,7 @@ test('#281: a compile waits for an annotation that began while it waited for ano
     const first = gate();
     const second = gate();
     let entered = 0;
-    r.guard.setHost({ spill: async () => {
+    r.guard.setHost({ deadline: () => Infinity, spill: async () => {
       entered++;
       await (entered === 1 ? first.opened : second.opened);
       return null;
@@ -2415,7 +2415,7 @@ test('#281: a write declined for a branch the workspace left stops the writes, a
   } finally { await h.framework.stop(); }
 });
 
-test('#281: stop during a compile that waits for an annotation lets no provider stream start after it', async () => {
+test('#281: stop during a compile that waits for an annotation lets no provider stream be driven after it', async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
   const framework = h.framework as unknown as { writeToolResultFile: (...args: unknown[]) => Promise<unknown> };
   const writeFile = framework.writeToolResultFile.bind(h.framework);
@@ -2424,6 +2424,14 @@ test('#281: stop during a compile that waits for an annotation lets no provider 
   const compiles = watchCompiles(h.framework);
   const traces: string[] = [];
   h.framework.onTrace((event) => traces.push((event as { type: string }).type));
+  let driven = 0;
+  const stream = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (...args) => {
+    const result = stream(...args);
+    const iterate = result[Symbol.asyncIterator].bind(result);
+    result[Symbol.asyncIterator] = () => { driven++; return iterate(); };
+    return result;
+  };
   let stopped = false;
   try {
     const running = h.run();
@@ -2436,6 +2444,7 @@ test('#281: stop during a compile that waits for an annotation lets no provider 
     // entry went with the retry it started.
     await bounded(running, 'the run');
     assert.equal(h.membrane.requests.length, 2, 'the retry was compiled once its stub was written');
+    assert.equal(driven, 1, 'only the original stream was driven; the retry sends nothing');
     assert.equal(traces.includes('inference:completed'), false, 'but, compiled after stop began, it was never driven');
   } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
@@ -2466,7 +2475,7 @@ test('#281: writes that stalled together each hold the workspace as unanswered u
     );
     assert.deepEqual([a, b], [{ path: 'work/tool-results/a.txt', unfinished: true }, { path: 'work/tool-results/b.txt', unfinished: true }]);
     gates.get('b')!.open();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await until(() => (h.framework as unknown as { stalledSpills: Set<unknown> }).stalledSpills.size === 1, 'b settles');
     assert.deepEqual(await framework.spillWithheld('c', 'C', branch), { skipped: 'workspace_unanswered' },
       'one stalled write settling leaves the other holding the workspace');
     gates.get('a')!.open();
@@ -2555,7 +2564,7 @@ test('#281: a compile during which an annotation began is compiled again once it
   try {
     const write = gate();
     let entered = false;
-    r.guard.setHost({ spill: async () => { entered = true; await write.opened; return null; }, track: () => {}, idle: () => {} });
+    r.guard.setHost({ deadline: () => Infinity, spill: async () => { entered = true; await write.opened; return null; }, track: () => {}, idle: () => {} });
     r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
     let reads = 0;
     const stub = () => (r.cm.getMessage(r.messageId)!.content[0] as { content: unknown }).content;
@@ -2837,5 +2846,393 @@ test('#277: withheld materialize, sync and delete keep the files they acted on i
     assert.deepEqual(synced.results.map((r) => [r.mount, r.synced]), [['work', ['disk.txt']]], sync);
     assert.deepEqual(keptLists(del), { path: 'work/LOG.md', deleted: true }, del);
     for (const stub of [materialize, sync, del]) assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file /);
+  } finally { await h.framework.stop(); }
+});
+
+test('an unexpected annotation exception releases its compression hold', async () => {
+  const r = await compressionRig();
+  const branch = r.cm.currentBranch.bind(r.cm);
+  try {
+    r.guard.abandon('test');
+    r.cm.currentBranch = () => { throw new Error('injected annotation branch read'); };
+    await r.guard.whenAnnotated();
+    r.cm.currentBranch = branch;
+    assert.equal(r.cm.getCompressionHolds().size, 0);
+    assert.equal(r.cm.getMessage(r.messageId!)!.content[0].type, 'tool_result');
+    assert.equal((r.cm.getMessage(r.messageId!)!.content[0] as { content: string }).content, TOOL_RESULT_GUARD_NOTICE);
+  } finally { r.cm.currentBranch = branch; await r.cm.close(); }
+});
+
+test('a throw after treeSet reports the original as readable', async () => {
+  const h = await workspaceHarness([], { autoMaterialize: true });
+  const ws = h.workspace as unknown as { pushUnlocked: () => Promise<never> };
+  const push = ws.pushUnlocked;
+  try {
+    ws.pushUnlocked = async () => { throw new Error('injected push exception'); };
+    const result = await h.workspace.writeBinary('work/throw.txt', Buffer.from('original'), 'text/plain');
+    assert.equal(result.success, false);
+    assert.equal((result.data as { inChronicle?: boolean })?.inChronicle, true);
+    assert.match(result.error!, /injected push exception/);
+    const file = await h.workspace.readBinary('work/throw.txt');
+    assert.ok('data' in file);
+    assert.equal(file.data.toString(), 'original');
+  } finally { ws.pushUnlocked = push; await h.framework.stop(); }
+});
+
+test('a throw from recording the intent after treeSet still reports the original as readable', async () => {
+  const h = await workspaceHarness([]);
+  const ws = h.workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown }> };
+  const intents = ws.intents.get('work')!;
+  const update = intents.update;
+  try {
+    intents.update = () => { throw new Error('injected intent exception'); };
+    const result = await h.workspace.writeBinary('work/intent.txt', Buffer.from('original'), 'text/plain');
+    assert.equal(result.success, false);
+    assert.equal((result.data as { inChronicle?: boolean })?.inChronicle, true);
+    assert.match(result.error!, /Stored "work\/intent\.txt" in Chronicle, but the rest of the write failed: injected intent exception/);
+    const file = await h.workspace.readBinary('work/intent.txt');
+    assert.ok('data' in file);
+  } finally { intents.update = update; await h.framework.stop(); }
+});
+
+test("the reference fetcher's writer takes a file the tree holds as saved", async () => {
+  const h = await workspaceHarness([], { autoMaterialize: true });
+  const ws = h.workspace as unknown as { pushUnlocked: () => Promise<never> };
+  const push = ws.pushUnlocked;
+  const f = h.framework as unknown as { getReferenceFetcher(): { saveFile: (name: string, data: Buffer, mime: string) => Promise<string | null> } };
+  try {
+    ws.pushUnlocked = async () => { throw new Error('injected push exception'); };
+    const saved = await f.getReferenceFetcher().saveFile('ref.txt', Buffer.from('fetched'), 'text/plain');
+    assert.equal(saved, 'work/refs/ref.txt', 'stored in the tree, so the reference names it');
+  } finally { ws.pushUnlocked = push; await h.framework.stop(); }
+});
+
+test("an inline spill's failed disk copy is traced with its error, cut at 200 characters, or a fallback", async () => {
+  const h = await workspaceHarness([]);
+  const traces: Array<{ type: string; error?: string }> = [];
+  h.framework.onTrace((e) => traces.push(e as never));
+  const f = h.framework as unknown as { writeToolResultFile(label: string, text: string, branch: string): Promise<unknown> };
+  const original = h.workspace.writeBinary.bind(h.workspace);
+  try {
+    for (const error of ['x'.repeat(300), undefined]) {
+      h.workspace.writeBinary = async () => ({ success: false, isError: true, ...(error ? { error } : {}), data: { inChronicle: true } });
+      await f.writeToolResultFile(`label-${error ? 'long' : 'none'}`, 'content', h.framework.getStore().currentBranch().name);
+      const traced = traces.filter((t) => t.type === 'tool:spill_failed').at(-1);
+      assert.ok(traced, 'traced');
+      assert.equal(traced!.error, error ? 'x'.repeat(200) : 'the rest of the write failed');
+    }
+  } finally { h.workspace.writeBinary = original; await h.framework.stop(); }
+});
+
+test('a batch that used its deadline is logged once for the batch, by the guard', async (t) => {
+  const h = await workspaceHarness([[calls('one', 'two', 'three'), refused()], [answer()]]);
+  (h.framework as unknown as { spillWithheld: () => Promise<unknown> }).spillWithheld = async () => ({ skipped: 'batch_deadline' });
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  try {
+    await bounded(h.run(), 'the run');
+    await h.framework.getAgent('assistant')!.toolResultGuard.whenAnnotated();
+    assert.equal(lines.filter((line) => /used its deadline/.test(line)).length, 1, lines.join('\n'));
+  } finally { await h.framework.stop(); }
+});
+
+test('a withheld spill with no finite deadline takes its own, not a 1 ms timer', async () => {
+  const h = await workspaceHarness([]);
+  const f = h.framework as unknown as {
+    writeToolResultFile: () => Promise<unknown>;
+    spillWithheld: (label: string, text: string, branch: string, deadline: number) => Promise<unknown>;
+    stalledSpills: Set<unknown>;
+  };
+  f.writeToolResultFile = async () => { await new Promise((resolve) => setTimeout(resolve, 20)); return { path: 'work/tool-results/slow.txt' }; };
+  try {
+    const spilled = await f.spillWithheld('slow', 'original', h.framework.getStore().currentBranch().name, Infinity);
+    assert.deepEqual(spilled, { path: 'work/tool-results/slow.txt' }, 'a 20 ms write finishes within the default deadline');
+    assert.equal(f.stalledSpills.size, 0);
+  } finally { await h.framework.stop(); }
+});
+
+test("a batch's deadline is taken when it is queued, not when the batches ahead of it finish", async () => {
+  const r = await compressionRig();
+  try {
+    const first = gate();
+    let entered = 0;
+    let taken = 0;
+    r.guard.setHost({
+      deadline: () => { taken++; return Date.now() + 60_000; },
+      spill: async () => { entered++; if (entered === 1) await first.opened; return null; },
+      track: () => {}, idle: () => {},
+    });
+    r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
+    assert.ok(r.guard.withhold('test-category'));
+    await until(() => entered === 1, 'the first annotation is writing');
+    // A second batch queued behind the first, still writing.
+    r.cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-2', name: 'search', input: {} }]);
+    r.guard.storeResults([{ type: 'tool_result', toolUseId: 'tu-2', content: 'SECOND' }],
+      [{ toolUseId: 'tu-2', content: 'SECOND' }], [], undefined, undefined);
+    r.guard.submissionResults([{ toolUseId: 'tu-2', content: 'SECOND' }]);
+    assert.ok(r.guard.withhold('test-category'));
+    assert.equal(taken, 2, "the second batch's deadline was taken when it was queued");
+    first.open();
+    await bounded(r.guard.whenAnnotated(), 'both annotations');
+    assert.equal(taken, 2, 'and not taken again when its annotation ran');
+  } finally { r.cm.close(); }
+});
+
+test('a throw before treeSet does not claim a readable original', async () => {
+  const h = await workspaceHarness([]);
+  const store = h.framework.getStore();
+  const set = store.treeSet.bind(store);
+  try {
+    store.treeSet = () => { throw new Error('injected tree exception'); };
+    await assert.rejects(h.workspace.writeBinary('work/throw.txt', Buffer.from('original'), 'text/plain'), /injected tree exception/);
+    assert.equal(store.treeGet('workspace/work/tree', 'throw.txt'), null);
+  } finally { store.treeSet = set; await h.framework.stop(); }
+});
+
+test('abort during the direct refusal retry annotation sends no retry', async () => {
+  const h = await harness([], { toolResultGuard: true });
+  const requests: NormalizedRequest[] = [];
+  const responses = [calls('one'), refused(), answer()];
+  (h.membrane as unknown as { stream: (r: NormalizedRequest) => Promise<NormalizedResponse> }).stream = async (r) => {
+    requests.push(r); return responses.shift()!;
+  };
+  const write = gate();
+  let entered = false;
+  slowSpill(h.framework, () => { entered = true; return write.opened; });
+  try {
+    const agent = h.framework.getAgent('assistant')!;
+    await agent.runInference([]);
+    agent.provideToolResult('one', { success: true, data: 'original' });
+    const controller = new AbortController();
+    const inference = agent.runInference([], undefined, { signal: controller.signal });
+    await until(() => entered, 'the direct retry waits for annotation');
+    controller.abort();
+    write.open();
+    const result = await inference;
+    assert.equal(requests.length, 2);
+    assert.equal(result.aborted, true);
+    assert.equal(String(agent.state.status), 'idle');
+  } finally { write.open(); await h.framework.stop(); }
+});
+
+test('unguarded results are read after the direct compile', async () => {
+  const h = await harness([]);
+  const agent = h.framework.getAgent('assistant')!;
+  const compile = agent.compileWithInjections.bind(agent);
+  const requests: NormalizedRequest[] = [];
+  (h.membrane as unknown as { stream: (r: NormalizedRequest) => Promise<NormalizedResponse> }).stream = async (r) => {
+    requests.push(r); return answer();
+  };
+  agent.compileWithInjections = async (...args) => {
+    const result = await compile(...args);
+    // A tool result becoming ready in the compile's await must be observed,
+    // as it was before annotations added another await around compilation.
+    agent.enterWaitingForTools([{ id: 'late', name: 'test--read', input: {} }], new MockYieldingStream([]));
+    agent.provideToolResult('late', { success: true, data: 'arrived-during-compile' });
+    return result;
+  };
+  try {
+    await agent.runInference([]);
+    assert.match(JSON.stringify(requests[0]), /arrived-during-compile/);
+  } finally { await h.framework.stop(); }
+});
+
+test('stop then start reopens withheld spills', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guard-restart-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  const framework = await AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
+    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const f = framework as unknown as {
+    toolResultFilePlace: () => unknown;
+    writeToolResultFile: () => Promise<unknown>;
+  };
+  f.toolResultFilePlace = () => ({ path: 'work/original.txt', safeLabel: 'original' });
+  let writes = 0;
+  f.writeToolResultFile = async () => { writes++; return { path: 'work/original.txt' }; };
+  try {
+    framework.start();
+    await framework.stop();
+    framework.start();
+    const guard = framework.getAgent('assistant')!.toolResultGuard;
+    guard.storeResults([{ type: 'tool_result', toolUseId: 'one', content: 'original' }],
+      [{ toolUseId: 'one', content: 'original' }], [], undefined, undefined);
+    guard.abandon('test');
+    await guard.whenAnnotated();
+    assert.equal(writes, 1);
+    assert.match(String(toolResults(framework)[0].content), /is in workspace file work\/original.txt/);
+  } finally { await framework.stop(); store.close(); }
+});
+
+test('a framework compile from before stop cannot drive after restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guard-generation-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  // One scripted answer for the turn compiled before the stop, one for the turn begun after the restart.
+  const membrane = new ScriptMembrane([[answer()], [answer()]]);
+  const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const agent = framework.getAgent('assistant')!;
+  const compile = gate();
+  const entered = gate();
+  const build = agent.buildActivationRequest.bind(agent);
+  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  let driven = 0;
+  const stream = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (...args) => {
+    const result = stream(...args);
+    const iterate = result[Symbol.asyncIterator].bind(result);
+    result[Symbol.asyncIterator] = () => { driven++; return iterate(); };
+    return result;
+  };
+  let starting: Promise<void> | undefined;
+  try {
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      await entered.opened;
+      await framework.stop();
+      framework.start();
+      compile.open();
+      await starting;
+    } finally { console.error = error; }
+    assert.equal(driven, 0);
+    assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
+    // A turn begun after the restart is admitted and drives its stream.
+    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+    await until(() => driven === 1, 'the turn begun after the restart drives');
+  } finally { compile.open(); await starting; await framework.stop(); store.close(); }
+});
+
+// Drain async storage/annotation continuations without advancing deadline time.
+async function flushAsync() {
+  for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+test('slow successful writes share one batch deadline', async (t) => {
+  const h = await workspaceHarness([]);
+  const f = h.framework as unknown as {
+    withheldSpillDeadlineMs: number;
+    writeToolResultFile: (label: string) => Promise<{ path: string }>;
+  };
+  f.withheldSpillDeadlineMs = 50;
+  const writes: string[] = [];
+  const first = gate();
+  const second = gate();
+  f.writeToolResultFile = async (label) => {
+    writes.push(label);
+    await (writes.length === 1 ? first.opened : second.opened);
+    return { path: `work/tool-results/${label}.txt` };
+  };
+  const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+  try {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+    guard.storeResults(['one', 'two', 'three'].map((id) => ({ type: 'tool_result', toolUseId: id, content: id })),
+      ['one', 'two', 'three'].map((id) => ({ toolUseId: id, content: id })), [], undefined, undefined);
+    guard.abandon('test');
+    let annotated = false;
+    void guard.whenAnnotated().then(() => { annotated = true; });
+    await flushAsync();
+    assert.equal(writes.length, 1);
+    t.mock.timers.tick(30);
+    first.open();
+    await flushAsync();
+    assert.equal(writes.length, 2);
+    t.mock.timers.tick(19);
+    await flushAsync();
+    assert.equal(annotated, false);
+    t.mock.timers.tick(1);
+    await flushAsync();
+    assert.equal(annotated, true, 'the second write has only the remaining 20 ms');
+    assert.equal(writes.length, 2, 'the third original stays in audit');
+    const notices = toolResults(h.framework).map((b) => String(b.content));
+    assert.match(notices[0], /is in workspace file/);
+    assert.match(notices[1], /was still being written/);
+    assert.equal(notices[2], AUDIT_STUB);
+  } finally { first.open(); second.open(); t.mock.timers.reset(); await h.framework.stop(); }
+});
+
+test('a withheld deadline and an unanswered skip are observable', async (t) => {
+  const h = await workspaceHarness([]);
+  const f = h.framework as unknown as {
+    withheldSpillDeadlineMs: number;
+    writeToolResultFile: () => Promise<null>;
+    spillWithheld: (label: string, text: string, branch: string) => Promise<unknown>;
+  };
+  f.withheldSpillDeadlineMs = 50;
+  const write = gate();
+  f.writeToolResultFile = async () => { await write.opened; return null; };
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
+  try {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+    const spilling = f.spillWithheld('stalled', 'original', h.framework.getStore().currentBranch().name);
+    let settled = false;
+    void spilling.then(() => { settled = true; });
+    t.mock.timers.tick(49);
+    await flushAsync();
+    assert.equal(settled, false);
+    t.mock.timers.tick(1);
+    await flushAsync();
+    assert.equal(settled, true, 'the configured 50 ms, not a multi-second ceiling');
+    assert.deepEqual(await spilling, { path: 'work/tool-results/stalled.txt', unfinished: true });
+    for (const label of ['skipped-1', 'skipped-2', 'skipped-3']) {
+      assert.deepEqual(await f.spillWithheld(label, 'original', h.framework.getStore().currentBranch().name), { skipped: 'workspace_unanswered' });
+    }
+    assert.ok(logs.some((line) => /still being written/.test(line) && /deadline/.test(line)), logs.join('\n'));
+    // One line for the stall's skips, not one per skipped result.
+    assert.equal(logs.filter((line) => /workspace_unanswered/.test(line)).length, 1, logs.join('\n'));
+    write.open();
+    t.mock.timers.reset();
+    await until(() => logs.some((line) => /answered again; 3 withheld original\(s\) were skipped/.test(line)), 'the count when the stall clears');
+  } finally { write.open(); t.mock.timers.reset(); await h.framework.stop(); }
+});
+
+test('an exhausted batch starts no new write without claiming a stalled workspace', async () => {
+  const h = await workspaceHarness([]);
+  const f = h.framework as unknown as {
+    spillWithheld(label: string, text: string, branch: string, deadline: number): Promise<unknown>;
+    writeToolResultFile(): Promise<null>;
+  };
+  let writes = 0;
+  f.writeToolResultFile = async () => { writes++; return null; };
+  try {
+    assert.deepEqual(await f.spillWithheld('expired', 'original', h.framework.getStore().currentBranch().name, Date.now() - 1),
+      { skipped: 'batch_deadline' });
+    assert.equal(writes, 0);
+  } finally { await h.framework.stop(); }
+});
+
+test('an inline spill names the readable tree file and traces its failed disk copy', async () => {
+  const h = await workspaceHarness([], { autoMaterialize: true });
+  writeFileSync(join(h.mountDir, 'tool-results'), 'not a directory');
+  const traces: Array<{ type: string; path?: string }> = [];
+  h.framework.onTrace((event) => traces.push(event as { type: string; path?: string }));
+  try {
+    const f = h.framework as unknown as {
+      spillOrTruncate(text: string, cap: number, label: string): Promise<{ text: string; filePath: string | null }>;
+    };
+    const result = await f.spillOrTruncate('original'.repeat(30), 20, 'inline');
+    assert.equal(result.filePath, 'work/tool-results/inline.txt');
+    assert.match(result.text, /work\/tool-results\/inline.txt/);
+    const file = await h.workspace.readBinary(result.filePath!);
+    assert.ok('data' in file);
+    assert.equal(file.data.toString(), 'original'.repeat(30));
+    assert.ok(traces.some((t) => t.type === 'tool:spill_failed' && t.path === result.filePath));
+  } finally { await h.framework.stop(); }
+});
+
+test('an already-aborted direct call never reaches membrane', async () => {
+  const h = await harness([]);
+  let calls = 0;
+  (h.membrane as unknown as { stream: () => Promise<NormalizedResponse> }).stream = async () => { calls++; return answer(); };
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await h.framework.getAgent('assistant')!.runInference([], undefined, { signal: controller.signal });
+    assert.equal(result.aborted, true);
+    assert.equal(calls, 0);
   } finally { await h.framework.stop(); }
 });
