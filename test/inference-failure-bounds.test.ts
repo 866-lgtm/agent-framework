@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import vm from 'node:vm';
 import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { ContextEntry, ContextLogView, ContextStrategy, MessageStoreView, ReadinessState, StrategyContext, TokenBudget } from '@animalabs/context-manager';
@@ -373,15 +374,41 @@ test('failure logs print a bounded projection, never the error object with its r
   assertBoundedStrings(odd.rawArgs, 'drain kick failed');
 });
 
+/** The line a drain kick logs when the context manager's tick throws `thrown`. */
+async function kickedWith(thrown: unknown): Promise<string> {
+  const kicked = makeHarness({ tick: async () => { throw thrown; } });
+  try {
+    kicked.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
+    await settle();
+  } finally { kicked.restore(); }
+  return assertBoundedStrings(kicked.rawArgs, 'drain kick failed');
+}
+
+test("a thrown value that isn't an Error logs its own text, or its JSON when its text is only a tag", async () => {
+  const prefix = '[inference-failed] drain kick failed for cairn after 0 ticks: ';
+  class Refusal {
+    readonly #why: string;
+    constructor(why: string) { this.#why = why; }
+    toString(): string { return `refused: ${this.#why}`; }
+  }
+  class Payload { code = 'zz_code'; detail = 'zz-detail'; }
+  const cyclic: Record<string, unknown> = { zz: 1 };
+  cyclic.self = cyclic;
+  const cases: Array<[string, unknown, string]> = [
+    ['a class with its own toString', new Refusal('zz-quota'), 'refused: zz-quota'],
+    ['a Buffer', Buffer.from('zz-buffer text'), 'zz-buffer text'],
+    ['an Error from another realm', vm.runInNewContext("new Error('zz-realm')"), 'Error: zz-realm'],
+    ['a plain object', { code: 'zz_plain', count: 1 }, '{"code":"zz_plain","count":1}'],
+    ['a class instance without toString', new Payload(), '{"code":"zz_code","detail":"zz-detail"}'],
+    ['an object JSON cannot write', cyclic, '[object Object]'],
+    ['an object with no fields but its tag', { [Symbol.toStringTag]: 'ZzTagged' }, '[object ZzTagged]'],
+  ];
+  for (const [what, thrown, logged] of cases) {
+    assert.equal(await kickedWith(thrown), `${prefix}${logged}`, what);
+  }
+});
+
 test("a failure's frames: cut to their bound, and from the stack's first frame line when the message isn't its header", async () => {
-  const kickedWith = async (thrown: Error) => {
-    const kicked = makeHarness({ tick: async () => { throw thrown; } });
-    try {
-      kicked.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
-      await settle();
-    } finally { kicked.restore(); }
-    return assertBoundedStrings(kicked.rawArgs, 'drain kick failed');
-  };
   const prefix = '[inference-failed] drain kick failed for cairn after 0 ticks: ';
   const framesOf = (stack: string) => stack.slice(stack.search(/^[ \t]+at /m));
 
@@ -579,6 +606,15 @@ test('alert data of null, from a JavaScript caller, is no data: the alert is sti
   assert.deepEqual(logged, [{ agent: 'cairn', kind: 'zz-detector', reason: 'short message' }]);
 });
 
+test('an alert message that is not a string, from a JavaScript caller, is recorded as its String', () => {
+  const { fw, traces, logged, restore } = makeHarness();
+  try {
+    fw.notifyOpsAlert('zz-untyped', 'cairn', undefined, { count: 1 });
+  } finally { restore(); }
+  assert.equal(traces.find((t) => t.type === 'ops:alert')?.message, 'undefined');
+  assert.deepEqual(logged, [{ agent: 'cairn', kind: 'zz-untyped', reason: 'undefined', count: 1 }]);
+});
+
 test('alert data that is not a plain object is one bounded field, not a field per character or element', () => {
   const { fw, traces, logged, restore } = makeHarness();
   const text = echo(10_000);
@@ -589,8 +625,16 @@ test('alert data that is not a plain object is one bounded field, not a field pe
     fw.notifyOpsAlert('zz-string', 'cairn', 'short message', text);
     fw.notifyOpsAlert('zz-array', 'cairn', 'short message', list);
     fw.notifyOpsAlert('zz-small', 'cairn', 'short message', [1, 2]);
+    // Only a plain object's fields are spread: a class instance is kept whole
+    // as its JSON, and an object with a null prototype is a plain record.
+    fw.notifyOpsAlert('zz-instance', 'cairn', 'short message', new (class ZzPayload { channel = 'zz-channel'; })());
+    fw.notifyOpsAlert('zz-record', 'cairn', 'short message', Object.assign(Object.create(null), { channel: 'zz-channel' }));
   } finally { restore(); }
-  const [stringAlert, arrayAlert, smallAlert] = traces.filter((t) => t.type === 'ops:alert');
+  const [stringAlert, arrayAlert, smallAlert, instanceAlert, recordAlert] = traces.filter((t) => t.type === 'ops:alert');
+  assert.deepEqual(instanceAlert.data, { data: { channel: 'zz-channel' } });
+  assert.deepEqual(logged[3], { agent: 'cairn', kind: 'zz-instance', reason: 'short message', data: { channel: 'zz-channel' } });
+  assert.deepEqual({ ...recordAlert.data }, { channel: 'zz-channel' });
+  assert.deepEqual(logged[4], { agent: 'cairn', kind: 'zz-record', reason: 'short message', channel: 'zz-channel' });
   for (const [sink, fields] of [['trace', stringAlert.data], ['failures.log', logged[0]]] as const) {
     assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: string data's fields`);
     assertCut(text, fields.data, 2_000, `${sink}: string data`);
@@ -616,8 +660,8 @@ test('alert data is bounded field by field, on the trace and the failures.log re
       text, error, nested, count: 3, small: { a: 1 },
       // Small JSON, large value: the listener gets the JSON's data, not the value.
       held: new Map([['zz', echo()]]), at: new Date(0),
-      // An Error inside a value is its projection too.
-      wrapped: { cause: new Error('zz-small') },
+      // An Error inside a value is its projection too, in an array as well.
+      wrapped: { cause: new Error('zz-small'), list: [new Error('zz-item')] },
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
@@ -626,7 +670,7 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     // An Error is its projection: serialising it would write its rawRequest.
     // It is cut once, so its marker states the head and the whole message.
     assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, fields.error, 2_000, `${sink}: error`);
-    assert.deepEqual(fields.wrapped, { cause: 'Error: zz-small' }, `${sink}: a nested Error`);
+    assert.deepEqual(fields.wrapped, { cause: 'Error: zz-small', list: ['Error: zz-item'] }, `${sink}: nested Errors`);
     // A value whose JSON is too long becomes its JSON, bounded.
     assert.equal(typeof fields.nested, 'string', `${sink}: nested`);
     assert.ok(fields.nested.length <= 2_000 && fields.nested.startsWith('{"items":[{"i":0,'), `${sink}: nested`);

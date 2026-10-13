@@ -1029,22 +1029,27 @@ function failureJson(value: unknown): string | undefined {
 }
 
 /**
- * The whole text describeFailure cuts: for an Error, its head (name,
+ * The whole text describeFailure cuts. For an Error, its head (name,
  * classification, status, provider code, each bounded) and its whole
- * message; for another object, its JSON (failureJson), or its String when
- * JSON can't write it, so a thrown plain object keeps its fields; for
- * anything else, its String.
+ * message. For anything else, its String when that's text of its own (a
+ * string, a Buffer, an Error from another realm, a class with its own
+ * toString). An object whose String is only its tag, such as
+ * `[object Object]`, is its JSON instead (failureJson), so a plain object
+ * keeps its fields; the tag stands when JSON can't write it or finds no
+ * fields to write.
  */
 function failureDescription(error: unknown): string {
   try {
     if (!(error instanceof Error)) {
-      if (typeof error === 'object' && error !== null) {
-        try {
-          const json = failureJson(error);
-          if (json !== undefined) return json;
-        } catch { /* its String, below */ }
-      }
-      return String(error);
+      if (typeof error !== 'object' || error === null) return String(error);
+      let text: string | undefined;
+      try { text = String(error); } catch { /* no String: its JSON, below */ }
+      if (text !== undefined && !/^\[object [^\]]*\]$/.test(text)) return text;
+      try {
+        const json = failureJson(error);
+        if (json !== undefined && json !== '{}') return json;
+      } catch { /* the tag, below */ }
+      return text ?? '[failure could not be described]';
     }
     const fields = error as Error & {
       type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
@@ -12875,7 +12880,10 @@ export class AgentFramework {
     rawMessage: string,
     opts?: { data?: Record<string, unknown>; skipLog?: boolean },
   ): void {
-    const message = boundFailureText(rawMessage);
+    // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
+    // that isn't a string; it's recorded as its String rather than thrown on.
+    const wholeMessage = String(rawMessage);
+    const message = boundFailureText(wholeMessage);
     // The caller's data goes to failures.log and to trace listeners, bounded
     // the same way for both. A JavaScript caller's null is no data, and data
     // that isn't a plain object (a string, an array, a Buffer) is kept as one
@@ -12901,7 +12909,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(rawMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
