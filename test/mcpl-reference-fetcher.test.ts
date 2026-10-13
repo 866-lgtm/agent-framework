@@ -16,9 +16,12 @@ const PAYLOAD = Buffer.from('RIFF-not-really-a-wav-'.repeat(100));
 const DIGEST = 'sha256:' + createHash('sha256').update(PAYLOAD).digest('base64url');
 
 let lastAuth: string | null = null;
+/** Requests served, by path and query. */
+const hits = new Map<string, number>();
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://x');
   lastAuth = req.headers.authorization ?? null;
+  hits.set(req.url ?? '/', (hits.get(req.url ?? '/') ?? 0) + 1);
   if (url.pathname === '/ok') {
     res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(PAYLOAD);
   } else if (url.pathname === '/redirect') {
@@ -323,6 +326,34 @@ test('within one result, a uri that any block calls expired takes no eager slot;
   await eagerFetch([block(refreshed, '2999-01-01T00:00:00Z')]);
   assert.ok(referenceRegistry.findByUri(refreshed)?.fetchedPath, 'the later result\'s fresh testimony stands');
 });
+
+// Found by Beatrice-2379's read of this change; these adapt her probe.
+for (const expired of [true, false]) {
+  test(`within one result, a repeated uri ${expired ? 'that a block calls expired still takes no eager slot' : 'still takes one eager slot'} when the registry evicts its record mid-result`, async () => {
+    const block = (uri: string, expiresAt?: string) => ({ type: 'resource', uri, sizeBytes: PAYLOAD.length, ...(expiresAt ? { expiresAt } : {}) });
+    const register = (uri: string) => {
+      const c = classifyBlock(block(uri));
+      if (c.kind !== 'reference') throw new Error('fixture: not a reference');
+      return referenceRegistry.register(c.testimony, 'srv');
+    };
+    const tag = expired ? 'expired' : 'fresh';
+    const target = `/ok?evicted=${tag}`;
+    // Fill the registry, which holds 2000 records, so that the target's
+    // record is its oldest: the next new uri evicts it.
+    const first = register(`${ORIGIN}${target}`);
+    for (let i = 0; i < 1999; i++) register(`${ORIGIN}/history?evicted=${tag}&i=${i}`);
+    assert.equal(referenceRegistry.findByUri(`${ORIGIN}${target}`), first, 'the target is the oldest record');
+    await eagerFetch([
+      block(`${ORIGIN}${target}`, expired ? '2001-01-01T00:00:00Z' : undefined),
+      block(`${ORIGIN}/ok?evicted=${tag}-new`), // evicts the target's record
+      block(`${ORIGIN}${target}`), // registers the target again, as a second record
+    ]);
+    const current = referenceRegistry.findByUri(`${ORIGIN}${target}`);
+    assert.notEqual(current?.refId, first.refId, 'the target was evicted and registered again');
+    assert.equal(hits.get(target) ?? 0, expired ? 0 : 1, 'requests for the target');
+    if (!expired) assert.ok(current?.fetchedPath, "the uri's current record, the one its stub names, holds the copy");
+  });
+}
 
 test('per-server budget exhausts cumulatively', async () => {
   const reg = new ReferenceRegistry();

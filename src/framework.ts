@@ -2535,23 +2535,24 @@ export class AgentFramework {
    *  says fetch_reference instead of a path. */
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
-    // Register every block first. The registry keys records by uri, so a uri
-    // the result repeats is one record, judged once. A uri that any of this
-    // result's blocks calls expired takes no slot, whichever block registered
-    // last. A later result's fresh expiry still supersedes, through
-    // register().
-    const records = new Map<import('./mcpl/references.js').ReferenceRecord, boolean>();
+    // Register every block first, then judge each uri once, by its latest
+    // record: the registry keys records by uri, but its eviction can give one
+    // uri a second record within a result. A uri that any of this result's
+    // blocks calls expired takes no slot, whichever block registered last. A
+    // later result's fresh expiry still supersedes, through register().
+    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      records.set(record, records.get(record) === true || isReferenceExpired(c.testimony));
+      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
+      byUri.set(c.testimony.uri, { record, expiredHere });
     }
     if (!eager) return;
     const fetcher = this.getReferenceFetcher();
-    const eligible = [...records]
-      .filter(([record, expiredHere]) => !expiredHere && fetcher.isEagerEligible(record))
-      .map(([record]) => record);
+    const eligible = [...byUri.values()]
+      .filter(({ record, expiredHere }) => !expiredHere && fetcher.isEagerEligible(record))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
