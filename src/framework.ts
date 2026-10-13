@@ -10462,6 +10462,9 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
+                // A turn resumed after its earlier rounds delivers after
+                // them: their queued deliveries are this chain's.
+                await turnSpeechChain;
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(agent.name, 1);
