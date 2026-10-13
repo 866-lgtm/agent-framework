@@ -26,6 +26,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 class ToolboxModule implements Module {
@@ -426,6 +427,29 @@ describe('explicit prose routing', () => {
       'nor finalized by the stream complete');
 
     await framework.stop();
+  });
+
+  it('the stream reads leading whitespace and a token\'s end as delivery does', async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as { deliverProse(agent: unknown, text: string): Promise<void> };
+    const agent = framework.getAgent('assistant')!;
+    const cases = ['  >>#alpha hello', '\u00a0>>#alpha hello', '\u2003>>#alpha hello', '\r>>#alpha hello', '\t>>#alpha\r\nhello'];
+    try {
+      for (const text of cases) {
+        routed.length = 0;
+        await gateway.deliverProse(agent, text);
+        const router = new ProseStreamRouter({
+          mode: 'explicit', initialTarget: null, resolve: (spec) => (spec === '#alpha' ? 'chan-alpha' : null),
+        });
+        const streamed = [...router.feed(text), ...router.finish()];
+        assert.deepEqual(routed.map((r) => r.locus), ['chan-alpha'], `delivery sends ${JSON.stringify(text)} to #alpha`);
+        assert.ok(streamed.length > 0 && streamed.every((d) => d.channelId === 'chan-alpha'),
+          `the stream sends ${JSON.stringify(text)} there too`);
+      }
+    } finally {
+      await framework.stop();
+    }
   });
 
   it("' !' continuation starts another turn immediately after prose ends the current one", async () => {

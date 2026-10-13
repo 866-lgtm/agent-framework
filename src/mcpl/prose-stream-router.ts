@@ -32,6 +32,9 @@ export interface RoutedDelta {
 
 type State = 'line-start' | 'indent' | 'maybe-prefix' | 'prefix-gap' | 'prefix-token' | 'after-token' | 'body';
 
+/** Whitespace as the delivery path reads it (`trimStart()`, `\s`, `\S`). */
+const isSpace = (ch: string): boolean => /\s/.test(ch);
+
 export class ProseStreamRouter {
   private target: string | null;
   private state: State = 'line-start';
@@ -57,6 +60,11 @@ export class ProseStreamRouter {
   /** Per-channel full text emitted so far (for outgoing/complete). */
   byChannel(): ReadonlyMap<string, string> {
     return this.accumulated;
+  }
+
+  /** Where text goes now: the destination the stream's prefixes have set, or null. */
+  get currentTarget(): string | null {
+    return this.target;
   }
 
   /**
@@ -113,8 +121,8 @@ export class ProseStreamRouter {
       case 'line-start':
         // Indentation before a prefix is held until the line's decision: the
         // delivery path reads an indented `>>` (explicit) or `>>>` (hybrid)
-        // line as a prefix too.
-        if (ch === ' ' || ch === '\t') {
+        // line as a prefix too, after any leading whitespace.
+        if (ch !== '\n' && isSpace(ch)) {
           this.state = 'indent';
           this.held = ch;
           return;
@@ -125,7 +133,7 @@ export class ProseStreamRouter {
         return;
 
       case 'indent':
-        if (ch === ' ' || ch === '\t') { this.held += ch; return; }
+        if (ch !== '\n' && isSpace(ch)) { this.held += ch; return; }
         if (ch === '>') { this.held += ch; this.state = 'maybe-prefix'; return; }
         this.emit(this.held, out);
         this.held = '';
@@ -146,7 +154,9 @@ export class ProseStreamRouter {
             this.state = 'prefix-gap';
             return;
           }
-          if (ch === '\n' || ch === ' ' || ch === '\t') {
+          // `>>` and then whitespace is a quoted arrow: delivery's prefix
+          // needs a non-whitespace token right after the arrows.
+          if (isSpace(ch)) {
             if (this.opts.mode === 'explicit') this.emit(this.held, out);
             this.held = '';
             this.state = ch === '\n' ? 'line-start' : 'body';
@@ -175,6 +185,9 @@ export class ProseStreamRouter {
       case 'prefix-token':
         if (ch === ' ' || ch === '\t') { this.applyTarget(); this.state = 'after-token'; this.sawBang = false; return; }
         if (ch === '\n') { this.applyTarget(); this.state = 'line-start'; return; }
+        // Any other whitespace ends the token too (`\S+`), and starts the
+        // body: the grammar's gap after a token is spaces and tabs only.
+        if (isSpace(ch)) { this.applyTarget(); this.state = 'body'; this.step(ch, out); return; }
         this.token += ch;
         return;
 

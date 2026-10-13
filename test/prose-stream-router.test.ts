@@ -78,6 +78,23 @@ test('explicit: indentation before a quoted arrow or a lone `>` stays body', () 
   assert.equal(textFor(out, 'discord:g:100'), 'look:\n  >> quoted arrow\n  > quote');
 });
 
+test('explicit: any leading whitespace before a prefix, as delivery trims it', () => {
+  const out = run(explicit(), '\u00a0>>#general nbsp\n\u2003>>#ops em space\n\r>>@sol after a CR');
+  assert.equal(textFor(out, 'discord:g:100'), 'nbsp\n');
+  assert.equal(textFor(out, 'discord:g:200'), 'em space\n');
+  assert.equal(textFor(out, 'discord:dm:300'), 'after a CR');
+});
+
+test('explicit: whitespace other than a space or tab ends the token and starts the body', () => {
+  const out = run(explicit(), '\t>>#ops\r\nhello');
+  assert.equal(textFor(out, 'discord:g:200'), '\r\nhello');
+});
+
+test('explicit: `>>` and then any whitespace is a quoted arrow', () => {
+  const out = run(explicit(), '>>#general look:\n>>\u00a0quoted');
+  assert.equal(textFor(out, 'discord:g:100'), 'look:\n>>\u00a0quoted');
+});
+
 test('` !` continuation modifier is swallowed; `!` as body survives', () => {
   const out = run(explicit(), '>>#general ! next turn continues\n>>#ops !bang body');
   assert.equal(textFor(out, 'discord:g:100'), 'next turn continues\n');

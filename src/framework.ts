@@ -1083,6 +1083,12 @@ export class AgentFramework {
   /** Sticky per-TURN delivery target set by the turn's first `>>` prefix.
    *  Cleared at every non-restart turn start; survives context restarts. */
   private proseTargetPins: Map<string, string> = new Map();
+  /**
+   * Explicit mode: where a turn's outgoing stream had routed when it ended,
+   * so a stream that resumes the turn (a tool-result-guard retry, a budget
+   * restart) carries on there. Turn-scoped, like the sticky destination.
+   */
+  private proseStreamTargets: Map<string, string | null> = new Map();
   /** Hybrid router is fail-closed after a malformed/unresolved envelope until a new valid target. */
   private proseHybridSuppressed: Set<string> = new Set();
   /** Agents whose current turn requested `!` continuation — re-woken when the
@@ -9313,6 +9319,7 @@ export class AgentFramework {
         // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
         // prose target at all. Neither mode freezes or announces a locus.
         this.proseTargetPins.delete(agent.name);
+        this.proseStreamTargets.delete(agent.name);
         this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
@@ -9331,6 +9338,7 @@ export class AgentFramework {
     if (trigger?.suppressProse) {
       this.turnLocusPins.delete(agent.name);
       this.proseTargetPins.delete(agent.name);
+      this.proseStreamTargets.delete(agent.name);
       this.proseContinuations.delete(agent.name);
     }
 
@@ -9677,19 +9685,26 @@ export class AgentFramework {
     // an exact invocation-shaped body from ordinary XML/prose. Buffer guarded
     // turns until completion: otherwise speculative outgoing chunks could
     // expose the wrapper before the fail-closed classifier runs.
+    // A stream that resumes its turn, as beginAgentTurn's continuingTurn: the
+    // turn-scoped routing state (sticky destination, stream destination) was
+    // kept for it.
+    const resumesTurn = trigger?.reason === 'context_budget_restart'
+      || trigger?.reason === 'tool_result_guard_retry';
     const proseStream = this.channelRegistry &&
       turnProseRouting !== 'disabled' &&
       !agent.toolWrapperProseGuard
       ? new ProseStreamRouter({
           mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
-          // Explicit text has no destination until a `>>` prefix names one.
-          // A fresh turn's stream starts suppressed (its sticky destination
-          // was cleared above), and one that resumes the turn (a tool-result
-          // guard retry, a budget restart) starts at the sticky destination
-          // delivery still holds. The trigger channel is only where explicit
-          // mode's typing indicator shows.
+          // Explicit text has no destination until a `>>` prefix names one,
+          // so a fresh turn's stream starts suppressed. One that resumes the
+          // turn (a tool-result-guard retry, a budget restart) carries on
+          // where the previous stream's prefixes had routed. That is the
+          // destination the text has authored, which delivery's sticky
+          // destination reaches only once its queued envelopes have run.
+          // The trigger channel is only where explicit mode's typing
+          // indicator shows.
           initialTarget: turnProseRouting === 'explicit'
-            ? this.proseTargetPins.get(agent.name) ?? null
+            ? (resumesTurn ? this.proseStreamTargets.get(agent.name) ?? null : null)
             : typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
@@ -10996,6 +11011,7 @@ export class AgentFramework {
           this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
         }
       }
+      if (proseStream) this.proseStreamTargets.set(agent.name, proseStream.currentTarget);
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       if (ownsPhysicalStream) {
         this.activeStreams.delete(agent.name);

@@ -380,6 +380,90 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
   } finally { await h.framework.stop(); }
 });
 
+test('explicit mode: a budget restart streams on to the destination the turn last addressed, before delivery catches up', { timeout: 15000 }, async () => {
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: '>>#alpha first' },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: '>>#cafe second' },
+        { type: 'tool_use', id: 'two', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+    ],
+    [answer()],
+  ], { proseRouting: 'explicit', maxStreamTokens: 1000 });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  // Delivery of 'first' is held until the resumed stream has written
+  // 'continued', so '>>#cafe second' is still queued, and delivery's sticky
+  // destination still #alpha, when the restart begins.
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let secondDelivered!: () => void;
+  const secondDone = new Promise<void>((resolve) => { secondDelivered = resolve; });
+  // The second tool call drops the stream budget, so the turn restarts.
+  const handle = h.module.handleToolCall.bind(h.module);
+  h.module.handleToolCall = async (call: ToolCall) => {
+    if (call.id === 'two') h.framework.getAgent('assistant')!.maxStreamTokens = 1;
+    return handle(call);
+  };
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    if (h.membrane.requests.length === 2) {
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+        const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string; content?: unknown }>;
+        for await (const event of events) {
+          yield event;
+          if (event.type === 'tokens' && event.content === 'continued') {
+            releaseFirst();
+            await secondDone;
+          }
+        }
+      };
+    }
+    return stream;
+  };
+  const restarts: string[] = [];
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
+  });
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, channelId });
+      if (text === 'first') await firstHeld;
+      if (text === 'second') secondDelivered();
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+      { text: 'continued', channelId: 'chan-cafe' },
+    ]);
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe'],
+      'the resumed stream follows the destination the turn last addressed');
+  } finally {
+    releaseFirst();
+    secondDelivered();
+    await h.framework.stop();
+  }
+});
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];

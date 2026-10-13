@@ -16,8 +16,9 @@
   channel. The MCPL outgoing stream (`channels/outgoing/chunk` and
   `complete`) started with the trigger channel as its destination, so a
   streaming-capable server there received text that delivery would bounce.
-  It now starts where delivery does: with no destination on a fresh turn,
-  since explicit text has none until a `>>` prefix names one, and at the
-  turn's sticky destination when a tool-result-guard retry or a budget
-  restart resumes the turn. The stream also reads an indented `>>` prefix,
-  as delivery does, rather than streaming the line as text.
+  It now starts with no destination on a fresh turn, since explicit text
+  has none until a `>>` prefix names one. When a tool-result-guard retry or
+  a budget restart resumes the turn, it starts where the turn's earlier
+  stream had routed. The stream also reads a `>>` prefix after any leading
+  whitespace, and ends its target at any whitespace, as delivery does,
+  rather than streaming such a line as text or dropping it.
