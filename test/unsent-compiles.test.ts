@@ -61,7 +61,7 @@ describe('compiles that are never sent', () => {
     } finally { await x.close(); }
   });
 
-  it('a preview leaves the consumed watermark: nobody read what it assembled', async () => {
+  it('a preview leaves the consumed watermark: the agent never read what it assembled', async () => {
     const x = await make();
     try {
       const agent = x.framework.getAgent('agent')!;

@@ -3705,28 +3705,33 @@ export class AgentFramework {
    * were activated right now — WITHOUT running inference, opening a stream, or
    * mutating agent state. Intended for debug/preview tooling.
    *
-   * What a preview commits (default): nothing durable. It compiles as a dry
-   * run (`dryRun`), filters tools and assembles the system prompt, then
-   * delegates to `Agent.buildActivationRequest`. No tokens are spent, nothing
-   * is written to Chronicle, no external MCPL server is contacted, no fold
-   * resolution is persisted and no compression work is queued; the consumed
-   * watermark and any prepared budget change are left alone; and with
-   * context-manager's thinking binding (context-manager#160) no stamps are
-   * committed and no compile awaits acceptance. It does touch in-memory
-   * state in two places:
-   *   - it hands the context manager the compression tool definitions, as
-   *     every activation request does;
-   *   - context-manager 0.13's adaptive select writes its bookkeeping on a dry
-   *     run too: the compile estimate a usage report is calibrated against,
-   *     the calibration sample's arming, and its transition and render
-   *     bookkeeping. So a preview between a sent compile and that request's
-   *     first usage report replaces the estimate the report is judged
-   *     against, and settings readers see the preview's transition values
-   *     until the next compile.
-   * When the fold plan doesn't fit the budget, the dry run returns the window
-   * as rendered, larger than the budget, where a committing compile would
-   * throw (other refusals, such as a head and tail that alone exceed it,
-   * still throw); 0.13 hands no over-budget signal back with the window.
+   * What a preview commits (default): nothing of its own. It compiles as a
+   * dry run (`dryRun`), filters tools and assembles the system prompt, then
+   * delegates to `Agent.buildActivationRequest`. No tokens are spent, no
+   * external MCPL server is contacted, no fold resolution is persisted and
+   * none of the compression its fold plan calls for is queued; the consumed
+   * watermark and any prepared budget change are left alone; and once
+   * context-manager's thinking binding (context-manager#160, not yet
+   * released) ships, no stamps are committed and no compile awaits
+   * acceptance. A dry run still leaves what context-manager 0.13 leaves on
+   * any compile (see `Agent.compileWithInjections`): a chunk that closes is
+   * recorded in the store, which is Chronicle's, and queued for compression;
+   * an expired compression hold is released; and the adaptive select's
+   * in-memory bookkeeping stays as the preview set it. So a preview between
+   * a sent compile and that request's first usage report replaces the
+   * estimate the report is judged against, and settings readers see the
+   * preview's transition values until the next compile. The preview keeps
+   * in-memory bookkeeping of its own too, such as handing the context manager
+   * the compression tool definitions, as every activation request does.
+   * Under the autobiographical strategy, a budget the context can't fit
+   * still throws, as for a committing compile: a dry run skips only
+   * context-manager's post-pick check, and an adaptive fold plan that
+   * doesn't fit then overruns at the middle's emission, with a refusal that
+   * names the tokens and the limit. Windowed passthrough's newest message
+   * alone is the one window that comes back larger than the budget. For a
+   * verdict instead of the refusal, `previewContextSettings` returns
+   * context-manager's own at a budget, with the agent's `maxTokens` reserved
+   * for the response.
    *
    * The trade-off is fidelity: the dynamically-gathered ContextInjection[]
    * (module `gatherContext` + MCPL `beforeInference` hooks) are NOT included
@@ -3758,10 +3763,10 @@ export class AgentFramework {
 
     // An explicit budget compiles against a HYPOTHETICAL window instead of the
     // agent's live one. Every preview is a dry run, so none of them settles
-    // a converging descent or commits anything durable (see the doc comment
-    // above).
-    // Default: no dynamic injection gathering → fully transparent (no
-    // inference, no Chronicle writes, no external RPC). Opt in explicitly.
+    // a converging descent or commits what a sent compile commits (see the
+    // doc comment above).
+    // Default: no dynamic injection gathering → no inference, no Chronicle
+    // writes of its own, no external RPC. Opt in explicitly.
     if (!opts?.injections) {
       return capture(await agent.buildActivationRequest(
         tools, undefined, opts?.budget, presentation?.available ?? tools, { dryRun: true },
@@ -3812,9 +3817,14 @@ export class AgentFramework {
    *
    * Unlike `previewActivation` (which renders a request), this returns the
    * picker's plan: resulting tokens, whether it fits, how many summaries would
-   * have to be produced first, and the per-chunk fold levels. Commits nothing:
-   * no resolution persistence, no compression enqueue, no transition
-   * bookkeeping — see `AutobiographicalStrategy.previewContext`.
+   * have to be produced first, and the per-chunk fold levels. It commits none
+   * of the plan: no resolution persistence, none of the summary or merge work
+   * the plan calls for, and its transition and render bookkeeping put back —
+   * see `AutobiographicalStrategy.previewContext`. Its select is a dry run,
+   * so in context-manager 0.13 it still leaves the rest of what a dry run
+   * leaves (see `Agent.compileWithInjections`): a chunk that closes is
+   * recorded and queued for compression, and the calibration estimate and a
+   * pending kv-unified draft's marker indices stay as it set them.
    *
    * Returns null when the agent's strategy has no fold plan (non-adaptive).
    */

@@ -465,9 +465,10 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    // A dry run: listed, never sent, so it persists no fold resolutions,
-    // queues no compression work and commits no thinking-binding stamps
-    // (see Agent.compileWithInjections for what a dry run still writes).
+    // A dry run: listed, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for (see
+    // Agent.compileWithInjections for what a dry run still leaves, and for
+    // context-manager#160's thinking binding).
     const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
@@ -669,13 +670,15 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    // A dry run: shown, never sent, so it persists no fold resolutions,
-    // queues no compression work and commits no thinking-binding stamps, at
-    // a hypothetical budget least of all (see Agent.compileWithInjections
-    // for what a dry run still writes). When the fold plan doesn't fit
-    // `maxTokens`, it returns the context as rendered, larger than asked,
-    // where a committing compile threw: context-manager 0.13 hands back no
-    // over-budget signal with a dry run.
+    // A dry run: shown, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for, at a
+    // hypothetical budget least of all (see Agent.compileWithInjections for
+    // what a dry run still leaves). Under the autobiographical strategy, a
+    // budget the context can't fit still throws: a dry run skips only
+    // context-manager's post-pick check, and an adaptive fold plan that
+    // doesn't fit then overruns at the middle's emission. Windowed
+    // passthrough's newest message alone is the one window that comes back
+    // larger than the budget.
     const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }

@@ -3,25 +3,40 @@
   hiding messages also run for their "last visible" line; the API's
   `message.list` and agent context commands; and a conversation fork's seed
   (the template's compile and the new namespace's emptiness check). A
-  committing compile persists fold resolutions and can queue compression
-  work, and with context-manager's thinking binding
-  (anima-research/context-manager#160) it commits stamps and joins the
-  branch's compiles awaiting acceptance, where one never sent can cost a live
-  stream's later replies their thinking. A dry run does none of that, and it
-  leaves the agent's consumed watermark and a prepared budget change alone,
-  as `previewActivation` already promised; a preview at the live window used
-  to settle a converging budget change. Context-manager 0.13's adaptive
-  select still writes its in-memory bookkeeping on a dry run until the next
-  compile: the compile estimate a usage report is calibrated against, the
-  arming of that calibration sample, and its transition and render
-  bookkeeping. `ActivationRequestOptions` gains `dryRun`.
-- When the fold plan doesn't fit the budget, a dry run returns the window as
-  rendered, larger than the budget, where a committing compile threw.
-  Refusals at other stages still throw, and context-manager 0.13 hands no
-  over-budget signal back. So at a budget too small for the context, a
-  preview and the API's agent context command now return instead of failing,
-  and a fork whose template doesn't fit the budget its seed is compiled at
-  (context-manager's default) is now seeded instead of failing to spawn.
+  committing compile persists fold resolutions and queues the compression its
+  fold plan calls for. Once context-manager's thinking binding
+  (anima-research/context-manager#160, not yet released) ships, it will also
+  commit stamps and join the branch's compiles awaiting acceptance, where one
+  never sent can cost a live stream's later replies their thinking. A dry run
+  does none of that, and it leaves the agent's consumed watermark and a
+  prepared budget change alone, as `previewActivation` already promised; a
+  preview at the live window used to settle a converging budget change.
+  `ActivationRequestOptions` gains `dryRun`.
+- Context-manager 0.13 still leaves some of a select's effects behind on a dry
+  run, as on any compile: a chunk that closes is recorded in the store and
+  queued for compression, a compression hold past its deadline is released,
+  and the adaptive select leaves its in-memory bookkeeping as the dry run set
+  it until the next compile, for example the compile estimate a usage report
+  is calibrated against and that sample's arming, its transition and render
+  bookkeeping, and a pending kv-unified draft's marker indices. So a dry run
+  between a sent compile and that request's first usage report replaces the
+  estimate the report is judged against, and under kv-unified one between a
+  sent compile and its submission changes the markers its receipt is checked
+  against. Context-manager 0.14.0 restores all of that after a dry run except
+  the hold release (anima-research/context-manager#161 and #114); this change
+  keeps the `^0.13.0` floor.
+- Under the autobiographical strategy, a dry run still refuses a budget the
+  context can't fit, as a committing compile does: context-manager skips only
+  its post-pick check, and an adaptive fold plan that doesn't fit then
+  overruns at the middle's emission, with a refusal that names the tokens and
+  the limit. So at such a budget a preview, `message.list` and the API's agent
+  context command still fail, and a fork whose template's fold plan doesn't
+  fit the default budget its seed is compiled at still fails to spawn.
+  Windowed passthrough, though, skips its refusal of a newest message larger
+  than the budget on a dry run: where they failed on such a message, a
+  preview, `message.list` and the agent context command now return it alone,
+  larger than the budget, and a fork is seeded with it. Passthrough, the
+  default strategy, keeps the newest messages that fit, as before.
 - A conversation fork's seed no longer copies the template's `thinking` and
   `redacted_thinking` blocks, and leaves out a message with no content left.
   A fork inherits the template's conversation, not its reasoning. A signed

@@ -623,15 +623,24 @@ export class Agent {
     opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean },
   ): Promise<CompileResult> {
     // A dry run is a compile that will never be sent. The context manager
-    // persists no fold resolutions for it and queues no compression or merge
-    // work, and with its thinking binding (context-manager#160) it commits no
-    // stamps and adds no compile awaiting acceptance. Context-manager 0.13's
-    // adaptive select still writes its in-memory bookkeeping on a dry run:
-    // it replaces the compile estimate a usage report is calibrated against,
-    // re-arms that calibration sample, and overwrites its transition and
-    // render bookkeeping until the next compile. Here nothing moves: nobody
-    // read what a dry run assembled, so the consumed watermark stays, and a
-    // prepared budget change waits for the compile that is sent.
+    // persists no fold resolutions for it and queues none of the compression
+    // or merge work its fold plan calls for. Its thinking binding
+    // (context-manager#160, not yet released) will commit stamps and add a
+    // compile awaiting acceptance for a committing compile only. Here nothing
+    // moves either: the agent never read what a dry run assembled, so the
+    // consumed watermark stays, and a prepared budget change waits for the
+    // compile that is sent.
+    //
+    // Context-manager 0.13 still leaves some of a select's effects behind on
+    // a dry run, as on any compile. A chunk that closes is recorded, durably,
+    // and queued for compression; a compression hold past its deadline is
+    // released. Its adaptive select also leaves its in-memory bookkeeping as
+    // the dry run set it, until the next compile: for example the compile
+    // estimate a usage report is calibrated against and that sample's arming,
+    // its transition and render bookkeeping, and a pending kv-unified draft's
+    // marker indices, which the draft's submission records as the markers
+    // its receipt is checked against. Context-manager 0.14.0 restores all of
+    // that after a dry run except the hold release.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
     const result = await this.contextManager.compile(
       this.compileBudget(budget), injections, opts as never,
@@ -812,11 +821,11 @@ export class Agent {
    * real activation path (`startStreamWithInjections`) and debug/preview
    * tooling (`Framework.previewActivation`). It does not call the membrane.
    * A compile that is sent commits what the context manager commits for it
-   * (fold resolutions, compression work, the consumed watermark); a preview
-   * passes `options.dryRun`, so its compile commits none of that (see
-   * `compileWithInjections`). Either way the context manager is handed the
-   * compression tool definitions. Safe to call regardless of the agent's
-   * current status.
+   * (fold resolutions, the compression its fold plan calls for, the consumed
+   * watermark); a preview passes `options.dryRun`, so its compile commits
+   * none of that (see `compileWithInjections` for what a dry run still
+   * leaves). Either way the context manager is handed the compression tool
+   * definitions. Safe to call regardless of the agent's current status.
    */
   async buildActivationRequest(
     availableTools: ToolDefinition[],
