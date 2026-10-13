@@ -19,9 +19,10 @@
   branch the watermark only advances: a compile that started before such a
   mark doesn't roll it back when it finishes.
 - A deferred write that goes back into the queue does so whatever its
-  content. That happens while its target's own turn, stream or tool cycle is
-  alive, or the host is quiesced. A `tool_result` used to land regardless,
-  apart from the `tool_use` it answers, which went back into the queue.
+  content, under its id and in its place in the order writes arrived. That
+  happens while its target's own turn, stream or tool cycle is alive, or the
+  host is quiesced. A `tool_result` used to land regardless, apart from the
+  `tool_use` it answers, which went back into the queue.
 - A write that waits now waits on its own target's state: the target's
   turn, stream and tool cycle, or a quiesced host. (A fresh `tool_result`
   still doesn't wait.) Before, a write for the primary agent waited out every

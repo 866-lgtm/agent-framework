@@ -13135,13 +13135,14 @@ export class AgentFramework {
        */
       forAgent?: string;
       /**
-       * Set when the message is being flushed FROM the durable deferred
-       * queue: it is the entry's one durable identity. A write stamps it
-       * into `metadata.deferredWriteId` (boot dedup); a re-deferral moves
-       * the same logical entry back to pending under the same id instead of
-       * minting a second, independently replayable one.
+       * Set when the message comes back from the deferred queue: the entry's
+       * one durable identity and its place in arrival order. A write stamps
+       * the id into `metadata.deferredWriteId` (boot dedup). A re-deferral
+       * moves the same logical entry back to pending under the same id and
+       * seq, instead of minting a second, independently replayable one, or
+       * moving it behind entries that arrived after it.
        */
-      deferredWriteId?: string;
+      fromQueue?: { id: string; seq: number };
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
       placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
       /**
@@ -13190,12 +13191,12 @@ export class AgentFramework {
     // append mid-surgery. Deferred here, flushed by resume(). tool_result
     // still lands (a draining turn's continuation depends on it).
     //
-    // A write coming back from the deferred queue (deferredWriteId) is
+    // A write coming back from the deferred queue (fromQueue) is
     // re-deferred whatever its content: its tool_use went back into the
     // queue just before it, in the same drain, and a tool_result stored
     // without it would split the pair. (A turn-end flush can run after a
     // successor turn has taken the agent: the 2026-07-31 interleave.)
-    const freshToolResult = opts?.deferredWriteId === undefined && content.some(b => b.type === 'tool_result');
+    const freshToolResult = opts?.fromQueue === undefined && content.some(b => b.type === 'tool_result');
     // One rule for every write, primary-bound or targeted: it waits while ITS
     // TARGET's own tool cycle is pending (pendingAssistantBlocks is keyed by
     // agent). Another agent's cycle says nothing about this window. The
@@ -13215,16 +13216,14 @@ export class AgentFramework {
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      // A re-deferral of a drained entry keeps its id and leaves the un-acked
-      // set: one logical message, one durable identity — never two entries.
-      const id = opts?.deferredWriteId ?? randomUUID();
-      let seq: number | undefined;
-      if (opts?.deferredWriteId) {
-        const prior = this.unackedDeferredWrites.find((m) => m.id === id);
-        seq = prior?.seq;
+      // A re-deferral of a drained entry keeps its id and seq, and leaves the
+      // un-acked set: one logical message, one durable identity, one place
+      // in arrival order, whether or not the queue is persisted.
+      const id = opts?.fromQueue?.id ?? randomUUID();
+      if (opts?.fromQueue) {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
-      this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      this.deferredMessages.push({ id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
@@ -13233,7 +13232,7 @@ export class AgentFramework {
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
-      opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
+      opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
     return stored;
@@ -13354,7 +13353,7 @@ export class AgentFramework {
     return this.writeDrainedInOrder(entries, where, (msg) => {
       const target = msg.forAgent ?? this.primaryAgentName;
       this.addMessage(msg.participant, msg.content, msg.metadata, {
-        deferredWriteId: msg.id,
+        fromQueue: { id: msg.id, seq: msg.seq },
         ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
         ...(opts?.bypassDeferral && target ? { bypassDeferralFor: target } : {}),
       });

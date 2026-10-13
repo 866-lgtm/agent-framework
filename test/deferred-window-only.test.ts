@@ -270,10 +270,11 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       pendingAssistantBlocks: Map<string, ContentBlock[]>;
       activeTurnTokens: Map<string, number>;
       activeStreams: Map<string, unknown>;
-      deferredMessages: Array<{ id: string; participant: string }>;
+      deferredMessages: Array<{ id: string; seq: number; participant: string }>;
       deferredWritesPersisted: boolean;
       drainDeferredFor: (name: string, stopAt?: unknown) => unknown[];
-      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string; deferredWriteId?: string }): string;
+      readdDrained: (entries: unknown[], where: string) => unknown[];
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string; fromQueue?: { id: string; seq: number } }): string;
     };
   }
   const otherCycle = (): ContentBlock[] => [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock];
@@ -497,6 +498,11 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.equal(internals.addMessage('Antra', text('one')), '', 'deferred');
     assert.equal(internals.addMessage('Antra', text('two'), undefined, { forAgent: 'scout' }), '', 'deferred');
     assert.equal(internals.addMessage('Antra', text('three')), '', 'deferred');
+    // A turn-end flush of the assistant's entries while a successor holds its
+    // turn defers them again (the 2026-07-31 interleave). They keep their
+    // places in arrival order.
+    internals.readdDrained(internals.drainDeferredFor('assistant'), 'turn-end flush');
+    assert.equal(internals.deferredMessages.length, 3, 'deferred again');
     await framework.stop();
 
     const reopened = await createFramework({ agents });
@@ -662,12 +668,14 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       // successor turn has started).
       const requeued = internals.addMessage('user', [
         { type: 'tool_result', toolUseId: 'p1', content: 'ok' } as ContentBlock,
-      ], undefined, { deferredWriteId: 'w1' });
+      ], undefined, { fromQueue: { id: 'w1', seq: 41 } });
       assert.equal(requeued, '');
-      assert.ok(internals.deferredMessages.some((m) => m.id === 'w1'));
+      // It goes back under its id and its place in arrival order, though this
+      // queue is held in memory only.
+      assert.ok(internals.deferredMessages.some((m) => m.id === 'w1' && m.seq === 41));
       // So does plain text.
-      assert.equal(internals.addMessage('Antra', text('plain'), undefined, { deferredWriteId: 'w2' }), '');
-      assert.ok(internals.deferredMessages.some((m) => m.id === 'w2'));
+      assert.equal(internals.addMessage('Antra', text('plain'), undefined, { fromQueue: { id: 'w2', seq: 42 } }), '');
+      assert.ok(internals.deferredMessages.some((m) => m.id === 'w2' && m.seq === 42));
       // A fresh tool_result write keeps landing as before.
       const fresh = internals.addMessage('user', [
         { type: 'tool_result', toolUseId: 'p2', content: 'ok' } as ContentBlock,
