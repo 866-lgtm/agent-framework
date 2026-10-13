@@ -3,9 +3,8 @@
  *
  * Plain speech is held back for reasons that are right in themselves: an
  * explicit send in the same round suppresses the round's prose (so a "sent
- * it" postscript is not posted twice), a turn may have no destination, two
- * conversations may compete for an unaddressed reply, and a malformed or
- * unresolvable routing prefix bounces. Before drafts, the held words were
+ * it" postscript is not posted twice), a turn may have no destination, and a
+ * malformed or unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
  * the exact words until the resident resends or dismisses them, or the
@@ -59,8 +58,6 @@ export type DraftReason =
   | 'explicit-send'
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'
-  /** Two conversations competed for an unaddressed reply. */
-  | 'ambiguous'
   /** An explicit/hybrid routing prefix was missing, malformed or unresolvable. */
   | 'bounced';
 
@@ -90,7 +87,7 @@ export interface DraftAttempt {
   attemptId: string;
   at: number;
   destination: PublishDestination;
-  /** How the words went out: the drafts tool, or explicit mode's `{{unsent}}`. */
+  /** How the words went out: the drafts tool, or a `{{unsent}}` envelope (explicit or hybrid). */
   via: 'resend' | 'unsent-token';
   /** The resident resent knowing an earlier attempt may have been posted. */
   confirmedDuplicate?: true;

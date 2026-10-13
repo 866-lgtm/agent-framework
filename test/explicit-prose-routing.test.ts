@@ -282,6 +282,15 @@ describe('explicit prose routing', () => {
     };
   }
 
+  /** The metadata of the newest message whose text starts with `prefix`. */
+  function noticeOf(framework: AgentFramework, prefix: string): { draftOwner?: string; draftIds?: string[] } | undefined {
+    const messages = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{
+      content: Array<{ type: string; text?: string }>;
+      metadata?: { draftOwner?: string; draftIds?: string[] };
+    }>;
+    return messages.filter((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').startsWith(prefix))).at(-1)?.metadata;
+  }
+
   type DraftsView = ProseDraftStore;
   const draftsOf = (framework: AgentFramework): DraftsView =>
     (framework as unknown as { proseDrafts: DraftsView }).proseDrafts;
@@ -1779,6 +1788,7 @@ describe('explicit prose routing', () => {
       assert.equal(routing.hybridHold, 'private');
       assert.equal(routing.logical.keptPrivate, 1, 'the unprefixed envelope after it is counted as kept private');
       assert.deepEqual(routing.logical.drafts, [], 'and is never drafted');
+      assert.deepEqual(draftsOf(framework).open('assistant'), [], 'the journal holds nothing either');
     } finally {
       await framework.stop();
     }
@@ -1801,6 +1811,8 @@ describe('explicit prose routing', () => {
       assert.deepEqual(routed, [], 'nothing is sent');
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing] {{unsent}} is draft'))!;
       assert.ok(notice.includes('Your message could not be held as a draft; its words remain in your history.'), notice);
+      assert.deepEqual(noticeOf(framework, '[prose-routing] {{unsent}} is draft')?.draftIds, [original.id],
+        'the notice names the refused draft in its metadata too, so the catch-up counts it as named');
     } finally {
       await framework.stop();
     }
@@ -1821,6 +1833,51 @@ describe('explicit prose routing', () => {
       const receipt = context(framework).texts.find((t) => t.startsWith('[delivered]'))!;
       for (const draft of held) assert.ok(receipt.includes(draft.id), `${draft.id} is named: ${receipt}`);
       assert.doesNotMatch(receipt, /and \d+ more/, 'none is left as a count');
+      assert.deepEqual([...(noticeOf(framework, '[delivered]')?.draftIds ?? [])].sort(), held.map((d) => d.id).sort(),
+        'its metadata names every draft, so settlement records each one');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("words a send held back that the journal refuses are reported in the receipt", async () => {
+    const framework = await createFramework('hybrid');
+    try {
+      stubRegistry(framework);
+      const store = draftsOf(framework);
+      store.hold = ((_agent: string, segments: unknown[]) =>
+        ({ held: [], notHeld: { count: segments.length, error: 'the journal refused the write' } })) as typeof store.hold;
+      const gateway = framework as unknown as {
+        holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; turn: number; notice: 'later' }): void;
+        appendProseDeliveryReceipt(agent: unknown, routing: RoutingState): void;
+      };
+      const agent = framework.getAgent('assistant')!;
+      const routing: RoutingState = { destination: null,
+        logical: { continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0 } };
+      gateway.holdSilencedProse(agent, ['first words', 'second words'], 'send', false, { routing, turn: 1, notice: 'later' });
+      gateway.appendProseDeliveryReceipt(agent, routing);
+      const receipt = context(framework).texts.find((t) => t.startsWith('[delivered]'))!;
+      assert.ok(receipt.includes('2 plain-speech segment(s) suppressed and NOT held as drafts (the journal refused the write) — ' +
+        'the words remain only in your history'), receipt);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("an {{unsent}} send whose outcome can't be recorded says so in a notice that names its draft", async () => {
+    const framework = await createFramework();
+    try {
+      const routed = stubRegistry(framework);
+      const store = draftsOf(framework);
+      const original = store.hold('assistant', [{ text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced').held[0]!;
+      store.recordOutcome = (() => { throw new Error('the journal refused the write'); }) as typeof store.recordOutcome;
+      const gateway = framework as unknown as { deliverProse(a: unknown, text: string): Promise<void> };
+      await gateway.deliverProse(framework.getAgent('assistant')!, '>>#alpha {{unsent}}');
+      assert.deepEqual(routed.map((r) => r.text), ['earlier words'], 'the words were sent');
+      const notice = context(framework).texts.find((t) => t.startsWith(`[prose-routing] {{unsent}} was draft ${original.id};`))!;
+      assert.ok(notice.includes('but recording that failed'), notice);
+      assert.deepEqual(noticeOf(framework, `[prose-routing] {{unsent}} was draft ${original.id};`)?.draftIds, [original.id],
+        'it names the draft in its metadata, so the catch-up counts it as named');
     } finally {
       await framework.stop();
     }

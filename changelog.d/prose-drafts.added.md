@@ -24,10 +24,10 @@
 - Drafts live in typed Chronicle records (`RecordJournal`) that do not follow
   branch switches: undo, rollback and checkout never change them, and they
   survive restarts. Nothing is ever sent from them on its own. Each
-  resident's 100 newest drafts are kept, and an older one for 7 days after
-  anything last happened to it (held, named, attempted, answered, dismissed);
-  the journal checkpoints what it keeps every 500 entries, so opening it
-  replays only what follows. A request naming a draft that was let go is
+  resident's 100 newest drafts are kept, and an older one for at least 7
+  days after anything last happened to it (held, named, attempted, answered,
+  dismissed). The journal lets such a draft go when it next checkpoints what
+  it keeps, every 500 entries, so opening it replays only what follows. A request naming a draft that was let go is
   refused, and nothing is sent.
 - A private notice names held drafts at the next tool boundary when the live
   stream presents mid-turn messages (a draft holding words copied from one
@@ -51,7 +51,8 @@
   landed after its turn had ended, and it leaves out the drafts of a turn
   still open and those a notice waiting to be written names. Notices
   name drafts and say how to resend or dismiss them, and quote none of their
-  words; the `drafts` tool's `list` and `read` show the words.
+  words; the `drafts` tool's `read` shows the words, and its `list` a
+  preview of each.
 - A draft is never published except by its resident's explicit resend (or
   `{{unsent}}`), and only that resident can list or act on it. Its notices go
   into the resident's own history, which residents sharing one message slot
@@ -76,7 +77,8 @@
 - `{{unsent}}` whose draft is being sent, queued in a resend, or unconfirmed
   sends nothing, and the envelope's own words are held as a bounce draft
   with `{{unsent}}` written out and the risk carried, so nothing the
-  resident wrote has to be typed again.
+  resident wrote has to be typed again. If the journal refuses that draft,
+  the notice says the words remain only in the history.
 - Prose segments also break at XML tool mode's refused attempts and their
   notices (`tool_attempt`, `tool_notice`): the words before an all-refused
   call and after its notice are two messages, routed or held separately.

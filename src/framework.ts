@@ -612,7 +612,7 @@ interface LogicalTurn {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply in the same round): counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send): counted, never drafted. */
   keptPrivate: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
@@ -637,7 +637,7 @@ function freshTurnRouting(): TurnRouting {
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
   routing: TurnRouting;
-  /** The turn token current when the round was built: a held draft's provenance (DraftSource.turn). */
+  /** The turn token of the stream that built the round, read at driveStream's entry: a held draft's provenance (DraftSource.turn). */
   turn: number;
   round?: number;
   notice: 'now' | 'later';
@@ -1307,10 +1307,10 @@ export class AgentFramework {
   private lastAnnouncedLocus: Map<string, string | null> = new Map();
 
   // ---- Held prose drafts (src/prose-drafts.ts) ---------------------------
-  /** Every resident's held drafts: suppressed, bounced or ambiguous plain
-   *  speech, never published except by their resident's resend, kept until
-   *  resent or dismissed. A logical turn's own drafts, for its receipt, are
-   *  its LogicalTurn's. */
+  /** Every resident's held drafts: plain speech that was suppressed, bounced
+   *  or left without a destination, never published except by their
+   *  resident's resend, kept until resent or dismissed. A logical turn's own
+   *  drafts, for its receipt, are its LogicalTurn's. */
   private proseDrafts: ProseDraftStore;
 
   // ---- Explicit prose routing (docs/explicit-prose-routing.md) ----------
@@ -5029,7 +5029,7 @@ export class AgentFramework {
       'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in the ' +
       'same round holds plain speech back, because a routing prefix bounced, or because it had no destination. ' +
       `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
-      `drafts are always kept; an older one is let go after ${AgentFramework.DRAFT_KEEP_DAYS} days in which nothing happened to it. ` +
+      `drafts are always kept; an older one may be let go once ${AgentFramework.DRAFT_KEEP_DAYS} days pass in which nothing happens to it. ` +
       'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
       'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
       'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
@@ -9429,14 +9429,12 @@ export class AgentFramework {
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
     'explicit-send': 'an explicit send in the same round holds plain speech back',
     'no-destination': 'it had no destination — after a routing envelope failed, plain speech waits for a new valid target',
-    ambiguous: 'more than one conversation was waiting for you, so unaddressed speech was held rather than guessed',
     bounced: 'its routing prefix bounced',
   };
 
   private static readonly DRAFT_REASON_SHORT: Record<DraftReason, string> = {
     'explicit-send': 'explicit send in the same round',
     'no-destination': 'no destination',
-    ambiguous: 'competing conversations',
     bounced: 'routing prefix bounced',
   };
 
@@ -9742,7 +9740,7 @@ export class AgentFramework {
     if (missing.length > 0) {
       return refuse(
         `No draft of yours with id ${missing.join(', ')}: there was none, or it was let go (a draft beyond your ${KEEP_NEWEST} newest ` +
-        `is kept for ${AgentFramework.DRAFT_KEEP_DAYS} days after anything last happened to it). drafts(action: "list") shows your open drafts.`,
+        `is kept for at least ${AgentFramework.DRAFT_KEEP_DAYS} days after anything last happened to it). drafts(action: "list") shows your open drafts.`,
       );
     }
 
@@ -10348,7 +10346,8 @@ export class AgentFramework {
       this.addMessage(
         'user',
         [{ type: 'text', text }],
-        { system: true, kind: 'prose-bounce', ...(held ? { draftOwner: agent.name, draftIds: [held.id] } : {}) } as MessageMetadata,
+        // It names the refused draft as well as any copy it held.
+        { system: true, kind: 'prose-bounce', draftOwner: agent.name, draftIds: held ? [draft.id, held.id] : [draft.id] } as MessageMetadata,
         { forAgent: agent.name },
       );
     } catch (err) {
@@ -10407,7 +10406,12 @@ export class AgentFramework {
           `[prose-routing] {{unsent}} was draft ${unsent.id}; its send came back ${outcome.status}, but recording that ` +
           `failed, so the draft reads as ${this.draftStateNow(agent.name, unsent.id)} now. drafts(action: "read") shows it.`;
         try {
-          this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+          this.addMessage(
+            'user',
+            [{ type: 'text', text }],
+            { system: true, kind: 'prose-bounce', draftOwner: agent.name, draftIds: [unsent.id] } as MessageMetadata,
+            { forAgent: agent.name },
+          );
         } catch (noticeErr) {
           console.error('[drafts] unrecorded-outcome notice failed:', noticeErr);
         }

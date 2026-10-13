@@ -1170,6 +1170,25 @@ describe('draft notices and turn-end settlement', () => {
     }
   });
 
+  it('the catch-up reads notices among the newest 500 messages, and names a draft whose only notice is further back', async () => {
+    const t = await catchUpFixture();
+    try {
+      const [old, recent] = t.internals.proseDrafts.hold('scout', [{ text: 'old', source }, { text: 'recent', source }], 'bounced').held;
+      // Neither notice was recorded: one now sits 500 messages back, the
+      // other among the newest.
+      t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [old!.id] } as never);
+      for (let i = 0; i < 500; i++) t.cm.addMessage('user', [{ type: 'text', text: `filler ${i}` }]);
+      const notice = t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [recent!.id] } as never);
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      assert.deepEqual(t.internals.proseDrafts.get('scout', recent!.id)!.noticedIn, [String(notice)], 'the recent notice is found and recorded');
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(old!.id), `the draft whose notice is past the window is named: ${catchUp}`);
+      assert.ok(!catchUp!.includes(recent!.id), 'the recently named one is not');
+    } finally {
+      await t.close();
+    }
+  });
+
   it('the catch-up leaves out a draft that a notice still waiting to be written names', async () => {
     const t = await catchUpFixture();
     const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;
