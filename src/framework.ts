@@ -14660,7 +14660,8 @@ export class AgentFramework {
     command?: string;
     /** The url as {@link redactUrl} shows it, since a credential may ride in
      *  it: no userinfo, each query parameter's value replaced, and any path
-     *  segment that looks like a credential replaced. */
+     *  segment or query parameter name that looks like a credential
+     *  replaced. */
     url?: string;
   }> {
     const result: Array<{

@@ -189,6 +189,12 @@ test("content that isn't a list of blocks reaches a script as the model reads it
     const filesModel = await modelCall('attach', 'files');
     assert.equal(filesModel.isError, false);
     assert.deepEqual(JSON.parse(await script('mcpl--files--attach')), { content: [], structuredContent: { a: 1 }, isError: false });
+    // Content left out isn't malformed: no content, on either peer.
+    answer({ structuredContent: { a: 1 } } as unknown as Answer);
+    assert.equal((await modelCall('attach', 'plain')).isError, false);
+    for (const tool of ['mcpl--plain--attach', 'mcpl--files--attach']) {
+      assert.deepEqual(JSON.parse(await script(tool)), { content: [], structuredContent: { a: 1 }, isError: false }, tool);
+    }
   });
 });
 

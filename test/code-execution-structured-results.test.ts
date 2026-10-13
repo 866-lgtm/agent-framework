@@ -44,7 +44,7 @@ class UnconvertibleModule implements Module {
   async stop(): Promise<void> {}
   async onProcess(): Promise<EventResponse> { return {}; }
   getTools(): ToolDefinition[] {
-    return ['cyclic', 'bigint', 'cyclic_data', 'cyclic_error'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
+    return ['cyclic', 'bigint', 'cyclic_data', 'cyclic_error', 'bare_throw'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
@@ -53,6 +53,8 @@ class UnconvertibleModule implements Module {
     if (name === 'cyclic') return { success: true, data: text('a loop'), structured: cyclic };
     if (name === 'bigint') return { success: true, data: text('a big number'), structured: { n: 1n } };
     if (name === 'cyclic_error') return { success: false, isError: true, error: 'db timeout', data: text('failed'), structured: cyclic };
+    // A toJSON that throws a value with no prototype, so String() can't describe it either.
+    if (name === 'bare_throw') return { success: true, data: text('bare'), structured: { toJSON() { throw Object.create(null); } } };
     return { success: true, data: cyclic };
   }
 }
@@ -133,6 +135,8 @@ test("a script reads a structured result whole, the model's calls and history ke
       // An error result that can't be converted keeps the tool's own error.
       'cyclic_error = json.loads(await loop__cyclic_error({}))',
       'assert cyclic_error["isError"] is True and cyclic_error["error"].endswith("The call itself completed, with this error: db timeout"), cyclic_error',
+      'bare_throw = json.loads(await loop__bare_throw({}))',
+      'assert bare_throw["isError"] is True and "(a value with no text form)" in bare_throw["error"], bare_throw',
       'print(r["structuredContent"]["runId"], r["structuredContent"]["state"], r["structuredContent"]["output"])',
     ].join('\n');
     membrane.pushResponse(createMockResponse([

@@ -71,12 +71,26 @@ function credentialLikeSegment(segment: string): boolean {
   return (segment.length >= 16 && /[0-9]/.test(segment)) || segment.length >= 32;
 }
 
+/** Query parameter names that say they carry a credential. */
+const CREDENTIAL_PARAM = /token|key|secret|password|auth|signature/i;
+
+/**
+ * A query parameter name that may itself be a credential, which
+ * {@link redactUrl} replaces and a warning never quotes: one shaped like a
+ * token, or one with no value whose name says it carries a credential, since
+ * a bare token rides as a name alone (`?<token>`).
+ */
+function credentialLikeQueryName(name: string, value: string): boolean {
+  return credentialLikeSegment(name) || (value === '' && CREDENTIAL_PARAM.test(name));
+}
+
 /**
  * A url as text a person or a log reads it: its scheme, host and port, and
  * its path with any credential-like segment replaced. The userinfo is
  * removed and each query parameter's value replaced, since a credential
- * rides there too, and so is a parameter name that looks like one. A url
- * that doesn't parse can't be redacted, so it isn't shown at all.
+ * rides there too, and so is a parameter name that may itself be one
+ * ({@link credentialLikeQueryName}). A url that doesn't parse can't be
+ * redacted, so it isn't shown at all.
  */
 export function redactUrl(url: string | undefined): string {
   let parsed: URL;
@@ -89,9 +103,7 @@ export function redactUrl(url: string | undefined): string {
   parsed.password = '';
   parsed.hash = '';
   parsed.pathname = parsed.pathname.split('/').map((segment) => (credentialLikeSegment(segment) ? 'redacted' : segment)).join('/');
-  // A bare token rides as a name with no value (`?<token>`), so a name that
-  // looks like a credential is replaced too.
-  parsed.search = new URLSearchParams([...parsed.searchParams].map(([name]): [string, string] => [credentialLikeSegment(name) ? 'redacted' : name, 'redacted'])).toString();
+  parsed.search = new URLSearchParams([...parsed.searchParams].map(([name, value]): [string, string] => [credentialLikeQueryName(name, value) ? 'redacted' : name, 'redacted'])).toString();
   return parsed.toString();
 }
 
@@ -246,17 +258,16 @@ function isLoopbackHost(hostname: string): boolean {
     /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(host) || host === '0.0.0.0' || host === '[::]';
 }
 
-/** Query parameter names that say they carry a credential. */
-const CREDENTIAL_PARAM = /token|key|secret|password|auth|signature/i;
-
 /**
  * What is usable in a server configuration but worth an operator's attention,
  * as messages; empty when there is nothing. A credential for an `http://` or
  * `ws://` url whose host isn't loopback crosses the network in cleartext:
  * `token` or `accessProvider` (in the `Authorization` header, or the
  * WebSocket `?token=` query), and a secret the url carries itself (a ws://
- * url's userinfo, a query parameter whose name says it's a credential, or a
- * path segment that looks like one, as {@link redactUrl} judges it). That can be
+ * url's userinfo, a query parameter whose name says it's a credential or may
+ * itself be one, or a path segment that looks like one, as {@link redactUrl}
+ * judges it). A name that may itself be a credential is counted, never
+ * quoted. That can be
  * deliberate, on a private network or behind a TLS-terminating proxy, so it
  * is a warning and never a refusal.
  */
@@ -276,13 +287,18 @@ export function serverConfigWarnings(config: McplServerConfig): string[] {
   // url sends it.
   if (url.protocol === 'ws:' && (url.username || url.password)) carried.push("its url's userinfo");
   if (url.pathname.split('/').some(credentialLikeSegment)) carried.push("a credential-like segment of its url's path");
-  const params = [...new Set([...url.searchParams.keys()].filter((name) => CREDENTIAL_PARAM.test(name)))];
+  const entries = [...url.searchParams];
+  const hidden = entries.filter(([name, value]) => credentialLikeQueryName(name, value)).length;
+  const params = [...new Set(entries.filter(([name, value]) => !credentialLikeQueryName(name, value) && CREDENTIAL_PARAM.test(name)).map(([name]) => name))];
   if (params.length > 0) {
     carried.push(`its url's query ${params.length === 1 ? 'parameter' : 'parameters'} ${params.map((name) => JSON.stringify(name)).join(', ')}`);
   }
+  if (hidden > 0) {
+    carried.push(hidden === 1 ? 'a query parameter whose name looks like a credential' : `${hidden} query parameters whose names look like credentials`);
+  }
   if (carried.length === 0) return [];
   const what = carried.length === 1 ? carried[0] : `${carried.slice(0, -1).join(', ')} and ${carried[carried.length - 1]}`;
-  const one = carried.length === 1 && params.length <= 1;
+  const one = carried.length === 1 && params.length <= 1 && hidden <= 1;
   const secure = url.protocol === 'http:' ? 'https' : 'wss';
   return [
     `MCP server "${config.id}": ${what} ${one ? 'goes' : 'go'} to ${url.host} unencrypted (${url.protocol}//), ` +

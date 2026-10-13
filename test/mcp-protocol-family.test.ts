@@ -84,8 +84,12 @@ test('errors and the status view show a url redacted: no userinfo, no query valu
   assert.equal(redactUrl('https://mcp.example/server/123e4567-e89b-12d3-a456-426614174000/mcp'), 'https://mcp.example/server/redacted/mcp');
   assert.equal(redactUrl(`https://mcp.example/${'a'.repeat(32)}/mcp`), 'https://mcp.example/redacted/mcp');
   assert.equal(redactUrl('https://mcp.example/v2/2026-07-28/organization-settings/mcp'), 'https://mcp.example/v2/2026-07-28/organization-settings/mcp');
-  // A bare token rides as a valueless name; a short plain name stays.
+  // A bare token rides as a valueless name: one shaped like a token, or one
+  // whose name says it's a credential, goes. A name with a value is a label
+  // and stays, and so does a short plain name.
   assert.equal(redactUrl('https://h/mcp?sk-live-abcdef0123456789'), 'https://h/mcp?redacted=redacted');
+  assert.equal(redactUrl('https://h/mcp?apikey_x9'), 'https://h/mcp?redacted=redacted');
+  assert.equal(redactUrl('https://h/mcp?token=abc'), 'https://h/mcp?token=redacted');
   assert.equal(redactUrl('https://h/mcp?verbose'), 'https://h/mcp?verbose=redacted');
   assert.equal(redactUrl('not a url ?token=abc'), '(an invalid url, not shown)');
   assert.equal(redactUrl(undefined), '(an invalid url, not shown)');
@@ -216,6 +220,13 @@ test('a secret the url carries itself is warned about too, and the warning never
   const both = warned('ws://u:p@10.0.0.5/mcpl?token=a&sig_key=b&region=eu', { token: 't' })[0]!;
   assert.match(both, /its credential, its url's userinfo and its url's query parameters "token", "sig_key" go to 10\.0\.0\.5 unencrypted.*read them;/);
   for (const text of [both, ...warned('ws://user:pw@10.0.0.5/mcpl?token=sekret')]) assert.ok(!/sekret|pw|u:p/.test(text), text);
+  // A name that may itself be a credential is warned about and counted, never quoted.
+  assert.deepEqual(warned('ws://mcp.lan/mcpl?sk-live-abcdef0123456789'), [
+    'MCP server "s": a query parameter whose name looks like a credential goes to mcp.lan unencrypted (ws://), where anything on the network path can read it; use wss:// unless that network is trusted',
+  ]);
+  const named = warned('ws://mcp.lan/mcpl?token=a&apikey_x9&x7y8z9w0v1u2t3s4r5')[0]!;
+  assert.match(named, /its url's query parameter "token" and 2 query parameters whose names look like credentials go to mcp\.lan unencrypted.*read them;/);
+  assert.ok(!/apikey_x9|x7y8z9/.test(named), named);
   const path = warned('http://10.0.0.5/api/mcp/s/Zt4kQ9xW2vLm8pRs7YbN/mcp')[0]!;
   assert.match(path, /a credential-like segment of its url's path goes to 10\.0\.0\.5 unencrypted.*read it;/);
   assert.ok(!path.includes('Zt4kQ9xW2vLm8pRs7YbN'), path);

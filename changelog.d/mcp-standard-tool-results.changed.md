@@ -29,7 +29,10 @@
   server's result itself, as one JSON object: `{ content, structuredContent,
   isError, error? }`. From a server that isn't an MCPL peer, `content` is the
   blocks as sent, so images and other payloads survive. `structuredContent`
-  is the tool's own JSON, as sent.
+  is the tool's own JSON, as sent. Content that is present but isn't a
+  list of blocks, from such a server, is the malformed result the model
+  reads (`isError`, with the malformed notice as `error`), its structured
+  content kept, where it was an empty success.
 - An MCPL peer's blocks in a script's `content` get the treatment every
   lane the model reads gives them, since what a script prints comes back to
   the model. An RFC-005 reference arrives without its URI, as the host's
