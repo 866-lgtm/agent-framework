@@ -320,6 +320,36 @@ test('recorded server text keeps short standalone values and unrelated words, bu
   assert.equal(redactServerText('12345678', cfg({token:'12345678'})), 'redacted');
 });
 
+test('recorded server text: the token as a url carries it, credential-named env values, only where nothing adjoins, and any value', () => {
+  // The static token, raw and as a url carries it, percent- or form-encoded.
+  const token = 'tok+en/123=';
+  const tokenConfig = cfg({ token });
+  for (const form of [token, encodeURIComponent(token), 'tok%2Ben%2F123%3D']) {
+    assert.equal(redactServerText(`refused: ${form}`, tokenConfig), 'refused: redacted', form);
+  }
+  // A stdio server's env: a value whose name says it's a credential, and no other.
+  const env = cfg({ command: 'srv', env: { GITHUB_TOKEN: 'ghp_abcdef123456', API_KEY: 'k3y-abcdefgh', PATH: '/usr/local/bin' } });
+  assert.equal(redactServerText('auth ghp_abcdef123456 k3y-abcdefgh /usr/local/bin', env), 'auth redacted redacted /usr/local/bin');
+  // Only where no letter or digit adjoins a string: a short pair stays whole elsewhere.
+  const pair = cfg({ url: 'https://h/mcp?v=2' });
+  assert.equal(redactServerText('dev=2 ready; v=2 sent', pair), 'dev=2 ready; redacted sent');
+  // A ws:// url's userinfo, as for wss://.
+  const ws = cfg({ url: 'ws://wsuser1234:wspass5678@h/mcp' });
+  assert.equal(redactServerText('connect wsuser1234 wspass5678', ws), 'connect redacted redacted');
+  // A url with a stray percent sign: its value is kept as written.
+  const stray = cfg({ url: 'https://h/mcp?note=100%&key=abcdefgh1234' });
+  assert.equal(redactServerText('note=100% key=abcdefgh1234', stray), 'redacted redacted');
+  // Any value reads as text: a rejection that isn't an Error doesn't throw.
+  assert.equal(redactServerText(undefined, tokenConfig), 'undefined');
+  assert.equal(redactServerText({ toString: () => `obj ${token}` }, tokenConfig), 'obj redacted');
+});
+
+test('the cleartext warning counts a credential-shaped value under a plain name, as redaction does', () => {
+  const warned = serverConfigWarnings(cfg({ url: 'http://remote.example/mcp?session=Zx81kQ0pL2mN7vB4tY6c' }));
+  assert.equal(warned.length, 1);
+  assert.match(warned[0], /its url's query parameter "session" goes to remote\.example unencrypted/);
+});
+
 test('recorded server text uses longest-first, one-pass replacements and is idempotent', () => {
   const config = cfg({ url: 'https://h/mcp?secret=token0123456789-tail&redacted=eu', token: 'token0123456789' });
   const original = 'secret=token0123456789-tail token0123456789 redacted=eu queue full';

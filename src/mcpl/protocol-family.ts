@@ -108,16 +108,23 @@ export function redactUrl(url: string | undefined): string {
 }
 
 /**
- * Server/transport diagnostics as the framework records them. Replace only
- * known URL credential strings and the configured static token, in their
- * encoded and decoded forms. Short standalone strings (under 8 characters)
- * are indistinguishable from ordinary words; short query values are removed
- * as name=value instead. A single longest-first replacement never scans its
- * own replacement text. Unknown secrets, including accessProvider's cached
- * bearer token, are outside this contract. JSON-RPC tool answers and errors
- * thrown directly to a host caller keep their separate pass-through contract.
+ * Server and transport text as the framework records it, with the strings a
+ * server's configuration knows to be credentials replaced:
+ * - from the url, as written and decoded: credential-like path segments and
+ *   query names, credential-shaped or credential-named query values, every
+ *   other non-empty parameter as its whole name=value, and a ws:// url's
+ *   username and password;
+ * - the static token, raw and percent- or form-encoded;
+ * - a stdio server's environment values whose names say they're credentials.
+ * A string replaced on its own has at least 8 characters, since a shorter
+ * one can't be told from ordinary text; a short query value is replaced
+ * with its name, as one name=value. A string is replaced only where no letter
+ * or digit adjoins it, and one longest-first pass never scans its own
+ * replacement. A credential the configuration doesn't hold, such as an
+ * access provider's cached bearer token or another origin's, is outside it.
+ * JSON-RPC answers and errors thrown to a host's own call pass as they are.
  */
-export function redactServerText(text: string, config: Pick<McplServerConfig, 'url' | 'token'>): string {
+export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
   return serverTextRedactor(config)(text);
 }
 
@@ -125,14 +132,25 @@ export function redactServerText(text: string, config: Pick<McplServerConfig, 'u
  * {@link redactServerText} for one configuration, its strings found and its
  * pattern built once: for a connection's records, such as each stderr line.
  */
-export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token'>): (text: string) => string {
+export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
   const secrets = new Set<string>();
   const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
   const decode = (value: string, query = false): string => {
     try { return decodeURIComponent(query ? value.replace(/\+/g, ' ') : value); }
     catch { return value; }
   };
-  standalone(config.token ?? '');
+  // The token as sent: raw in a header, and percent- or form-encoded where a
+  // transport puts it in a url.
+  for (const token of [config.token ?? '']) {
+    standalone(token);
+    standalone(encodeURIComponent(token));
+    standalone(new URLSearchParams({ t: token }).toString().slice(2));
+  }
+  // A stdio server's environment values whose names say they carry a
+  // credential, by the same rule as the url's parameters.
+  for (const [name, value] of Object.entries(config.env ?? {})) {
+    if (CREDENTIAL_PARAM.test(name)) standalone(value);
+  }
   let url: URL | undefined;
   try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
   if (url) {
@@ -168,11 +186,14 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
       }
     }
   }
-  if (secrets.size === 0) return (text) => text;
+  const asText = (text: unknown): string => (typeof text === 'string' ? text : String(text));
+  if (secrets.size === 0) return asText;
   const alternatives = [...secrets].sort((a, b) => b.length - a.length)
     .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const pattern = new RegExp(alternatives.join('|'), 'g');
-  return (text) => text.replace(pattern, 'redacted');
+  // Only where no letter or digit adjoins it, so a short name=value such as
+  // v=2 leaves dev=2 alone.
+  const pattern = new RegExp(`(?<![A-Za-z0-9])(?:${alternatives.join('|')})(?![A-Za-z0-9])`, 'g');
+  return (text) => asText(text).replace(pattern, 'redacted');
 }
 
 /**
@@ -357,7 +378,9 @@ export function serverConfigWarnings(config: McplServerConfig): string[] {
   if (url.pathname.split('/').some(credentialLikeSegment)) carried.push("a credential-like segment of its url's path");
   const entries = [...url.searchParams];
   const hidden = entries.filter(([name, value]) => credentialLikeQueryName(name, value)).length;
-  const params = [...new Set(entries.filter(([name, value]) => !credentialLikeQueryName(name, value) && CREDENTIAL_PARAM.test(name)).map(([name]) => name))];
+  // A parameter carries a credential by its name, or by its value's shape,
+  // as redaction reads it; the name is shown only when it isn't one itself.
+  const params = [...new Set(entries.filter(([name, value]) => !credentialLikeQueryName(name, value) && (CREDENTIAL_PARAM.test(name) || credentialLikeSegment(value))).map(([name]) => name))];
   if (params.length > 0) {
     carried.push(`its url's query ${params.length === 1 ? 'parameter' : 'parameters'} ${params.map((name) => JSON.stringify(name)).join(', ')}`);
   }
