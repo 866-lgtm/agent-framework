@@ -485,6 +485,8 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
  *  no tool blocks (the membrane's tool cycle) and not named as the agent
  *  itself (it would render as an assistant turn, a prefill). */
 function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agentName: string): boolean {
+  // Exact, as membrane's role test is: only a participant equal to the
+  // request's assistantParticipant (Agent's name) renders as the assistant.
   return msg.participant !== agentName
     && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
 }
