@@ -583,6 +583,20 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it('through the real connection, failed locus speech keeps its failure marker, since nothing holds it', async () => {
+    const h = await harness();
+    try {
+      h.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await h.turn([createMockResponse([text('words a refusing connector drops')])]);
+      await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
+      const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
+      assert.match(marker, /could not be delivered to .* Nothing was posted/);
+      assert.deepEqual(h.drafts(), [], 'locus speech is not held');
+    } finally {
+      await h.close();
+    }
+  });
+
   for (const mode of ['explicit', 'hybrid'] as const) {
     it('through the real connection, failed ' + mode + ' speech is held as a bounce draft with one notice, not a second marker', async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
@@ -795,7 +809,7 @@ describe('held prose drafts, end to end', () => {
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours are unnamed on this branch of your history: /);
+      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours are unnamed on this branch of your history: /);
       assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); explicit send in the same round\)/);
       assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in the same round\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
@@ -813,7 +827,7 @@ describe('held prose drafts, end to end', () => {
       const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}`, source }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 10 held drafts of yours are unnamed on this branch of your history: /);
+      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours are unnamed on this branch of your history: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
       const named = [...notice.matchAll(/(d-[a-z2-9]{5}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
@@ -846,7 +860,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`a held draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
       assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');

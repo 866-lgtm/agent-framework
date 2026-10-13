@@ -2,7 +2,7 @@
  * Explicit prose routing (docs/explicit-prose-routing.md).
  *
  * The model names every destination in-band (`>>` prefixes); unprefixed prose
- * is NEVER delivered — it bounces to a clipboard for a prefixed resend. The
+ * is NEVER delivered — it bounces to a held draft for a prefixed resend. The
  * laria regression (2026-07-24): a DM reply generated while the host-inferred
  * locus pointed at a guild channel was misdelivered there. In explicit mode
  * that class is structurally impossible: the worst case is a bounce.
@@ -169,7 +169,7 @@ describe('explicit prose routing', () => {
     });
   }
 
-  it('unprefixed prose NEVER delivers — bounces to clipboard, then a prefixed {{unsent}} resend delivers verbatim (laria regression)', async () => {
+  it('unprefixed prose NEVER delivers — bounces to a held draft, then a prefixed {{unsent}} resend delivers verbatim (laria regression)', async () => {
     const original = 'laria.\n\nYes, I remember. Two words through the keyhole.';
     membrane.pushResponse(createMockResponse([{ type: 'text', text: original }] as ContentBlock[]));
 
@@ -191,7 +191,7 @@ describe('explicit prose routing', () => {
     assert.equal(bounceNotices.length, 1, 'exactly one bounce notice');
     assert.equal(routed.length, 1, 'only the prefixed resend delivered');
     assert.equal(routed[0]!.locus, 'discord:dm:99', 'delivered to the DM the model named');
-    assert.equal(routed[0]!.text, original, 'clipboard substitution is verbatim');
+    assert.equal(routed[0]!.text, original, '{{unsent}} substitution is verbatim');
 
     await framework.stop();
   });
@@ -339,7 +339,7 @@ describe('explicit prose routing', () => {
       await gateway.deliverProse(agent, '>>#alpha {{unsent}}', { notice: 'later' });
       assert.deepEqual(routed, [], 'nothing is sent');
       assert.deepEqual(store.open('assistant'), [], 'and nothing is held');
-      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing] {{unsent}} names no held draft') && t.includes('nothing was sent')));
+      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing] {{unsent}} names no held bounce draft') && t.includes('nothing was sent')));
       // With words of its own, those are held as a bounce draft rather than
       // posted as a fragment.
       await gateway.deliverProse(agent, '>>#alpha Here it is again: {{unsent}}', { notice: 'later' });
@@ -368,6 +368,8 @@ describe('explicit prose routing', () => {
       assert.deepEqual(routed.map((r) => r.text), ['the words'], 'the first {{unsent}} sends the bounce');
       await gateway.deliverProse(agent, '>>#alpha {{unsent}}', { notice: 'later' });
       assert.deepEqual(routed.map((r) => r.text), ['the words'], 'a second one, with the draft delivered, sends nothing');
+      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing] {{unsent}} names no held bounce draft')),
+        'and says why');
     } finally {
       await framework.stop();
     }

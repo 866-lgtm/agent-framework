@@ -9045,7 +9045,9 @@ export class AgentFramework {
   /**
    * Silenced plain speech: an explicit send holds it as resendable drafts; a
    * deliberate silence (skip_reply, a silent turn, or a private think in
-   * the same tool round, where that policy applies) keeps it private —
+   * the same native round, where that policy applies: an XML-mode round has
+   * no verbatim content to route live, so its prose is routed at the turn's
+   * end as ordinary speech) keeps it private —
    * counted for the receipt, never drafted. `segments` are the runs exactly
    * as written (splitProseRuns), so a draft keeps the resident's words byte
    * for byte.
@@ -9351,7 +9353,7 @@ export class AgentFramework {
     const rest = pending.slice(shown.length).map((d) => d.id);
     const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
     const text =
-      `[drafts] ${agent.name}: ${pending.length === 1 ? 'a held draft' : `${pending.length} held drafts`} of yours ` +
+      `[drafts] ${agent.name}: ${pending.length === 1 ? 'an open draft' : `${pending.length} open drafts`} of yours ` +
       `${pending.length === 1 ? 'is' : 'are'} unnamed on this branch of your history: ${shown.join(' · ')}${more}. ` +
       'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
     let mid: string;
@@ -9942,7 +9944,7 @@ export class AgentFramework {
    * Explicit-prose-routing delivery gateway (docs/explicit-prose-routing.md).
    * Every prose segment of an `explicit`-mode agent flows through here:
    * parse the `>>` prefix, resolve the target, deliver — or bounce to the
-   * clipboard with a resend notice. Misdelivery is structurally impossible:
+   * held bounce draft with a resend notice. Misdelivery is structurally impossible:
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
@@ -10006,7 +10008,7 @@ export class AgentFramework {
       // fragment. The envelope's own words, if it has any, are held as a
       // bounce draft, with its notice; otherwise a short notice says so.
       const own = body.replaceAll('{{unsent}}', '').trim();
-      const reason = '{{unsent}} names no held draft: your latest bounce draft has been sent, set aside or let go';
+      const reason = '{{unsent}} names no held bounce draft';
       if (own) {
         this.bounceProse(agent, own, reason, undefined, prefix, hold);
       } else {

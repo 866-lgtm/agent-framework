@@ -460,7 +460,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // Constructor Options
 // ============================================================================
 
-/** Bound connector values for notices/logs; the PublishOutcome keeps the original. */
+/** Bound connector values for notices, logs and an outcome's reason. A
+ *  PublishOutcome keeps the connector's structured data (`detail`) whole. */
 function connectorText(value: unknown): string {
   let text: string;
   try {

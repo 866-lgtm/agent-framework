@@ -1,11 +1,12 @@
 - **Held prose drafts: suppressed speech is kept, not destroyed.** Plain
-  speech that is not sent is now held as a draft with its exact words,
-  instead of surviving only as a count: speech suppressed by an
+  speech that routing holds back is now held as a draft with its exact
+  words, instead of surviving only as a count: speech suppressed by an
   explicit send in the same round (locus and hybrid modes, mid-turn, trailing
   and text-only, native and XML tool modes), hybrid prose left without a
-  destination after a failed envelope, and explicit/hybrid bounces (which
-  replace the in-memory latest-wins clipboard; `{{unsent}}` keeps meaning the
-  latest bounce). A draft held beside a send keeps its run exactly as
+  destination after a failed envelope, and explicit/hybrid bounces, a
+  delivery that definitely failed among them (which replace the in-memory
+  latest-wins clipboard; `{{unsent}}` keeps meaning the latest bounce). Locus
+  speech whose delivery fails keeps its failure marker, and isn't held. A draft held beside a send keeps its run exactly as
   written, indentation and surrounding newlines included; routing still
   publishes trimmed segments. Deliberate privacy is never drafted:
   `skip_reply` (the tool, or a hybrid `>>>skip_reply` envelope, which keeps
@@ -41,7 +42,7 @@
   counts as named while a message naming it is on the current branch, so one
   no notice reached (a crash, an aborted turn), or whose notices a rollback
   or branch move took away, is named at the next turn's start: every such
-  draft by id, the newest eight with its state and why it was held. Notices
+  open draft by id, the newest eight with its state and why it was held. Notices
   name drafts and say how to resend or dismiss them, and quote none of their
   words; the `drafts` tool's `list` and `read` show the words.
 - A draft is never published except by its resident's explicit resend (or
