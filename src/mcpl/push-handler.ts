@@ -370,8 +370,9 @@ export class PushHandler {
    * failing `field` and the error's message as `detail`. A missing eventId
    * prints as `""` and traces as `''`, as the channel lane's missing id does.
    * A channel-scoped push refused because its channel isn't declared or may
-   * not be used is refused for as long as that lasts, so its line prints at
-   * most once a minute per channel (RefusalLines); every refusal is traced.
+   * not be used names the channel, and is refused for as long as that lasts,
+   * so its line prints at most once a minute per channel (RefusalLines);
+   * every refusal is traced.
    */
   private traceCoalesceRejection(
     serverId: string,
@@ -381,13 +382,13 @@ export class PushHandler {
   ): void {
     const reason = coalesceRejectionReason(answered);
     const field = typeof error.field === 'string' && error.field ? error.field : undefined;
-    const channelId = params.coalesce?.channelId;
-    const held = (answered === -32023 || answered === -32017) && typeof channelId === 'string'
-      ? this.channelRefusalLines.admit(serverId, channelId)
-      : 0;
+    const scoped = params.coalesce?.channelId;
+    const channelId = (answered === -32023 || answered === -32017) && typeof scoped === 'string' ? scoped : undefined;
+    const held = channelId === undefined ? 0 : this.channelRefusalLines.admit(serverId, channelId);
     if (held !== null) {
       console.error(
         `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet ?? '')} eventId=${logValue(params.eventId ?? '')} ` +
+        (channelId === undefined ? '' : `channel=${logValue(channelId)} `) +
         `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}` +
         (held ? ` (${held} more since the last line)` : ''),
       );

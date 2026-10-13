@@ -310,13 +310,26 @@ test('a refusal line prints for a channel\'s first refusal, then at most once a 
   assert.equal(lines.admit('editor', 'nowhere'), null, 'and its next minute starts');
 });
 
-test('a refusal line keeps servers and channels apart, and a channel by the 256 units its line prints', () => {
+test('a refusal line keeps servers and channels apart, and keys a channel as its line prints it', () => {
   const lines = new RefusalLines(() => 0);
   assert.equal(lines.admit('a:b', 'c'), 0);
   assert.equal(lines.admit('a', 'b:c'), 0, 'a colon doesn\'t merge two server and channel pairs');
+  assert.equal(lines.admit('a\u0000b', 'c'), 0);
+  assert.equal(lines.admit('a', 'b\u0000c'), 0, 'nor does a NUL');
   const head = 'x'.repeat(256);
   assert.equal(lines.admit('editor', `${head}one`), 0);
-  assert.equal(lines.admit('editor', `${head}two`), null, 'two ids alike in their first 256 units, which their lines print alike, share a record');
+  assert.equal(lines.admit('editor', `${head}two`), null, 'ids cut to the same 256 units at the same length print alike, and share a record');
+  assert.equal(lines.admit('editor', `${head}three`), 0, 'an id of another length prints otherwise, and has its own');
+});
+
+test('refusal lines time their minute with the monotonic clock, not the wall clock', (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const lines = new RefusalLines();
+  assert.equal(lines.admit('editor', 'nowhere'), 0);
+  assert.equal(lines.admit('editor', 'nowhere'), null);
+  now += 60_000;
+  assert.equal(lines.admit('editor', 'nowhere'), 1, 'a minute on the monotonic clock, the wall clock standing still');
 });
 
 test('refusal lines cover at most 1,000 channels, evicting the least recently refused', () => {

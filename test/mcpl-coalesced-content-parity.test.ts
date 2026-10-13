@@ -461,7 +461,7 @@ test('a message for an unregistered channel is traced with its message id, coale
   ]);
 });
 
-test('a channel-scoped push refused for its channel (-32023, -32017) is traced each time and named on the host at most once a minute per channel', async (t) => {
+test('a channel-scoped push refused for its channel (-32023, -32017) is traced each time and named, with its channel, on the host at most once a minute per channel', async (t) => {
   let now = 0;
   const throttle = (g: Awaited<ReturnType<typeof fixture>>) => {
     (g.framework as unknown as { pushHandler: { channelRefusalLines: RefusalLines } }).pushHandler.channelRefusalLines = new RefusalLines(() => now);
@@ -475,6 +475,15 @@ test('a channel-scoped push refused for its channel (-32023, -32017) is traced e
     const r = await f.send('push/event', f.params(id, 'to_nowhere', { initial: true, channelId: 'nope', key: id }));
     assert.equal(r.error?.code, -32023);
   }
+  // Another channel of the same server prints its own first refusal.
+  const other = await f.send('push/event', f.params('v1', 'to_elsewhere', { initial: true, channelId: 'elsewhere', key: 'v1' }));
+  assert.equal(other.error?.code, -32023);
+  // A push refused for what it holds (-32602) prints every time, whatever its channel.
+  for (const id of ['m1', 'm2']) {
+    const { timestamp: _, ...untimed } = f.params(id, 'to_nowhere', { initial: true, channelId: 'nope', key: id });
+    const r = await f.send('push/event', untimed);
+    assert.equal(r.error?.code, -32602);
+  }
   // -32017: a server with no channels.incoming grant.
   const g = await fixture({ server: { disabledCapabilities: ['channels.incoming'] } }); t.after(g.close); throttle(g);
   g.framework.onTrace((e) => { if (e.type === 'mcpl:push-event-rejected') rejected.push(e); });
@@ -485,13 +494,16 @@ test('a channel-scoped push refused for its channel (-32023, -32017) is traced e
   now += 60_000;
   await f.send('push/event', f.params('u4', 'to_nowhere', { initial: true, channelId: 'nope', key: 'u4' }));
   assert.deepEqual(rejected.map(({ eventId, reason }) => [eventId, reason]), [
-    ['u1', 'coalesce-invalid'], ['u2', 'coalesce-invalid'], ['u3', 'coalesce-invalid'],
-    ['d1', 'coalesce-invalid'], ['d2', 'coalesce-invalid'], ['u4', 'coalesce-invalid'],
+    ['u1', 'coalesce-invalid'], ['u2', 'coalesce-invalid'], ['u3', 'coalesce-invalid'], ['v1', 'coalesce-invalid'],
+    ['m1', 'coalesce-invalid'], ['m2', 'coalesce-invalid'], ['d1', 'coalesce-invalid'], ['d2', 'coalesce-invalid'], ['u4', 'coalesce-invalid'],
   ]);
   assert.deepEqual(lines.filter((l) => l.startsWith('[push-event-rejected]')), [
-    '[push-event-rejected] server=editor featureSet=doc eventId=u1 reason=coalesce-invalid field=coalesce.channelId: "Unknown channel"',
-    '[push-event-rejected] server=editor featureSet=doc eventId=d1 reason=coalesce-invalid field=coalesce.channelId: "Channel not permitted"',
-    '[push-event-rejected] server=editor featureSet=doc eventId=u4 reason=coalesce-invalid field=coalesce.channelId: "Unknown channel" (2 more since the last line)',
+    '[push-event-rejected] server=editor featureSet=doc eventId=u1 channel=nope reason=coalesce-invalid field=coalesce.channelId: "Unknown channel"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=v1 channel=elsewhere reason=coalesce-invalid field=coalesce.channelId: "Unknown channel"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=m1 reason=coalesce-invalid field=timestamp: "timestamp is required"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=m2 reason=coalesce-invalid field=timestamp: "timestamp is required"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=d1 channel=chat reason=coalesce-invalid field=coalesce.channelId: "Channel not permitted"',
+    '[push-event-rejected] server=editor featureSet=doc eventId=u4 channel=nope reason=coalesce-invalid field=coalesce.channelId: "Unknown channel" (2 more since the last line)',
   ]);
 });
 
