@@ -15253,11 +15253,6 @@ export class AgentFramework {
     // Modern servers: the same namespacing, tool policy and RFC-008 class
     // hints. Feature sets are MCPL and don't apply. A server whose listing
     // fails stays unlisted (unknown), never "listed nothing".
-    // Each server's configuration as the refresh began, for its failure
-    // record alone, so a server removed while an earlier listing waited still
-    // has its record redacted. Its tool policy and prefix read the live
-    // configuration, as a server connected meanwhile has one only there.
-    const configsAtStart = new Map(this.mcplServerConfigs);
     for (const server of this.modernServers().values()) {
       if (!server.isConnected) continue;
       const config = this.mcplServerConfigs.get(server.id);
@@ -15281,7 +15276,7 @@ export class AgentFramework {
         this.emitTrace({
           type: 'mcpl:server-error',
           serverId: server.id,
-          error: `tools/list failed: ${redactServerText(error instanceof Error ? error.message : String(error), configsAtStart.get(server.id) ?? config ?? {})}`,
+          error: `tools/list failed: ${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}`,
         });
       }
     }
