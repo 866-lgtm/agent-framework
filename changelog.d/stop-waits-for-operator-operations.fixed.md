@@ -48,8 +48,10 @@
     says that the parked wakes it released won't run.
   - A host's trace listener can call `stop()` from inside an operation, such
     as on its completion trace, and `stop()` still waits for that operation.
-    A multi-turn `host/command` undo stopped that way refuses at its next
-    turn and answers with the turns it undid.
+    A multi-turn `host/command` undo stopped that way still undoes every
+    turn it was asked for.
+  - `undoLastTurn()` and `redo()` refuse while a surgery or a branch switch
+    holds the store, instead of moving the branch beneath it.
   - While the host stops, an MCPL awareness barrier that fails no longer
     recycles the connections, which `stop()` is closing. The framework
     releases it as it releases a completed one, so nothing waits on a

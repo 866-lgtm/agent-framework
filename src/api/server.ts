@@ -536,7 +536,8 @@ export class ApiServer {
       throw new Error('name is required');
     }
 
-    const previousBranch = this.currentBranch;
+    const store = this.framework.getStore();
+    const from = store.isClosed() ? this.currentBranch : store.currentBranch().name;
 
     // The framework switches the store, reconciles the Discord awareness
     // markers and re-materializes the config mount. It refuses during a live
@@ -545,17 +546,19 @@ export class ApiServer {
     // (a refusal moves nothing), so the current branch follows it through the
     // awaited steps.
     const switching = this.framework.switchBranch(params.name);
+    void switching.catch(() => {}); // awaited below; handled even if the next line throws
     this.followStoreBranch();
+    const moved = this.currentBranch !== from;
     let switched = false;
     try {
       await switching;
       switched = true;
     } finally {
       // A later step can fail after the store has moved: clients still hear
-      // where it is.
-      if (switched || this.currentBranch !== previousBranch) {
+      // where it is. A refusal moved nothing, so there's nothing to tell.
+      if (switched || moved) {
         this.broadcast('branch:switched', {
-          from: previousBranch,
+          from,
           to: this.currentBranch,
         });
       }

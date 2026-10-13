@@ -1143,11 +1143,13 @@ export class AgentFramework {
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
-  /** True from the start of each stop() attempt until it has finished waiting
-   * on operatorOperations, whether the wait completed or timed out: the window
-   * in which an awareness sync is admitted although the queue is closed (see
-   * syncDiscordAwarenessMarkers). */
-  private stopWaitPending = false;
+  /** stop() attempts whose wait on operatorOperations hasn't ended: one is
+   * added as an attempt starts, and removed when its wait completes or times
+   * out, or when the attempt fails before reaching it. While any is here, an
+   * awareness sync is admitted although the queue is closed (see
+   * syncDiscordAwarenessMarkers). A set, because a trace listener can start a
+   * second attempt inside the first's synchronous start. */
+  private readonly openStopWaits = new Set<object>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -2154,12 +2156,16 @@ export class AgentFramework {
     try { validateShutdownTimeout(teardownTimeoutMs); }
     catch (error) { return Promise.reject(error); }
     if (this.stopPromise) return this.stopPromise;
-    const attempt = this.stopOwned(teardownTimeoutMs);
+    const stopWait = {};
+    this.openStopWaits.add(stopWait);
+    const attempt = this.stopOwned(teardownTimeoutMs, stopWait);
     this.stopPromise = attempt;
     void attempt.then(() => { this.stopCompleted = true; }, () => {});
     // Failed cleanup can be retried while its original store is open. A
     // terminal storage failure after successful close must remain a failure.
     void attempt.catch(() => {
+      // An attempt that failed before its wait leaves no wait open.
+      this.openStopWaits.delete(stopWait);
       if (!this.ownedStoreClosed && this.stopPromise === attempt) this.stopPromise = null;
     });
     return attempt;
@@ -2193,9 +2199,9 @@ export class AgentFramework {
 
   /** Wait in rounds until the set is empty: admitted work can still start work
    * of its own, and an awareness sync can still join. All rounds share the
-   * caller's deadline rather than renewing its budget. Ends the window in
-   * which a sync is admitted (stopWaitPending). */
-  private async waitForOperatorOperations(timeoutMs: number | undefined): Promise<void> {
+   * caller's deadline rather than renewing its budget. Ends this attempt's
+   * window for an awareness sync (openStopWaits). */
+  private async waitForOperatorOperations(timeoutMs: number | undefined, stopWait: object): Promise<void> {
     const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
     try {
       while (this.operatorOperations.size > 0) {
@@ -2216,14 +2222,11 @@ export class AgentFramework {
     } finally {
       // In the same step as the last look at the set, so no awareness sync
       // can join it unseen.
-      this.stopWaitPending = false;
+      this.openStopWaits.delete(stopWait);
     }
   }
 
-  private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
-    // An awareness sync is admitted until this attempt has finished waiting on
-    // the operator set (waitForOperatorOperations ends the window).
-    this.stopWaitPending = true;
+  private async stopOwned(teardownTimeoutMs: number | undefined, stopWait: object): Promise<void> {
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -2304,7 +2307,7 @@ export class AgentFramework {
     // down, and the store stays open for another stop().
     let operatorOperationsTimedOut: unknown;
     try {
-      await this.waitForOperatorOperations(teardownTimeoutMs);
+      await this.waitForOperatorOperations(teardownTimeoutMs, stopWait);
     } catch (error) {
       operatorOperationsTimedOut = error;
     }
@@ -5790,7 +5793,7 @@ export class AgentFramework {
     let undone = 0;
     try {
       for (let i = 0; i < requested; i++) {
-        const r = this.undoLastTurn(agentName, hostCommandRequester(serverId, params));
+        const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params));
         if (!r.undone) break;
         undone++;
       }
@@ -6166,12 +6169,27 @@ export class AgentFramework {
     toBranch?: string;
   } {
     this.refuseOperatorAfterStop('undo');
+    return this.runUndoLastTurn(agentName, requester);
+  }
+
+  /** undoLastTurn's work, for a host/command undo already admitted: a stop()
+   *  begun by a trace of one of its turns doesn't refuse the next. */
+  private runUndoLastTurn(agentName: string, requester?: OperatorRequester): {
+    undone: boolean;
+    turnIndex?: number;
+    fromBranch?: string;
+    toBranch?: string;
+  } {
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
       throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+    }
+    // A surgery or a branch switch holds the store while it awaits its steps.
+    if (this.surgeryHold) {
+      throw new Error(`Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -6239,6 +6257,10 @@ export class AgentFramework {
     }
     if (agent.state.status !== 'idle') {
       throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+    }
+    // A surgery or a branch switch holds the store while it awaits its steps.
+    if (this.surgeryHold) {
+      throw new Error(`Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
     const redoStack = this.redoStacks.get(agentName);
@@ -14075,7 +14097,7 @@ export class AgentFramework {
    *  stop() whose budget ran out doesn't refuse it partway, after its branch
    *  has moved. */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
-    if (this.queue?.isClosed && !this.stopWaitPending) throw new Error('awareness sync refused: the framework is stopping');
+    if (this.queue?.isClosed && this.openStopWaits.size === 0) throw new Error('awareness sync refused: the framework is stopping');
     return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
   }
 

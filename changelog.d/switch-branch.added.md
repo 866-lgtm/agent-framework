@@ -10,4 +10,6 @@
     store, and now calls `switchBranch()`. So it refuses during a live turn
     instead of moving the branch beneath it. Its current branch follows the
     store from the moment it moves, and clients hear of a move even when a
-    later step fails.
+    later step fails, but not of a refused switch. A branch create with
+    `switchTo` creates the branch first, so during a live turn it creates
+    it and answers the switch's refusal.
