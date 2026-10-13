@@ -346,6 +346,40 @@ test('native Membrane observes the first refusal even when guard is enabled by a
   } finally { await framework.stop(); }
 });
 
+test('explicit mode: a guard retry streams on to the sticky destination delivery uses', async () => {
+  const h = await harness([
+    [createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'), refused()],
+    [answer()],
+  ], { toolResultGuard: true, proseRouting: 'explicit', refusalHandling: { retries: 3 } });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, speech: string, channelId: string) => {
+      routed.push({ text: speech, channelId }); return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2, 'the guard retried once');
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'continued', channelId: 'chan-alpha' },
+    ], 'delivery keeps the sticky destination across the retry');
+    const toAlpha = streamed.filter((d) => d.channelId === 'chan-alpha').map((d) => d.delta).join('');
+    assert.match(toAlpha, /continued/, 'the resumed stream follows delivery there');
+    assert.doesNotMatch(streamed.map((d) => d.delta).join(''), /discard-this-partial-output/);
+  } finally { await h.framework.stop(); }
+});
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];

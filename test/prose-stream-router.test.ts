@@ -67,6 +67,17 @@ test('unresolvable target suppresses that envelope only', () => {
   assert.equal(textFor(out, 'discord:g:100'), 'to somewhere');
 });
 
+test('explicit: an indented prefix routes, as delivery reads it', () => {
+  const out = run(explicit(), '  >>#general indented reply\n\t>>#ops tabbed aside\n  plain indented line');
+  assert.equal(textFor(out, 'discord:g:100'), 'indented reply\n');
+  assert.equal(textFor(out, 'discord:g:200'), 'tabbed aside\n  plain indented line');
+});
+
+test('explicit: indentation before a quoted arrow or a lone `>` stays body', () => {
+  const out = run(explicit(), '>>#general look:\n  >> quoted arrow\n  > quote');
+  assert.equal(textFor(out, 'discord:g:100'), 'look:\n  >> quoted arrow\n  > quote');
+});
+
 test('` !` continuation modifier is swallowed; `!` as body survives', () => {
   const out = run(explicit(), '>>#general ! next turn continues\n>>#ops !bang body');
   assert.equal(textFor(out, 'discord:g:100'), 'next turn continues\n');

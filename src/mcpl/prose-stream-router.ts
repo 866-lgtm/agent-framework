@@ -30,7 +30,7 @@ export interface RoutedDelta {
   delta: string;
 }
 
-type State = 'line-start' | 'hybrid-indent' | 'maybe-prefix' | 'prefix-gap' | 'prefix-token' | 'after-token' | 'body';
+type State = 'line-start' | 'indent' | 'maybe-prefix' | 'prefix-gap' | 'prefix-token' | 'after-token' | 'body';
 
 export class ProseStreamRouter {
   private target: string | null;
@@ -87,10 +87,10 @@ export class ProseStreamRouter {
    *  no body — dropped, matching delivery which would deliver empty body). */
   finish(): RoutedDelta[] {
     const out: RoutedDelta[] = [];
-    if (this.state === 'hybrid-indent') this.emit(this.held, out);
+    if (this.state === 'indent') this.emit(this.held, out);
     if (this.state === 'maybe-prefix') {
       const full = this.opts.mode === 'hybrid' ? '>>>' : '>>';
-      const arrows = this.opts.mode === 'hybrid' ? this.held.trimStart() : this.held;
+      const arrows = this.held.trimStart();
       if (arrows !== full) this.emit(this.held, out);
     }
     // prefix-token / after-token at EOF: prefix without body — nothing to emit.
@@ -111,8 +111,11 @@ export class ProseStreamRouter {
         return;
 
       case 'line-start':
-        if (this.opts.mode === 'hybrid' && (ch === ' ' || ch === '\t')) {
-          this.state = 'hybrid-indent';
+        // Indentation before a prefix is held until the line's decision: the
+        // delivery path reads an indented `>>` (explicit) or `>>>` (hybrid)
+        // line as a prefix too.
+        if (ch === ' ' || ch === '\t') {
+          this.state = 'indent';
           this.held = ch;
           return;
         }
@@ -121,7 +124,7 @@ export class ProseStreamRouter {
         this.step(ch, out);
         return;
 
-      case 'hybrid-indent':
+      case 'indent':
         if (ch === ' ' || ch === '\t') { this.held += ch; return; }
         if (ch === '>') { this.held += ch; this.state = 'maybe-prefix'; return; }
         this.emit(this.held, out);
@@ -132,7 +135,7 @@ export class ProseStreamRouter {
 
       case 'maybe-prefix': {
         const prefix = this.opts.mode === 'hybrid' ? '>>>' : '>>';
-        const arrows = this.opts.mode === 'hybrid' ? this.held.trimStart() : this.held;
+        const arrows = this.held.trimStart();
         if (ch === '>' && arrows.length < prefix.length) {
           this.held += '>';
           return;
