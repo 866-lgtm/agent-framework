@@ -248,16 +248,43 @@ test('an over-budget phrase quoted inside a classified provider error does not k
   assert.equal(long.ticks(), 8, 'presentation bounds never change the decision');
 });
 
-test('a reason that is not a string is described, not thrown on before anything is recorded', () => {
+test('a reason that is not a string is described whole, not thrown on: each sink cuts it once, and the fallback reads it uncut', async () => {
   // Unreachable from the stream paths, which pass a message; a malformed
   // trace event must still leave its failure record.
+  const error = new Error(`zz-not-a-string ${echo()}`);
   const { fw, markers, logged, restore } = makeHarness();
   try {
-    fw.noteInferenceExhausted('cairn', new Error(`zz-not-a-string ${echo()}`));
+    fw.noteInferenceExhausted('cairn', error);
   } finally { restore(); }
-  assert.match(markers[0].meta.reason, /^Error: zz-not-a-string zz-head/);
-  assert.ok(markers[0].meta.reason.length <= 600);
-  assert.match(logged[0].reason as string, /^Error: zz-not-a-string zz-head/);
+  const whole = `Error: ${error.message}`;
+  assertCut(whole, markers[0].meta.reason, 600, 'marker');
+  assert.equal(markers[0].meta.reasonChars, whole.length);
+  assertCut(whole, logged[0].reason as string, 2_000, 'failures.log');
+  assert.equal(logged[0].reasonChars, whole.length);
+
+  // The OverBudget fallback reads the whole description, so a phrase that
+  // every excerpt omits still kicks the drain.
+  const phrased = makeHarness();
+  try {
+    phrased.fw.noteInferenceExhausted('cairn', new Error(`${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`));
+    await settle();
+  } finally { phrased.restore(); }
+  assert.equal(phrased.ticks(), 8);
+});
+
+test("a caller's long error type is bounded wherever it is written", () => {
+  // classifyInferenceError bounds the types it reads; a caller that passes
+  // its own is bounded the same way.
+  const { fw, markers, logged, errs, restore } = makeHarness();
+  const type = `zz${'T'.repeat(MEGA)}`;
+  try {
+    fw.noteInferenceExhausted('cairn', 'zz-reason', false, type);
+  } finally { restore(); }
+  assertCut(type, markers[0].meta.errorType, 128, 'marker metadata');
+  assertCut(type, logged[0].errorType as string, 128, 'failures.log');
+  assert.ok(markers[0].text.length < 1_000, `marker text is ${markers[0].text.length} chars`);
+  const line = errs.find((e) => e.startsWith('[inference-failed] agent=cairn'))!;
+  assert.ok(line.length < 400, `stderr line is ${line.length} chars`);
 });
 
 test('each excerpt states the whole length when it was cut, and only then', () => {
@@ -346,6 +373,46 @@ test('failure logs print a bounded projection, never the error object with its r
   assertBoundedStrings(odd.rawArgs, 'drain kick failed');
 });
 
+test("a failure's frames: cut to their bound, and from the stack's first frame line when the message isn't its header", async () => {
+  const kickedWith = async (thrown: Error) => {
+    const kicked = makeHarness({ tick: async () => { throw thrown; } });
+    try {
+      kicked.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
+      await settle();
+    } finally { kicked.restore(); }
+    return assertBoundedStrings(kicked.rawArgs, 'drain kick failed');
+  };
+  const prefix = '[inference-failed] drain kick failed for cairn after 0 ticks: ';
+  const framesOf = (stack: string) => stack.slice(stack.search(/^[ \t]+at /m));
+
+  // A stack far past the bound: its frames are cut by the one rule.
+  const deep = new Error('zz-deep');
+  const deepStack = `Error: zz-deep\n${Array.from({ length: 1_000 }, (_, i) => `    at zzFrame${i} (deep.js:${i + 1}:1)`).join('\n')}`;
+  deep.stack = deepStack;
+  const deepLine = await kickedWith(deep);
+  const deepHead = `${prefix}Error: zz-deep\n`;
+  assert.ok(deepLine.startsWith(deepHead));
+  assertCut(framesOf(deepStack), deepLine.slice(deepHead.length), 2_000, 'the frames of a deep stack');
+
+  // A message that isn't in the stack (replaced after the stack was taken),
+  // and an empty message: the frames are the stack's from its first frame line.
+  const replaced = new Error('zz-original');
+  const replacedStack = 'Error: zz-original\n    at zzThrower (replaced.js:1:1)\n    at zzCaller (replaced.js:2:1)';
+  replaced.stack = replacedStack;
+  replaced.message = `zz-replaced ${'r'.repeat(300)}`;
+  assert.equal(await kickedWith(replaced), `${prefix}Error: ${replaced.message}\n${framesOf(replacedStack)}`);
+  const empty = new Error('');
+  empty.stack = 'Error\n    at zzThrower (empty.js:1:1)';
+  assert.equal(await kickedWith(empty), `${prefix}Error: \n    at zzThrower (empty.js:1:1)`);
+
+  // A message that ends in blank lines: the frames start at the frame line,
+  // since a frame's indent is spaces or tabs and never crosses a line break
+  // (an indent that did made a run of blank lines quadratic to scan).
+  const blank = new Error('zz-blank\n\n');
+  blank.stack = 'Error: zz-blank\n\n\n    at zzThrower (blank.js:1:1)';
+  assert.equal(await kickedWith(blank), `${prefix}Error: zz-blank\n\n\n    at zzThrower (blank.js:1:1)`);
+});
+
 test('a thrown non-Error, and an error whose projection throws, still log bounded lines', async () => {
   const thrownString = makeHarness({ tick: async () => { throw `socket said: ${echo()}`; } });
   try {
@@ -409,6 +476,19 @@ test('a provider hold keeps a bounded reason, and a failed resume logs the bound
   const threwLine = assertBoundedStrings(threw.rawArgs, 'providerHold hook threw');
   assert.match(threwLine, /treating as no hold: MembraneError \(invalid_request, HTTP 400, zz_bad_request, retryable=false\): Bad request: zz-head/);
   assert.match(threwLine, /\n {4}at /);
+
+  // One that throws a plain object logs its JSON, bounded, so the fields that
+  // printing the object showed are kept.
+  const thrown = { code: 'zz_hold', detail: echo() };
+  const plain = makeHarness();
+  providerState(plain.fw);
+  try {
+    plain.fw.providerHoldHook = () => { throw thrown; };
+    assert.equal(plain.fw.holdProviderAcceleration(plain.fw.agents.get('cairn'), hugeProviderError()), false);
+  } finally { plain.restore(); }
+  const plainLine = assertBoundedStrings(plain.rawArgs, 'providerHold hook threw');
+  const noHold = 'treating as no hold: ';
+  assertCut(JSON.stringify(thrown), plainLine.slice(plainLine.indexOf(noHold) + noHold.length), 2_000, 'a thrown plain object');
 
   // The built-in acceleration cooldown keeps the error's own message as its reason.
   const accelerated = makeHarness();
@@ -499,6 +579,30 @@ test('alert data of null, from a JavaScript caller, is no data: the alert is sti
   assert.deepEqual(logged, [{ agent: 'cairn', kind: 'zz-detector', reason: 'short message' }]);
 });
 
+test('alert data that is not a plain object is one bounded field, not a field per character or element', () => {
+  const { fw, traces, logged, restore } = makeHarness();
+  const text = echo(10_000);
+  const list = Array.from({ length: 2_000 }, (_, i) => i);
+  try {
+    // From a JavaScript caller: bounded field by field, a string or an array
+    // would spread into a field per character or element.
+    fw.notifyOpsAlert('zz-string', 'cairn', 'short message', text);
+    fw.notifyOpsAlert('zz-array', 'cairn', 'short message', list);
+    fw.notifyOpsAlert('zz-small', 'cairn', 'short message', [1, 2]);
+  } finally { restore(); }
+  const [stringAlert, arrayAlert, smallAlert] = traces.filter((t) => t.type === 'ops:alert');
+  for (const [sink, fields] of [['trace', stringAlert.data], ['failures.log', logged[0]]] as const) {
+    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: string data's fields`);
+    assertCut(text, fields.data, 2_000, `${sink}: string data`);
+  }
+  for (const [sink, fields] of [['trace', arrayAlert.data], ['failures.log', logged[1]]] as const) {
+    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: array data's fields`);
+    assertCut(JSON.stringify(list), fields.data, 2_000, `${sink}: array data`);
+  }
+  assert.deepEqual(smallAlert.data, { data: [1, 2] });
+  assert.deepEqual(logged[2], { agent: 'cairn', kind: 'zz-small', reason: 'short message', data: [1, 2] });
+});
+
 /** The projection's head for hugeProviderError(), before ': ' and the message. */
 const HUGE_ERROR_HEAD = 'MembraneError (invalid_request, HTTP 400, zz_bad_request, retryable=false)';
 
@@ -512,6 +616,8 @@ test('alert data is bounded field by field, on the trace and the failures.log re
       text, error, nested, count: 3, small: { a: 1 },
       // Small JSON, large value: the listener gets the JSON's data, not the value.
       held: new Map([['zz', echo()]]), at: new Date(0),
+      // An Error inside a value is its projection too.
+      wrapped: { cause: new Error('zz-small') },
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
@@ -520,6 +626,7 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     // An Error is its projection: serialising it would write its rawRequest.
     // It is cut once, so its marker states the head and the whole message.
     assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, fields.error, 2_000, `${sink}: error`);
+    assert.deepEqual(fields.wrapped, { cause: 'Error: zz-small' }, `${sink}: a nested Error`);
     // A value whose JSON is too long becomes its JSON, bounded.
     assert.equal(typeof fields.nested, 'string', `${sink}: nested`);
     assert.ok(fields.nested.length <= 2_000 && fields.nested.startsWith('{"items":[{"i":0,'), `${sink}: nested`);
@@ -545,9 +652,10 @@ test('logFailure bounds every field it writes', () => {
     fw.logFailure({
       agent: 'cairn', reason, note, consecutive: 1,
       error, nested: { list: Array.from({ length: 2_000 }, (_, i) => i) }, circular,
+      wrapped: { cause: error },
     });
     const line = readFileSync(join(dir, 'logs', 'failures.log'), 'utf-8').trim();
-    assert.ok(line.length < 9_000, `failures.log line is ${line.length} chars`);
+    assert.ok(line.length < 11_000, `failures.log line is ${line.length} chars`);
     const record = JSON.parse(line);
     // The written record, not what a caller passed: each string is cut by the one rule.
     assertCut(reason, record.reason, 2_000, 'failures.log reason');
@@ -555,6 +663,10 @@ test('logFailure bounds every field it writes', () => {
     assert.equal(record.consecutive, 1);
     assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, record.error, 2_000, 'failures.log error');
     assert.ok(typeof record.nested === 'string' && record.nested.length <= 2_000);
+    // An Error inside a value is written as its projection, not its own
+    // fields with the request.
+    assert.ok(typeof record.wrapped === 'string' && record.wrapped.length <= 2_000, 'failures.log wrapped');
+    assert.ok(record.wrapped.startsWith(`{"cause":"${HUGE_ERROR_HEAD}: Bad request: zz-head`), record.wrapped.slice(0, 120));
     // A value JSON can't write no longer loses the whole record.
     assert.equal(record.circular, '[object Object]');
   } finally {
@@ -632,7 +744,7 @@ function assertNoObjectPrinted(rawArgs: unknown[][]): void {
 /** Never retries, so a test reaches exhaustion on the first failure. */
 const noRetry: ErrorPolicy = { maxRetries: 0, onInferenceError: () => ({ retry: false }) };
 
-async function runFailingTurn(path: Path, make: (request: NormalizedRequest) => Error, opts?: { errorPolicy?: ErrorPolicy }) {
+async function runFailingTurn(path: Path, make: (request: NormalizedRequest) => Error, opts?: { errorPolicy?: ErrorPolicy; turns?: number }) {
   const dir = mkdtempSync(join(tmpdir(), 'af-failure-bounds-'));
   const cwd = process.cwd();
   process.chdir(dir);
@@ -647,13 +759,15 @@ async function runFailingTurn(path: Path, make: (request: NormalizedRequest) => 
   const traces: any[] = [];
   framework.onTrace((e) => traces.push(e));
   try {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {} });
-    await framework.runUntilIdle();
+    for (let turn = 0; turn < (opts?.turns ?? 1); turn++) {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: `hello ${turn}`, metadata: {} });
+      await framework.runUntilIdle();
+    }
     const messages = framework.getAgent('resident')!.getContextManager().queryMessages({}).messages;
     const markers = messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
     const failuresLog = existsSync(join(dir, 'logs', 'failures.log')) ? readFileSync(join(dir, 'logs', 'failures.log'), 'utf-8') : '';
     const inferenceLogs = framework.queryInferenceLogs({}).entries;
-    return { markers, traces, errs, rawArgs, failuresLog, inferenceLogs, calls: membrane.calls.length };
+    return { messages, markers, traces, errs, rawArgs, failuresLog, inferenceLogs, calls: membrane.calls.length };
   } finally {
     await framework.stop();
     restore();
@@ -737,6 +851,19 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-refusal').length, 0);
   assert.equal(errs.some((e) => e.includes('drain kicked')), false);
   assertNoObjectPrinted(rawArgs);
+
+  // Classified, it gets the poisoned-history quarantine at the hard-down
+  // threshold, as the framework's own copy does: the newest exchanges are
+  // shed, each retry on the rewound history failing again, up to the rewind
+  // cap, and the one rewind marker counts them.
+  const shed = await runFailingTurn('stream error event', () => foreignMembraneError(quoted), { turns: 3 });
+  const counts = shed.errs.map((e) => /^\[inference-rewind\] agent=resident auto-quarantined .* \((\d+) turn\(s\) shed this episode, cap 3\)/.exec(e)?.[1])
+    .filter((count): count is string => count !== undefined);
+  assert.deepEqual(counts, ['1', '2', '3']);
+  assert.equal(shed.messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system).length, 0, 'the three exchanges are shed');
+  const rewind = shed.messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
+  assert.equal(rewind.length, 1);
+  assert.match((rewind[0].content[0] as { text: string }).text, /^\[refusal-rewind\] The 3 most recent turn\(s\) were set aside/);
 
   // Its type is bounded like a provider code, in every sink it reaches.
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });

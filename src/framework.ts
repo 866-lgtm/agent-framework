@@ -1019,19 +1019,33 @@ function boundProviderErrorCode(code: unknown): string | undefined {
 }
 
 /**
- * A bounded string describing a failure, for logs that would otherwise print
- * the error object; it is one line unless one of its parts has newlines, as a
- * message can. Printing the object prints its message whole, in the stack,
- * and every own field: a MembraneError's `rawRequest` is the whole request
- * that failed, and Node's console prints each of its strings, a long system
- * prompt among them, up to 10,000 characters. The projection keeps what a
- * reader needs (name, classification, status, provider code, message) and
- * nothing else. The head's parts are bounded each, and the whole is cut once,
- * so its marker states the length of the head and the whole message.
+ * A value's JSON for a failure sink, with every Error inside it written as its
+ * projection (describeFailure): serialising an Error writes its own fields, a
+ * MembraneError's whole `rawRequest` among them. Throws, or returns undefined,
+ * as JSON.stringify does.
  */
-function describeFailure(error: unknown): string {
+function failureJson(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? describeFailure(nested) : nested));
+}
+
+/**
+ * The whole text describeFailure cuts: for an Error, its head (name,
+ * classification, status, provider code, each bounded) and its whole
+ * message; for another object, its JSON (failureJson), or its String when
+ * JSON can't write it, so a thrown plain object keeps its fields; for
+ * anything else, its String.
+ */
+function failureDescription(error: unknown): string {
   try {
-    if (!(error instanceof Error)) return boundFailureText(String(error));
+    if (!(error instanceof Error)) {
+      if (typeof error === 'object' && error !== null) {
+        try {
+          const json = failureJson(error);
+          if (json !== undefined) return json;
+        } catch { /* its String, below */ }
+      }
+      return String(error);
+    }
     const fields = error as Error & {
       type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
     };
@@ -1044,20 +1058,43 @@ function describeFailure(error: unknown): string {
     ].filter((part): part is string => part !== undefined);
     const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
     const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
-    return boundFailureText(`${head}: ${String(error.message)}`);
+    return `${head}: ${String(error.message)}`;
   } catch {
     return '[failure could not be described]';
   }
 }
 
 /**
- * describeFailure, then the error's stack frames (the stack from its first
- * `at` line after the message), bounded, on the lines below: for a log of a
- * failure the framework's own code may have thrown, where the frames say
- * where. The stack opens with the message, and a message's own lines can look
- * like frames (an echoed request quoting a stack trace), so the frames are
- * looked for after it. The leak the projection closes was the object's own
- * fields, not its stack.
+ * A bounded string describing a failure, for logs that would otherwise print
+ * the error object; it is one line unless one of its parts has newlines, as a
+ * message can. Printing the object prints its message whole, in the stack,
+ * and every own field: a MembraneError's `rawRequest` is the whole request
+ * that failed, and Node's console prints each of its strings, a long system
+ * prompt among them, up to 10,000 characters. The projection keeps what a
+ * reader needs (name, classification, status, provider code, message) and
+ * nothing else. The head's parts are bounded each, and the whole
+ * (failureDescription) is cut once, so its marker states the length of the
+ * head and the whole message.
+ */
+function describeFailure(error: unknown): string {
+  return boundFailureText(failureDescription(error));
+}
+
+/** A stack frame's line: an indent of spaces or tabs, then `at `. The indent
+ *  never crosses a line break, so a run of blank lines isn't rescanned from
+ *  each line's start. */
+const FRAME_LINE = /^[ \t]+at /m;
+
+/**
+ * describeFailure, then the error's stack frames, bounded, on the lines
+ * below: for a log of a failure the framework's own code may have thrown,
+ * where the frames say where. The stack opens with the message, and a
+ * message's own lines can look like frames (an echoed request quoting a stack
+ * trace), so when the message is the stack's header, before its first frame
+ * line, the frames are the stack from its first frame line after the
+ * message. Otherwise (a stack without its header, a message that isn't in
+ * the stack or is empty) they are the stack from its first frame line. The
+ * leak the projection closes was the object's own fields, not its stack.
  */
 function describeFailureWithFrames(error: unknown): string {
   let frames: string | undefined;
@@ -1068,9 +1105,9 @@ function describeFailureWithFrames(error: unknown): string {
       // The message is the stack's header only before its first frame: a
       // stack without its header (copied, or frames only) can hold the
       // message's text inside a frame's name.
-      const firstFrame = stack.search(/^\s+at /m);
+      const firstFrame = stack.search(FRAME_LINE);
       const at = message ? stack.indexOf(message) : -1;
-      const frameLine = /^\s+at /gm;
+      const frameLine = new RegExp(FRAME_LINE.source, 'gm');
       frameLine.lastIndex = at >= 0 && (firstFrame < 0 || at < firstFrame) ? at + message.length : 0;
       const found = frameLine.exec(stack);
       if (found) frames = boundFailureText(stack.slice(found.index));
@@ -1084,11 +1121,12 @@ function describeFailureWithFrames(error: unknown): string {
  * A failure record's fields, each bounded, for logs/failures.log and the
  * ops:alert trace: a string to FAILURE_TEXT_MAX_CHARS; an Error to its
  * projection, since serialising one writes its own fields, a MembraneError's
- * whole `rawRequest` among them; any other value to its JSON, as the plain
- * data that JSON describes when it fits FAILURE_TEXT_MAX_CHARS and as the
- * JSON text, bounded, when it doesn't. So the trace's data is what
- * failures.log writes: a Map or an object with toJSON whose JSON is small
- * never hands a listener the value itself.
+ * whole `rawRequest` among them; any other value to its JSON, with each Error
+ * inside it as its projection (failureJson), as the plain data that JSON
+ * describes when it fits FAILURE_TEXT_MAX_CHARS and as the JSON text,
+ * bounded, when it doesn't. So the trace's data is what failures.log writes:
+ * a Map or an object with toJSON whose JSON is small never hands a listener
+ * the value itself.
  */
 function boundFailureFields(record: Record<string, unknown>): Record<string, unknown> {
   const bounded: Record<string, unknown> = {};
@@ -1097,7 +1135,7 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
     else if (value instanceof Error) bounded[key] = describeFailure(value);
     else {
       let json: string | undefined;
-      try { json = JSON.stringify(value); } catch { bounded[key] = describeFailure(value); continue; }
+      try { json = failureJson(value); } catch { bounded[key] = describeFailure(value); continue; }
       bounded[key] = json === undefined ? undefined
         : json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
     }
@@ -12839,8 +12877,14 @@ export class AgentFramework {
   ): void {
     const message = boundFailureText(rawMessage);
     // The caller's data goes to failures.log and to trace listeners, bounded
-    // the same way for both. A JavaScript caller's null is no data.
-    const data = opts?.data == null ? undefined : boundFailureFields(opts.data);
+    // the same way for both. A JavaScript caller's null is no data, and data
+    // that isn't a plain object (a string, an array, a Buffer) is kept as one
+    // field, `data`, rather than spread into a field per character or element.
+    const rawData: unknown = opts?.data;
+    const plain = typeof rawData === 'object' && rawData !== null &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(rawData));
+    const data = rawData == null ? undefined
+      : boundFailureFields(plain ? rawData as Record<string, unknown> : { data: rawData });
     if (!opts?.skipLog) {
       this.logFailure({ agent: agentName, kind, reason: message, ...data });
     }
@@ -12969,7 +13013,7 @@ export class AgentFramework {
     agentName: string,
     rawReason: string,
     retryable?: boolean,
-    errorType?: string,
+    rawErrorType?: string,
     detail?: { httpStatus?: number; providerErrorCode?: string },
   ): void {
     // The reason is the failure's own message, and a provider can echo the
@@ -12985,7 +13029,12 @@ export class AgentFramework {
     //
     // A reason that isn't a string (the stream paths always pass a message)
     // is described rather than allowed to throw before anything is recorded.
-    const wholeReason: string = typeof rawReason === 'string' ? rawReason : describeFailure(rawReason);
+    // Its whole description is the whole reason, cut once by each sink.
+    const wholeReason: string = typeof rawReason === 'string' ? rawReason : failureDescription(rawReason);
+    // The type is bounded wherever it's written, as classifyInferenceError
+    // bounds the types it reads, since a caller can pass one it didn't classify.
+    const errorType = typeof rawErrorType === 'string'
+      ? boundFailureText(rawErrorType, PROVIDER_ERROR_CODE_MAX_CHARS) : rawErrorType;
     const reason = boundFailureText(wholeReason);
     const markerReason = boundFailureText(wholeReason, FAILURE_MARKER_REASON_MAX_CHARS);
     const httpStatus = typeof detail?.httpStatus === 'number' ? detail.httpStatus : undefined;
