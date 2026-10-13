@@ -50,10 +50,12 @@ import {
   type RootIdentity,
   candidateOf,
   sameCandidate,
+  sameRootIdentity,
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
 import {
   type MountView,
+  ROOT_REPLACED,
   type Walk,
   fingerprintVouches,
   locateRoot,
@@ -106,10 +108,6 @@ export type TreeOp = 'created' | 'modified' | 'deleted';
 export interface PassResult {
   /** Tree changes adopted from disk. */
   ops: Array<{ path: string; op: TreeOp }>;
-  /**
-   * A path sync's adoptions that gave up a change of the workspace's own,
-   * each with the state the rule would otherwise have kept (`was`).
-   */
   /** What a path sync gave up of the workspace's own; `op` is what it did to the
    *  workspace copy, absent when it changed none (a deletion or conflict given
    *  up for a disk copy the workspace can't hold). */
@@ -122,6 +120,12 @@ export interface PassResult {
   incomplete: Array<{ path: string; reason: string }>;
   /** For a directory scope: the subdirectories disk shows directly beneath it. */
   dirs: string[];
+  /**
+   * The branch the pass decided on, absent when it decided nothing. A caller
+   * that reads the tree or branch intent to go with the reports checks it is
+   * still the selected branch, synchronously, before it reads.
+   */
+  branchId?: string;
 }
 
 export interface MountRuntime {
@@ -634,6 +638,22 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
     const hasIntent = mount.intents.get(path) !== null;
     gathered.facts.set(path, await learnDisk(mount, path, { p, hasStore, hasIntent }, opts));
   }
+
+  // Everything above was observed by path beneath the root's path. A root
+  // replaced meanwhile lends its replacement's files, and their absence, to
+  // the original's paths, so if the root isn't the one the pass began under
+  // now, nothing observed counts and nothing is decided from it.
+  if (gathered.rootIdentity !== null) {
+    const after = await locateRoot(mount.view, mount.rootReal);
+    if (!('identity' in after) || !sameRootIdentity(after.identity, gathered.rootIdentity)) {
+      const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
+      for (const path of gathered.facts.keys()) gathered.facts.set(path, { kind: 'unobserved', reason });
+      gathered.rootIdentity = null;
+      gathered.walk = null;
+      gathered.dirs = [];
+      gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason });
+    }
+  }
   return gathered;
 }
 
@@ -684,6 +704,7 @@ export async function reconcilePass(
 
   // Decide and apply — synchronously, so nothing interleaves.
   const branchId = store.currentBranch().id;
+  result.branchId = branchId;
   type Planned = { path: string; verdict: Verdict; d: DiskFact; s: { hash: string; size: number } | null; p: Physical | undefined; bi: BranchIntent | null };
   const planned: Planned[] = [];
   for (const [path, d] of facts) {
@@ -876,7 +897,11 @@ export async function pushPaths(
 
   type Plan = {
     path: string;
-    /** The path's evidence before this push's intent, put back if the effect never touches it. */
+    /**
+     * The path's evidence just before this push's intent, after what planning
+     * itself recorded (an agreement, a resolved intent), put back if the
+     * effect never touches the path.
+     */
     before: Physical | undefined;
     prior: Agreed | null;
     /** What the effect may find at the path. */
@@ -889,6 +914,15 @@ export async function pushPaths(
   for (const path of paths) {
     const p = agreement.get(mount.name, path);
     facts.set(path, await learnDisk(mount, path, { p, hasStore: true, hasIntent: true }, {}));
+  }
+  // Each path was observed by path beneath the root's path. Under a root
+  // replaced meanwhile they describe the replacement, so, as a pass does,
+  // nothing is decided or recorded from them.
+  const after = await locateRoot(mount.view, mount.rootReal);
+  if (!('identity' in after) || !sameRootIdentity(after.identity, root.identity)) {
+    const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
+    for (const path of paths) result.skipped.push({ path, reason });
+    return result;
   }
 
   // Decide synchronously what to push.
@@ -927,7 +961,7 @@ export async function pushPaths(
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
       const blob = store.getBlob(s.hash);
-      if (blob) plans.push({ path, kind: 'write', blob, hash: s.hash, prior: priorP, before: p, expect });
+      if (blob) plans.push({ path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect });
       else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
       continue;
     }
@@ -1005,7 +1039,7 @@ export async function pushPaths(
         // directory synced, nothing removed — applyDeletions or not. Only
         // ever a confirmation, force or not: a file that appears meanwhile
         // refuses it.
-        plans.push({ path, kind: 'unlink', prior, before: p, expect: { kind: 'absent' } });
+        plans.push({ path, kind: 'unlink', prior, before: agreement.get(mount.name, path), expect: { kind: 'absent' } });
         continue;
       }
       if (!opts.applyDeletions) {
@@ -1013,7 +1047,7 @@ export async function pushPaths(
         continue;
       }
       if (d.kind === 'absent') continue;
-      plans.push({ path, kind: 'unlink', prior, before: p, expect });
+      plans.push({ path, kind: 'unlink', prior, before: agreement.get(mount.name, path), expect });
       continue;
     }
     const blob = store.getBlob(s.hash);
@@ -1021,7 +1055,7 @@ export async function pushPaths(
       result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
       continue;
     }
-    plans.push({ path, kind: 'write', blob, hash: s.hash, prior, before: p, expect });
+    plans.push({ path, kind: 'write', blob, hash: s.hash, prior, before: agreement.get(mount.name, path), expect });
   }
 
   // 1. Durable intents before any disk effect, the root they write under first.

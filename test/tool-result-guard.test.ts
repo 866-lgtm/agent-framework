@@ -361,6 +361,575 @@ test('native Membrane observes the first refusal even when guard is enabled by a
   } finally { await framework.stop(); }
 });
 
+test('explicit mode: a guard retry streams on to the sticky destination delivery uses', async () => {
+  const h = await harness([
+    [createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'), refused()],
+    [answer()],
+  ], { toolResultGuard: true, proseRouting: 'explicit', refusalHandling: { retries: 3 } });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, speech: string, channelId: string) => {
+      routed.push({ text: speech, channelId }); return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2, 'the guard retried once');
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'continued', channelId: 'chan-alpha' },
+    ], 'delivery keeps the sticky destination across the retry');
+    const toAlpha = streamed.filter((d) => d.channelId === 'chan-alpha').map((d) => d.delta).join('');
+    assert.match(toAlpha, /continued/, 'the resumed stream follows delivery there');
+    assert.doesNotMatch(streamed.map((d) => d.delta).join(''), /discard-this-partial-output/);
+  } finally { await h.framework.stop(); }
+});
+
+test('explicit mode: a budget restart streams on to the destination the turn last addressed, before delivery catches up', { timeout: 15000 }, async () => {
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: '>>#alpha first' },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: '>>#cafe second' },
+        { type: 'tool_use', id: 'two', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+    ],
+    [answer()],
+  ], { proseRouting: 'explicit', maxStreamTokens: 1000 });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  // Delivery of 'first' is held until the resumed stream has written
+  // 'continued', so '>>#cafe second' is still queued, and delivery's sticky
+  // destination still #alpha, when the restart begins.
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let secondDelivered!: () => void;
+  const secondDone = new Promise<void>((resolve) => { secondDelivered = resolve; });
+  // The second tool call drops the stream budget, so the turn restarts.
+  const handle = h.module.handleToolCall.bind(h.module);
+  h.module.handleToolCall = async (call: ToolCall) => {
+    if (call.id === 'two') h.framework.getAgent('assistant')!.maxStreamTokens = 1;
+    return handle(call);
+  };
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    if (h.membrane.requests.length === 2) {
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+        const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string; content?: unknown }>;
+        for await (const event of events) {
+          yield event;
+          if (event.type === 'tokens' && event.content === 'continued') {
+            releaseFirst();
+            await secondDone;
+          }
+        }
+      };
+    }
+    return stream;
+  };
+  const restarts: string[] = [];
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
+  });
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, channelId });
+      if (text === 'first') await firstHeld;
+      if (text === 'second') secondDelivered();
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+      { text: 'continued', channelId: 'chan-cafe' },
+    ]);
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('second')).map((d) => d.channelId), ['chan-cafe'],
+      "the second round's prefix starts a new line in the stream, as delivery reads it");
+    assert.equal(streamed.some((d) => d.delta.includes('>>')), false, 'no prefix is streamed as text');
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe'],
+      'the resumed stream follows the destination the turn last addressed');
+  } finally {
+    releaseFirst();
+    secondDelivered();
+    await h.framework.stop();
+  }
+});
+
+test("explicit mode: a private round's prefix doesn't move where a budget restart resumes", { timeout: 15000 }, async () => {
+  // A same-round private think keeps its round's text out of delivery, so
+  // its `>>#cafe` sets no destination: the resumed reply goes to #alpha.
+  const privateRound = createMockResponse([
+    { type: 'text', text: '>>#cafe private plan' },
+    { type: 'tool_use', id: 'two', name: 'think', input: { content: 'plan privately' } },
+  ] as ContentBlock[], 'tool_use');
+  privateRound.usage = { inputTokens: 100, outputTokens: 5 };
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: '>>#alpha first\n' },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      privateRound,
+    ],
+    [answer()],
+  ], { proseRouting: 'explicit', maxStreamTokens: 20, sameRoundThinkTextPolicy: 'private' });
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  const restarts: string[] = [];
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
+  });
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, channelId });
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
+    getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'continued', channelId: 'chan-alpha' },
+    ], 'the private round moves no destination');
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-alpha'],
+      'the resumed reply streams where it is delivered');
+  } finally {
+    await h.framework.stop();
+  }
+});
+
+/**
+ * A budget-restart turn whose first round's delivery is held: round one
+ * writes `first`, round two `second` and crosses the budget, and the resumed
+ * stream writes `continued`. `held` resolves once the resumed stream has
+ * handed over its 'complete' and either its reply has gone out or the event
+ * loop has turned 200 times, enough for a delivery that doesn't wait on the
+ * held one to run; `release` lets the held delivery finish.
+ */
+async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; second: string; continued: string }) {
+  const secondRound = createMockResponse([
+    { type: 'text', text: texts.second },
+    { type: 'tool_use', id: 'two', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  secondRound.usage = { inputTokens: 100, outputTokens: 5 };
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: texts.first },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      secondRound,
+    ],
+    [createMockResponse([{ type: 'text', text: texts.continued }] as ContentBlock[])],
+  ], { proseRouting: mode, maxStreamTokens: 20 });
+  const routed: Array<{ text: string; channelId: string | null }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  // What the registry's #cafe names; a test may rebind it while 'first' is held.
+  const directory = { cafe: 'chan-cafe' };
+  let release!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { release = resolve; });
+  let resumedEnded!: () => void;
+  const ended = new Promise<void>((resolve) => { resumedEnded = resolve; });
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    if (h.membrane.requests.length === 2) {
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+        // The framework stops pulling once it has 'complete', so the signal
+        // goes with that event rather than after the loop.
+        const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string }>;
+        for await (const event of events) {
+          if (event.type === 'complete') resumedEnded();
+          yield event;
+        }
+      };
+    }
+    return stream;
+  };
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: directory.cafe } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
+      routed.push({ text: text.trim(), channelId });
+      if (text.trim() === 'first') await firstHeld;
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  const restarts: string[] = [];
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
+  });
+  const run = h.run();
+  const held = ended.then(async () => {
+    for (let turn = 0; turn < 200 && !routed.some((r) => r.text === texts.continued.replace(/^>>\S+\s*/, '').trim()); turn++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  });
+  return { h, run, held, release, routed, streamed, restarts, directory };
+}
+
+test("explicit mode: a resumed stream's deliveries queue behind the turn's earlier ones", { timeout: 15000 }, async () => {
+  // From a review's probe. While 'first' is still posting, '>>#cafe second'
+  // is queued behind it, and the resumed reply waits behind both: it then
+  // goes to #cafe, where the turn last addressed, as the stream sends it.
+  const t = await heldRestart('explicit', { first: '>>#alpha first\n', second: '>>#cafe second', continued: 'continued' });
+  try {
+    await t.held;
+    assert.deepEqual(t.routed.map((r) => r.text), ['first'], 'nothing goes out while the first post is held');
+    t.release();
+    await t.run;
+    assert.equal(t.h.membrane.requests.length, 2);
+    assert.ok(t.restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(t.routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+      { text: 'continued', channelId: 'chan-cafe' },
+    ], 'the turn delivers in the order it wrote');
+    assert.deepEqual(t.streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe']);
+  } finally {
+    t.release();
+    await t.h.framework.stop();
+  }
+});
+
+test("locus mode: a resumed stream's deliveries queue behind the turn's earlier ones", { timeout: 15000 }, async () => {
+  const t = await heldRestart('locus', { first: 'first', second: 'second', continued: 'continued' });
+  try {
+    await t.held;
+    assert.deepEqual(t.routed.map((r) => r.text), ['first'], 'nothing goes out while the first post is held');
+    t.release();
+    await t.run;
+    assert.ok(t.restarts.includes('context_budget'), 'the turn restarted for its budget');
+    assert.deepEqual(t.routed.map((r) => r.text), ['first', 'second', 'continued'], 'the turn delivers in the order it wrote');
+  } finally {
+    t.release();
+    await t.h.framework.stop();
+  }
+});
+
+/**
+ * The registry stub for one-stream explicit turns: #alpha and #cafe resolve,
+ * deliveries and stream chunks are recorded, and a `think` tool is offered.
+ */
+function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text: text.trim(), channelId });
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
+    getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  return { routed, streamed };
+}
+
+test("explicit mode: within one stream, each round after a private round or >>skip_reply streams where delivery sends it", { timeout: 15000 }, async () => {
+  // The stream follows each prefix as it's written, a private round's too.
+  // At each round's end it returns to the turn's destination, which a private
+  // think's >>#cafe and a >>skip_reply envelope leave at #alpha.
+  const h = await harness([[
+    createMockResponse([
+      { type: 'text', text: '>>#alpha first\n' },
+      { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([
+      { type: 'text', text: '>>#cafe private plan' },
+      { type: 'tool_use', id: 'two', name: 'think', input: { content: 'plan privately' } },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([
+      { type: 'text', text: 'middle' },
+      { type: 'tool_use', id: 'three', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([
+      { type: 'text', text: '>>skip_reply aside' },
+      { type: 'tool_use', id: 'four', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([{ type: 'text', text: 'later' }] as ContentBlock[]),
+  ]], { proseRouting: 'explicit', sameRoundThinkTextPolicy: 'private' });
+  const { routed, streamed } = explicitRegistry(h);
+  try {
+    await h.run();
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'middle', channelId: 'chan-alpha' },
+      { text: 'later', channelId: 'chan-alpha' },
+    ]);
+    for (const text of ['middle', 'later']) {
+      assert.deepEqual(streamed.filter((d) => d.delta.includes(text)).map((d) => d.channelId), ['chan-alpha'],
+        `${text} streams to #alpha`);
+    }
+  } finally {
+    await h.framework.stop();
+  }
+});
+
+test("explicit mode: a membrane retry within a stream starts again at the turn's destination", { timeout: 15000 }, async () => {
+  // Round one set #alpha. The membrane then refuses the next attempt and
+  // retries it; the retried attempt's unprefixed reply is delivered to
+  // #alpha, and streams there too.
+  const h = await harness([[
+    createMockResponse([
+      { type: 'text', text: '>>#alpha first\n' },
+      { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[]),
+  ]], { proseRouting: 'explicit' });
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+      const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string; content?: unknown }>;
+      for await (const event of events) {
+        if (event.type === 'tokens' && event.content === 'continued') {
+          yield { type: 'tokens', content: 'refused partial', meta: { type: 'text', visible: true, blockIndex: 0 } };
+          yield { type: 'retrying', attempt: 1, maxAttempts: 3 };
+        }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  const { routed, streamed } = explicitRegistry(h);
+  try {
+    await h.run();
+    assert.deepEqual(routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'continued', channelId: 'chan-alpha' },
+    ]);
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-alpha']);
+    assert.equal(streamed.some((d) => d.delta.includes('refused partial')), true,
+      'the refused attempt had streamed, as text streams before a refusal is known');
+  } finally {
+    await h.framework.stop();
+  }
+});
+
+test("explicit mode: a round's later text block starts a new line for the stream, as delivery joins blocks", { timeout: 15000 }, async () => {
+  // Two text blocks in one round, the second opening with a prefix, the first
+  // not ending with a newline. Delivery reads them joined by a newline.
+  const h = await harness([[
+    createMockResponse([
+      { type: 'text', text: '>>#alpha first part' },
+      { type: 'text', text: '>>#cafe second' },
+      { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+    ] as ContentBlock[], 'tool_use'),
+    createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[]),
+  ]], { proseRouting: 'explicit' });
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+      const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string; content?: unknown }>;
+      let split = false;
+      for await (const event of events) {
+        if (!split && event.type === 'tokens' && typeof event.content === 'string' && event.content.includes('>>#cafe')) {
+          // The mock streams a round's text as one token: stream it as the
+          // two blocks the round holds.
+          split = true;
+          yield { type: 'tokens', content: '>>#alpha first part', meta: { type: 'text', visible: true, blockIndex: 0 } };
+          yield { type: 'tokens', content: '>>#cafe second', meta: { type: 'text', visible: true, blockIndex: 1 } };
+          continue;
+        }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  const { routed, streamed } = explicitRegistry(h);
+  try {
+    await h.run();
+    assert.deepEqual(routed.slice(0, 2), [
+      { text: 'first part', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+    ]);
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('second')).map((d) => d.channelId), ['chan-cafe']);
+    assert.equal(streamed.some((d) => d.delta.includes('>>')), false, 'no prefix is streamed as text');
+  } finally {
+    await h.framework.stop();
+  }
+});
+
+test("explicit mode: a round's targets are resolved once, when it ends, for its delivery and the resumed stream alike", { timeout: 15000 }, async () => {
+  // From a review's probe. Both rounds that name #cafe have ended, and their
+  // deliveries wait behind 'first', when the registry's #cafe starts naming
+  // another channel. Each goes to the channel #cafe named when its round
+  // ended, where the stream sent it: the queued '>>#cafe second', and the
+  // resumed '>>#cafe continued', whose text-only round ended before the wait.
+  const t = await heldRestart('explicit', { first: '>>#alpha first\n', second: '>>#cafe second', continued: '>>#cafe continued' });
+  try {
+    await t.held;
+    t.directory.cafe = 'chan-rebound';
+    t.release();
+    await t.run;
+    assert.deepEqual(t.routed, [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+      { text: 'continued', channelId: 'chan-cafe' },
+    ]);
+    assert.deepEqual(t.streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe']);
+  } finally {
+    t.release();
+    await t.h.framework.stop();
+  }
+});
+
+test("a fresh turn that delivers nothing still replaces an earlier turn's speech chain for its restart", { timeout: 15000 }, async () => {
+  // An earlier turn's delivery that never settles: a stream resuming this
+  // turn must not queue behind it.
+  const quiet = createMockResponse([
+    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  quiet.usage = { inputTokens: 100, outputTokens: 5 };
+  // The reply names its destination, so nothing bounces into another turn.
+  const reply = createMockResponse([{ type: 'text', text: '>>#alpha continued' }] as ContentBlock[], 'end_turn');
+  const h = await harness([[quiet], [reply]], { proseRouting: 'explicit', maxStreamTokens: 20 });
+  (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
+    .proseSpeechChains.set('assistant', new Promise<void>(() => {}));
+  const routed: string[] = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push(text);
+      return { delivered: true, channelId };
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    const run = h.run();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), 10000); });
+    try {
+      assert.notEqual(await Promise.race([run.then(() => 'done' as const), timeout]), 'timeout',
+        'the resumed turn finishes');
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(h.membrane.requests.length, 2);
+    assert.deepEqual(routed.map((text) => text.trim()), ['continued']);
+  } finally {
+    await h.framework.stop();
+  }
+});
+
+test("a fresh turn clears the sticky destination and the turn's destination in every mode", async () => {
+  for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
+    const h = await harness([[answer()]], { proseRouting: mode });
+    const internals = h.framework as unknown as {
+      proseTurnDestinations: Map<string, string | null>;
+      proseTargetPins: Map<string, string>;
+    };
+    internals.proseTurnDestinations.set('assistant', 'chan-earlier');
+    internals.proseTargetPins.set('assistant', 'chan-earlier');
+    try {
+      await h.run();
+      assert.equal(internals.proseTurnDestinations.has('assistant'), false, `${mode}: the turn's destination`);
+      assert.equal(internals.proseTargetPins.has('assistant'), false, `${mode}: the sticky destination`);
+    } finally {
+      await h.framework.stop();
+    }
+  }
+});
+
+for (const shape of ['text-only', 'trailing'] as const) {
+  test(`explicit mode: a turn's ${shape} text is admitted before a module's speech callback runs`, { timeout: 15000 }, async () => {
+    // From a review's probe: a speech callback that rebinds #cafe can't move
+    // where the turn's final text goes, since that text was admitted first.
+    const scripts = shape === 'text-only'
+      ? [[createMockResponse([{ type: 'text', text: '>>#cafe final' }] as ContentBlock[])]]
+      : [[
+        createMockResponse([
+          { type: 'text', text: '>>#alpha first\n' },
+          { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+        ] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: '>>#cafe final' }] as ContentBlock[]),
+      ]];
+    const h = await harness(scripts, { proseRouting: 'explicit' });
+    let cafe = 'chan-cafe';
+    const routed: Array<{ text: string; channelId: string }> = [];
+    const streamed: Array<{ channelId: string; delta: string }> = [];
+    (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+        : spec === '#cafe' ? { channelId: cafe } : { error: `no channel ${spec}` },
+      routeSpeech: async (_agent: string, text: string, channelId: string) => {
+        routed.push({ text: text.trim(), channelId });
+        return { delivered: true, channelId };
+      },
+      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+        streamed.push({ channelId, delta });
+      },
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+      getDescriptor: () => undefined, getChannelTools: () => [],
+    }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+    const modules = (h.framework as unknown as { moduleRegistry: { dispatchSpeech: (...args: unknown[]) => Promise<void> } }).moduleRegistry;
+    const dispatch = modules.dispatchSpeech.bind(modules);
+    modules.dispatchSpeech = async (...args: unknown[]) => {
+      cafe = 'chan-rebound';
+      await dispatch(...args);
+    };
+    try {
+      await h.run();
+      assert.deepEqual(routed.at(-1), { text: 'final', channelId: 'chan-cafe' });
+      assert.ok(streamed.some((d) => d.channelId === 'chan-cafe' && d.delta.includes('final')));
+    } finally {
+      await h.framework.stop();
+    }
+  });
+}
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];
