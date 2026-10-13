@@ -3,8 +3,9 @@
   machine: its `token` or `accessProvider`, or a secret the url carries
   itself (a `ws://` url's userinfo, a query parameter whose name says
   credential: `token`, `key`, `secret`, `password`, `auth` or `signature`,
-  a query parameter name that may itself be one, or a path segment that
-  looks like one, as the redacted url judges it). A name that may itself be
+  or whose value is shaped like one under a plain name, a query parameter
+  name that may itself be one, or a path segment that looks like one, as
+  the redacted url judges it). A name that may itself be
   a credential is counted in the warning, never quoted. An `http(s)://` url
   with userinfo is refused instead, since the HTTP client can't send it and
   its error would quote it. Loopback hosts are

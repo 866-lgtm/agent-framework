@@ -133,23 +133,30 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * pattern built once: for a connection's records, such as each stderr line.
  */
 export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
+  // Strings replaced wherever they occur, and short name=value pairs, which
+  // are replaced only where no letter or digit adjoins them, so a pair such as
+  // v=2 leaves dev=2 alone.
   const secrets = new Set<string>();
+  const shortPairs = new Set<string>();
   const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
   const decode = (value: string, query = false): string => {
     try { return decodeURIComponent(query ? value.replace(/\+/g, ' ') : value); }
     catch { return value; }
   };
   // The token as sent: raw in a header, and percent- or form-encoded where a
-  // transport puts it in a url.
-  for (const token of [config.token ?? '']) {
-    standalone(token);
-    standalone(encodeURIComponent(token));
-    standalone(new URLSearchParams({ t: token }).toString().slice(2));
-  }
+  // transport puts it in a url (a token that can't be encoded, such as one
+  // with an unpaired surrogate, has no encoded form).
+  const token = config.token ?? '';
+  standalone(token);
+  try { standalone(encodeURIComponent(token)); } catch { /* no percent-encoded form */ }
+  try { standalone(new URLSearchParams({ t: token }).toString().slice(2)); } catch { /* no form-encoded form */ }
   // A stdio server's environment values whose names say they carry a
-  // credential, by the same rule as the url's parameters.
+  // credential: a part of the name that ends with a credential word
+  // (GITHUB_TOKEN, API_KEY, PGPASSWORD, ACCESSTOKEN), and not one where the
+  // word only begins or sits inside a part (GIT_AUTHOR_NAME, KEYBOARD_LAYOUT,
+  // TOKENIZERS_PARALLELISM).
   for (const [name, value] of Object.entries(config.env ?? {})) {
-    if (CREDENTIAL_PARAM.test(name)) standalone(value);
+    if (name.split(/[_\-.]/).some((part) => CREDENTIAL_NAME_PART.test(part))) standalone(value);
   }
   let url: URL | undefined;
   try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
@@ -175,8 +182,9 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
         standalone(value);
       }
       if (value !== '') {
-        secrets.add(`${encodedName}=${encodedValue}`);
-        secrets.add(`${name}=${value}`);
+        for (const pair of [`${encodedName}=${encodedValue}`, `${name}=${value}`]) {
+          (value.length >= 8 ? secrets : shortPairs).add(pair);
+        }
       }
     }
     if (url.protocol === 'ws:' || url.protocol === 'wss:') {
@@ -186,15 +194,24 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
       }
     }
   }
-  const asText = (text: unknown): string => (typeof text === 'string' ? text : String(text));
-  if (secrets.size === 0) return asText;
-  const alternatives = [...secrets].sort((a, b) => b.length - a.length)
-    .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  // Only where no letter or digit adjoins it, so a short name=value such as
-  // v=2 leaves dev=2 alone.
-  const pattern = new RegExp(`(?<![A-Za-z0-9])(?:${alternatives.join('|')})(?![A-Za-z0-9])`, 'g');
+  if (secrets.size === 0 && shortPairs.size === 0) return asText;
+  const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const alternatives = [
+    ...[...secrets].map(value => ({ value, source: escape(value) })),
+    ...[...shortPairs].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
+  ].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
+  const pattern = new RegExp(alternatives.join('|'), 'g');
   return (text) => asText(text).replace(pattern, 'redacted');
 }
+
+/** Any value as text: a value that can't be printed reads as a placeholder. */
+function asText(text: unknown): string {
+  if (typeof text === 'string') return text;
+  try { return String(text); } catch { return '[a value that cannot be printed]'; }
+}
+
+/** A part of an environment variable's name that ends with a credential word. */
+const CREDENTIAL_NAME_PART = /(?:token|key|secret|password|passwd|auth|signature|credentials?)$/i;
 
 /**
  * A credential provider's failure as a log line may show it: the error's
@@ -353,12 +370,12 @@ function isLoopbackHost(hostname: string): boolean {
  * `ws://` url whose host isn't loopback crosses the network in cleartext:
  * `token` or `accessProvider` (in the `Authorization` header, or the
  * WebSocket `?token=` query), and a secret the url carries itself (a ws://
- * url's userinfo, a query parameter whose name says it's a credential or may
- * itself be one, or a path segment that looks like one, as {@link redactUrl}
- * judges it). A name that may itself be a credential is counted, never
- * quoted. That can be
- * deliberate, on a private network or behind a TLS-terminating proxy, so it
- * is a warning and never a refusal.
+ * url's userinfo, a query parameter whose name says it's a credential, or
+ * whose value is shaped like one under a plain name, a query parameter name
+ * that may itself be one, or a path segment that looks like one, as
+ * {@link redactUrl} judges it). A name that may itself be a credential is
+ * counted, never quoted. That can be deliberate, on a private network or
+ * behind a TLS-terminating proxy, so it is a warning and never a refusal.
  */
 export function serverConfigWarnings(config: McplServerConfig): string[] {
   let transport: McpTransportKind;

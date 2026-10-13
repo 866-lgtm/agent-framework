@@ -43,6 +43,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   Client,
+  InsufficientScopeError,
   SdkError,
   SdkErrorCode,
   SdkHttpError,
@@ -60,7 +61,7 @@ import {
 
 import { StdioTransport, type McplTransport } from './transport.js';
 import { McplProtocolVersionError, McplRequestError } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, redactServerText } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, redactServerText, serverTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -228,10 +229,16 @@ class ObservedTransport implements Transport {
  * line's first 200 characters, after the configuration's credentials are
  * replaced, so a credential across the cut can't leave its first part.
  */
-export function malformedLineDiagnostic(config: McplServerConfig, text: string, error: unknown): string {
-  const shown = redactServerText(text, config);
-  return `MCP server "${config.id}" sent a malformed JSON-RPC message (${shown.length > 200 ? `${shown.slice(0, 200)}…` : shown}): ` +
-    (error instanceof Error ? error.message.split('\n')[0] : String(error));
+export function malformedLineDiagnostic(
+  config: McplServerConfig,
+  text: string,
+  error: unknown,
+  recorded: (text: unknown) => string = serverTextRedactor(config),
+): string {
+  // The parser's message can quote the line, so it's redacted too.
+  const shown = recorded(text);
+  const why = recorded(error instanceof Error ? error.message.split('\n')[0] : error);
+  return `MCP server "${config.id}" sent a malformed JSON-RPC message (${shown.length > 200 ? `${shown.slice(0, 200)}…` : shown}): ${why}`;
 }
 
 /**
@@ -248,10 +255,15 @@ class SpawnerStdioTransport implements Transport {
   onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
   private line: McplTransport | null = null;
 
+  /** Built once for the transport: every malformed line uses it. */
+  private readonly recorded: (text: unknown) => string;
+
   constructor(
     private readonly config: McplServerConfig,
     private readonly onStderr: (line: string) => void,
-  ) {}
+  ) {
+    this.recorded = serverTextRedactor(config);
+  }
 
   async start(): Promise<void> {
     const line = StdioTransport.spawn(this.config);
@@ -271,7 +283,7 @@ class SpawnerStdioTransport implements Transport {
       try {
         message = parseJSONRPCMessage(parsed);
       } catch (error) {
-        this.onerror?.(new Error(malformedLineDiagnostic(this.config, text, error)));
+        this.onerror?.(new Error(malformedLineDiagnostic(this.config, text, error, this.recorded)));
         return;
       }
       this.onmessage?.(message);
@@ -921,18 +933,25 @@ export class ModernMcpConnection extends EventEmitter {
         'no-response',
       );
     }
-    if (error instanceof SdkHttpError && (error.code === SdkErrorCode.ClientHttpAuthentication || error.code === SdkErrorCode.ClientHttpForbidden)) {
+    // An HTTP refusal of the credential: 401 or 403, however the SDK raised
+    // it. It raises a plain 403 under another code than its step-up limit's,
+    // and an insufficient_scope 403 as InsufficientScopeError when no OAuth
+    // provider is configured.
+    const refusedWith = error instanceof SdkHttpError && (error.status === 401 || error.status === 403)
+      ? error.status
+      : error instanceof InsufficientScopeError ? 403 : null;
+    if (refusedWith !== null) {
       if (record.continued) {
         return new McplRequestError(
           `${prefix} did not finish ${what}: it asked for another round (input_required), and the server refused a later one: ` +
-            `HTTP ${error.status} (${message}). The outcome is unknown: the server may already have acted on the call. ${advice}`,
+            `HTTP ${refusedWith} (${message}). The outcome is unknown: the server may already have acted on the call. ${advice}`,
           'no-response',
         );
       }
       // The response body (the SDK's `text`) is the server's text and can
-      // echo the request's url, so it's left out; the status stays.
-      const { text: _body, ...data } = (error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
-      return new McplRequestError(`${prefix} refused ${what}: HTTP ${error.status} (${message})`, 'error-response', undefined, { ...data, httpStatus: error.status });
+      // echo the request's url, so it's left out of the data; the status stays.
+      const { text: _body, ...data } = (error instanceof SdkHttpError && error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
+      return new McplRequestError(`${prefix} refused ${what}: HTTP ${refusedWith} (${message})`, 'error-response', undefined, { ...data, httpStatus: refusedWith });
     }
     if (deadline) {
       const outcome = record.method === 'tools/list'

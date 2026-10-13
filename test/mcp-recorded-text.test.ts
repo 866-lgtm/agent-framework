@@ -65,6 +65,22 @@ test('both framework engines scrub failure, error and stderr records before trac
   }
 });
 
+test("both engines' wiring redacts a stdio server's credential env value in its stderr records", () => {
+  const stdio = { id: 'local', command: 'srv', env: { API_TOKEN: 'envToken0123456789', PATH: '/usr/local/bin' } };
+  for (const method of ['wireMcplEvents', 'wireModernEvents']) {
+    const traces: unknown[] = [];
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.mcplServerConfigs = new Map([[stdio.id, stdio]]);
+    framework.emitTrace = (event: unknown) => traces.push(event);
+    framework.opsAlert = () => {};
+    const connection = Object.assign(new EventEmitter(), { id: stdio.id, willReconnect: false });
+    framework[method](connection, stdio);
+    connection.emit('stderr', { line: 'auth with envToken0123456789 from /usr/local/bin' });
+    assert.equal(traces.length, 1, method);
+    assert.match(JSON.stringify(traces[0]), /auth with redacted from \/usr\/local\/bin/, method);
+  }
+});
+
 test('an SDK HTTP 404 error keeps its path but hides the secret in connection console, traces and ops alerts', async (t) => {
   failConnectWithHttpBody(t);
   const dir = mkdtempSync(join(tmpdir(), 'mcp-recorded-text-'));
@@ -199,9 +215,11 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   assert.match(String(result.error), /socket closed: 1008 \/api\/mcp\/s\/redacted\/mcp/);
   // A redactor for any server's text is made before an operation waits, so
   // a server removed meanwhile still has its credentials replaced.
+  const other = { id: 'other', url: 'https://g/api/s/otherSecret0123456789/mcp' };
+  framework.mcplServerConfigs = new Map([[config.id, config], [other.id, other]]);
   const everyServer = framework.everyServerRedactor();
   framework.mcplServerConfigs = new Map();
-  assert.equal(everyServer(`closed ${secret}`), 'closed redacted');
+  assert.equal(everyServer(`closed ${secret} and otherSecret0123456789`), 'closed redacted and redacted');
   framework.mcplServerConfigs = new Map([[config.id, config]]);
 
   // The model's dispatch: the tool:failed trace (message and stack) and the
@@ -215,7 +233,10 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   // The server is disconnected while the call is in flight: its failure is
   // still recorded with the configuration it was dispatched under.
   framework.mcplServerConfigs.delete(config.id);
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  const until = Date.now() + 30_000;
+  while (!(traces.some((event) => event.type === 'tool:failed') && events.length > 0) && Date.now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   const failed = traces.find((event) => event.type === 'tool:failed');
   assert.ok(failed, 'the failure is traced');
   for (const text of [failed!.error, failed!.stack, events[0]?.result?.error]) {
@@ -227,9 +248,17 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
 test("a malformed line's diagnostic is redacted before it is cut, so no part of a credential across the cut is kept", () => {
   const envSecret = 'envSecretValue0123456789';
   const line = JSON.stringify({ note: `${'p'.repeat(185)} ${envSecret}` });
+  // The credential starts this far into the line; a cut at 200 would keep
+  // the first (200 - start) of its characters.
+  const start = line.indexOf(envSecret);
+  const kept = envSecret.slice(0, 200 - start);
+  assert.ok(kept.length > 0 && kept.length < envSecret.length, `the cut falls inside the credential (${kept.length})`);
   const diagnostic = malformedLineDiagnostic({ id: 'stdio-env', command: 'srv', env: { API_TOKEN: envSecret } } as never, line, new Error('not a message'));
   assert.match(diagnostic, /sent a malformed JSON-RPC message/);
-  assert.ok(!diagnostic.includes(envSecret.slice(0, 6)), diagnostic);
+  assert.ok(!diagnostic.includes(kept), diagnostic);
+  // The parser's own message can quote the line; it's redacted too.
+  const quoting = malformedLineDiagnostic({ id: 'stdio-env', command: 'srv', env: { API_TOKEN: envSecret } } as never, '{}', new Error(`unexpected ${envSecret}`));
+  assert.ok(!quoting.includes(envSecret), quoting);
   assert.match(diagnostic, / redac/, 'the replacement, cut where the line is cut');
 });
 

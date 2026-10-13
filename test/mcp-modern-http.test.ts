@@ -259,3 +259,26 @@ test("HTTP: a 403 refusal's response body, which can echo the url, stays out of 
   assert.ok(!JSON.stringify(err.data).includes('pathSecret'), JSON.stringify(err.data));
 });
 
+for (const [what, headers] of [
+  ['a plain 403', {}],
+  ['an insufficient_scope 403', { 'www-authenticate': 'Bearer error="insufficient_scope", scope="tools"' }],
+] as const) {
+  test(`HTTP: ${what} on a first-round call is an error-response with the status in data, over the wire`, async () => {
+    const { url, server } = await startServer(() => true, (message, res) => {
+      if (message.method !== 'tools/call') return false;
+      res.writeHead(403, { 'content-type': 'text/plain', ...headers }).end('forbidden here');
+      return true;
+    });
+    cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+    const connection = await ModernMcpConnection.connect({ id: 'remote', url, token: 't' });
+    cleanups.push(() => connection.close());
+    await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
+      assert.ok(err instanceof McplRequestError);
+      assert.equal(err.outcome, 'error-response', err.message);
+      assert.equal((err.data as { httpStatus?: number }).httpStatus, 403);
+      assert.equal((err.data as { text?: unknown }).text, undefined);
+      return true;
+    });
+  });
+}
+

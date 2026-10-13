@@ -196,10 +196,29 @@ test('restartMcplServer of an id whose disconnect is in flight is refused before
 test("a disconnect removes its server's prefix claim, and leaves one another server holds", async () => {
   await withFramework(true, async (framework) => {
     const internals = framework as unknown as { mcplPrefixMap: Map<string, string> };
+    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'first');
+    await framework.disconnectMcplServer('first');
+    assert.equal(internals.mcplPrefixMap.has('mcpl--first'), false, 'its own claim is released');
     // As after a restart under a new id: `second` holds the prefix `first` had.
+    await framework.connectMcplServer(serverConfig('first') as never);
     internals.mcplPrefixMap.set('mcpl--first', 'second');
     await framework.disconnectMcplServer('first');
     assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'second', "the other server's claim stands");
+  });
+});
+
+test('restartMcplServer of an id whose connect is in flight is refused before it tears anything down', async (t) => {
+  // MCPL is up, so the connect holds its id before its first await.
+  await withFramework(true, async (framework) => {
+    const connecting = framework.connectMcplServer(serverConfig('later') as never);
+    const disconnect = t.mock.method(framework, 'disconnectMcplServer');
+    await assert.rejects(
+      framework.restartMcplServer('later', serverConfig('renamed') as never),
+      /MCP server "later" was not restarted: it is being connected; restart it once that has finished/,
+    );
+    assert.equal(disconnect.mock.callCount(), 0, 'the restart started no disconnect of its own');
+    disconnect.mock.restore();
+    await connecting;
   });
 });
 

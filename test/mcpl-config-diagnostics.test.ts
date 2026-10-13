@@ -332,6 +332,35 @@ test('FeatureSetManager: each §6.4 disablement is traced beside its console lin
   assert.equal(quiet.lines.length, 3, 'the console line stays');
 });
 
+test("a refused initial policy's reason is recorded without the server's configured credentials", async () => {
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.traceListeners = [];
+  fw.featureSetManager = new FeatureSetManager();
+  fw.checkpointManager = null;
+  const traces: Traced[] = [];
+  fw.onTrace((e: Traced) => traces.push(e));
+  const secret = 'srvSecret0123456789';
+  const connection = {
+    id: 'srv',
+    capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+    mcpToolsAdvertised: false,
+    establishGrant: () => {},
+    sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback: 'mcp-only', reason: `policy for ${secret} too narrow` }),
+    close: async () => {},
+  };
+  const capture = captureConsoleError();
+  try {
+    await fw.registerMcplServerFeatures({ id: 'srv', url: `wss://h/mcp/${secret}` } as McplServerConfig, connection);
+  } finally {
+    capture.stop();
+  }
+  const refused = traces.filter((t) => t.type === 'mcpl:policy-refused');
+  assert.equal(refused.length, 1);
+  assert.equal((refused[0] as { reason?: string }).reason, 'policy for redacted too narrow');
+  assert.ok(capture.lines.some((l) => l.includes('srv refused initial policy (policy for redacted too narrow)')), capture.lines.join('\n'));
+  assert.ok(!capture.lines.join('\n').includes(secret));
+});
+
 test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {
   for (const fallback of ['close', 'mcp-only'] as const) {
     const fw = Object.create(AgentFramework.prototype) as any;

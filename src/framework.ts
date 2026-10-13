@@ -14133,13 +14133,17 @@ export class AgentFramework {
    * branch actually taken (anything but `close` is treated as `mcp-only`)
    * and a non-string `reason` is dropped.
    */
-  private static policyRefusalFields(receipt: { fallback?: unknown; reason?: unknown }): {
+  private static policyRefusalFields(
+    receipt: { fallback?: unknown; reason?: unknown },
+    recorded: (text: unknown) => string,
+  ): {
     fallback: 'close' | 'mcp-only';
     reason: string | null;
   } {
     return {
       fallback: receipt.fallback === 'close' ? 'close' : 'mcp-only',
-      reason: typeof receipt.reason === 'string' ? receipt.reason : null,
+      // The server's own words, recorded as every server text is.
+      reason: typeof receipt.reason === 'string' ? recorded(receipt.reason) : null,
     };
   }
 
@@ -14265,7 +14269,7 @@ export class AgentFramework {
             type: 'mcpl:policy-refused',
             serverId: connection.id,
             phase: 'manifest-change',
-            ...AgentFramework.policyRefusalFields(receipt),
+            ...AgentFramework.policyRefusalFields(receipt, recorded),
           });
           if (fallback === 'close') {
             await connection.close();
@@ -14377,13 +14381,13 @@ export class AgentFramework {
       if (receipt && receipt.accepted === false) {
         const fallback = receipt.fallback ?? 'mcp-only';
         console.error(
-          `[mcpl] ${config.id} refused initial policy (${receipt.reason ?? 'no reason'}) — fallback: ${fallback}`,
+          `[mcpl] ${config.id} refused initial policy (${redactServerText(receipt.reason ?? 'no reason', config)}) — fallback: ${fallback}`,
         );
         this.emitTrace({
           type: 'mcpl:policy-refused',
           serverId: config.id,
           phase: 'initial',
-          ...AgentFramework.policyRefusalFields(receipt),
+          ...AgentFramework.policyRefusalFields(receipt, (text) => redactServerText(text, config)),
         });
         if (fallback === 'close') {
           await connection.close();
@@ -14563,14 +14567,17 @@ export class AgentFramework {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
     AgentFramework.usableConfigFamily(config);
+    const inFlight = this.mcpServerOps?.get(id);
+    if (inFlight) {
+      // A connect or disconnect of the server being restarted, in flight,
+      // whatever id the restart moves it to: the restart's own disconnect
+      // would wait behind it, and its connect would then meet whatever that
+      // operation left, after the server was torn down.
+      throw new Error(`MCP server "${id}" was not restarted: it is being ${inFlight.kind === 'disconnect' ? 'disconnected' : 'connected'}; restart it once that has finished`);
+    }
     if (config.id !== id) {
       const taken = this.mcpServerIdTaken(config.id);
       if (taken) throw new Error(taken);
-    } else if (this.mcpServerOps?.get(id)) {
-      // A connect or disconnect of this id in flight: the restart's own
-      // disconnect would queue behind it and then be refused, after the
-      // server was torn down.
-      throw new Error(`MCP server "${id}" was not restarted: it is being ${this.mcpServerOps.get(id)!.kind === 'disconnect' ? 'disconnected' : 'connected'}; restart it once that has finished`);
     }
     const collision = this.mcplPrefixCollision(config, id);
     if (collision) throw new Error(collision);
@@ -15382,7 +15389,7 @@ export class AgentFramework {
         this.emitMcplToolDiff(oldToolNames, serverId);
       })
       .catch((error) => {
-        console.error('MCPL tool refresh error:', recorded(error instanceof Error ? error.message : error));
+        console.error('MCPL tool refresh error:', recorded(error instanceof Error ? (error.stack ?? error.message) : error));
       })
       .finally(() => {
         this.mcplToolRefreshInFlight = false;

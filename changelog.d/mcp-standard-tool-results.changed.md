@@ -102,6 +102,13 @@
   up when its handshake settles (a modern connect in flight, or such a
   legacy one, fails with "was not connected"); then it removes what was
   registered. A teardown never removes what a later connection registered.
+  `restartMcplServer` refuses, before it tears the running server down, what
+  its connect would refuse: a configuration with no usable binding, a new id
+  another server holds, a tool prefix another server or a module holds, a
+  framework whose `stop()` has begun, and a connect or disconnect of the
+  server in flight. On main a restart disconnected first, so a refused
+  connect left the server gone; now the server keeps running. A disconnect
+  releases its tool-prefix claim only while its own server holds it.
 - A server configuration naming no usable transport is now an error before
   anything is spawned or dialed. That covers a `transport` that doesn't
   match the url's scheme, `transport: 'http'` without a url, and an

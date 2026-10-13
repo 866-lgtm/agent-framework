@@ -322,26 +322,41 @@ test('recorded server text keeps short standalone values and unrelated words, bu
 
 test('recorded server text: the token as a url carries it, credential-named env values, only where nothing adjoins, and any value', () => {
   // The static token, raw and as a url carries it, percent- or form-encoded.
-  const token = 'tok+en/123=';
+  const token = 'tok en+x/123=';
   const tokenConfig = cfg({ token });
-  for (const form of [token, encodeURIComponent(token), 'tok%2Ben%2F123%3D']) {
+  // Percent-encoded (%20 for the space) and form-encoded (+ for it) differ here.
+  for (const form of [token, 'tok%20en%2Bx%2F123%3D', 'tok+en%2Bx%2F123%3D']) {
     assert.equal(redactServerText(`refused: ${form}`, tokenConfig), 'refused: redacted', form);
   }
-  // A stdio server's env: a value whose name says it's a credential, and no other.
-  const env = cfg({ command: 'srv', env: { GITHUB_TOKEN: 'ghp_abcdef123456', API_KEY: 'k3y-abcdefgh', PATH: '/usr/local/bin' } });
-  assert.equal(redactServerText('auth ghp_abcdef123456 k3y-abcdefgh /usr/local/bin', env), 'auth redacted redacted /usr/local/bin');
-  // Only where no letter or digit adjoins a string: a short pair stays whole elsewhere.
-  const pair = cfg({ url: 'https://h/mcp?v=2' });
+  // A stdio server's env: a value whose name has a credential word as a whole
+  // part of it, and no other (GIT_AUTHOR_NAME holds 'auth' inside a word).
+  const env = cfg({ command: 'srv', env: {
+    GITHUB_TOKEN: 'ghp_abcdef123456', API_KEY: 'k3y-abcdefgh', PGPASSWORD: 'pgpass-abcdefgh', ACCESSTOKEN: 'acc-abcdefgh12',
+    PATH: '/usr/local/bin', GIT_AUTHOR_NAME: 'Somebody Longname', KEYBOARD_LAYOUT: 'dvorak-programmer', TOKENIZERS_PARALLELISM: 'parallel-false',
+  } });
+  assert.equal(
+    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
+    'auth redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
+  // A short pair only where no letter or digit adjoins it; any other string
+  // wherever it occurs, after a percent escape, an ANSI code or a JSON escape too.
+  const pair = cfg({ url: 'https://h/api/s/pathSecret0123456789/mcp?v=2' });
   assert.equal(redactServerText('dev=2 ready; v=2 sent', pair), 'dev=2 ready; redacted sent');
+  assert.equal(redactServerText('a%2FpathSecret0123456789 \u001b[31mpathSecret0123456789 "\\npathSecret0123456789"', pair),
+    'a%2Fredacted \u001b[31mredacted "\\nredacted"');
   // A ws:// url's userinfo, as for wss://.
   const ws = cfg({ url: 'ws://wsuser1234:wspass5678@h/mcp' });
   assert.equal(redactServerText('connect wsuser1234 wspass5678', ws), 'connect redacted redacted');
   // A url with a stray percent sign: its value is kept as written.
   const stray = cfg({ url: 'https://h/mcp?note=100%&key=abcdefgh1234' });
   assert.equal(redactServerText('note=100% key=abcdefgh1234', stray), 'redacted redacted');
-  // Any value reads as text: a rejection that isn't an Error doesn't throw.
+  // Any value reads as text: a rejection that isn't an Error doesn't throw,
+  // and neither does one that can't be printed.
   assert.equal(redactServerText(undefined, tokenConfig), 'undefined');
   assert.equal(redactServerText({ toString: () => `obj ${token}` }, tokenConfig), 'obj redacted');
+  assert.equal(redactServerText(Object.create(null), tokenConfig), '[a value that cannot be printed]');
+  assert.equal(redactServerText({ toString() { throw new Error('no'); } }, tokenConfig), '[a value that cannot be printed]');
+  // A token that can't be url-encoded (an unpaired surrogate) is still replaced as written.
+  assert.equal(redactServerText('x abcdefgh\ud800ij', cfg({ token: 'abcdefgh\ud800ij' })), 'x redacted');
 });
 
 test('the cleartext warning counts a credential-shaped value under a plain name, as redaction does', () => {
