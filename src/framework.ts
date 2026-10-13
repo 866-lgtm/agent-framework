@@ -1179,6 +1179,8 @@ export class AgentFramework {
    * nothing to carry its turn. A turn that settles has written its receipt
    * and taken its ` !`, and a tool-ended turn settles before the next turn
    * can start, so the queued deliveries it leaves keep writing to its own.
+   * Only the stream that holds the open turn closes it; disposal drops it,
+   * and stop() clears every agent's.
    */
   private openLogical: Map<string, LogicalTurn> = new Map();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
@@ -2105,6 +2107,10 @@ export class AgentFramework {
 
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
+    // An open logical turn doesn't survive a stop: a start after a restart
+    // on this instance opens a new one rather than carrying its ` !` and
+    // receipt tallies across (openLogical).
+    this.openLogical.clear();
 
     // Cancel all active streams
     for (const agent of this.agents.values()) {
@@ -4358,9 +4364,12 @@ export class AgentFramework {
   private settleAgent(
     agentName: string,
     outcome: { stopReason: AgentSettleResult['stopReason']; speech: string; error?: string },
+    /** The settling stream's logical turn, when that stream still owns the
+     *  agent: it ends here, so the agent's next fresh start opens a new one.
+     *  A settle from a stream a newer one replaced closes nothing. */
+    closes: LogicalTurn | undefined,
   ): void {
-    // The logical turn ends here, so the agent's next fresh start opens a new one.
-    this.openLogical.delete(agentName);
+    if (closes && this.openLogical.get(agentName) === closes) this.openLogical.delete(agentName);
     const run = this.ephemeralRuns.get(agentName);
     if (!run) return;
     run.lastActivity = Date.now();
@@ -7056,7 +7065,7 @@ export class AgentFramework {
             // agent must be wakeable the moment it goes idle. (Idempotent;
             // driveStream's finally is the backstop.)
             this.eventGate?.onInferenceEnded(agent.name);
-            this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' });
+            this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' }, this.turnRouting.get(agent.name)?.logical);
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
           } else if (overBudget || overPhysical) {
             // Context budget exceeded: break the stream, let compile() compress.
@@ -9727,7 +9736,7 @@ export class AgentFramework {
           stopReason: 'exhausted',
           speech: '',
           error: err.message,
-        });
+        }, this.turnRouting.get(agent.name)?.logical);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -10501,7 +10510,7 @@ export class AgentFramework {
                     .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
                     .map((block) => block.text)
                     .join('\n'),
-            });
+            }, streamRouting.logical);
 
             this.emitTrace({
               type: 'inference:completed',
@@ -10895,7 +10904,7 @@ export class AgentFramework {
                   stopReason: 'exhausted',
                   speech: '',
                   error: 'Turn abandoned by operator quiesce',
-                });
+                }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
                 this.emitTrace({
                   type: 'inference:aborted',
                   agentName: agent.name,
@@ -10924,7 +10933,7 @@ export class AgentFramework {
                 stopReason: 'exhausted',
                 speech: '',
                 error: err.message,
-              });
+              }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -10978,7 +10987,7 @@ export class AgentFramework {
                       stopReason: 'exhausted',
                       speech: '',
                       error: 'Turn abandoned by operator quiesce',
-                    });
+                    }, streamRouting.logical);
                   }
                   this.emitTrace({
                     type: 'inference:aborted',
@@ -11022,7 +11031,7 @@ export class AgentFramework {
                 stopReason: 'exhausted',
                 speech: '',
                 error: `Stream aborted: ${reason}`,
-              });
+              }, streamRouting.logical);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -11168,7 +11177,7 @@ export class AgentFramework {
         stopReason: 'exhausted',
         speech: '',
         error: err.message,
-      });
+      }, streamRouting.logical);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
