@@ -2515,8 +2515,13 @@ export class AgentFramework {
       const tools = this.compressionToolsForAgent(agent.name);
       cm.setToolDefinitions(tools);
       if (this.providerGateBlocked(agent.name)) return [];
-      if (cm.isReady()) return [];
-      const pending = cm.getPendingWork()?.description;
+      // The context manager refuses its state queries while its strategy's
+      // initialization is pending (a branch switch in flight) or has failed.
+      // Such an agent sits this pass out; the others still run, and the
+      // snapshot reports the refusal.
+      const state = this.contextReadiness(cm);
+      if ('refused' in state || state.ready) return [];
+      const pending = state.pending;
       const progress = this.contextProgress(cm);
       const record: ContextMaintenanceAgentRun = {
         agentName: agent.name,
@@ -2568,10 +2573,15 @@ export class AgentFramework {
             },
           );
         } finally {
-          const pending = cm.getPendingWork()?.description;
+          const state = this.contextReadiness(cm);
           record.finishedAt = Date.now();
-          record.readyAfter = cm.isReady();
-          if (pending) record.pendingAfter = pending;
+          if ('refused' in state) {
+            record.readyAfter = false;
+            record.refusedAfter = state.refused;
+          } else {
+            record.readyAfter = state.ready;
+            if (state.pending) record.pendingAfter = state.pending;
+          }
           const progress = this.contextProgress(cm);
           if (progress) record.progressAfter = progress;
         }
@@ -2582,6 +2592,23 @@ export class AgentFramework {
       this.currentMaintenanceRun = null;
       this.maintenanceHistory.unshift(run);
       if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
+    }
+  }
+
+  /**
+   * The context manager's readiness, or its refusal to say: it refuses its
+   * state queries while its strategy's initialization is pending or has
+   * failed, until a successful `switchBranch` or `setStrategy`.
+   */
+  private contextReadiness(
+    cm: ContextManager,
+  ): { ready: boolean; pending?: string } | { refused: string } {
+    try {
+      const ready = cm.isReady();
+      const pending = ready ? undefined : cm.getPendingWork()?.description;
+      return pending ? { ready, pending } : { ready };
+    } catch (error) {
+      return { refused: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -3928,12 +3955,13 @@ export class AgentFramework {
   getContextMaintenanceSnapshot(): ContextMaintenanceSnapshot {
     const agents = [...this.agents.values()].map((agent) => {
       const cm = agent.getContextManager();
-      const pending = cm.getPendingWork()?.description;
+      const state = this.contextReadiness(cm);
       const progress = this.contextProgress(cm);
       return {
         agentName: agent.name,
-        ready: cm.isReady(),
-        ...(pending ? { pending } : {}),
+        ...('refused' in state
+          ? { ready: false, refused: state.refused }
+          : { ready: state.ready, ...(state.pending ? { pending: state.pending } : {}) }),
         ...(progress ? { progress } : {}),
       };
     });

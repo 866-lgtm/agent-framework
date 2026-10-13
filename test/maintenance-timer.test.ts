@@ -100,6 +100,51 @@ class FailingStrategy implements ContextStrategy {
   }
 }
 
+/** A strategy whose initialization always fails. */
+class RefusingInitStrategy implements ContextStrategy {
+  readonly name = 'refusing-init-test';
+
+  async initialize(_ctx: StrategyContext): Promise<void> {
+    throw new Error('strategy initialization failed for the test');
+  }
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'not expected' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {}
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+/** A strategy whose tick fences its own manager with a failed initialization. */
+class FencingTickStrategy implements ContextStrategy {
+  readonly name = 'fencing-tick-test';
+  manager?: { setStrategy(strategy: ContextStrategy): Promise<void> };
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'fencing tick queued' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    await this.manager?.setStrategy(new RefusingInitStrategy()).catch(() => undefined);
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 class ToolModule implements Module {
   readonly name = 'maintenance-tools';
 
@@ -332,6 +377,85 @@ describe('queued context maintenance timer', () => {
         framework.getContextMaintenanceSnapshot().history[0].agents[0].error,
         'provider rejected maintenance request',
       );
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an agent whose context manager refuses sits the pass out, and the others still run', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-'));
+    const healthy = new QueuedStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [
+        { name: 'fenced', model: 'test-model', systemPrompt: 'test', strategy: new QueuedStrategy() },
+        { name: 'healthy', model: 'test-model', systemPrompt: 'test', strategy: healthy },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
+    (framework as any).opsAlert = (
+      kind: string,
+      agentName: string,
+      _message: string,
+      opts?: { data?: Record<string, unknown> },
+    ) => alerts.push({ kind, agentName, data: opts?.data });
+
+    // A failed strategy initialization fences the context manager: its state
+    // queries throw until a successful switchBranch or setStrategy.
+    const fenced = framework.getAgent('fenced')!.getContextManager();
+    await assert.rejects(fenced.setStrategy(new RefusingInitStrategy()), /strategy initialization failed for the test/);
+    assert.throws(() => fenced.isReady(), /requires successful strategy initialization/);
+
+    try {
+      framework.start();
+      await waitFor(() => healthy.ticks >= 2);
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const snapshot = framework.getContextMaintenanceSnapshot();
+      assert.deepEqual(snapshot.history[0].agents.map((run) => run.agentName), ['healthy']);
+      assert.equal(snapshot.history[0].agents[0].readyAfter, true);
+      const entry = snapshot.agents.find((agent) => agent.agentName === 'fenced');
+      assert.equal(entry?.ready, false);
+      assert.match(entry?.refused ?? '', /requires successful strategy initialization/);
+      assert.deepEqual(alerts, []);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a refusal that begins during the pass is recorded on the agent, not thrown out of the pass', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-after-'));
+    const strategy = new FencingTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    strategy.manager = framework.getAgent('agent')!.getContextManager();
+    const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
+    (framework as any).opsAlert = (
+      kind: string,
+      agentName: string,
+      _message: string,
+      opts?: { data?: Record<string, unknown> },
+    ) => alerts.push({ kind, agentName, data: opts?.data });
+
+    try {
+      framework.start();
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      assert.equal(run.agentName, 'agent');
+      assert.equal(run.readyAfter, false);
+      assert.match(run.refusedAfter ?? '', /requires successful strategy initialization/);
+      assert.equal(alerts.some((alert) => alert.data?.scope === 'pass'), false);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
