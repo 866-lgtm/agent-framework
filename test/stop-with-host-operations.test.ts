@@ -134,8 +134,10 @@ describe('stop() with an operator operation in flight', () => {
     framework.onTrace((event) => { traces.push(event.type); });
     const quiescing = framework.quiesce({ reason: 'surgery', timeoutMs: 600_000 });
     void quiescing.then(() => { settled = true; }, () => { settled = true; });
+    const stopping = framework.stop();
     try {
-      await framework.stop();
+      await until(() => settled || order.includes('modules stopped'), 'stop to interrupt the quiesce or reach teardown', 10_000);
+      await stopping;
       assert.equal(settled, true, 'stop() returned while the quiesce was still waiting');
       const status = await quiescing;
       assert.equal(status.quiesced, true);
@@ -145,6 +147,7 @@ describe('stop() with an operator operation in flight', () => {
     } finally {
       tokens.delete('agent');
       await quiescing.catch(() => {});
+      await stopping;
     }
     assert.equal(await bootsQuiesced(), true, 'the host boots quiesced');
     assert.deepEqual(rejections, []);
