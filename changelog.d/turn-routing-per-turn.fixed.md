@@ -14,13 +14,13 @@
   across turns: every stream queues its deliveries behind the agent's
   earlier ones, a fresh turn's included. A turn's text-only reply can
   therefore wait for an earlier turn's posts, up to their request timeout.
-- A ` !` continuation that an earlier round asked for now starts when a
-  tool ends the turn, once that turn's deliveries have run, in every mode,
-  unless the framework has stopped or the agent has been disposed by then.
-  Before, hybrid and locus mode started it only after the next turn, and
-  explicit mode dropped it, or, when its delivery ran late, started it
-  after the next turn.
-- A turn whose last response is empty writes its receipt, and checks for a
-  continuation, after its last rounds' queued deliveries. Before, those
-  deliveries were never receipted, or were counted in the next turn's
-  receipt.
+- In explicit and hybrid mode, a ` !` continuation that an earlier round
+  asked for now starts when a tool ends the turn, once that turn's
+  deliveries have run, unless the framework has stopped or the agent has
+  been disposed by then. Before, hybrid mode started it only after the
+  next turn, and explicit mode dropped it, or, when its delivery ran late,
+  started it after the next turn.
+- In hybrid and locus mode, a turn whose last response is empty writes its
+  receipt, and checks for a continuation, after its last rounds' queued
+  deliveries. Before, those deliveries were never receipted, or were
+  counted in the next turn's receipt.
