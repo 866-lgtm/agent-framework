@@ -1044,6 +1044,88 @@ function truncateReason(reason: string, max = 160): string {
   return reason.length <= max ? reason : reason.slice(0, max) + '…';
 }
 
+/** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
+const THROWN_TEXT_LIMIT = 500;
+
+/**
+ * What a thrown value says, safely and briefly: an Error's message, or any
+ * other value, as a string. Every inspection and coercion of the value is
+ * inside the try, so reading it can't throw: a revoked Proxy (whose
+ * instanceof throws), a hostile getter, an Error whose message isn't a
+ * string, or a value with no string form reads as text or as unreadable.
+ * The text is bounded, since a provider or handler error can carry a whole
+ * request body.
+ */
+function thrownText(error: unknown): string {
+  let text: string;
+  try {
+    text = String(error instanceof Error ? error.message : error);
+  } catch {
+    text = '(a value that could not be read)';
+  }
+  return text.length <= THROWN_TEXT_LIMIT ? text : `${text.slice(0, THROWN_TEXT_LIMIT)}… (${text.length} characters)`;
+}
+
+/**
+ * A failed handler's reason, never throwing: an Error's message, else "the
+ * handler failed" and what it threw (nothing, for `undefined`). Telling an
+ * Error apart is itself guarded, since instanceof throws on a revoked Proxy.
+ */
+function handlerFailureText(error: unknown): string {
+  let isError = false;
+  try {
+    isError = error instanceof Error;
+  } catch {
+    // Not an Error that can be read; thrownText says so.
+  }
+  if (isError) return thrownText(error);
+  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error)}`;
+}
+
+/** A server's responder, and whether the request it belongs to has been answered yet. */
+type AnswerOnce = {
+  responder: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+  answered: () => boolean;
+};
+
+/**
+ * Wrap a server request's responder so the request is answered at most once,
+ * and a later failure can tell whether the handler already answered.
+ * - An answer counts once the responder returns. One that throws, such as a
+ *   result the transport can't serialize, leaves the request unanswered, so
+ *   the listener's failure answer still goes out. This assumes a responder
+ *   that throws has sent nothing, which holds for the connection's own: they
+ *   serialize before they write, and their transports' writes don't throw
+ *   after writing.
+ * - A second answer is refused and logged: a handler that answered and then
+ *   threw isn't answered again, and a handler that answers after the
+ *   listener answered its failure doesn't send a second response.
+ * - Only the methods the responder has are wrapped, so a handler that checks
+ *   for `respondError` still finds a responder without one.
+ */
+function answerOnce<R extends { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void }>(
+  responder: R | undefined,
+  method: string,
+  serverId: string,
+): AnswerOnce & { responder: R | undefined } {
+  if (!responder) return { responder: undefined, answered: () => false };
+  let done = false;
+  const once = <A extends unknown[]>(kind: string, send: (...args: A) => void) => (...args: A): void => {
+    if (done) {
+      console.error(`[mcpl] ${method} from ${serverId}: a second answer (${kind}) was refused; the request was already answered`);
+      return;
+    }
+    send(...args);
+    done = true;
+  };
+  const wrapped: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } = { ...responder };
+  if (responder.respond) wrapped.respond = once('respond', (result: unknown) => responder.respond!(result));
+  if (responder.respondError) {
+    wrapped.respondError = once('respondError', (code: number, message: string, data?: unknown) => responder.respondError!(code, message, data));
+  }
+  return { responder: wrapped as R, answered: () => done };
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -2514,9 +2596,73 @@ export class AgentFramework {
   }
 
   /**
+   * A server's request or notification the host couldn't handle, answered
+   * with a JSON-RPC error when it is a request (a notification has no one to
+   * answer, and is logged), rather than thrown out of the connection's
+   * listener, where it was an unhandled rejection and the server's request
+   * waited for its timeout.
+   * - `refused`: the listener turned it away before its handler ran; the
+   *   host is stopping, and none of it was taken. Answered -32000, "the host
+   *   is stopping", the code the push coalescer already gives a stopping
+   *   host: the server can send it again to the host's next run.
+   * - `failed`: the handler threw, whatever it threw, `undefined` included.
+   *   While the host stops (its queue closed), that's answered -32000 too,
+   *   with the handler's own message after the stop wording; on a live host
+   *   it's a fault, answered -32603 with the handler's message. The handler
+   *   may have admitted part of the request first (an earlier message of a
+   *   batch), so nothing here claims that none of it was taken.
+   * A request the handler already answered before it threw isn't answered
+   * again: the failure is logged.
+   */
+  private refuseServerItem(
+    method: string,
+    serverId: string,
+    answer: AnswerOnce,
+    outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+  ): void {
+    // Optional chaining: prototype-built harnesses leave the queue unset.
+    const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
+    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error);
+    const reason = outcome.kind === 'refused'
+      ? 'the host is stopping'
+      : stopping
+        ? `the host stopped while handling this request (${what})`
+        : what;
+    if (outcome.kind === 'failed' && answer.answered()) {
+      console.error(`[mcpl] ${method} from ${serverId} failed after it was answered: ${reason}`);
+      return;
+    }
+    console.error(outcome.kind === 'refused'
+      ? `[mcpl] ${method} from ${serverId} refused: ${reason}`
+      : `[mcpl] ${method} from ${serverId} failed: ${reason} (part of it may already have been admitted)`);
+    try {
+      answer.responder?.respondError?.(stopping ? -32000 : -32603, reason);
+    } catch {
+      // The connection is going too; there is no one left to tell.
+    }
+  }
+
+  /**
    * Push a process event to the queue.
+   *
+   * After stop() the queue is closed and this throws, so a direct caller
+   * learns the framework is stopped — except for a tool's result. A call
+   * still running at stop() completes later, into a callback with nothing
+   * to catch the throw (an unhandled rejection), and nothing could take its
+   * result anyway: the queue that would carry it to its stream is closed,
+   * stop() is ending the streams, and the tool has already run. That
+   * result is dropped, and the drop is logged.
    */
   pushEvent(event: ProcessEvent): void {
+    if (event.type === 'tool-result' && this.queue?.isClosed) {
+      // What an operator reconciling a dropped result needs (the resident
+      // may run the tool again): which tool, and whether it succeeded.
+      const outcome = event.result.success && !event.result.isError
+        ? 'succeeded'
+        : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
+      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
+      return;
+    }
     this.queue.push(event);
     this.emitTrace({ type: 'process:received', processEvent: event });
   }
@@ -11656,6 +11802,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'code_execution',
           result,
@@ -12662,7 +12809,7 @@ export class AgentFramework {
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (isPresentationTool(call.name)) {
       const result = this.editToolPresentation(agentName, enrichedCall);
-      this.pushEvent({type:'tool-result',callId:call.id,agentName,moduleName:'tool-presentation',result});
+      this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
       return;
     }
 
@@ -12724,10 +12871,16 @@ export class AgentFramework {
     ) {
       void this.tuneOutCoordinator
         .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
+        // A rejection is answered with a failed result, as a framework tool's
+        // dispatch failure is (dispatchUtilsToolCall), never left unhandled.
+        .catch((err): ToolResult => ({ success: false, error: thrownText(err), isError: true }))
         .then((result) => {
-          this.queue.push({
+          // Through pushEvent, like every other tool's result, so one that
+          // arrives after stop() is dropped rather than rejected unhandled.
+          this.pushEvent({
             type: 'tool-result',
             callId: enrichedCall.id,
+            toolName: enrichedCall.name,
             agentName,
             moduleName: 'tune-out',
             result,
@@ -12798,6 +12951,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: enrichedCall.id,
+        toolName: enrichedCall.name,
         agentName,
         moduleName: 'framework',
         result: { success: true, data: PROSE_ROUTING_HELP },
@@ -12847,6 +13001,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName,
           result,
@@ -12868,6 +13023,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName,
           result: {
@@ -14678,9 +14834,20 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'push/event', connection.id);
+      try {
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
+        // Checked here, after the barrier and before anything records the
+        // push as accepted: a stopped host refuses it.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.pushHandler?.handlePushEvent(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -14690,26 +14857,50 @@ export class AgentFramework {
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
       if (this.pushCoalescer?.isRendering(connection.id)) {
-        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        try {
+          responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        } catch {
+          // The connection is going; there is no one left to tell.
+        }
         return;
       }
       if (this.inferenceRouter && responder) {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
-        await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
-          respond: responder.respond,
-          respondError: responder.respondError,
-          requestId: responder.id,
-        });
+        const answer = answerOnce(responder, 'inference/request', connection.id);
+        try {
+          const barrier = this.discordAwarenessBarrier;
+          if (barrier) await barrier.promise;
+          // A stopping host starts no inference for a server: refused, like a
+          // push, before the router runs.
+          if (this.queue?.isClosed) {
+            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' });
+            return;
+          }
+          await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+            respond: answer.responder!.respond,
+            respondError: answer.responder!.respondError,
+            requestId: responder.id,
+          });
+        } catch (error) {
+          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error });
+        }
       }
     });
 
     // Handle channel registration (Step 7)
     connection.on('channels-register', async (
       params: ChannelsRegisterParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'channels/register', connection.id);
+      try {
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleRegister(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
@@ -14718,9 +14909,18 @@ export class AgentFramework {
     // filtering plus a diagnostic trace.
     connection.on('channels-changed', async (
       params: ChannelsChangedParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'channels/changed', connection.id);
+      try {
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleChanged(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever
@@ -14779,11 +14979,20 @@ export class AgentFramework {
     // Handle incoming channel messages (Step 7)
     connection.on('channels-incoming', async (
       params: ChannelsIncomingParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'channels/incoming', connection.id);
+      try {
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleIncoming(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -14792,14 +15001,20 @@ export class AgentFramework {
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (!responder) return;
+      const answer = answerOnce(responder, 'host/command', connection.id);
       try {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
+        // A stopping host runs no host command: refused like the requests
+        // above, before its handler runs.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
+          return;
+        }
         const result = await this.handleHostCommand(connection.id, params ?? {});
-        responder.respond(result);
+        answer.responder!.respond(result);
       } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        responder.respondError(-32603, err.message);
+        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error });
       }
     });
 
@@ -15177,6 +15392,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
+        toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
         result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
@@ -15191,6 +15407,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
+        toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
         result: {
@@ -15350,6 +15567,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
           result: {
@@ -15369,6 +15587,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
           result: { success: false, error: err.message, isError: true },
@@ -15400,6 +15619,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result: { success: false, error, isError: true },
@@ -15468,6 +15688,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result,
@@ -15480,6 +15701,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result: { success: false, error: err.message, isError: true },
@@ -15501,7 +15723,7 @@ export class AgentFramework {
         module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
     try {
@@ -15671,9 +15893,10 @@ export class AgentFramework {
           }
         : { success: false, error: r.error, isError: false };
     }
-    this.queue.push({
+    this.pushEvent({
       type: 'tool-result',
       callId: call.id,
+      toolName: call.name,
       agentName,
       moduleName: 'tune-out',
       result,
@@ -15687,7 +15910,7 @@ export class AgentFramework {
 
     const finish = (result: ToolResult) => {
       this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
     if (call.name === 'wake') {
@@ -15790,7 +16013,7 @@ export class AgentFramework {
         ...(result.isError ? { error: result.error } : {}),
       });
       this.pushEvent({
-        type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace',
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace',
         result: { ...result, isError: result.isError ?? false },
       });
     })();
@@ -15807,7 +16030,7 @@ export class AgentFramework {
         durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     void (async (): Promise<void> => {
       try {
@@ -15946,7 +16169,7 @@ export class AgentFramework {
         durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     type Candidate =
       | { kind: 'attachment'; data: string | null; mediaType: string; messagesBack: number }
@@ -16350,6 +16573,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'framework',
           result,
@@ -16523,6 +16747,7 @@ export class AgentFramework {
     this.pushEvent({
       type: 'tool-result',
       callId: call.id,
+      toolName: call.name,
       agentName,
       moduleName: 'agent',
       result,
@@ -16563,7 +16788,7 @@ export class AgentFramework {
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
-    this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {
@@ -16577,6 +16802,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'gate',
           result,
@@ -16589,6 +16815,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'gate',
           result: { success: false, error: err.message, isError: true },
