@@ -593,6 +593,121 @@ test("explicit mode: a resumed stream's deliveries queue behind the turn's earli
   }
 });
 
+test("explicit mode: a round's targets are resolved once, when it ends, for its delivery and the resumed stream alike", { timeout: 15000 }, async () => {
+  // From a review's probe. While delivery of 'first' is held, the registry's
+  // #cafe starts naming another channel. The round that wrote '>>#cafe second'
+  // had already ended, so its delivery and the resumed reply both go to the
+  // channel #cafe named then, where the stream sent them.
+  const secondRound = createMockResponse([
+    { type: 'text', text: '>>#cafe second' },
+    { type: 'tool_use', id: 'two', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  secondRound.usage = { inputTokens: 100, outputTokens: 5 };
+  const h = await harness([
+    [
+      createMockResponse([
+        { type: 'text', text: '>>#alpha first\n' },
+        { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+      ] as ContentBlock[], 'tool_use'),
+      secondRound,
+    ],
+    [answer()],
+  ], { proseRouting: 'explicit', maxStreamTokens: 20 });
+  let cafe = 'chan-cafe';
+  const routed: Array<{ text: string; channelId: string }> = [];
+  const streamed: Array<{ channelId: string; delta: string }> = [];
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const open = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request: NormalizedRequest, options?: YieldingStreamOptions) => {
+    const stream = open(request, options);
+    if (h.membrane.requests.length === 2) {
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<unknown> })[Symbol.asyncIterator] = async function* () {
+        const events = { [Symbol.asyncIterator]: iterate } as AsyncIterable<{ type?: string; content?: unknown }>;
+        for await (const event of events) {
+          yield event;
+          if (event.type === 'tokens' && event.content === 'continued') {
+            cafe = 'chan-rebound';
+            releaseFirst();
+          }
+        }
+      };
+    }
+    return stream;
+  };
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
+      : spec === '#cafe' ? { channelId: cafe } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, channelId });
+      if (text.trim() === 'first') await firstHeld;
+      return { delivered: true, channelId };
+    },
+    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId, delta });
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), channelId: r.channelId })), [
+      { text: 'first', channelId: 'chan-alpha' },
+      { text: 'second', channelId: 'chan-cafe' },
+      { text: 'continued', channelId: 'chan-cafe' },
+    ]);
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe']);
+  } finally {
+    releaseFirst();
+    await h.framework.stop();
+  }
+});
+
+test("a fresh turn that delivers nothing still replaces an earlier turn's speech chain for its restart", { timeout: 15000 }, async () => {
+  // An earlier turn's delivery that never settles: a stream resuming this
+  // turn must not queue behind it.
+  const quiet = createMockResponse([
+    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+  ] as ContentBlock[], 'tool_use');
+  quiet.usage = { inputTokens: 100, outputTokens: 5 };
+  const h = await harness([[quiet], [answer()]], { proseRouting: 'explicit', maxStreamTokens: 20 });
+  (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
+    .proseSpeechChains.set('assistant', new Promise<void>(() => {}));
+  const routed: string[] = [];
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
+    routeSpeech: async (_agent: string, text: string, channelId: string) => {
+      routed.push(text);
+      return { delivered: true, channelId };
+    },
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  try {
+    const run = h.run();
+    const timeout = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 3000));
+    assert.notEqual(await Promise.race([run.then(() => 'done' as const), timeout]), 'timeout',
+      'the resumed turn finishes');
+    assert.equal(h.membrane.requests.length, 2);
+  } finally {
+    await h.framework.stop();
+  }
+});
+
+test("a fresh turn clears the turn's destination in every mode", async () => {
+  const h = await harness([[answer()]], { proseRouting: 'hybrid' });
+  const internals = h.framework as unknown as { proseTurnDestinations: Map<string, string | null> };
+  internals.proseTurnDestinations.set('assistant', 'chan-earlier');
+  try {
+    await h.run();
+    assert.equal(internals.proseTurnDestinations.has('assistant'), false);
+  } finally {
+    await h.framework.stop();
+  }
+});
+
 test('backward-compatible direct Agent inference also guards tool results', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];

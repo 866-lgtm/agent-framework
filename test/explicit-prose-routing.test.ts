@@ -457,7 +457,8 @@ describe('explicit prose routing', () => {
     stubRegistry(framework);
     const internals = framework as unknown as {
       deliverProse(agent: unknown, text: string): Promise<void>;
-      roundDestination(current: string | null, segments: string[]): string | null;
+      admitProse(text: string): unknown[];
+      roundDestination(current: string | null, envelopes: unknown[]): string | null;
       proseTargetPins: Map<string, string>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -474,7 +475,8 @@ describe('explicit prose routing', () => {
           internals.proseTargetPins.clear();
           if (start) internals.proseTargetPins.set('assistant', start);
           for (const segment of segments) await internals.deliverProse(agent, segment);
-          assert.equal(internals.roundDestination(start, segments), internals.proseTargetPins.get('assistant') ?? null,
+          const admitted = segments.flatMap((segment) => internals.admitProse(segment));
+          assert.equal(internals.roundDestination(start, admitted), internals.proseTargetPins.get('assistant') ?? null,
             `${JSON.stringify(segments)} from ${start}`);
         }
       }
@@ -501,6 +503,35 @@ describe('explicit prose routing', () => {
         const streamed = [...router.feed(text), ...router.finish()];
         assert.equal(routed.length, 0, `delivery bounces ${JSON.stringify(text)}`);
         assert.deepEqual(streamed, [], `and the stream sends none of ${JSON.stringify(text)}`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('hybrid: a segment that is only `>>>`, or `>>>` and a gap, holds back the next segment, as delivery does', async () => {
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    const gateway = framework as unknown as {
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean): Promise<void>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
+    try {
+      for (const prefix of ['>>>', '>>> ', '>>>\t']) {
+        routed.length = 0;
+        await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true);
+        await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true);
+        await gateway.deliverHybridProse(agent, 'secret', 'chan-locus', true);
+        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
+        const streamed = [
+          ...router.feed('>>>#alpha first'), ...router.endSegment(),
+          ...router.feed(prefix), ...router.endSegment(),
+          ...router.feed('secret'), ...router.finish(),
+        ];
+        assert.deepEqual(routed.map((r) => r.text), ['first'], `delivery sends only first, after ${JSON.stringify(prefix)}`);
+        assert.equal(streamed.filter((d) => d.delta.includes('secret')).length, 0,
+          `and the stream holds secret back after ${JSON.stringify(prefix)}`);
       }
     } finally {
       await framework.stop();

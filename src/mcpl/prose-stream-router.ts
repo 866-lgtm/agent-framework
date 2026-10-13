@@ -96,10 +96,15 @@ export class ProseStreamRouter {
     const out: RoutedDelta[] = [];
     if (this.state === 'indent') this.emit(this.held, out);
     if (this.state === 'maybe-prefix') {
-      const full = this.opts.mode === 'hybrid' ? '>>>' : '>>';
+      // Hybrid's `>>>` with nothing after it is an envelope with no target:
+      // delivery bounces it and holds back what follows. Anything else held
+      // is text to delivery, explicit's bare `>>` included.
       const arrows = this.held.trimStart();
-      if (arrows !== full) this.emit(this.held, out);
+      if (this.opts.mode === 'hybrid' && arrows === '>>>') this.target = null;
+      else this.emit(this.held, out);
     }
+    // Hybrid's `>>>` and a gap with nothing after it: no target either.
+    if (this.state === 'prefix-gap') this.target = null;
     if (this.state === 'prefix-token') this.applyTarget();
     this.held = '';
     this.token = '';

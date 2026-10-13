@@ -30,4 +30,6 @@
   its prose deliveries behind the turn's earlier ones, in every mode, so the
   turn delivers in the order it wrote. Before, a resumed reply could be
   delivered ahead of an earlier round's queued envelope, to the destination
-  that envelope was about to change.
+  that envelope was about to change. In explicit mode, a round's `>>`
+  targets are resolved once, when the round ends, and its queued delivery
+  posts to those channels.

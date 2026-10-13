@@ -506,6 +506,15 @@ function splitExplicitEnvelopes(rawText: string): string[] {
   return envelopes.filter((envelope) => envelope.trim()).map((envelope) => envelope.replace(/^\s+(?=>>)/, ''));
 }
 
+/**
+ * An envelope of explicit prose as its round was admitted: for a `>>` target,
+ * the registry's answer then, which its delivery uses.
+ */
+interface AdmittedEnvelope {
+  text: string;
+  resolved?: { channelId: string } | { error: string; candidates?: string[] };
+}
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -8797,29 +8806,46 @@ export class AgentFramework {
    * or via the turn's sticky target).
    */
   private async deliverProse(agent: Agent, rawText: string, round?: { keepPrivate?: boolean }): Promise<void> {
+    await this.deliverAdmittedProse(agent, this.admitProse(rawText), round);
+  }
+
+  /**
+   * Explicit prose's envelopes, each `>>` target resolved now, once. A live
+   * round is admitted at its boundary: its turn's destination is decided from
+   * these resolutions (roundDestination), and its queued delivery posts to
+   * them, however the registry's names change before it runs.
+   */
+  private admitProse(rawText: string): AdmittedEnvelope[] {
+    return splitExplicitEnvelopes(rawText).map((text) => {
+      const parsed = parseProsePrefix(text);
+      return parsed.kind === 'target'
+        ? { text, resolved: this.channelRegistry!.resolveProseTarget(parsed.target!) }
+        : { text };
+    });
+  }
+
+  private async deliverAdmittedProse(
+    agent: Agent,
+    envelopes: AdmittedEnvelope[],
+    round?: { keepPrivate?: boolean },
+  ): Promise<void> {
     // Multi-envelope: a single prose block may address SEVERAL destinations,
     // each envelope routed independently (sticky/bounce as usual).
-    for (const envelope of splitExplicitEnvelopes(rawText)) {
+    for (const envelope of envelopes) {
       await this.deliverProseEnvelope(agent, envelope, round);
     }
   }
 
   /**
-   * Where a delivered round leaves its turn's sticky destination, decided at
-   * the round boundary, as the explicit gateway sets it once the round's
-   * envelopes run: each `>>` envelope whose target resolves becomes the
-   * destination. One that doesn't resolve bounces and leaves it, as do
-   * `>>skip_reply` and unprefixed text.
+   * Where a delivered round leaves its turn's sticky destination, as the
+   * explicit gateway sets it once the round's envelopes run: each `>>`
+   * envelope whose target resolved becomes the destination. One that didn't
+   * resolve bounces and leaves it, as do `>>skip_reply` and unprefixed text.
    */
-  private roundDestination(current: string | null, segments: string[]): string | null {
+  private roundDestination(current: string | null, envelopes: AdmittedEnvelope[]): string | null {
     let destination = current;
-    for (const segment of segments) {
-      for (const envelope of splitExplicitEnvelopes(segment)) {
-        const parsed = parseProsePrefix(envelope);
-        if (parsed.kind !== 'target') continue;
-        const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
-        if ('channelId' in resolved) destination = resolved.channelId;
-      }
+    for (const envelope of envelopes) {
+      if (envelope.resolved && 'channelId' in envelope.resolved) destination = envelope.resolved.channelId;
     }
     return destination;
   }
@@ -8917,10 +8943,11 @@ export class AgentFramework {
 
   private async deliverProseEnvelope(
     agent: Agent,
-    rawText: string,
+    envelope: AdmittedEnvelope,
     round?: { keepPrivate?: boolean },
   ): Promise<void> {
     const name = agent.name;
+    const rawText = envelope.text;
     const parsed = parseProsePrefix(rawText);
     // A private round (one that called skip_reply) asks for no continuation.
     // Its turn ends at the round's tool results, and explicit mode doesn't
@@ -8952,7 +8979,7 @@ export class AgentFramework {
     let targetChannel: string;
     let body: string;
     if (parsed.kind === 'target') {
-      const res = this.channelRegistry!.resolveProseTarget(parsed.target!);
+      const res = envelope.resolved ?? this.channelRegistry!.resolveProseTarget(parsed.target!);
       if ('error' in res) {
         this.bounceProse(agent, parsed.body, res.error, res.candidates);
         return;
@@ -9345,13 +9372,15 @@ export class AgentFramework {
       this.turnProseDeliveries.delete(agent.name);
       this.turnProseSuppressed.delete(agent.name);
       this.proseHybridSuppressed.delete(agent.name);
-      if (turnProseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
+      // The sticky destination and the turn's destination are turn-scoped in
+      // every mode, so a turn whose mode changes before it resumes can't
+      // start from an earlier turn's.
+      this.proseTargetPins.delete(agent.name);
+      this.proseTurnDestinations.delete(agent.name);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
         // Explicit and disabled prose routing have no inferred locus.
         // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
         // prose target at all. Neither mode freezes or announces a locus.
-        this.proseTargetPins.delete(agent.name);
-        this.proseTurnDestinations.delete(agent.name);
         this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
@@ -9648,6 +9677,9 @@ export class AgentFramework {
     let turnSpeechChain: Promise<void> = resumesTurn
       ? this.proseSpeechChains.get(agent.name) ?? Promise.resolve()
       : Promise.resolve();
+    // Kept at once, so a fresh turn that queues nothing still replaces the
+    // previous turn's chain for a stream that resumes it.
+    this.proseSpeechChains.set(agent.name, turnSpeechChain);
     const chainSpeech = (link: () => Promise<void>, failure: string): void => {
       turnSpeechChain = turnSpeechChain.then(link).catch((err) => console.error(failure, err));
       this.proseSpeechChains.set(agent.name, turnSpeechChain);
@@ -10004,17 +10036,21 @@ export class AgentFramework {
                     // round's tool results.
                     if (!hasSameRoundPrivateThink) {
                       const keepPrivate = roundToolNames.some((n) => bareToolName(n) === 'skip_reply');
+                      // The round is admitted now: its targets are resolved
+                      // once, for the turn's destination and for its queued
+                      // delivery alike.
+                      const admitted = roundSegments.map((seg) => this.admitProse(seg));
                       if (!keepPrivate) {
                         this.proseTurnDestinations.set(
                           agent.name,
-                          this.roundDestination(this.proseTurnDestinations.get(agent.name) ?? null, roundSegments),
+                          this.roundDestination(this.proseTurnDestinations.get(agent.name) ?? null, admitted.flat()),
                         );
                       }
                       console.error(
                         `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                       );
-                      for (const seg of roundSegments) {
-                        chainSpeech(() => this.deliverProse(agent, seg, { keepPrivate }), 'mid-turn prose delivery failed:');
+                      for (const envelopes of admitted) {
+                        chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { keepPrivate }), 'mid-turn prose delivery failed:');
                       }
                     }
                   } else if (turnSilenced) {
