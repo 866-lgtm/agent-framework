@@ -61,7 +61,7 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
-import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown } from './shutdown.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
@@ -1138,9 +1138,8 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
-  /** An operator's operations in flight, which stop() waits for before it
-   *  tears down what they use: quiesce(), resume(), each host/command, a
-   *  store surgery until it releases the store, and an awareness sync. */
+  /** Admitted operator work, including child config materializations.
+   * stop() drains this set before teardown, unless its wait budget expires. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
@@ -2134,8 +2133,9 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. Failed module/MCPL cleanup can be retried with its
-   * original context; storage stays open until that cleanup succeeds.
+   * Stop the event loop. Failed operator/module/MCPL waits can be retried;
+   * storage stays open. A wait timeout permits teardown to continue while
+   * that work may still act on the components being torn down.
    * @param teardownTimeoutMs Optional budget for each wait on cleanup: an
    * operator's operations already running, then modules and MCPL together.
    * Omit to wait until cleanup settles, as required by existing module/child
@@ -2165,13 +2165,43 @@ export class AgentFramework {
     }
   }
 
-  /** Count an operator's operation as in flight until it settles, so that
-   *  stop() can wait for it (see stopOwned). */
-  private trackOperatorOperation<T>(label: string, operation: Promise<T>): Promise<T> {
+  /** Register before invoking the body: its synchronous trace callbacks can
+   * reenter stop(). Invocation stays in this stack, preserving immediate
+   * mode changes; the returned promise carries its result to the caller. */
+  private trackOperatorOperation<T>(label: string, run: () => Promise<T>): Promise<T> {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (error: unknown) => void;
+    const operation = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
     const entry = { label, promise: operation.then(() => {}, () => {}) };
     this.operatorOperations.add(entry);
     void entry.promise.then(() => { this.operatorOperations.delete(entry); });
+    try { resolve(run()); } catch (error) { reject(error); }
     return operation;
+  }
+
+  private refuseOperatorAfterStop(verb: string): void {
+    if (this.queue?.isClosed) throw new Error(verb + ' refused: the framework is stopping');
+  }
+
+  /** Admission is closed, but admitted work can still start child work.
+   * All rounds share the caller's deadline rather than renewing its budget. */
+  private async waitForOperatorOperations(timeoutMs: number | undefined): Promise<void> {
+    const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+    while (this.operatorOperations.size > 0) {
+      const remaining = deadline === undefined ? undefined : Math.ceil(deadline - performance.now());
+      const timedOut = () => new ShutdownTimeoutError(
+        [...this.operatorOperations].map(({ label }) => label), timeoutMs!, [],
+      );
+      if (remaining !== undefined && remaining < 1) throw timedOut();
+      try {
+        await waitForShutdown([...this.operatorOperations], remaining);
+      } catch (error) {
+        // Report the original budget and everything still pending, including
+        // child work added after this round's snapshot.
+        if (error instanceof ShutdownTimeoutError) throw timedOut();
+        throw error;
+      }
+    }
   }
 
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
@@ -2245,16 +2275,15 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
-    // An operator's operation admitted before stop() began (a quiesce
-    // draining, a resume, an undo) finishes before what it uses is torn down:
-    // the event gate, the MCPL connections and the store. Once the queue is
-    // closed, a quiesce stops waiting for its drain and a resume that hasn't
-    // left quiesce refuses; the rest finish their work. One that outlasts the
-    // budget may still write, so the store stays open, as it does for a
-    // module whose teardown timed out.
+    // Admission closed with the queue. Only admitted operations can add
+    // work now (for example a surgery's config materialization), so drain
+    // until the set is empty. This follows stream cancellation and the event
+    // loop, allowing a quiesce or surgery waiting on them to settle.
+    // If the budget expires, teardown proceeds while the operation may still
+    // act on torn-down components. Keep the store open for a later stop().
     let operatorOperationsTimedOut: unknown;
     try {
-      await waitForShutdown([...this.operatorOperations], teardownTimeoutMs);
+      await this.waitForOperatorOperations(teardownTimeoutMs);
     } catch (error) {
       operatorOperationsTimedOut = error;
     }
@@ -3396,12 +3425,13 @@ export class AgentFramework {
    * dedicated cancel kind that settles the turn without feeding the
    * inference-failure accounting.
    */
-  quiesce(opts?: {
+  async quiesce(opts?: {
     reason?: string;
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
-    return this.trackOperatorOperation('host:quiesce', this.runQuiesce(opts));
+    this.refuseOperatorAfterStop('quiesce');
+    return this.trackOperatorOperation('host:quiesce', () => this.runQuiesce(opts));
   }
 
   private async runQuiesce(opts?: {
@@ -3409,8 +3439,6 @@ export class AgentFramework {
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
-    // stop() closes the queue first: a stopping host takes no host command.
-    if (this.queue?.isClosed) throw new Error('quiesce refused: the framework is stopping');
     if (this.quiesced) {
       // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
       // out undrained must be escalatable with a second quiesce({abandon})
@@ -3480,9 +3508,9 @@ export class AgentFramework {
       console.error('[host-mode] quiesce superseded by a concurrent resume during drain');
       return this.getHostModeStatus();
     }
-    // stop() began while we waited. It ends every turn itself, and it waits
-    // for this call before it tears down. The host stays quiesced, so it
-    // boots quiesced.
+    // Stop cuts this drain short, including any requested abandon. It cancels
+    // streams and waits for the event loop; a token with no stream settles
+    // on its own. Return the status as it stands and keep the durable quiesce.
     if (this.queue?.isClosed) {
       console.error('[host-mode] quiesce stopped waiting for its drain: the framework is stopping');
       return this.getHostModeStatus();
@@ -3546,8 +3574,9 @@ export class AgentFramework {
         );
       }
     }
-    // Bounded grace for the cancelled streams' teardown to settle. A stopping
-    // framework ends the turns itself and waits for this call, so stop waiting.
+    // Bounded grace for cancelled streams. Stop cancels streams too; a turn
+    // with no stream settles on its own. Report the abandon that already ran,
+    // even if stop cuts its grace short.
     const grace = Date.now() + 10_000;
     while (this.quiesced && !this.queue?.isClosed && this.activeTurnTokens.size > 0 && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -3565,8 +3594,9 @@ export class AgentFramework {
    * Unavailable previews warn and pass — refusing to resume because the
    * strategy cannot preview would hold hosts hostage to a diagnostic.
    */
-  resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
-    return this.trackOperatorOperation('host:resume', this.runResume(opts));
+  async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
+    this.refuseOperatorAfterStop('resume');
+    return this.trackOperatorOperation('host:resume', () => this.runResume(opts));
   }
 
   private async runResume(opts?: { force?: boolean }): Promise<HostModeStatus> {
@@ -3657,9 +3687,9 @@ export class AgentFramework {
           await barrier.promise;
           this.completeMcplDataPlaneGate(barrier);
         } catch (error) {
-          // The host IS resumed — don't rethrow. failMcplDataPlaneGate
-          // recycles the connections, and their reconnect flows re-run the
-          // funnel with quiesced=false, self-healing the data planes.
+          // The host has resumed. Report the failed barrier without undoing
+          // that commit. The funnel recycles while serving; during stop it
+          // neither recycles on failure nor readies data planes on success.
           await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
         }
       }
@@ -3673,7 +3703,9 @@ export class AgentFramework {
       // mid-quiesce boots quiesced but with these queues empty (sources like
       // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
       // Deferred context WRITES are persisted while quiesced and survive.
-      console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+      console.error(this.queue?.isClosed
+        ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
+        : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
     }
     return this.getHostModeStatus();
   }
@@ -5453,7 +5485,7 @@ export class AgentFramework {
     serverId: string,
     params: HostCommandParams,
   ): ReturnType<AgentFramework['runHostCommand']> {
-    return this.trackOperatorOperation(`host/command:${String(params.command)}`, this.runHostCommand(serverId, params));
+    return this.trackOperatorOperation(`host/command:${String(params.command)}`, () => this.runHostCommand(serverId, params));
   }
 
   /** handleHostCommand's work, run where stop() can wait for it. */
@@ -5754,7 +5786,7 @@ export class AgentFramework {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
 
-    await this.syncDiscordAwarenessMarkers();
+    await this.runDiscordAwarenessSync();
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -6077,6 +6109,7 @@ export class AgentFramework {
     fromBranch?: string;
     toBranch?: string;
   } {
+    this.refuseOperatorAfterStop('undo');
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
@@ -6099,11 +6132,7 @@ export class AgentFramework {
     this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
     this.store.switchBranch(undoBranchName);
 
-    // Materialize config files from the new branch (fire-and-forget; gate picks up via mtime)
-    const wsUndo = this.moduleRegistry.getModule('workspace');
-    if (wsUndo && 'materializeMount' in wsUndo) {
-      (wsUndo as any).materializeMount('_config').catch(() => {});
-    }
+    this.materializeConfigMountAfterBranchSwitch();
 
     // Push onto redo stack
     let redoStack = this.redoStacks.get(agentName);
@@ -6147,6 +6176,7 @@ export class AgentFramework {
     fromBranch?: string;
     toBranch?: string;
   } {
+    this.refuseOperatorAfterStop('redo');
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
@@ -6165,11 +6195,7 @@ export class AgentFramework {
 
     this.store.switchBranch(branchName);
 
-    // Materialize config files from the restored branch (fire-and-forget; gate picks up via mtime)
-    const wsRedo = this.moduleRegistry.getModule('workspace');
-    if (wsRedo && 'materializeMount' in wsRedo) {
-      (wsRedo as any).materializeMount('_config').catch(() => {});
-    }
+    this.materializeConfigMountAfterBranchSwitch();
 
     // Restore the checkpoint
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -6294,7 +6320,7 @@ export class AgentFramework {
     // stop() waits for the release (see stopOwned): a surgery admitted before
     // stop() began finishes, flush included, before the store closes.
     let settle!: () => void;
-    void this.trackOperatorOperation(`surgery:${verb}`, new Promise<void>((resolve) => { settle = resolve; }));
+    void this.trackOperatorOperation(`surgery:${verb}`, () => new Promise<void>((resolve) => { settle = resolve; }));
     let released = false;
     return () => {
       if (released) return;
@@ -6379,6 +6405,7 @@ export class AgentFramework {
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
+    this.refuseOperatorAfterStop('roll back');
     const logBase: OperatorLogInput = {
       kind: 'rollback',
       agent: agentName,
@@ -6448,7 +6475,7 @@ export class AgentFramework {
           );
         }
         if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-        await this.syncDiscordAwarenessMarkers();
+        await this.runDiscordAwarenessSync();
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6514,6 +6541,7 @@ export class AgentFramework {
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
+    this.refuseOperatorAfterStop('suppress');
     const requestedIds = [...new Set(opts.messageIds.map(String))];
     const logBase: OperatorLogInput = {
       kind: 'suppress',
@@ -6620,7 +6648,7 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        await this.syncDiscordAwarenessMarkers();
+        await this.runDiscordAwarenessSync();
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6657,14 +6685,14 @@ export class AgentFramework {
     }
   }
 
-  /** Re-materialize config files from the (new) active branch — fire and
-   *  forget; the gate picks changes up via mtime. Mirrors undoLastTurn. */
+  /** Start config file IO without holding the caller or a surgery's store
+   * reservation. The gate picks it up by mtime; stop() still waits for it. */
   private materializeConfigMountAfterBranchSwitch(): void {
     const ws = this.moduleRegistry.getModule('workspace');
     if (ws && 'materializeMount' in ws) {
-      (ws as { materializeMount: (m: string) => Promise<void> })
-        .materializeMount('_config')
-        .catch(() => {});
+      void this.trackOperatorOperation('config:materialize',
+        () => (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config'),
+      ).catch(() => {});
     }
   }
 
@@ -13960,8 +13988,9 @@ export class AgentFramework {
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
-  syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
-    return this.trackOperatorOperation('awareness:sync', this.runDiscordAwarenessSync(onlyServerId));
+  async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+    this.refuseOperatorAfterStop('awareness sync');
+    return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
   }
 
   private async runDiscordAwarenessSync(_onlyServerId?: string): Promise<void> {
@@ -14264,6 +14293,9 @@ export class AgentFramework {
       // check sits AFTER this guard: readyControlPlane can also synchronously
       // flush a control event that installs a newer barrier.)
       if (this.discordAwarenessBarrier !== null) return false;
+      // This generation is retired above, but a stopping host reopens no
+      // data plane. Recheck for each connection: a ready() can reenter stop().
+      if (this.queue?.isClosed) return true;
       // Host quiesce (issue #122): this is the single point every barrier
       // completion and reconnect flow funnels through, so holding here keeps
       // data planes paused across awareness drains and reconnects for the
@@ -14713,6 +14745,13 @@ export class AgentFramework {
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    this.refuseOperatorAfterStop('connect MCPL server');
+    return this.trackOperatorOperation('mcpl:connect', () => this.runConnectMcplServer(config));
+  }
+
+  private async runConnectMcplServer(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
     // Lazily bring up the MCPL subsystem — a framework that started with zero
     // configured servers can still deploy its first one at runtime.
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
@@ -14748,6 +14787,11 @@ export class AgentFramework {
    * No-op-ish if the server is not connected (still clears routing state).
    */
   async disconnectMcplServer(id: string): Promise<void> {
+    this.refuseOperatorAfterStop('disconnect MCPL server');
+    return this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(id));
+  }
+
+  private async runDisconnectMcplServer(id: string): Promise<void> {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
@@ -14782,12 +14826,20 @@ export class AgentFramework {
     id: string,
     newConfig?: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    this.refuseOperatorAfterStop('restart MCPL server');
+    return this.trackOperatorOperation('mcpl:restart', () => this.runRestartMcplServer(id, newConfig));
+  }
+
+  private async runRestartMcplServer(
+    id: string,
+    newConfig?: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
     const config = newConfig ?? this.mcplServerConfigs.get(id);
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
-    await this.disconnectMcplServer(id);
-    await this.connectMcplServer(config);
+    await this.runDisconnectMcplServer(id);
+    await this.runConnectMcplServer(config);
   }
 
   /**

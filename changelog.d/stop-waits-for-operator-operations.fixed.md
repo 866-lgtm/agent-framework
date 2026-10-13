@@ -1,24 +1,7 @@
-- **`stop()` waits for an operator's operation that is already running before
-  it tears down what that operation uses.** A quiesce, a resume, a
-  `host/command`, a store surgery (`rollbackToMessage`, `suppressMessages`)
-  or an awareness sync (`syncDiscordAwarenessMarkers`) admitted before
-  `stop()` began now finishes before the event gate, the modules, the MCPL
-  connections and the store go. Before, such an operation kept running
-  through the teardown: a resume could clear the durable quiesce mark and
-  reopen the data planes after the final sync, a surgery could find its
-  store closed partway, and a `host/command` answer could miss its
-  connection.
-  - A quiesce stops waiting for its drain, or for an abandoned turn's grace,
-    once `stop()` begins. `stop()` ends the turns itself. The host stays
-    quiesced, so it boots quiesced.
-  - A resume that hasn't left quiesce when `stop()` begins is refused with
-    an error, and the host stays quiesced. One that has left it finishes,
-    its durable clear included, before the final sync.
-  - `quiesce()` and `resume()` called once `stop()` has begun are refused
-    with an error, as a `host/command` already was.
-  - A failed awareness drain no longer recycles the MCPL connections of a
-    host that is stopping, since `stop()` is closing them.
-  - **For operators:** `stop(teardownTimeoutMs)` bounds this wait too. An
-    operation that outlasts it fails `stop()` with a `ShutdownTimeoutError`
-    that names it, and the store stays open, as for a module whose teardown
-    timed out, so `stop()` can be called again.
+- **`stop()` waits for admitted operator work before teardown, subject to its optional wait budget.** Quiesce, resume, each `host/command`, store surgeries, awareness syncs, MCPL connect/disconnect/restart calls, and config materializations are tracked. When the wait completes, their work finishes before the event gate, modules, MCPL connections, final sync, and store close. Previously, an operation could keep writing or open a connection after teardown.
+  - A quiesce stops waiting for its drain or abandon grace when stop begins. Stop cancels streams and waits for the event loop; a turn with a token but no stream settles on its own. The host stays durably quiesced. A drain cut short returns its current status (possibly `drained: false`), logs the stopping message, and omits the `host:quiesce` trace. If abandon was requested but had not begun, stream cancellation is left to stop. An abandon whose grace is cut short still reports the abandon through its usual trace and log.
+  - A resume refuses at entry once the queue is closed, even on an unquiesced host. An admitted resume checks again after its maintenance and preview waits, before leaving quiesce. A resume past that commit completes its flush and durable clear. Its log names parked wakes that will not run during stop.
+  - The public quiesce, resume, rollback, suppression, undo, redo, awareness-sync, and MCPL lifecycle entry points refuse after queue closure, before reads or mutations, with `<verb> refused: the framework is stopping`. Already-admitted operations use private continuations for their remaining work. Registration precedes the body's synchronous callbacks, so a trace listener can reenter stop without escaping its wait.
+  - Undo, redo, rollback, and suppression still start config materialization without awaiting file IO. Stop waits for that work too, including a materialization started by a surgery while stop is already waiting. One deadline covers every round of that operator wait.
+  - The MCPL barrier funnel applies the stop boundary to every completion path. A failed barrier recycles no connection during stop. A successful barrier is retired but readies no data plane.
+  - **For operators:** an admitted awareness drain finishes its deliveries, each within its own deadline. `stop(teardownTimeoutMs)` also bounds the operator wait. On timeout, teardown proceeds while the operation may still act on torn-down components; the store stays open for another stop attempt. The timeout is a `ShutdownTimeoutError` naming pending work, either alone or inside an `AggregateError` if other cleanup failed. A retry while the work remains pending can time out again; a retry after it settles can close the store.

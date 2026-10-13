@@ -4,20 +4,20 @@
  * stop() refuses a host/command that arrives once it has begun. These tests
  * cover the operations admitted before that: a quiesce draining, a resume, a
  * host/command, a store surgery and an awareness sync, whether they came over
- * MCPL or from a direct call. stop() waits for each before it tears down what
- * it uses: the event gate, the modules, the MCPL connections and the store.
- * A quiesce stops waiting for its drain, and a resume that hasn't committed
- * refuses, so the wait stays short and the host boots in the mode it had.
+ * MCPL or from a direct call. A completed wait precedes the event gate,
+ * modules, MCPL connections and store teardown; an explicit budget can cut
+ * the wait short and leave the store open. Quiesce releases its drain, and
+ * a resume that has not committed preserves the durable quiesce.
  *
  * Where a test holds an operation open, it lets it go once stop() reaches its
- * modules' teardown, or after a short while if stop() is waiting short of it.
+ * modules' teardown or reads a nonempty operations set to wait for them.
  * The order of the two events is the verdict, so it doesn't depend on timing.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
@@ -51,6 +51,10 @@ interface Internals {
   mcplServerRegistry: unknown;
   beginDiscordAwarenessBarrier: () => { requiresBarrier: boolean; promise: Promise<unknown> };
   wireMcplEvents(connection: unknown): void;
+  operatorOperations: Set<{ label: string; promise: Promise<void> }>;
+  moduleRegistry: { getModule(name: string): unknown };
+  saveTurnCheckpoints(name: string, checkpoints: unknown[]): void;
+  discordAwarenessBarrier: unknown;
 }
 const internals = (framework: AgentFramework): Internals => framework as unknown as Internals;
 
@@ -60,6 +64,7 @@ describe('stop() with an operator operation in flight', () => {
   let logged: string[];
   let rejections: unknown[];
   let order: string[];
+  let waitReads: number;
   const onRejection = (reason: unknown): void => { rejections.push(reason); };
   const consoleError = console.error;
   const consoleWarn = console.warn;
@@ -70,6 +75,7 @@ describe('stop() with an operator operation in flight', () => {
     logged = [];
     rejections = [];
     order = [];
+    waitReads = 0;
     process.on('unhandledRejection', onRejection);
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     console.warn = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -82,22 +88,29 @@ describe('stop() with an operator operation in flight', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function create(): Promise<AgentFramework> {
-    return AgentFramework.create({
+  async function create(): Promise<AgentFramework> {
+    const framework = await AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
       modules: [new TeardownProbe(order)],
     });
+    internals(framework).operatorOperations = new class extends Set<{ label: string; promise: Promise<void> }> {
+      override [Symbol.iterator](): SetIterator<{ label: string; promise: Promise<void> }> {
+        if (this.size > 0) waitReads++;
+        return super[Symbol.iterator]();
+      }
+    }();
+    return framework;
   }
 
-  /** Let the held operation go once stop() reaches its modules, or after 300 ms if it waits short of them. */
+  /** A positive observation releases the hold. Main reaches module teardown
+   * without reading the set, making the wrong order observable too. */
   async function releaseWhenStopWaits(release: () => void): Promise<void> {
-    const deadline = Date.now() + 300;
-    while (!order.includes('modules stopped') && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-    release();
+    try {
+      await until(() => waitReads > 0 || order.includes('modules stopped'),
+        'stop to read pending operations or stop its modules', 30_000);
+    } finally { release(); }
   }
 
   async function bootsQuiesced(): Promise<boolean> {
@@ -113,10 +126,12 @@ describe('stop() with an operator operation in flight', () => {
     const framework = await create();
     framework.start();
     // A turn between dequeue and stream registration holds its token with no
-    // stream to cancel, so nothing but stop() can end this drain.
+    // stream to cancel. Stop cuts the drain short; the token remains alive.
     const tokens = internals(framework).activeTurnTokens;
     tokens.set('agent', -1);
     let settled = false;
+    const traces: string[] = [];
+    framework.onTrace((event) => { traces.push(event.type); });
     const quiescing = framework.quiesce({ reason: 'surgery', timeoutMs: 600_000 });
     void quiescing.then(() => { settled = true; }, () => { settled = true; });
     try {
@@ -125,6 +140,7 @@ describe('stop() with an operator operation in flight', () => {
       const status = await quiescing;
       assert.equal(status.quiesced, true);
       assert.equal(status.drained, false);
+      assert.ok(!traces.includes('host:quiesce'), 'an interrupted drain reports no completed quiesce');
       assert.ok(logged.some((line) => line.includes('quiesce stopped waiting for its drain: the framework is stopping')), logged.join('\n'));
     } finally {
       tokens.delete('agent');
@@ -150,7 +166,8 @@ describe('stop() with an operator operation in flight', () => {
       await framework.stop();
       const took = Date.now() - began;
       assert.equal(settled, true, 'stop() returned while the abandon was still waiting');
-      assert.ok(took < 5_000, `stop() took ${took} ms, waiting out the abandon's ten seconds`);
+      // Only waiting out the ten-second grace should consume this bound.
+      assert.ok(took < 8_000, `stop() took ${took} ms, waiting out the abandon's ten seconds`);
       assert.deepEqual((await quiescing).unabandonable, ['agent']);
     } finally {
       tokens.delete('agent');
@@ -187,7 +204,7 @@ describe('stop() with an operator operation in flight', () => {
     const framework = await create();
     await framework.quiesce();
     await framework.stop();
-    await assert.rejects(framework.resume(), /^Error: resume refused: the framework is stopping, so the host stays quiesced$/);
+    await assert.rejects(framework.resume(), /^Error: resume refused: the framework is stopping$/);
     assert.equal(await bootsQuiesced(), true, 'the host boots quiesced');
   });
 
@@ -265,10 +282,12 @@ describe('stop() with an operator operation in flight', () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let syncing = false;
-    framework.syncDiscordAwarenessMarkers = async () => {
+    internals(framework).beginDiscordAwarenessBarrier = () => {
       syncing = true;
-      await held;
-      order.push('markers synced');
+      return { requiresBarrier: true, promise: held.then(() => {
+        order.push('markers synced');
+        return { status: 'delivered', delivered: 0, failed: 0 };
+      }) };
     };
     const rolling = framework.rollbackToMessage('agent', { messageId: ids[0]! });
     await until(() => syncing, 'the rollback to reach its marker sync');
@@ -317,10 +336,332 @@ describe('stop() with an operator operation in flight', () => {
         && /^Shutdown timed out after 100 ms; pending: awareness:sync$/.test(error.message),
     );
     assert.equal(framework.getStore().isClosed(), false, 'the operation may still write');
+    assert.ok(order.includes('modules stopped'), 'timeout still proceeds with teardown');
+    await assert.rejects(framework.stop(100), (error: unknown) =>
+      error instanceof ShutdownTimeoutError && error.pending.includes('awareness:sync'));
+    assert.equal(framework.getStore().isClosed(), false, 'a still-running retry keeps the store open too');
     deliver!();
     await syncing;
     await framework.stop();
     assert.equal(framework.getStore().isClosed(), true);
     assert.deepEqual(rejections, []);
   });
+  const lateCalls: Array<[string, (framework: AgentFramework) => unknown]> = [
+    ['quiesce', (f) => f.quiesce()],
+    ['resume', (f) => f.resume()],
+    ['roll back', (f) => f.rollbackToMessage('agent', { messageId: 'invalid' })],
+    ['suppress', (f) => f.suppressMessages('agent', { messageIds: ['invalid'] })],
+    ['undo', (f) => f.undoLastTurn('agent')],
+    ['redo', (f) => f.redo('agent')],
+    ['awareness sync', (f) => f.syncDiscordAwarenessMarkers()],
+    ['connect MCPL server', (f) => f.connectMcplServer({ id: 'late', command: 'unused' })],
+    ['disconnect MCPL server', (f) => f.disconnectMcplServer('late')],
+    ['restart MCPL server', (f) => f.restartMcplServer('late')],
+  ];
+  for (const [verb, call] of lateCalls) {
+    it('round: ' + verb + ' refuses during teardown and after stop, without writes or operator logs', async () => {
+      const framework = await create();
+      let backendCalls = 0;
+      Object.assign(internals(framework), {
+        mcplHostCapabilities: {},
+        mcplServerRegistry: {
+          getAllServers: () => [], closeAll: async () => {},
+          removeServer: async () => { backendCalls++; },
+        },
+        connectMcplServerInternal: async () => { backendCalls++; },
+        refreshMcplTools: async () => { backendCalls++; },
+        emitMcplToolDiff: () => { backendCalls++; },
+      });
+      let finishModules!: () => void;
+      const hold = new Promise<void>((resolve) => { finishModules = resolve; });
+      framework.getModule('teardown-probe')!.stop = async () => {
+        order.push('modules stopped');
+        await hold;
+      };
+      const stopping = framework.stop();
+      await until(() => order.includes('modules stopped'), 'module teardown');
+      const sequence = framework.getStore().currentSequence();
+      const branch = framework.getStore().currentBranch().name;
+      const logPath = framework.getOperatorLogPath()!;
+      const log = () => existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
+      const beforeLog = log();
+      const refused = async () => assert.rejects(
+        Promise.resolve().then(() => call(framework)),
+        (error: unknown) => error instanceof Error && error.message === verb + ' refused: the framework is stopping',
+      );
+      try {
+        await refused();
+        assert.equal(framework.getStore().currentSequence(), sequence);
+        assert.equal(framework.getStore().currentBranch().name, branch);
+        assert.equal(log(), beforeLog);
+        assert.equal(backendCalls, 0);
+      } finally { finishModules(); await stopping; }
+      await refused();
+      assert.equal(log(), beforeLog);
+    });
+  }
+
+  it('round: resume admitted after closure refuses before a held maintenance pass ends', async () => {
+    const framework = await create();
+    await framework.quiesce();
+    let endPass!: () => void;
+    internals(framework).maintenancePass = new Promise<void>((resolve) => { endPass = resolve; });
+    const stopping = framework.stop();
+    let settled = false;
+    const resuming = framework.resume().finally(() => { settled = true; });
+    void resuming.catch(() => {});
+    try {
+      // Admission is synchronous; promise settlement needs only its microtasks.
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(settled, true, 'refusal must not wait for maintenance');
+      await assert.rejects(resuming, /resume refused: the framework is stopping/);
+    } finally { endPass(); await stopping; await resuming.catch(() => {}); }
+  });
+
+  it('round: resume rechecks closure after preview retries', async () => {
+    const framework = await create();
+    await framework.quiesce();
+    let previewed = false;
+    framework.previewAgentRuntimeSettings = (() => {
+      previewed = true;
+      return { available: false, reason: 'preview_in_flight', path: 'none', liveBudgetTokens: 0, transition: 'stable' };
+    }) as typeof framework.previewAgentRuntimeSettings;
+    const resuming = framework.resume();
+    void resuming.catch(() => {});
+    assert.equal(previewed, true);
+    const stopping = framework.stop();
+    await assert.rejects(resuming, /resume refused: the framework is stopping/);
+    await stopping;
+    assert.equal(await bootsQuiesced(), true);
+  });
+
+  it('round: a successful resume barrier across stop retires without readying a data plane', async () => {
+    const framework = await create();
+    let ready = 0;
+    const connection = {
+      id: 'srv', pauseDataPlane() {}, readyControlPlane() {},
+      ready() { ready++; },
+    };
+    const fw = internals(framework);
+    fw.mcplServerRegistry = { getAllServers: () => [connection], closeAll: async () => {} };
+    await framework.quiesce();
+    let deliver!: () => void;
+    fw.beginDiscordAwarenessBarrier = () => ({
+      requiresBarrier: true,
+      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 0, failed: 0 }); }),
+    });
+    const resuming = framework.resume();
+    await until(() => deliver !== undefined, 'resume barrier');
+    const stopping = framework.stop();
+    await releaseWhenStopWaits(deliver);
+    await resuming;
+    await stopping;
+    assert.equal(ready, 0);
+    assert.equal(fw.discordAwarenessBarrier, null);
+    assert.ok(logged.some((line) => line.includes("parked wake(s) won't run") && line.includes('stopping')));
+    assert.equal(await bootsQuiesced(), false);
+  });
+
+  for (const action of ['connect', 'disconnect', 'restart'] as const) {
+    it('round: an admitted MCPL ' + action + ' settles before connection teardown', async () => {
+      const framework = await create();
+      const fw = framework as unknown as Internals & {
+        mcplHostCapabilities: object;
+        mcplServerConfigs: Map<string, { id: string; command: string }>;
+        connectMcplServerInternal(config: unknown): Promise<void>;
+        refreshMcplTools(): Promise<void>;
+        emitMcplToolDiff(...args: unknown[]): void;
+      };
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let entered = false;
+      let connected = action !== 'connect';
+      fw.mcplHostCapabilities = {};
+      fw.mcplServerConfigs.set('srv', { id: 'srv', command: 'unused' });
+      fw.connectMcplServerInternal = async () => {
+        entered = true;
+        await held;
+        connected = true;
+        order.push('connection opened');
+      };
+      fw.refreshMcplTools = async () => {};
+      fw.emitMcplToolDiff = () => {};
+      fw.mcplServerRegistry = {
+        getAllServers: () => [],
+        removeServer: async () => {
+          entered = true;
+          await held;
+          connected = false;
+          order.push('connection removed');
+        },
+        closeAll: async () => { connected = false; order.push('connections closed'); },
+      };
+      const running = action === 'connect' ? framework.connectMcplServer({ id: 'srv', command: 'unused' })
+        : action === 'disconnect' ? framework.disconnectMcplServer('srv') : framework.restartMcplServer('srv');
+      void running.catch(() => {});
+      await until(() => entered, 'MCPL operation');
+      const stopping = framework.stop();
+      await releaseWhenStopWaits(release);
+      await running;
+      await stopping;
+      assert.equal(connected, false);
+      assert.ok(order.indexOf(action === 'disconnect' ? 'connection removed' : 'connection opened') < order.indexOf('modules stopped'), order.join(', '));
+    });
+  }
+
+  for (const action of ['undo', 'redo', 'rollback', 'suppress'] as const) {
+    it('round: ' + action + ' config materialization stays fire-and-forget but finishes before teardown', async () => {
+      const framework = await create();
+      const fw = internals(framework);
+      const cm = framework.getAgent('agent')!.getContextManager();
+      const sequenceBefore = framework.getStore().currentSequence();
+      const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: 'm' + n }]));
+      fw.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
+      if (action === 'redo') framework.undoLastTurn('agent');
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let materializing = false;
+      const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+      fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+        materializeMount: async () => { materializing = true; await held; order.push('config materialized'); },
+      } : getModule(name);
+      if (action === 'undo') framework.undoLastTurn('agent');
+      else if (action === 'redo') framework.redo('agent');
+      else if (action === 'rollback') await framework.rollbackToMessage('agent', { messageId: ids[0]! });
+      else await framework.suppressMessages('agent', { messageIds: [ids[1]!] });
+      assert.equal(materializing, true, 'the caller returned before file IO settled');
+      const stopping = framework.stop();
+      await releaseWhenStopWaits(release);
+      await stopping;
+      assert.ok(order.indexOf('config materialized') < order.indexOf('modules stopped'), order.join(', '));
+    });
+  }
+
+  for (const action of ['rollback', 'suppress'] as const) it('round: stop also waits for materialization an admitted ' + action + ' starts after its first snapshot', async () => {
+    const framework = await create();
+    const fw = internals(framework);
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: 'm' + n }]));
+    let finishSwitch!: () => void;
+    const switchHold = new Promise<void>((resolve) => { finishSwitch = resolve; });
+    if (action === 'rollback') {
+      const switchBranch = cm.switchBranch.bind(cm);
+      cm.switchBranch = async (...args: Parameters<typeof cm.switchBranch>) => { await switchHold; return switchBranch(...args); };
+    } else {
+      const fork = cm.fork.bind(cm);
+      cm.fork = async (...args: Parameters<typeof cm.fork>) => { await switchHold; return fork(...args); };
+    }
+    let finishMaterialize!: () => void;
+    const materializeHold = new Promise<void>((resolve) => { finishMaterialize = resolve; });
+    let materializing = false;
+    const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+      materializeMount: async () => { materializing = true; await materializeHold; order.push('config materialized'); },
+    } : getModule(name);
+    const rolling = action === 'rollback'
+      ? framework.rollbackToMessage('agent', { messageId: ids[0]! })
+      : framework.suppressMessages('agent', { messageIds: [ids[1]!] });
+    void rolling.catch(() => {});
+    const stopping = framework.stop();
+    await releaseWhenStopWaits(finishSwitch);
+    try {
+      await rolling;
+      assert.equal(materializing, true);
+      await until(() => waitReads >= 2 || order.includes('modules stopped'), 'stop to discover child work', 30_000);
+      assert.equal(order.includes('modules stopped'), false, 'the original snapshot is not the whole wait');
+    } finally { finishMaterialize(); await stopping; }
+    assert.ok(order.indexOf('config materialized') < order.indexOf('modules stopped'));
+  });
+
+  it('round: a synchronous host trace can begin stop without losing the operation that emitted it', async () => {
+    const framework = await create();
+    const fw = internals(framework);
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const sequenceBefore = framework.getStore().currentSequence();
+    cm.addMessage('user', [{ type: 'text', text: 'a turn' }]);
+    fw.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
+    let deliver!: () => void;
+    fw.beginDiscordAwarenessBarrier = () => ({
+      requiresBarrier: true,
+      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 0, failed: 0 }); }),
+    });
+    let stopping: Promise<void> | undefined;
+    framework.onTrace((event) => {
+      if (event.type === 'undo:completed') stopping = framework.stop();
+    });
+    const connection = Object.assign(new EventEmitter(), { id: 'srv' });
+    fw.wireMcplEvents(connection);
+    connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 1 }, {
+      id: 9,
+      respond: () => { order.push('undo answered'); },
+      respondError: () => { order.push('undo failed'); },
+    });
+    await until(() => stopping !== undefined && (deliver !== undefined || order.includes('undo failed')), 'reentrant stop and awareness sync');
+    assert.ok(deliver, 'the admitted undo must finish its awareness sync');
+    await releaseWhenStopWaits(deliver);
+    await stopping;
+    await until(() => order.includes('undo answered') || order.includes('undo failed'), 'undo answer');
+    assert.ok(order.indexOf('undo answered') >= 0 && order.indexOf('undo answered') < order.indexOf('modules stopped'), order.join(', '));
+    assert.deepEqual(rejections, []);
+  });
+
+  for (const elapsed of [6_000, 9_999, 11_000]) it('round: child work shares the operator deadline after ' + elapsed + ' ms of clock input', async () => {
+    const framework = await create();
+    const fw = internals(framework);
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: 'm' + n }]));
+    let finishSwitch!: () => void;
+    const switchHold = new Promise<void>((resolve) => { finishSwitch = resolve; });
+    const switchBranch = cm.switchBranch.bind(cm);
+    cm.switchBranch = async (...args: Parameters<typeof cm.switchBranch>) => { await switchHold; return switchBranch(...args); };
+    let finishMaterialize!: () => void;
+    const materializeHold = new Promise<void>((resolve) => { finishMaterialize = resolve; });
+    const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
+    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
+      materializeMount: async () => { await materializeHold; order.push('config materialized'); },
+    } : getModule(name);
+    const rolling = framework.rollbackToMessage('agent', { messageId: ids[0]! });
+    void rolling.catch(() => {});
+    const nowProperty = Object.getOwnPropertyDescriptor(performance, 'now');
+    const timer = globalThis.setTimeout;
+    const budgets: number[] = [];
+    let now = 0;
+    let stopping: Promise<void> | undefined;
+    try {
+      Object.defineProperty(performance, 'now', { configurable: true, value: () => now });
+      globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+        if (args[1] !== undefined && args[1] > 100) budgets.push(args[1]);
+        return timer(...args);
+      }) as typeof setTimeout;
+      stopping = framework.stop(10_000);
+      void stopping.catch(() => {});
+      await releaseWhenStopWaits(() => { now = elapsed; finishSwitch(); });
+      await rolling;
+      await until(() => waitReads >= 2 || order.includes('modules stopped'), 'the second operator wait');
+      // Clock input controls the remaining budget. In the timeout cases,
+      // work stays held until the assertion, so elapsed wall time is no verdict.
+      if (elapsed === 6_000) {
+        assert.deepEqual(budgets.slice(0, 2), [10_000, 4_000]);
+        finishMaterialize();
+        await stopping;
+      }
+      else {
+        await assert.rejects(stopping, (error: unknown) =>
+          error instanceof ShutdownTimeoutError && error.pending.includes('config:materialize')
+            && error.message.startsWith('Shutdown timed out after 10000 ms;'));
+        assert.equal(framework.getStore().isClosed(), false);
+      }
+    } finally {
+      finishSwitch();
+      finishMaterialize();
+      globalThis.setTimeout = timer;
+      if (nowProperty) Object.defineProperty(performance, 'now', nowProperty);
+      else Reflect.deleteProperty(performance, 'now');
+      await rolling.catch(() => {});
+      await stopping?.catch(() => {});
+      await framework.stop();
+    }
+  });
+
 });
