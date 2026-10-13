@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MembraneError } from '@animalabs/membrane';
 
 /** Reach the private per-turn routing state (its triggering channel) + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
@@ -362,7 +363,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it("the channel registry resolves and reports the current turn's trigger channel", async () => {
+  it("the channel registry resolves and reports the current turn's trigger channel, then its locus", async () => {
     const framework = await makeFramework();
     const i = framework as unknown as {
       initializeMcpl(servers: unknown[]): Promise<void>;
@@ -370,7 +371,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
         resolveLocus(agentName: string): string | null;
         buildChannelContext(agentName?: string): { defaultOutgoing?: { channelId: string } } | undefined;
       };
-      turnRouting: Map<string, { triggerChannel?: string }>;
+      turnRouting: Map<string, { triggerChannel?: string; locus?: string }>;
     };
     // The real registry, with no servers: its resolver reads the framework's turn state.
     await i.initializeMcpl([]);
@@ -379,6 +380,63 @@ describe('Trunk channel routing (item-3 redux)', () => {
       'the locus a turn freezes comes from its trigger channel');
     assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:guild:chanA',
       'and the agent is told the same channel');
+    // A re-pin moved the turn's locus: a later start of the turn tells the
+    // agent where its speech now lands.
+    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:chanA', locus: 'discord:dm:42' });
+    assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:dm:42');
+    await framework.stop();
+  });
+
+  it("the compile a capacity hold defers a turn to keeps the turn's trigger channel", async () => {
+    // The first stream ends with an organization acceleration 429, which
+    // holds the turn; a message from another channel arrives during the hold.
+    membrane.pushResponse(createMockResponse([] as never[]));
+    const framework = await makeFramework();
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const n = ++streams;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && n === 1) {
+            yield {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'rate_limit', retryable: true, httpStatus: 429,
+                message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+                rawError: { status: 429 }, rawRequest: request,
+              }),
+            };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    const held = framework as unknown as {
+      providerAccelerationCooldowns: Map<string, unknown>;
+      releaseProviderAccelerationCooldown(agentName: string): void;
+    };
+    const triggerAtStart: Array<string | undefined> = [];
+    framework.onTrace((event) => {
+      if (event.type !== 'inference:started') return;
+      triggerAtStart.push(internals(framework).turnRouting.get('scout')?.triggerChannel);
+      if (triggerAtStart.length === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
+    });
+
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: what time is it'));
+    await framework.runUntilIdle();
+    assert.ok(held.providerAccelerationCooldowns.has('scout'), 'the turn is held');
+    framework.pushEvent(channelIncoming('discord:guild:chanB', 'B: unrelated chatter'));
+    await framework.runUntilIdle();
+    held.releaseProviderAccelerationCooldown('scout');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(triggerAtStart, ['discord:guild:chanA', 'discord:guild:chanA'],
+      "the deferred compile's batch names chanB, and the turn keeps chanA");
     await framework.stop();
   });
 

@@ -24,10 +24,11 @@ At logical turn end, a `[delivered]` receipt names canonical destinations (or a
 bounce explains failure), so authored intent cannot impersonate delivery.
 Unprefixed prose after a successful envelope follows that explicit destination
 for the remainder of the turn; a fresh turn begins at its ordinary locus.
-After `>>>skip_reply`, or an envelope that publishes nowhere, unprefixed prose
-is held back until a later `>>>` names a destination. Both hold for the whole
-logical turn, across its later streams, such as a framework retry's, a budget
-restart's or the compile a provider-capacity hold defers the turn to.
+After `>>>skip_reply`, or a `>>>` envelope that is malformed, doesn't resolve
+or isn't delivered, unprefixed prose isn't published until a later `>>>` names
+a destination that resolves. The sticky destination and this hold last for
+the whole logical turn, across its later streams, such as a framework retry's,
+a budget restart's or the compile a provider-capacity hold defers the turn to.
 
 This is publication routing only. It creates no privacy meaning for `<think>`
 or other prose tags, and grants no channel authority beyond the existing

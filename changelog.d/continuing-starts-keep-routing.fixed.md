@@ -11,8 +11,23 @@
   - the turn's locus was resolved again: a retry lost a mid-turn addressed
     re-pin, a re-inference took the locus of whichever wake started it, and
     a held turn's later compile let a newer ambient message move it.
-- At a start that continues the turn, a wake that arrived after the turn
-  began moves the turn's locus only as a mid-turn message does: when it
-  addressed the agent, or came from a channel the turn sent into. The agent
-  gets the same `[routing] The conversation moved to …` notice. Ambient
-  traffic in another channel no longer moves a held turn's locus.
+- A message that no tool boundary weighed now moves the turn's locus at the
+  turn's next start, by the rule a mid-turn message follows: a
+  conversational message that addressed the agent, or that follows up in a
+  channel the turn sent into, with the same
+  `[routing] The conversation moved to …` notice. That covers a message that
+  arrives during a capacity hold or before a re-inference, and one drained
+  at a budget restart's over-budget boundary, which before never moved the
+  locus. Ambient traffic, reactions and system markers don't move it.
+- The channel context passed to `beforeInference` hooks
+  (`channels.defaultOutgoing`) names the turn's locus once the turn has one.
+  After a re-pin, a later start of the turn reports the channel its speech
+  lands in, not the channel that triggered the turn.
+- A start that fails before its stream exists now lands the messages
+  deferred during it, as a stream's end does. Before, they waited for the
+  agent's next start and landed after any message stored in between.
+- A send's engaged channel, and a `channel_open`'s move of the locus, are
+  recorded on the turn that called the tool, even when the tool's result, or
+  the open that follows a send, comes after that turn has ended.
+- `stop()` clears every agent's routing state, so a resume after a restart
+  starts afresh.

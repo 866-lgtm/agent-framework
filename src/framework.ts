@@ -587,25 +587,22 @@ interface TurnRouting {
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
   /**
-   * The time up to which the turn's re-pin has weighed arriving input: when
-   * the turn began, then each tool boundary that weighed its injected
-   * messages. A wake whose event comes later arrived since: at a start that
-   * continues the turn, it can re-pin the locus as a mid-turn message does
-   * (repinTurnLocus).
+   * Locus and hybrid mode: the channel the newest message that arrived
+   * between the turn's streams would re-pin the locus to (repinChannel),
+   * if one did. No tool boundary weighs such a message, since none of the
+   * turn's streams was running: it was stored during a capacity hold or the
+   * wait for a re-inference, or flushed at the end of a stream that didn't
+   * settle the turn, or by the start that continues it (noteArrival). The
+   * turn's next start re-pins there and clears it, as a boundary would have.
    */
-  consideredUntil: number;
+  arrival?: string;
 }
 
-function freshTurnRouting(consideredUntil = Date.now()): TurnRouting {
+function freshTurnRouting(): TurnRouting {
   return {
     engaged: new Set(), destination: null, hybridHold: false,
-    continuation: false, deliveries: [], suppressed: 0, consideredUntil,
+    continuation: false, deliveries: [], suppressed: 0,
   };
-}
-
-/** When a wake's event happened: a gate wake's event time, else when it was queued. */
-function wakeEventAt(request: InferenceRequest): number {
-  return request.wakeAt ?? request.timestamp;
 }
 
 /** How a round's prose is delivered: kept private, and under which turn's routing. */
@@ -1267,7 +1264,8 @@ export class AgentFramework {
    * consumes tool results the non-streaming fallback left (whichever wake
    * the scheduler starts it with), the later compile a provider-capacity
    * hold defers a turn to. A silent start neither continues nor opens one,
-   * and leaves the open turn's object untouched. A stream that ends without
+   * and leaves the open turn's object untouched (its own is the live routing
+   * while it runs: turnRouting). A stream that ends without
    * settling needs to do nothing to carry its turn. Settling only detaches
    * the turn from future starts: the settling stream keeps its own object,
    * which its remaining deliveries, its receipt and its ` !` check go on
@@ -2203,10 +2201,11 @@ export class AgentFramework {
 
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
-    // An open logical turn doesn't survive a stop: a start after a restart
-    // on this instance opens a new one rather than carrying its ` !` and
-    // receipt tallies across (openLogical).
+    // A turn doesn't survive a stop: a start after a restart on this
+    // instance, a resume included, gets new routing state rather than
+    // carrying the old turn's across (openLogical, turnRouting).
     this.openLogical.clear();
+    this.turnRouting.clear();
 
     // Cancel all active streams
     for (const agent of this.agents.values()) {
@@ -7174,23 +7173,20 @@ export class AgentFramework {
             //    Reactions and system markers are already excluded by
             //    isConversationalInjection, and the engaged-this-turn scope
             //    keeps unrelated channels from moving the pin.
+            // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
-            const lastQualifying = [...midTurnInjections].reverse().find((inj) => {
-              const m = inj.metadata as Record<string, unknown> | undefined;
-              if (!isConversationalInjection(inj.metadata)) return false;
-              if (typeof m?.channelId !== 'string') return false;
-              const tags = m.tags as string[] | undefined;
-              if (isAddressedMessage(tags, m)) return true;
-              return routing.engaged.has(m.channelId as string);
-            });
-            const newLocus = (lastQualifying?.metadata as Record<string, unknown> | undefined)
-              ?.channelId as string | undefined;
+            let newLocus: string | undefined;
+            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
             if (newLocus) {
               const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed');
               if (notice) midTurnInjections.push(notice);
             }
-            // This boundary has weighed every message that arrived before it.
-            routing.consideredUntil = Date.now();
+          } else if (!shouldEndTurn) {
+            // A boundary that can't re-pin now (over budget, or no live
+            // stream to tell) leaves its injections to the turn's next start,
+            // as arrivals: a budget restart, or a re-inference on these tool
+            // results.
+            for (const inj of midTurnInjections) this.noteArrival(agent.name, inj.metadata);
           }
 
           if (shouldEndTurn) {
@@ -8806,7 +8802,7 @@ export class AgentFramework {
       // held in the gate while the agent was busy lands BEHIND a newer
       // addressed message's direct wake, and queue order would hand the turn
       // to the older one. Ties keep the later-queued request, as before.
-      const eventAt = wakeEventAt;
+      const eventAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
       for (const r of requests) {
@@ -8855,7 +8851,7 @@ export class AgentFramework {
         counterparty: budgetRestart ? undefined : provReq?.counterparty,
         wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
-      }, 0, false, requests);
+      });
     }
   }
 
@@ -8998,14 +8994,44 @@ export class AgentFramework {
   }
 
   /**
+   * The channel a message moves its turn's locus to, by the addressed
+   * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (not a
+   * reaction or a system marker) that addressed the agent, or that follows
+   * up in a channel the turn sent into (TurnRouting.engaged). Undefined for
+   * any other message. A tool boundary weighs the messages it injects by it,
+   * and noteArrival the ones that arrive between the turn's streams.
+   */
+  private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): string | undefined {
+    if (!isConversationalInjection(metadata)) return undefined;
+    const m = metadata as Record<string, unknown> | undefined;
+    if (typeof m?.channelId !== 'string') return undefined;
+    if (isAddressedMessage(m.tags as string[] | undefined, m)) return m.channelId;
+    return routing.engaged.has(m.channelId) ? m.channelId : undefined;
+  }
+
+  /**
+   * Weigh a message stored for an agent whose logical turn is open while
+   * none of the turn's streams is running, so that no tool boundary will
+   * weigh it: one that would re-pin the locus becomes the turn's arrival,
+   * the newest replacing any before it (TurnRouting.arrival).
+   */
+  private noteArrival(agentName: string, metadata: MessageMetadata | undefined): void {
+    const open = this.openLogical.get(agentName);
+    if (!open) return;
+    const channelId = this.repinChannel(metadata, open);
+    if (channelId) open.arrival = channelId;
+  }
+
+  /**
    * Move a turn's locus to the channel its conversation moved to: an
    * addressed message, or a follow-up in a channel the turn engaged (the
-   * addressed re-pin). Ambient chatter never moves it. Leaves a durable
-   * `[routing]` notice in the window and updates lastAnnouncedLocus, so the
-   * next turn's announce-on-change diffs against what the agent was last
-   * told. Returns the notice as stored, for a live stream to inject with its
-   * boundary's other messages; undefined when the locus is already there or
-   * the notice couldn't be stored.
+   * addressed re-pin, repinChannel). Ambient chatter never moves it. Leaves
+   * a durable `[routing]` notice in the window and updates
+   * lastAnnouncedLocus, so the next turn's announce-on-change diffs against
+   * what the agent was last told. Returns the notice as stored, for a live
+   * stream to inject with its boundary's other messages. Returns undefined
+   * when the locus is already there, and when the notice couldn't be
+   * stored, though the locus has moved then too.
    */
   private repinTurnLocus(
     agent: Agent,
@@ -9456,8 +9482,6 @@ export class AgentFramework {
     trigger?: InferenceRequest,
     attempt = 0,
     providerGateAlreadyHeld = false,
-    /** The scheduler's requests this start consumes (beginAgentTurn). */
-    batch: readonly InferenceRequest[] = [],
   ): Promise<void> {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
@@ -9504,7 +9528,7 @@ export class AgentFramework {
             console.error(`[provider-admission] ${agent.name}: host quiesced while parked — wake requeued, not started`);
             return;
           }
-          await this.startAgentStream(agent, trigger, attempt, true, batch);
+          await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
           console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
@@ -9537,13 +9561,26 @@ export class AgentFramework {
     this.activeTurnTriggers.set(agent.name, trigger);
     let tokenHandedOff = false;
     try {
-      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, batch);
+      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate);
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
       }
       if (!tokenHandedOff && ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+      // A start that ends before its stream exists lands what was deferred
+      // during it, as a stream's teardown does. Left queued, those messages
+      // would land only at the agent's next start, after any stored meanwhile.
+      if (!tokenHandedOff && !this.activeTurnTokens.has(agent.name)
+        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const msg of this.drainDeferredFor(agent.name)) {
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
+        }
+        this.ackDeferredWrites();
+      }
     }
   }
 
@@ -9558,8 +9595,6 @@ export class AgentFramework {
     attempt: number,
     turnToken: number,
     ownsProviderGate: boolean,
-    /** The scheduler's requests this start consumes, for a start that continues an open turn. */
-    batch: readonly InferenceRequest[],
   ): Promise<boolean> {
     const startedAt = Date.now();
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
@@ -9593,6 +9628,7 @@ export class AgentFramework {
             const id = agent.getContextManager().addMessage(
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
+            this.noteArrival(agent.name, msg.metadata);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -9663,7 +9699,12 @@ export class AgentFramework {
     //  - A resume (a budget restart, a tool-result-guard retry) carries its
     //    turn's request on and keeps the turn's object as it is.
     //  - A silent start routes no prose. It gets an object of its own, with
-    //    no locus, so it neither takes nor disturbs an open turn's.
+    //    no locus, so it neither takes nor disturbs an open turn's. Its
+    //    object is the agent's live routing while it runs, and the open
+    //    turn's next start makes the turn's object live again. (No silent
+    //    start runs while a prose turn is open in production: a capacity
+    //    hold holds silent wakes with the turn's, and a re-inference's wake
+    //    is queued before its stream ends, so it batches with them.)
     //  - Any other start continues the agent's open logical turn, if one is
     //    open (openLogical): a framework retry, the start that consumes tool
     //    results the non-streaming fallback left (whichever wake the
@@ -9682,14 +9723,14 @@ export class AgentFramework {
     if (resumesTurn) {
       routing = this.routingOf(agent.name);
     } else if (trigger?.suppressProse) {
-      routing = freshTurnRouting(startedAt);
+      routing = freshTurnRouting();
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
       if (open) {
         routing = open;
       } else {
-        routing = freshTurnRouting(startedAt);
+        routing = freshTurnRouting();
         this.openLogical.set(agent.name, routing);
         opensTurn = true;
       }
@@ -9735,23 +9776,16 @@ export class AgentFramework {
         if (locus !== null) routing.locus = locus;
         if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
       }
-    } else if (!resumesTurn && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
-      // A start that continues the turn keeps its locus. Wakes that arrived
-      // since the turn last weighed its input can still move it, by the
-      // addressed re-pin a mid-turn boundary applies: that boundary sees only
-      // the messages it drains, and these were stored without one (during a
-      // capacity hold no turn is alive, so nothing defers them). The newest
-      // one that addressed the agent, or that came from a channel the turn
-      // engaged, moves the locus. Ambient chatter doesn't, and neither does a
-      // wake the turn has already weighed, such as its own held trigger or
-      // the wake of a message a boundary drained.
-      let arrival: InferenceRequest | undefined;
-      for (const request of batch) {
-        if (!request.channelId || wakeEventAt(request) <= routing.consideredUntil) continue;
-        if (!request.addressed && !routing.engaged.has(request.channelId)) continue;
-        if (!arrival || wakeEventAt(request) >= wakeEventAt(arrival)) arrival = request;
+    } else {
+      // Every other start of the turn keeps its locus: a resume, or a start
+      // that continues the open turn. A message that arrived while none of
+      // the turn's streams was running can still move it, as it would have
+      // at a tool boundary: no boundary drained it (TurnRouting.arrival).
+      const arrival = routing.arrival;
+      routing.arrival = undefined;
+      if (arrival && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
+        this.repinTurnLocus(agent, routing, arrival, 'arrival');
       }
-      if (arrival) this.repinTurnLocus(agent, routing, arrival.channelId!, 'continuing-start');
     }
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
@@ -13178,6 +13212,11 @@ export class AgentFramework {
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    // Stored while none of the agent's turns is alive, or assembled for the
+    // start now beginning: no tool boundary will weigh it.
+    if (!this.activeTurnTokens.has(agent.name) || opts?.bypassDeferralFor === agent.name) {
+      this.noteArrival(agent.name, metadata);
+    }
     return stored;
   }
 
@@ -13796,8 +13835,14 @@ export class AgentFramework {
         // agent as a trunk (it never exposes conversation forks), so without this
         // a reply falls back to the process-global most-recent-inbound locus and
         // a concurrent message in another channel hijacks it. Empty for
-        // heartbeat / no-trigger turns → correct global fallback.
-        activeChannelResolver: (agentName) => this.turnRouting.get(agentName)?.triggerChannel,
+        // heartbeat / no-trigger turns → correct global fallback. Once the
+        // turn has a locus, it's the locus, a re-pin's included: that's where
+        // the turn's plain speech lands, so the channel context the agent is
+        // told at a later start of the turn names it.
+        activeChannelResolver: (agentName) => {
+          const routing = this.turnRouting.get(agentName);
+          return routing?.locus ?? routing?.triggerChannel;
+        },
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
@@ -15460,6 +15505,9 @@ export class AgentFramework {
     this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
+    // The turn that sends: a send's engaged channel is recorded on it, even
+    // when the send's result, or the open that follows, comes after the turn.
+    const sendingTurn = this.turnRouting.get(agentName);
 
     // Build state params for stateful tools (Step 8).
     // A tools/list attribution selects that exact stateful set. Untagged tools
@@ -15559,7 +15607,7 @@ export class AgentFramework {
                 // the microtask queue, i.e. before the tool-result event
                 // that evaluates injections.
                 if (status !== 'unknown-channel' && status !== 'ambiguous') {
-                  this.routingOf(agentName).engaged.add(channelId ?? target);
+                  sendingTurn?.engaged.add(channelId ?? target);
                 }
                 if (status === 'opened') {
                   console.error(
@@ -15677,6 +15725,9 @@ export class AgentFramework {
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
+    // The turn that called: a channel_open's result moves its locus, even
+    // if that result arrives after the turn has ended.
+    const callingTurn = this.routingOf(agentName);
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
@@ -15700,11 +15751,10 @@ export class AgentFramework {
             (result.data as { channelId?: string } | undefined)?.channelId
             ?? (call.input as { channelId?: string } | undefined)?.channelId;
           if (opened) {
-            const openerRouting = this.routingOf(agentName);
-            openerRouting.triggerChannel = opened;
+            callingTurn.triggerChannel = opened;
             const openerAgent = this.agents.get(agentName);
             if (openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
-              openerRouting.locus = opened;
+              callingTurn.locus = opened;
               this.lastAnnouncedLocus.set(agentName, opened);
               result = {
                 ...result,

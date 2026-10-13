@@ -357,12 +357,12 @@ describe('explicit prose routing', () => {
   type RoutingState = {
     pin?: string; destination: string | null; hybridHold: boolean;
     continuation: boolean; deliveries: string[]; suppressed: number;
-    triggerChannel?: string; locus?: string; engaged: Set<string>; consideredUntil: number;
+    triggerChannel?: string; locus?: string; engaged: Set<string>; arrival?: string;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
     destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
-    engaged: new Set(), consideredUntil: Date.now(), ...fields,
+    engaged: new Set(), ...fields,
   });
 
   async function within<T>(promise: Promise<T>, label: string, ms = 5000): Promise<T> {
@@ -906,10 +906,11 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears open turns", async () => {
+  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears every turn's routing", async () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {
       openLogical: Map<string, RoutingState>;
+      turnRouting: Map<string, RoutingState>;
       settleAgent(name: string, outcome: { stopReason: 'completed'; speech: string }, closes: RoutingState | undefined): void;
     };
     const open: RoutingState = routingState({ continuation: true });
@@ -923,8 +924,10 @@ describe('explicit prose routing', () => {
     internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, open);
     assert.equal(internals.openLogical.has('assistant'), false, "the turn's own settle closes it");
     internals.openLogical.set('assistant', open);
+    internals.turnRouting.set('assistant', open);
     await framework.stop();
     assert.equal(internals.openLogical.size, 0, 'stop() clears every open logical turn');
+    assert.equal(internals.turnRouting.size, 0, 'and every live routing state, so a resume after a restart starts afresh');
   });
 
   it('a silent start neither takes nor disturbs an open logical turn, and leaves it to the next start that routes prose', async () => {
@@ -943,7 +946,7 @@ describe('explicit prose routing', () => {
       // Everything the open turn has decided about where its speech goes.
       const decided = (): RoutingState => routingState({
         continuation: true, pin: 'chan-alpha', hybridHold: true, triggerChannel: 'chan-alpha',
-        locus: 'world:commons', engaged: new Set(['discord:g:cafe']), consideredUntil: 1,
+        locus: 'world:commons', engaged: new Set(['discord:g:cafe']), arrival: 'discord:g:cafe',
       });
       const open = decided();
       internals.openLogical.set('assistant', open);

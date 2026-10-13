@@ -41,9 +41,9 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (TurnRouting.locus) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
+       * The turn's outbound locus as this stream starts: the channel its
+       * plain prose is routed to, until a re-pin moves it. Omitted for turns
+       * with no locus (heartbeats with no default channel). Observability only, like every
        * trace field; lets external taps (e.g. a TTS relay) tag the whole
        * activation with its channel without re-deriving routing.
        */
@@ -95,7 +95,7 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The turn's outbound locus as its stream started (see inference:started). */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -110,7 +110,7 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The turn's outbound locus as its stream started (see inference:started). */
       channelId?: string;
     })
   | (TraceEventBase & {
