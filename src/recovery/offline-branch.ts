@@ -1,5 +1,5 @@
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
+import { ContextManager, continuesBody, type BodyShard } from '@animalabs/context-manager';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
@@ -299,14 +299,15 @@ function validateAnchorBoundary(
   total: number,
   target: StoredWindowMessage,
 ): void {
-  const groupId = (target as StoredWindowMessage & { bodyGroupId?: string }).bodyGroupId;
-  if (!groupId || targetIndex + 1 >= total) return;
+  if (targetIndex + 1 >= total) return;
   const next = contextManager.getMessageWindow(targetIndex + 1, 1, {
     resolveBlobs: false,
-  }).messages[0] as (StoredWindowMessage & { bodyGroupId?: string }) | undefined;
-  if (next?.bodyGroupId === groupId) {
+  }).messages[0];
+  // A body continues only into a later shard of the same ingestion: a
+  // reposted document shares its group id but starts a body of its own.
+  if (continuesBody(target as BodyShard, next as BodyShard | undefined)) {
     throw new Error(
-      `Recovery anchor ${String(target.id)} splits body group ${groupId}; choose its final shard.`,
+      `Recovery anchor ${String(target.id)} splits body group ${(target as BodyShard).bodyGroupId}; choose its final shard.`,
     );
   }
 }
@@ -321,7 +322,9 @@ function validateRemovalIntegrity(
     index >= interval.start && index <= interval.end);
   const toolUses = new Map<string, boolean>();
   const toolResults = new Map<string, boolean>();
-  const groupMembership = new Map<string, boolean>();
+  // The message before, in store order: a selection splits a body when a
+  // message continuing the one before it lands on the other side.
+  let previous: { message: BodyShard; removed: boolean } | null = null;
 
   for (let offset = 0; offset < total; offset += RECOVERY_SCAN_WINDOW) {
     const messages = contextManager.getMessageWindow(
@@ -332,16 +335,14 @@ function validateRemovalIntegrity(
     for (let i = 0; i < messages.length; i++) {
       const index = offset + i;
       const isRemoved = removed(index);
-      const message = messages[i] as StoredWindowMessage & { bodyGroupId?: string };
-      if (message.bodyGroupId) {
-        const prior = groupMembership.get(message.bodyGroupId);
-        if (prior !== undefined && prior !== isRemoved) {
-          throw new Error(
-            `Recovery selection splits body group ${message.bodyGroupId}; adjust the anchor or suppression boundary.`,
-          );
-        }
-        groupMembership.set(message.bodyGroupId, isRemoved);
+      const message = messages[i];
+      const shard = message as BodyShard;
+      if (previous && previous.removed !== isRemoved && continuesBody(previous.message, shard)) {
+        throw new Error(
+          `Recovery selection splits body group ${shard.bodyGroupId}; adjust the anchor or suppression boundary.`,
+        );
       }
+      previous = { message: shard, removed: isRemoved };
       for (const rawBlock of message.content) {
         const block = rawBlock as { type?: unknown; id?: unknown; toolUseId?: unknown };
         if (block.type === 'tool_use' && typeof block.id === 'string') {
