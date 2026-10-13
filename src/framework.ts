@@ -394,7 +394,7 @@ import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { redactUrl, redactServerText, resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
+import { redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverTextRedactor } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import type {
   McplServerConfig,
@@ -14751,8 +14751,7 @@ export class AgentFramework {
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection): void {
-    const config = this.mcplServerConfigs.get(connection.id) ?? {};
-    const recorded = (text: string): string => redactServerText(text, config);
+    const recorded = serverTextRedactor(this.mcplServerConfigs.get(connection.id) ?? {});
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.
     connection.on('stderr', (params: { line: string }) => {
@@ -15080,8 +15079,7 @@ export class AgentFramework {
    * MCPL data-plane traffic, which this family doesn't carry.
    */
   private wireModernEvents(connection: ModernMcpConnection): void {
-    const config = this.mcplServerConfigs.get(connection.id) ?? {};
-    const recorded = (text: string): string => redactServerText(text, config);
+    const recorded = serverTextRedactor(this.mcplServerConfigs.get(connection.id) ?? {});
     connection.on('stderr', (params: { line: string }) => {
       this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });

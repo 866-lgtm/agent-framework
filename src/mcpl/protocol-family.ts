@@ -118,6 +118,14 @@ export function redactUrl(url: string | undefined): string {
  * thrown directly to a host caller keep their separate pass-through contract.
  */
 export function redactServerText(text: string, config: Pick<McplServerConfig, 'url' | 'token'>): string {
+  return serverTextRedactor(config)(text);
+}
+
+/**
+ * {@link redactServerText} for one configuration, its strings found and its
+ * pattern built once: for a connection's records, such as each stderr line.
+ */
+export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token'>): (text: string) => string {
   const secrets = new Set<string>();
   const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
   const decode = (value: string, query = false): string => {
@@ -160,10 +168,11 @@ export function redactServerText(text: string, config: Pick<McplServerConfig, 'u
       }
     }
   }
-  if (secrets.size === 0) return text;
+  if (secrets.size === 0) return (text) => text;
   const alternatives = [...secrets].sort((a, b) => b.length - a.length)
     .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  return text.replace(new RegExp(alternatives.join('|'), 'g'), 'redacted');
+  const pattern = new RegExp(alternatives.join('|'), 'g');
+  return (text) => text.replace(pattern, 'redacted');
 }
 
 /**
