@@ -4085,10 +4085,10 @@ export class AgentFramework {
    * can change there: a new maxTokens (the response reserve) or strategy
    * configuration. It also sees a context that grew while the agent ran at
    * another budget after the record was written, through a persist: false
-   * change. The system prompt and tools are outside the context manager's
-   * budget, so they don't enter it (context-manager #162). If a compile at a
-   * budget applied at once this way is refused, the agent restores it paced
-   * then (armed by Agent.restoreRuntimeSettings, run in
+   * change. The system prompt, tools and injections are outside the context
+   * manager's budget, so they don't enter it (context-manager #162). If a
+   * compile at a budget applied at once this way is refused, the agent
+   * restores it paced then (armed by Agent.restoreRuntimeSettings, run in
    * Agent.compileAtLiveBudgetNoting). A budget at or above the recipe's is
    * applied at once with or without the marker, as an increase always is.
    *

@@ -164,12 +164,13 @@ export class Agent {
   /**
    * For each budget, the start of the latest-started compile that has ended
    * there with a fit or a refusal, whether or not what it showed was
-   * credited. Of two compiles at one
-   * budget, the later-started one planned at the newer store, so an
-   * earlier-started one that ends after it is ignored, with or without
-   * injections. An entry is kept only while a compile that started before it
-   * is still running, the only kind it can turn away, so the map is empty
-   * whenever no compile runs.
+   * credited. Of two compiles at one budget, the later-started one planned
+   * at the newer store, so an earlier-started one that ends after it is
+   * ignored. (Injections are added after the context manager selects against
+   * the budget, so compiles with and without them plan alike.) An entry is
+   * kept only while a compile that started before it is still running, the
+   * only kind it can turn away, so the map is empty whenever no compile
+   * runs.
    */
   private readonly latestEndedStart = new Map<number, number>();
   /** The last outcome the listener recorded; a failed record is told again, and so is any after a change. */
