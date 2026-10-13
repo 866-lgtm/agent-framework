@@ -49,6 +49,18 @@
   `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
   script gets a failure that says the tool may have completed. Results
   without structured content keep the existing script contract.
+- A result that can't be converted to JSON, such as a cyclic object or a
+  `BigInt` from an in-process module, reaches the script as an error that
+  names the tool and says the call itself completed: for a structured
+  result, the object above with `content: []`, `structuredContent: null`,
+  `isError: true` and the `error`, and `Error: …` otherwise. Before, the
+  script got the runner's bare error, such as `Converting circular
+  structure…`.
+- The `code_execution` tool's description now says what a script's tool
+  function returns: the text, or for a structured result the JSON object
+  above, with references and the oversized form. These two changes, and an
+  end-to-end test with real Python adapted from #181's, come from
+  @Meganeuridae's review of this change against #181.
 - The direct tool path (`executeToolCall`, `ModuleContext.callTool`) now
   treats an MCP tool error (`isError: true`) as a failure, with
   `success: false` and the error text; before, every answer counted as

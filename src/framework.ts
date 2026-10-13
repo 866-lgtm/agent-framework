@@ -958,6 +958,22 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
+/**
+ * What a script gets for a tool result that can't be converted to JSON,
+ * such as a cyclic object or a BigInt that an in-process module returned.
+ * It names the tool, and says the call itself completed, so a script that
+ * reports it doesn't invite a blind retry. The host's log gets the same
+ * line, since the tool that returned it needs fixing whether or not the
+ * script reports it.
+ */
+function unconvertibleScriptResult(toolName: string, err: unknown): string {
+  const reason = err instanceof Error ? err.message : String(err);
+  const text = `tool '${toolName}' returned a result that can't be converted to JSON, so the script can't receive it ` +
+    `(${reason}). The call itself completed.`;
+  console.error(`[code_execution] ${text}`);
+  return text;
+}
+
 /** Cap an API error message for inline use in a rewind marker: keep enough to
  *  identify the failure class without pasting a wall of provider JSON into the
  *  agent's context. */
@@ -11863,12 +11879,17 @@ export class AgentFramework {
 
   /**
    * Resolve one script-inner tool call to the string the script's tool
-   * function returns. Never rejects — errors become "Error: ..." strings,
+   * function returns. Never rejects: errors become "Error: ..." strings,
    * matching the managed PTC runtime ("Claude's code receives this error").
    *
-   * Results are serialized with the HISTORY serializer (images become
-   * placeholders): programmatic tool results are text-only by contract, and
-   * a script variable holding megabytes of base64 helps nobody.
+   * A result without structured content is serialized with the HISTORY
+   * serializer: images become placeholders, since a script variable holding
+   * megabytes of base64 helps nobody. A result with structured content is
+   * one JSON object holding both of the server's views
+   * (scriptStructuredResult), so its content blocks reach the script as the
+   * dispatch gave them, images and payloads included. A result that can't be
+   * converted to JSON, such as a cyclic object or a BigInt from an in-process
+   * module, becomes an error that names the tool, in each path's error form.
    */
   private async handleScriptToolCall(
     agentName: string,
@@ -11902,8 +11923,12 @@ export class AgentFramework {
     // Scripts get (nearly) full data — the script environment IS the spill:
     // filtering big results in code is the whole point. 5MB protocol safety
     // cap only; no context-cap truncation, no file spill.
-    if (structured) return this.scriptStructuredResult(result);
-    return toolResultDataToHistoryString(result.data, 5_000_000);
+    if (structured) return this.scriptStructuredResult(result, toolName);
+    try {
+      return toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS);
+    } catch (err) {
+      return `Error: ${unconvertibleScriptResult(toolName, err)}`;
+    }
   }
 
   /** The 5MB protocol safety cap on what a script receives. */
@@ -11921,16 +11946,24 @@ export class AgentFramework {
    * saved to the workspace, and the script gets
    * `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
    * script gets a failure to materialize the result, saying the tool may
-   * already have completed, never a success missing its result.
+   * already have completed, never a success missing its result. A result
+   * that can't be converted to JSON (a cyclic object, a BigInt) gets the
+   * same object empty, `{ content: [], structuredContent: null, isError:
+   * true, error }`, the error naming the tool.
    */
-  private async scriptStructuredResult(result: ToolResult): Promise<string> {
+  private async scriptStructuredResult(result: ToolResult, toolName: string): Promise<string> {
     const object = {
       content: Array.isArray(result.data) ? result.data : [],
       structuredContent: result.structured,
       isError: result.isError === true,
       ...(result.isError ? { error: result.error ?? '' } : {}),
     };
-    const json = JSON.stringify(object);
+    let json: string;
+    try {
+      json = JSON.stringify(object);
+    } catch (err) {
+      return JSON.stringify({ content: [], structuredContent: null, isError: true, error: unconvertibleScriptResult(toolName, err) });
+    }
     if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return json;
     const workspace = this.getWorkspaceModule();
     const mount = workspace ? this.firstWritableMountName(workspace) : null;
