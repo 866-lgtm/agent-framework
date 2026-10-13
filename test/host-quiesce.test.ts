@@ -683,7 +683,7 @@ test('a batch carrying a budget restart re-parks its sibling wakes instead of co
   });
 });
 
-test('resume flushes deferred writes per message: one poison write neither drops the rest nor skips the reopen, and stays queued', async () => {
+test('resume flushes deferred writes in order: a poison write stays queued with what follows it, and the reopen still completes', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
     const traces: TraceEvent[] = [];
@@ -709,13 +709,14 @@ test('resume flushes deferred writes per message: one poison write neither drops
 
     const status = await framework.resume();
     assert.equal(status.quiesced, false);
-    // A drained write whose store throws is never dropped: it goes back into
-    // the queue under its id, for the next flush.
-    assert.equal(status.deferredWrites, 1, 'only the write that failed is still queued');
+    // A drained write whose store throws is never dropped, and nothing lands
+    // ahead of it: it and the write queued behind it go back into the queue
+    // under their ids, for the next flush.
+    assert.equal(status.deferredWrites, 2, 'the write that failed and the one behind it are still queued');
     assert.deepEqual(
       cm.getAllMessages().slice(before).map((m) => (m.content[0] as { text: string }).text),
-      ['first', 'third'],
-      'the writes behind the poison one still landed',
+      ['first'],
+      'the write queued before the poison one landed',
     );
     assert.ok(traces.some((t) => t.type === 'host:resume'), 'resume completed its follow-through');
   });

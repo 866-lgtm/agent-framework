@@ -481,6 +481,11 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
+/** A deferred entry as a log line names it: its id, participant and block types. */
+function describeDeferredWrite(msg: { id: string; participant: string; content: ContentBlock[] }): string {
+  return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map((b) => b.type))].join('+') || 'empty'})`;
+}
+
 /** Whether a deferred message can join a live stream at a tool boundary:
  *  no tool blocks (the membrane's tool cycle) and not named as the agent
  *  itself (it would render as an assistant turn, a prefill). */
@@ -2272,21 +2277,25 @@ export class AgentFramework {
       }
     }
 
-    // Every turn is over: from the start of stop() no turn starts and no
-    // stream registers (providerAdmissionClosed, checked for every agent),
-    // and every stream registered before was cancelled and awaited above. So
-    // nothing else will deliver what is still deferred: a message held for
-    // a turn's end whose flush found the target busy again, or one that
-    // arrived for an idle agent and was deferred behind its own state. Land
-    // each at its registered target now, while the store is open; a
-    // memory-only queue would otherwise lose it. A quiesced host defers it
-    // again, into the persisted queue, for boot recovery; a write that throws
-    // stays queued (writeDrained). An entry for a target no longer registered
-    // (a disposed fork) is left: dropped with a memory-only queue at exit, and
-    // logged and dropped from a persisted one at boot.
+    // No stream is left: from the start of stop() none registers and no turn
+    // starts (providerAdmissionClosed, checked for every agent), and every
+    // stream registered before was cancelled and awaited above. So nothing
+    // else will deliver what is still deferred: a message held for a turn's
+    // end whose flush found the target busy again, or one that arrived for an
+    // idle agent and was deferred behind its own state. Land each at its
+    // registered target now, while the store is open; a memory-only queue
+    // would otherwise lose it at exit. It goes past the deferral: a frame
+    // stop() doesn't wait for (a puppet call, or a turn started outside the
+    // event loop) can still hold its target's turn token, but no reply can
+    // follow the entry in any stream. A quiesced host defers it again
+    // instead, into the persisted queue, for boot recovery. A write that
+    // throws stays queued with what follows it (writeDrainedInOrder), and a
+    // memory-only queue still loses it at exit. An entry for a target no
+    // longer registered (a disposed fork) is left: dropped with a memory-only
+    // queue at exit, and logged and dropped from a persisted one at boot.
     if (this.deferredMessages.length > 0) {
       for (const name of this.agents.keys()) {
-        for (const msg of this.drainDeferredFor(name)) this.readdDrained(msg, 'stop');
+        this.readdDrained(this.drainDeferredFor(name), 'stop', this.quiesced ? undefined : { bypassDeferralFor: name });
       }
       this.ackDeferredWrites();
     }
@@ -3654,8 +3663,9 @@ export class AgentFramework {
    * acknowledging each durably as it lands (the persisted queue is rewritten
    * after every message). A crash mid-flush therefore replays exactly the
    * un-acked remainder at the next boot — no loss, no duplicates. A write
-   * the store REJECTS is logged and acked too: replaying a poison message
-   * forever would wedge every later boot on it.
+   * the store rejects stays queued, logged, with what is queued behind it for
+   * its target (writeDrainedInOrder), so a target's entries never land out of
+   * order; a boot that meets it again logs it and goes on.
    *
    * Per-target: an agent whose turn is still alive keeps ITS messages
    * deferred for its own turn boundary; everyone else's flush now.
@@ -3678,10 +3688,15 @@ export class AgentFramework {
     flush.sort(bySeq);
     this.deferredMessages = keep;
     this.handOffDeferredWrites(flush);
-    let stored = 0;
+    // Each target's entries in queue order, cut at the first that can't be
+    // stored; other targets' entries go on.
+    const byTarget = new Map<string | null | undefined, DeferredWrite[]>();
     for (const msg of flush) {
-      if (this.readdDrained(msg, `host-mode ${label}`)) stored++;
+      const target = msg.forAgent ?? this.primaryAgentName;
+      byTarget.set(target, [...(byTarget.get(target) ?? []), msg]);
     }
+    let stored = 0;
+    for (const entries of byTarget.values()) stored += this.readdDrained(entries, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
     this.ackDeferredWrites();
@@ -6270,7 +6285,7 @@ export class AgentFramework {
       if (this.deferredMessages.length > 0) {
         for (const name of reserved.keys()) {
           if (this.activeTurnTokens.has(name) || this.pendingAssistantBlocks.has(name)) continue;
-          for (const msg of this.drainDeferredFor(name)) this.readdDrained(msg, 'post-surgery flush');
+          this.readdDrained(this.drainDeferredFor(name), 'post-surgery flush');
         }
         this.ackDeferredWrites();
       }
@@ -7089,13 +7104,13 @@ export class AgentFramework {
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
-            for (const msg of deferred) {
-              // One that can't be stored stays queued and isn't injected; the
-              // rest are, so the boundary still hands the round's results on.
-              const stored = this.writeDrained(msg, `tool boundary for ${agent.name}`, () => {
-                agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-              });
-              if (!stored) continue;
+            // Stored in queue order, cut at the first that can't be stored: it
+            // and what follows wait for the turn's end, and only what was
+            // stored is injected (the round's results go on either way).
+            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) => {
+              agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+            });
+            for (const msg of stored) {
               midTurnInjections.push({
                 participant: msg.participant,
                 content: msg.content,
@@ -9603,18 +9618,16 @@ export class AgentFramework {
       this.deferredMessages.length > 0
     ) {
       {
-        const deferred = this.drainDeferredFor(agent.name);
-        for (const msg of deferred) {
-          // One poison message, or a transient store-write failure, must not
-          // abort the turn or drop the messages behind it in the queue; the
-          // one that failed stays queued (writeDrained).
-          this.writeDrained(msg, `turn-start flush for ${agent.name}`, () => {
-            const id = agent.getContextManager().addMessage(
-              msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
-            );
-            this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
-          });
-        }
+        // One poison message, or a transient store-write failure, must not
+        // abort the turn or drop the messages behind it in the queue: the
+        // drain cuts there, and it and what follows stay queued, in order
+        // (writeDrainedInOrder).
+        this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `turn-start flush for ${agent.name}`, (msg) => {
+          const id = agent.getContextManager().addMessage(
+            msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
+          );
+          this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
+        });
         this.ackDeferredWrites();
       }
     }
@@ -9654,7 +9667,7 @@ export class AgentFramework {
       }
       if (!this.activeTurnTokens.has(agent.name)
         && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
-        for (const msg of this.drainDeferredFor(agent.name)) this.readdDrained(msg, 'withdrawn-turn flush');
+        this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
         this.ackDeferredWrites();
       }
       return false;
@@ -11535,7 +11548,7 @@ export class AgentFramework {
       // prefix is stored in order, or goes back into the queue whole under
       // its ids when a successor turn has already taken the agent.
       if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
-        for (const msg of this.drainDeferredFor(agent.name)) this.readdDrained(msg, 'turn-end flush');
+        this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
       }
     }
@@ -11720,7 +11733,7 @@ export class AgentFramework {
       // was queued — nobody else will flush it, so we do.
       if (!this.activeTurnTokens.has(agentName)
         && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
-        for (const msg of this.drainDeferredFor(agentName)) this.readdDrained(msg, 'puppet flush');
+        this.readdDrained(this.drainDeferredFor(agentName), 'puppet flush');
         this.ackDeferredWrites();
       }
     }
@@ -13228,12 +13241,12 @@ export class AgentFramework {
   }
 
   /**
-   * Write one drained entry. If the write throws, the entry goes back into
-   * the queue under its id and seq, and the caller goes on with the rest:
-   * left in the un-acked set, the next ack would drop it from the durable
-   * queue, and a memory-only queue would lose it at once. Every site that
-   * writes a drained entry writes through this. Returns whether it was
-   * written (stored, or deferred again by addMessage).
+   * Write one drained entry. If the write throws, it is logged, naming the
+   * entry, and goes back into the queue under its id and seq
+   * (requeueDrained): left in the un-acked set, the next ack would drop it
+   * from the durable queue. Every site writes a drained list through
+   * writeDrainedInOrder, which cuts there. Returns whether it was written
+   * (stored, or deferred again by addMessage).
    */
   private writeDrained(msg: DeferredWrite, where: string, write: () => void): boolean {
     try {
@@ -13241,23 +13254,58 @@ export class AgentFramework {
       return true;
     } catch (error) {
       console.error(
-        `[deferral] ${where}: a deferred write for ${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
-        `(participant=${msg.participant}) could not be stored; it stays queued: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
+        `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
+        `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} could not be stored; it stays queued, ` +
+        `holding what is queued behind it for that agent: ${error instanceof Error ? error.message : String(error)}`,
       );
-      this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== msg.id);
-      if (!this.deferredMessages.some((m) => m.id === msg.id)) this.deferredMessages.push(msg);
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      this.requeueDrained([msg]);
       return false;
     }
   }
 
-  /** Re-add one drained entry through addMessage, which stores it or defers it again. */
-  private readdDrained(msg: DeferredWrite, where: string): boolean {
-    return this.writeDrained(msg, where, () => {
+  /**
+   * Put drained entries back into the queue under their ids and seq: out of
+   * the un-acked set, and persisted when the queue is. A memory-only queue
+   * keeps them while the framework runs.
+   */
+  private requeueDrained(entries: DeferredWrite[]): void {
+    if (entries.length === 0) return;
+    const ids = new Set(entries.map((m) => m.id));
+    this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => !ids.has(m.id));
+    for (const msg of entries) {
+      if (!this.deferredMessages.some((m) => m.id === msg.id)) this.deferredMessages.push(msg);
+    }
+    if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+  }
+
+  /**
+   * Write one agent's drained entries in queue order, each through
+   * writeDrained. The drain cuts at the first that can't be stored: it and
+   * every later entry go back into the queue, so nothing lands ahead of an
+   * earlier entry and a queued pair stays together. An entry that keeps
+   * failing holds its agent's later writes, logged at each flush, rather than
+   * letting them land out of order. Returns what was written, a prefix of
+   * `entries`.
+   */
+  private writeDrainedInOrder(entries: DeferredWrite[], where: string, write: (msg: DeferredWrite) => void): DeferredWrite[] {
+    for (let i = 0; i < entries.length; i++) {
+      const msg = entries[i]!;
+      if (!this.writeDrained(msg, where, () => write(msg))) {
+        this.requeueDrained(entries.slice(i + 1));
+        return entries.slice(0, i);
+      }
+    }
+    return entries;
+  }
+
+  /** Re-add one agent's drained entries through addMessage, which stores each
+   *  or defers it again, cut at the first that can't be stored. */
+  private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferralFor?: string }): DeferredWrite[] {
+    return this.writeDrainedInOrder(entries, where, (msg) => {
       this.addMessage(msg.participant, msg.content, msg.metadata, {
         deferredWriteId: msg.id,
         ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+        ...(opts?.bypassDeferralFor ? { bypassDeferralFor: opts.bypassDeferralFor } : {}),
       });
     });
   }

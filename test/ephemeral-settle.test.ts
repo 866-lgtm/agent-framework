@@ -122,6 +122,49 @@ async function stopAndRemove(framework: AgentFramework, tempDir: string): Promis
 }
 
 describe('runEphemeralToCompletion settle signal', () => {
+  it('a run whose turn stop() refuses ends at once, and a run asked for once stop() has begun is refused', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-stopping-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'too late' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      const later = await createEphemeral(framework, 'later');
+      // Hold the run's compile until stop() has begun.
+      let compiling!: () => void;
+      const inCompile = new Promise<void>((resolve) => { compiling = resolve; });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const start = agent.startStreamWithInjections.bind(agent);
+      (agent as unknown as { startStreamWithInjections: typeof start }).startStreamWithInjections = async (...args) => {
+        compiling();
+        await released;
+        return start(...args);
+      };
+      const run = runStartedEphemeral(framework, agent, contextManager);
+      await inCompile;
+      const stopped = framework.stop();
+      release();
+      const refusedAt = Date.now();
+      await assert.rejects(run, /refused: the framework is stopping/);
+      assert.ok(Date.now() - refusedAt < 5_000, 'ended at once, not at its startup watchdog');
+      await stopped;
+      await assert.rejects(
+        framework.runEphemeralToCompletion(later.agent, later.contextManager),
+        /framework is stopping: refusing new ephemeral run/,
+      );
+      later.cleanup();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('resolves plain text completion and deregisters the agent', async () => {
     const { tempDir, storePath } = tempStorePath('ephemeral-plain-');
     const membrane = new MockMembrane();

@@ -125,12 +125,13 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(): Promise<AgentFramework> {
+  async function createFramework(extra: Partial<Parameters<typeof AgentFramework.create>[0]> = {}): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' }],
       modules: [module],
+      ...extra,
     });
     module.framework = framework;
     return framework;
@@ -397,7 +398,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await reopened.stop();
   });
 
-  it('at a tool boundary, a write whose store throws stays queued and is not injected; the rest are', async () => {
+  it('at a tool boundary, a write whose store throws cuts the drain: it and what follows wait for the turn end, in order', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Moving.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
@@ -424,14 +425,94 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
       await framework.runUntilIdle();
     } finally { console.error = error; }
-    assert.deepEqual(injected(), ['Antra: look right']);
+    assert.deepEqual(injected(), [], 'nothing from the failed write on is injected');
     assert.deepEqual(windowOf(framework).slice(2), [
       'user: <tool_result>',
-      'Antra: look right',
       'assistant: Done.',
       'Antra: look left',
-    ], 'the one that failed was kept, and stored at the turn end');
+      'Antra: look right',
+    ], 'both were kept, and stored at the turn end in queue order');
     await framework.stop();
+  });
+
+  it("a queued tool_use whose store throws keeps its tool_result from being stored alone", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.deferredWritesPersisted = true;
+    // A pair queued for the agent, as puppetToolCall queues one behind a live turn.
+    const queue = framework as unknown as {
+      deferredSeq: number;
+      deferredMessages: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; forAgent?: string }>;
+    };
+    queue.deferredMessages.push(
+      { id: 'pair-use', seq: ++queue.deferredSeq, participant: 'assistant', content: [{ type: 'tool_use', id: 'p1', name: 'robot--move', input: {} } as ContentBlock], forAgent: 'assistant' },
+      { id: 'pair-result', seq: ++queue.deferredSeq, participant: 'user', content: [{ type: 'tool_result', toolUseId: 'p1', content: 'moved' } as ContentBlock], forAgent: 'assistant' },
+    );
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+      if ((args[1] as ContentBlock[]).some((b) => b.type === 'tool_use')) throw new Error('disk full');
+      return add(...args);
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try { await framework.stop(); } finally { console.error = error; }
+    assert.ok(errors.some((e) => e.includes('pair-use (assistant: tool_use)') && e.includes('disk full')), errors.join('\n'));
+    assert.deepEqual(queue.deferredMessages.map((m) => m.id), ['pair-use', 'pair-result'], 'both stay queued, in order');
+
+    const reopened = await createFramework();
+    const window = windowOf(reopened);
+    assert.deepEqual(window.slice(-2), ['assistant: <tool_use>', 'user: <tool_result>'], 'boot recovery stored the pair, in order');
+    assert.equal(window.filter((line) => line === 'user: <tool_result>').length, 1, 'no tool_result was stored alone');
+    await reopened.stop();
+  });
+
+  it("stop() stores what is deferred for an agent whose turn frame it doesn't wait for", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    // A frame stop() doesn't await, such as a puppet call still running,
+    // holds the agent's turn token.
+    internals.activeTurnTokens.set('assistant', 1);
+    assert.equal(internals.addMessage('Antra', text('still to land')), '', 'deferred: the turn is alive');
+    await framework.stop();
+
+    const reopened = await createFramework();
+    assert.ok(windowOf(reopened).includes('Antra: still to land'), 'stored before the store closed');
+    await reopened.stop();
+  });
+
+  it('a turn waiting to retry when the framework stops gives up rather than compile again', async () => {
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const framework = await createFramework({
+      errorPolicy: {
+        maxRetries: 2,
+        onInferenceError: (_error: Error, _agent: string, attempt: number) => {
+          waiting();
+          return attempt < 2 ? { retry: true as const, delayMs: 50 } : { retry: false as const };
+        },
+      },
+    });
+    const internals = internalsOf(framework);
+    const agent = framework.getAgent('assistant')!;
+    let compiles = 0;
+    (agent as unknown as { startStreamWithInjections: () => Promise<never> }).startStreamWithInjections = async () => {
+      compiles++;
+      throw new Error('boom');
+    };
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+    await inDelay;
+    assert.equal(internals.addMessage('Antra', text('while it waits')), '', 'deferred: the turn is alive');
+    const error = console.error;
+    console.error = () => {};
+    try { await framework.stop(); } finally { console.error = error; }
+    assert.equal(compiles, 1, 'the retry was refused, not compiled');
+
+    const reopened = await createFramework();
+    assert.ok(windowOf(reopened).includes('Antra: while it waits'), 'what was deferred for it was stored');
+    await reopened.stop();
   });
 
   it('a message stored straight into the context during a round, with nothing injected at the boundary, stays unread', async () => {

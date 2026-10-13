@@ -257,6 +257,37 @@ describe('live operator surgery', () => {
     }
   });
 
+  it("the post-surgery flush lands what waited behind the hold while another agent's tool cycle is pending, and acknowledges it", async () => {
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
+    const internals = framework as unknown as {
+      surgeryHold: unknown;
+      deferredWritesPersisted: boolean;
+      unackedDeferredWrites: unknown[];
+      pendingAssistantBlocks: Map<string, unknown[]>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    internals.deferredWritesPersisted = true;
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'deferred');
+      // Another agent's tool cycle says nothing about scout's window.
+      internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'x', input: {} }]);
+      releaseSwitch();
+      await rollback;
+      assert.ok(remainingTexts().includes('waited for the hold'), 'flushed when the hold released');
+      assert.equal(internals.unackedDeferredWrites.length, 0, 'and acknowledged, so the recovery queue no longer holds it');
+    } finally {
+      internals.pendingAssistantBlocks.delete('builder');
+      c.switchBranch = originalSwitch;
+    }
+  });
+
   // --- strategy-initialization failure -----------------------------------------
   // switchBranch()/fork() move the chronicle branch BEFORE awaiting strategy
   // initialization, so a rejection there leaves the store on the new branch.

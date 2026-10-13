@@ -34,15 +34,22 @@
   cycle holds them.
 - `stop()` now stores what is still deferred for each registered agent
   before the store closes; before, a memory-only queue lost it. Once `stop()`
-  begins, no turn starts and no stream registers, for any agent, so nothing
-  is mid-turn when it does: a turn that was mid-compile when the streams
-  were cancelled is refused rather than left running, and an ephemeral run
-  refused this way ends at once rather than at its startup watchdog. A
+  begins, no turn starts and no stream registers, for any agent: a turn that
+  was mid-compile when the streams were cancelled, or one waiting to retry,
+  is refused rather than left running, and an ephemeral run refused this way
+  ends at once rather than at its startup watchdog. Since no reply can then
+  follow a stored entry, `stop()` stores each one even while a frame it
+  doesn't wait for, such as a puppet call, still holds its target's turn. A
   quiesced host keeps what is deferred in its persisted queue for boot
   recovery. An entry for a target no longer registered (a disposed fork) is
   dropped from a memory-only queue at exit, as before.
 - A deferred write whose store throws goes back into the queue under its
-  id, and the others continue. Before, it stayed in the un-acked set and the
-  next acknowledgement dropped it from the persisted queue (at a turn start
-  or a flush it was lost even from memory). At a tool boundary, such a write
-  isn't injected either.
+  id, and so does every entry queued behind it for that agent, so none lands
+  out of order and a queued `tool_use` and its `tool_result` stay together.
+  The log line names the entry, and one that keeps throwing holds the
+  agent's later deferred writes until it can be stored. Before, it stayed in
+  the un-acked set and the next acknowledgement dropped it from the
+  persisted queue (at a turn start or a flush it was lost even from memory).
+  At a tool boundary, nothing from it on is injected. While the framework
+  runs it is kept; a memory-only queue still loses it when the process
+  exits.

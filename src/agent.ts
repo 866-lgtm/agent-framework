@@ -561,15 +561,16 @@ export class Agent {
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
   /** Counts marks: a compile writes its watermark back only if no mark was
-   *  made while it ran (a tool boundary's, a branch switch's). */
+   *  made while it ran (a tool boundary's, or another compile's). */
   private watermarkMarks = 0;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as consumed (boot, branch switch, and a
-   *  tool boundary that injected messages into the live stream). */
+  /** Mark everything currently stored as consumed (the agent's creation, at
+   *  boot or later, and a tool boundary that injected messages into the live
+   *  stream). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
