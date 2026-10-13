@@ -252,7 +252,8 @@ export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch & {
    * agent's live budget fits at it, with nothing about the budget changed
    * while it ran (a paced descent's settle included): the store fit that
    * budget. A compile the context manager refuses at it as over budget
-   * withdraws it, unless a newer compile has fit at that same budget since.
+   * withdraws it, unless a compile at it that started later has shown
+   * whether it fits.
    * When it equals `contextBudgetTokens`, a restore applies that budget at
    * once, rather than pacing a descent again from the recipe's budget
    * (context-manager #162), if a preview at boot says it still fits; if not,

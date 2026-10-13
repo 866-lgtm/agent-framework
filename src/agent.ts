@@ -157,6 +157,14 @@ export class Agent {
   private descentEpoch = 0;
   /** The live budget the last compile planned at, whether it fit, and the live budget's epoch then. */
   private lastCompiledBudget?: { budget: number; fit: boolean; epoch: number };
+  /** Counts compiles at the live budget as they start. */
+  private compilesStarted = 0;
+  /**
+   * For each budget, when the latest-started compile whose outcome there is
+   * noted started. Of two compiles at one budget, the later-started one
+   * planned the newer context, so its outcome stands, whichever finishes last.
+   */
+  private readonly latestNotedStart = new Map<number, number>();
   /** The last outcome the listener recorded; a failed record is told again, and so is any after a change. */
   private recordedCompiledBudget?: { budget: number; fit: boolean; epoch: number };
   /**
@@ -372,12 +380,17 @@ export class Agent {
   }
 
   /**
-   * Note what a compile at `budget`, planned at the live budget's `epoch`,
-   * showed. It speaks for the live budget only if that hasn't changed since;
-   * the listener is told either way, so a refusal withdraws the record's
-   * marker for the budget it planned at whatever changed meanwhile.
+   * Note what a compile at `budget` showed, planned at the live budget's
+   * `epoch` and started as the `started`th. A compile that started before
+   * one already noted at that budget planned an older context, and is
+   * ignored. Otherwise it speaks for the live budget only if that hasn't
+   * changed since, and the listener is told either way, so a refusal
+   * withdraws the record's marker for the budget it planned at whatever
+   * changed meanwhile.
    */
-  private noteCompiledBudget(budget: number, fit: boolean, epoch: number): void {
+  private noteCompiledBudget(budget: number, fit: boolean, epoch: number, started: number): void {
+    if (started < (this.latestNotedStart.get(budget) ?? 0)) return;
+    this.latestNotedStart.set(budget, started);
     if (epoch === this.liveBudgetEpoch) this.lastCompiledBudget = { budget, fit, epoch };
     const recorded = this.recordedCompiledBudget;
     if (recorded?.budget === budget && recorded.fit === fit && recorded.epoch === epoch) return;
@@ -393,6 +406,7 @@ export class Agent {
     const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
     const epoch = this.liveBudgetEpoch;
     const descent = this.descentEpoch;
+    const started = ++this.compilesStarted;
     let result: CompileResult;
     try {
       result = await compile();
@@ -400,11 +414,9 @@ export class Agent {
       if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
       // A refusal shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
-      // nothing is credited. Only a newer compile that fit at that same
-      // budget, proven at the live budget's epoch since, outweighs it.
-      if (epoch === this.liveBudgetEpoch || this.getProvenContextBudgetTokens() !== live) {
-        this.noteCompiledBudget(live, false, epoch);
-      }
+      // nothing is credited, unless a compile that started later has shown
+      // what that budget does.
+      this.noteCompiledBudget(live, false, epoch, started);
       // A budget a boot restore applied at once, refused at its first test,
       // before anything wrote the budget: restore it paced instead, as the
       // boot would have without its proof, and compile again from the
@@ -439,8 +451,8 @@ export class Agent {
     const sameLive = this.liveBudgetEpoch === epoch;
     const sameDescent = this.descentEpoch === descent;
     const settled = this.settleRuntimeSettingsTransition();
-    if (sameLive && settled && sameDescent) this.noteCompiledBudget(this.contextBudgetTokens!, true, this.liveBudgetEpoch);
-    else if (sameLive && !settled) this.noteCompiledBudget(live, true, epoch);
+    if (sameLive && settled && sameDescent) this.noteCompiledBudget(this.contextBudgetTokens!, true, this.liveBudgetEpoch, started);
+    else if (sameLive && !settled) this.noteCompiledBudget(live, true, epoch, started);
     return result;
   }
 

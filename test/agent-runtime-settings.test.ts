@@ -278,7 +278,7 @@ describe('a reached budget across a restart', () => {
       }
       // One line, written once the restore is made, saying why and what it made.
       assert.deepEqual(log.lines.filter((line) => line.includes('[agent-settings]')), [
-        '[agent-settings] agent: its last compile before the stop fit at contextBudgetTokens=60000, but the folded floor renders ' +
+        '[agent-settings] agent: its record says a compile fit at contextBudgetTokens=60000, but the folded floor renders ' +
           '70000 tokens against it now; restored it paced instead: contextBudgetTokens is 60000, and compiles plan at 100000 (converging)',
       ]);
     });
@@ -371,6 +371,22 @@ describe('a reached budget across a restart', () => {
       ]);
       restarted.updateAgentRuntimeSettings('agent', { tailTokens: 20_000 });
       assert.deepEqual(persisted(restarted), { transitionPaceTokens: 4_000, tailTokens: 20_000 }, 'a later write leaves them out');
+    });
+    await run(async ({ framework, restart }) => {
+      writeRecord(framework(), { transitionPaceTokens: 0, tailTokens: 20_000 });
+      const log = quietErrors();
+      let restarted: AgentFramework;
+      try {
+        restarted = await restart();
+      } finally {
+        log.restore();
+      }
+      assert.equal(restarted.getAgentRuntimeSettings('agent').tailTokens, 20_000);
+      assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [
+        '[agent-settings] ignoring an invalid persisted transitionPaceTokens for agent "agent": a number that isn\'t a positive safe integer',
+      ]);
+      restarted.updateAgentRuntimeSettings('agent', { sameRoundThinkTextPolicy: 'private' });
+      assert.deepEqual(persisted(restarted), { tailTokens: 20_000, sameRoundThinkTextPolicy: 'private' }, 'a later write leaves the pace out');
     });
   });
 
@@ -495,34 +511,72 @@ describe('a reached budget across a restart', () => {
     });
   });
 
-  it('a refusal planned before the budget came back to it leaves the marker a newer compile wrote there', async () => {
+  /**
+   * Two compiles at 60k, the first held until `between` has run: `firstFits`
+   * says how the first ends, and the second, started after it, ends the
+   * other way.
+   */
+  async function twoCompilesAt60k(f: AgentFramework, firstFits: boolean, between: () => Promise<void>) {
+    const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
+    const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
+      const isFirst = ++calls === 1;
+      if (isFirst) await held;
+      if (isFirst !== firstFits) throw refusal;
+      return original.apply(this, args);
+    }, async () => {
+      const first = compile(f);
+      await between();
+      release();
+      if (firstFits) await first;
+      else await assert.rejects(first, /over budget/);
+    });
+  }
+
+  it('of two compiles at one budget, the one that started later decides, whichever finishes last', async () => {
+    // A refusal planned before a fit at the same budget, with nothing changed between them.
     await run(async ({ framework }) => {
       const f = framework();
       f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
-      const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
-      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      let calls = 0;
-      // The first compile plans at 60k and is refused only after the budget
-      // went to 80k and came back to 60k, and a second compile fit at 60k.
-      await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
-        if (++calls === 1) {
-          await held;
-          throw refusal;
-        }
-        return original.apply(this, args);
-      }, async () => {
-        const first = compile(f);
-        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
-        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await twoCompilesAt60k(f, false, async () => {
         await compile(f);
         assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the second compile fit at 60k');
-        release();
-        await assert.rejects(first, /over budget/);
       });
-      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the newer fit outweighs the older refusal');
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the later-started fit stands');
       assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), 60_000);
+    });
+    // A refusal planned before the budget went to 80k and came back to 60k,
+    // where a second compile fit; then, in a second run, the budget moves to
+    // 70k unpersisted before the refusal arrives.
+    for (const moveAway of [false, true]) {
+      await run(async ({ framework }) => {
+        const f = framework();
+        f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+        await twoCompilesAt60k(f, false, async () => {
+          f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000 });
+          f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+          await compile(f);
+          assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the second compile fit at 60k');
+          if (moveAway) f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 70_000 }, { persist: false });
+        });
+        assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 }, 'the later-started fit stands');
+        assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), moveAway ? undefined : 60_000);
+      });
+    }
+    // A fit planned before a refusal at the same budget.
+    await run(async ({ framework }) => {
+      const f = framework();
+      f.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
+      await compile(f);
+      await twoCompilesAt60k(f, true, async () => {
+        await assert.rejects(compile(f), /over budget/);
+        assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'the second compile\'s refusal withdrew the marker');
+      });
+      assert.deepEqual(persisted(f), { contextBudgetTokens: 60_000 }, 'the later-started refusal stands');
+      assert.equal(f.getAgent('agent')!.getProvenContextBudgetTokens(), undefined);
     });
   });
 
@@ -875,7 +929,7 @@ describe('a reached budget across a restart', () => {
     const cases: Array<[Record, string]> = [
       // One line, which keeps why a reached budget wasn't applied at once.
       [{ contextBudgetTokens: 60_000, contextBudgetReachedTokens: 60_000 },
-        `[agent-settings] agent: its last compile before the stop fit at contextBudgetTokens=60000, but whether it fits now can't be checked (${refused}); ${kept}`],
+        `[agent-settings] agent: its record says a compile fit at contextBudgetTokens=60000, but whether it fits now can't be checked (${refused}); ${kept}`],
       [{ contextBudgetTokens: 60_000 }, `[agent-settings] agent: ${kept}`],
     ];
     for (const [record, line] of cases) {

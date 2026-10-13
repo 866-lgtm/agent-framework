@@ -4073,26 +4073,27 @@ export class AgentFramework {
    * this (validatePersistedAgentRuntimeSettings), and a valid one always
    * applies. A tail, pace or budget that can't be applied now (a tail or pace
    * on a strategy without live settings, a budget no longer above maxTokens,
-   * a lower one on a strategy that can't prepare a smaller window) is kept
-   * set but unapplied (Agent.keepRuntimeSettings), so a later persisting
-   * write keeps it in the record.
+   * a lower one restored paced on a strategy that can't prepare a smaller
+   * window) is kept set but unapplied (Agent.keepRuntimeSettings), so a later
+   * persisting write keeps it in the record.
    *
    * A budget below the recipe's restores as a paced descent from it, unless
-   * the record says the last compile before the stop fit at it
-   * (`contextBudgetReachedTokens`) and the preflight says it fits now: then
-   * it is applied at once. The preflight plans the stored context as the
-   * context manager will, with the restored tail and pace, so it sees what a
-   * restart can change there: a new maxTokens (the response reserve) or
-   * strategy configuration. It also sees a context that grew while the agent
-   * ran at another budget after the record was written, through a persist:
-   * false change. The system prompt and tools are outside the context
-   * manager's budget, so they don't enter it (context-manager #162). If a
-   * compile at a budget applied at once is refused, the agent restores it
-   * paced then (Agent.restoreRuntimeSettings). A budget at or above the
-   * recipe's is applied at once either way, as an increase always is.
+   * the record carries its marker (`contextBudgetReachedTokens`, written when
+   * a compile fit at it) and the preflight says it fits now: then it is
+   * applied at once. The preflight plans the stored context as the context
+   * manager will, with the restored tail and pace, so it sees what a restart
+   * can change there: a new maxTokens (the response reserve) or strategy
+   * configuration. It also sees a context that grew while the agent ran at
+   * another budget after the record was written, through a persist: false
+   * change. The system prompt and tools are outside the context manager's
+   * budget, so they don't enter it (context-manager #162). If a compile at a
+   * budget applied at once this way is refused, the agent restores it paced
+   * then (Agent.restoreRuntimeSettings). A budget at or above the recipe's
+   * is applied at once with or without the marker, as an increase always is.
    *
-   * One line says why a reached budget wasn't applied at once, what couldn't
-   * be applied, and the budget set beside the one compiles plan at.
+   * When a marked budget isn't applied at once or a setting can't be
+   * applied, one line says why, what couldn't be applied, and the budget set
+   * beside the one compiles plan at.
    */
   private restorePersistedRuntimeSettings(
     agentName: string,
@@ -4137,7 +4138,7 @@ export class AgentFramework {
           why = `applying it at once failed (${messageOf(error)}), though the preflight says it fits now`;
         }
       }
-      if (why !== undefined) atOnce = `its last compile before the stop fit at contextBudgetTokens=${budget}, but ${why}`;
+      if (why !== undefined) atOnce = `its record says a compile fit at contextBudgetTokens=${budget}, but ${why}`;
     }
     const budgetKept = budget !== undefined && !appliedAtOnce && !restore({ contextBudgetTokens: budget });
     if (atOnce === undefined && unapplied.length === 0) return;
@@ -4178,7 +4179,7 @@ export class AgentFramework {
    * budget. Nothing else in the record changes, and a budget other than the
    * record's (one applied with `persist: false`, or a descent's starting
    * budget) writes nothing. A record that can't be read, or written, is
-   * logged, and the agent tells it again at its next compile.
+   * logged, and the next compile at that budget tells it again.
    */
   private recordCompiledContextBudget(agentName: string, budget: number, fit: boolean): boolean {
     try {
@@ -4189,7 +4190,7 @@ export class AgentFramework {
       this.persistAgentRuntimeSettings(agentName, fit ? { ...settings, contextBudgetReachedTokens: budget } : settings);
       return true;
     } catch (error) {
-      // The agent tells it again at its next compile.
+      // The next compile at this budget tells it again.
       console.error(`[agent-settings] couldn't record ${agentName}'s compile at budget ${budget}:`, error);
       return false;
     }
