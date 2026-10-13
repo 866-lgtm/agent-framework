@@ -395,7 +395,7 @@ import type { McplServerConnection } from './mcpl/server-connection.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { redactUrl, resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
-import { normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
+import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -967,10 +967,16 @@ interface EphemeralRun {
  * line, since the tool that returned it needs fixing whether or not the
  * script reports it.
  */
-function unconvertibleScriptResult(toolName: string, err: unknown): string {
-  const reason = err instanceof Error ? err.message : String(err);
+function unconvertibleScriptResult(toolName: string, err: unknown, ownError?: string): string {
+  let reason: string;
+  try {
+    reason = err instanceof Error ? err.message : String(err);
+  } catch {
+    reason = 'a value with no text form'; // String() throws on an object with no prototype
+  }
+  const own = ownError ? `, with this error: ${ownError}` : '.';
   const text = `tool '${toolName}' returned a result that can't be converted to JSON, so the script can't receive it ` +
-    `(${reason}). The call itself completed.`;
+    `(${reason}). The call itself completed${own}`;
   console.error(`[code_execution] ${text}`);
   return text;
 }
@@ -12002,7 +12008,8 @@ export class AgentFramework {
     try {
       json = JSON.stringify(object);
     } catch (err) {
-      return JSON.stringify({ content: [], structuredContent: null, isError: true, error: unconvertibleScriptResult(toolName, err) });
+      const error = unconvertibleScriptResult(toolName, err, result.isError ? result.error : undefined);
+      return JSON.stringify({ content: [], structuredContent: null, isError: true, error });
     }
     if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return json;
     const workspace = this.getWorkspaceModule();
@@ -15432,7 +15439,14 @@ export class AgentFramework {
         return this.mcpToolResult(result, call.id, mcpl);
       }
       const direct = AgentFramework.directToolResult(result);
-      return mcpl && Array.isArray(direct.data) ? { ...direct, data: direct.data.map(referenceBlockForScript) } : direct;
+      if (mcpl) return Array.isArray(direct.data) ? { ...direct, data: direct.data.map(referenceBlockForScript) } : direct;
+      // A standard peer's content that isn't a list of blocks is a malformed
+      // result on the model's reading (normalizeStandardToolResult), so the
+      // script reads it that way too, its structured content kept.
+      if (!result.isError && result.content !== undefined && !Array.isArray(result.content)) {
+        return { success: false, isError: true, error: MALFORMED_CONTENT_NOTICE, data: [], structured: result.structuredContent };
+      }
+      return direct;
     };
 
     if (modern) {

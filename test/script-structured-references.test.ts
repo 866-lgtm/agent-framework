@@ -65,8 +65,8 @@ interface Harness {
   answer: (result: Answer) => void;
   /** A script's call to a tool of the MCPL peer `files`, or of the MCP-only peer `plain`. */
   script: (tool: string) => Promise<string>;
-  /** A call the model makes to a tool of `files`, through the same dispatch. */
-  modelCall: (tool: string) => Promise<ToolResult>;
+  /** A call the model makes to a tool of `files` (or of `plain`), through the same dispatch. */
+  modelCall: (tool: string, server?: 'files' | 'plain') => Promise<ToolResult>;
   /** The URIs the fetcher was asked for, saved records aside. */
   fetched: string[];
   workspace: WorkspaceModule;
@@ -111,7 +111,7 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
       return { ok: true, path: SAVED };
     },
   });
-  const modelCall = (tool: string) => new Promise<ToolResult>((resolve) => {
+  const modelCall = (tool: string, server: 'files' | 'plain' = 'files') => new Promise<ToolResult>((resolve) => {
     const id = `model-${randomUUID()}`;
     const push = internals.pushEvent;
     internals.pushEvent = (event) => {
@@ -119,7 +119,7 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
       internals.pushEvent = push;
       resolve(event.result!);
     };
-    internals.dispatchMcplToolCall('agent', { id, name: `mcpl--files--${tool}`, input: {} }, 'files', 'mcpl--files');
+    internals.dispatchMcplToolCall('agent', { id, name: `mcpl--${server}--${tool}`, input: {} }, server, `mcpl--${server}`);
   });
   framework.start();
   try {
@@ -173,6 +173,22 @@ test("an MCP-only peer's structured result reaches a script as the server sent i
     assert.deepEqual(object, { content: blocks('plain'), structuredContent: { attachments: 2 }, isError: false },
       'resource links, embedded resources, uri-form media and inline data are ordinary MCP blocks there');
     assert.deepEqual(fetched, [], 'nothing is a reference, so nothing is fetched');
+  });
+});
+
+test("content that isn't a list of blocks reaches a script as the model reads it, for each kind of peer", async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    answer({ content: 'not a list' as unknown as unknown[], structuredContent: { a: 1 } });
+    const notice = '[malformed result: its content is not a list of blocks; the tool may already have completed]';
+    // A standard peer's reading calls it a malformed result, on both paths.
+    const plainModel = await modelCall('attach', 'plain');
+    assert.equal(plainModel.isError, true);
+    assert.ok(plainModel.error?.startsWith(notice), plainModel.error);
+    assert.deepEqual(JSON.parse(await script('mcpl--plain--attach')), { content: [], structuredContent: { a: 1 }, isError: true, error: notice });
+    // An MCPL peer's reading has no content and reads the structured view, on both paths.
+    const filesModel = await modelCall('attach', 'files');
+    assert.equal(filesModel.isError, false);
+    assert.deepEqual(JSON.parse(await script('mcpl--files--attach')), { content: [], structuredContent: { a: 1 }, isError: false });
   });
 });
 

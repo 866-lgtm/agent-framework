@@ -84,6 +84,9 @@ test('errors and the status view show a url redacted: no userinfo, no query valu
   assert.equal(redactUrl('https://mcp.example/server/123e4567-e89b-12d3-a456-426614174000/mcp'), 'https://mcp.example/server/redacted/mcp');
   assert.equal(redactUrl(`https://mcp.example/${'a'.repeat(32)}/mcp`), 'https://mcp.example/redacted/mcp');
   assert.equal(redactUrl('https://mcp.example/v2/2026-07-28/organization-settings/mcp'), 'https://mcp.example/v2/2026-07-28/organization-settings/mcp');
+  // A bare token rides as a valueless name; a short plain name stays.
+  assert.equal(redactUrl('https://h/mcp?sk-live-abcdef0123456789'), 'https://h/mcp?redacted=redacted');
+  assert.equal(redactUrl('https://h/mcp?verbose'), 'https://h/mcp?verbose=redacted');
   assert.equal(redactUrl('not a url ?token=abc'), '(an invalid url, not shown)');
   assert.equal(redactUrl(undefined), '(an invalid url, not shown)');
   // The configuration errors that name a url give it redacted, or not at all.
@@ -205,14 +208,14 @@ test('a credential sent in cleartext to a host that is not loopback is warned ab
 
 test('a secret the url carries itself is warned about too, and the warning never quotes it', () => {
   const warned = (url: string, extra: Partial<McplServerConfig> = {}) => serverConfigWarnings(cfg({ url, ...extra }));
-  assert.match(warned('http://user:pw@10.0.0.5/mcp')[0]!, /its url's userinfo goes to 10\.0\.0\.5 unencrypted \(http:\/\/\).*read it;/);
+  assert.match(warned('ws://user:pw@10.0.0.5/mcpl')[0]!, /its url's userinfo goes to 10\.0\.0\.5 unencrypted \(ws:\/\/\).*read it;/);
   assert.match(warned('ws://mcp.lan/mcpl?api_key=k1')[0]!, /its url's query parameter "api_key" goes to mcp\.lan unencrypted.*use wss:\/\//);
   for (const name of ['token', 'Access_Token', 'apikey', 'client_secret', 'password', 'auth', 'X-Amz-Signature']) {
     assert.equal(warned(`http://10.0.0.5/mcp?${name}=v`).length, 1, name);
   }
-  const both = warned('http://u:p@10.0.0.5/mcp?token=a&sig_key=b&region=eu', { token: 't' })[0]!;
+  const both = warned('ws://u:p@10.0.0.5/mcpl?token=a&sig_key=b&region=eu', { token: 't' })[0]!;
   assert.match(both, /its credential, its url's userinfo and its url's query parameters "token", "sig_key" go to 10\.0\.0\.5 unencrypted.*read them;/);
-  for (const text of [both, ...warned('http://user:pw@10.0.0.5/mcp?token=sekret')]) assert.ok(!/sekret|pw|u:p/.test(text), text);
+  for (const text of [both, ...warned('ws://user:pw@10.0.0.5/mcpl?token=sekret')]) assert.ok(!/sekret|pw|u:p/.test(text), text);
   const path = warned('http://10.0.0.5/api/mcp/s/Zt4kQ9xW2vLm8pRs7YbN/mcp')[0]!;
   assert.match(path, /a credential-like segment of its url's path goes to 10\.0\.0\.5 unencrypted.*read it;/);
   assert.ok(!path.includes('Zt4kQ9xW2vLm8pRs7YbN'), path);
@@ -247,6 +250,19 @@ test('an access provider that throws is logged by its error class and length, no
   assert.equal(describeCredentialError(new ProviderError('x')), 'ProviderError, 1 character');
   assert.equal(describeCredentialError('sekret'), 'a thrown string');
   assert.equal(describeCredentialError(undefined), 'a thrown undefined');
+});
+
+test("an http(s) url with userinfo is refused, since the HTTP client can't send it and its error would quote it", () => {
+  for (const url of ['http://user:S3CRET@127.0.0.1:9/mcp', 'http://user:S3CRET@10.0.0.5/mcp', 'https://user:S3CRET@mcp.example/mcp', 'http://justauser@127.0.0.1:9/mcp']) {
+    const problems = serverConfigProblems(cfg({ url }));
+    assert.deepEqual(problems, [
+      'MCP server "s": an http(s):// url can\'t carry userinfo (user:password@), since the HTTP client refuses such a url; give the credential as "token" or "accessProvider"',
+    ], url);
+    // The modern engine checks at create(), so nothing is dialed with it.
+    assert.throws(() => ModernMcpConnection.create(cfg({ id: 's', url })), (error: Error) => error.message === problems[0]);
+    assert.deepEqual(serverConfigWarnings(cfg({ url })), [], 'a refusal, not also a warning');
+  }
+  assert.deepEqual(serverConfigProblems(cfg({ url: 'ws://user:pw@127.0.0.1:9/mcpl' })), [], 'a WebSocket url sends its userinfo');
 });
 
 test('both engines admit a configuration through checkServerConfig, which logs its warnings', () => {

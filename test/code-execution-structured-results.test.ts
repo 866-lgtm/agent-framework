@@ -44,7 +44,7 @@ class UnconvertibleModule implements Module {
   async stop(): Promise<void> {}
   async onProcess(): Promise<EventResponse> { return {}; }
   getTools(): ToolDefinition[] {
-    return ['cyclic', 'bigint', 'cyclic_data'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
+    return ['cyclic', 'bigint', 'cyclic_data', 'cyclic_error'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
@@ -52,6 +52,7 @@ class UnconvertibleModule implements Module {
     cyclic.self = cyclic;
     if (name === 'cyclic') return { success: true, data: text('a loop'), structured: cyclic };
     if (name === 'bigint') return { success: true, data: text('a big number'), structured: { n: 1n } };
+    if (name === 'cyclic_error') return { success: false, isError: true, error: 'db timeout', data: text('failed'), structured: cyclic };
     return { success: true, data: cyclic };
   }
 }
@@ -129,6 +130,9 @@ test("a script reads a structured result whole, the model's calls and history ke
       'cyclic_data = await loop__cyclic_data({})',
       'assert cyclic_data.startswith("Error: tool ") and "loop--cyclic_data" in cyclic_data and "circular" in cyclic_data, cyclic_data',
       'assert all("The call itself completed." in e for e in [cyclic["error"], bigint["error"], cyclic_data]), "completed"',
+      // An error result that can't be converted keeps the tool's own error.
+      'cyclic_error = json.loads(await loop__cyclic_error({}))',
+      'assert cyclic_error["isError"] is True and cyclic_error["error"].endswith("The call itself completed, with this error: db timeout"), cyclic_error',
       'print(r["structuredContent"]["runId"], r["structuredContent"]["state"], r["structuredContent"]["output"])',
     ].join('\n');
     membrane.pushResponse(createMockResponse([

@@ -75,8 +75,8 @@ function credentialLikeSegment(segment: string): boolean {
  * A url as text a person or a log reads it: its scheme, host and port, and
  * its path with any credential-like segment replaced. The userinfo is
  * removed and each query parameter's value replaced, since a credential
- * rides there too. A url that doesn't parse can't be redacted, so it isn't
- * shown at all.
+ * rides there too, and so is a parameter name that looks like one. A url
+ * that doesn't parse can't be redacted, so it isn't shown at all.
  */
 export function redactUrl(url: string | undefined): string {
   let parsed: URL;
@@ -89,7 +89,9 @@ export function redactUrl(url: string | undefined): string {
   parsed.password = '';
   parsed.hash = '';
   parsed.pathname = parsed.pathname.split('/').map((segment) => (credentialLikeSegment(segment) ? 'redacted' : segment)).join('/');
-  parsed.search = new URLSearchParams([...parsed.searchParams].map(([name]): [string, string] => [name, 'redacted'])).toString();
+  // A bare token rides as a name with no value (`?<token>`), so a name that
+  // looks like a credential is replaced too.
+  parsed.search = new URLSearchParams([...parsed.searchParams].map(([name]): [string, string] => [credentialLikeSegment(name) ? 'redacted' : name, 'redacted'])).toString();
   return parsed.toString();
 }
 
@@ -183,6 +185,17 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     return [(error as Error).message];
   }
   const problems: string[] = [];
+  if (binding.transport === 'http') {
+    // fetch refuses a url with userinfo, and its error quotes the whole url,
+    // password included, into the connect failure's log line, trace and
+    // ops alert. A setting nothing could send is refused, not ignored.
+    const url = new URL(config.url!);
+    if (url.username || url.password) {
+      problems.push(
+        `MCP server "${config.id}": an http(s):// url can't carry userinfo (user:password@), since the HTTP client refuses such a url; give the credential as "token" or "accessProvider"`,
+      );
+    }
+  }
   if (config.protocol !== undefined) {
     if (config.protocol !== 'legacy' && config.protocol !== 'modern') {
       problems.push(`MCP server "${config.id}": protocol must be 'legacy' or 'modern', got ${JSON.stringify(config.protocol)}`);
@@ -241,9 +254,9 @@ const CREDENTIAL_PARAM = /token|key|secret|password|auth|signature/i;
  * as messages; empty when there is nothing. A credential for an `http://` or
  * `ws://` url whose host isn't loopback crosses the network in cleartext:
  * `token` or `accessProvider` (in the `Authorization` header, or the
- * WebSocket `?token=` query), and a secret the url carries itself (userinfo,
- * a query parameter whose name says it's a credential, or a path segment
- * that looks like one, as {@link redactUrl} judges it). That can be
+ * WebSocket `?token=` query), and a secret the url carries itself (a ws://
+ * url's userinfo, a query parameter whose name says it's a credential, or a
+ * path segment that looks like one, as {@link redactUrl} judges it). That can be
  * deliberate, on a private network or behind a TLS-terminating proxy, so it
  * is a warning and never a refusal.
  */
@@ -259,7 +272,9 @@ export function serverConfigWarnings(config: McplServerConfig): string[] {
   if ((url.protocol !== 'http:' && url.protocol !== 'ws:') || isLoopbackHost(url.hostname)) return [];
   const carried: string[] = [];
   if (config.token || config.accessProvider) carried.push('its credential');
-  if (url.username || url.password) carried.push("its url's userinfo");
+  // An http:// url's userinfo is refused (serverConfigProblems); a ws://
+  // url sends it.
+  if (url.protocol === 'ws:' && (url.username || url.password)) carried.push("its url's userinfo");
   if (url.pathname.split('/').some(credentialLikeSegment)) carried.push("a credential-like segment of its url's path");
   const params = [...new Set([...url.searchParams.keys()].filter((name) => CREDENTIAL_PARAM.test(name)))];
   if (params.length > 0) {

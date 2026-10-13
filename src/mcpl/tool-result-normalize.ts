@@ -30,6 +30,11 @@
  */
 import type { ToolResult } from '../types/index.js';
 
+/** What a result whose content is present but isn't a list of blocks reads
+ *  as, on the model's path and a script's alike. */
+export const MALFORMED_CONTENT_NOTICE =
+  '[malformed result: its content is not a list of blocks; the tool may already have completed]';
+
 /** Saves a payload under a host-chosen name; resolves to its workspace path,
  *  or null when there is nowhere writable to put it. */
 export type SaveToolPayload = (fileName: string, bytes: Buffer, mimeType: string) => Promise<string | null>;
@@ -258,7 +263,7 @@ export async function normalizeStandardToolResult(
   if (malformed) {
     return {
       success: false,
-      error: `[malformed result: its content is not a list of blocks; the tool may already have completed]${text ? `\n${text}` : ''}`,
+      error: `${MALFORMED_CONTENT_NOTICE}${text ? `\n${text}` : ''}`,
       isError: true,
       ...structured,
     };
