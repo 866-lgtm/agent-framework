@@ -84,7 +84,7 @@ test('closing the connection while a request awaits its answer rejects it as no-
   connection = null;
 });
 
-test('channels/open keeps a deadline when requestTimeoutMs is 0, as channels/publish does', async () => {
+test('channels/open keeps a deadline when requestTimeoutMs is 0, as channels/publish does', { timeout: 10_000 }, async () => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
   (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 200;
   const err = await rejectsWith(connection.sendChannelsOpen({ type: 'channel', address: { id: 'nowhere' } } as never), 'no-response');
