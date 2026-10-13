@@ -220,6 +220,7 @@ describe('RecordJournal', () => {
       failAppend = 'after-writing';
       assert.throws(() => journal.append({ n: 'B' }), /EIO: fsync failed/);
       assert.strictEqual(journal.needsReconcile, false, 'no load() on this store can read B back');
+      assert.strictEqual(journal.needsReopen, true, 'what this view holds may lack B until a reopen');
       assert.deepStrictEqual(journal.load().entries.map((e) => e.entry.n), ['A'], 'B is outside this view of the store');
       // A checkpoint now would cover B, unreduced, so nothing more is written.
       const blocked = /append failed inside the store \(EIO: fsync failed\).*until the store is reopened/;
@@ -244,6 +245,31 @@ describe('RecordJournal', () => {
       assert.throws(() => second.append({ n: 'D' }), /until the store is reopened/);
       assert.deepStrictEqual(new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load(),
         { snapshot: { seen: ['A', 'B', 'C'] }, entries: [] });
+    });
+  });
+
+  it('a durable checkpoint whose barrier throws blocks writes until load() replays it', () => {
+    withStore((store) => {
+      let failNextSync = false;
+      const flaky = {
+        getRecordIdsByType: (type: string) => store.getRecordIdsByType(type),
+        getRecord: (id: string) => store.getRecord(id),
+        appendJson: (type: string, data: unknown) => store.appendJson(type, data),
+        sync: () => {
+          if (failNextSync) { failNextSync = false; throw new Error('disk full'); }
+          store.sync();
+        },
+      } as unknown as JsStore;
+      const journal = new RecordJournal<Entry, { seen: string[] }>(flaky, { type: 'journal-test/entry' });
+      journal.append({ n: 'A' });
+
+      failNextSync = true;
+      assert.throws(() => journal.checkpoint({ seen: ['A'] }, { durable: true }), /disk full/);
+      assert.strictEqual(journal.needsReconcile, true);
+      assert.strictEqual(journal.needsReopen, false, 'the checkpoint is in this view of the store');
+      assert.throws(() => journal.append({ n: 'C' }), /load\(\) and reduce its tail/);
+      assert.deepStrictEqual(journal.load(), { snapshot: { seen: ['A'] }, entries: [] }, 'the checkpoint landed');
+      journal.append({ n: 'C' });
     });
   });
 
