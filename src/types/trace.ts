@@ -1,6 +1,7 @@
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
+import type { DraftReason } from '../prose-drafts.js';
 
 /**
  * Base for all trace events.
@@ -585,7 +586,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'prose:drafts-held';
       agentName: string;
-      reason: 'explicit-send' | 'no-destination' | 'ambiguous' | 'bounced';
+      reason: DraftReason;
       draftIds: string[];
       textLen: number;
     })
