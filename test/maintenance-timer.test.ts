@@ -123,6 +123,48 @@ class RefusingInitStrategy implements ContextStrategy {
   }
 }
 
+/** A strategy that refuses on its own, as the autobiographical one does for a branch it hasn't reloaded. */
+class StaleStrategy implements ContextStrategy {
+  readonly name = 'stale-test';
+
+  checkReadiness(): ReadinessState {
+    throw new Error('StaleStrategy.checkReadiness requires reinitialization for the current branch generation');
+  }
+
+  getProgressSnapshot(): Record<string, unknown> {
+    throw new Error('StaleStrategy.getProgressSnapshot requires reinitialization for the current branch generation');
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {}
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+/** A strategy with work pending that no tick finishes. */
+class NeverReadyStrategy implements ContextStrategy {
+  readonly name = 'never-ready-test';
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'never ready' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {}
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 /** A strategy whose tick fences its own manager with a failed initialization. */
 class FencingTickStrategy implements ContextStrategy {
   readonly name = 'fencing-tick-test';
@@ -383,7 +425,7 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  it('an agent whose context manager refuses sits the pass out, and the others still run', async () => {
+  it('an agent whose readiness can\'t be read fails alone: its run records the error and it gets its own alert', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-'));
     const healthy = new QueuedStrategy();
     const framework = await AgentFramework.create({
@@ -414,21 +456,27 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => healthy.ticks >= 2);
-      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.some(
+        (run) => run.agents.some((agent) => agent.agentName === 'healthy' && agent.readyAfter === true),
+      ));
       const snapshot = framework.getContextMaintenanceSnapshot();
-      assert.deepEqual(snapshot.history[0].agents.map((run) => run.agentName), ['healthy']);
-      assert.equal(snapshot.history[0].agents[0].readyAfter, true);
+      const run = snapshot.history.find((r) => r.agents.some((agent) => agent.agentName === 'healthy'))!;
+      const fencedRun = run.agents.find((agent) => agent.agentName === 'fenced');
+      assert.equal(fencedRun?.ticks, 0);
+      assert.match(fencedRun?.error ?? '', /requires successful strategy initialization/);
       const entry = snapshot.agents.find((agent) => agent.agentName === 'fenced');
       assert.equal(entry?.ready, false);
-      assert.match(entry?.refused ?? '', /requires successful strategy initialization/);
-      assert.deepEqual(alerts, []);
+      assert.match(entry?.error ?? '', /requires successful strategy initialization/);
+      assert.ok(alerts.some((alert) => alert.agentName === 'fenced' && alert.data?.scope === 'agent'));
+      assert.equal(alerts.some((alert) => alert.data?.scope === 'pass'), false);
+      assert.equal(alerts.some((alert) => alert.agentName === 'healthy'), false);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('a refusal that begins during the pass is recorded on the agent, not thrown out of the pass', async () => {
+  it('a failure that begins during the pass is that agent\'s error and alert, not the pass\'s', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-after-'));
     const strategy = new FencingTickStrategy();
     const framework = await AgentFramework.create({
@@ -453,9 +501,104 @@ describe('queued context maintenance timer', () => {
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
       const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
       assert.equal(run.agentName, 'agent');
-      assert.equal(run.readyAfter, false);
-      assert.match(run.refusedAfter ?? '', /requires successful strategy initialization/);
+      assert.equal(run.ticks, 1);
+      assert.match(run.error ?? '', /requires successful strategy initialization/);
+      assert.equal(run.readyAfter, undefined);
+      assert.ok(alerts.some((alert) => alert.agentName === 'agent' && alert.kind === 'context-maintenance-failed' && alert.data?.scope === 'agent'));
       assert.equal(alerts.some((alert) => alert.data?.scope === 'pass'), false);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a strategy that can\'t report its readiness or its progress fails that agent alone, and the snapshot still answers', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-stale-'));
+    const healthy = new QueuedStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [
+        { name: 'stale', model: 'test-model', systemPrompt: 'test', strategy: new StaleStrategy() },
+        { name: 'healthy', model: 'test-model', systemPrompt: 'test', strategy: healthy },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
+    (framework as any).opsAlert = (
+      kind: string,
+      agentName: string,
+      _message: string,
+      opts?: { data?: Record<string, unknown> },
+    ) => alerts.push({ kind, agentName, data: opts?.data });
+
+    try {
+      framework.start();
+      await waitFor(() => healthy.ticks >= 2);
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.some(
+        (run) => run.agents.some((agent) => agent.agentName === 'healthy' && agent.readyAfter === true),
+      ));
+      const snapshot = framework.getContextMaintenanceSnapshot();
+      const entry = snapshot.agents.find((agent) => agent.agentName === 'stale');
+      assert.equal(entry?.ready, false);
+      assert.match(entry?.error ?? '', /requires reinitialization for the current branch generation/);
+      assert.equal(entry?.progress, undefined);
+      assert.ok(alerts.some((alert) => alert.agentName === 'stale' && alert.data?.scope === 'agent'));
+      assert.equal(alerts.some((alert) => alert.data?.scope === 'pass'), false);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('no pass starts while a surgery holds the store', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-hold-'));
+    const strategy = new QueuedStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    try {
+      framework.start();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(strategy.ticks, 0);
+      assert.equal(framework.getContextMaintenanceSnapshot().history.length, 0);
+      internals.surgeryHold = null;
+      await waitFor(() => strategy.ticks >= 2);
+    } finally {
+      internals.surgeryHold = null;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a pass that ends before its agent is ready records what is still pending', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-pending-after-'));
+    const strategy = new NeverReadyStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    try {
+      framework.start();
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const run = framework.getContextMaintenanceSnapshot().history.at(-1)!.agents[0];
+      assert.equal(run.ticks, 8);
+      assert.equal(run.readyAfter, false);
+      assert.equal(run.pendingBefore, 'never ready');
+      assert.equal(run.pendingAfter, 'never ready');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

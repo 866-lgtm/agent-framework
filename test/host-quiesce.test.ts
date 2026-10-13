@@ -312,6 +312,28 @@ test('resume proceeds with a warn when the strategy cannot preview', async () =>
   });
 });
 
+test('resume proceeds without a verdict for an agent whose context manager refuses', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // A failed strategy initialization fences the context manager: its
+    // settings queries throw until a successful switchBranch or setStrategy.
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const failing = {
+      name: 'refusing-init-test',
+      async initialize() { throw new Error('strategy initialization failed for the test'); },
+      checkReadiness: () => ({ ready: true }),
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    await assert.rejects(cm.setStrategy(failing), /strategy initialization failed for the test/);
+    assert.throws(() => cm.getHotContextSettings(), /requires successful strategy initialization/);
+
+    const status = await framework.resume();
+    assert.equal(status.quiesced, false);
+  });
+});
+
 test('maintenanceTick runs the real maintenance pass while quiesced', async () => {
   class QueuedStrategy implements ContextStrategy {
     readonly name = 'queued-test';

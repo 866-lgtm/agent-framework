@@ -204,9 +204,11 @@ export async function createOfflineRecoveryBranch(
       await contextManager.switchBranch(createdBranch);
       // Work from newest to oldest so earlier redactions never perturb the
       // live positions used by later range endpoints.
+      // Each interval goes as a range, a single message included: removing one
+      // message alone is refused for any shard, a one-shard body's too, and
+      // the range removal refuses a bisected body itself.
       for (const interval of [...suppression.intervals].reverse()) {
-        if (interval.fromId === interval.toId) contextManager.removeMessage(interval.fromId);
-        else contextManager.removeMessages(interval.fromId, interval.toId);
+        contextManager.removeMessages(interval.fromId, interval.toId);
       }
       if (batch) outbox.activate(batch.id);
     } catch (error) {

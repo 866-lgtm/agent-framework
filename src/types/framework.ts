@@ -303,10 +303,9 @@ export interface ContextMaintenanceAgentRun {
   progressBefore?: Record<string, unknown>;
   progressAfter?: Record<string, unknown>;
   /**
-   * Set when the context manager refused to report its readiness after the
-   * pass: its strategy's initialization was pending or had failed.
+   * The agent's failure in this pass: a tick that threw, or its readiness
+   * that couldn't be read, before the ticks or after them.
    */
-  refusedAfter?: string;
   error?: string;
 }
 
@@ -329,11 +328,11 @@ export interface ContextMaintenanceSnapshot {
     ready: boolean;
     pending?: string;
     /**
-     * The context manager's refusal to report its readiness: its strategy's
-     * initialization is pending (a branch switch in flight) or has failed.
-     * Such an agent is skipped by maintenance passes until it answers again.
+     * Why the agent's readiness can't be read: the context manager refuses
+     * while its strategy's initialization is pending or has failed, and a
+     * strategy can refuse on its own. `ready` is false then.
      */
-    refused?: string;
+    error?: string;
     progress?: Record<string, unknown>;
   }>;
 }

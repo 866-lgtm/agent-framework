@@ -2505,6 +2505,11 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
+    // A surgery holds the store while it switches or forks a branch, and a
+    // context manager mid-switch refuses its queries. Maintenance waits for
+    // the hold to end rather than report the surgery as a failure: no pass
+    // starts while it's up, and a running pass starts no new tick.
+    if (this.surgeryHold) return;
     const queued = [...this.agents.values()].flatMap((agent) => {
       try {
         agent.toolResultGuard.flushUnrecorded();
@@ -2515,27 +2520,26 @@ export class AgentFramework {
       const tools = this.compressionToolsForAgent(agent.name);
       cm.setToolDefinitions(tools);
       if (this.providerGateBlocked(agent.name)) return [];
-      // The context manager refuses its state queries while its strategy's
-      // initialization is pending (a branch switch in flight) or has failed.
-      // Such an agent sits this pass out; the others still run, and the
-      // snapshot reports the refusal.
       const state = this.contextReadiness(cm);
-      if ('refused' in state || state.ready) return [];
-      const pending = state.pending;
+      if ('ready' in state && state.ready) return [];
       const progress = this.contextProgress(cm);
       const record: ContextMaintenanceAgentRun = {
         agentName: agent.name,
         startedAt: Date.now(),
         ticks: 0,
         readyBefore: false,
-        ...(pending ? { pendingBefore: pending } : {}),
+        ...('pending' in state && state.pending ? { pendingBefore: state.pending } : {}),
         ...(progress ? { progressBefore: progress } : {}),
       };
-      return [{
-        agent,
-        cm,
-        record,
-      }];
+      if ('error' in state) {
+        // Its readiness can't be read: that agent's failure, reported for it
+        // alone, while the others run.
+        record.error = state.error;
+        record.finishedAt = Date.now();
+        this.reportMaintenanceFailure(agent.name, record);
+        return [{ agent, cm, record, failed: true }];
+      }
+      return [{ agent, cm, record, failed: false }];
     });
     if (queued.length === 0) return;
 
@@ -2547,11 +2551,11 @@ export class AgentFramework {
     this.currentMaintenanceRun = run;
 
     try {
-      await Promise.all(queued.map(async ({ agent, cm, record }) => {
+      await Promise.all(queued.filter((item) => !item.failed).map(async ({ agent, cm, record }) => {
         try {
           for (
             let i = 0;
-            i < MAINTENANCE_TICKS_PER_PASS && this.running && !cm.isReady();
+            i < MAINTENANCE_TICKS_PER_PASS && this.running && !this.surgeryHold && !cm.isReady();
             i++
           ) {
             await cm.tick();
@@ -2559,28 +2563,20 @@ export class AgentFramework {
           }
         } catch (error) {
           record.error = error instanceof Error ? error.message : String(error);
-          console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
-          this.opsAlert(
-            'context-maintenance-failed',
-            agent.name,
-            record.error,
-            {
-              data: {
-                scope: 'agent',
-                ...(record.pendingBefore ? { pending: record.pendingBefore } : {}),
-                ...(record.progressBefore ? { progress: record.progressBefore } : {}),
-              },
-            },
-          );
+          this.reportMaintenanceFailure(agent.name, record);
         } finally {
-          const state = this.contextReadiness(cm);
           record.finishedAt = Date.now();
-          if ('refused' in state) {
-            record.readyAfter = false;
-            record.refusedAfter = state.refused;
-          } else {
-            record.readyAfter = state.ready;
-            if (state.pending) record.pendingAfter = state.pending;
+          if (!this.surgeryHold) {
+            const state = this.contextReadiness(cm);
+            if ('error' in state) {
+              if (record.error === undefined) {
+                record.error = state.error;
+                this.reportMaintenanceFailure(agent.name, record);
+              }
+            } else {
+              record.readyAfter = state.ready;
+              if (state.pending) record.pendingAfter = state.pending;
+            }
           }
           const progress = this.contextProgress(cm);
           if (progress) record.progressAfter = progress;
@@ -2596,31 +2592,66 @@ export class AgentFramework {
   }
 
   /**
-   * The context manager's readiness, or its refusal to say: it refuses its
-   * state queries while its strategy's initialization is pending or has
-   * failed, until a successful `switchBranch` or `setStrategy`.
+   * One agent's maintenance failure, recorded on its run (`record.error`):
+   * logged, and alerted for that agent unless a surgery holds the store, in
+   * which case the surgery is what ended it.
+   */
+  private reportMaintenanceFailure(agentName: string, record: ContextMaintenanceAgentRun): void {
+    if (this.surgeryHold) {
+      console.error(
+        `[context-maintenance] agent=${agentName} stopped while a ${this.surgeryHold.verb} holds the store:`,
+        record.error,
+      );
+      return;
+    }
+    console.error(`[context-maintenance] agent=${agentName} failed:`, record.error);
+    this.opsAlert(
+      'context-maintenance-failed',
+      agentName,
+      record.error ?? 'unknown failure',
+      {
+        data: {
+          scope: 'agent',
+          ...(record.pendingBefore ? { pending: record.pendingBefore } : {}),
+          ...(record.progressBefore ? { progress: record.progressBefore } : {}),
+        },
+      },
+    );
+  }
+
+  /**
+   * An agent's context readiness, or the error that reading it threw. The
+   * context manager refuses while its strategy's initialization is pending
+   * or has failed (context-manager 0.14), and a strategy can refuse on its
+   * own, as the autobiographical one does after a store-level branch switch
+   * it hasn't reloaded for. Every such throw is that agent's failure.
    */
   private contextReadiness(
     cm: ContextManager,
-  ): { ready: boolean; pending?: string } | { refused: string } {
+  ): { ready: boolean; pending?: string } | { error: string } {
     try {
       const ready = cm.isReady();
       const pending = ready ? undefined : cm.getPendingWork()?.description;
       return pending ? { ready, pending } : { ready };
     } catch (error) {
-      return { refused: error instanceof Error ? error.message : String(error) };
+      return { error: error instanceof Error ? error.message : String(error) };
     }
   }
 
+  /** The strategy's progress snapshot, for diagnostics: one it can't give reads as none. */
   private contextProgress(cm: ContextManager): Record<string, unknown> | undefined {
-    const strategy = cm.getStrategy() as {
-      getProgressSnapshot?: () => unknown;
-    };
-    if (typeof strategy.getProgressSnapshot !== 'function') return undefined;
-    const progress = strategy.getProgressSnapshot();
-    return progress && typeof progress === 'object'
-      ? progress as Record<string, unknown>
-      : undefined;
+    try {
+      const strategy = cm.getStrategy() as {
+        getProgressSnapshot?: () => unknown;
+      };
+      if (typeof strategy.getProgressSnapshot !== 'function') return undefined;
+      const progress = strategy.getProgressSnapshot();
+      return progress && typeof progress === 'object'
+        ? progress as Record<string, unknown>
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -3558,11 +3589,23 @@ export class AgentFramework {
     }
     const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
     for (const agentName of this.agents.keys()) {
-      let preview = this.previewAgentRuntimeSettings(agentName);
-      for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+      let preview: RuntimeSettingsPreview;
+      try {
         preview = this.previewAgentRuntimeSettings(agentName);
+        for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+          preview = this.previewAgentRuntimeSettings(agentName);
+        }
+      } catch (error) {
+        // The agent's settings can't be read (its context manager refuses while
+        // its strategy's initialization is pending or has failed): no verdict
+        // for it, as for any preview that isn't available.
+        console.warn(
+          `[host-mode] resume: feasibility preview unavailable for ${agentName} ` +
+          `(${error instanceof Error ? error.message : String(error)}) — proceeding without a verdict`,
+        );
+        continue;
       }
       if (preview.available && preview.effective && !preview.effective.fits) {
         failing.push({ agentName, preview });
@@ -3959,8 +4002,8 @@ export class AgentFramework {
       const progress = this.contextProgress(cm);
       return {
         agentName: agent.name,
-        ...('refused' in state
-          ? { ready: false, refused: state.refused }
+        ...('error' in state
+          ? { ready: false, error: state.error }
           : { ready: state.ready, ...(state.pending ? { pending: state.pending } : {}) }),
         ...(progress ? { progress } : {}),
       };
