@@ -1020,12 +1020,13 @@ function boundProviderErrorCode(code: unknown): string | undefined {
 
 /**
  * A value's JSON for a failure sink, with every Error inside it written as its
- * projection (describeFailure): serialising an Error writes its own fields, a
- * MembraneError's whole `rawRequest` among them. Throws, or returns undefined,
- * as JSON.stringify does.
+ * whole projection (failureDescription): serialising an Error writes its own
+ * fields, a MembraneError's whole `rawRequest` among them. The projection is
+ * left uncut, as a nested string is, so the sink's one cut of the JSON states
+ * its whole length. Throws, or returns undefined, as JSON.stringify does.
  */
 function failureJson(value: unknown): string | undefined {
-  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? describeFailure(nested) : nested));
+  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? failureDescription(nested) : nested));
 }
 
 /**

@@ -764,10 +764,9 @@ test('logFailure bounds every field it writes', () => {
     assert.equal(record.consecutive, 1);
     assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, record.error, 2_000, 'failures.log error');
     assert.ok(typeof record.nested === 'string' && record.nested.length <= 2_000);
-    // An Error inside a value is written as its projection, not its own
-    // fields with the request.
-    assert.ok(typeof record.wrapped === 'string' && record.wrapped.length <= 2_000, 'failures.log wrapped');
-    assert.ok(record.wrapped.startsWith(`{"cause":"${HUGE_ERROR_HEAD}: Bad request: zz-head`), record.wrapped.slice(0, 120));
+    // An Error inside a value is written as its whole projection, not its own
+    // fields with the request, and the value's JSON is cut once.
+    assertCut(JSON.stringify({ cause: `${HUGE_ERROR_HEAD}: ${error.message}` }), record.wrapped, 2_000, 'failures.log wrapped');
     // A value JSON can't write no longer loses the whole record.
     assert.equal(record.circular, '[object Object]');
   } finally {
