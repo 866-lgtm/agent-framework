@@ -26,6 +26,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -85,11 +86,13 @@ class SlowModule implements Module {
    * - failure: the module throws (the registry answers an error result)
    * - isError: { success: true, isError: true }, a result that reports an error
    * - bare-failure: { success: false } with no error text
+   * - long-failure: the module throws a 5,000-character error
    */
-  finish(outcome: 'success' | 'failure' | 'isError' | 'bare-failure'): void {
+  finish(outcome: 'success' | 'failure' | 'isError' | 'bare-failure' | 'long-failure'): void {
     if (outcome === 'success') this.settle!.resolve({ success: true, data: { done: true } });
     else if (outcome === 'isError') this.settle!.resolve({ success: true, isError: true, data: { done: false } });
     else if (outcome === 'bare-failure') this.settle!.resolve({ success: false });
+    else if (outcome === 'long-failure') this.settle!.reject(new Error('x'.repeat(5000)));
     else this.settle!.reject(new Error('the work failed'));
   }
 
@@ -193,6 +196,17 @@ describe('stop() with work still in flight', () => {
     assert.match(line, /the tool failed: /, line);
   });
 
+  it("a tool's long error is bounded in the drop's log line", async () => {
+    const { framework, module } = await frameworkWithRunningTool();
+    await framework.stop();
+    module.finish('long-failure');
+    const line = await droppedLine();
+
+    assert.ok(line.length < 800, `logged ${line.length} characters`);
+    assert.match(line, /the tool failed: x+… \(5000 characters\)$/, line);
+    assert.deepEqual(rejections, []);
+  });
+
   it('a result that reports an error is dropped as failed, and a failure with no text says only that', async () => {
     // { success: true, isError: true } is a failure: the drop must not call it a success.
     {
@@ -288,13 +302,15 @@ describe('stop() with work still in flight', () => {
     });
   });
 
-  it('every tool result the framework produces names its tool', () => {
+  it('every tool result the framework produces names its tool, and the call it answers', () => {
     // The drop's log line names the tool from the event's toolName, so a
-    // producer that leaves it out logs a drop nobody can reconcile. Every
+    // producer that leaves it out logs a drop nobody can reconcile, and one
+    // that names another call's tool misleads whoever reconciles it. Every
     // object literal in src whose `type` is the string 'tool-result' (in any
-    // quoting) carries toolName. Read as TypeScript's syntax tree, not as
-    // text, so no spelling of the literal escapes the check.
-    const src = new URL('../../src/', import.meta.url).pathname;
+    // quoting) carries toolName, and where its callId and toolName both read
+    // a call (`X.id`, `Y.name`), they read the same one. Read as TypeScript's
+    // syntax tree, not as text, so no spelling of the literal escapes the check.
+    const src = fileURLToPath(new URL('../../src/', import.meta.url));
     const files: string[] = [];
     const walk = (dir: string): void => {
       for (const name of readdirSync(dir)) {
@@ -310,8 +326,16 @@ describe('stop() with work still in flight', () => {
       while (ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
       return (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) && e.text === 'tool-result';
     };
+    // The call an `X.id` or `X.name` reads, as source text (`call`, `tc`).
+    const callRead = (p: ts.ObjectLiteralElementLike | undefined, field: 'id' | 'name'): string | undefined => {
+      if (!p || !ts.isPropertyAssignment(p)) return undefined;
+      const e = p.initializer;
+      return ts.isPropertyAccessExpression(e) && e.name.text === field ? e.expression.getText() : undefined;
+    };
     const missing: string[] = [];
+    const mismatched: string[] = [];
     let literals = 0;
+    let paired = 0;
     for (const file of files) {
       const sf = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
       const visit = (node: ts.Node): void => {
@@ -319,9 +343,17 @@ describe('stop() with work still in flight', () => {
           const type = node.properties.find((p) => ts.isPropertyAssignment(p) && nameOf(p.name) === 'type');
           if (type && ts.isPropertyAssignment(type) && isToolResult(type.initializer)) {
             literals++;
-            const named = node.properties.some((p) =>
-              (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && nameOf(p.name) === 'toolName');
-            if (!named) missing.push(`${file.slice(src.length)}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`);
+            const where = `${file.slice(src.length)}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`;
+            const property = (name: string) => node.properties.find((p) =>
+              (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && nameOf(p.name) === name);
+            const toolName = property('toolName');
+            if (!toolName) missing.push(where);
+            const idOf = callRead(property('callId'), 'id');
+            const nameFrom = callRead(toolName, 'name');
+            if (idOf !== undefined && nameFrom !== undefined) {
+              paired++;
+              if (idOf !== nameFrom) mismatched.push(`${where}: callId reads ${idOf}, toolName reads ${nameFrom}`);
+            }
           }
         }
         ts.forEachChild(node, visit);
@@ -330,6 +362,8 @@ describe('stop() with work still in flight', () => {
     }
     assert.ok(literals > 20, `found ${literals} tool-result literals; the scan has lost them`);
     assert.deepEqual(missing, [], 'tool-result events without toolName');
+    assert.ok(paired > 20, `paired ${paired} callId/toolName reads; the pairing has lost them`);
+    assert.deepEqual(mismatched, [], "tool-result events naming another call's tool");
   });
 
   describe('a server sending while the host stops', () => {
@@ -345,12 +379,46 @@ describe('stop() with work still in flight', () => {
       return { framework, connection };
     }
 
-    function responder(opts: { throws?: boolean } = {}) {
+    /**
+     * Put a stand-in in for every request listener's handler, each calling
+     * `handler` with what it was given: the push handler, the channel
+     * registry's three, the inference router and the host-command handler.
+     */
+    function standIns(framework: AgentFramework, handler: (...args: never[]) => Promise<unknown>): void {
+      const fw = framework as unknown as {
+        pushHandler: unknown; channelRegistry: unknown; inferenceRouter: unknown; handleHostCommand: unknown;
+      };
+      fw.pushHandler = { handlePushEvent: handler };
+      fw.channelRegistry = { handleIncoming: handler, handleRegister: handler, handleChanged: handler, stopAll: () => {} };
+      fw.inferenceRouter = { handleInferenceRequest: handler };
+      fw.handleHostCommand = handler;
+    }
+
+    /** Every request listener: its event, its method, and parameters it takes. */
+    const requests = [
+      ['push-event', 'push/event', { featureSet: 'chat', eventId: 'e20', payload: { content: [{ type: 'text', text: 'x' }] } }],
+      ['channels-incoming', 'channels/incoming', { messages: [{ channelId: 'c', messageId: 'm20', content: [] }] }],
+      ['channels-register', 'channels/register', { channels: [] }],
+      ['channels-changed', 'channels/changed', { added: [] }],
+      ['inference-request', 'inference/request', { messages: [] }],
+      ['host-command', 'host/command', { command: 'undo' }],
+    ] as const;
+
+    /**
+     * A server's responder, recording each answer.
+     * - throws: respondError records its answer, then throws (the connection is going).
+     * - serializes: respond serializes the result before it records it, as the
+     *   connection's sendResponse does, so a result JSON can't hold throws.
+     */
+    function responder(opts: { throws?: boolean; serializes?: boolean } = {}) {
       const answers: Array<{ result?: unknown; error?: { code: number; message: string } }> = [];
       return {
         id: 7,
         answers,
-        respond: (result: unknown) => { answers.push({ result }); },
+        respond: (result: unknown) => {
+          if (opts.serializes) JSON.stringify(result);
+          answers.push({ result });
+        },
         respondError: (code: number, message: string) => {
           answers.push({ error: { code, message } });
           if (opts.throws) throw new Error('the connection is gone');
@@ -371,14 +439,7 @@ describe('stop() with work still in flight', () => {
       await framework.stop();
       // Stand-in handlers, put in after stop() (which stops the real registry): every arrival below comes later.
       let handled = 0;
-      const fw = framework as unknown as { pushHandler: unknown; channelRegistry: unknown; inferenceRouter: unknown };
-      fw.pushHandler = { handlePushEvent: async () => { handled++; } };
-      fw.channelRegistry = {
-        handleIncoming: async () => { handled++; },
-        handleRegister: async () => { handled++; },
-        handleChanged: async () => { handled++; },
-      };
-      fw.inferenceRouter = { handleInferenceRequest: async () => { handled++; } };
+      standIns(framework, async () => { handled++; return {}; });
 
       const push = responder();
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e1', payload: { content: [{ type: 'text', text: 'late' }] } }, push);
@@ -390,16 +451,20 @@ describe('stop() with work still in flight', () => {
       connection.emit('channels-changed', { added: [] }, changed);
       const inference = responder();
       connection.emit('inference-request', { messages: [] }, inference);
-      await answered(push, incoming, register, changed, inference);
+      const command = responder();
+      connection.emit('host-command', { command: 'undo' }, command);
+      await answered(push, incoming, register, changed, inference, command);
 
-      assert.equal(handled, 0, 'never handed to a handler, which would record it as accepted');
-      for (const r of [push, incoming, register, changed, inference]) assert.deepEqual(r.answers, [stopping]);
+      assert.equal(handled, 0, 'never handed to a handler, which would record it as accepted or act on it');
+      for (const r of [push, incoming, register, changed, inference, command]) assert.deepEqual(r.answers, [stopping]);
       assert.deepEqual(rejections, []);
     });
 
     for (const [event, method, params] of [
       ['push-event', 'push/event', { featureSet: 'chat', eventId: 'e2', payload: { content: [{ type: 'text', text: 'waiting' }] } }],
       ['channels-incoming', 'channels/incoming', { messages: [{ channelId: 'c', messageId: 'm2', content: [] }] }],
+      ['inference-request', 'inference/request', { messages: [] }],
+      ['host-command', 'host/command', { command: 'undo' }],
     ] as const) {
       it(`a ${method} held at the awareness barrier while the host stops is refused once the barrier lifts`, async () => {
         const { framework, connection } = await wiredFramework();
@@ -408,9 +473,7 @@ describe('stop() with work still in flight', () => {
           promise: new Promise<void>((r) => { lift = r; }),
         };
         let handled = 0;
-        const fw = framework as unknown as { pushHandler: unknown; channelRegistry: unknown };
-        fw.pushHandler = { handlePushEvent: async () => { handled++; } };
-        fw.channelRegistry = { handleIncoming: async () => { handled++; }, stopAll: () => {} };
+        standIns(framework, async () => { handled++; return {}; });
 
         const r = responder();
         connection.emit(event, params, r);
@@ -475,8 +538,11 @@ describe('stop() with work still in flight', () => {
         revoked.revoke();
         const numbered = new Error('placeholder');
         Object.defineProperty(numbered, 'message', { value: 42 });
+        // An Error whose message getter throws: reading it is itself guarded.
+        const unreadable = new Error('placeholder');
+        Object.defineProperty(unreadable, 'message', { get() { throw new Error('the message getter broke'); } });
         const thrown: Record<string, unknown> = {
-          e5: undefined, e7: 'a plain string', e8: Object.create(null), e12: revoked.proxy, e13: numbered,
+          e5: undefined, e7: 'a plain string', e8: Object.create(null), e12: revoked.proxy, e13: numbered, e14: unreadable,
         };
         fw.pushHandler = {
           // eslint-disable-next-line prefer-promise-reject-errors
@@ -494,15 +560,17 @@ describe('stop() with work still in flight', () => {
         const e8 = answersFor('e8');
         const e12 = answersFor('e12');
         const e13 = answersFor('e13');
+        const e14 = answersFor('e14');
         const incoming = responder();
         connection.emit('channels-incoming', { messages: [{ channelId: 'c', messageId: 'm', content: [] }] }, incoming);
-        await answered(e5, e7, e8, e12, e13, incoming);
+        await answered(e5, e7, e8, e12, e13, e14, incoming);
 
         assert.deepEqual(e5.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
         assert.deepEqual(e7.answers, [{ error: { code: -32603, message: 'the handler failed: a plain string' } }]);
         assert.deepEqual(e8.answers, [{ error: { code: -32603, message: 'the handler failed: (a value that could not be read)' } }]);
         assert.deepEqual(e12.answers, [{ error: { code: -32603, message: 'the handler failed: (a value that could not be read)' } }]);
         assert.deepEqual(e13.answers, [{ error: { code: -32603, message: '42' } }]);
+        assert.deepEqual(e14.answers, [{ error: { code: -32603, message: '(a value that could not be read)' } }]);
         assert.deepEqual(incoming.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
         assert.ok(!logged.some((line) => line.includes('refused')), 'a live host refuses nothing');
         assert.deepEqual(rejections, []);
@@ -544,6 +612,89 @@ describe('stop() with work still in flight', () => {
 
         assert.deepEqual(push.answers, [{ result: { accepted: true } }]);
         assert.ok(logged.some((line) => line.includes('push/event from srv failed after it was answered: the trace emit broke')), logged.join('\n'));
+        assert.deepEqual(rejections, []);
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it("a handler's answer that throws, such as a result JSON can't hold, isn't counted, so the request still gets the listener's answer", async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void }) => {
+          r.respond({ accepted: true, sequence: 1n });
+        });
+        const push = responder({ serializes: true });
+        connection.emit('push-event', { featureSet: 'chat', eventId: 'e21', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
+        await answered(push);
+
+        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Do not know how to serialize a BigInt' } }]);
+        assert.ok(!logged.some((line) => line.includes('failed after it was answered')), logged.join('\n'));
+        assert.deepEqual(rejections, []);
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('a handler that answers after its failure was answered is refused, so the server gets one response', async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void }) => {
+          setImmediate(() => r.respond({ accepted: true }));
+          throw new Error('the handler broke first');
+        });
+        const push = responder();
+        connection.emit('push-event', { featureSet: 'chat', eventId: 'e22', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
+        await answered(push);
+        await until(() => logged.some((line) => line.includes('a second answer (respond) was refused')), 'the refused second answer');
+        await turn();
+
+        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the handler broke first' } }]);
+        assert.ok(logged.some((line) => line.includes('push/event from srv: a second answer (respond) was refused; the request was already answered')), logged.join('\n'));
+        assert.deepEqual(rejections, []);
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('a responder without respondError reaches the handler without one', async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        let seen: string | undefined;
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void; respondError?: unknown }) => {
+          seen = typeof r.respondError;
+          r.respond({ results: [] });
+        });
+        const answers: unknown[] = [];
+        connection.emit('channels-incoming', { messages: [{ channelId: 'c', messageId: 'm23', content: [] }] }, {
+          id: 7, respond: (result: unknown) => { answers.push(result); },
+        });
+        await until(() => answers.length > 0, 'the answer');
+        await turn();
+
+        assert.equal(seen, 'undefined', "a handler checking for respondError takes its fallback");
+        assert.deepEqual(answers, [{ results: [] }]);
+        assert.deepEqual(rejections, []);
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it("every request listener answers its handler's throw -32603 with its error, never rejecting into the listener", async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        standIns(framework, async () => { throw new Error('the handler broke'); });
+        const answers = requests.map(([event, , params]) => {
+          const r = responder();
+          connection.emit(event, params, r);
+          return r;
+        });
+        await answered(...answers);
+
+        for (const [i, [, method]] of requests.entries()) {
+          assert.deepEqual(answers[i]!.answers, [{ error: { code: -32603, message: 'the handler broke' } }], method);
+          assert.ok(logged.some((line) => line.includes(`${method} from srv failed: the handler broke`)), `${method}:\n${logged.join('\n')}`);
+        }
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();

@@ -17,19 +17,22 @@
     the tool again). For this, the framework's tool results carry the tool's
     name (`ToolResultEvent.toolName`, optional).
   - A server's `push/event`, `channels/incoming`, `channels/register`,
-    `channels/changed` or `inference/request` that arrives once the host is
-    stopping is refused before its handler runs, with a JSON-RPC error
-    (`-32000`, "the host is stopping", the code the push coalescer already
-    gives a stopping host). It is never answered "accepted", and no
-    inference starts.
+    `channels/changed`, `inference/request` or `host/command` that arrives
+    once the host is stopping is refused before its handler runs, with a
+    JSON-RPC error (`-32000`, "the host is stopping", the code the push
+    coalescer already gives a stopping host). It is never answered
+    "accepted", no inference starts, and no host command runs.
   - A handler that throws is answered with an error too: while the host
     stops, `-32000` with the handler's own message after "the host stopped
     while handling this request"; on a live host, `-32603` with its message.
-    The message is bounded, any thrown value is printed safely, and a
-    request the handler already answered isn't answered twice. Part of the
-    request may already have been admitted. A notification is logged.
+    The message is bounded, and any thrown value is printed safely. Part of
+    the request may already have been admitted. A notification is logged.
   - **For operators:** such a handler fault used to be an unhandled
     rejection, which ends a Node process by default, so a supervisor would
     have restarted the host. Now the host stays up and logs the failure.
+  - A request is answered at most once. A second answer, such as a
+    handler's late one after its failure was answered, is refused and
+    logged. An answer that throws, such as a result the connection can't
+    serialize, doesn't count, so the request still gets the error answer.
   - Any other event pushed to a stopped framework still throws to its
     caller.

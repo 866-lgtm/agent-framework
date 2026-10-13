@@ -997,21 +997,41 @@ type AnswerOnce = {
 };
 
 /**
- * Wrap a server request's responder so a later failure can tell whether the
- * handler already answered: a request is answered once, and a handler that
- * answered and then threw is logged, not answered a second time.
+ * Wrap a server request's responder so the request is answered at most once,
+ * and a later failure can tell whether the handler already answered.
+ * - An answer counts once the responder returns. One that throws, such as a
+ *   result the transport can't serialize, leaves the request unanswered, so
+ *   the listener's failure answer still goes out. This assumes a responder
+ *   that throws has sent nothing, which holds for the connection's own: they
+ *   serialize before they write, and their transports' writes don't throw
+ *   after writing.
+ * - A second answer is refused and logged: a handler that answered and then
+ *   threw isn't answered again, and a handler that answers after the
+ *   listener answered its failure doesn't send a second response.
+ * - Only the methods the responder has are wrapped, so a handler that checks
+ *   for `respondError` still finds a responder without one.
  */
 function answerOnce<R extends { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void }>(
   responder: R | undefined,
+  method: string,
+  serverId: string,
 ): AnswerOnce & { responder: R | undefined } {
   if (!responder) return { responder: undefined, answered: () => false };
   let done = false;
-  const wrapped = {
-    ...responder,
-    respond: (result: unknown) => { done = true; responder.respond?.(result); },
-    respondError: (code: number, message: string, data?: unknown) => { done = true; responder.respondError?.(code, message, data); },
-  } as R;
-  return { responder: wrapped, answered: () => done };
+  const once = <A extends unknown[]>(kind: string, send: (...args: A) => void) => (...args: A): void => {
+    if (done) {
+      console.error(`[mcpl] ${method} from ${serverId}: a second answer (${kind}) was refused; the request was already answered`);
+      return;
+    }
+    send(...args);
+    done = true;
+  };
+  const wrapped: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } = { ...responder };
+  if (responder.respond) wrapped.respond = once('respond', (result: unknown) => responder.respond!(result));
+  if (responder.respondError) {
+    wrapped.respondError = once('respondError', (code: number, message: string, data?: unknown) => responder.respondError!(code, message, data));
+  }
+  return { responder: wrapped as R, answered: () => done };
 }
 
 export class AgentFramework {
@@ -14416,7 +14436,7 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder);
+      const answer = answerOnce(responder, 'push/event', connection.id);
       try {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
@@ -14447,7 +14467,7 @@ export class AgentFramework {
         return;
       }
       if (this.inferenceRouter && responder) {
-        const answer = answerOnce(responder);
+        const answer = answerOnce(responder, 'inference/request', connection.id);
         try {
           const barrier = this.discordAwarenessBarrier;
           if (barrier) await barrier.promise;
@@ -14473,7 +14493,7 @@ export class AgentFramework {
       params: ChannelsRegisterParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder);
+      const answer = answerOnce(responder, 'channels/register', connection.id);
       try {
         if (this.queue?.isClosed) {
           this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
@@ -14493,7 +14513,7 @@ export class AgentFramework {
       params: ChannelsChangedParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder);
+      const answer = answerOnce(responder, 'channels/changed', connection.id);
       try {
         if (this.queue?.isClosed) {
           this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
@@ -14563,7 +14583,7 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder);
+      const answer = answerOnce(responder, 'channels/incoming', connection.id);
       try {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
@@ -14583,14 +14603,20 @@ export class AgentFramework {
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (!responder) return;
+      const answer = answerOnce(responder, 'host/command', connection.id);
       try {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
+        // A stopping host runs no host command: refused like the requests
+        // above, before its handler runs.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
+          return;
+        }
         const result = await this.handleHostCommand(connection.id, params ?? {});
-        responder.respond(result);
+        answer.responder!.respond(result);
       } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        responder.respondError(-32603, err.message);
+        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error });
       }
     });
 
