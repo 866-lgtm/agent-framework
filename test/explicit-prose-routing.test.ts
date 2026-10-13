@@ -1099,7 +1099,17 @@ describe('explicit prose routing', () => {
       assert.deepEqual(routed.filter(r => r.text !== 'fails'), [{ text: 'first', locus: 'discord:g:cafe' }, { text: 'recovered', locus: 'world:commons' }]);
       const cm = framework.getAgent('assistant')!.getContextManager();
       const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
-      assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('>>>#channel {{unsent}}')));
+      if (failure === 'throw') {
+        // A plain send that threw is marker-only: nothing is held, and the
+        // notice offers no {{unsent}}.
+        const notice = texts.find(t => t.startsWith('[prose-routing]') && t.includes('fails'.length + ' chars'))!;
+        assert.match(notice, /may not have been delivered/);
+        assert.match(notice, /isn't held as a draft/);
+        assert.doesNotMatch(notice, /\{\{unsent\}\}/);
+        assert.equal(draftsOf(framework).open('assistant').some(d => d.text === 'fails'), false);
+      } else {
+        assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('>>>#channel {{unsent}}')));
+      }
       await framework.stop();
     });
   }
