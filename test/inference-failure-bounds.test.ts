@@ -1025,15 +1025,19 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
   }
 });
 
-test('the breaker reads the status a real failure carries: a 404 never sheds; a 400, a 413 and no status do', async () => {
+test('the breaker reads the status a real failure carries: a 404 never sheds; a 400, a 413 under either label and no status do', async () => {
   // Through classifyInferenceError, the inference:exhausted trace and
   // noteInferenceExhausted to the gate, three failed turns each: the
   // escalation threshold. A shed is read from its own line, since the cap's
   // and nothing-left-to-shed's lines share its prefix.
-  for (const [status, sheds] of [[404, false], [400, true], [413, true], [undefined, true]] as const) {
-    const label = status === undefined ? 'no status' : `HTTP ${status}`;
-    const { errs, traces, messages } = await runFailingTurn('stream error event', () => new MembraneError({
-      type: 'invalid_request', retryable: false, message: `zz-${label}`, rawError: { status },
+  const legs = [
+    ['invalid_request', 404, false], ['invalid_request', 400, true], ['invalid_request', 413, true],
+    ['context_length', 413, true], ['invalid_request', undefined, true],
+  ] as const;
+  for (const [type, status, sheds] of legs) {
+    const label = `${type} ${status === undefined ? 'with no status' : `at ${status}`}`;
+    const { errs, traces, messages, markers, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
+      type, retryable: false, message: `zz-${label}`, rawError: { status },
       ...(status === undefined ? {} : { httpStatus: status }),
     }), { turns: 3 });
     const exhausted = traces.filter((t) => t.type === 'inference:exhausted');
@@ -1050,6 +1054,11 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
     } else {
       assert.equal(shed.length, 0, `${label} sheds nothing`);
       assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);
+      // Only the shed is gated: each failure is still marked and logged.
+      assert.equal(markers.length, 3, `${label}: an [inference-failed] marker per failure`);
+      const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+        .filter((record) => record.kind === 'inference-exhausted');
+      assert.deepEqual(records.map((record) => record.httpStatus), [404, 404, 404], `${label}: a failures.log record per failure`);
     }
   }
 });

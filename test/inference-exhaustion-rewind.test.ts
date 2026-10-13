@@ -1,13 +1,13 @@
 /**
  * Poison-history breaker (6.5): noteInferenceExhausted used to only log at
- * streak>=3 ("[inference-hard-down]") while injecting a marker into the SAME
- * poisoned history — every new push event woke the agent onto a context the
- * API rejects, forever, until a manual /unstick.
+ * streak>=3 ("[inference-hard-down]") while injecting a marker into the same
+ * history, so every new push event woke the agent onto a context the API kept
+ * refusing, until a manual /unstick.
  *
  * Now, at the hard-down threshold, when the failure suggests the provider
- * refused the request's content (shedMayHelp: an invalid_request at HTTP 400,
- * 413 or 422, or with no status), the breaker auto-quarantines: sheds the
- * newest complete exchange (the same
+ * refused the request's content or size (shedMayHelp: an invalid_request at
+ * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
+ * breaker auto-quarantines: sheds the newest complete exchange (the same
  * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
  * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
@@ -87,7 +87,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(marker, 'rewind marker added');
   assert.equal(marker!.meta.cause, 'inference-failure');
   assert.match(marker!.content[0].text, /set aside because the model API kept refusing the requests that carried them \(/);
-  assert.match(marker!.content[0].text, /so they were removed for the conversation to go on/);
+  assert.match(marker!.content[0].text, /\), so that the conversation could go on\./);
   assert.doesNotMatch(marker!.content[0].text, /rejecting the conversation/);
 
   // A retry was queued so the rewound history is verified immediately.
@@ -111,7 +111,7 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
   // The breaker keys on the membrane error type and the HTTP status
   // (shedMayHelp), not on `retryable`. membrane marks auth (expired key),
   // context_length, abort, safety and unsupported all non-retryable, but none
-  // of them is a refusal of the request's content. Shedding good exchanges,
+  // of them is a request the provider refused as malformed. Shedding good exchanges,
   // with a rewind marker saying the API kept refusing them, on an expired API
   // key is exactly the category error this guards.
   for (const errorType of ['auth', 'context_length', 'abort', 'safety', 'unsupported']) {
@@ -186,9 +186,10 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
 // reaches agent-framework for an Anthropic 404 (a model that doesn't exist),
 // which no shed can fix. With 0.5.86 the raw-fetch Responses adapter already
 // files every status it doesn't list as invalid_request. The breaker runs
-// only for a 400, 413 or 422, the statuses that suggest the provider refused
-// the request's content (a heuristic: other refusals come back the same
-// way); an error without a status keeps the type-only rule.
+// only for an invalid_request at 400, 413 or 422, the statuses that suggest
+// the provider refused the request's content or size (a heuristic: other
+// refusals come back the same way), and for a context_length at 413, the
+// label #56 gives a 413; an error without a status keeps the type-only rule.
 test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', () => {
   const missingModel = makeHarness();
   const alerts: any[] = [];
@@ -236,6 +237,32 @@ test('the current failure decides the shed, whatever failed before it in the str
   assert.deepEqual([...ending400.removed].sort(), ['a1', 'r1'], '404, 404, 400: the 400 sheds at the third failure');
 });
 
+test('a 413 sheds whatever membrane calls it, and a context_length at 400 or 422 keeps the history', () => {
+  // membrane 0.5.86's Responses adapter files a 413 as invalid_request, and
+  // membrane #56 as context_length: the arm keys on the status.
+  for (const errorType of ['invalid_request', 'context_length']) {
+    const tooLarge = makeHarness();
+    try {
+      for (let i = 0; i < 3; i++) {
+        tooLarge.fw.noteInferenceExhausted('cairn', '413 request too large', false, errorType, { httpStatus: 413 });
+      }
+    } finally { tooLarge.restore(); }
+    assert.deepEqual([...tooLarge.removed].sort(), ['a1', 'r1'], `${errorType} at 413 sheds at the threshold`);
+  }
+
+  // A token overflow is for the context budget and compression to prevent.
+  for (const httpStatus of [400, 422]) {
+    const overflow = makeHarness();
+    try {
+      for (let i = 0; i < 5; i++) {
+        overflow.fw.noteInferenceExhausted('cairn', 'prompt is too long', false, 'context_length', { httpStatus });
+      }
+    } finally { overflow.restore(); }
+    assert.deepEqual(overflow.removed, [], `context_length at ${httpStatus} keeps the history`);
+    assert.ok(overflow.errs.some((e) => e.includes('[inference-hard-down]')), `context_length at ${httpStatus} is still reported hard-down`);
+  }
+});
+
 test('the status reaches the breaker from the inference:exhausted trace', () => {
   const h = makeHarness();
   try {
@@ -248,7 +275,7 @@ test('the status reaches the breaker from the inference:exhausted trace', () => 
   assert.ok(h.errs.some((e) => e.includes('[inference-hard-down]')));
 });
 
-test('shedMayHelp: an invalid_request at 400, 413 or 422, or with no status, and nothing else', () => {
+test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a context_length at 413, and nothing else', () => {
   // Every membrane error type (0.5.86), the framework's own two, and none.
   const types = ['invalid_request', 'rate_limit', 'context_length', 'auth', 'server', 'network', 'timeout', 'abort',
     'safety', 'unsupported', 'unknown', 'over_budget', 'context_refusal', undefined];
@@ -256,7 +283,8 @@ test('shedMayHelp: an invalid_request at 400, 413 or 422, or with no status, and
   for (let status = 100; status <= 599; status++) statuses.push(status);
   for (const type of types) {
     for (const status of statuses) {
-      const expected = type === 'invalid_request' && (status === undefined || status === 400 || status === 413 || status === 422);
+      const expected = (type === 'invalid_request' && (status === undefined || status === 400 || status === 413 || status === 422))
+        || (type === 'context_length' && status === 413);
       assert.equal(shedMayHelp(type, status), expected, `${String(type)} at ${String(status)}`);
     }
   }
