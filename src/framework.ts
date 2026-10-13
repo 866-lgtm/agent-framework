@@ -9719,6 +9719,20 @@ export class AgentFramework {
         );
       }
     };
+    // Explicit mode keeps the stream's destination as it changes, so a stream
+    // that resumes this turn starts there, however soon after this one it
+    // starts: a guard retry can begin before this stream's teardown runs. A
+    // stream another has since replaced keeps nothing.
+    const noteStreamTarget = (): void => {
+      if (proseStream && turnProseRouting === 'explicit' && agent.streamId === myStreamId) {
+        this.proseStreamTargets.set(agent.name, proseStream.currentTarget);
+      }
+    };
+    const feedStream = (text: string): void => {
+      if (!proseStream) return;
+      emitOutgoing(proseStream.feed(text));
+      noteStreamTarget();
+    };
 
     // Tool-result-guard publication boundary. While a SUBMITTED batch is
     // pending (or a guard recovery is running), a refusal can still abandon
@@ -9732,7 +9746,7 @@ export class AgentFramework {
       guardHeld = [];
       for (const item of held) {
         this.emitTrace(item.trace);
-        if (proseStream && item.text !== undefined) emitOutgoing(proseStream.feed(item.text));
+        if (item.text !== undefined) feedStream(item.text);
       }
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
@@ -9776,7 +9790,7 @@ export class AgentFramework {
               guardHeld.push({ trace, text });
             } else {
               this.emitTrace(trace);
-              if (proseStream && text !== undefined) emitOutgoing(proseStream.feed(text));
+              if (text !== undefined) feedStream(text);
             }
             break;
           }
@@ -9804,6 +9818,7 @@ export class AgentFramework {
             outgoingIndex = 0;
             discardGuardHeld();
             proseStream?.reset();
+            noteStreamTarget();
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -9833,6 +9848,12 @@ export class AgentFramework {
             // preceding results before storing/dispatching this new round.
             agent.toolResultGuard.accept();
             releaseGuardHeld();
+            // The round's text ends here: delivery parses each round's text
+            // on its own, so the next round's text starts a new line.
+            if (proseStream) {
+              emitOutgoing(proseStream.endSegment());
+              noteStreamTarget();
+            }
             adoptInjectedRound();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
@@ -10021,6 +10042,7 @@ export class AgentFramework {
               // persisted as assistant speech, including a terminal refusal
               // after the single recovery retry.
               proseStream?.reset();
+              noteStreamTarget();
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
@@ -11011,7 +11033,6 @@ export class AgentFramework {
           this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
         }
       }
-      if (proseStream) this.proseStreamTargets.set(agent.name, proseStream.currentTarget);
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       if (ownsPhysicalStream) {
         this.activeStreams.delete(agent.name);

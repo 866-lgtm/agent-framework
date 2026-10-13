@@ -95,6 +95,21 @@ test('explicit: `>>` and then any whitespace is a quoted arrow', () => {
   assert.equal(textFor(out, 'discord:g:100'), 'look:\n>>\u00a0quoted');
 });
 
+test('explicit: each segment starts a new line, and a prefix with no body takes effect at its end', () => {
+  // Delivery parses each round's text on its own: a round may begin with a
+  // prefix, and a round that is only a prefix sets the sticky destination.
+  const r = explicit();
+  const out: RoutedDelta[] = [];
+  out.push(...r.feed('>>#general first'), ...r.endSegment());
+  out.push(...r.feed('>>#ops second'), ...r.endSegment());
+  out.push(...r.feed('>>@sol'), ...r.endSegment());
+  out.push(...r.feed('to sol'), ...r.finish());
+  assert.equal(textFor(out, 'discord:g:100'), 'first');
+  assert.equal(textFor(out, 'discord:g:200'), 'second');
+  assert.equal(textFor(out, 'discord:dm:300'), 'to sol');
+  assert.equal(r.currentTarget, 'discord:dm:300');
+});
+
 test('` !` continuation modifier is swallowed; `!` as body survives', () => {
   const out = run(explicit(), '>>#general ! next turn continues\n>>#ops !bang body');
   assert.equal(textFor(out, 'discord:g:100'), 'next turn continues\n');

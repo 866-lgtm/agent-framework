@@ -455,6 +455,9 @@ test('explicit mode: a budget restart streams on to the destination the turn las
       { text: 'second', channelId: 'chan-cafe' },
       { text: 'continued', channelId: 'chan-cafe' },
     ]);
+    assert.deepEqual(streamed.filter((d) => d.delta.includes('second')).map((d) => d.channelId), ['chan-cafe'],
+      "the second round's prefix starts a new line in the stream, as delivery reads it");
+    assert.equal(streamed.some((d) => d.delta.includes('>>')), false, 'no prefix is streamed as text');
     assert.deepEqual(streamed.filter((d) => d.delta.includes('continued')).map((d) => d.channelId), ['chan-cafe'],
       'the resumed stream follows the destination the turn last addressed');
   } finally {

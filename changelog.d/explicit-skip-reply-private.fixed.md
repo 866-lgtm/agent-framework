@@ -21,4 +21,7 @@
   a budget restart resumes the turn, it starts where the turn's earlier
   stream had routed. The stream also reads a `>>` prefix after any leading
   whitespace, and ends its target at any whitespace, as delivery does,
-  rather than streaming such a line as text or dropping it.
+  rather than streaming such a line as text or dropping it. Each round's
+  text starts a new line for the stream, as delivery parses each round on
+  its own: a round that began with a `>>` prefix streamed it as text to the
+  previous round's destination.

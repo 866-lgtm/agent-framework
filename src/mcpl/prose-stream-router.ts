@@ -90,10 +90,14 @@ export class ProseStreamRouter {
     return coalesce(out);
   }
 
-  /** End of stream: flush any held line-start text (it can no longer become a
-   *  complete prefix; an unterminated `>>tok` at EOF is routing metadata with
-   *  no body — dropped, matching delivery which would deliver empty body). */
-  finish(): RoutedDelta[] {
+  /**
+   * The end of a segment: one round's text, which delivery parses on its
+   * own. The pending line's decision is made now. Held line-start text can
+   * no longer become a prefix, so it is body. A prefix whose target is
+   * written but has no body takes effect, as delivery reads `>>#chan` with
+   * nothing after it. The next segment starts a new line.
+   */
+  endSegment(): RoutedDelta[] {
     const out: RoutedDelta[] = [];
     if (this.state === 'indent') this.emit(this.held, out);
     if (this.state === 'maybe-prefix') {
@@ -101,10 +105,16 @@ export class ProseStreamRouter {
       const arrows = this.held.trimStart();
       if (arrows !== full) this.emit(this.held, out);
     }
-    // prefix-token / after-token at EOF: prefix without body — nothing to emit.
+    if (this.state === 'prefix-token') this.applyTarget();
     this.held = '';
-    this.state = 'line-start';
+    this.token = '';
+    if (this.opts.mode !== 'locus') this.state = 'line-start';
     return coalesce(out);
+  }
+
+  /** End of stream: the last segment ends. */
+  finish(): RoutedDelta[] {
+    return this.endSegment();
   }
 
   private step(ch: string, out: RoutedDelta[]): void {
