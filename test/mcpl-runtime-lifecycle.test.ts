@@ -116,6 +116,19 @@ test('restartMcplServer accepts an updated config (new toolPrefix)', async () =>
   });
 });
 
+test('restartMcplServer refuses a toolPrefix another server holds before tearing anything down', async () => {
+  await withFramework(true, async (framework) => {
+    await framework.connectMcplServer(serverConfig('second') as never);
+    await assert.rejects(
+      framework.restartMcplServer('first', serverConfig('first', { toolPrefix: 'mcpl--second' }) as never),
+      /collides with server "second"/,
+    );
+    const first = framework.listMcplServers().find(s => s.id === 'first');
+    assert.equal(first?.connected, true, 'the server is still connected');
+    assert.ok(framework.getAllTools().some(t => t.name === 'mcpl--first--echo'), 'and its tools still listed');
+  });
+});
+
 test('connectMcplServer rejects a duplicate id and a colliding prefix', async () => {
   await withFramework(true, async (framework) => {
     await assert.rejects(

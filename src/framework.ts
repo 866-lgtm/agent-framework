@@ -14465,20 +14465,8 @@ export class AgentFramework {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
     }
 
-    // Same collision rules create() enforces at startup: the tool prefix must
-    // not shadow a module name or another server's prefix.
-    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
-    if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
-      throw new Error(
-        `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`,
-      );
-    }
-    const prefixOwner = this.mcplPrefixMap.get(prefix);
-    if (prefixOwner && prefixOwner !== config.id) {
-      throw new Error(
-        `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${prefixOwner}"`,
-      );
-    }
+    const collision = this.mcplPrefixCollision(config);
+    if (collision) throw new Error(collision);
 
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     await this.connectMcplServerInternal(config);
@@ -14571,10 +14559,30 @@ export class AgentFramework {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
     // A configuration the connect would refuse is refused here, before the
-    // running server is torn down for it.
+    // running server is torn down for it: its binding and settings, and a
+    // tool prefix another server or a module already holds.
     AgentFramework.usableConfigFamily(config);
+    const collision = this.mcplPrefixCollision(config, id);
+    if (collision) throw new Error(collision);
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
+  }
+
+  /** The collision rules create() enforces at startup, as a runtime connect
+   *  (or a restart, before its disconnect) meets them: the tool prefix must
+   *  not shadow a module name or another server's prefix. The server's own
+   *  prefix is free to keep, and so is that of the server a restart is
+   *  about to disconnect (`leaving`). */
+  private mcplPrefixCollision(config: import('./mcpl/types.js').McplServerConfig, leaving?: string): string | null {
+    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
+      return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`;
+    }
+    const prefixOwner = this.mcplPrefixMap.get(prefix);
+    if (prefixOwner && prefixOwner !== config.id && prefixOwner !== leaving) {
+      return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${prefixOwner}"`;
+    }
+    return null;
   }
 
   /** The protocol family a configuration resolves to, or a refusal naming
