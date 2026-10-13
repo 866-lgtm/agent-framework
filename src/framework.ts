@@ -1138,8 +1138,9 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
-  /** Admitted operator work, including child config materializations.
-   * stop() drains this set before teardown, unless its wait budget expires. */
+  /** An operator's operations in flight, and the config materializations they
+   * start. stop() waits until this set is empty before it tears down, unless
+   * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
@@ -2133,9 +2134,10 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. Failed operator/module/MCPL waits can be retried;
-   * storage stays open. A wait timeout permits teardown to continue while
-   * that work may still act on the components being torn down.
+   * Stop the event loop. After a failed or timed-out wait on operator, module
+   * or MCPL cleanup, storage stays open and stop() can be called again. A
+   * timed-out wait lets teardown go on while that work may still act on what
+   * is being torn down.
    * @param teardownTimeoutMs Optional budget for each wait on cleanup: an
    * operator's operations already running, then modules and MCPL together.
    * Omit to wait until cleanup settles, as required by existing module/child
@@ -2183,8 +2185,9 @@ export class AgentFramework {
     if (this.queue?.isClosed) throw new Error(verb + ' refused: the framework is stopping');
   }
 
-  /** Admission is closed, but admitted work can still start child work.
-   * All rounds share the caller's deadline rather than renewing its budget. */
+  /** Wait in rounds until the set is empty: admitted work can still start work
+   * of its own, and an awareness sync can still join. All rounds share the
+   * caller's deadline rather than renewing its budget. */
   private async waitForOperatorOperations(timeoutMs: number | undefined): Promise<void> {
     const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
     while (this.operatorOperations.size > 0) {
@@ -2275,12 +2278,13 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
-    // Admission closed with the queue. Only admitted operations can add
-    // work now (for example a surgery's config materialization), so drain
-    // until the set is empty. This follows stream cancellation and the event
-    // loop, allowing a quiesce or surgery waiting on them to settle.
-    // If the budget expires, teardown proceeds while the operation may still
-    // act on torn-down components. Keep the store open for a later stop().
+    // Closing the queue closed admission, except for an awareness sync (see
+    // syncDiscordAwarenessMarkers). What admitted operations start now, such
+    // as a surgery's config materialization, joins the set, and so does such
+    // a sync, so wait until the set is empty. This comes after the streams and
+    // the event loop, which a quiesce or a surgery may be waiting on. If the
+    // budget runs out, teardown goes on while the operation may still act on
+    // what it tears down, and the store stays open for another stop().
     let operatorOperationsTimedOut: unknown;
     try {
       await this.waitForOperatorOperations(teardownTimeoutMs);
@@ -3687,9 +3691,10 @@ export class AgentFramework {
           await barrier.promise;
           this.completeMcplDataPlaneGate(barrier);
         } catch (error) {
-          // The host has resumed. Report the failed barrier without undoing
-          // that commit. The funnel recycles while serving; during stop it
-          // neither recycles on failure nor readies data planes on success.
+          // The host has resumed, so report the failed barrier without undoing
+          // that. While serving, failMcplDataPlaneGate recycles the
+          // connections and their reconnect flows reopen the data planes;
+          // while the host stops, it releases the barrier instead.
           await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
         }
       }
@@ -4002,6 +4007,8 @@ export class AgentFramework {
    * true in quiesce mode precisely so this machinery stays hot.
    */
   async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
+    // A pass already running is stop()'s to wait for; a new one isn't started.
+    this.refuseOperatorAfterStop('maintain');
     if (!this.running) {
       // startQueuedMaintenance no-ops on a stopped/never-started framework —
       // a bare snapshot would masquerade as a completed pass, so say so.
@@ -6692,7 +6699,12 @@ export class AgentFramework {
     if (ws && 'materializeMount' in ws) {
       void this.trackOperatorOperation('config:materialize',
         () => (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config'),
-      ).catch(() => {});
+      ).catch((error) => {
+        console.error(
+          '[workspace] re-materializing the config mount after a branch switch failed:',
+          error instanceof Error ? error.message : error,
+        );
+      });
     }
   }
 
@@ -11654,6 +11666,16 @@ export class AgentFramework {
     toolName: string,
     input: Record<string, unknown>,
   ): Promise<{ toolUseId: string; result: ToolResult }> {
+    this.refuseOperatorAfterStop('puppet');
+    return this.trackOperatorOperation('puppet:tool-call', () => this.runPuppetToolCall(agentName, toolName, input));
+  }
+
+  /** puppetToolCall's work, run where stop() can wait for it. */
+  private async runPuppetToolCall(
+    agentName: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<{ toolUseId: string; result: ToolResult }> {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     // Idle AND no turn alive: status reads 'idle' from dequeue until the
@@ -13987,9 +14009,13 @@ export class AgentFramework {
     await this.refreshMcplTools();
   }
 
-  /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
-  async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
-    this.refuseOperatorAfterStop('awareness sync');
+  /** Reconcile the durable ledger with Chronicle, then deliver every server's work.
+   *  Unlike the other operator entry points, this one isn't refused once stop()
+   *  has begun: its callers, such as the API server's branch switch, have
+   *  already changed the store and call it to finish that change. stop() waits
+   *  for one that starts while stop() is waiting. One that starts later can
+   *  fail to deliver, and the outbox keeps that work for the next start. */
+  syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
     return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
   }
 
@@ -14293,9 +14319,6 @@ export class AgentFramework {
       // check sits AFTER this guard: readyControlPlane can also synchronously
       // flush a control event that installs a newer barrier.)
       if (this.discordAwarenessBarrier !== null) return false;
-      // This generation is retired above, but a stopping host reopens no
-      // data plane. Recheck for each connection: a ready() can reenter stop().
-      if (this.queue?.isClosed) return true;
       // Host quiesce (issue #122): this is the single point every barrier
       // completion and reconnect flow funnels through, so holding here keeps
       // data planes paused across awareness drains and reconnects for the
@@ -14328,9 +14351,15 @@ export class AgentFramework {
         error: `Discord awareness accounting unhealthy: ${err.message}`,
       });
     }
-    // A stopping host closes these connections itself. Recycling them now
-    // would start reconnects only for stop() to close them again.
-    if (this.queue?.isClosed) return;
+    // A stopping host closes these connections itself, so recycling them now
+    // would start reconnects only for stop() to close them again. Release the
+    // barrier instead, as a completed one is released: nothing waits on a
+    // rejected barrier, and unless the host is quiesced, what the pause held
+    // back reaches the listeners' stopping refusal.
+    if (this.queue?.isClosed) {
+      this.completeMcplDataPlaneGate(barrier);
+      return;
+    }
     await Promise.all(connections.map(async (connection) => {
       await connection.reconnectAfterFailure().catch((closeError) => {
         console.error(
