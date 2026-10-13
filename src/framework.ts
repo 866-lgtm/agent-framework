@@ -9569,6 +9569,9 @@ export class AgentFramework {
       if (logical) silent.logical = logical;
       this.turnRouting.set(agent.name, silent);
     }
+    // This start's own logical turn: a failure before its stream exists
+    // settles it, and no other start's.
+    const startLogical = this.turnRouting.get(agent.name)?.logical;
 
     this.touchEphemeralRun(agent.name, true);
     this.emitTrace({
@@ -9747,7 +9750,7 @@ export class AgentFramework {
           stopReason: 'exhausted',
           speech: '',
           error: err.message,
-        }, this.turnRouting.get(agent.name)?.logical);
+        }, startLogical);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -10853,8 +10856,8 @@ export class AgentFramework {
             // trailing paths awaited the chain when there was final text; a
             // turn whose last response is empty awaits it here, so the
             // receipt and the continuation see its last rounds' deliveries.
-            // Locus mode only; explicit-mode envelopes acknowledge themselves
-            // through the prose gateway.
+            // Locus and hybrid mode; explicit-mode envelopes acknowledge
+            // themselves through the prose gateway.
             await turnSpeechChain;
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent, streamRouting);

@@ -714,6 +714,7 @@ describe('explicit prose routing', () => {
           for (const end = Date.now() + 5000; turns < 1 && Date.now() < end;) {
             await new Promise<void>((resolve) => setTimeout(resolve, 5));
           }
+          assert.equal(turns, 1, 'the re-inference has started');
           assert.equal(earlier.logical.continuation, false, 'the earlier delivery has not run as the re-inference starts');
           release();
         }
@@ -895,6 +896,27 @@ describe('explicit prose routing', () => {
     } finally {
       await framework.stop();
     }
+  });
+
+  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears open turns", async () => {
+    const framework = await createFramework('hybrid');
+    const internals = framework as unknown as {
+      openLogical: Map<string, RoutingState['logical']>;
+      settleAgent(name: string, outcome: { stopReason: 'completed'; speech: string }, closes: RoutingState['logical'] | undefined): void;
+    };
+    const open: RoutingState['logical'] = { continuation: true, deliveries: [], suppressed: 0 };
+    const stale: RoutingState['logical'] = { continuation: false, deliveries: [], suppressed: 0 };
+    internals.openLogical.set('assistant', open);
+    // A settle from a stream a newer one replaced passes its own logical
+    // turn, or none; neither closes the open one.
+    internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, stale);
+    internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, undefined);
+    assert.equal(internals.openLogical.get('assistant'), open, "a stale settle leaves the newer turn open");
+    internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, open);
+    assert.equal(internals.openLogical.has('assistant'), false, "the turn's own settle closes it");
+    internals.openLogical.set('assistant', open);
+    await framework.stop();
+    assert.equal(internals.openLogical.size, 0, 'stop() clears every open logical turn');
   });
 
   it('a silent start leaves an open logical turn to the next start that routes prose', async () => {

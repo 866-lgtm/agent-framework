@@ -4,10 +4,11 @@
   have posted, and in explicit mode the next turn can start at once. That
   start cleared the sticky destination those deliveries read when they
   post, so a queued unprefixed segment bounced into the next turn. Each
-  turn now has its own routing state and receipt tallies (the sticky
-  destination, the turn's destination, hybrid's hold, a ` !` continuation,
-  and the destinations and suppressed segments its receipt reports), and a
-  queued delivery keeps the one of the turn that queued it. In hybrid and
+  turn now has its own routing state (the sticky destination, the turn's
+  destination, hybrid's hold) and its logical turn's ` !` continuation and
+  receipt tallies (the destinations and suppressed segments its receipt
+  reports), and a queued delivery keeps the one of the turn that queued
+  it. In hybrid and
   locus mode the ended turn already keeps the next one waiting until its
   receipt is written, as before.
 - The agent's prose deliveries go out in the order they were written,
