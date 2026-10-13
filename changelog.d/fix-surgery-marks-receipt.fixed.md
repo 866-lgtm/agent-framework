@@ -22,8 +22,8 @@
   that a host can call after its own branch moves. A delivery that fails to
   start raises a `discord-awareness-delivery` ops alert instead of failing
   the command, and the next sync, reconnect or start delivers what is still
-  pending. (The web switch used to be acknowledged only after its marks were
-  attempted.)
+  pending. (The web switch used to await the awareness sync before
+  answering.)
 - A gate installed while a drain is still running (restoring the source
   branch mid-delivery, say) waits for that drain and then drains again from
   the ledger. So before traffic is released, every mark pending when the

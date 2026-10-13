@@ -545,10 +545,10 @@ export class ApiServer {
     // Reversible Discord awareness markers are part of the branch projection.
     // The switch is acknowledged once it has landed: delivery of the marks it
     // adds and removes starts behind the MCPL data-plane gate, which holds
-    // channel traffic until they are attempted, and a failure is an ops alert
-    // rather than a failed switch. (It used to wait for every add and remove
-    // to be attempted, which after a large rollback took the drain's whole
-    // length.)
+    // channel traffic that arrives after it until they are attempted, or
+    // deferred while their server is disconnected, and a failure is an ops
+    // alert rather than a failed switch. (It used to await the awareness
+    // sync, which after a large rollback took the drain's whole length.)
     this.framework.startDiscordAwarenessDelivery('branch switch');
 
     // Materialize config files from the new branch
