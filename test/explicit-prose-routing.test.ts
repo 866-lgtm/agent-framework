@@ -941,8 +941,10 @@ describe('explicit prose routing', () => {
       assert.equal(internals.openLogical.get('assistant'), open, 'and neither took nor closed the open one');
       assert.equal(open.continuation, true, "the open turn's ' !' is untouched");
       // The next start that routes prose continues it, and its ' !' runs.
+      // (feedTurn counts starts from here: the prose turn is 1, the
+      // continuation 2.)
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]));
-      feedTurn(framework, 3, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
+      feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
       trigger(framework);
       await framework.runUntilIdle();
       for (const end = Date.now() + 5000; turns < 3 && Date.now() < end;) {
