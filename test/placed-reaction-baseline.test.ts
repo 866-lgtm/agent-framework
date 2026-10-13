@@ -277,6 +277,8 @@ describe('placed-reaction baseline', () => {
     [`<:mark:${'3'.repeat(21)}>`, false],
     [`mark:${'4'.repeat(16)}`, false],
     [`<:mark:${'5'.repeat(20)}>`, true],
+    [`mark:${'6'.repeat(17)}`, true],
+    [`mark:${'7'.repeat(21)}`, false],
     ['a:b:1', false],
   ] as const) {
     it(`a custom marker ${marker} is ${converted ? '' : 'not '}reduced to its ID`, async () => {
@@ -292,10 +294,17 @@ describe('placed-reaction baseline', () => {
     assert.throws(() => baseline(fw), /Discord awareness.*ledger/i);
     await fw.disconnectMcplServer('probe');
     await assert.rejects(() => fw.connectMcplServer(server()), /Discord awareness.*ledger/i);
-    // A reconnecting server is refused before it could leave a closed stub
-    // registered under its id, so the connect can simply be retried.
-    await assert.rejects(() => fw.connectMcplServer(server({ reconnect: true })), /Discord awareness.*ledger/i);
-    const registry = (fw as unknown as { mcplServerRegistry: { getServer(id: string): unknown } }).mcplServerRegistry;
-    assert.equal(registry.getServer('probe'), null, 'nothing is left registered');
+    // Every connect reads the ledger before it registers anything: a
+    // reconnecting server, with or without its own baseline, would otherwise
+    // be left registered as a closed stub that blocks a retried connect.
+    const internals = fw as unknown as {
+      mcplServerRegistry: { getServer(id: string): unknown };
+      mcplServerConfigs: Map<string, unknown>;
+    };
+    for (const config of [server({ reconnect: true }), server({ reconnect: true, env: { [ENV_KEY]: '🟪' } })]) {
+      await assert.rejects(() => fw.connectMcplServer(config), /Discord awareness.*ledger/i);
+      assert.equal(internals.mcplServerRegistry.getServer('probe'), null, 'no connection is left registered');
+      assert.equal(internals.mcplServerConfigs.has('probe'), false, 'no config is left registered');
+    }
   });
 });

@@ -14246,6 +14246,14 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
 
+    // Every connect needs a readable awareness ledger: a runtime connect's
+    // awareness barrier reconciles it, and a stdio child taking the
+    // protective default derives that from it. Read it first, so an
+    // unreadable ledger refuses the connect before anything is registered
+    // under its id or spawned (a reconnecting server would otherwise be left
+    // registered as a closed stub). With no outbox configured nothing is read.
+    this.getPlacedReactionBaseline();
+
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl).
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
@@ -14267,9 +14275,7 @@ export class AgentFramework {
     // The default is derived at each spawn: the env below is a getter, which
     // the transport reads at first connect, at every automatic reconnect and
     // at a stub's retry, so retained markers added since the last spawn are
-    // covered. Deriving it once here first refuses the connect when the
-    // awareness ledger can't be read, before anything spawns and before a
-    // reconnecting server could leave a closed stub registered under its id.
+    // covered.
     let connectionConfig = config;
     if (!isWebSocketTransport(config)) {
       const declared = this.declaredReactionBaseline(config);
@@ -14278,8 +14284,6 @@ export class AgentFramework {
           `[mcpl] ${config.id}: DISCORD_SUPPRESSED_REACTIONS_BASELINE ${declared.source === 'env' ? 'from its env' : 'inherited from the host'} ` +
             `replaces the framework's protective default`,
         );
-      } else {
-        this.getPlacedReactionBaseline();
       }
       connectionConfig = { ...config };
       Object.defineProperty(connectionConfig, 'env', {
