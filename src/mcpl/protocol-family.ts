@@ -117,12 +117,14 @@ export function redactUrl(url: string | undefined): string {
  * - the static token, raw and percent- or form-encoded;
  * - a stdio server's environment values whose names say they're credentials.
  * A string replaced on its own has at least 8 characters, since a shorter
- * one can't be told from ordinary text; a short query value is replaced
- * with its name, as one name=value. A string is replaced only where no letter
- * or digit adjoins it, and one longest-first pass never scans its own
- * replacement. A credential the configuration doesn't hold, such as an
- * access provider's cached bearer token or another origin's, is outside it.
- * JSON-RPC answers and errors thrown to a host's own call pass as they are.
+ * one can't be told from ordinary text, and it is replaced wherever it
+ * occurs, after an escape or inside a longer token too. A short query value
+ * is replaced only with its name, as one name=value, and only where no
+ * letter or digit adjoins the pair, so v=2 leaves dev=2 alone. One
+ * longest-first pass never scans its own replacement. A credential the
+ * configuration doesn't hold, such as the token an access provider fetches
+ * or another origin's, is outside it. JSON-RPC answers, and the error a
+ * host's own connect raises, pass as they are.
  */
 export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
   return serverTextRedactor(config)(text);

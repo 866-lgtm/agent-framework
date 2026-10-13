@@ -14263,13 +14263,14 @@ export class AgentFramework {
       try {
         const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
         if (receipt && receipt.accepted === false) {
-          const fallback = receipt.fallback ?? 'mcp-only';
+          const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
+          const fallback = refusal.fallback;
           console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
           this.emitTrace({
             type: 'mcpl:policy-refused',
             serverId: connection.id,
             phase: 'manifest-change',
-            ...AgentFramework.policyRefusalFields(receipt, recorded),
+            ...refusal,
           });
           if (fallback === 'close') {
             await connection.close();
@@ -14349,6 +14350,10 @@ export class AgentFramework {
     connection: McplServerConnection,
   ): Promise<void> {
     if (!connection.capabilities) return;
+    // The server's configuration as it is now, before any await: every
+    // record of what the server says below keeps it, whatever the host
+    // changes in the configuration meanwhile.
+    const recorded = serverTextRedactor(config);
 
     // §5.4: compute the effective grant from the (config-masked)
     // advertisement. Not yet active — expansion activates only after the
@@ -14379,15 +14384,18 @@ export class AgentFramework {
     try {
       const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
       if (receipt && receipt.accepted === false) {
-        const fallback = receipt.fallback ?? 'mcp-only';
+        // The fallback the host takes, which is the one logged; the server's
+        // reason is its own text.
+        const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
+        const fallback = refusal.fallback;
         console.error(
-          `[mcpl] ${config.id} refused initial policy (${redactServerText(receipt.reason ?? 'no reason', config)}) — fallback: ${fallback}`,
+          `[mcpl] ${config.id} refused initial policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`,
         );
         this.emitTrace({
           type: 'mcpl:policy-refused',
           serverId: config.id,
           phase: 'initial',
-          ...AgentFramework.policyRefusalFields(receipt, (text) => redactServerText(text, config)),
+          ...refusal,
         });
         if (fallback === 'close') {
           await connection.close();
@@ -14402,9 +14410,9 @@ export class AgentFramework {
       connection.establishGrant(grant);
       if (receipt?.accepted === true && receipt.mode === 'degraded') {
         for (const uf of receipt.unavailableFeatures ?? []) {
-          console.error(
+          console.error(recorded(
             `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${uf.missingCapabilities.join(', ')})`,
-          );
+          ));
         }
       }
     } catch (err) {
@@ -14416,7 +14424,7 @@ export class AgentFramework {
       console.error(
         `[mcpl] ${config.id} did not answer the initial policy Request — ` +
           `MCPL privileged surface stays disabled (§6.7 unanswered expansion): ` +
-          (err instanceof Error ? err.message : String(err)),
+          recorded(err instanceof Error ? err.message : err),
       );
       return;
     }

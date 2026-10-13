@@ -361,6 +361,42 @@ test("a refused initial policy's reason is recorded without the server's configu
   assert.ok(!capture.lines.join('\n').includes(secret));
 });
 
+test("the initial policy's other records keep the credentials out too, with the configuration as it was when the request went", async () => {
+  const secret = 'srvSecret0123456789';
+  const run = async (answer: () => Promise<unknown>, mutate?: (config: McplServerConfig) => void) => {
+    const fw = Object.create(AgentFramework.prototype) as any;
+    fw.traceListeners = [];
+    fw.featureSetManager = new FeatureSetManager();
+    fw.checkpointManager = null;
+    const traces: Traced[] = [];
+    fw.onTrace((e: Traced) => traces.push(e));
+    const config = { id: 'srv', url: `wss://h/mcp/${secret}` } as McplServerConfig;
+    const connection = {
+      id: 'srv',
+      capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+      mcpToolsAdvertised: false,
+      establishGrant: () => {},
+      sendFeatureSetsUpdateRequest: async () => { mutate?.(config); return answer(); },
+      close: async () => {},
+    };
+    const capture = captureConsoleError();
+    try { await fw.registerMcplServerFeatures(config, connection); } finally { capture.stop(); }
+    const text = capture.lines.join('\n') + JSON.stringify(traces);
+    assert.ok(!text.includes(secret), text);
+    return { lines: capture.lines, traces };
+  };
+  // An unanswered request whose error quotes the url.
+  await run(async () => { throw new Error(`timed out talking to wss://h/mcp/${secret}`); });
+  // A refusal whose fallback isn't one the host knows: it logs what it does.
+  const odd = await run(async () => ({ accepted: false, fallback: `close-${secret}`, reason: 'no' }));
+  assert.ok(odd.lines.some((l) => l.includes('refused initial policy (no) — fallback: mcp-only')), odd.lines.join('\n'));
+  // A degraded acceptance whose effect quotes the url.
+  await run(async () => ({ accepted: true, mode: 'degraded', unavailableFeatures: [{ featureSet: 'fs', effect: `see ${secret}`, missingCapabilities: ['x'] }] }));
+  // The host replaces the url while the request waits: the record still
+  // knows the credential the request went with.
+  await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }), (config) => { (config as { url?: string }).url = 'wss://h/mcp/rotatedSecret0123456789'; });
+});
+
 test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {
   for (const fallback of ['close', 'mcp-only'] as const) {
     const fw = Object.create(AgentFramework.prototype) as any;
