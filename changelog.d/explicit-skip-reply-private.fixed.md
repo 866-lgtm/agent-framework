@@ -22,15 +22,15 @@
   delivered rounds have set, decided at each round's end, so a private
   round's prefix doesn't count. The stream also reads a `>>` prefix after
   any leading whitespace, and ends its target at any whitespace, as delivery
-  does, rather than streaming such a line as text or dropping it. Each
-  round's text starts a new line for the stream, as delivery parses each
+  does, rather than streaming such a line as text or dropping it. The stream
+  parses each round's text from the start of a line, as delivery parses each
   round on its own: a round that began with a `>>` prefix streamed it as
   text to the previous round's destination. A round's later text block
-  starts a new line too, as delivery joins a round's text blocks with a
-  newline. At each round's end, and when the membrane retries a refused
-  attempt, the stream returns to the turn's destination, so a private
-  round's prefix, a `>>skip_reply` envelope or a target that didn't resolve
-  no longer moves where later rounds stream.
+  starts a new line, as delivery joins a round's text blocks with a newline.
+  At each round's end, and when the membrane retries a refused attempt, the
+  stream returns to the turn's destination, so a private round's prefix, a
+  `>>skip_reply` envelope or a target that didn't resolve no longer moves
+  where later rounds stream.
 - A turn resumed by a tool-result-guard retry or a budget restart now queues
   its prose deliveries behind the turn's earlier ones, in every mode, so the
   turn delivers in the order it wrote. Before, a resumed reply could be
