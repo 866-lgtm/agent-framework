@@ -14,6 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
 import type { JsStore } from '@animalabs/chronicle';
 
 import type {
@@ -25,6 +26,7 @@ import type {
   ChannelsIncomingParams,
   ChannelsIncomingResult,
   ChannelIncomingMessageResult,
+  ChannelIncomingMessage,
   ChannelsPublishParams,
   ChannelsOpenResult,
   ChannelHistoryRequest,
@@ -34,6 +36,10 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
+import { expandCoreTags } from './tags.js';
+import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { isVisiblyEmptyContent } from './visible-content.js';
+import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -42,17 +48,141 @@ import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js
 const TYPING_INTERVAL_MS = 7_000;
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
-type DesiredChannelState = 'open' | 'closed';
+/**
+ * Durable "which label did this channelId have, each time we saw it" log.
+ * `resolveProseTarget()` resolves a label to an id only for channels
+ * currently in the live `channels` map — fine for normal addressing, but
+ * useless for browsing history on a channel the bot has since disconnected
+ * from (or that didn't survive a restart). This log lets that lookup survive
+ * a disconnect/restart by replaying the most recent label sighting per
+ * channelId. See `labelHistory`, `appendLabelSighting`, and
+ * `resolveProseTargetDurable`.
+ */
+const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
+
+type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
+
+/**
+ * Parameters of an active tune-out (issue #77), carried on the
+ * 'desired-state' record entering the tuned-out state and projected into
+ * `desiredStates`. A tuned-out channel stays OPEN at the transport (traffic
+ * must keep arriving for the subconscious); the divert-don't-wake behavior
+ * is applied downstream at ingestion.
+ */
+export interface TuneOutParams {
+  /** Identity of this tune-out epoch. Stamped into diverted messages
+   *  (`metadata.tuneOut = { epochId }`) for permanent main-view exclusion
+   *  and per-epoch audit; also keys durable wake counting. */
+  epochId: string;
+  /** Subconscious summary cadence, in seconds. */
+  cadenceSeconds: number;
+  /** Maximum messages dumped raw at cancel; above the cap the subconscious
+   *  curates a digest and `fetch_history` covers the rest. */
+  backlogCap: number;
+  /** Wake invocations before the tune-out auto-cancels. */
+  maxWakes: number;
+  /** Chronicle sequence when the tune-out began — window anchor + audit bound. */
+  startedAtSequence: number;
+  /** Absolute wall-clock deadline (epoch ms). When set, the tune-out
+   *  auto-cancels at this time via the standard cancel flow ("duration
+   *  elapsed") — the agent's self-binding attention budget (#77 "for a
+   *  period chosen by the agent"). Unset = until cancelled. */
+  expiresAtMs?: number;
+}
 
 interface ChannelLifecycleEvent {
-  kind: 'desired-state' | 'legacy-policy-migrated' | 'invitation-declined';
+  kind:
+    | 'desired-state'
+    | 'legacy-policy-migrated'
+    | 'invitation-declined'
+    | 'tune-out-wake';
   serverId: string;
   timestamp: string;
   channelId?: string;
   desired?: DesiredChannelState;
+  /** Present when desired === 'tuned-out'. */
+  tuneOut?: TuneOutParams;
+  /** kind 'tune-out-wake': durable running wake count for an epoch.
+   *  Lives in the lifecycle log (not gate stats) because gate runtime
+   *  state dies with the process and max-wakes must not reset on restart. */
+  epochId?: string;
+  wakeCount?: number;
   source?: string;
   messageId?: string;
   acknowledgment?: string;
+}
+
+/** One append-log record in `CHANNEL_LABEL_HISTORY_LOG_ID`: "at `ts`, this
+ *  channelId's label was observed to be `label`". See `labelHistory`. */
+interface ChannelLabelSightingEvent {
+  channelId: string;
+  label: string;
+  ts: number;
+  /** DM recipient id (e.g. a Discord snowflake), when the descriptor's
+   *  metadata carried one — persisted so a `<@id>` mention form can still
+   *  resolve a DM's channelId after a restart, the same way
+   *  `resolveProseTarget()`'s live `dmMeta().recipientId` matching does. */
+  recipientId?: string;
+  /** DM recipient's actual username, when the descriptor's metadata
+   *  carried one — persisted because it can differ from the descriptor's
+   *  display `label` (e.g. label "DM: Tess" but recipientName
+   *  "antra_tessera"), and `resolveProseTarget()`'s live matching prefers
+   *  it over the label for exactly that reason. Without this, an `@name`
+   *  lookup after a restart could only ever match the label text, never
+   *  the actual username an agent would naturally type. */
+  recipientName?: string;
+  /** True when the descriptor's metadata explicitly classified this
+   *  channel as a DM (`channelType === 'dm'`) at sighting time — persisted
+   *  because `resolveProseTarget()`'s live classification checks this
+   *  metadata field FIRST, before any id-shape or label-prefix convention,
+   *  so a DM whose id/label don't follow the usual `:dm:`/`DM: ` shape
+   *  still needs a durable way to be recognized as a DM at all once
+   *  disconnected. Only ever recorded `true` (an explicit positive
+   *  classification) — a channel with no signal either way is left
+   *  `undefined`, not asserted `false`, so classification always falls
+   *  back to id/label-shape heuristics rather than durably asserting a
+   *  negative for the (overwhelmingly common) case where this metadata
+   *  was simply never sent. */
+  isDm?: boolean;
+}
+
+/** Extract a DM's identity/classification fields from a descriptor's
+ *  metadata, if present — mirrors `resolveProseTarget()`'s own local
+ *  `dmMeta()` read (`recipientId`, `recipientName`, `channelType`). Used
+ *  to durably persist them alongside a label sighting (see
+ *  `ChannelLabelSightingEvent`'s corresponding fields), captured at the
+ *  SAME point (sighting time) rather than re-derived later from id/label
+ *  shape, which is exactly what the live resolver does NOT do either. */
+function extractDmMeta(metadata: Record<string, unknown> | undefined): {
+  recipientId?: string;
+  recipientName?: string;
+  isDm?: boolean;
+} {
+  const recipientId = typeof metadata?.recipientId === 'string' ? metadata.recipientId : undefined;
+  const recipientName = typeof metadata?.recipientName === 'string' ? metadata.recipientName : undefined;
+  const isDm = metadata?.channelType === 'dm' ? true : undefined;
+  return { recipientId, recipientName, isDm };
+}
+
+/**
+ * Case-insensitive channel-label comparison key: strips a leading '#' and
+ * lowercases. Mirrors the normalization `resolveProseTarget()` applies to
+ * its live-channel label matches (see the local `norm` there) — factored out
+ * so `resolveLabelFromHistory()` recognizes the same spellings without
+ * duplicating (and risking drift from) the live matching rules.
+ */
+function normalizeChannelLabel(s: string): string {
+  return s.replace(/^#/, '').toLowerCase();
+}
+
+/**
+ * Same as `normalizeChannelLabel`, but also strips a trailing parenthetical
+ * guild/server suffix (e.g. "#fable (antra's server)" -> "fable") so a bare
+ * channel name matches the disambiguated label agents often omit. Mirrors
+ * `resolveProseTarget()`'s local `nameOf` helper.
+ */
+function normalizeChannelLabelName(label: string): string {
+  return normalizeChannelLabel(label.replace(/\s*\([^)]*\)\s*$/, ''));
 }
 
 function shallowEqualRecord(
@@ -101,6 +231,10 @@ interface McplChannelIncomingEvent {
   content: ContentBlock[];
   timestamp: string;
   metadata?: Record<string, unknown>;
+  /** MCPL RFC-001 event tags (`chat:addressed`, `chat:ambient`, …) — carried
+   *  through so the host can rank addressed messages over ambient chatter
+   *  when picking a turn's frozen speech locus. */
+  tags?: string[];
   triggerInference?: boolean;
   targetAgents?: string[];
 }
@@ -118,6 +252,16 @@ function convertBlock(block: McplContentBlock): ContentBlock {
       return { type: 'text', text: block.text };
 
     case 'image':
+      if (isInlineContradiction(block)) {
+        // RFC-005 vector 2: inline data claiming bulk disposition — fail
+        // closed, withhold the data (checked BEFORE the data branch).
+        return { type: 'text', text: INLINE_WITHHELD_TEXT };
+      }
+      if (block.uri && block.disposition) {
+        // RFC-005 uri-form media with a disposition claim: stub, do not
+        // hand the URI to the provider or inline it.
+        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
+      }
       if (block.data && block.mimeType) {
         return {
           type: 'image',
@@ -133,6 +277,16 @@ function convertBlock(block: McplContentBlock): ContentBlock {
       return { type: 'text', text: '[Image: no data]' };
 
     case 'audio':
+      if (isInlineContradiction(block)) {
+        // RFC-005 vector 2: inline data claiming bulk disposition — fail
+        // closed, withhold the data (checked BEFORE the data branch).
+        return { type: 'text', text: INLINE_WITHHELD_TEXT };
+      }
+      if (block.uri && block.disposition) {
+        // RFC-005 uri-form media with a disposition claim: stub, do not
+        // hand the URI to the provider or inline it.
+        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
+      }
       if (block.data && block.mimeType) {
         return {
           type: 'audio',
@@ -142,7 +296,14 @@ function convertBlock(block: McplContentBlock): ContentBlock {
       return { type: 'text', text: '[Audio: no data]' };
 
     case 'resource':
-      return { type: 'text', text: `[Resource: ${block.uri}]` };
+      // RFC-005: reference blocks become bounded stubs — never raw URIs
+      // (a signed URL is a bearer credential that looks like a location).
+      return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
+
+    default:
+      // Unknown wire block types previously fell off the exhaustive switch
+      // and propagated `undefined` into ContentBlock[]. Fail visibly.
+      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
   }
 }
 
@@ -227,20 +388,37 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'think',
     description:
-      'Reason privately. The content stays in your own context and is NOT sent to any ' +
-      'channel or surface. Same-round routing of ordinary text beside think() depends on ' +
-      'your current same_round_think_text_policy; inspect or change it with agent_settings. ' +
-      'Use think() purely to work things out before (or instead of) speaking. To deliberately ' +
-      'NOT reply this turn, call skip_reply instead.',
+      'Your personal workspace and reasoning channel. Before reasoning about your ' +
+      'output, call the scratchpad immediately — you may reason within it. ' +
+      'Scratchpad may be called multiple times, for thinking after calling other tools. ' +
+      'Work through every angle of the problem there: considerations, counterarguments ' +
+      'edge cases, tangents, comparisons, nuances, examples. Be thorough and exhaustive. ' +
+      'It will not be made visible to the user.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         content: {
           type: 'string',
-          description: 'Your private thought / reasoning (optional; not sent anywhere).',
+          description: 'Your private thought / reasoning (not sent anywhere).',
         },
       },
       required: [],
+    },
+  },
+  {
+    name: 'journal',
+    description:
+      'Write an entry in your private journal. The entry stays in your own context and ' +
+      'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
+      'than a line that you want to keep for yourself — reflections, what you decided and ' +
+      'why, notes for later. It does not end your turn and does not affect where ordinary ' +
+      'text is routed; to end the turn without replying, call skip_reply afterwards.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        content: { type: 'string', description: 'The journal entry (private; not sent anywhere).' },
+      },
+      required: ['content'],
     },
   },
   {
@@ -248,14 +426,23 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     description:
       'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
       'read the messages but deliberately choose not to reply right now — ambient chatter, ' +
-      'nothing to add, or you are waiting. Any plain text you wrote this turn stays private ' +
-      'and is NOT posted. To reply instead, just write plain text (no tool call).',
+      'nothing to add, or you are waiting. To reply instead, just write plain text. ' +
+        'To end this turn but come back on your own shortly, set wake_in_seconds.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         reason: {
           type: 'string',
-          description: 'Optional private note on why you are not replying (not sent anywhere).',
+          description:
+            'Optional ONE short line on why you are not replying (private; not sent anywhere). ' +
+            'Keep it under ~100 characters — put anything longer in journal() first.',
+        },
+        wake_in_seconds: {
+          type: 'number',
+          description:
+            'Optional self-wake: if nothing else wakes you first, you wake again after this ' +
+            'many seconds (1 = go again almost immediately; clamped to 1–3600). Any other ' +
+            'wake before then cancels it. Omit to stay idle until the next external wake.',
         },
       },
       required: [],
@@ -268,6 +455,17 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 interface ChannelRegistryOptions {
+  /**
+   * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
+   * the event the ordinary path would have queued. The handler decides
+   * replace / append / withdraw and returns the per-message result. Throws a
+   * `CoalesceError` for a malformed or unauthorized occurrence.
+   */
+  handleCoalescedIncoming?: (
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: McplChannelIncomingEvent,
+  ) => Promise<ChannelIncomingMessageResult>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
   /** Callback to determine whether an incoming message should trigger inference. */
@@ -285,6 +483,22 @@ interface ChannelRegistryOptions {
     channelId: string | null;
     reason: string;
     textLen: number;
+  }) => void;
+  /**
+   * Called when channels were opened WITHOUT the agent asking (subscription
+   * policy admitting a newly discovered channel, or delivery into a closed
+   * locus). The host wires this to drop a durable notice into the agent's
+   * window — the agent must always learn that new traffic will start
+   * flowing, and that `channel_close` opts out (their decision outranks
+   * policy). Fires ONCE per channel ever: the desired-state decision is
+   * durable, so reboots do not re-announce. Must not trigger inference.
+   */
+  onChannelAutoOpened?: (info: {
+    /** Agent whose action caused the open (delivery); absent for policy opens. */
+    conversationId?: string;
+    serverId: string;
+    source: 'subscription-policy' | 'opened-by-delivery';
+    channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   /**
    * Resolve a conversation fork's HOME channel from its agent name. Conversation
@@ -328,6 +542,21 @@ interface ChannelRegistryOptions {
 // ChannelRegistry
 // ============================================================================
 
+/**
+ * Who is actually making a channel tool call, as established by the
+ * framework's own dispatch — model-origin calls come through
+ * dispatchToolCall (which knows the agent), module calls come through
+ * ModuleContext.callTool. Tool INPUT can claim anything; this cannot.
+ */
+export type ChannelToolOrigin =
+  | { kind: 'module'; moduleName?: string }
+  | { kind: 'agent'; agentName: string };
+
+/** The machine decision sources a module-origin channel_close may record.
+ *  Closed on purpose: honest provenance means a small, auditable vocabulary,
+ *  not arbitrary self-description. */
+export const MACHINE_CLOSE_SOURCES = new Set(['subscription-gc', 'housekeeping']);
+
 export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
@@ -346,6 +575,12 @@ export class ChannelRegistry {
     reason: string;
     textLen: number;
   }) => void;
+  private onChannelAutoOpened?: (info: {
+    conversationId?: string;
+    serverId: string;
+    source: 'subscription-policy' | 'opened-by-delivery';
+    channels: Array<{ channelId: string; label?: string }>;
+  }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
   private homeChannel?: string;
@@ -353,6 +588,56 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+
+  /**
+   * Most-recently-known label per channelId, replayed from
+   * `CHANNEL_LABEL_HISTORY_LOG_ID` (last sighting wins) and kept current by
+   * `appendLabelSighting()`. Unlike `channels`, this survives disconnect and
+   * restart — it's what lets `resolveProseTargetDurable()` resolve a label
+   * for a channel that's no longer live. Keyed by bare channelId, not
+   * `{serverId}:{channelId}` — the label history exists to answer "what id
+   * did this label refer to", independent of which server it came through.
+   */
+  private labelHistory = new Map<string, string>();
+
+  /**
+   * EVERY distinct label a channelId has ever been durably seen with (not
+   * just the latest) — additive alongside `labelHistory`, populated by the
+   * same replay-at-boot loop and the same `appendLabelSighting()` call.
+   * `labelHistory` alone can only resolve a channel's CURRENT/latest name;
+   * this is what lets `resolveLabelFromHistory()` find a channel by a label
+   * it used to have before a rename — the exact case this whole durable log
+   * exists for (finding an old/renamed channel while browsing history).
+   */
+  private allLabelsSeen = new Map<string, Set<string>>();
+
+  /**
+   * DM recipientId per channelId, durably replayed alongside `labelHistory`
+   * — the piece a `<@id>` mention-form lookup needs that `allLabelsSeen`'s
+   * label strings alone can't provide. See `resolveLabelFromHistory()`'s
+   * DM-aware arm.
+   */
+  private dmRecipientIds = new Map<string, string>();
+
+  /**
+   * DM recipient's actual username per channelId — can differ from the
+   * channel's display label (`resolveProseTarget()`'s live DM matching
+   * prefers this over the label for exactly that reason). See
+   * `resolveDmFromHistory()`.
+   */
+  private dmRecipientNames = new Map<string, string>();
+
+  /**
+   * channelId -> true, for every channel EXPLICITLY classified as a DM via
+   * `metadata.channelType === 'dm'` at some sighting — an id/label-shape-
+   * independent classification signal, the same one `resolveProseTarget()`
+   * checks live. Only ever holds `true`; a channel with no explicit
+   * classification is simply absent (not `false`), so `isDmChannelId()`
+   * falls back to id/label-shape heuristics for it rather than durably
+   * asserting a negative for the common case where this metadata was never
+   * sent at all.
+   */
+  private dmClassified = new Map<string, true>();
 
   /** Most recent incoming channel ID — used for speech routing / default publish. */
   private defaultPublishChannel: string | null = null;
@@ -371,11 +656,20 @@ export class ChannelRegistry {
   /** Chronicle-projected desired lifecycle state, keyed by server + channel.
    *  Provenance is kept so reconcile can tell a pure default (nobody ever
    *  decided) from a real decision (agent-tool, invitation-declined, …). */
-  private desiredStates = new Map<string, { state: DesiredChannelState; source: string }>();
+  private desiredStates = new Map<string, {
+    state: DesiredChannelState;
+    source: string;
+    /** Present iff state === 'tuned-out'. */
+    tuneOut?: TuneOutParams;
+    /** Durable wake count for the active tune-out epoch (replayed from
+     *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
+    wakeCount?: number;
+  }>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
+  private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -391,6 +685,7 @@ export class ChannelRegistry {
       ) => void;
     },
   ) {
+    this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -398,11 +693,13 @@ export class ChannelRegistry {
     this.sendTypingFn = options?.sendTypingFn;
     this.shouldTriggerInference = options?.shouldTriggerInference;
     this.onRouteFailure = options?.onRouteFailure;
+    this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.homeChannel = options?.homeChannel;
     this.store = options?.store;
     this.initializeLifecycleStore();
+    this.initializeLabelHistoryStore();
   }
 
   /**
@@ -429,20 +726,33 @@ export class ChannelRegistry {
     responder?: Responder,
   ): Promise<void> {
     const registeredIds: string[] = [];
+    // §14.5: per-descriptor authorization with ITEMIZED results — one entry
+    // per submitted descriptor. Strict 0.5 servers treat a result without
+    // `results` (or a descriptor missing from it) as rejected, so the shape
+    // is interop-critical, not decorative. Rejection here is per-descriptor
+    // validation; the method-level channels.register gate already ran at the
+    // connection (§14.1).
+    const results: ChannelsRegisterResult['results'] = [];
 
     for (const channel of params.channels) {
+      if (!channel || typeof channel.id !== 'string' || channel.id.length === 0) {
+        results.push({ id: String(channel?.id ?? ''), accepted: false, reason: 'invalid descriptor: missing id' });
+        continue;
+      }
       const key = `${serverId}:${channel.id}`;
       this.channels.set(key, {
         serverId,
         descriptor: channel,
         open: false,
       });
+      this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
       registeredIds.push(channel.id);
+      results.push({ id: channel.id, accepted: true });
     }
 
     // Respond before reconciliation — the server blocks on this response and
     // can't process channels/open until it arrives.
-    const result: ChannelsRegisterResult = { registered: registeredIds };
+    const result: ChannelsRegisterResult = { registered: registeredIds, results };
     responder?.respond(result);
 
     // One-time migration from the retired recipe policy, then reconcile the
@@ -467,39 +777,80 @@ export class ChannelRegistry {
   async handleChanged(
     serverId: string,
     params: ChannelsChangedParams,
+    responder?: Responder,
   ): Promise<void> {
-    // Process removed channels
+    // §14.5: dual-mode. Request form answers ITEMIZED per-descriptor
+    // results for added channels; Notification form filters itemwise with a
+    // diagnostic. Either way, added descriptors are validated exactly like
+    // channels/register — a changed-set cannot smuggle in what register
+    // would have rejected (PR #79 review blocker 5).
+    const addedResults: Array<{ id: string; accepted: boolean; reason?: string }> = [];
+    // Process removed channels — itemized truthfully: removal of a channel
+    // we never had is reported, not silently accepted.
     if (params.removed) {
       for (const channelId of params.removed) {
         const key = `${serverId}:${channelId}`;
-        this.channels.delete(key);
+        const existed = this.channels.delete(key);
         this.stopTyping(channelId);
+        addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
     }
 
-    // Process updated channels (replace descriptor, preserve open state)
+    // Process updated channels — validated itemwise exactly like added
+    // (§14.5: a changed-set cannot smuggle in what register would reject),
+    // and every submitted descriptor gets a verdict: a strict server reads
+    // absence from `results` as rejection.
     if (params.updated) {
       for (const channel of params.updated) {
+        if (!channel || typeof channel.id !== 'string' || channel.id.length === 0) {
+          addedResults.push({ id: String(channel?.id ?? ''), accepted: false, reason: 'invalid descriptor: missing id' });
+          this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, reason: 'missing id (update)' });
+          continue;
+        }
         const key = `${serverId}:${channel.id}`;
         const existing = this.channels.get(key);
-        if (existing) {
-          existing.descriptor = channel;
+        if (!existing) {
+          addedResults.push({ id: channel.id, accepted: false, reason: 'not registered — update rejected (§14.5)' });
+          this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, channelId: channel.id, reason: 'update for unregistered channel' });
+          continue;
         }
+        existing.descriptor = channel;
+        this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
+        addedResults.push({ id: channel.id, accepted: true });
       }
     }
 
-    // Process added channels (register + reconcile durable desired state)
+    // Process added channels (validate per-descriptor, register; reconcile
+    // after responding, below)
+    const accepted: typeof params.added = [];
     if (params.added) {
       for (const channel of params.added) {
+        if (!channel || typeof channel.id !== 'string' || channel.id.length === 0) {
+          addedResults.push({ id: String(channel?.id ?? ''), accepted: false, reason: 'invalid descriptor: missing id' });
+          this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, reason: 'missing id' });
+          continue;
+        }
         const key = `${serverId}:${channel.id}`;
         this.channels.set(key, {
           serverId,
           descriptor: channel,
           open: false,
         });
+        this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
+        addedResults.push({ id: channel.id, accepted: true });
+        accepted.push(channel);
       }
-      await this.reconcileChannels(serverId, params.added);
     }
+
+    // Respond before reconciliation, as handleRegister does. A server that
+    // announces from inside a request it is serving (a tool that refreshes
+    // or subscribes) cannot read the channels/open or channels/close that
+    // reconciling sends until this response arrives; reconciling first
+    // deadlocks both sides until one times out (#160). The verdicts are
+    // settled above, so nothing in the response depends on reconciling.
+    responder?.respond({ results: addedResults });
+
+    if (accepted.length > 0) await this.reconcileChannels(serverId, accepted);
 
     this.emitTraceFn({
       type: 'mcpl:channels-changed',
@@ -516,21 +867,28 @@ export class ChannelRegistry {
    * Converts each message's content, pushes McplChannelIncomingEvent to the
    * queue, and responds with per-message results.
    */
-  handleIncoming(
+  async handleIncoming(
     serverId: string,
     params: ChannelsIncomingParams,
     responder?: Responder,
-  ): void {
+  ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
 
     for (const message of params.messages) {
-      // Convert MCPL content blocks to membrane ContentBlocks
-      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
-
-      // Track default publish channel (most recent incoming)
-      this.defaultPublishChannel = message.channelId;
-      this.defaultPublishMessageId = message.messageId;
-      this.defaultPublishThreadId = message.threadId;
+      if (!message || typeof message.channelId !== 'string' || !message.channelId
+        || typeof message.messageId !== 'string' || !message.messageId) {
+        results.push({
+          messageId: typeof message?.messageId === 'string' ? message.messageId : '',
+          accepted: false,
+          reason: message?.coalesce !== undefined ? 'coalesce_invalid' : 'invalid channel/message identity',
+        });
+        continue;
+      }
+      // §14.5 FIRST, before ANY semantic processing: admission against the
+      // actually-registered channel precedes tag expansion and content
+      // conversion — decoding an unregistered sender's payload (including
+      // inline base64) is allocation and parsing work done for a message
+      // that must be rejected (Sol, PR #79 re-review blocker 2).
 
       // Lazy-register the channel if we've never seen it. A channel can deliver
       // an incoming message before its channels/register (boot enumeration) or
@@ -543,37 +901,84 @@ export class ChannelRegistry {
       // is reachable. The inbound message carries enough to make it publishable,
       // so register it here; a later authoritative channels/register or
       // channels/changed will overwrite this descriptor with the richer one.
+      // §14.5: channels/incoming is validated against the ACTUALLY
+      // REGISTERED channel. An unknown claimed channelId is rejected
+      // per-message with an itemized result — never minted by its first
+      // message (PR #79 review blocker 5: lazy-registration let a server
+      // self-attest a channel identity without ever passing
+      // channels/register authorization). A server whose channel genuinely
+      // exists registers it first; discord's DM case goes through
+      // ensureChannelRegistered on push/event, which creates a CLOSED
+      // routable entry rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
-        const channelLabel =
-          typeof message.metadata?.channelName === 'string' && message.metadata.channelName
-            ? (message.metadata.channelName as string)
-            : message.channelId;
-        this.channels.set(incomingKey, {
-          serverId,
-          descriptor: {
-            id: message.channelId,
-            type: serverId,
-            label: channelLabel,
-            direction: 'bidirectional',
-            address: message.threadId ? { threadId: message.threadId } : undefined,
-            metadata: { lazyRegistered: true },
-          },
-          open: true,
-        });
         this.emitTraceFn({
-          type: 'mcpl:channel-lazy-registered',
+          type: 'mcpl:channel-incoming-rejected',
           serverId,
           channelId: message.channelId,
-          label: channelLabel,
+          reason: 'unknown channel — not registered (§14.5)',
         });
-      } else {
+        results.push({
+          messageId: message.messageId,
+          accepted: false,
+          reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
+        });
+        continue;
+      }
+
+      // ACCEPTED from here down: semantic processing only for admitted
+      // messages. §16.3 core-tag closure, then content conversion.
+      const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
+      // §6; the coalescer appends nothing for it). Any other message that
+      // shows the model nothing would wake it with no visible cause.
+      const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
+      const rejectEmpty = () => {
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${message.channelId} messageId=${message.messageId} reason=empty-content`);
+        this.emitTraceFn({
+          type: 'mcpl:channel-incoming-rejected',
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          reason: 'empty-content',
+        });
+        results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
+      };
+      if (coalesced) {
+        // RFC-006 §13: malformed content on a coalesced item is that item's
+        // failure, not the batch's — check the shape before converting.
+        try {
+          validateCoalescedContent(message.content, undefined, { allowEmpty: emptyAllowed });
+        } catch (error) {
+          if (error instanceof EmptyContentError) rejectEmpty();
+          else results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          continue;
+        }
+      }
+      if (message.tags) message.tags = expandCoreTags(message.tags);
+      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+        rejectEmpty();
+        continue;
+      }
+
+      // Track default publish channel (most recent ACCEPTED incoming) —
+      // deliberately after §14.5 validation: a rejected message from an
+      // unregistered channel must not retarget outbound speech (the locus is
+      // exactly the authority a self-attested channel would be stealing).
+      // A coalesced item is "accepted" only once the coalescer admits it, so
+      // for those this runs after the hook (below).
+      const markAccepted = () => {
+        this.defaultPublishChannel = message.channelId;
+        this.defaultPublishMessageId = message.messageId;
+        this.defaultPublishThreadId = message.threadId;
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
         // operations.
         this.channels.get(incomingKey)!.open = true;
-      }
+      };
+      if (!coalesced) markAccepted();
 
       // Determine whether to trigger inference
       let triggerInference = true;
@@ -608,8 +1013,29 @@ export class ChannelRegistry {
         content: convertedContent,
         timestamp: message.timestamp,
         metadata: message.metadata,
+        ...(message.tags ? { tags: message.tags } : {}),
         triggerInference,
       };
+
+      if (coalesced) {
+        // RFC-006 §14.3: a coalesced message is admitted like any other and
+        // then handed, with the event the ordinary path would have queued, to
+        // the coalescer, which replaces, appends or withdraws. Malformed
+        // `coalesce` is a per-message failure; siblings are unaffected.
+        try {
+          const result = await this.handleCoalescedIncoming!(serverId, message, event);
+          if (result.accepted) markAccepted();
+          results.push(result);
+        } catch (error) {
+          const err = error as Error & { code?: number };
+          results.push({
+            messageId: message.messageId,
+            accepted: false,
+            reason: err.code === -32602 ? 'coalesce_invalid' : err.message,
+          });
+        }
+        continue;
+      }
 
       // Push to the processing queue
       // Cast through unknown because McplChannelIncomingEvent matches the
@@ -649,9 +1075,32 @@ export class ChannelRegistry {
    * channels/register or channels/changed overwrites this descriptor with the
    * richer one.
    */
-  ensureChannelRegistered(serverId: string, channelId: string, label?: string): void {
+  ensureChannelRegistered(
+    serverId: string,
+    channelId: string,
+    label?: string,
+    extraMetadata?: Record<string, unknown>,
+  ): void {
     const existing = this.findChannelEntry(channelId);
     if (existing) {
+      // Backfill identity onto a bare lazy registration: a DM that first
+      // arrived with no label/recipient info gets a usable name the next
+      // time a message reveals it (labels must show people, not ids).
+      if (
+        (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
+        label && existing.descriptor.label === channelId
+      ) {
+        existing.descriptor.label = label;
+        if (extraMetadata) {
+          existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
+        }
+        // The channel now has a real label, not just the bare id — durable.
+        this.appendLabelSighting(
+          existing.descriptor.id,
+          existing.descriptor.label,
+          extractDmMeta(existing.descriptor.metadata),
+        );
+      }
       return;
     }
 
@@ -663,10 +1112,23 @@ export class ChannelRegistry {
         type: serverId,
         label: label ?? channelId,
         direction: 'bidirectional',
-        metadata: { lazyRegistered: true },
+        metadata: { lazyRegistered: true, ...(extraMetadata ?? {}) },
       },
       open: false,
     });
+    // Only persist a REAL label durably. Falling back to the bare
+    // channelId as a placeholder (no server-supplied label at all — e.g. a
+    // Discord DM push missing both channelName and an author name,
+    // framework.ts's derivePushEventChannel) must never overwrite a real
+    // label already on file from a previous boot: after a restart the live
+    // `channels` map starts empty, so THIS is the very branch a
+    // label-less post-restart event takes — recording the placeholder here
+    // would clobber the good label initializeLabelHistoryStore() just
+    // replayed, defeating the entire point of the durable log. The live
+    // descriptor above still carries the placeholder for in-process
+    // routing; only the durable write is skipped when there's no real
+    // label to record.
+    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -785,6 +1247,18 @@ export class ChannelRegistry {
    * Get the descriptor for a channel by its channelId (first match across
    * servers). Used by the conversation router for DM classification.
    */
+  /**
+   * RFC-006 §3.2: is `channelId` registered BY `serverId` through a server
+   * declaration (channels/register, channels/changed) or an authorized open?
+   * A placeholder minted from a push's `origin` (ensureChannelRegistered)
+   * does not count: a channel id appearing in an untrusted field is not a
+   * registration.
+   */
+  isDeclaredChannel(serverId: string, channelId: string): boolean {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    return !!entry && !(entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered;
+  }
+
   getDescriptor(channelId: string): ChannelDescriptor | undefined {
     return this.findChannelEntry(channelId)?.descriptor;
   }
@@ -823,8 +1297,21 @@ export class ChannelRegistry {
 
   /**
    * Handle a call to one of the synthesized channel tools.
+   *
+   * `origin` is TRUSTED DISPATCH CONTEXT, supplied by the framework's own
+   * routing (dispatchChannelToolCall and the public executeToolCall for
+   * model-origin calls, the framework's private ModuleRegistry closure for
+   * module ctx.callTool) — never derived from tool input. Machine
+   * provenance on channel_close is honored only for module origin; a
+   * model-origin call carrying the same fields is recorded as the agent
+   * decision it actually is. Absent origin is treated as agent-origin (the
+   * untrusted-safe default).
    */
-  async handleChannelToolCall(toolName: string, input: unknown): Promise<ToolResult> {
+  async handleChannelToolCall(
+    toolName: string,
+    input: unknown,
+    origin?: ChannelToolOrigin,
+  ): Promise<ToolResult> {
     switch (toolName) {
       case 'channel_list':
         return this.handleToolList();
@@ -838,7 +1325,15 @@ export class ChannelRegistry {
         });
 
       case 'channel_close':
-        return this.handleToolClose(input as { channelId: string; serverId?: string });
+        return this.handleToolClose(
+          input as {
+            channelId: string;
+            serverId?: string;
+            source?: string;
+            overrideExplicitOpen?: boolean;
+          },
+          origin,
+        );
 
       case 'channel_decline':
         return this.handleToolDecline(input as {
@@ -854,8 +1349,11 @@ export class ChannelRegistry {
       case 'think':
         return this.handleToolThink(input as { content?: string });
 
+      case 'journal':
+        return this.handleToolJournal(input as { content?: string });
+
       case 'skip_reply':
-        return this.handleToolSkipReply(input as { reason?: string });
+        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: number });
 
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
@@ -987,12 +1485,31 @@ export class ChannelRegistry {
       if (
         event.kind === 'desired-state' &&
         typeof event.channelId === 'string' &&
-        (event.desired === 'open' || event.desired === 'closed')
+        (event.desired === 'open' || event.desired === 'closed' ||
+          (event.desired === 'tuned-out' && event.tuneOut))
       ) {
         this.desiredStates.set(
           this.lifecycleKey(event.serverId, event.channelId),
-          { state: event.desired, source: typeof event.source === "string" ? event.source : "unknown" },
+          {
+            state: event.desired,
+            source: typeof event.source === "string" ? event.source : "unknown",
+            tuneOut: event.desired === 'tuned-out' ? event.tuneOut : undefined,
+            wakeCount: 0,
+          },
         );
+      } else if (
+        event.kind === 'tune-out-wake' &&
+        typeof event.channelId === 'string' &&
+        typeof event.wakeCount === 'number'
+      ) {
+        // Fold durable wake counts into the projection — but only while the
+        // epoch that recorded them is still the active desired state
+        // (last-record-wins semantics, same as desired-state itself).
+        const key = this.lifecycleKey(event.serverId, event.channelId);
+        const current = this.desiredStates.get(key);
+        if (current?.state === 'tuned-out' && current.tuneOut?.epochId === event.epochId) {
+          current.wakeCount = event.wakeCount;
+        }
       } else if (event.kind === 'legacy-policy-migrated') {
         this.migratedLegacyPolicies.add(event.serverId);
       }
@@ -1001,6 +1518,341 @@ export class ChannelRegistry {
 
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
+  }
+
+  // ==========================================================================
+  // Private: Durable channel-label history (disconnected-channel resolution)
+  // ==========================================================================
+
+  /**
+   * Replay `CHANNEL_LABEL_HISTORY_LOG_ID` into `labelHistory`. Same
+   * construction-time timing as `initializeLifecycleStore()`, and the same
+   * register-if-missing / swallow-"already exists" pattern. The log is
+   * chronological, so folding forward and letting each record overwrite the
+   * map entry for its channelId naturally keeps only the latest sighting.
+   */
+  private initializeLabelHistoryStore(): void {
+    if (!this.store) return;
+
+    try {
+      this.store.registerState({ id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
+        throw error;
+      }
+    }
+
+    const raw = this.store.getStateJson(CHANNEL_LABEL_HISTORY_LOG_ID);
+    if (!Array.isArray(raw)) return;
+
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const event = item as Partial<ChannelLabelSightingEvent>;
+      if (typeof event.channelId !== 'string' || typeof event.label !== 'string' || !event.label) continue;
+      this.labelHistory.set(event.channelId, event.label);
+      let seen = this.allLabelsSeen.get(event.channelId);
+      if (!seen) {
+        seen = new Set();
+        this.allLabelsSeen.set(event.channelId, seen);
+      }
+      seen.add(event.label);
+      if (typeof event.recipientId === 'string' && event.recipientId) {
+        this.dmRecipientIds.set(event.channelId, event.recipientId);
+      }
+      if (typeof event.recipientName === 'string' && event.recipientName) {
+        this.dmRecipientNames.set(event.channelId, event.recipientName);
+      }
+      if (event.isDm === true) {
+        this.dmClassified.set(event.channelId, true);
+      }
+    }
+  }
+
+  /**
+   * Record that `channelId` was most recently seen with `label` (and,
+   * optionally, DM identity/classification fields). Called from every
+   * place a `ChannelDescriptor` is set into the live `channels` map
+   * (`handleRegister`, `handleChanged`'s update/add branches,
+   * `ensureChannelRegistered`) so the label survives disconnect and restart
+   * for `resolveLabelFromHistory()` / `resolveProseTargetDurable()`.
+   *
+   * Guarded like `setDesiredState()`: a reconnect or re-registration that
+   * reports the same label AND the same dmMeta fields as last time is a
+   * no-op, so the append log doesn't grow without bound on every
+   * boot/resubscribe — but a later call that newly supplies (or changes)
+   * any dmMeta field for an already-known label (label unchanged) still
+   * records, since that's genuinely new durable information, not a no-op
+   * resighting. `isDm` only ever compares against a possible narrowing:
+   * once durably `true`, a later sighting without `channelType==='dm'`
+   * metadata (i.e. `dmMeta.isDm === undefined`, NOT `false` — see
+   * `extractDmMeta`) is simply silent on the question, not a "no longer a
+   * DM" downgrade, so it never counts as a change on its own.
+   *
+   * `label` is `string | undefined` (not just `string`) even though
+   * `ChannelDescriptor.label` is typed `string`: that typing is a
+   * compile-time-only assertion over untrusted wire data from an MCPL
+   * server, and only `channel.id` is runtime-validated on the way in
+   * (`handleRegister`/`handleChanged`). A missing/undefined label is
+   * dropped rather than recorded — durable garbage here would later throw
+   * inside `resolveLabelFromHistory()`'s normalization, which every
+   * `HistoryModule` tool call passes through unguarded via
+   * `resolveProseTargetDurable()`.
+   */
+  private appendLabelSighting(
+    channelId: string,
+    label: string | undefined,
+    dmMeta: { recipientId?: string; recipientName?: string; isDm?: boolean } = {},
+  ): void {
+    if (typeof label !== 'string' || !label) return;
+    const { recipientId, recipientName, isDm } = dmMeta;
+    // Never let a bare-id placeholder (ensureChannelRegistered's fallback
+    // `label ?? channelId` when no real label was ever supplied — e.g. a
+    // Discord DM push missing both channelName and an author name) durably
+    // overwrite a real label already on file. This is exactly the restart
+    // scenario the durable log exists to survive: the live `channels` map
+    // is empty after a restart, so the next label-less event would
+    // otherwise take the "first sighting" path and clobber a good label
+    // the replay above just restored. (Belt-and-braces alongside
+    // ensureChannelRegistered's own guard, which should stop this before
+    // it ever gets here — see there for the primary fix.)
+    if (label === channelId && this.labelHistory.has(channelId)) return;
+    const labelUnchanged = this.labelHistory.get(channelId) === label;
+    const recipientIdUnchanged = recipientId === undefined || recipientId === this.dmRecipientIds.get(channelId);
+    const recipientNameUnchanged = recipientName === undefined || recipientName === this.dmRecipientNames.get(channelId);
+    const isDmUnchanged = isDm === undefined || this.dmClassified.get(channelId) === true;
+    if (labelUnchanged && recipientIdUnchanged && recipientNameUnchanged && isDmUnchanged) return;
+    this.labelHistory.set(channelId, label);
+    let seen = this.allLabelsSeen.get(channelId);
+    if (!seen) {
+      seen = new Set();
+      this.allLabelsSeen.set(channelId, seen);
+    }
+    seen.add(label);
+    if (recipientId) this.dmRecipientIds.set(channelId, recipientId);
+    if (recipientName) this.dmRecipientNames.set(channelId, recipientName);
+    if (isDm) this.dmClassified.set(channelId, true);
+    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
+      channelId,
+      label,
+      ts: Date.now(),
+      ...(recipientId ? { recipientId } : {}),
+      ...(recipientName ? { recipientName } : {}),
+      ...(isDm ? { isDm } : {}),
+    } satisfies ChannelLabelSightingEvent);
+  }
+
+  /**
+   * Look up a label spec against label *history* rather than the live
+   * `channels` map — the fallback path for a channel the bot isn't
+   * currently connected to. Applies the same normalization
+   * `resolveProseTarget()` uses for its live label/name matches
+   * (`normalizeChannelLabel` / `normalizeChannelLabelName`), plus a raw-id
+   * fast path (mirroring `resolveProseTarget()`'s own raw-id acceptance).
+   *
+   * Matches against `allLabelsSeen` — EVERY label a channel has ever had —
+   * not just its current/latest one in `labelHistory`, so a channel renamed
+   * A -> B -> A is still resolvable by a name from BEFORE the most recent
+   * rename (the point of a history-browsing tool is finding things by what
+   * they used to be called). Ambiguity is genuine here: if the same
+   * normalized spec matches historical labels belonging to two DIFFERENT
+   * channelIds (an actual rename collision, not just the same channel seen
+   * twice), that's a real ambiguity, not a false positive from re-scanning
+   * one channel's own label list — `byLabel`/`byName` tracking below
+   * already only flags ambiguous when the matched channelId itself differs.
+   *
+   * Returns undefined — rather than raising an ambiguity error — when a
+   * normalized spec matches more than one distinct channelId in history;
+   * callers fall back to `resolveProseTarget()`'s original error in that
+   * case via `resolveProseTargetDurable()`.
+   */
+  private resolveLabelFromHistory(spec: string): string | undefined {
+    const trimmed = spec.trim();
+    if (!trimmed) return undefined;
+
+    // Fast path: spec is already a channelId we have label history for.
+    if (this.labelHistory.has(trimmed)) return trimmed;
+
+    // DM-aware arm, mirroring resolveProseTarget()'s own `@name` / `<@id>`
+    // handling (see there) — but over durable history instead of the live
+    // `channels` map, so a disconnected/post-restart DM stays addressable
+    // by the natural forms an agent would type, not just the exact stored
+    // label string. Tried BEFORE the generic byLabel/byName loop below
+    // because a bare `@antra` would otherwise also partially match via
+    // normalizeChannelLabel's '#'-only stripping (which does nothing for a
+    // leading '@') and fail confusingly instead of going through DM rules.
+    const mention = /^<@!?(\d+)>$/.exec(trimmed);
+    if (trimmed.startsWith('@') || mention) {
+      return this.resolveDmFromHistory(trimmed, mention);
+    }
+
+    const normSpec = normalizeChannelLabel(trimmed);
+    let byLabel: string | undefined;
+    let byLabelAmbiguous = false;
+    let byName: string | undefined;
+    let byNameAmbiguous = false;
+
+    for (const [channelId, labels] of this.allLabelsSeen) {
+      for (const label of labels) {
+        // `?? ''` is belt-and-braces: appendLabelSighting/replay already
+        // refuse to store a falsy label, so this should never see one, but
+        // normalizeChannelLabel has no internal guard of its own (unlike
+        // resolveProseTarget's `e.descriptor.label ?? ''`), and this is
+        // exactly the kind of one-bad-record-poisons-every-future-call path
+        // that caused finding #2.
+        const normLabel = normalizeChannelLabel(label ?? '');
+        const normName = normalizeChannelLabelName(label ?? '');
+        if (normLabel === normSpec) {
+          if (byLabel !== undefined && byLabel !== channelId) byLabelAmbiguous = true;
+          byLabel = channelId;
+        }
+        if (normName === normSpec) {
+          if (byName !== undefined && byName !== channelId) byNameAmbiguous = true;
+          byName = channelId;
+        }
+      }
+    }
+
+    if (byLabel !== undefined && !byLabelAmbiguous) return byLabel;
+    if (byName !== undefined && !byNameAmbiguous) return byName;
+    return undefined;
+  }
+
+  /**
+   * A channel counts as a DM (for the purposes of durable-history lookup)
+   * if: it was EXPLICITLY classified as one via `metadata.channelType ===
+   * 'dm'` at some sighting (`dmClassified` — the same classification
+   * signal `resolveProseTarget()`'s live `isDmEntry()` checks FIRST, before
+   * any naming convention, so an id/label that don't follow the usual
+   * `:dm:`/`DM: ` shape still get recognized correctly — this is what
+   * `private-room-42` labeled just `Tess` needs); OR, as a fallback for
+   * descriptors that never carried that metadata at all, its id shape says
+   * so, or any label it has ever carried says so.
+   */
+  private isDmChannelId(channelId: string): boolean {
+    if (this.dmClassified.get(channelId) === true) return true;
+    if (channelId.includes(':dm:')) return true;
+    const labels = this.allLabelsSeen.get(channelId);
+    if (!labels) return false;
+    for (const label of labels) {
+      if (label.toLowerCase().startsWith('dm: ')) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Durable-history counterpart to `resolveProseTarget()`'s DM-matching arm
+   * (see there for the live version this mirrors). Handles the two forms
+   * `resolveProseTarget()` supports: a `<@id>` mention (matched against
+   * `dmRecipientIds`, persisted alongside a label sighting specifically for
+   * this) and a bare `@name` (matched against EITHER the persisted
+   * `dmRecipientNames` — the DM's actual username, which the live resolver
+   * prefers and which can differ from the display label, e.g. label
+   * "DM: Tess" but username "antra_tessera" — OR the `DM: `-stripped form
+   * of each DM channel's CURRENT label in `labelHistory`, as a fallback for
+   * descriptors that never carried a recipientName; historical DM labels
+   * aren't name-matched here the way non-DM labels are in
+   * `resolveLabelFromHistory`'s main loop, since a DM's label is a person's
+   * name, not a channel name subject to the same kind of rename).
+   *
+   * Returns undefined on no-match OR ambiguity, same contract as
+   * `resolveLabelFromHistory` — the caller falls back to the live
+   * resolver's original error.
+   */
+  private resolveDmFromHistory(trimmed: string, mention: RegExpExecArray | null): string | undefined {
+    // dmClassified/dmRecipientIds/dmRecipientNames are always populated
+    // alongside allLabelsSeen (same appendLabelSighting call, same
+    // falsy-label early return) — so allLabelsSeen's keys are a superset
+    // of every channel any DM signal could exist for.
+    const dmChannelIds = [...this.allLabelsSeen.keys()].filter((id) => this.isDmChannelId(id));
+
+    if (mention) {
+      const id = mention[1]!;
+      const matches = dmChannelIds.filter((cid) => this.dmRecipientIds.get(cid) === id);
+      return matches.length === 1 ? matches[0] : undefined;
+    }
+
+    const name = trimmed.slice(1).toLowerCase();
+    const labelName = (channelId: string): string => {
+      const label = (this.labelHistory.get(channelId) ?? '').toLowerCase();
+      return label.startsWith('dm: ') ? label.slice(4) : label;
+    };
+
+    // Three strict tiers, mirroring the LIVE resolver's precedence (which
+    // prefers recipientName over the label outright, never a flat pool of
+    // equal-priority candidates): (1) EXACT match against a channel's own
+    // recorded recipientName, (2) EXACT match against a channel's label
+    // (only tried when tier 1 found NOTHING — not merely "didn't match
+    // this channel", genuinely zero matches across every dm channel), (3)
+    // fuzzy/substring match across the combined name pool, as a last
+    // resort. Each tier stops at real ambiguity (2+ matches) rather than
+    // falling through — an ambiguous EXACT recipientName match is a
+    // genuine collision between two real usernames, not something a
+    // weaker label-based tier should silently resolve.
+    //
+    // Tier 1 taking outright precedence (not "additive" the way label
+    // fuzzy-matching is within a single channel) is the actual fix: a flat
+    // combined pool let a DIFFERENT channel's stale/unrelated display
+    // label collide with THIS channel's real recorded username, making an
+    // otherwise-unique lookup falsely ambiguous after a restart — even
+    // though the persisted recipientName data was sufficient on its own to
+    // resolve it. See the regression for the exact collision shape.
+    const exactRecipientName = dmChannelIds.filter((cid) => this.dmRecipientNames.get(cid)?.toLowerCase() === name);
+    if (exactRecipientName.length === 1) return exactRecipientName[0];
+    if (exactRecipientName.length > 1) return undefined;
+
+    const exactLabel = dmChannelIds.filter((cid) => labelName(cid) === name);
+    if (exactLabel.length === 1) return exactLabel[0];
+    if (exactLabel.length > 1) return undefined;
+
+    const candidateNames = (channelId: string): string[] => {
+      const names: string[] = [];
+      const recipientName = this.dmRecipientNames.get(channelId);
+      if (recipientName) names.push(recipientName.toLowerCase());
+      const label = labelName(channelId);
+      if (label) names.push(label);
+      return names;
+    };
+    const fuzzy = dmChannelIds.filter((cid) =>
+      candidateNames(cid).some((n) => n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name))),
+    );
+    return fuzzy.length === 1 ? fuzzy[0] : undefined;
+  }
+
+  /**
+   * Durable-history-aware counterpart to `resolveProseTarget()`. Resolves a
+   * label or channelId to a canonical channel id even for a channel the bot
+   * is not currently connected to (browsing message history is exactly the
+   * case where you want to look at an old/quiet/disconnected channel, so the
+   * live-only `resolveProseTarget()` isn't enough).
+   *
+   * Tries the live path first — unchanged, so ordinary addressing keeps its
+   * exact current behavior — and only consults `labelHistory` on a live
+   * miss. If history has no answer either, the original error/candidates
+   * from `resolveProseTarget()` are returned unchanged, so callers keep the
+   * same debuggability they'd get from the live-only path.
+   *
+   * CAVEAT (prose-misdelivery safety): if two channels once shared a label
+   * but only ONE of them ever got a durable label-history record (e.g. the
+   * other was lazily registered label-less, or predates this feature), this
+   * can return a single confident answer where `resolveProseTarget()` on
+   * fuller live data would have said "ambiguous" — the durable fallback
+   * only sees what was actually persisted, not what's structurally true.
+   * This is harmless for the current sole caller
+   * (`HistoryModule.resolveChannel`, read-only), but a future caller wiring
+   * this into a SEND path should be aware the ambiguity guarantee is weaker
+   * here than on the live path.
+   */
+  resolveProseTargetDurable(
+    spec: string,
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+    const live = this.resolveProseTarget(spec);
+    if (!('error' in live)) return live;
+
+    const channelId = this.resolveLabelFromHistory(spec);
+    if (channelId !== undefined) {
+      return { channelId, label: this.labelHistory.get(channelId) };
+    }
+    return live;
   }
 
   private setDesiredState(
@@ -1020,6 +1872,147 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  // ==========================================================================
+  // Tune-out state (issue #77) — durable in the lifecycle log
+  // ==========================================================================
+
+  /**
+   * Enter (or re-enter with fresh params) the tuned-out state for a channel.
+   * Re-entering under a new epochId replaces the active epoch; the previous
+   * epoch's stamped messages stay excluded (stamps are permanent) and its
+   * wake count is superseded. Transport stays open (see reconcile).
+   */
+  enterTuneOut(
+    serverId: string,
+    channelId: string,
+    params: TuneOutParams,
+    source: string,
+  ): void {
+    const key = this.lifecycleKey(serverId, channelId);
+    this.desiredStates.set(key, {
+      state: 'tuned-out',
+      source,
+      tuneOut: params,
+      wakeCount: 0,
+    });
+    this.appendLifecycleEvent({
+      kind: 'desired-state',
+      serverId,
+      channelId,
+      desired: 'tuned-out',
+      tuneOut: params,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * End the active tune-out, returning the channel to `nextState`.
+   * The caller (tune-out coordinator) owns the dump/notice flow; this is
+   * only the durable state flip. No-op returning null if the channel is
+   * not tuned out.
+   */
+  cancelTuneOut(
+    serverId: string,
+    channelId: string,
+    nextState: 'open' | 'closed',
+    source: string,
+  ): { params: TuneOutParams; wakeCount: number } | null {
+    const key = this.lifecycleKey(serverId, channelId);
+    const current = this.desiredStates.get(key);
+    if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
+    const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
+    this.desiredStates.set(key, { state: nextState, source });
+    this.appendLifecycleEvent({
+      kind: 'desired-state',
+      serverId,
+      channelId,
+      desired: nextState,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+    return ended;
+  }
+
+  /**
+   * Durably record one wake invocation against the active epoch and return
+   * the updated count with the params (the coordinator compares against
+   * maxWakes and decides auto-cancel). Durable here, not in gate stats:
+   * gate runtime state dies with the process, and a restart must not grant
+   * a hammered channel a fresh wake budget.
+   */
+  recordTuneOutWake(
+    serverId: string,
+    channelId: string,
+  ): { params: TuneOutParams; wakeCount: number } | null {
+    const key = this.lifecycleKey(serverId, channelId);
+    const current = this.desiredStates.get(key);
+    if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
+    current.wakeCount = (current.wakeCount ?? 0) + 1;
+    this.appendLifecycleEvent({
+      kind: 'tune-out-wake',
+      serverId,
+      channelId,
+      epochId: current.tuneOut.epochId,
+      wakeCount: current.wakeCount,
+      timestamp: new Date().toISOString(),
+    });
+    return { params: current.tuneOut, wakeCount: current.wakeCount };
+  }
+
+  /** Active tune-out params + wake count for a channel, or null. */
+  getTuneOutState(
+    serverId: string,
+    channelId: string,
+  ): { params: TuneOutParams; wakeCount: number } | null {
+    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
+    return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
+  }
+
+  /** Registered channel entries (read-only iteration for the coordinator). */
+  listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
+    return [...this.channels.values()].map((e) => ({
+      serverId: e.serverId,
+      descriptor: e.descriptor,
+    }));
+  }
+
+  /**
+   * Small chronicle snapshot-state helpers for the tune-out coordinator
+   * (dispositions slot). Registration is idempotent; absent store = null/no-op
+   * (mirrors the lifecycle log's optional-store posture).
+   */
+  readCoordinatorState(stateId: string): unknown {
+    if (!this.store) return null;
+    try {
+      this.store.registerState({ id: stateId, strategy: 'snapshot' });
+    } catch { /* already registered */ }
+    return this.store.getStateJson(stateId);
+  }
+
+  writeCoordinatorState(stateId: string, value: unknown): void {
+    if (!this.store) return;
+    try {
+      this.store.registerState({ id: stateId, strategy: 'snapshot' });
+    } catch { /* already registered */ }
+    this.store.setStateJson(stateId, value);
+  }
+
+  /**
+   * Publish into a channel on behalf of a named non-resident agent (the
+   * subconscious's speak_in_channel). Same delivery path as the
+   * channel_publish tool; the agent name rides the speech-routed trace.
+   */
+  async publishForAgent(
+    channelId: string,
+    text: string,
+    agentName: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
+    this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
+    return this.handleToolPublish({ channelId, content: text });
   }
 
   /**
@@ -1050,23 +2043,60 @@ export class ChannelRegistry {
     });
   }
 
-  private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): void {
+  /**
+   * True when the server's recipe subscription policy wants this channel
+   * open. This is an ONGOING admission policy (subscribed ⇒ open, no matter
+   * when the channel is discovered) — not just a bootstrap seed. Allow-list
+   * entries may be composite MCPL ids or raw server-internal ids.
+   */
+  private policyWantsOpen(serverId: string, channel: ChannelDescriptor): boolean {
+    const policy = this.legacyPolicies.get(serverId) ?? 'manual';
+    if (policy === 'auto') return true;
+    if (Array.isArray(policy)) {
+      if (policy.includes(channel.id)) return true;
+      const raw = (channel.address as { channelId?: string } | undefined)?.channelId;
+      return typeof raw === 'string' && raw.length > 0 && policy.includes(raw);
+    }
+    return false;
+  }
+
+  /**
+   * Returns true when this call made a FRESH subscription-policy decision to
+   * open the channel — the caller announces those to the agent (once per
+   * channel ever: the decision persists in chronicle, so reboots see an
+   * existing non-default source and never re-fire).
+   */
+  private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): boolean {
+    const byPolicy = this.policyWantsOpen(serverId, channel);
+    const wantsOpen = channel.initiallyOpen === true || byPolicy;
     const existing = this.desiredStates.get(this.lifecycleKey(serverId, channel.id));
     if (existing) {
-      // A server upgrading its descriptor to initiallyOpen may lift a pure
-      // default — 'default-closed' means nobody ever decided. Real decisions
+      // A server upgrading its descriptor to initiallyOpen — or a channel
+      // matching the subscription policy — may lift a pure default:
+      // 'default-closed' means nobody ever decided. Real decisions
       // (agent-tool, invitation-declined, legacy migration, …) always stick.
-      if (channel.initiallyOpen === true && existing.state === 'closed' && existing.source === 'default-closed') {
-        this.setDesiredState(serverId, channel.id, 'open', 'server-bootstrap');
+      if (wantsOpen && existing.state === 'closed' && existing.source === 'default-closed') {
+        this.setDesiredState(
+          serverId,
+          channel.id,
+          'open',
+          channel.initiallyOpen === true ? 'server-bootstrap' : 'subscription-policy',
+        );
+        return channel.initiallyOpen !== true && byPolicy;
       }
-      return;
+      return false;
     }
     this.setDesiredState(
       serverId,
       channel.id,
-      channel.initiallyOpen === true ? 'open' : 'closed',
-      channel.initiallyOpen === true ? 'server-bootstrap' : 'default-closed',
+      wantsOpen ? 'open' : 'closed',
+      channel.initiallyOpen === true
+        ? 'server-bootstrap'
+        : wantsOpen
+          ? 'subscription-policy'
+          : 'default-closed',
     );
+    return channel.initiallyOpen !== true && byPolicy;
   }
 
   private async reconcileChannels(
@@ -1076,12 +2106,35 @@ export class ChannelRegistry {
     const server = this.serverRegistry.getServer(serverId);
     if (!server) return;
 
+    // §14.1: channels/open + channels/close require channels.lifecycle.
+    // Skipping reconciliation for an ungranted server is the enforcement —
+    // its channels simply stay in whatever state the server chose, and the
+    // host never directs lifecycle it was not granted authority over.
+    if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
+      this.emitTraceFn({
+        type: 'mcpl:channel-reconcile-skipped',
+        serverId,
+        reason: 'channels.lifecycle not in effective grant (§14.1)',
+      });
+      return;
+    }
+
+    // Channels the subscription policy freshly admitted in THIS pass —
+    // announced to the agent as one batched notice after the loop, so a
+    // first boot on a new policy doesn't produce one notice per channel.
+    const policyOpened: Array<{ channelId: string; label?: string }> = [];
+
     for (const channel of channels) {
-      this.ensureInitialDesiredState(serverId, channel);
+      if (this.ensureInitialDesiredState(serverId, channel)) {
+        policyOpened.push({ channelId: channel.id, label: channel.label });
+      }
       const key = `${serverId}:${channel.id}`;
       const desired = this.getDesiredState(serverId, channel.id);
       const entry = this.channels.get(key);
-      if (desired !== 'open') {
+      // Tuned-out sits on the OPEN side of reconcile: traffic must keep
+      // arriving (the subconscious reads it); only main's wake/visibility
+      // is diverted, downstream at ingestion.
+      if (desired !== 'open' && desired !== 'tuned-out') {
         try {
           await server.sendChannelsClose({ channelId: channel.id });
           if (entry) entry.open = false;
@@ -1115,6 +2168,21 @@ export class ChannelRegistry {
         });
       }
     }
+
+    // Announce policy admissions to the agent — nothing may start flowing
+    // traffic into their window without them being told, and told how to
+    // opt out (channel_close; their decision outranks policy).
+    if (policyOpened.length > 0) {
+      try {
+        this.onChannelAutoOpened?.({
+          serverId,
+          source: 'subscription-policy',
+          channels: policyOpened,
+        });
+      } catch (err) {
+        console.error('onChannelAutoOpened (policy) failed:', err);
+      }
+    }
   }
 
   // ==========================================================================
@@ -1128,6 +2196,10 @@ export class ChannelRegistry {
    * (typing timer lifecycle is still managed for when the callback is wired).
    */
   private sendTypingNotification(serverId: string, channelId: string): void {
+    // §14.1: channels/typing requires channels.typing in the grant. Silent
+    // skip — a typing indicator is cosmetic and per-7s, so a diagnostic per
+    // tick would be noise.
+    if (!CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.typing')) return;
     if (this.sendTypingFn) {
       this.sendTypingFn(serverId, channelId, this.typingMetadata.get(channelId));
     }
@@ -1138,6 +2210,13 @@ export class ChannelRegistry {
   // ==========================================================================
   // Private: Channel Lookup
   // ==========================================================================
+
+  /** Descriptors registered by one server — the §14.3 channels/list answer. */
+  descriptorsForServer(serverId: string): ChannelDescriptor[] {
+    return [...this.channels.values()]
+      .filter((e) => e.serverId === serverId)
+      .map((e) => e.descriptor);
+  }
 
   /** Server id owning a registered channel (by descriptor id), or null. */
   getChannelServerId(channelId: string): string | null {
@@ -1224,6 +2303,272 @@ export class ChannelRegistry {
     };
   }
 
+  /**
+   * The single open executor: record durable desired-open intent, tell the
+   * server to subscribe, mark the live entry open. Every path that opens a
+   * channel — the agent's channel_open tool, delivery into a closed locus,
+   * an explicit send into a closed channel — funnels here, so lifecycle
+   * events, desired state, and live state can never diverge by path.
+   * Desired state is recorded BEFORE the server round-trip: intent sticks
+   * even if the subscribe fails, and reconciliation retries later.
+   */
+  private async openChannelNow(
+    entry: ChannelEntry,
+    source: string,
+    history?: ChannelHistoryRequest,
+  ): Promise<ChannelsOpenResult> {
+    this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
+    const server = this.serverRegistry.getServer(entry.serverId);
+    if (!server) {
+      throw new Error(`Server not found: ${entry.serverId}`);
+    }
+    if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
+      // Desired state is already recorded — intent sticks; reconciliation
+      // will retry if the grant later widens (§6.7 expansion-on-receipt).
+      throw new Error(`channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`);
+    }
+    const result: ChannelsOpenResult = await server.sendChannelsOpen({
+      channelId: entry.descriptor.id,
+      type: entry.descriptor.type,
+      address: entry.descriptor.address,
+      ...(history ? { history } : {}),
+    });
+    entry.open = true;
+    return result;
+  }
+
+  /**
+   * Resolve a `>>` prose-routing target (explicit prose routing —
+   * docs/explicit-prose-routing.md) to a registered channel.
+   *
+   * Accepted spellings, tried in order:
+   *   1. exact descriptor id (`discord:guild:123`, always unambiguous)
+   *   2. exact raw server-internal id (`address.channelId`)
+   *   3. `#label` / bare label — case-insensitive match on descriptor label
+   *      with any leading '#' stripped from both sides
+   *   4. `@name` — DM descriptor labels (`DM: name`), case-insensitive
+   *
+   * Ambiguity is an error carrying candidates — never a guess: this is the
+   * mechanism that makes prose misdelivery structurally impossible.
+   */
+  resolveProseTarget(
+    spec: string,
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+    const entries = [...this.channels.values()];
+    const trimmed = spec.trim();
+    if (!trimmed) return { error: 'empty target' };
+
+    const exact = entries.filter((e) => e.descriptor.id === trimmed);
+    if (exact.length === 1) {
+      return { channelId: exact[0]!.descriptor.id, label: exact[0]!.descriptor.label };
+    }
+    if (exact.length > 1) {
+      return {
+        error: `channel id "${trimmed}" is ambiguous across servers`,
+        candidates: exact.map((e) => `${e.serverId}:${e.descriptor.id}`),
+      };
+    }
+
+    const raw = entries.filter(
+      (e) => (e.descriptor.address as { channelId?: string } | undefined)?.channelId === trimmed,
+    );
+    if (raw.length === 1) {
+      return { channelId: raw[0]!.descriptor.id, label: raw[0]!.descriptor.label };
+    }
+    if (raw.length > 1) {
+      return {
+        error: `raw id "${trimmed}" is ambiguous`,
+        candidates: raw.map((e) => e.descriptor.id),
+      };
+    }
+
+    const norm = normalizeChannelLabel;
+
+    // DM addressing is PEOPLE-first: usernames and mention tokens, never
+    // ids-only (2026-07-24, antra + Fable's live-canary bug report). A DM
+    // entry is matched by, in order: recipientId (from a `<@id>` mention
+    // token), exact recipient/label name, then prefix-lenient name (handles
+    // "@antra_tessera" vs a display name "antra" and vice versa).
+    const mention = /^<@!?(\d+)>$/.exec(trimmed);
+    if (trimmed.startsWith('@') || mention) {
+      const dmMeta = (e: ChannelEntry) =>
+        e.descriptor.metadata as { channelType?: string; recipientId?: string; recipientName?: string } | undefined;
+      const dmName = (e: ChannelEntry) => {
+        const meta = dmMeta(e);
+        if (meta?.recipientName) return meta.recipientName.toLowerCase();
+        const label = (e.descriptor.label ?? '').toLowerCase();
+        return label.startsWith('dm: ') ? label.slice(4) : label;
+      };
+      const isDmEntry = (e: ChannelEntry) =>
+        dmMeta(e)?.channelType === 'dm' ||
+        (e.descriptor.label ?? '').toLowerCase().startsWith('dm: ') ||
+        e.descriptor.id.includes(':dm:');
+      const dms = entries.filter(isDmEntry);
+
+      if (mention) {
+        const id = mention[1]!;
+        const byId = dms.filter((e) => dmMeta(e)?.recipientId === id);
+        if (byId.length === 1) {
+          return { channelId: byId[0]!.descriptor.id, label: byId[0]!.descriptor.label };
+        }
+        return {
+          error: `no registered DM matches the mention <@${id}>`,
+          candidates: dms.map((e) => e.descriptor.label ?? e.descriptor.id).slice(0, 6),
+        };
+      }
+
+      const name = trimmed.slice(1).toLowerCase();
+      const exact = dms.filter((e) => dmName(e) === name);
+      const pool = exact.length > 0
+        ? exact
+        : dms.filter((e) => {
+            const n = dmName(e);
+            return n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name));
+          });
+      if (pool.length === 1) {
+        return { channelId: pool[0]!.descriptor.id, label: pool[0]!.descriptor.label };
+      }
+      if (pool.length > 1) {
+        return {
+          error: `"${trimmed}" matches several DMs`,
+          candidates: pool.map((e) => e.descriptor.label ?? e.descriptor.id),
+        };
+      }
+      return {
+        error: `no registered DM found for "${trimmed}" — for someone without a registered DM channel, use the send_dm tool`,
+        ...(dms.length ? { candidates: dms.map((e) => e.descriptor.label ?? e.descriptor.id).slice(0, 6) } : {}),
+      };
+    }
+
+    const byLabel = entries.filter(
+      (e) => norm(e.descriptor.label ?? '') === norm(trimmed),
+    );
+    if (byLabel.length === 1) {
+      return { channelId: byLabel[0]!.descriptor.id, label: byLabel[0]!.descriptor.label };
+    }
+    if (byLabel.length > 1) {
+      return {
+        error: `label "${trimmed}" matches several channels`,
+        candidates: byLabel.map((e) => e.descriptor.id),
+      };
+    }
+
+    // Name-segment match: server labels carry a disambiguating suffix
+    // (`#fable (antra's server)`) that agents naturally omit — `>>#fable`
+    // must resolve. Strip a trailing parenthetical from the stored label and
+    // compare the bare channel name. Same name in several guilds is a real
+    // ambiguity: error with full labels so the agent can use the exact id.
+    const nameOf = normalizeChannelLabelName;
+    const byName = entries.filter((e) => nameOf(e.descriptor.label ?? '') === norm(trimmed));
+    if (byName.length === 1) {
+      return { channelId: byName[0]!.descriptor.id, label: byName[0]!.descriptor.label };
+    }
+    if (byName.length > 1) {
+      return {
+        error: `"${trimmed}" matches several channels`,
+        candidates: byName.map((e) => `${e.descriptor.label} = ${e.descriptor.id}`),
+      };
+    }
+
+    // No match: offer near-candidates (labels containing the name) so the
+    // bounce notice is self-healing rather than a dead end.
+    const near = entries
+      .filter((e) => norm(e.descriptor.label ?? '').includes(norm(trimmed)))
+      .slice(0, 5)
+      .map((e) => `${e.descriptor.label} = ${e.descriptor.id}`);
+    return { error: `no channel matches "${trimmed}"`, ...(near.length ? { candidates: near } : {}) };
+  }
+
+  /**
+   * The `>>` target to show an agent for a channel: one whitespace-free token
+   * that `resolveProseTarget()` maps back to this same channel. The prefix
+   * grammar takes the target as the first non-whitespace run, so a label with
+   * a space can't be quoted verbatim: `>>#DM: alice` parses as target `#DM:`
+   * plus body `alice …`, and `>>#fable (antra's server)` delivers
+   * `(antra's server)` as text. Tried in order: `@name` for a DM, `#label`,
+   * `#name` (label without its server suffix), the descriptor id.
+   *
+   * Undefined when there is no safe token: the channel isn't registered (on
+   * `serverId`, when given), no candidate is whitespace-free and resolves back,
+   * or the id is registered by more than one server. A resolved target names a
+   * channel by id alone, and ids are unique only within a connection, so a
+   * shared id could route the reply through the wrong server.
+   */
+  proseTargetFor(channelId: string, serverId?: string): string | undefined {
+    const sameId = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    const entry = serverId ? sameId.find((e) => e.serverId === serverId) : sameId[0];
+    if (!entry || sameId.length > 1) return undefined;
+    const d = entry.descriptor;
+    const label = d.label ?? '';
+    const meta = d.metadata as { channelType?: string; recipientName?: string } | undefined;
+    const isDm = meta?.channelType === 'dm' || label.toLowerCase().startsWith('dm: ') || d.id.includes(':dm:');
+    const dmName = meta?.recipientName ?? (label.toLowerCase().startsWith('dm: ') ? label.slice(4) : undefined);
+    const bare = label.replace(/^#/, '');
+    const candidates = [
+      ...(isDm && dmName ? [`@${dmName}`] : []),
+      ...(bare ? [`#${bare}`, `#${bare.replace(/\s*\([^)]*\)\s*$/, '')}`] : []),
+      d.id,
+    ];
+    for (const c of candidates) {
+      if (/\s/.test(c) || c === '#') continue;
+      const r = this.resolveProseTarget(c);
+      if ('channelId' in r && r.channelId === d.id) return c;
+    }
+    return undefined;
+  }
+
+  /**
+   * Open a channel because something was DELIVERED into it (explicit send
+   * tool or routed speech). Sending into a closed channel is not a thing:
+   * engaging a channel opens it, so typing indicators, reaction machinery,
+   * and inbound forwarding all come alive with the first outbound message.
+   * Accepts composite MCPL ids or raw server-internal ids (explicit send
+   * tools receive whatever the agent typed).
+   */
+  async openIfClosedForSend(
+    rawChannelId: string,
+    serverId?: string,
+  ): Promise<{
+    status: 'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed';
+    channelId?: string;
+    label?: string;
+  }> {
+    let matches = [...this.channels.values()].filter(
+      (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
+    );
+    if (matches.length === 0) {
+      matches = [...this.channels.values()].filter(
+        (e) =>
+          (e.descriptor.address as { channelId?: string } | undefined)?.channelId === rawChannelId &&
+          (!serverId || e.serverId === serverId),
+      );
+    }
+    if (matches.length === 0) return { status: 'unknown-channel' };
+    if (matches.length > 1) return { status: 'ambiguous' };
+    const entry = matches[0]!;
+    const resolved = { channelId: entry.descriptor.id, label: entry.descriptor.label };
+    if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') {
+      return { status: 'already-open', ...resolved };
+    }
+    try {
+      await this.openChannelNow(entry, 'opened-by-reply');
+      this.emitTraceFn({
+        type: 'mcpl:channel-opened-by-send',
+        serverId: entry.serverId,
+        channelId: entry.descriptor.id,
+      });
+      return { status: 'opened', ...resolved };
+    } catch (err) {
+      this.emitTraceFn({
+        type: 'mcpl:channel-open-failed',
+        serverId: entry.serverId,
+        channelId: entry.descriptor.id,
+        error: (err as Error).message,
+      });
+      return { status: 'open-failed', ...resolved };
+    }
+  }
+
   private async handleToolOpen(input: {
     channelId: string;
     serverId?: string;
@@ -1240,22 +2585,27 @@ export class ChannelRegistry {
       };
     }
 
+    // A tuned-out channel is transport-open but attention-diverted; a plain
+    // open would silently discard the epoch (and its pending backlog dump).
+    // Cancelling is the tune-out coordinator's flow, reached via its own
+    // tool — refuse with the pointer rather than eat the state.
+    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
+      return {
+        success: false,
+        isError: false,
+        error:
+          `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
+          `(tune_out with mode: 'cancel') to resume normal attention — ` +
+          `cancelling delivers the diverted backlog.`,
+        data: { refusal: 'tuned-out', channelId: input.channelId },
+      };
+    }
+
     const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
     if (entry.open && alreadyDesiredOpen && !input.backscroll) {
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already open' },
-      };
-    }
-
-    this.setDesiredState(entry.serverId, input.channelId, 'open', 'agent-tool');
-
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return {
-        success: false,
-        error: `Server not found: ${entry.serverId}`,
-        isError: true,
       };
     }
 
@@ -1266,13 +2616,7 @@ export class ChannelRegistry {
             ...(input.beforeMessageId ? { beforeMessageId: input.beforeMessageId } : {}),
           }
         : undefined;
-      const result: ChannelsOpenResult = await server.sendChannelsOpen({
-        channelId: entry.descriptor.id,
-        type: entry.descriptor.type,
-        address: entry.descriptor.address,
-        ...(history ? { history } : {}),
-      });
-      entry.open = true;
+      const result = await this.openChannelNow(entry, 'agent-tool', history);
       return {
         success: true,
         data: {
@@ -1291,7 +2635,25 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolClose(input: { channelId: string; serverId?: string }): Promise<ToolResult> {
+  private async handleToolClose(
+    input: {
+      channelId: string;
+      serverId?: string;
+      /** Machine callers name their decision source ('subscription-gc',
+       *  'housekeeping') so the durable record carries honest provenance.
+       *  Honored ONLY for module-origin dispatch — tool input is untrusted,
+       *  so a model-origin call carrying this field is still recorded as
+       *  'agent-tool' (the resident may close their own channel; they may
+       *  not attribute the act to housekeeping). */
+      source?: string;
+      /** A machine close aimed at an explicitly-opened channel is refused
+       *  unless the caller certifies an explicit idle lease (a configured
+       *  per-channel budget is consent to close at that budget). Module
+       *  origin only, like `source`. */
+      overrideExplicitOpen?: boolean;
+    },
+    origin?: ChannelToolOrigin,
+  ): Promise<ToolResult> {
     const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId);
     const entry = resolved.entry;
     if (!entry) {
@@ -1310,7 +2672,49 @@ export class ChannelRegistry {
       };
     }
 
-    this.setDesiredState(entry.serverId, input.channelId, 'closed', 'agent-tool');
+    // Provenance comes from trusted dispatch, not from self-description:
+    // only module-origin calls may record a machine source, and only from
+    // the closed vocabulary. Agent-origin (or origin-less — the safe
+    // default for any legacy caller) records 'agent-tool' and has its
+    // machine fields ignored entirely.
+    const isModuleOrigin = origin?.kind === 'module';
+    let closeSource = 'agent-tool';
+    if (isModuleOrigin && input.source !== undefined) {
+      if (!MACHINE_CLOSE_SOURCES.has(input.source)) {
+        return {
+          success: false,
+          isError: true,
+          error:
+            `Unknown machine close source '${input.source}'. Machine closes must use one of: ` +
+            `${[...MACHINE_CLOSE_SOURCES].join(', ')}.`,
+        };
+      }
+      closeSource = input.source;
+    }
+
+    // Housekeeping must not override stated intent (issue #5: GC closes wore
+    // the agent's badge and reset explicitly-opened doors). A machine-sourced
+    // close of a channel whose current desired state is an agent/operator
+    // 'open' is refused — structurally, so the caller can stand down rather
+    // than retry — unless it certifies an explicit idle lease.
+    if (isModuleOrigin && closeSource !== 'agent-tool' && !input.overrideExplicitOpen) {
+      const current = this.desiredStates.get(this.lifecycleKey(entry.serverId, input.channelId));
+      // Tuned-out is stated intent too: a GC/housekeeping close would
+      // silently end the epoch and orphan its backlog.
+      if ((current?.state === 'open' || current?.state === 'tuned-out') && current.source === 'agent-tool') {
+        return {
+          success: false,
+          isError: false,
+          error:
+            `Channel ${input.channelId} was explicitly opened (source: agent-tool); ` +
+            `a '${closeSource}' close does not override stated intent. Machine closes ` +
+            `of explicit opens require an explicit idle lease (overrideExplicitOpen).`,
+          data: { refusal: 'explicit-open', channelId: input.channelId },
+        };
+      }
+    }
+
+    this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     this.stopTyping(input.channelId);
 
     const server = this.serverRegistry.getServer(entry.serverId);
@@ -1323,6 +2727,13 @@ export class ChannelRegistry {
     }
 
     try {
+      if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
+        return {
+          success: false,
+          error: `channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`,
+          isError: true,
+        };
+      }
       await server.sendChannelsClose({ channelId: input.channelId });
       entry.open = false;
       return {
@@ -1368,6 +2779,8 @@ export class ChannelRegistry {
       const server = this.serverRegistry.getServer(entry.serverId);
       if (!server) {
         acknowledgmentError = `Server not found: ${entry.serverId}`;
+      } else if (!CapabilityGrant.of(server).has('channels.acknowledge')) {
+        acknowledgmentError = `channels.acknowledge not in "${entry.serverId}"'s effective grant (§14.1)`;
       } else {
         try {
           const result = await server.sendChannelsAcknowledge({
@@ -1422,10 +2835,30 @@ export class ChannelRegistry {
       data: {
         noted: true,
         note:
-          'Thought recorded (private — not sent anywhere). Same-round text routing depends on ' +
-          'your current same_round_think_text_policy; use agent_settings get to inspect it, or ' +
-          'call skip_reply to end the turn without replying.',
+          'Thought recorded (private — not sent anywhere).',
       },
+    };
+  }
+
+  /**
+   * Handle the synthesized `journal` tool — a private place for long-form
+   * notes. Sends nothing, does not end the turn, does not touch prose routing.
+   *
+   * Why it exists (sill, 2026-09-19): residents were keeping 2–3KB diaries in
+   * `skip_reply.reason`. Long prose in a private-REASONING tool argument
+   * (`skip_reply.reason`, `think.content`) makes replayed history read as a
+   * reasoning trace, and every memory-compression request over it is refused
+   * `reasoning_extraction` regardless of content; the same prose in a
+   * note-taking tool passes (canary record: context-manager
+   * `tool-prose-hoist.ts`, whose fallback rung rewrites old history into calls
+   * to THIS tool — so the result wording below is mirrored there as
+   * DEFAULT_TOOL_PROSE_RESULT; keep the two in step).
+   */
+  private handleToolJournal(_input: { content?: string }): ToolResult {
+    return {
+      success: true,
+      // No echo: the entry is already in the tool_use block.
+      data: { recorded: true, note: 'Journal entry recorded (private — not sent anywhere).' },
     };
   }
 
@@ -1436,7 +2869,14 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
+    // The self-wake itself is armed by the framework (which owns the
+    // EventGate) BEFORE this dispatch; when the gate is absent the framework
+    // strips the field so this confirmation stays truthful.
+    const wakeSecs = Number(input.wake_in_seconds);
+    const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
+      ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))
+      : undefined;
     return {
       success: true,
       // The note says "ended the turn" — make it TRUE. Without endTurn the
@@ -1450,7 +2890,9 @@ export class ChannelRegistry {
       // on Fable: ~60% of skip_reply result bytes were verbatim input echo).
       data: {
         skipped: true,
-        note: 'Turn ended; nothing sent.',
+        note: selfWake !== undefined
+          ? `Turn ended; nothing sent. Self-wake in ~${selfWake}s unless something wakes you first.`
+          : 'Turn ended; nothing sent.',
       },
     };
   }
@@ -1465,9 +2907,66 @@ export class ChannelRegistry {
    * the speech simply stays in chronicle + module surfaces).
    */
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  configured home channel → process-global default). Public so a
-   *  multi-segment caller can snapshot it ONCE and pin every segment to it via
-   *  routeSpeech's `overrideChannelId`. */
+   *  process-global default). Public so a multi-segment caller can snapshot it
+   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
+  /**
+   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
+   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
+   * server declared `channels.streaming` in its initialize capabilities —
+   * servers that never opted in (the whole existing fleet) receive nothing.
+   * Fire-and-forget and never throws: streaming is an observer surface; the
+   * authoritative delivery is the eventual channels/publish.
+   */
+  sendOutgoingChunk(
+    channelId: string,
+    conversationId: string,
+    inferenceId: string,
+    index: number,
+    delta: string,
+  ): void {
+    const server = this.streamingServerFor(channelId);
+    if (!server) return;
+    try {
+      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta });
+    } catch { /* observer surface — never disturb the turn */ }
+  }
+
+  /** Spec 14.3 companion: final moderated content per channel at stream end. */
+  sendOutgoingComplete(
+    channelId: string,
+    conversationId: string,
+    inferenceId: string,
+    text: string,
+  ): void {
+    const server = this.streamingServerFor(channelId);
+    if (!server) return;
+    try {
+      server.sendChannelsOutgoingComplete({
+        inferenceId,
+        conversationId,
+        channelId,
+        content: [{ type: 'text', text }],
+      });
+    } catch { /* observer surface — never disturb the turn */ }
+  }
+
+  private streamingServerFor(channelId: string) {
+    // The map is keyed `${serverId}:${channelId}`; stream targets arrive as
+    // bare descriptor ids (what resolveProseTarget returns). Scan like the
+    // resolver does, and fail closed on cross-server ambiguity — the same
+    // never-guess rule that governs delivery.
+    const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    if (matches.length !== 1) return null;
+    const server = this.serverRegistry.getServer(matches[0]!.serverId);
+    // §5.4: the GRANT gates streaming, not the raw advertisement. The old
+    // `capabilities?.channels?.streaming` check was doubly wrong: undefined
+    // for the boolean `channels: true` shape (masking discord-mcpl's latent
+    // double-post, AUDIT-001), and pre-policy it would have sent before the
+    // server was told anything was granted.
+    if (!CapabilityGrant.of(server).has('channels.streaming')) return null;
+    return server;
+  }
+
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
     return home
@@ -1480,13 +2979,15 @@ export class ChannelRegistry {
   async routeSpeech(
     conversationId: string,
     text: string,
-    /** Pin the outbound locus, skipping resolution. Callers delivering MULTIPLE
-     *  segments of ONE turn snapshot resolveLocus() once and pass it here, so a
-     *  new turn starting mid-dispatch (segments run after the agent is idle,
-     *  PR #32) can't overwrite the per-agent triggering channel between segments
-     *  and split one reply across channels. */
-    overrideChannelId?: string | null,
-  ): Promise<{ delivered: boolean; channelId: string } | null> {
+    /** The turn's FROZEN locus, snapshotted once by the caller (resolveLocus
+     *  at turn start) and passed to every segment of the turn. Mandatory:
+     *  there is deliberately no live-resolution fallback here — a late
+     *  dispatch resolving live can read the NEXT turn's trigger state or a
+     *  stale global default and land the reply in the wrong channel (item-3,
+     *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
+     *  "this turn is pinned to no locus": fail loudly rather than guess. */
+    locusChannelId: string | null,
+  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
     // reply never reached the human, instead of it vanishing silently.
@@ -1494,6 +2995,7 @@ export class ChannelRegistry {
       console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
+        conversationId,
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
@@ -1502,27 +3004,18 @@ export class ChannelRegistry {
       return null;
     };
 
-    // Resolve the outbound locus, in precedence order:
-    //   1. fork HOME channel — a conversation fork always replies in the channel
-    //      it was spawned to serve (item 3, forks).
-    //   2. this turn's TRIGGERING channel — a single trunk agent (connectome-
-    //      host's only mode) replies in the channel whose message woke THIS
-    //      inference, so a concurrent inbound elsewhere can't hijack the reply
-    //      (item-3 redux, trunk agents). Also carries DM channels, which arrive
-    //      as push/events and never touch `defaultPublishChannel`.
-    //   3. the configured `homeChannel` — where turns with no triggering
-    //      channel (heartbeats, timers) belong, so a check-in never lands in
-    //      whatever channel last had unrelated activity.
-    //   4. the process-global `defaultPublishChannel` — last resort when no
-    //      home channel is configured.
-    // Using the global for a fork or a concurrent trunk turn is the item-3 bug:
-    // it tracks the most-recent inbound across ALL channels, so a reply lands
-    // wherever a message last happened to arrive rather than where it belongs.
-    const channelId = overrideChannelId ?? this.resolveLocus(conversationId);
+    // Runtime backstop for JS callers the compiler can't see: an omitted
+    // locus is a routing bug at the call site, never something to paper over
+    // with a live re-resolution.
+    if (locusChannelId === undefined) {
+      return fail(null, 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)');
+    }
+    const channelId = locusChannelId;
     if (!channelId) {
-      // Reached only when the agent has no home, no active triggering channel,
-      // AND no global inbound was ever seen.
-      return fail(null, 'no locus (no home/active channel, defaultPublishChannel null)');
+      // The turn froze with no locus (no home, no triggering channel, no
+      // global inbound ever seen) — the agent was told its prose stays in
+      // the archive; honor that.
+      return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
     const entry = this.findChannelEntry(channelId);
@@ -1530,9 +3023,47 @@ export class ChannelRegistry {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
     }
 
+    // INVARIANT: it is not possible to send into a closed channel. Speech
+    // routed into a closed-but-registered locus (the canonical case: a DM
+    // that woke the agent — DMs register closed) OPENS the channel first,
+    // so typing indicators, reaction machinery, and inbound forwarding come
+    // alive with the reply. If the open fails, the speech does NOT go out:
+    // a half-alive delivery is worse than a loud marker.
+    if (!entry.open) {
+      try {
+        await this.openChannelNow(entry, 'opened-by-delivery');
+        console.error(
+          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
+        );
+        this.emitTraceFn({
+          type: 'mcpl:channel-opened-by-send',
+          serverId: entry.serverId,
+          channelId,
+        });
+        try {
+          this.onChannelAutoOpened?.({
+            conversationId,
+            serverId: entry.serverId,
+            source: 'opened-by-delivery',
+            channels: [{ channelId, label: entry.descriptor.label }],
+          });
+        } catch (err) {
+          console.error('onChannelAutoOpened (delivery) failed:', err);
+        }
+      } catch (err) {
+        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
+      }
+    }
+
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       return fail(channelId, `server "${entry.serverId}" not found`);
+    }
+    // §14.1: channels/publish requires channels.publish in the grant. The
+    // host not sending is the enforcement — a send to an ungranted server
+    // would have it act on authority it was never told it has.
+    if (!CapabilityGrant.of(server).has('channels.publish')) {
+      return fail(channelId, `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`);
     }
 
     const publishParams: ChannelsPublishParams = {
@@ -1542,6 +3073,11 @@ export class ChannelRegistry {
     };
     const result = await server.sendChannelsPublish(publishParams);
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
+    // Surface the posted message's id (ChannelsPublishResult.messageId) so
+    // trace consumers can act on the just-posted message — e.g. a TTS-relay
+    // tap editing it down to the words actually voiced on interruption.
+    // Previously this was silently dropped here.
+    const messageId = (result as { messageId?: string } | undefined)?.messageId;
 
     // The server accepted the publish RPC but reported the message was not
     // actually delivered (e.g. missing Send Messages permission). Previously
@@ -1553,13 +3089,16 @@ export class ChannelRegistry {
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({
       type: 'mcpl:speech-routed',
+      conversationId,
       serverId: entry.serverId,
       channelId,
       delivered,
       textLen: text.length,
+      text,
+      ...(messageId !== undefined ? { messageId } : {}),
     });
 
-    return { delivered, channelId };
+    return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
   }
 
   private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
@@ -1602,6 +3141,13 @@ export class ChannelRegistry {
     }
 
     try {
+      if (!CapabilityGrant.of(server).has('channels.publish')) {
+        return {
+          success: false,
+          error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,
+          isError: true,
+        };
+      }
       const publishParams: ChannelsPublishParams = {
         conversationId: '', // Framework will fill this when wired
         channelId,

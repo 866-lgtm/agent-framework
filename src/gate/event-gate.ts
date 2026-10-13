@@ -25,6 +25,8 @@ import type {
   GateEventInfo,
   GatePolicyStats,
   GateStatus,
+  ShadowWarning,
+  GateProbeRow,
 } from './types.js';
 
 // Re-export types consumers need
@@ -76,6 +78,51 @@ interface PendingEvent {
    *  metadata carries one — batched-wake lines render this instead of the raw
    *  composite channel id. */
   channelLabel?: string;
+  /** Author id of the event (discord snowflake etc.), when the metadata carries
+   *  one — a debounced wake names the newest such author as its counterparty. */
+  authorId?: string;
+  /** MCPL server id the event came from — the namespace for the counterparty
+   *  (`<serverId>:user:<id>`), same as the direct channel-incoming path. */
+  serverId?: string;
+  /** `chat:addressed` (mention / reply-to-bot / DM): an addressed event outranks
+   *  newer ambient chatter when a batched wake picks its provenance — the same
+   *  rule the framework applies to the turn's speech locus. */
+  addressed: boolean;
+  /** The REGISTERED (composite) channel id the event arrived on, resolved by
+   *  the host at enqueue time. Differs from `channelId` for push events,
+   *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
+   *  DM) — unroutable. Absent when the host could not resolve one. */
+  routeChannelId?: string;
+}
+
+/**
+ * Where a gate-requested wake came from, handed to the framework alongside the
+ * reason so the turn's InferenceRequest can carry it (host telemetry stamps
+ * "who woke the agent" from it). Ids only, never content or display names.
+ */
+export interface WakeProvenance {
+  /** Composite channel id of the chosen event — telemetry only, never a
+   *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
+   *  are raw server ids (unroutable and a second spelling of the same
+   *  channel); the framework derives the composite id on the direct path. */
+  channelId?: string;
+  /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
+   *  channel id's first segment only when the event carried no server id). */
+  counterparty?: string;
+  /** True when the chosen event was `chat:addressed`. */
+  addressed?: boolean;
+  /** Speech locus for the wake: the routable channel of the chosen event,
+   *  set ONLY when that event addressed the agent (mention / reply / DM) and
+   *  the host resolved its registered channel. A batched wake used to carry
+   *  no locus at all, so its reply fell back to the process-global
+   *  most-recent-inbound channel — which any ambient message elsewhere,
+   *  arriving a second after the DM that caused the wake, could retarget
+   *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
+   *  batches still set nothing and keep the legacy fallback. */
+  routeChannelId?: string;
+  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
+   *  requests can order by event recency, not by flush order. */
+  at?: number;
 }
 
 interface DebounceState {
@@ -145,6 +192,51 @@ function isMetadataTruthy(value: unknown): boolean {
   if (Array.isArray(value)) return value.length > 0;
   if (typeof value === 'object') return Object.keys(value).length > 0;
   return Boolean(value);
+}
+
+/**
+ * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
+ * wins (mention / reply / DM outranks newer ambient chatter — the framework's
+ * own locus rule); else the newest channel-bearing event. Channel, author and
+ * addressed all come from that one event, so they can never disagree.
+ */
+export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
+  let newest: PendingEvent | undefined;
+  let newestAddressed: PendingEvent | undefined;
+  for (const e of events) {
+    // A resolved route counts as naming a channel only for an ADDRESSED
+    // event: a push whose origin declares only `mcplChannelId` (no raw
+    // channel id, no author) is still a routable addressed message, and
+    // skipping it would leave its wake on the most-recent-inbound fallback.
+    // An ambient one stays out: the route is never reported for it, so as
+    // the pick it would carry no telemetry at all and hide an earlier event
+    // that names its channel and author.
+    if (!e.channelId && !e.authorId && !(e.addressed && e.routeChannelId)) continue;
+    if (!newest || e.timestamp >= newest.timestamp) newest = e;
+    if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
+  }
+  const pick = newestAddressed ?? newest;
+  if (!pick) return undefined;
+  // push-event channel ids are the adapter's raw ids (a Discord snowflake):
+  // not a composite channel id, so not reported as one
+  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
+  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
+  return {
+    ...(channelId ? { channelId } : {}),
+    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
+    ...(pick.addressed ? { addressed: true } : {}),
+    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
+    at: pick.timestamp,
+  };
+}
+
+/**
+ * Default route-channel resolution when the host supplies none: a
+ * channel-incoming event's channel id is already the registered composite id;
+ * a push event's is the adapter's raw id, which only the host can map.
+ */
+function defaultRouteChannel(info: GateEventInfo): string | undefined {
+  return info.eventType === 'mcpl:channel-incoming' && info.channelId ? info.channelId : undefined;
 }
 
 /** Compact, log-friendly serialization of a GateBehavior. */
@@ -310,9 +402,135 @@ function validatePolicy(raw: unknown): GatePolicy {
     if (names.length > 0) resets = names;
   }
 
+  // Validate passthrough — only meaningful on the counting behaviors, where
+  // "matched but didn't fire" is a distinct outcome that can fall through.
+  // On always/defer/skip/debounce the flag would be a no-op at best and a
+  // misleading promise at worst, so reject it loudly instead of ignoring it.
+  let passthrough: boolean | undefined;
+  if (obj.passthrough !== undefined) {
+    if (typeof obj.passthrough !== 'boolean') {
+      throw new Error(`Policy "${obj.name}": passthrough must be a boolean`);
+    }
+    if (obj.passthrough) {
+      const counting = typeof behavior === 'object'
+        && ('rate_limit' in behavior || 'passive_sample' in behavior);
+      if (!counting) {
+        throw new Error(
+          `Policy "${obj.name}": passthrough is only valid with rate_limit or `
+          + `passive_sample behaviors — for "${formatBehavior(behavior)}" there is `
+          + 'no non-firing match to fall through on',
+        );
+      }
+      passthrough = true;
+    }
+  }
+
   const policy: GatePolicy = { name: obj.name, match, behavior };
   if (resets) policy.resets = resets;
+  if (passthrough) policy.passthrough = passthrough;
   return policy;
+}
+
+// ---------------------------------------------------------------------------
+// Shadow lint — prove (conservatively) when rule ordering makes a rule dead
+// ---------------------------------------------------------------------------
+
+/** Set-inclusion helper for exact-string lists. */
+function subsetOf(a: string[], b: string[]): boolean {
+  return a.every((x) => b.includes(x));
+}
+
+/** A glob field on the EARLIER rule is at least as broad as the LATER rule's
+ *  when it's absent, the universal "*", or literally identical. Anything
+ *  cleverer (real glob subsumption) is out of conservative scope. */
+function globAtLeastAsBroad(earlier: string | undefined, later: string | undefined): boolean {
+  if (earlier === undefined || earlier === '*') return true;
+  return earlier === later;
+}
+
+/**
+ * Event types for which `earlier` provably matches EVERY event that `later`
+ * would match — i.e. the types for which `later` is unreachable when
+ * `earlier` sits before it and consumes its matches. Returns null when
+ * subsumption can't be proven (which is not proof of safety — the lint is
+ * deliberately one-sided so every warning it emits is true).
+ */
+function subsumedEventTypes(earlier: GatePolicy, later: GatePolicy): string[] | 'all' | null {
+  const e = earlier.match;
+  const l = later.match;
+
+  // Scope: which of `later`'s event types does `earlier` cover?
+  let covered: string[] | 'all';
+  if (!e.scope || e.scope.length === 0) {
+    covered = l.scope && l.scope.length > 0 ? l.scope : 'all';
+  } else if (!l.scope || l.scope.length === 0) {
+    // `later` matches all types; `earlier` only consumes its own scope, so
+    // the shadow is partial — exactly those types.
+    covered = e.scope;
+  } else {
+    const overlap = l.scope.filter((t) => e.scope!.includes(t));
+    if (overlap.length === 0) return null;
+    covered = overlap;
+  }
+
+  // Every remaining discriminator on `earlier` must be at least as broad as
+  // `later`'s, otherwise some `later` events slip past `earlier`.
+  if (!globAtLeastAsBroad(e.source, l.source)) return null;
+  if (!globAtLeastAsBroad(e.channel, l.channel)) return null;
+  if (!globAtLeastAsBroad(e.mount, l.mount)) return null;
+  if (!globAtLeastAsBroad(e.pathGlob, l.pathGlob)) return null;
+
+  if (e.filter) {
+    if (!l.filter || e.filter.type !== l.filter.type || e.filter.pattern !== l.filter.pattern) {
+      return null;
+    }
+  }
+
+  // metadataTrue / tagsAny are OR-lists: earlier subsumes when later's list
+  // is a subset of earlier's (any event satisfying later then satisfies
+  // earlier too). tagsAll / tagsNone are AND/NOT constraints: earlier
+  // subsumes when its constraints are a subset of later's.
+  if (e.metadataTrue && e.metadataTrue.length > 0) {
+    if (!l.metadataTrue || !subsetOf(l.metadataTrue, e.metadataTrue)) return null;
+  }
+  if (e.tagsAny && e.tagsAny.length > 0) {
+    if (!l.tagsAny || !subsetOf(l.tagsAny, e.tagsAny)) return null;
+  }
+  if (e.tagsAll && !subsetOf(e.tagsAll, l.tagsAll ?? [])) return null;
+  if (e.tagsNone && !subsetOf(e.tagsNone, l.tagsNone ?? [])) return null;
+
+  return covered;
+}
+
+/**
+ * Find rules made unreachable by earlier, broader rules (first match wins).
+ * The 2026-08-08 Mythos incident is the canonical catch: a prepended
+ * `{scope:[mcpl:channel-incoming]}` sampler silently made the
+ * direct-address and mention rules dead for the whole incoming lane.
+ * `passthrough` observers shadow nothing — non-firing matches fall through.
+ */
+export function findShadowedPolicies(policies: GatePolicy[]): ShadowWarning[] {
+  const out: ShadowWarning[] = [];
+  for (let i = 0; i < policies.length; i++) {
+    const earlier = policies[i];
+    if (earlier.passthrough) continue;
+    for (let j = i + 1; j < policies.length; j++) {
+      const covered = subsumedEventTypes(earlier, policies[j]);
+      if (covered) {
+        out.push({ earlier: earlier.name, later: policies[j].name, eventTypes: covered });
+      }
+    }
+  }
+  return out;
+}
+
+/** Human-readable one-liner for a ShadowWarning, used in tool results,
+ *  traces, and gate_status alike so the same hazard reads the same way
+ *  everywhere. */
+export function formatShadowWarning(w: ShadowWarning): string {
+  const types = w.eventTypes === 'all' ? 'ALL event types' : w.eventTypes.join(', ');
+  return `rule "${w.earlier}" makes "${w.later}" unreachable for ${types} `
+    + `(first match wins — every event "${w.later}" would match is consumed by "${w.earlier}" first)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +563,18 @@ export class EventGate {
   // Inference buffering
   private inferring = new Set<string>();
   private inferenceBuffer: PendingEvent[] = [];
+  /** Host quiesce suppression — see setQuiesced. */
+  private quiesced = false;
+  /** Lifetime count of buffer-cap evictions (see bufferForInference). */
+  private droppedBufferedEvents = 0;
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
+
+  // Shadow-lint cache (see refreshShadowWarnings) — recomputed on every
+  // config change, fingerprinted so an unchanged hazard set doesn't re-trace.
+  private shadowWarningsCache: ShadowWarning[] = [];
+  private shadowWarningsFingerprint = '[]';
 
   // Observability counters for events that didn't match any policy
   private totalEvaluations = 0;
@@ -366,6 +593,13 @@ export class EventGate {
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
 
+  // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
+  // a self-wake suppresses NOTHING — it means "if nothing else wakes me by
+  // then, wake me". Any turn start for the agent cancels its pending
+  // self-wake (an external wake supersedes it; the timer would otherwise
+  // land as a redundant empty wake right after the turn).
+  private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
   private privilegedUsersPath: string | undefined;
@@ -375,9 +609,16 @@ export class EventGate {
 
   // Dependency-injected callbacks
   private emitTrace: (event: TraceEventLike) => void;
-  private addMessageFn: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
-  private requestInferenceFn: (agentName: string, reason: string, source: string) => void;
+  private addMessageFn: (
+    participant: string,
+    content: Array<{ type: 'text'; text: string }>,
+    metadata?: Record<string, unknown>,
+    /** Registry agent to deliver into; absent = primary (historical). */
+    forAgent?: string,
+  ) => unknown;
+  private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
+  private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -387,13 +628,22 @@ export class EventGate {
     initialConfig?: GateConfig;
     privilegedUsersPath?: string;
     emitTrace: (event: TraceEventLike) => void;
-    addMessage: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
-    requestInference: (agentName: string, reason: string, source: string) => void;
+    addMessage: (
+      participant: string,
+      content: Array<{ type: 'text'; text: string }>,
+      metadata?: Record<string, unknown>,
+      forAgent?: string,
+    ) => unknown;
+    requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** Map an event to the registered channel it arrived on (the host knows
+     *  how push-event origins compose into channel ids). Default: a
+     *  channel-incoming event's own channel id; nothing for push events. */
+    resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -401,6 +651,7 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -448,6 +699,7 @@ export class EventGate {
     // Load config
     this.config = this.loadConfig() ?? opts.initialConfig ?? { ...DEFAULT_CONFIG };
     this.compiledPolicies = this.compilePolicies(this.config);
+    this.refreshShadowWarnings('startup');
 
     // Programmable gate: an optional agent-authored `gate.js` next to gate.json.
     // Absent ⇒ inactive (zero overhead beyond a throttled stat check).
@@ -561,6 +813,7 @@ export class EventGate {
       this.config = newConfig;
       this.compiledPolicies = this.compilePolicies(newConfig);
       this.lastReloadTimestamp = now;
+      this.refreshShadowWarnings('reload');
 
       this.emitTrace({
         type: 'gate:config-reloaded',
@@ -591,23 +844,46 @@ export class EventGate {
    * without waiting for the throttled mtime reload.
    *
    * The freshest on-disk config is re-read first, so a concurrent operator edit
-   * isn't clobbered. A policy with the same `name` is replaced IN PLACE (order
-   * preserved); otherwise it is appended, or prepended when `position:'prepend'`
-   * — first match wins, so a wake rule that must beat a broad defer/debounce
-   * belongs at the front.
+   * isn't clobbered. A policy with the same `name` is replaced IN PLACE when no
+   * `position` is given (order preserved); WITH a `position` it is moved there
+   * — so re-issuing a rule is also how you reposition it. New policies append
+   * by default; `'prepend'` puts one at the very front (ahead of EVERYTHING,
+   * including addressed-message wake rules — see the shadow lint), and the
+   * anchored forms `{before: name}` / `{after: name}` insert relative to an
+   * existing rule, which is almost always the safer way to order a sampler
+   * or debounce against a specific catch-all.
    */
-  addPolicy(rawPolicy: unknown, options?: { position?: 'append' | 'prepend' }): GatePolicy {
+  addPolicy(
+    rawPolicy: unknown,
+    options?: { position?: 'append' | 'prepend' | { before: string } | { after: string } },
+  ): GatePolicy {
     const policy = validatePolicy(rawPolicy);
     const current = this.loadConfig() ?? this.config;
     const policies = [...current.policies];
     const idx = policies.findIndex((p) => p.name === policy.name);
-    if (idx >= 0) {
-      policies[idx] = policy;
-    } else if (options?.position === 'prepend') {
-      policies.unshift(policy);
+    const position = options?.position;
+
+    if (idx >= 0 && position === undefined) {
+      policies[idx] = policy; // replace in place, order preserved
     } else {
-      policies.push(policy);
+      if (idx >= 0) policies.splice(idx, 1); // repositioning a known rule
+      if (position === 'prepend') {
+        policies.unshift(policy);
+      } else if (position !== undefined && typeof position === 'object') {
+        const anchorName = 'before' in position ? position.before : position.after;
+        const anchorIdx = policies.findIndex((p) => p.name === anchorName);
+        if (anchorIdx < 0) {
+          throw new Error(
+            `addPolicy: no policy named "${anchorName}" to anchor on — `
+            + `have: [${policies.map((p) => p.name).join(', ')}]`,
+          );
+        }
+        policies.splice('before' in position ? anchorIdx : anchorIdx + 1, 0, policy);
+      } else {
+        policies.push(policy);
+      }
     }
+
     this.writeConfig({ ...current, policies });
     this.emitTrace({
       type: 'gate:policy-added',
@@ -665,6 +941,7 @@ export class EventGate {
     writeFileSync(this.configPath, JSON.stringify(config, null, 2) + '\n');
     this.config = config;
     this.compiledPolicies = this.compilePolicies(config);
+    this.refreshShadowWarnings('policy-mutation');
     this.configSource = 'file';
     this.configErrors = [];
     this.lastReloadTimestamp = Date.now();
@@ -676,17 +953,9 @@ export class EventGate {
   }
 
   // =========================================================================
-  // Policy matching — first match wins
+  // Policy matching — first match wins (passthrough observers excepted; the
+  // match/decide loop lives inline in evaluate() and probe())
   // =========================================================================
-
-  private matchPolicy(info: GateEventInfo): GatePolicy | null {
-    for (const compiled of this.compiledPolicies) {
-      if (this.compiledMatches(compiled, info)) {
-        return compiled.policy;
-      }
-    }
-    return null;
-  }
 
   private compiledMatches(compiled: CompiledPolicy, info: GateEventInfo): boolean {
     const match = compiled.policy.match;
@@ -797,13 +1066,32 @@ export class EventGate {
     // Programmable gate (gate.js) takes precedence when present and returns a
     // behavior; null/undefined (inactive, error, or a deliberate pass) falls
     // through to the declarative gate.json policies below.
+    //
+    // Declarative policies: first match wins — EXCEPT `passthrough` observers,
+    // which consume the event only when their counting behavior actually
+    // fires. A passthrough policy that matched-but-didn't-fire records its
+    // count and evaluation continues, so a density sampler placed early can
+    // no longer swallow the addressed-message rules behind it.
     const scripted = this.gateScript.evaluate(info);
-    const policy: GatePolicy | null =
-      scripted != null ? { name: 'gate.js', match: {}, behavior: scripted } : this.matchPolicy(info);
-    const decision = this.computeDecision(policy, info);
+    let decision: GateDecision | null = null;
+    const observed: string[] = [];
+    if (scripted != null) {
+      decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
+    } else {
+      for (const compiled of this.compiledPolicies) {
+        if (!this.compiledMatches(compiled, info)) continue;
+        const candidate = this.computeDecision(compiled.policy, info);
+        if (candidate.trigger || !compiled.policy.passthrough) {
+          decision = candidate;
+          break;
+        }
+        observed.push(compiled.policy.name); // counted, didn't fire, fell through
+      }
+    }
 
     this.totalEvaluations++;
-    if (!policy) {
+    if (!decision) {
+      decision = this.computeDecision(null, info);
       const bucket = this.defaultByEventType.get(info.eventType)
         ?? { triggered: 0, skipped: 0 };
       if (decision.trigger) {
@@ -815,6 +1103,7 @@ export class EventGate {
       }
       this.defaultByEventType.set(info.eventType, bucket);
     }
+    if (observed.length > 0) decision.observed = observed;
 
     this.emitTrace({
       type: 'gate:decision',
@@ -824,6 +1113,7 @@ export class EventGate {
       matchedPolicy: decision.policyName,
       trigger: decision.trigger,
       behavior: formatBehavior(decision.behavior),
+      ...(observed.length > 0 ? { observed } : {}),
       timestamp: this.now(),
     });
 
@@ -996,6 +1286,164 @@ export class EventGate {
   }
 
   // =========================================================================
+  // Dry-run probes — side-effect-free "what would this event do right now"
+  // =========================================================================
+
+  /**
+   * Non-mutating twin of the behavior decision: would this policy trigger for
+   * this event, given CURRENT counter/bucket state? Reads state, never writes
+   * it — no stats, no traces, no counter increments, no debounce batching.
+   */
+  private wouldTrigger(policy: GatePolicy, info: GateEventInfo): boolean {
+    const b = policy.behavior;
+    if (b === 'always') return true;
+    if (b === 'defer' || b === 'skip') return false;
+    if (typeof b === 'object') {
+      if ('debounce' in b) return false; // batches; never triggers inline
+      if ('rate_limit' in b) {
+        const cfg = b.rate_limit;
+        const key = this.resolveKey(info.metadata, cfg.keyBy);
+        const bucket = this.rateLimitBuckets.get(policy.name)?.get(key);
+        if (!bucket) return true; // fresh bucket starts full
+        let tokens = bucket.tokens;
+        if (tokens < cfg.tokens) {
+          const elapsed = Math.max(0, this.now() - bucket.lastRefill);
+          tokens = Math.min(cfg.tokens, tokens + Math.floor(elapsed / cfg.refillIntervalMs));
+        }
+        return tokens > 0;
+      }
+      if ('passive_sample' in b) {
+        const cfg = b.passive_sample;
+        const key = this.resolveKey(info.metadata, cfg.keyBy);
+        const count = this.passiveSampleCounters.get(policy.name)?.get(key) ?? 0;
+        return count + 1 >= cfg.every;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Evaluate an event against the declarative policy table WITHOUT side
+   * effects: no counters advance, no debounce batches form, no stats or
+   * traces are recorded, and sleep suppression is ignored (a probe asks
+   * about the table, not the moment). gate.js is not consulted — a script
+   * may be stateful, and a probe must never perturb state.
+   */
+  probe(info: GateEventInfo): GateDecision {
+    for (const compiled of this.compiledPolicies) {
+      if (!this.compiledMatches(compiled, info)) continue;
+      const trigger = this.wouldTrigger(compiled.policy, info);
+      if (trigger || !compiled.policy.passthrough) {
+        return { trigger, policyName: compiled.policy.name, behavior: compiled.policy.behavior };
+      }
+    }
+    const trigger = (this.config.default ?? 'always') === 'always';
+    return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
+  }
+
+  /**
+   * Probe a canonical set of synthetic chat/heartbeat events and report which
+   * rule wins each and whether it would wake. Backs the before/after table in
+   * the wake_add_rule result — the point where a rule change's real semantics
+   * must become legible (af#105; the Mythos stand-back-density incident would
+   * have been visible as `dm: discord-direct-address → stand-back-density`).
+   * Probes are representative shapes, not an exhaustive event space — rules
+   * keyed on specific channels/mounts may not match any probe.
+   */
+  probeTable(): GateProbeRow[] {
+    const chat = (
+      label: string,
+      eventType: string,
+      metadata: Record<string, unknown>,
+      tags: string[],
+    ): { label: string; info: GateEventInfo } => ({
+      label,
+      info: {
+        content: `[probe] ${label}`,
+        eventType,
+        serverId: 'discord',
+        channelId: '',
+        metadata: { ...metadata, eventType },
+        tags,
+      },
+    });
+
+    const probes = [
+      chat('dm (open channel)', 'mcpl:channel-incoming', { isDM: true, isMention: true },
+        ['chat:dm', 'chat:private', 'chat:addressed', 'chat:from-human']),
+      chat('dm (closed channel)', 'mcpl:push-event', { isDM: true, isMention: true },
+        ['chat:dm', 'chat:private', 'chat:addressed', 'chat:from-human']),
+      chat('explicit mention (open channel)', 'mcpl:channel-incoming',
+        { isMention: true, isExplicitMention: true },
+        ['chat:mention', 'chat:addressed', 'chat:from-human']),
+      chat('explicit mention (closed channel)', 'mcpl:push-event',
+        { isMention: true, isExplicitMention: true },
+        ['chat:mention', 'chat:addressed', 'chat:from-human']),
+      chat('reply to you', 'mcpl:channel-incoming', { isMention: true, isReplyToBot: true },
+        ['chat:reply', 'chat:addressed', 'chat:from-human']),
+      chat('ambient (human)', 'mcpl:channel-incoming', {},
+        ['chat:ambient', 'chat:from-human']),
+      chat('ambient (bot)', 'mcpl:channel-incoming', { isBot: true },
+        ['chat:ambient', 'chat:from-bot']),
+      {
+        label: 'heartbeat',
+        info: {
+          content: '[probe] heartbeat',
+          eventType: 'mcpl:push-event',
+          serverId: 'heartbeat',
+          channelId: '',
+          metadata: { source: 'heartbeat', eventType: 'mcpl:push-event' },
+        } as GateEventInfo,
+      },
+    ];
+
+    return probes.map(({ label, info }) => {
+      const d = this.probe(info);
+      return {
+        probe: label,
+        eventType: info.eventType,
+        policy: d.policyName,
+        behavior: d.policyName === null
+          ? `default:${formatBehavior(d.behavior)}`
+          : formatBehavior(d.behavior),
+        wouldWake: d.trigger,
+      };
+    });
+  }
+
+  // =========================================================================
+  // Shadow lint surface
+  // =========================================================================
+
+  /** Current shadow-lint findings for the live policy order. Fresh compute —
+   *  cheap (policy lists are tens of entries at most). */
+  lintShadows(): ShadowWarning[] {
+    return findShadowedPolicies(this.config.policies);
+  }
+
+  /**
+   * Recompute shadow warnings and, when the set changed and is non-empty,
+   * emit a `gate:shadow-warnings` trace so the hazard lands in ops
+   * observability at the moment the order changed — not at the next missed
+   * DM. Called from writeConfig and reloadIfChanged.
+   */
+  private refreshShadowWarnings(reason: string): void {
+    const warnings = this.lintShadows();
+    const fingerprint = JSON.stringify(warnings);
+    if (fingerprint === this.shadowWarningsFingerprint) return;
+    this.shadowWarningsFingerprint = fingerprint;
+    this.shadowWarningsCache = warnings;
+    if (warnings.length > 0) {
+      this.emitTrace({
+        type: 'gate:shadow-warnings',
+        reason,
+        warnings: warnings.map(formatShadowWarning),
+        timestamp: this.now(),
+      });
+    }
+  }
+
+  // =========================================================================
   // shouldTriggerInference callback adapter
   // =========================================================================
 
@@ -1021,6 +1469,15 @@ export class EventGate {
   // Debounce
   // =========================================================================
 
+  /** Registered channel for an event; a resolver fault never breaks gating. */
+  private routeChannelFor(info: GateEventInfo): string | undefined {
+    try {
+      return this.resolveRouteChannelFn(info) || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
 
@@ -1037,6 +1494,10 @@ export class EventGate {
         typeof info.metadata?.channelName === 'string' && info.metadata.channelName
           ? (info.metadata.channelName as string)
           : undefined,
+      authorId: this.extractAuthorId(info.metadata) ?? undefined,
+      serverId: info.serverId || undefined,
+      addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
+      routeChannelId: this.routeChannelFor(info),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1060,8 +1521,11 @@ export class EventGate {
     const events = state.events;
     this.debounceTimers.delete(policyName);
 
-    // If any agent is currently inferring, buffer for later (with cap)
-    if (this.inferring.size > 0) {
+    // If any agent is currently inferring — or the host is quiesced — buffer
+    // for later (with cap). While quiesced, delivering would write a
+    // "[Gate: N events]" message into the very context being operated on
+    // mid-surgery; buffering composes them and they land at resume.
+    if (this.inferring.size > 0 || this.quiesced) {
       this.bufferForInference(events);
       return;
     }
@@ -1097,7 +1561,10 @@ export class EventGate {
     if (referenced.length > 0) {
       const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
-        const key = e.channelId ?? '(unknown channel)';
+        // The registered id when known, so this line names the channel the
+        // same way routing notices and send tools do (a push event's own
+        // channelId is the adapter's raw id).
+        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
         const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
@@ -1124,8 +1591,16 @@ export class EventGate {
       policies: policyNames,
     });
 
+    // Provenance of the batched wake (who/where woke the agent): the newest
+    // ADDRESSED event first, else the newest event naming a channel or an
+    // author; channel + author + addressed from that ONE event. When that
+    // event addressed the agent and its registered channel is known,
+    // `routeChannelId` names the turn's speech locus too — the reply goes
+    // back to whoever addressed the agent, not to whichever channel last saw
+    // any traffic. Ambient-only batches carry telemetry only.
+    const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate');
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
 
@@ -1135,12 +1610,38 @@ export class EventGate {
 
   onInferenceStarted(agentName: string): void {
     this.inferring.add(agentName);
+    // A turn is starting — whatever caused it supersedes any pending
+    // self-wake. (Arming happens MID-turn via skip_reply, i.e. after this
+    // ran for the arming turn, so a fresh arm always survives its own turn.)
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
   }
 
   onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
+    this.flushInferenceBufferIfClear();
+  }
 
-    // Flush inference buffer if no agents are inferring
+  /**
+   * Host quiesce suppression (issue #122). While set, debounce firings buffer
+   * instead of writing gate messages into context; clearing it flushes the
+   * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
+   * timers deliberately do NOT route through this — their inference requests
+   * are per-agent targeted pushes that the framework's quiesce wake gate parks
+   * and releases at resume, whereas the buffer's deliverEvents broadcasts a
+   * wake to every agent.
+   */
+  setQuiesced(quiesced: boolean): void {
+    if (this.quiesced === quiesced) return;
+    this.quiesced = quiesced;
+    if (!quiesced) this.flushInferenceBufferIfClear();
+  }
+
+  private flushInferenceBufferIfClear(): void {
+    if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
       // Defer to avoid re-entrancy inside trace callbacks
@@ -1152,10 +1653,16 @@ export class EventGate {
    *  A non-empty `inferring` with a stale timestamp + growing `bufferedEvents`
    *  is the signature of the wake-wedge: an agent stuck mid-"inference" so all
    *  incoming events buffer and never trigger. */
-  inferenceDiagnostics(): { inferring: string[]; bufferedEvents: number; sleepUntil: number } {
+  inferenceDiagnostics(): {
+    inferring: string[];
+    bufferedEvents: number;
+    droppedBufferedEvents: number;
+    sleepUntil: number;
+  } {
     return {
       inferring: [...this.inferring],
       bufferedEvents: this.inferenceBuffer.length,
+      droppedBufferedEvents: this.droppedBufferedEvents,
       sleepUntil: this.sleepUntil,
     };
   }
@@ -1169,6 +1676,18 @@ export class EventGate {
     for (const event of events) {
       if (this.inferenceBuffer.length >= MAX_INFERENCE_BUFFER) {
         this.inferenceBuffer.shift(); // Drop oldest
+        // Telemetry (issue #122): quiesce stretches buffering from
+        // single-inference minutes to operator-length windows, so silent
+        // eviction is no longer a corner case — count and log it, or the
+        // resume flush reads as complete when it isn't.
+        this.droppedBufferedEvents++;
+        if (this.droppedBufferedEvents % 50 === 1) {
+          console.error(
+            `[gate] inference buffer cap (${MAX_INFERENCE_BUFFER}) — dropped ` +
+            `${this.droppedBufferedEvents} oldest buffered event(s)` +
+            `${this.quiesced ? ' during quiesce' : ''}; the flush on release will be incomplete`,
+          );
+        }
       }
       this.inferenceBuffer.push(event);
     }
@@ -1204,6 +1723,62 @@ export class EventGate {
       timestamp: this.now(),
     });
     return { until: this.sleepUntil };
+  }
+
+  // =========================================================================
+  // Self-wake (skip_reply wake_in_seconds)
+  // =========================================================================
+
+  /**
+   * Arm a one-shot self-wake for `agentName` in `seconds` (clamped to
+   * [1, 3600]). Fires a normal inference request when it elapses — no
+   * suppression window, unlike sleep. Re-arming replaces the pending timer.
+   * Cancelled by the agent's next turn start (see onInferenceStarted):
+   * the semantics are "if nothing else wakes me by then, wake me".
+   */
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+    const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
+    const prev = this.selfWakeTimers.get(agentName);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.selfWakeTimers.delete(agentName);
+      this.emitTrace({
+        type: 'gate:decision',
+        eventType: 'selfwake:fired',
+        matchedPolicy: 'self-wake',
+        trigger: true,
+        behavior: 'always',
+        timestamp: this.now(),
+      });
+      // Compact in-window notice: without it the wake turn contains nothing
+      // new, so the agent can't tell WHAT woke it (its own timer vs. a
+      // heartbeat) or WHEN. One line, timestamped to the second. Added
+      // before the inference request so it rides the wake turn (addMessage's
+      // turn-alive guard defers it to that turn's start if needed).
+      const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
+      // Deliver the notice into the WAKING agent's window — a self-wake
+      // armed by a non-primary agent (e.g. a subconscious cadence) must not
+      // narrate itself into the primary's context.
+      this.addMessageFn('user', [{
+        type: 'text',
+        text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
+      }], { source: 'gate:self-wake' }, agentName);
+      this.requestInferenceFn(
+        agentName,
+        `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
+        'self-wake',
+      );
+    }, ms);
+    this.selfWakeTimers.set(agentName, timer);
+    this.emitTrace({
+      type: 'gate:decision',
+      eventType: 'selfwake:set',
+      matchedPolicy: 'self-wake',
+      trigger: false,
+      behavior: 'skip',
+      timestamp: this.now(),
+    });
+    return { inMs: ms };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
@@ -1261,6 +1836,19 @@ export class EventGate {
   }
 
   /** Load the privileged-users file (bare array or { userIds: [...] }). */
+  /**
+   * Whether an author id is on the privileged-users list (hot-reloaded).
+   * Shared by sleep bypass and tune-out wake classification (#77: wakes are
+   * "mentions, gate-privileged authors, etc.").
+   */
+  isPrivilegedUser(authorId: string | null | undefined): boolean {
+    if (!authorId) return false;
+    // Throttled mtime check (was an unconditional sync re-read): the framework's
+    // privileged-interrupt path calls this on every inbound message.
+    this.reloadPrivilegedIfChanged();
+    return this.privilegedUserIds.has(String(authorId));
+  }
+
   private loadPrivileged(): void {
     if (!this.privilegedUsersPath) return;
     try {
@@ -1296,18 +1884,6 @@ export class EventGate {
     } catch {
       /* leave the last-known set in place on a transient stat/read error */
     }
-  }
-
-  /**
-   * Is this author on the hot-reloaded privileged-users list? Reuses the same
-   * list that governs sleep-wake bypass. Used by the framework to let a
-   * privileged human interrupt (abort) a runaway in-flight turn. Reloads the
-   * file first so a freshly-edited list takes effect without a restart.
-   */
-  isPrivilegedUser(authorId: string | undefined | null): boolean {
-    if (!authorId) return false;
-    this.reloadPrivilegedIfChanged();
-    return this.privilegedUserIds.has(String(authorId));
   }
 
   getToolDefinition(): ToolDefinition {
@@ -1380,6 +1956,7 @@ export class EventGate {
       script: this.gateScript.status(),
       policies,
       errors: [...this.configErrors],
+      shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,
@@ -1399,6 +1976,10 @@ export class EventGate {
       clearTimeout(state.timer);
     }
     this.debounceTimers.clear();
+    for (const timer of this.selfWakeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.selfWakeTimers.clear();
     this.rateLimitBuckets.clear();
     this.passiveSampleCounters.clear();
     this.rateLimitDenied.clear();

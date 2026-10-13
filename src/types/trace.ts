@@ -37,7 +37,20 @@ export type TraceEvent =
     })
 
   // Inference lifecycle
-  | (TraceEventBase & { type: 'inference:started'; agentName: string })
+  | (TraceEventBase & {
+      type: 'inference:started';
+      agentName: string;
+      /**
+       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
+       * turn's plain prose will be routed to. Omitted for turns with no locus
+       * (heartbeats with no default channel). Observability only, like every
+       * trace field; lets external taps (e.g. a TTS relay) tag the whole
+       * activation with its channel without re-deriving routing.
+       */
+      channelId?: string;
+      /** True for a control-plane wake that must not surface typing/prose. */
+      silent?: boolean;
+    })
   | (TraceEventBase & {
       type: 'inference:completed';
       agentName: string;
@@ -82,6 +95,8 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
+      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      channelId?: string;
     })
   | (TraceEventBase & {
       /**
@@ -95,6 +110,8 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
+      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:tool_calls_yielded';
@@ -154,6 +171,19 @@ export type TraceEvent =
       agentStatus: string;
       result: unknown;
     })
+  | (TraceEventBase & {
+      /**
+       * A writable workspace existed but the oversized-result spill write
+       * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
+       * retained. Distinct from the no-workspace fallback, which is silent
+       * by design (nothing unexpected happened).
+       */
+      type: 'tool:spill_failed';
+      label: string;
+      path: string;
+      contentLength: number;
+      error: string;
+    })
 
   // Module lifecycle
   | (TraceEventBase & { type: 'module:added'; moduleName: string })
@@ -180,6 +210,48 @@ export type TraceEvent =
       type: 'message:added';
       messageId: string;
       source: string;
+    })
+  /** An unread message withdrawn or replaced by its sender (RFC-006). */
+  | (TraceEventBase & {
+      type: 'message:removed';
+      messageId: string;
+      source: string;
+    })
+  /** A push/event refused at the MCPL boundary (today: visibly-empty content). */
+  | (TraceEventBase & {
+      type: 'mcpl:push-event-rejected';
+      serverId: string;
+      eventId: string;
+      featureSet: string;
+      reason: string;
+    })
+  /** A channels/incoming message refused at the MCPL boundary: unregistered
+   *  channel (§14.5), or visibly-empty content (then `messageId` is set). */
+  | (TraceEventBase & {
+      type: 'mcpl:channel-incoming-rejected';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+      reason: string;
+    })
+  /** MCPL content with nothing model-visible reached the store/wake site
+   *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */
+  | (TraceEventBase & {
+      type: 'mcpl:empty-content-dropped';
+      lane: 'push' | 'channel';
+      serverId: string;
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
+    })
+  /** RFC-006 coalescing decision record (received / displaced / removed /
+   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+  | (TraceEventBase & {
+      type: 'mcpl:coalescing';
+      kind: string;
+      subject?: string;
+      eventId?: string;
+      [key: string]: unknown;
     })
 
   // EventGate lifecycle
@@ -238,6 +310,20 @@ export type TraceEvent =
       toBranch: string;
     })
 
+  // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
+  // Mirrors the durable operator-actions.jsonl record so live UIs see the
+  // same entry the file keeps.
+  | (TraceEventBase & {
+      type: 'operator:action';
+      agentName?: string;
+      kind: string;
+      requester?: { via: string; name?: string; id?: string };
+      note?: string;
+      params?: Record<string, unknown>;
+      result?: Record<string, unknown>;
+      error?: string;
+    })
+
   // MCPL subprocess stderr (one trace per line, for receipts when things break)
   | (TraceEventBase & {
       type: 'mcpl:server-stderr';
@@ -281,6 +367,54 @@ export type TraceEvent =
       channelId?: string;
     })
 
+  // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
+  // delivered prose segment. `text` is the segment verbatim — the same content
+  // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
+  // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
+  // for the posted message (when the MCPL server reports one). Together they
+  // give external taps the (channelId, messageId, text) tuple needed to edit
+  // a just-posted message, e.g. a TTS interruption truncating a reply to the
+  // words actually voiced.
+  | (TraceEventBase & {
+      type: 'mcpl:speech-routed';
+      /** Agent / conversation whose speech was routed. */
+      conversationId: string;
+      serverId: string;
+      channelId: string;
+      delivered: boolean;
+      textLen: number;
+      /** The routed prose segment, verbatim. */
+      text: string;
+      /** Surface message id (e.g. Discord message id), when reported. */
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:speech-route-failed';
+      /** Agent / conversation whose speech failed to route. */
+      conversationId: string;
+      /** Empty string when the failure was "no locus at all". */
+      channelId: string;
+      reason: string;
+      textLen: number;
+    })
+
+  // Admin puppet: an operator executed a tool AS an agent and stored the
+  // tool_use + tool_result pair in that agent's window (Framework.
+  // puppetToolCall). Provenance lives HERE and in the host log — the stored
+  // messages deliberately byte-match a model-initiated call.
+  | (TraceEventBase & {
+      type: 'puppet:tool-call';
+      agentName: string;
+      toolName: string;
+      toolUseId: string;
+      isError: boolean;
+      durationMs: number;
+      /** The pair was queued behind a turn that replaced the puppet's
+       *  reservation (provider-admission re-entry) instead of stored
+       *  directly; it lands at that turn's end flush. */
+      deferred?: boolean;
+    })
+
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
   // Previously these outcomes were visible only on the host process's own
   // stderr, so a server that lost the boot handshake race just went missing.
@@ -292,6 +426,15 @@ export type TraceEvent =
       attempt: number;
       /** True when a background reconnect loop will keep retrying. */
       willRetry: boolean;
+    })
+  | (TraceEventBase & {
+      /** §17.6: the ONE normalized receipt per manifest change — closed
+       *  host-derived impact vocabulary, never a server-authored flag. */
+      type: 'mcpl:manifest-change-receipt';
+      serverId: string;
+      revision: string | null;
+      announcedDomains: string[];
+      impacts: Array<{ impact: string; subject: string; disposition: string }>;
     })
   | (TraceEventBase & {
       type: 'mcpl:server-reconnected';
@@ -313,6 +456,49 @@ export type TraceEvent =
       type: 'mcpl:server-error';
       serverId: string;
       error: string;
+    })
+  // Configuration that is accepted but silently does nothing. Each mirrors
+  // a console line, so hosts that keep per-server logs from the trace bus
+  // see it too.
+  | (TraceEventBase & {
+      /** §5.3/§6.7: the server refused the host's policy Request. */
+      type: 'mcpl:policy-refused';
+      serverId: string;
+      /** The initial policy at connect, or the re-negotiation after a manifest change. */
+      phase: 'initial' | 'manifest-change';
+      reason: string | null;
+      /** `close`: the host closed the connection. `mcp-only`: the grant
+       *  stays empty and only plain MCP tools work. */
+      fallback: 'close' | 'mcp-only';
+    })
+  | (TraceEventBase & {
+      /** §6.4 derivation disabled a declared feature set. */
+      type: 'mcpl:feature-set-disabled';
+      serverId: string;
+      featureSet: string;
+      /** `invalid_uses`: `uses` absent, empty or unrecognized.
+       *  `missing_capabilities`: `uses` names capabilities the grant lacks. */
+      reason: 'invalid_uses' | 'missing_capabilities';
+      /** True when config selected the set (enabledFeatureSets omitted or
+       *  matching it, and not disabledFeatureSets): derivation overrode it. */
+      selectedByConfig: boolean;
+      /** invalid_uses: the unrecognized entries (empty when `uses` was absent or empty). */
+      unrecognized?: string[];
+      /** missing_capabilities: the capability paths the grant lacks. */
+      missing?: string[];
+    })
+  | (TraceEventBase & {
+      /** An operator tool-name pattern matches no model-facing tool. Emitted
+       *  once per pattern, after the servers it could name have listed. */
+      type: 'mcpl:tool-pattern-unmatched';
+      /** `toolClassOverrides`, `toolLifecycle.observe.tools` or `toolLifecycle.inputs.tools`. */
+      setting: string;
+      /** The server whose toolLifecycle config holds the pattern. */
+      serverId?: string;
+      pattern: string;
+      /** The pattern rewritten under the server's actual tool prefix. */
+      suggestion?: string;
+      hint: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
@@ -341,6 +527,34 @@ export type TraceEvent =
       message: string;
       /** Kind-specific structured payload (mirrors the failures.log record). */
       data?: Record<string, unknown>;
+    })
+
+  // Host quiesce/maintenance mode (issue #122)
+  | (TraceEventBase & {
+      type: 'host:quiesce';
+      reason?: string;
+      /** Whether all turns settled within the drain window. */
+      drained: boolean;
+      /** Turns still alive at return (0 unless the drain timed out). */
+      activeTurns: number;
+      /** Wakes still parked on provider admission at return (see HostModeStatus). */
+      parkedAdmissions?: number;
+      /** True when undrained turns were force-cancelled (abandon). */
+      abandoned?: boolean;
+      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      unabandonable?: string[];
+    })
+  | (TraceEventBase & {
+      type: 'host:resume';
+      /** True when a failing feasibility verdict was overridden. */
+      forced?: boolean;
+      /** Gated inference requests released back to the scheduler. */
+      releasedRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'host:quiesced_boot';
+      reason?: string;
+      since?: number;
     });
 
 /**

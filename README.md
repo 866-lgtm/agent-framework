@@ -53,6 +53,11 @@ await server.start();
 
 An agent wraps an LLM identity: model, system prompt, context strategy, and tool permissions. Multiple agents can coexist, each with independent context and inference state.
 
+Agents can opt into the [tool result guard](docs/tool-result-guard.md) through
+`agent_settings` with `{"action":"update","tool_result_guard":true}`. The
+setting persists across restarts; withheld results remain recoverable in
+Chronicle's audit history.
+
 ```typescript
 {
   name: 'researcher',
@@ -239,6 +244,73 @@ Optional host-side implementation of the MCP Live protocol. External servers (ga
 }
 ```
 
+#### Tool names and tool-name patterns
+
+An MCPL tool reaches the model as `<toolPrefix>--<tool>`. `toolPrefix`
+defaults to `mcpl--<serverId>`: server `search` with no `toolPrefix` offers
+`mcpl--search--query`, and with `toolPrefix: 'search'` it offers
+`search--query`.
+
+These settings take RFC-007 §6.2 patterns (`*` matches any run of characters)
+over that full model-facing name, so they need the prefix:
+
+- `toolClassOverrides` (framework config), e.g. `{ 'mcpl--search--*': ['web'] }`
+- `toolLifecycle.observe.tools` and `toolLifecycle.inputs.tools` (per server)
+
+`enabledTools` / `disabledTools` (per server) are different: they take the
+bare server-side name (`query`) with no prefix.
+
+A pattern that matches no tool is reported once, as a console line and an
+`mcpl:tool-pattern-unmatched` trace. When the pattern used the bare server id
+(`search--*` under the default prefix), the report suggests the prefixed form.
+A pattern that could name a server's tools is not judged until that server
+has listed them, so late connects and reconnects don't cause early reports.
+
+#### Feature sets
+
+`enabledFeatureSets` and `disabledFeatureSets` select which of a server's
+declared feature sets are enabled (`.`-segment wildcards such as `chat.*`;
+`disabledFeatureSets` wins on overlap):
+
+- `enabledFeatureSets` omitted: every declared set is a candidate.
+- `enabledFeatureSets: []`: no set is enabled.
+- In both cases a set is enabled only if its declared `uses` lists
+  recognized capabilities that the server's grant covers. A set that declares
+  no `uses` stays disabled even when `enabledFeatureSets` lists it. This is
+  reported on the console and as an `mcpl:feature-set-disabled` trace.
+
+A server that refuses the host's policy is reported as an `mcpl:policy-refused`
+trace. With `fallback: 'close'` the host closes the connection; with
+`'mcp-only'` only plain MCP tools keep working.
+
+#### Event coalescing (RFC-006)
+
+The host advertises `eventCoalescing` (both lanes, deferred rendering,
+channel-scoped pushes, a one-hour retry window). A server may add
+`coalesce: { key }` to a `push/event` or a `channels/incoming` message so that a
+later occurrence of the same subject **replaces** the earlier one while it is
+still unread, and **appends** once a model has seen it; `retract: true`
+withdraws unread content and appends the supplied deletion notice only when
+some version was read (or history is unknown). `initial: true` on a create lets
+the host know the subject's history is complete, so a create → edit → delete
+that nobody read leaves no trace. `deferred: true` (push only) holds a batch of
+notices outside context and asks the server for the content with `push/render`
+when a turn is assembled.
+
+Plain content stays in context and is delivered on arrival through the ordinary
+channel/push path; the host only remembers where it landed. "Unread" means:
+above the agent's consumed watermark (advanced at every compile of a model
+request), on the current branch, not a sharded message, and not folded into a
+summary by compression. On any doubt — restart, branch switch, eviction — the
+host appends, as it does today. There is no per-subject cap: a busy channel's
+unread backlog is simply its unread backlog. Receipts and subject history are
+kept in the `mcpl/coalescing` state (retry window 1 h); audit lines are
+`mcpl:coalescing` trace events.
+
+#### Per-channel conversation routing (deprecated)
+
+> **Deprecated: `FrameworkConfig.conversations` (`ConversationRouter`).** Per-channel conversation routing sends each channel's traffic to its own fork agent, spawned from a template agent and closed after an idle TTL. It is being retired ([#235](https://github.com/anima-research/agent-framework/issues/235)). Its `'mention'` bind/trigger rule, the default for channels, reads `metadata.mentioned`, which discord-mcpl does not set, so on Discord channels an @-mention never binds a fork or triggers a bound one. Don't adopt it in new hosts. Existing configurations still route exactly as before, and the framework logs one `[deprecated]` line when it is created with `conversations` set. Removal is a follow-up.
+
 ### Streaming Lifecycle
 
 1. **Start**: Framework calls `agent.startStreamWithInjections()` → `YieldingStream`
@@ -266,9 +338,30 @@ const server = new ApiServer(framework, { port: 8765 });
 await server.start();
 ```
 
-**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`
+**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`
 
 Also available as an MCP server via the `agent-framework-mcp` binary.
+
+### Host quiesce / maintenance mode
+
+Pause the inference thread and MCPL data planes while keeping the framework,
+context managers, and membrane hot — so compression/refold/quarantine work runs
+through the live machinery instead of offline scripts (issue #122). Quiesce
+persists across restarts; `resume` gates on a fresh per-agent feasibility
+preview of the current runtime settings (`force` overrides).
+
+```typescript
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
+await framework.maintenanceTick();   // drain quarantine / advance merges
+await framework.resume();            // throws ResumeBlockedError if the layout won't compile
+```
+
+Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
+`POST /maintenance/tick`, `GET /hostmode`; options via query string) and as
+`host/command` verbs (`quiesce`, `resume`, `maintain`, `host-status`) from MCPL
+servers granted `allowHostCommands`. The HTTP host verbs accept an optional
+shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`) for
+deployments that front the port with a proxy.
 
 ## Observability
 

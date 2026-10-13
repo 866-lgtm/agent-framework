@@ -6,6 +6,7 @@
  */
 
 import { constants as fsConstants } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
 import { join, resolve, relative, dirname, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
@@ -34,7 +35,7 @@ import type {
 } from './types.js';
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
-import { syncFromFs, materializeToFs, hashContent, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
+import { syncFromFs, materializeToFs, hashContent, isBinary, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
 
 export type {
   WorkspaceConfig,
@@ -76,6 +77,82 @@ class WorkspaceImageReadError extends Error {
     super(message);
     this.name = 'WorkspaceImageReadError';
   }
+}
+
+/**
+ * Why a workspace-owned filesystem read was refused. Distinguishes the cases a
+ * peer needs to react to differently: a path that never resolved inside the
+ * mount (`unknown_mount`, `traversal`), a mount whose root is gone
+ * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
+ * (`directory`), a symlink refused by the mount's `followSymlinks` policy
+ * (`symlink`), a symlink whose canonical target lands outside the canonical
+ * mount root (`escape`), and a file swapped underneath the read (`changed`).
+ */
+export type WorkspaceReadErrorCode =
+  | 'unknown_mount'
+  | 'traversal'
+  | 'mount_unavailable'
+  | 'not_found'
+  | 'directory'
+  | 'symlink'
+  | 'escape'
+  | 'changed';
+
+/** Where in the open sequence a `WorkspaceReadError` originated (diagnostics). */
+export type WorkspaceReadStage =
+  | 'parse'
+  | 'lstat'
+  | 'realpath_root'
+  | 'open'
+  | 'fstat'
+  | 'post_lstat'
+  | 'realpath'
+  | 'stat'
+  | 'read';
+
+/**
+ * Thrown by `WorkspaceModule.readFileFromDisk()`. Messages carry the
+ * mount-prefixed path only — never absolute filesystem paths — so they can be
+ * surfaced to the agent or logged without leaking host layout.
+ */
+export class WorkspaceReadError extends Error {
+  constructor(
+    readonly code: WorkspaceReadErrorCode,
+    message: string,
+    readonly stage: WorkspaceReadStage,
+    /** Underlying errno code (e.g. 'ENOENT', 'ELOOP') when a syscall failed. */
+    readonly errno?: string,
+  ) {
+    super(message);
+    this.name = 'WorkspaceReadError';
+  }
+}
+
+/** Successful `readFileFromDisk()` result. */
+export interface WorkspaceDiskReadResult {
+  /** File bytes — the whole file, or its first `maxBytes` when `truncated`. */
+  bytes: Buffer;
+  /** Full on-disk size in bytes, regardless of truncation. */
+  size: number;
+  /** True when `maxBytes` was set and the file was larger; `bytes` is a prefix. */
+  truncated: boolean;
+  /** mtime of the file actually read (for change-detection caches). */
+  mtimeMs: number;
+  /** Canonical (realpath) location of the file read — inside the canonical mount root by construction. */
+  realPath: string;
+  /** Mount the path resolved into. */
+  mount: string;
+}
+
+export interface ReadFileFromDiskOptions {
+  /** Read at most this many bytes (a bounded prefix read — the rest of the file is never loaded). */
+  maxBytes?: number;
+}
+
+function errnoOf(err: unknown): string | undefined {
+  return typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+    ? (err as { code: string }).code
+    : undefined;
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -292,9 +369,13 @@ function validateJpeg(bytes: Buffer, mountPrefixedPath: string): void {
     offset += 1;
 
     if (marker === JPEG_EOI) {
-      if (!sawSof || !sawSos || offset !== bytes.length) {
+      if (!sawSof || !sawSos) {
         invalidImage('JPEG', mountPrefixedPath);
       }
+      // Bytes after EOI are tolerated: hardware encoders (e.g. Raspberry Pi
+      // camera stills) pad each frame to a 4-byte boundary with NULs after
+      // the EOI marker, and every mainstream decoder stops at EOI. The image
+      // proper (SOI..EOI) has been fully validated by this point.
       return;
     }
     if (marker === JPEG_TEM || (marker >= 0xd0 && marker <= 0xd7)) {
@@ -525,6 +606,11 @@ export class WorkspaceModule implements Module {
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
+  /** Persisted state decoded in start(), held until mounts exist to apply it
+   *  to — in the Host ordering start() runs before initStore() creates the
+   *  mounts, so restoration must be second-callback-safe like watcher
+   *  startup already is (issue #72). Cleared after application. */
+  private savedState: WorkspaceModuleState | null = null;
 
   constructor(config: WorkspaceConfig) {
     // Detect overlapping mount paths: if mount A contains mount B,
@@ -593,30 +679,134 @@ export class WorkspaceModule implements Module {
       this.mounts.set(mount.name, mountState);
     }
 
+    this.applySavedState();
     this.ensureRunning();
   }
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
 
-    // Restore persisted state if restarting
+    // Decode persisted state if restarting; application waits until mounts
+    // exist (see applySavedState) — in the Host ordering they don't yet.
     if (ctx.isRestart) {
-      const saved = ctx.getState<WorkspaceModuleState>();
-      if (saved) {
-        for (const [name, meta] of Object.entries(saved.mounts)) {
-          const mount = this.mounts.get(name);
-          if (mount) {
-            mount.lastMaterializedSeq = meta.lastMaterializedSeq;
-            mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
-            // watcherReadyAt intentionally not restored — each session must
-            // observe its own watcher attach, otherwise a stale timestamp
-            // would hide a new-session attach failure.
-          }
-        }
-      }
+      this.savedState = ctx.getState<WorkspaceModuleState>() ?? null;
     }
 
+    this.applySavedState();
     this.ensureRunning();
+  }
+
+  /**
+   * Apply persisted per-mount state once both halves of the lifecycle have
+   * happened. Like watcher startup, either callback may fire second, so both
+   * start() and initStore() call this; it runs to effect exactly once — the
+   * saved payload is cleared after application so stale persisted values can
+   * never overwrite newer runtime state (e.g. a materialization that already
+   * happened this session).
+   */
+  private applySavedState(): void {
+    if (!this.savedState || this.mounts.size === 0) return;
+
+    for (const [name, meta] of Object.entries(this.savedState.mounts)) {
+      const mount = this.mounts.get(name);
+      if (mount) {
+        mount.lastMaterializedSeq = meta.lastMaterializedSeq;
+        mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
+        // watcherReadyAt intentionally not restored — each session must
+        // observe its own watcher attach, otherwise a stale timestamp
+        // would hide a new-session attach failure.
+      }
+    }
+    this.savedState = null;
+
+    // Absorb out-of-band branch switches (e.g. an offline repair that left
+    // the store on a child branch): if the pinned branch is a strict ancestor
+    // of the current branch and disk state is fully contained in the current
+    // branch's history, re-pin. Without this, every materialize refuses
+    // forever after a repair, even though nothing on disk can be clobbered.
+    this.healBranchPins();
+  }
+
+  /**
+   * True when everything last materialized to disk for a mount is part of the
+   * CURRENT branch's history — i.e. the current branch is a linear
+   * continuation of the pinned branch as of the pinned sequence.
+   *
+   * Walks the current branch's parent chain. Safe iff the pinned branch is on
+   * the chain AND every fork point along the way is at or after `pinnedSeq`
+   * (a fork before `pinnedSeq` means disk holds records the current branch
+   * never had — genuine divergence). A missing/GC'd intermediate branch or a
+   * child without fork metadata is treated as unsafe: ancestry can't be
+   * proven, so the guard stays closed and `force` is the escape hatch.
+   */
+  private isLinearContinuation(
+    store: JsStore,
+    pinnedBranchId: string,
+    pinnedSeq: number,
+  ): boolean {
+    const current = store.currentBranch();
+    if (current.id === pinnedBranchId) return true;
+    const byId = new Map(store.listBranches().map((b) => [b.id, b]));
+    const visited = new Set<string>();
+    let cursor = byId.get(current.id);
+    while (cursor && !visited.has(cursor.id)) {
+      visited.add(cursor.id);
+      if (cursor.id === pinnedBranchId) return true;
+      if (cursor.parentId === undefined || cursor.branchPoint === undefined) return false;
+      if (cursor.branchPoint < pinnedSeq) return false;
+      cursor = byId.get(cursor.parentId);
+    }
+    return false;
+  }
+
+  /**
+   * Why materializing this mount is blocked on the current branch, or null if
+   * it isn't. Single source of truth for the materialize guard AND the
+   * `canMaterialize` status field, so status can never report `true` for a
+   * mount that materialize would refuse (the pre-fix defect: status computed
+   * per-mount id-equality while the guard checked ALL mounts).
+   */
+  private mountMaterializeBlockReason(store: JsStore, mount: MountState): string | null {
+    if (this.config.materializeOnlyActiveBranch === false) return null;
+    if (!mount.lastMaterializedBranchId) return null;
+    const current = store.currentBranch();
+    if (mount.lastMaterializedBranchId === current.id) return null;
+    if (this.isLinearContinuation(store, mount.lastMaterializedBranchId, mount.lastMaterializedSeq)) {
+      return null;
+    }
+    const pinned = store.listBranches().find((b) => b.id === mount.lastMaterializedBranchId);
+    const pinnedName = pinned ? `"${pinned.name}"` : `id ${mount.lastMaterializedBranchId} (branch no longer exists)`;
+    return (
+      `current branch "${current.name}" has diverged from the branch last materialized to disk ` +
+      `(${pinnedName} at seq ${mount.lastMaterializedSeq}) — disk may hold state the current branch ` +
+      `never had. Pass force: true to overwrite disk from the current branch if it is canonical.`
+    );
+  }
+
+  /**
+   * Re-pin mounts whose last-materialized branch is a proven ancestor of the
+   * current branch. Runs after persisted state is applied on restart, so an
+   * out-of-band branch switch (offline repair/treatment branches) heals at
+   * boot instead of wedging materialize until manual surgery.
+   */
+  private healBranchPins(): void {
+    const store = this.store;
+    if (!store) return;
+    const current = store.currentBranch();
+    for (const mount of this.mounts.values()) {
+      if (
+        mount.lastMaterializedBranchId &&
+        mount.lastMaterializedBranchId !== current.id &&
+        this.isLinearContinuation(store, mount.lastMaterializedBranchId, mount.lastMaterializedSeq)
+      ) {
+        console.warn(
+          `[workspace] Mount "${mount.config.name}": branch pin ${mount.lastMaterializedBranchId} → ` +
+          `${current.id} ("${current.name}") — current branch linearly continues the last ` +
+          `materialized branch (out-of-band switch, e.g. repair); disk state is preserved history.`,
+        );
+        mount.lastMaterializedBranchId = current.id;
+      }
+    }
   }
 
   /**
@@ -649,6 +839,15 @@ export class WorkspaceModule implements Module {
                 mount: name,
                 path: mount.config.path,
                 error: err.message,
+              } as ProcessEvent);
+            },
+            onReattach: () => {
+              mount.watcherError = null;
+              void this.initialScan(name);
+              this.ctx?.pushEvent({
+                type: 'workspace:watcher-reattached',
+                mount: name,
+                path: mount.config.path,
               } as ProcessEvent);
             },
           },
@@ -716,6 +915,15 @@ export class WorkspaceModule implements Module {
     this.ctx = null;
   }
 
+  /** Mount names + modes, for peer callers (framework spill/journal paths)
+   *  that need a writable mount without reaching into private state. */
+  getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only' }> {
+    return [...this.mounts.values()].map((m) => ({
+      name: m.config.name,
+      mode: m.config.mode === 'read-only' ? 'read-only' : 'read-write',
+    }));
+  }
+
   // ==========================================================================
   // Tool Definitions
   // ==========================================================================
@@ -724,13 +932,19 @@ export class WorkspaceModule implements Module {
     return [
       {
         name: 'read',
-        description: 'Read a file from the workspace. Returns content with line numbers.',
+        description: 'Read a file from the workspace. Returns content with line numbers. '
+          + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files. '
+          + 'For long lines or spill files, use offsetChars/limitChars instead: returns raw text without '
+          + 'line numbers, with nextOffsetChars (null at EOF). Keep limitChars when continuing. '
+          + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'File path (mount-prefixed, e.g., "project/src/main.ts")' },
             offset: { type: 'number', description: 'Starting line number (1-indexed)' },
-            limit: { type: 'number', description: 'Maximum number of lines to return' },
+            limit: { type: 'number', description: 'Maximum number of lines to return (default 2000)' },
+            offsetChars: { type: 'integer', description: 'Character paging: zero-based UTF-16 offset (default 0); use nextOffsetChars to continue' },
+            limitChars: { type: 'integer', description: 'Character paging: code units to return (default 2000), plus at most one to keep a surrogate pair intact. Use the limit suggested by a spill notice.' },
           },
           required: ['path'],
         },
@@ -839,6 +1053,7 @@ export class WorkspaceModule implements Module {
           properties: {
             path: { type: 'string', description: 'Specific path to materialize (optional — defaults to all changed)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
+            force: { type: 'boolean', description: 'Materialize even if the current branch has diverged from the branch last written to disk (default false). Only needed for genuine divergence — descendant branches pass automatically.' },
           },
         },
       },
@@ -860,9 +1075,48 @@ export class WorkspaceModule implements Module {
   // Tool Dispatch
   // ==========================================================================
 
+  private generatedTextFiles = new Map<string, {read: () => string; agentName: string}>();
+
+  /** Compare the same normalized physical path for registration and tool access. */
+  private generatedFileKey(path: string): string {
+    const slash = path.indexOf('/');
+    const mountName = slash < 0 ? path : path.slice(0, slash);
+    const mount = this.config.mounts.find(m => m.name === mountName);
+    if (!mount) throw new Error(`Unknown mount: "${mountName}"`);
+    const resolved = resolve(mount.path, slash < 0 ? '' : path.slice(slash + 1));
+    if (!isContainedPath(mount.path, resolved)) throw new Error(`Path traversal detected: "${path}"`);
+    return resolved;
+  }
+
+  private findGeneratedTextFile(path: string) {
+    if (!this.generatedTextFiles.size) return undefined;
+    try { return this.generatedTextFiles.get(this.generatedFileKey(path)); }
+    catch {
+      // Not an alias of a valid generated file. Let the selected tool return
+      // its established validation error (including image-specific errors).
+      return undefined;
+    }
+  }
+
+  /** Generated files bypass stored blobs so every read reflects current definitions. */
+  registerGeneratedTextFile(path: string, read: () => string, agentName: string): void {
+    const [mount, ...parts] = path.split('/');
+    if (!this.config.mounts.some(m => m.name === mount) || !parts.length
+      || parts.some(p => !p || p === '.' || p === '..') || this.generatedTextFiles.has(this.generatedFileKey(path)))
+      throw new Error(`Duplicate/invalid generated path: ${path}`);
+    this.generatedTextFiles.set(this.generatedFileKey(path), {read, agentName});
+  }
+
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       const input = call.input as Record<string, unknown>;
+      const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
+      if (generated) {
+        if (call.callerAgentName !== generated.agentName) return {success:false,isError:true,error:'Generated file belongs to another agent'};
+        if (call.name !== 'read') return {success:false,isError:true,error:'Generated file is read-only; edit the presentation configuration instead'};
+        return await this.handleRead(input as unknown as ReadInput, generated.read());
+      }
+
       switch (call.name) {
         case 'read': return await this.handleRead(input as unknown as ReadInput);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
@@ -956,8 +1210,17 @@ export class WorkspaceModule implements Module {
   /**
    * Resolve a mount-prefixed path (e.g. "tickets/2026-04-22-foo.md") to its
    * absolute filesystem path. Returns null if the mount is unknown or the
-   * resolved path escapes the mount root (path-traversal guard). Public API
-   * for peer modules that need to read workspace files directly.
+   * resolved path escapes the mount root.
+   *
+   * **Lexical containment only.** The guard reasons about `..` segments in the
+   * path string; it knows nothing about what is on disk. A symlink inside the
+   * mount that targets an outside file passes this check, and a caller that
+   * then does `fs.readFile(path)` reads the outside content. Use the returned
+   * path for resolution-only purposes (write targets, nonexistent paths,
+   * display); for reading file content, use {@link readFileFromDisk}, which
+   * enforces the mount's `followSymlinks` policy and canonical containment.
+   *
+   * @deprecated for direct filesystem reads — call `readFileFromDisk()`.
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
@@ -1019,6 +1282,71 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * Read a file's raw bytes from a mount (through the Chronicle tree, synced
+   * first like the `read` tool). Public API for the framework's synthesized
+   * `read_image` tool and other peer callers that need binary content.
+   */
+  async readBinary(
+    mountPrefixedPath: string,
+  ): Promise<{ data: Buffer } | { error: string }> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+    const store = this.getStore();
+    await this.ensureSynced(mount, relativePath);
+    const entry = store.treeGet(mount.treeStateId, relativePath);
+    if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
+    const blob = store.getBlob(entry.blobHash);
+    if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
+    return { data: blob };
+  }
+
+  /**
+   * Read a file's raw bytes straight from the mount's filesystem, bypassing
+   * the Chronicle tree.
+   *
+   * For material that is *passing through* rather than being kept: an upload,
+   * a render being shipped somewhere, a file handed to a service. The store
+   * path (`readBinary`) is append-only, so reading through it means every
+   * byte is retained forever and the mount's `maxFileSize` guard applies —
+   * correct for the resident's memory, wrong for egress, where paying a
+   * permanent cost to send something once is the wrong trade.
+   *
+   * Same mount boundary and traversal guard as every other path here: only
+   * declared mounts, nothing above their root. Deliberately does NOT sync,
+   * register, or hash anything — it reads and returns.
+   */
+  async readBinaryFromDisk(
+    mountPrefixedPath: string,
+    opts: { maxBytes?: number } = {},
+  ): Promise<{ data: Buffer; absolutePath: string } | { error: string }> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+    const absolutePath = resolve(mount.config.path, relativePath);
+    try {
+      const info = await stat(absolutePath);
+      if (!info.isFile()) return { error: `Not a file: ${mountPrefixedPath}` };
+      if (opts.maxBytes !== undefined && info.size > opts.maxBytes) {
+        return { error: `File too large: ${info.size} > ${opts.maxBytes} bytes` };
+      }
+      return { data: await readFile(absolutePath), absolutePath };
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === 'ENOENT') return { error: `File not found on disk: ${mountPrefixedPath}` };
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
   private parsePath(path: string): { mount: MountState; relativePath: string } {
@@ -1031,10 +1359,12 @@ export class WorkspaceModule implements Module {
       throw new Error(`Unknown mount: "${mountName}". Available: ${[...this.mounts.keys()].join(', ')}`);
     }
 
-    // Path traversal guard (CWE-22): ensure resolved path stays within mount
+    // Path traversal guard (CWE-22): ensure resolved path stays within mount.
+    // Containment must compare with the PLATFORM separator (isContainedPath):
+    // resolve() emits backslashes on Windows, so a '/'-suffixed root never
+    // prefix-matches there and every in-mount path was rejected as traversal.
     const resolved = resolve(mount.config.path, relativePath);
-    const mountRoot = mount.config.path.endsWith('/') ? mount.config.path : mount.config.path + '/';
-    if (resolved !== mount.config.path && !resolved.startsWith(mountRoot)) {
+    if (!isContainedPath(mount.config.path, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
     }
 
@@ -1084,82 +1414,107 @@ export class WorkspaceModule implements Module {
     return this.validateImageBytes(blob, mountPrefixedPath, maxSize);
   }
 
-  private async readImageFromFilesystem(
+  /**
+   * Open a mount-relative file for reading with the mount boundary enforced on
+   * the *filesystem*, not just the path string:
+   *
+   * 1. `lstat` the lexical path — refuse directories; refuse a final-component
+   *    symlink when the mount does not `followSymlinks`.
+   * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
+   *    holds against a symlink swapped in between lstat and open; where it
+   *    doesn't (Windows), re-`lstat` after opening instead.
+   * 3. `realpath` both the mount root and the opened path and require canonical
+   *    containment — this is what catches an *intermediate* symlinked
+   *    directory escaping the mount, and a followed symlink whose target lands
+   *    outside, on every platform (junctions included).
+   * 4. Confirm the descriptor and the canonical path are the same inode.
+   *
+   * `inspect` runs right after the descriptor is stat'd and before the
+   * containment work, so callers can impose size policy in the same order the
+   * image reader always has. The returned handle is the caller's to close.
+   */
+  private async openContainedFile(
     mount: MountState,
     relativePath: string,
     mountPrefixedPath: string,
-    maxSize: number,
-  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
+    inspect?: (fileStat: Stats) => void,
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; fileStat: Stats; realFilePath: string }> {
     const lexicalPath = resolve(mount.config.path, relativePath);
-    const useNoFollow = !mount.config.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number';
+    const follow = mount.config.followSymlinks === true;
+    const useNoFollow = !follow && typeof fsConstants.O_NOFOLLOW === 'number';
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
       fileInfo = await lstat(lexicalPath);
     } catch (err) {
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      const code = errnoOf(err);
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'lstat', code);
       }
-      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'lstat', code);
     }
-
     if (fileInfo.isDirectory()) {
-      throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'lstat');
     }
-    if (fileInfo.isSymbolicLink() && !mount.config.followSymlinks) {
-      throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+    if (fileInfo.isSymbolicLink() && !follow) {
+      throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'lstat');
     }
 
     let realMountRoot: string;
     try {
       realMountRoot = await realpath(mount.config.path);
-    } catch {
-      throw new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+    } catch (err) {
+      throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`, 'realpath_root', errnoOf(err));
     }
 
-    let handle: Awaited<ReturnType<typeof open>> | null = null;
+    let handle: Awaited<ReturnType<typeof open>>;
     try {
       handle = await open(lexicalPath, fsConstants.O_RDONLY | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      const code = errnoOf(err);
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'open', code);
       }
-      if (!mount.config.followSymlinks && isErrnoCode(err, 'ELOOP')) {
-        throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+      if (!follow && code === 'ELOOP') {
+        throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'open', code);
       }
-      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'open', code);
     }
 
     try {
-      const fileStat = await handle.stat();
-      if (fileStat.isDirectory()) {
-        throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
-      }
-      if (!fileStat.isFile()) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
-      }
-      if (fileStat.size === 0) {
-        throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
-      }
-      if (fileStat.size > maxSize) {
-        throw new WorkspaceImageReadError(
-          'too_large',
-          `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+      let fileStat: Stats;
+      try {
+        fileStat = await handle.stat();
+      } catch (err) {
+        const code = errnoOf(err);
+        throw new WorkspaceReadError(
+          'not_found',
+          code === 'ENOENT' ? `File not found: ${mountPrefixedPath}` : `Unable to read file: ${mountPrefixedPath}`,
+          'fstat',
+          code,
         );
       }
+      if (fileStat.isDirectory()) {
+        throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
+      }
+      if (!fileStat.isFile()) {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
+      }
+      inspect?.(fileStat);
 
-      if (!mount.config.followSymlinks && !useNoFollow) {
+      if (!follow && !useNoFollow) {
         let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
         try {
           postOpenInfo = await lstat(lexicalPath);
         } catch (err) {
-          if (isErrnoCode(err, 'ENOENT')) {
-            throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+          const code = errnoOf(err);
+          if (code === 'ENOENT') {
+            throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'post_lstat', code);
           }
-          throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+          throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'post_lstat', code);
         }
         if (postOpenInfo.isSymbolicLink()) {
-          throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+          throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'post_lstat');
         }
       }
 
@@ -1167,29 +1522,162 @@ export class WorkspaceModule implements Module {
       try {
         realFilePath = await realpath(lexicalPath);
       } catch (err) {
-        if (isErrnoCode(err, 'ENOENT')) {
-          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        const code = errnoOf(err);
+        if (code === 'ENOENT') {
+          throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'realpath', code);
         }
-        throw new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('not_found', `Unable to resolve file: ${mountPrefixedPath}`, 'realpath', code);
       }
 
       if (!isContainedPath(realMountRoot, realFilePath)) {
-        throw new WorkspaceImageReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
 
-      let pathStat: Awaited<ReturnType<typeof stat>>;
+      let pathStat: Stats;
       try {
         pathStat = await stat(realFilePath);
       } catch (err) {
-        if (isErrnoCode(err, 'ENOENT')) {
-          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        const code = errnoOf(err);
+        if (code === 'ENOENT') {
+          throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat', code);
         }
-        throw new WorkspaceImageReadError('not_found', `Unable to stat image file: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('not_found', `Unable to stat file: ${mountPrefixedPath}`, 'stat', code);
       }
       if (pathStat.dev !== fileStat.dev || pathStat.ino !== fileStat.ino) {
-        throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat');
       }
 
+      return { handle, fileStat, realFilePath };
+    } catch (err) {
+      await handle.close();
+      throw err;
+    }
+  }
+
+  /**
+   * Read a workspace file from disk with the mount boundary enforced on the
+   * filesystem (see {@link openContainedFile}). Public API for peer modules
+   * that read mounted files outside the Chronicle tree — the safe replacement
+   * for `resolveAbsolutePath()` + `fs.readFile()`, whose lexical-only guard let
+   * an in-mount symlink smuggle outside content into context (agent-framework
+   * #129, found via connectome-host #101).
+   *
+   * - Honors the mount's `followSymlinks` policy (default: refuse).
+   * - With symlinks allowed, the canonical target must stay beneath the
+   *   canonical mount root; a sibling-prefix root (`/mount-other`) does not count.
+   * - `maxBytes` performs a bounded prefix read: at most `maxBytes` bytes are
+   *   ever loaded, and `truncated` reports that the file was larger.
+   *
+   * Throws {@link WorkspaceReadError} with a `code` distinguishing unknown
+   * mount, lexical traversal, unavailable mount, missing file, directory,
+   * policy-denied symlink, outside-mount target, and file-changed-during-read.
+   */
+  async readFileFromDisk(
+    mountPrefixedPath: string,
+    options: ReadFileFromDiskOptions = {},
+  ): Promise<WorkspaceDiskReadResult> {
+    if (options.maxBytes !== undefined && !(Number.isInteger(options.maxBytes) && options.maxBytes >= 0)) {
+      throw new RangeError('readFileFromDisk: maxBytes must be a non-negative integer');
+    }
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code: WorkspaceReadErrorCode = message.startsWith('Unknown mount') ? 'unknown_mount' : 'traversal';
+      throw new WorkspaceReadError(code, message, 'parse');
+    }
+    if (!relativePath) {
+      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'parse');
+    }
+
+    const { handle, fileStat, realFilePath } = await this.openContainedFile(mount, relativePath, mountPrefixedPath);
+    try {
+      const size = fileStat.size;
+      const cap = options.maxBytes;
+      let bytes: Buffer;
+      let truncated = false;
+      if (cap !== undefined && size > cap) {
+        truncated = true;
+        bytes = Buffer.alloc(cap);
+        let offset = 0;
+        while (offset < cap) {
+          const { bytesRead } = await handle.read(bytes, offset, cap - offset, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+        }
+        if (offset < cap) bytes = bytes.subarray(0, offset);
+      } else {
+        bytes = await handle.readFile();
+      }
+      return { bytes, size, truncated, mtimeMs: fileStat.mtimeMs, realPath: realFilePath, mount: mount.config.name };
+    } catch (err) {
+      if (err instanceof WorkspaceReadError) throw err;
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'read', errnoOf(err));
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** Map a core read refusal onto the image reader's historical error vocabulary and wording. */
+  private imageErrorFromRead(err: WorkspaceReadError, mount: MountState, mountPrefixedPath: string): WorkspaceImageReadError {
+    const p = mountPrefixedPath;
+    switch (err.code) {
+      case 'mount_unavailable':
+        return new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+      case 'directory':
+        return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
+      case 'symlink':
+        return new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${p}`);
+      case 'escape':
+        return new WorkspaceImageReadError('escape', `Symlink escape detected: ${p}`);
+      case 'changed':
+        return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
+      case 'not_found':
+      default:
+        if (err.message.startsWith('File not found')) {
+          return new WorkspaceImageReadError('not_found', `File not found: ${p}`);
+        }
+        if (err.stage === 'realpath') {
+          return new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${p}`);
+        }
+        if (err.stage === 'stat') {
+          return new WorkspaceImageReadError('not_found', `Unable to stat image file: ${p}`);
+        }
+        return new WorkspaceImageReadError('not_found', `Unable to read image file: ${p}`);
+    }
+  }
+
+  private async readImageFromFilesystem(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
+    let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
+    try {
+      opened = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+        if (fileStat.size === 0) {
+          throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+        }
+        if (fileStat.size > maxSize) {
+          throw new WorkspaceImageReadError(
+            'too_large',
+            `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+          );
+        }
+      });
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) throw err;
+      if (err instanceof WorkspaceReadError) throw this.imageErrorFromRead(err, mount, mountPrefixedPath);
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    }
+    const { handle } = opened;
+    try {
       const bytes = await handle.readFile();
       return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
     } catch (err) {
@@ -1199,7 +1687,7 @@ export class WorkspaceModule implements Module {
       }
       throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
     } finally {
-      await handle?.close();
+      await handle.close();
     }
   }
 
@@ -1275,6 +1763,11 @@ export class WorkspaceModule implements Module {
       if (!fileStat.isFile() || fileStat.size > maxSize) return;
 
       const buffer = await readFile(absolutePath);
+      // Binaries are never synced into the tree (mirrors syncFromFs): the old
+      // utf-8 round-trip here silently replaced non-UTF-8 bytes with U+FFFD,
+      // permanently mangling images in the blob store. Binary reads are served
+      // straight from disk (readImageFromFilesystem / read_image fallback).
+      if (isBinary(buffer)) return;
       const content = buffer.toString('utf-8');
       const blobHash = store.storeBlob(Buffer.from(content, 'utf-8'), 'text/plain');
 
@@ -1292,7 +1785,22 @@ export class WorkspaceModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleRead(input: ReadInput): Promise<ToolResult> {
+  private async handleRead(input: ReadInput, generatedContent?: string): Promise<ToolResult> {
+    const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
+    const offsetChars = input.offsetChars ?? 0;
+    const limitChars = input.limitChars ?? 2000;
+    if (characterPaging) {
+      if (input.offset !== undefined || input.limit !== undefined) {
+        return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
+      }
+      if (!Number.isSafeInteger(offsetChars) || offsetChars < 0
+          || !Number.isSafeInteger(limitChars) || limitChars < 1
+          || input.offsetChars === null || input.limitChars === null) {
+        return { success: false, isError: true, error: 'offsetChars must be a non-negative safe integer and limitChars a positive safe integer.' };
+      }
+    }
+    let content = generatedContent;
+    if (content === undefined) {
     const { mount, relativePath } = this.parsePath(input.path);
     const store = this.getStore();
 
@@ -1308,13 +1816,42 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
     }
 
-    const content = blob.toString('utf-8');
+    content = blob.toString('utf-8');
+    }
+    if (characterPaging) {
+      const start = Math.min(offsetChars, content.length);
+      const splitsPair = (at: number): boolean =>
+        at > 0 && at < content.length
+        && content.charCodeAt(at - 1) >= 0xd800 && content.charCodeAt(at - 1) <= 0xdbff
+        && content.charCodeAt(at) >= 0xdc00 && content.charCodeAt(at) <= 0xdfff;
+      if (splitsPair(start)) {
+        return { success: false, isError: true, error: 'offsetChars splits a surrogate pair; use nextOffsetChars from the previous page.' };
+      }
+      let end = start + Math.min(limitChars, content.length - start);
+      if (splitsPair(end)) end++;
+      return {
+        success: true,
+        data: {
+          path: input.path,
+          totalChars: content.length,
+          offsetChars: start,
+          nextOffsetChars: end < content.length ? end : null,
+          content: content.slice(start, end),
+        },
+      };
+    }
     const lines = content.split('\n');
 
-    // Apply offset/limit
+    // Apply offset/limit. An unlimited read of a large file would inject the
+    // whole thing into the turn (a 2MB file ≈ 600k tokens → the request blows
+    // past the model context and 400s), so an omitted limit falls back to a
+    // default cap; the result reports total/from/to so the agent can page.
+    const DEFAULT_READ_LINE_LIMIT = 2000;
     const startLine = (input.offset ?? 1) - 1; // Convert to 0-indexed
-    const endLine = input.limit ? startLine + input.limit : lines.length;
+    const effectiveLimit = input.limit ?? DEFAULT_READ_LINE_LIMIT;
+    const endLine = startLine + effectiveLimit;
     const slice = lines.slice(startLine, endLine);
+    const truncated = endLine < lines.length;
 
     // Format with line numbers (cat -n style)
     const formatted = slice
@@ -1328,6 +1865,9 @@ export class WorkspaceModule implements Module {
         totalLines: lines.length,
         fromLine: startLine + 1,
         toLine: Math.min(endLine, lines.length),
+        ...(truncated
+          ? { note: `Truncated at ${effectiveLimit} lines (file has ${lines.length}). Use offset/limit to read more.` }
+          : {}),
         content: formatted,
       },
     };
@@ -1662,8 +2202,20 @@ export class WorkspaceModule implements Module {
         mount.initialSyncDone = true;
       }
 
-      const prefix = relativePath ? relativePath + '/' : undefined;
-      const entries = store.treeList(mount.treeStateId, prefix);
+      // If `path` points at a single FILE, grep just that file. Otherwise treat
+      // `path` as a directory prefix (the original behaviour). Previously a file
+      // path produced an empty prefix like "notes.md/" and matched nothing, so
+      // grepping a specific file silently returned zero results.
+      let entries: Array<{ path: string; blobHash: string }>;
+      const fileNode = relativePath
+        ? (store.treeGet(mount.treeStateId, relativePath) as { blobHash?: string } | null)
+        : null;
+      if (fileNode && fileNode.blobHash) {
+        entries = [{ path: relativePath, blobHash: fileNode.blobHash }];
+      } else {
+        const prefix = relativePath ? relativePath + '/' : undefined;
+        entries = store.treeList(mount.treeStateId, prefix);
+      }
 
       for (const entry of entries) {
         if (fileGlob && !fileGlob.test(entry.path)) continue;
@@ -1732,7 +2284,7 @@ export class WorkspaceModule implements Module {
         initialSyncDone: mount.initialSyncDone,
         currentBranch: currentBranch.name,
         lastMaterializedBranch: mount.lastMaterializedBranchId,
-        canMaterialize: !mount.lastMaterializedBranchId || mount.lastMaterializedBranchId === currentBranch.id,
+        canMaterialize: this.mountMaterializeBlockReason(store, mount) === null,
       };
     }
 
@@ -1741,20 +2293,6 @@ export class WorkspaceModule implements Module {
 
   private async handleMaterialize(input: MaterializeInput): Promise<ToolResult> {
     const store = this.getStore();
-
-    // Guard: only materialize on the active branch
-    if (this.config.materializeOnlyActiveBranch !== false) {
-      const currentBranch = store.currentBranch();
-      for (const mount of this.mounts.values()) {
-        if (mount.lastMaterializedBranchId && mount.lastMaterializedBranchId !== currentBranch.id) {
-          return {
-            success: false,
-            error: `Cannot materialize: current branch "${currentBranch.name}" differs from last materialized branch. Switch back or set materializeOnlyActiveBranch: false.`,
-            isError: true,
-          };
-        }
-      }
-    }
 
     const allWritten: Array<{ mount: string; path: string }> = [];
 
@@ -1769,6 +2307,36 @@ export class WorkspaceModule implements Module {
       mountsToMaterialize = [...this.mounts.entries()]
         .filter(([, m]) => m.config.mode === 'read-write')
         .map(([name, mount]) => ({ name, mount }));
+    }
+
+    // Branch guard, scoped to the mounts actually being materialized: a
+    // linear continuation (current branch descends from the pinned branch at
+    // or after the pinned seq) passes; genuine divergence refuses unless
+    // force. One mount's stale pin must never block another mount.
+    const blocked: Array<{ mount: string; reason: string }> = [];
+    for (const { name, mount } of mountsToMaterialize) {
+      const reason = this.mountMaterializeBlockReason(store, mount);
+      if (!reason) continue;
+      if (input.force) {
+        // Disk reflects another line of history, so an incremental diff from
+        // the pinned seq is meaningless — reset tracking and re-materialize
+        // the full tree, exactly like materializeMount() after a deliberate
+        // branch switch.
+        mount.lastMaterializedSeq = 0;
+        mount.lastMaterializedBranchId = null;
+      } else {
+        blocked.push({ mount: name, reason });
+      }
+    }
+    mountsToMaterialize = mountsToMaterialize.filter(
+      ({ name }) => !blocked.some((b) => b.mount === name),
+    );
+    if (mountsToMaterialize.length === 0 && blocked.length > 0) {
+      return {
+        success: false,
+        error: `Cannot materialize: ${blocked.map((b) => `[${b.mount}] ${b.reason}`).join('; ')}`,
+        isError: true,
+      };
     }
 
     for (const { name, mount } of mountsToMaterialize) {
@@ -1788,8 +2356,12 @@ export class WorkspaceModule implements Module {
         allWritten.push({ mount: name, path: p });
       }
 
-      // Track which branch we materialized on
-      if (written.length > 0) {
+      // Track which branch we materialized on. Re-pin on a clean empty
+      // materialize too (previously-pinned mount, nothing pending): disk
+      // already reflects the current branch's tree, and leaving the old pin
+      // would keep force required forever after a cross-branch materialize
+      // that happened to write nothing.
+      if (written.length > 0 || mount.lastMaterializedBranchId !== null) {
         mount.lastMaterializedBranchId = store.currentBranch().id;
       }
     }
@@ -1799,6 +2371,7 @@ export class WorkspaceModule implements Module {
       data: {
         materialized: allWritten,
         count: allWritten.length,
+        ...(blocked.length > 0 ? { skipped: blocked } : {}),
       },
     };
   }
@@ -1831,6 +2404,7 @@ export class WorkspaceModule implements Module {
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
     const allResults: Array<{ mount: string; synced: string[]; conflicts: ConflictInfo[] }> = [];
+    const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
 
     let mountsToSync: Array<{ name: string; mount: MountState }>;
     if (input.mount) {
@@ -1863,6 +2437,11 @@ export class WorkspaceModule implements Module {
         });
         this.emitFsEvents(name, result.synced, result.conflicts);
       }
+      // Skips were previously computed and dropped, so "nothing synced" and
+      // "your file was refused" looked identical from the outside. Say which.
+      for (const s of result.skipped) {
+        allSkipped.push({ mount: name, path: s.path, reason: s.reason });
+      }
     }
 
     return {
@@ -1871,6 +2450,7 @@ export class WorkspaceModule implements Module {
         results: allResults,
         totalSynced: allResults.reduce((sum, r) => sum + r.synced.length, 0),
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
+        ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
       },
     };
   }

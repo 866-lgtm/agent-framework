@@ -1,6 +1,7 @@
 import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
+import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -12,6 +13,7 @@ export type SameRoundThinkTextPolicySource =
  * Configuration for an agent.
  */
 export interface AgentConfig {
+  toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
   /** Unique name for this agent */
   name: string;
 
@@ -48,6 +50,17 @@ export interface AgentConfig {
    *  restarts with recompiled (compressed) context. Default: 150000. */
   maxStreamTokens?: number;
 
+  /**
+   * The model's PHYSICAL context window (provider hard cap, e.g. 200000).
+   * When set, the framework projects each continuation round's real size
+   * (cache-inclusive input of the prior round + the blocks about to be
+   * appended + reserve for response) and restarts the stream through a fresh
+   * compile instead of dispatching a request the provider will 400
+   * (issue #92: a legal compile can walk past the physical window mid-turn).
+   * Unset → no projection; only the maxStreamTokens restart applies.
+   */
+  physicalWindowTokens?: number;
+
   /** Per-agent context compile budget (input tokens). When unset, the
    *  ContextManager's built-in default (100k) applies. */
   contextBudgetTokens?: number;
@@ -66,7 +79,24 @@ export interface AgentConfig {
    * Set '5m' explicitly for high-frequency loops with sub-5-minute cadence,
    * where the cheaper write premium wins.
    */
-  cacheTtl?: '5m' | '1h';
+  cacheTtl?: '5m' | '1h' | '24h';
+
+  /**
+   * Whether to emit prompt-cache markers (cache_control) on requests.
+   * Default true (Anthropic API). Set false for transports that reject
+   * cache_control — e.g. Bedrock legacy Claude models, which fail with
+   * "your request did not allow prompt caching".
+   */
+  promptCaching?: boolean;
+
+  /**
+   * Prefill-formatter support: a synthetic user message appended after the
+   * conversation (e.g. chapterx's `<cmd>cat untitled.txt</cmd>` CLI-sim
+   * scaffold). Forwarded verbatim to membrane's prefill formatters; ignored
+   * by native formatting. Part of reproducing a prefill-era bot's exact
+   * prompting structure when migrating it into a resident.
+   */
+  prefillUserMessage?: string;
 
   /** Provider-specific request parameters (for example Responses reasoning
    * and server-side compaction settings). */
@@ -105,6 +135,31 @@ export interface AgentConfig {
    * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
    */
   refusalHandling?: {
+    /**
+     * Same-model retries on a content-policy refusal, performed by MEMBRANE
+     * at the provider seam (passed through as `refusalRetries`). Default 0.
+     *
+     * Near the classifier's threshold a refusal is probabilistic rather than a
+     * property of the payload: identical bytes pass and refuse minutes apart
+     * (mythos, 2026-07-27 replay reps). So the first response is to ask again
+     * — no context surgery, no fallback model. Membrane replays the SAME
+     * request immediately and cache-warm, so only the discarded output tokens
+     * are real spend.
+     *
+     * Retrying in the framework instead was tried and removed: a requeue
+     * recompiles, so the attempts are correlated rather than fresh draws, and
+     * it cannot tell a streaming consumer to drop the abandoned attempt.
+     * Membrane announces each retry with a `retrying` stream event, which
+     * driveStream handles by discarding what was streamed.
+     *
+     * Retries are spent before the framework sees the refusal at all, so the
+     * escalation order is: membrane retries -> autoRewind (if on) -> the
+     * refusal reaction, which therefore means "the border is close" rather
+     * than firing on every near-threshold flip.
+     *
+     * Native tool mode only — see the XML-mode warning in Membrane.
+     */
+    retries?: number;
     /** Auto-rewind the triggering turn on refusal and retry. Default false. */
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
@@ -116,6 +171,35 @@ export interface AgentConfig {
      */
     announceHumanTurns?: boolean;
   };
+
+  /** Opt-in tool-output admission and one guarded retry after a provider
+   * refusal. Agents can persistently override this via agent_settings
+   * tool_result_guard. Full originals remain in Chronicle's audit history.
+   * Default false. Disabling does not restore previously withheld output. */
+  toolResultGuard?: boolean;
+
+  /**
+   * How the agent's PLAIN PROSE (non-tool output) reaches channels.
+   * - 'locus' (default): host-inferred — the turn-frozen locus machinery.
+   * - 'explicit': the model prefixes prose with a destination
+   *   (`>>#channel` / `>>@person` / `>>skip_reply`); unprefixed prose is never
+   *   delivered — it bounces to a clipboard for a cheap prefixed resend.
+   *   See docs/explicit-prose-routing.md.
+   * - 'hybrid': unprefixed prose keeps locus routing; `>>>destination` routes
+   *   that publication envelope through the same authorized resolver.
+   *   See docs/hybrid-prose-routing.md.
+   * - 'disabled': generated prose is never published. Only explicit tools may
+   *   send externally; prose remains in Chronicle with a private suppression receipt.
+   */
+  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+
+  /**
+   * Fail-closed containment for a text response whose entire visible prose is
+   * an invocation-shaped wrapper naming a tool registered on that exact turn.
+   * The wrapper is neither executed nor stored as assistant continuity; a
+   * content-free system receipt is stored instead. Default false.
+   */
+  toolWrapperProseGuard?: boolean;
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
@@ -124,6 +208,18 @@ export interface AgentRuntimeSettingsPatch {
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /**
+   * Apply a `contextBudgetTokens` DECREASE immediately instead of starting a
+   * paced descent: the next compile plans straight at the new budget and the
+   * whole fold-down (and its KV invalidation) is paid on that one turn. Also
+   * cancels any in-flight descent. No effect on increases (already immediate)
+   * or on other keys. A MODE for this apply, not a setting — never persisted.
+   *
+   * This is the emergency lever: when window content must shrink NOW
+   * (refusal streaks, over-wall wedges), a converging descent is the wrong
+   * tool and used to be the only one (mythos, 2026-07-26).
+   */
+  immediate?: boolean;
 }
 
 export interface AgentRuntimeSettingsSnapshot {
@@ -208,6 +304,17 @@ export interface CompletedToolCall {
  * Inference request for an agent.
  */
 export interface InferenceRequest {
+  /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
+  coalescingSubject?: string;
+  coalescingEventId?: string;
+  /** Host-owned: this wake's cause is an RFC-006 deferred batch, which has
+   *  no model-visible content until it renders at the turn's assembly. */
+  coalescingBatch?: boolean;
+  /** Host-owned, set on a turn's trigger when EVERY request batched into it
+   *  was a deferred-batch wake: these are their subjects. If assembly settles
+   *  all of them without materializing content, the turn has no cause left
+   *  and does not run. */
+  coalescingBatchSubjects?: string[];
   agentName: string;
   reason: string;
   source: string;
@@ -222,4 +329,42 @@ export interface InferenceRequest {
    * which correctly fall back to the global default channel.
    */
   channelId?: string;
+  /**
+   * True when the triggering message explicitly addressed the agent (mention,
+   * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
+   * batch spans several channels, an addressed channel outranks ambient
+   * chatter for the turn's frozen speech locus: overheard conversation must
+   * not capture the agent's voice just by being newest.
+   */
+  addressed?: boolean;
+  /**
+   * Who spoke the message that triggered this inference, as an adapter-
+   * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display
+   * name. Undefined for wakes without an author (heartbeat, timers, module
+   * events). Read by the host to stamp gateway telemetry (x-gate-counterparty)
+   * so a household ledger can say who woke whom; carries no content.
+   */
+  counterparty?: string;
+  /**
+   * Where the wake came from, for telemetry ONLY — never a speech locus.
+   * Set by the EventGate for batched wakes (composite channel id of the
+   * chosen event when the event carried one; push-event raw ids are not
+   * used). Routing keeps reading `channelId`, set from registered ids: by
+   * the direct channel paths, and by a gate wake only when its chosen event
+   * addressed the agent and the host resolved that event's registered
+   * channel (ambient-only batches leave it unset).
+   */
+  wakeChannelId?: string;
+  /** Timestamp of the event the wake provenance was taken from (ms). */
+  wakeAt?: number;
+  /** Suppress every automatic plain-prose delivery for this logical turn.
+   * Explicit tool calls remain available. Used by authenticated silent wakes. */
+  suppressProse?: boolean;
+  /** Ephemeral system-position prompt for this turn only. Never written to
+   * Chronicle; callers must supply bounded non-secret control text. */
+  ephemeralSystemPrompt?: string;
+  /** The authenticated silent heartbeat tick this turn answers. Every row the
+   * turn stores is stamped `metadata.silentHeartbeat` with it, and request
+   * builds render a request-only separator before the tick's first row. */
+  silentHeartbeat?: SilentHeartbeatTick;
 }

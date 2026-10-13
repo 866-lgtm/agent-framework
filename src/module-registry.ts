@@ -75,6 +75,15 @@ export class ModuleRegistry {
   private pushEventFn: (event: ProcessEvent) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
+  /** Framework ops-alert channel, surfaced to modules via
+   *  ModuleContext.notifyOps. Readonly-public so ModuleContextImpl can
+   *  delegate without another positional constructor parameter. */
+  readonly notifyOpsFn?: (
+    kind: string,
+    agentName: string,
+    message: string,
+    data?: Record<string, unknown>,
+  ) => void;
 
   constructor(
     store: JsStore,
@@ -89,6 +98,7 @@ export class ModuleRegistry {
       pushEvent: (event: ProcessEvent) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
+      notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
     }
   ) {
     this.store = store;
@@ -102,6 +112,7 @@ export class ModuleRegistry {
     this.pushEventFn = options.pushEvent;
     this.onTraceFn = options.onTrace;
     this.callToolFn = options.callTool;
+    this.notifyOpsFn = options.notifyOps;
   }
 
   /**
@@ -228,6 +239,25 @@ export class ModuleRegistry {
       }
     }
     return tools;
+  }
+
+  /**
+   * All utilities from all modules, namespaced exactly like tools
+   * (`module--name`). See Module.getUtilities — these are deliberately kept
+   * out of the model-facing tool list and surfaced through the framework's
+   * `utils` meta-tool; dispatch goes through the same handleToolCall.
+   */
+  getAllUtilities(): ToolDefinition[] {
+    const utilities: ToolDefinition[] = [];
+    for (const module of this.modules.values()) {
+      for (const util of module.getUtilities?.() ?? []) {
+        utilities.push({
+          ...util,
+          name: `${module.name}--${util.name}`,
+        });
+      }
+    }
+    return utilities;
   }
 
   /**
@@ -554,6 +584,10 @@ class ModuleContextImpl implements ModuleContext {
 
   callTool(call: ToolCall): Promise<ToolResult> {
     return this.callToolFn(call);
+  }
+
+  notifyOps(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void {
+    this.registry.notifyOpsFn?.(kind, agentName, message, data);
   }
 
   addMessage(

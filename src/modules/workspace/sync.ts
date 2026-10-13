@@ -8,7 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, readdir, stat, access } from 'node:fs/promises';
-import { join, dirname, relative, resolve } from 'node:path';
+import { join, dirname, relative, resolve, sep } from 'node:path';
 import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
 import type { MountState } from './types.js';
 
@@ -19,8 +19,11 @@ export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
  * Returns the absolute path, or null if the path is outside the mount.
  */
 function safePath(mountPath: string, relativePath: string): string | null {
+  // Compare with the PLATFORM separator: resolve() emits backslashes on
+  // Windows, so a '/'-suffixed root never prefix-matches there and every
+  // in-mount path was reported as outside the mount.
   const resolved = resolve(mountPath, relativePath);
-  const root = mountPath.endsWith('/') ? mountPath : mountPath + '/';
+  const root = mountPath.endsWith(sep) ? mountPath : mountPath + sep;
   if (resolved !== mountPath && !resolved.startsWith(root)) {
     return null;
   }
@@ -40,7 +43,14 @@ export function hashContent(content: string | Buffer): string {
 /**
  * Check if content appears to be binary.
  */
-function isBinary(buffer: Buffer): boolean {
+export interface SkippedFile {
+  /** Relative path of the file that was not synced */
+  path: string;
+  /** Why, in words the resident can act on */
+  reason: string;
+}
+
+export function isBinary(buffer: Buffer): boolean {
   // Check for null bytes in first 8KB
   const check = buffer.subarray(0, 8192);
   for (let i = 0; i < check.length; i++) {
@@ -68,8 +78,11 @@ export interface SyncResult {
   synced: SyncedPath[];
   /** Paths that conflicted (both agent and user modified) — filesystem wins */
   conflicts: ConflictInfo[];
-  /** Paths that were skipped (binary, too large, etc.) */
-  skipped: string[];
+  /** Paths that were skipped, each with the reason — a silently skipped file
+   *  is indistinguishable from one that synced cleanly, which is how a
+   *  resident ends up believing a file is in their workspace when it never
+   *  arrived. */
+  skipped: SkippedFile[];
 }
 
 /**
@@ -93,7 +106,7 @@ export async function syncFromFs(
   for (const relativePath of filesToSync) {
     const absolutePath = safePath(mount.config.path, relativePath);
     if (!absolutePath) {
-      result.skipped.push(relativePath);
+      result.skipped.push({ path: relativePath, reason: 'path resolves outside the mount' });
       continue;
     }
 
@@ -113,13 +126,23 @@ export async function syncFromFs(
       const fileStat = await stat(absolutePath);
       if (!fileStat.isFile()) continue;
       if (fileStat.size > maxSize) {
-        result.skipped.push(relativePath);
+        result.skipped.push({
+          path: relativePath,
+          reason: `too large: ${fileStat.size} bytes > maxFileSize ${maxSize}`,
+        });
         continue;
       }
 
       const buffer = await readFile(absolutePath);
       if (isBinary(buffer)) {
-        result.skipped.push(relativePath);
+        // Disk -> store sync is text-only, at ANY size: the tree stores text
+        // blobs. Binary that must live in the store has to be written through
+        // writeBinary; binary that is only passing through should be read with
+        // readBinaryFromDisk instead of synced at all.
+        result.skipped.push({
+          path: relativePath,
+          reason: 'binary file — disk sync stores text only (read it from disk, or write it via a binary-aware tool)',
+        });
         continue;
       }
 
@@ -159,8 +182,11 @@ export async function syncFromFs(
 
       store.treeSet(mount.treeStateId, relativePath, entry);
       result.synced.push({ path: relativePath, op: existing ? 'modified' : 'created' });
-    } catch {
-      result.skipped.push(relativePath);
+    } catch (error) {
+      result.skipped.push({
+        path: relativePath,
+        reason: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -276,7 +302,10 @@ async function walkDirectory(
       if (results.length >= maxFiles) break;
 
       const fullPath = join(dir, entry.name);
-      const relativePath = relative(basePath, fullPath);
+      // Logical workspace paths are '/'-separated everywhere (mount-prefixed
+      // paths, chronicle tree paths); node's relative() emits backslashes on
+      // Windows, so normalize. No-op on POSIX (sep === '/').
+      const relativePath = relative(basePath, fullPath).split(sep).join('/');
 
       // Check ignore patterns (simple glob matching)
       if (shouldIgnore(relativePath, entry.name, ignorePatterns)) continue;

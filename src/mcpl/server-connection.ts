@@ -12,6 +12,9 @@
 import { EventEmitter } from 'node:events';
 
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { maskNegotiatedCapabilities } from './capability-mask.js';
+import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
+import { CAPABILITY_DISABLED } from './errors.js';
 
 import type {
   McplServerConfig,
@@ -21,10 +24,10 @@ import type {
   JsonRpcResponse,
   BeforeInferenceParams,
   BeforeInferenceResult,
-  AfterInferenceParams,
-  AfterInferenceResult,
   FeatureSetsUpdateParams,
+  FeatureSetsUpdateResult,
   InferenceChunkParams,
+  InferenceLifecycleParams,
   StateRollbackParams,
   StateRollbackResult,
   ChannelsOpenParams,
@@ -43,6 +46,7 @@ import type {
 } from './types.js';
 
 import { McplMethod } from './types.js';
+import type { ToolLifecycleParams, ToolObserveRule } from './tool-lifecycle.js';
 
 /** Timeout for the initialize handshake in milliseconds.
  *  Spring Boot + JDA servers can take 5-10s to boot, so 30s is safe. */
@@ -88,7 +92,6 @@ interface RequestOptions {
  * - `'channels-register'`  — Server sent `channels/register`
  * - `'channels-changed'`   — Server sent `channels/changed`
  * - `'channels-incoming'`  — Server sent `channels/incoming`
- * - `'feature-sets-changed'` — Server sent `featureSets/changed`
  * - `'error'`              — Connection-level error
  * - `'close'`              — Connection closed
  * - `'connect-failed'`     — Initial connect failed; background retry scheduled
@@ -99,8 +102,96 @@ export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
   readonly id: string;
 
-  /** MCPL capabilities negotiated during the initialize handshake, or null if the server does not support MCPL. */
+  /** MCPL capabilities negotiated during the initialize handshake — after
+   *  host-side capability scoping (enabledCapabilities/disabledCapabilities)
+   *  — or null if the server does not support MCPL. */
   capabilities: McplCapabilities | null;
+
+  /** Dotted paths of advertised capabilities the host config masked at the
+   *  last handshake (empty when no scoping is configured). Inbound methods
+   *  gated by a masked capability are rejected in setupMessageRouting. */
+  droppedCapabilities: ReadonlySet<string> = new Set();
+
+  /** OUTER standard MCP capabilities.tools was present at handshake (§5.1 —
+   *  the sole source of the `tools` capability path). */
+  mcpToolsAdvertised = false;
+
+  /** Host-owned per-server authority for host/command (config
+   *  allowHostCommands, default false). No capability path exists and the
+   *  grant cannot confer it — server params never decide admin authority. */
+  allowHostCommands = false;
+
+  /**
+   * The effective capability grant (§5.4) — the sole authorization
+   * allowlist for this connection. Starts EMPTY: until the initial policy
+   * exchange completes (§5.3) nothing is granted and every privileged
+   * inbound method is rejected. The framework computes the grant from the
+   * masked advertisement and activates it via establishGrant() only after
+   * the featureSets/update Request is answered (expansion activates on
+   * receipt, §6.7); revocations re-call establishGrant() BEFORE the
+   * corresponding Request is sent (reduction applies first, §6.7).
+   */
+  grant: CapabilityGrant = CapabilityGrant.empty();
+
+  /** True once the §5.3 initial policy Request has been answered. */
+  policyEstablished = false;
+
+  /**
+   * RFC-007 §6: the server's `tools/observe` filter — interest, never
+   * authority (it only narrows what the grant allows). Null = no filter in
+   * force, which means every granted call is reported with METADATA ONLY
+   * (§5.1). Per connection epoch: discarded on reconnect and whenever
+   * `toolLifecycle.observe` leaves the grant (§6.5).
+   */
+  toolObserveFilter: ToolObserveRule[] | null = null;
+
+  /** Increments at every transport boundary. RFC-007 terminals go only to
+   *  the epoch their opening went to, never across a reconnect. */
+  transportEpoch = 0;
+
+  /**
+   * §17 manifest tracking (host side of RFC-003): what this host actually
+   * fetched and acted on — never the server's announcement log (§17.10:
+   * those are different facts). Read by the legibility surface.
+   */
+  manifestState: {
+    /** revision of the last VALIDATED fetched manifest (server-authored,
+     *  untrusted, equality-only) — null until a §17.4 fetch succeeds. */
+    lastValidatedRevision: string | null;
+    lastFetchedAt: number | null;
+    /** epoch ms of the last §6.7 receipt that activated a grant change. */
+    lastNegotiatedAt: number | null;
+  } = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
+
+  /**
+   * Activate (or replace) the effective grant. Ordering is the caller's
+   * contract per §6.7: call BEFORE sending a reducing featureSets/update,
+   * AFTER the receipt for an expanding one.
+   */
+  establishGrant(grant: CapabilityGrant): void {
+    this.grant = grant;
+    this.policyEstablished = true;
+    // RFC-007 §6.5: revoking observe discards the filter; the server sends
+    // it again if the capability is granted later.
+    if (!grant.has('toolLifecycle.observe')) this.toolObserveFilter = null;
+  }
+
+  /** A §5.3 grant belongs to one initialized transport epoch. Reconnecting
+   * performs a fresh initialize handshake, so authority from the dead epoch
+   * must be revoked before the replacement transport is exposed. */
+  private resetPolicyForTransportBoundary(): void {
+    this.grant = CapabilityGrant.empty();
+    this.policyEstablished = false;
+    this.transportEpoch++;
+    // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
+    // server sends it again, and until then receives metadata only.
+    this.toolObserveFilter = null;
+    // §17 tracking is per-epoch for the same reason the grant is: these are
+    // facts about what THIS host fetched/negotiated on THIS initialized
+    // transport, and a fresh initialize starts a fresh manifest history
+    // (Sol, PR #84 review — they previously survived into the new epoch).
+    this.manifestState = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
+  }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
    *  stub awaiting its first background reconnect. */
@@ -116,7 +207,7 @@ export class McplServerConnection extends EventEmitter {
   private pendingRequests = new Map<string | number, PendingRequest>();
   /** Metadata retained after selected request deadlines so a late response is
    * observable even though its original promise has already been rejected. */
-  private orphanedRequests = new Map<string | number, { method: string }>();
+  private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
   private closed = false;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
@@ -129,6 +220,15 @@ export class McplServerConnection extends EventEmitter {
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
+  /** Cap on buffered responder-less events during a plane pause (issue #122).
+   *  Held server→host requests are never dropped and may exceed this. */
+  private static readonly MAX_BUFFERED_EVENTS = 1000;
+  private droppedBufferedEvents = 0;
+  /** True while ready()/readyControlPlane() re-emit a buffer snapshot. Items
+   *  re-buffering mid-flush were already admitted once — applying the cap to
+   *  them again would evict events that were legally held (the cap targets
+   *  NEW arrivals during a pause, not churn from control-plane flushes). */
+  private flushDepth = 0;
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
@@ -180,11 +280,22 @@ export class McplServerConnection extends EventEmitter {
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
-    for (const { event, args } of pending) {
-      // Re-enter the gate for every buffered item. A control handler (notably
-      // tools/list_changed) may install a newer data-plane barrier while this
-      // snapshot is being flushed; later data items must observe that pause.
-      this.emit(event, ...args);
+    if (pending.length > 200) {
+      console.error(
+        `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
+        `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
+      );
+    }
+    this.flushDepth++;
+    try {
+      for (const { event, args } of pending) {
+        // Re-enter the gate for every buffered item. A control handler (notably
+        // tools/list_changed) may install a newer data-plane barrier while this
+        // snapshot is being flushed; later data items must observe that pause.
+        this.emit(event, ...args);
+      }
+    } finally {
+      this.flushDepth--;
     }
   }
 
@@ -197,18 +308,20 @@ export class McplServerConnection extends EventEmitter {
   readyControlPlane(): void {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
-    const deferred: Array<{ event: string; args: unknown[] }> = [];
     this.bufferedEvents = [];
-    for (const item of pending) {
-      if (McplServerConnection.isControlPlaneEvent(item.event)) {
-        super.emit(item.event, ...item.args);
-      } else {
-        deferred.push(item);
+    this.flushDepth++;
+    try {
+      for (const item of pending) {
+        // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+        // events include channels-register/changed, which are grant-gated —
+        // the old direct flush bypassed positive-grant enforcement entirely
+        // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+        // the same call, since dataPlaneReady is still false.
+        this.emit(item.event, ...item.args);
       }
+    } finally {
+      this.flushDepth--;
     }
-    // Data events emitted by control handlers while the snapshot was flushing
-    // were appended to the new buffer. Preserve their order behind older data.
-    this.bufferedEvents = [...deferred, ...this.bufferedEvents];
   }
 
   /**
@@ -233,22 +346,107 @@ export class McplServerConnection extends EventEmitter {
         ? this.controlPlaneReady
         : this.dataPlaneReady)
     ) {
+      // Positive-grant admission (§5.4/§14.1), at the single choke-point
+      // every path shares: live routing AND buffer flushes re-enter here, so
+      // an event buffered while the connection was staged is authorized
+      // against the grant current at ADMISSION — by which time the §5.3
+      // policy exchange has settled. Rejecting earlier (at line receipt)
+      // answered staged traffic with -32002 before the grant existed, which
+      // both bounced conforming servers' startup pushes and made a FAILED
+      // startup observable to the server (a response where the ledger said
+      // nothing was released).
+      // host/command: host-owned authority, not a capability — no §6.2 path
+      // exists and none is invented here. Default DENY; only the operator's
+      // config confers it (PR #79 review blocker 9: any server could
+      // request undo/hide/unstick).
+      if (name === 'host-command' && !this.allowHostCommands) {
+        const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+        if (responder?.respondError) {
+          responder.respondError(CAPABILITY_DISABLED, 'host/command requires host-owned authority (McplServerConfig.allowHostCommands)', {});
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded host/command — allowHostCommands not set`);
+        }
+        return true;
+      }
+      const requiredCap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name];
+      if (requiredCap && !this.grant.has(requiredCap)) {
+        const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
+        const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+        if (responder?.respondError) {
+          responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded ${name} — "${requiredCap}" ${phase}`);
+        }
+        return true;
+      }
       return super.emit(event, ...args);
+    }
+    // Buffer cap (issue #122): a long data-plane pause (quiesce window) on a
+    // busy server would otherwise grow this array without bound. Only
+    // responder-LESS events are ever dropped — a buffered server→host REQUEST
+    // holds a live responder the server is blocking on, and dropping it would
+    // strand that call forever (the server timing out and reconnecting is the
+    // accepted bound there, and reconnect re-runs the barrier funnel).
+    if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
+      const hasResponder = (item: { args: unknown[] }): boolean => {
+        const responder = item.args[1] as { respond?: unknown } | undefined;
+        return typeof responder?.respond === 'function';
+      };
+      if (!hasResponder({ args })) {
+        this.droppedBufferedEvents++;
+        if (this.droppedBufferedEvents % 100 === 1) {
+          console.error(
+            `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_BUFFERED_EVENTS}) — ` +
+            `dropped ${this.droppedBufferedEvents} responder-less event(s) while the plane is paused`,
+          );
+        }
+        const dropIndex = this.bufferedEvents.findIndex((item) => !hasResponder(item));
+        if (dropIndex >= 0) {
+          this.bufferedEvents.splice(dropIndex, 1); // drop-oldest non-request
+          this.bufferedEvents.push({ event: name, args });
+        }
+        // else: buffer is all held requests — drop the incoming event instead.
+        return true;
+      }
     }
     this.bufferedEvents.push({ event: name, args });
     return true;
   }
+
+  /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time
+   *  enforcement in emit(). */
+  private static readonly EVENT_TO_REQUIRED_CAPABILITY: Record<string, string> = {
+    'push-event': 'pushEvents',
+    'inference-request': 'inferenceRequest',
+    'model-info': 'modelInfo',
+    'channels-register': 'channels.register',
+    'channels-changed': 'channels.register',
+    'channels-incoming': 'channels.incoming',
+    'channels-list': 'channels.register',
+    // RFC-007 §4.1: tools/observe is accepted only under toolLifecycle.observe
+    // (-32002 otherwise, including before the §5.3 policy exchange).
+    'tools-observe': 'toolLifecycle.observe',
+  };
 
   private static isControlPlaneEvent(event: string): boolean {
     return event === 'stderr'
       || event === 'scope-elevate'
       || event === 'channels-register'
       || event === 'channels-changed'
-      || event === 'feature-sets-changed'
       || event === 'tools-list-changed'
+      // RFC-007: a filter is policy-shaped and only narrows; applying it
+      // while the data plane is paused can only reduce what is sent.
+      || event === 'tools-observe'
       || event === 'connect-failed'
       || event === 'reconnect-failed'
-      || event === 'orphaned-response';
+      || event === 'orphaned-response'
+      // host/command is OPERATOR traffic, not agent-wake traffic: it must
+      // stay deliverable while the data plane is paused, or a quiesced host
+      // could never receive the `resume` that lifts the pause (issue #122 —
+      // the command would buffer behind the very gate it is meant to open).
+      // The allowHostCommands authority check lives on the emit pass path
+      // below, so promotion does not widen who may issue commands.
+      || event === 'host-command';
   }
 
   private static isLifecycleEvent(event: string): boolean {
@@ -273,9 +471,12 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
   ): Promise<McplServerConnection> {
-    const { transport, capabilities } = await McplServerConnection.handshake(config, hostCapabilities);
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(config, hostCapabilities);
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
+    connection.droppedCapabilities = droppedCapabilities;
+    connection.mcpToolsAdvertised = mcpToolsAdvertised;
+    connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Store config for reconnection
@@ -300,7 +501,7 @@ export class McplServerConnection extends EventEmitter {
   private static async handshake(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null }> {
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean }> {
     const transport = await openTransport(config);
 
     try {
@@ -318,7 +519,7 @@ export class McplServerConnection extends EventEmitter {
 
       // Await the initialize response, racing an early transport close/error and
       // a timeout. All three paths clean up their listeners.
-      const capabilities = await new Promise<McplCapabilities | null>((resolve, reject) => {
+      const { mcpl: rawCapabilities, mcpToolsAdvertised } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean }>((resolve, reject) => {
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
@@ -341,7 +542,13 @@ export class McplServerConnection extends EventEmitter {
           const result = msg.result as Record<string, unknown> | undefined;
           const caps = result?.capabilities as Record<string, unknown> | undefined;
           const experimental = caps?.experimental as Record<string, unknown> | undefined;
-          resolve((experimental?.mcpl as McplCapabilities) ?? null);
+          // §5.1: `tools` capability is the OUTER standard MCP member — the
+          // experimental manifest cannot mint it. Carried alongside so the
+          // grant can join it into §6.4 derivation.
+          resolve({
+            mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
+            mcpToolsAdvertised: caps?.tools !== undefined,
+          });
         };
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
@@ -365,7 +572,20 @@ export class McplServerConnection extends EventEmitter {
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
 
-      return { transport, capabilities };
+      // §5.1 boolean shorthand expands to explicit leaves BEFORE the config
+      // mask runs, so sub-leaf policy is addressable — `channels: true` with
+      // `disabledCapabilities: ['channels.streaming']` must actually drop
+      // streaming (PR #79 review blocker 1).
+      const capabilities = expandAdvertisementShorthand(rawCapabilities);
+      // Host-side capability scoping: intersect the server's advertisement
+      // with config policy so a masked capability behaves exactly as if it
+      // had never been advertised (hooks, streaming, queries all read this).
+      const { capabilities: scoped, dropped } = maskNegotiatedCapabilities(capabilities, config);
+      if (dropped.length > 0) {
+        console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.join(', ')}`);
+      }
+
+      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };
     } catch (err) {
       // Never leak the child / socket if the handshake fails.
       await transport.close().catch(() => { /* best effort */ });
@@ -436,27 +656,63 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.BeforeInference, params as unknown as Record<string, unknown>) as Promise<BeforeInferenceResult>;
   }
 
-  /**
-   * Send `context/afterInference`.
-   * When `blocking` is true, sends as a request and awaits the result.
-   * When `blocking` is false (or omitted), sends as a notification.
-   */
-  sendAfterInference(params: AfterInferenceParams, blocking?: boolean): Promise<AfterInferenceResult | void> {
-    if (blocking) {
-      return this.sendRequest(McplMethod.AfterInference, params as unknown as Record<string, unknown>) as Promise<AfterInferenceResult>;
-    }
-    this.sendNotification(McplMethod.AfterInference, params as unknown as Record<string, unknown>);
-    return Promise.resolve();
+  /** RFC-006 deferred push rendering; its own timeout bounds context assembly. */
+  sendPushRender(params: import('./push-coalescer.js').PushRenderParams): Promise<import('./push-coalescer.js').PushRenderResult> {
+    return this.sendRequest('push/render', params as unknown as Record<string, unknown>, { timeoutMs: 5000, surfaceOrphanedResponse: true }) as Promise<import('./push-coalescer.js').PushRenderResult>;
   }
 
-  /** Send `featureSets/update` notification. */
+
+  /** Send `featureSets/update` as a Notification. §6.7: valid ONLY for
+   *  purely descriptive metadata that does not alter the grant. Any grant
+   *  change — including the §5.3 initial policy — MUST use the Request form
+   *  below. */
   sendFeatureSetsUpdate(params: FeatureSetsUpdateParams): void {
     this.sendNotification(McplMethod.FeatureSetsUpdate, params as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * Send `featureSets/update` as a Request (§5.3, §6.7) and await the
+   * degradation receipt. A short timeout, distinct from tool-call timeouts:
+   * a pre-0.5 server treats the Request as a notification and never
+   * answers, and per §6.7 an unanswered expansion simply does not activate
+   * — the caller leaves the grant empty and the connection MCP-only.
+   */
+  sendFeatureSetsUpdateRequest(
+    params: FeatureSetsUpdateParams,
+    timeoutMs = 15_000,
+  ): Promise<FeatureSetsUpdateResult> {
+    return this.sendRequest(
+      McplMethod.FeatureSetsUpdate,
+      params as unknown as Record<string, unknown>,
+      { timeoutMs },
+    ) as Promise<FeatureSetsUpdateResult>;
   }
 
   /** Send `inference/chunk` notification. */
   sendInferenceChunk(params: InferenceChunkParams): void {
     this.sendNotification(McplMethod.InferenceChunk, params as unknown as Record<string, unknown>);
+  }
+
+  /** Send `inference/lifecycle` notification (§10.5). Best-effort. */
+  sendInferenceLifecycle(params: InferenceLifecycleParams): void {
+    this.sendNotification(McplMethod.InferenceLifecycle, params as unknown as Record<string, unknown>);
+  }
+
+  /** Send `tools/lifecycle` notification (RFC-007). Best-effort. The
+   *  caller (ToolLifecycleEmitter) has already applied grant, narrowing,
+   *  class exclusions and this connection's filter. */
+  sendToolLifecycle(params: ToolLifecycleParams): void {
+    this.sendNotification(McplMethod.ToolsLifecycle, params as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * Fetch the server's complete current manifest (§17.4) — the
+   * experimental.mcpl object in the same shape initialize carries, never a
+   * delta. The fetched CONTENT is authoritative for every decision; the
+   * revision is only the cheap path (§17.1).
+   */
+  sendManifestRequest(timeoutMs = 15_000): Promise<McplCapabilities | null> {
+    return this.sendRequest(McplMethod.Manifest, {}, { timeoutMs }) as Promise<McplCapabilities | null>;
   }
 
   /** Send `state/rollback` request and await result. */
@@ -585,6 +841,7 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
     this.closed = true;
+    this.resetPolicyForTransportBoundary();
 
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
@@ -663,7 +920,7 @@ export class McplServerConnection extends EventEmitter {
     const attempt = Math.max(1, this.reconnectAttempts);
 
     try {
-      const { transport, capabilities } = await McplServerConnection.handshake(
+      const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(
         this.config,
         this.hostCapabilities,
       );
@@ -673,8 +930,12 @@ export class McplServerConnection extends EventEmitter {
       // awareness barrier synchronously, then releases control traffic needed
       // to establish the server while data remains held.
       this.pauseDataPlane();
+      this.resetPolicyForTransportBoundary();
       this.transport = transport;
       this.capabilities = capabilities;
+      this.droppedCapabilities = droppedCapabilities;
+      this.mcpToolsAdvertised = mcpToolsAdvertised;
+      this.allowHostCommands = this.config?.allowHostCommands === true;
       this.closed = false;
       this.nextRequestId = 1;
       this.pendingRequests.clear();
@@ -730,7 +991,8 @@ export class McplServerConnection extends EventEmitter {
         pending.timer = setTimeout(() => {
           this.pendingRequests.delete(id);
           if (options.surfaceOrphanedResponse) {
-            this.orphanedRequests.set(id, { method });
+            this.orphanedRequests.set(id, { method, ...(method === 'push/render' ? { renderParams: { featureSet: params.featureSet, key: params.key, eventId: params.eventId } } : {}) });
+            if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
           reject(new Error(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
@@ -779,12 +1041,50 @@ export class McplServerConnection extends EventEmitter {
     [McplMethod.ChannelsRegister]: 'channels-register',
     [McplMethod.ChannelsChanged]: 'channels-changed',
     [McplMethod.ChannelsIncoming]: 'channels-incoming',
-    [McplMethod.FeatureSetsChanged]: 'feature-sets-changed',
+    // §6.6/§12: a request bearing an id MUST get a result or an error —
+    // neither of these had an entry, so callers hung forever (AUDIT-001
+    // item 4, which also poisoned the audit's own usage evidence).
+    [McplMethod.ModelInfo]: 'model-info',
+    // §17.3: deliberately UNGATED (not in EVENT_TO_REQUIRED_CAPABILITY) —
+    // announcing conveys no authority, and gating it would silence exactly
+    // the servers whose grants just narrowed. The cost is the host's
+    // re-fetch, which the framework rate-limits (§17.8).
+    [McplMethod.ManifestChanged]: 'manifest-changed',
+    [McplMethod.ChannelsList]: 'channels-list',
     'notifications/tools/list_changed': 'tools-list-changed',
+    [McplMethod.ToolsObserve]: 'tools-observe',
     // Host-level admin commands initiated from a surface (e.g. a Discord
     // slash command). Params: { command, ... }; host responds with a
     // command-specific result object.
     'host/command': 'host-command',
+  };
+
+  /**
+   * Inbound (server-initiated) method → required capability path, per SPEC
+   * §14.1's table plus the non-channel privileged methods. **Positive-grant
+   * enforcement** (§5.4): the method is admitted only when the effective
+   * grant contains the named path — absence is denial, and before the
+   * initial policy exchange completes the grant is empty, so everything
+   * privileged is rejected (§5.3).
+   *
+   * This replaces the earlier `droppedCapabilities` deny-list check, which
+   * could only deny what had been advertised-then-masked: a server that
+   * never advertised a capability at all was never denied. (Adjudicated in
+   * review of PR #75; the mask itself is retained as the config-policy
+   * layer feeding the grant.)
+   *
+   * Channel methods key on their specific sub-capabilities, not the bare
+   * `channels` parent — a bare parent grants nothing (§5.4).
+   */
+  private static readonly METHOD_TO_REQUIRED_CAPABILITY: Record<string, string> = {
+    [McplMethod.PushEvent]: 'pushEvents',
+    [McplMethod.InferenceRequest]: 'inferenceRequest',
+    [McplMethod.ModelInfo]: 'modelInfo',
+    [McplMethod.ChannelsRegister]: 'channels.register',
+    [McplMethod.ChannelsChanged]: 'channels.register',
+    [McplMethod.ChannelsIncoming]: 'channels.incoming',
+    [McplMethod.ChannelsList]: 'channels.register',
+    [McplMethod.ToolsObserve]: 'toolLifecycle.observe',
   };
 
   /**
@@ -823,6 +1123,35 @@ export class McplServerConnection extends EventEmitter {
       const request = msg as JsonRpcRequest;
       const eventName = McplServerConnection.METHOD_TO_EVENT[request.method];
 
+      // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
+      // rather than hang (§6.6 — a method that will never be answered MUST
+      // return an error).
+      // featureSets/changed is REMOVED in 0.5.0 (§6.7 — it carried a
+      // server-authored change payload, the self-attestation defect; the
+      // need is met by §17's host-diffed manifest fetch). It was still
+      // routed, control-plane classified, and mutating declarations — a
+      // live ungated self-attestation path (PR #79 review blocker 4).
+      if (request.method === McplMethod.FeatureSetsChanged) {
+        if (request.id != null) {
+          this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
+        }
+        return;
+      }
+
+      if (request.method === McplMethod.ScopeElevate) {
+        if (request.id != null) {
+          this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
+        }
+        return;
+      }
+
+      // Positive-grant enforcement (§5.4, §14.1) happens at ADMISSION, in
+      // the emit() override below — the one choke-point that live routing
+      // and staged-buffer flushes share. See the comment there for why
+      // rejecting here, at line receipt, was wrong for staged connections.
+
       if (eventName) {
         // Emit the typed event with params and (for requests) a respond callback
         if (request.id != null) {
@@ -855,6 +1184,10 @@ export class McplServerConnection extends EventEmitter {
       // re-inject either result because the original dispatch context is gone.
       const orphaned = this.orphanedRequests.get(response.id);
       this.orphanedRequests.delete(response.id);
+      if (orphaned?.renderParams) {
+        this.emit('orphaned-render-response', { params: orphaned.renderParams, result: response.result, error: response.error });
+        return; // audit only: a timeout fallback can never be replaced
+      }
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };
@@ -928,6 +1261,7 @@ export class McplServerConnection extends EventEmitter {
     transport.on('close', (info: TransportCloseInfo) => {
       if (!this.closed) {
         this.closed = true;
+        this.resetPolicyForTransportBoundary();
 
         // Reject all pending requests
         for (const [id, pending] of this.pendingRequests) {

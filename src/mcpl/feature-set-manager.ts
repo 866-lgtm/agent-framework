@@ -18,6 +18,7 @@ import {
   FEATURE_SET_NOT_ENABLED,
   UNKNOWN_FEATURE_SET,
 } from './errors.js';
+import { isKnownCapabilityPath } from './capability-grant.js';
 
 // ============================================================================
 // Error Class
@@ -128,6 +129,16 @@ export class FeatureSetManager {
   private servers = new Map<string, ServerState>();
 
   /**
+   * @param emitTrace Receives an `mcpl:feature-set-disabled` trace beside
+   *   each §6.4 disablement's console line, so hosts that keep per-server
+   *   logs from the trace bus see a set that config enabled but derivation
+   *   turned off. Omit for scratch derivations (nothing is installed).
+   */
+  constructor(
+    private readonly emitTrace?: (event: { type: string; [key: string]: unknown }) => void,
+  ) {}
+
+  /**
    * Initialize a server's feature set state from its capabilities and host config.
    *
    * Called after a server connects and advertises its capabilities.
@@ -143,7 +154,16 @@ export class FeatureSetManager {
   initializeServer(
     serverId: string,
     capabilities: McplCapabilities,
-    config?: { enabledFeatureSets?: string[]; disabledFeatureSets?: string[] }
+    config?: { enabledFeatureSets?: string[]; disabledFeatureSets?: string[] },
+    /**
+     * The effective capability grant (§5.4). When provided, §6.4's
+     * FAIL-CLOSED derivation runs: a feature set whose `uses` is absent,
+     * empty, or contains an unrecognized value is disabled with reason
+     * `invalid_uses`; one whose `uses` names an ungranted capability is
+     * disabled with the missing paths recorded. Derivation overrides config
+     * enablement — config can narrow the derivable set, never widen past it.
+     */
+    grant?: import('./capability-grant.js').CapabilityGrant,
   ): FeatureSetsUpdateParams {
     // Cross-package compat: agent-framework's McplCapabilities types
     // featureSets as Record<string, FeatureSetDeclaration>, but mcpl-core-ts
@@ -165,11 +185,16 @@ export class FeatureSetManager {
       enabled: new Set<string>(),
     };
 
-    // Resolve which feature sets to enable
-    const enablePatterns = config?.enabledFeatureSets ?? [];
+    // §5.3 as pinned (mcpl e869744): ABSENT enabledFeatureSets constrains
+    // nothing — every declared set is a candidate and §6.4 derivation
+    // governs. PRESENT is an allowlist ([] = deny-all selection). The old
+    // reading (unmentioned defaults disabled) reversed the pin (PR #79
+    // review blocker 7). FLEET BEHAVIOR CHANGE: configs that omitted
+    // enabledFeatureSets now enable every derivable declared set.
     const disablePatterns = config?.disabledFeatureSets ?? [];
-
-    const toEnable = resolvePatterns(enablePatterns, declared);
+    const toEnable = config?.enabledFeatureSets === undefined
+      ? Object.keys(declared)
+      : resolvePatterns(config.enabledFeatureSets, declared);
     const toDisable = resolvePatterns(disablePatterns, declared);
 
     // Enable matching sets
@@ -180,6 +205,51 @@ export class FeatureSetManager {
     // Disable explicitly overrides enable (disable wins on conflict)
     for (const name of toDisable) {
       state.enabled.delete(name);
+    }
+
+    // §6.4 fail-closed derivation against the grant. Runs AFTER config
+    // resolution so it can only remove: nothing a declaration or a config
+    // says can supply a capability the grant lacks.
+    if (grant) {
+      // Named only when the operator listed it: with enabledFeatureSets
+      // omitted every declared set is selected, which is no surprise.
+      const explicitSelection = config?.enabledFeatureSets !== undefined;
+      const disable = (
+        name: string,
+        reason: 'invalid_uses' | 'missing_capabilities',
+        detail: string,
+        extra: { unrecognized?: string[]; missing?: string[] },
+      ): void => {
+        const selectedByConfig = state.enabled.delete(name);
+        const note = explicitSelection && selectedByConfig ? ' — overrides enabledFeatureSets' : '';
+        console.error(`[mcpl] ${serverId}/${name} disabled: ${detail}${note}`);
+        this.emitTrace?.({
+          type: 'mcpl:feature-set-disabled',
+          serverId,
+          featureSet: name,
+          reason,
+          selectedByConfig,
+          ...extra,
+        });
+      };
+      for (const [name, decl] of Object.entries(declared)) {
+        const uses = (decl as { uses?: unknown }).uses;
+        if (!Array.isArray(uses) || uses.length === 0) {
+          disable(name, 'invalid_uses', 'invalid_uses (§6.4 — uses absent or empty)', { unrecognized: [] });
+          continue;
+        }
+        const unknown = uses.filter((u) => typeof u !== 'string' || !isKnownCapabilityPath(u));
+        if (unknown.length > 0) {
+          disable(name, 'invalid_uses', `invalid_uses (§6.4 — unrecognized: ${unknown.join(', ')})`, {
+            unrecognized: unknown.map((u) => (typeof u === 'string' ? u : JSON.stringify(u))),
+          });
+          continue;
+        }
+        const missing = (uses as string[]).filter((u) => !grant.has(u));
+        if (missing.length > 0) {
+          disable(name, 'missing_capabilities', `missing capabilities ${missing.join(', ')} (§6.4)`, { missing });
+        }
+      }
     }
 
     this.servers.set(serverId, state);

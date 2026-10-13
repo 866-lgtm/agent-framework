@@ -2,12 +2,14 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
+export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
 // Built-in modules
 export * from './modules/index.js';
@@ -55,10 +57,27 @@ export type {
 
 // Usage tracking
 export { UsageTracker } from './usage/index.js';
+
+// Client-side programmatic tool calling (code_execution): exposed so external
+// tooling can drive the python runtime the way the framework does (protocol
+// harnesses, runtime smoke tests).
+export {
+  PyRunner,
+  buildInjectedTools,
+  buildCodeExecutionToolDefinition,
+  CODE_EXECUTION_TOOL_NAME,
+  PYTHON_RUNTIME_SOURCE,
+} from './code-execution/index.js';
+export type {
+  InjectedTool,
+  ExecResult,
+  PyRunnerOptions,
+  ScriptToolCallHandler,
+} from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
-export { EventGate } from './gate/index.js';
+export { EventGate, type WakeProvenance } from './gate/index.js';
 export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior } from './gate/index.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
@@ -74,8 +93,23 @@ export type { McplServerConfig } from './mcpl/index.js';
 export { McplServerConnection } from './mcpl/index.js';
 export type { McplHostCapabilities } from './mcpl/index.js';
 
+// MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
+// needs to write McplServerConfig.toolLifecycle policy and class tables, and
+// the portable pattern matcher both use.
+export { TOOL_CLASSES, DEFAULT_INPUT_CLASSES, globMatch } from './mcpl/index.js';
+export type {
+  ToolClass,
+  ToolClassSource,
+  ToolLifecycleConfig,
+  ToolLifecycleNarrowing,
+  ToolLifecycleParams,
+  ToolObserveRule,
+} from './mcpl/index.js';
+
 // Per-channel conversation routing
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,
@@ -106,8 +140,19 @@ export type {
   DiscordAwarenessRef,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
+// Live operator surgery (rollback / suppress) and its durable action log
+export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
+export type { OperatorLogEntry, OperatorLogInput, OperatorRequester } from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
   OfflineRecoveryBranchOptions,
   OfflineRecoveryBranchResult,
 } from './recovery/offline-branch.js';
+
+export * from "./tool-presentation.js";
+export {
+  SILENT_HEARTBEAT_SEPARATOR,
+  silentHeartbeatOf,
+  type SilentHeartbeatStamp,
+  type SilentHeartbeatTick,
+} from './silent-heartbeat.js';

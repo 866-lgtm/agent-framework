@@ -72,6 +72,12 @@ export interface McplImageContent {
   mimeType?: string;
   /** URI reference (present when using URI form) */
   uri?: string;
+  /** RFC-005 reference testimony (uri form only). */
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }
 
 export interface McplAudioContent {
@@ -82,12 +88,25 @@ export interface McplAudioContent {
   mimeType?: string;
   /** URI reference (present when using URI form) */
   uri?: string;
+  /** RFC-005 reference testimony (uri form only). */
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }
 
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */
   uri: string;
+  /** RFC-005 §3 reference testimony (all optional, all server claims). */
+  mimeType?: string;
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }
 
 // ============================================================================
@@ -99,22 +118,36 @@ export interface McplResourceContent {
  * Parsed from the server's `initialize` response.
  */
 export interface McplCapabilities {
-  /** MCPL protocol version (e.g., "0.4") */
+  /** MCPL protocol version (e.g., "0.5") */
   version: string;
+
+  /** §17.2 canonical content digest; absent = manifest fixed at initialize. */
+  revision?: string;
 
   /** Server supports push/event */
   pushEvents?: boolean;
 
-  /** Context hook capabilities */
+  /**
+   * Context hooks — §5.1 recursive shape. Boolean `true` at any level is
+   * shorthand for every leaf beneath it. `afterInference` is REMOVED in
+   * 0.5.0 (replaced by metadata-only inference/lifecycle, §10.5).
+   */
   contextHooks?: {
-    beforeInference?: boolean;
-    afterInference?: boolean | { blocking: boolean };
+    beforeInference?: boolean | {
+      observe?: boolean;
+      inject?: { system?: boolean; beforeUser?: boolean; afterUser?: boolean };
+    };
   };
 
-  /** Server-initiated inference capabilities */
-  inferenceRequest?: {
-    streaming?: boolean;
-  };
+  /** Server-initiated inference. `true` = the capability with no refinements. */
+  inferenceRequest?: boolean | { streaming?: boolean };
+
+  /** Server consumes inference/lifecycle notifications (§10.5). */
+  inferenceLifecycle?: boolean;
+
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
 
   /** Server supports model/info requests */
   modelInfo?: boolean;
@@ -122,8 +155,8 @@ export interface McplCapabilities {
   /** Declared feature sets (keyed by feature set name) */
   featureSets?: Record<string, FeatureSetDeclaration>;
 
-  /** Channel capabilities */
-  channels?: McplChannelCapabilities;
+  /** Channel capabilities — §14.1 object of leaves, or `true` for all. */
+  channels?: boolean | McplChannelCapabilities;
 }
 
 /**
@@ -132,25 +165,43 @@ export interface McplCapabilities {
  */
 export interface McplHostCapabilities {
   version: string;
+  /** RFC-006 support, independent of capability grants. */
+  eventCoalescing?: boolean | {
+    pushEvents?: boolean;
+    channelsIncoming?: boolean;
+    deferred?: boolean;
+    channelScopedPush?: boolean;
+    /** Retry-window guarantee in ms (integer ≥ 3,600,000; default 3,600,000). */
+    retryWindowMs?: number;
+  };
   pushEvents?: boolean;
   contextHooks?: {
-    beforeInference?: boolean;
-    afterInference?: boolean | { blocking: boolean };
+    beforeInference?: boolean | {
+      observe?: boolean;
+      inject?: { system?: boolean; beforeUser?: boolean; afterUser?: boolean };
+    };
   };
-  inferenceRequest?: {
-    streaming?: boolean;
-  };
+  inferenceRequest?: boolean | { streaming?: boolean };
+  inferenceLifecycle?: boolean;
+
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
+  modelInfo?: boolean;
   featureSets?: boolean;
-  channels?: McplChannelCapabilities;
+  channels?: boolean | McplChannelCapabilities;
 }
 
-/** Channel-specific capability flags. */
+/** Channel capability leaves (§14.1). `observe` was the pre-0.5 name for
+ *  what split into `incoming` — removed, not aliased. */
 export interface McplChannelCapabilities {
   register?: boolean;
-  publish?: boolean;
-  observe?: boolean;
   lifecycle?: boolean;
+  publish?: boolean;
+  incoming?: boolean;
   streaming?: boolean;
+  acknowledge?: boolean;
+  typing?: boolean;
 }
 
 // ============================================================================
@@ -175,8 +226,21 @@ export interface McplServerConfig {
   /** Arguments for the command */
   args?: string[];
 
-  /** Environment variables for the child process */
+  /**
+   * Environment variables for the child process. Stdio children do NOT inherit
+   * the host environment wholesale: they get a small allowlist (PATH, HOME,
+   * LANG, LC_*, TMPDIR, TLS CA bundles, and HTTP(S) proxy settings — see
+   * CHILD_ENV_ALLOWLIST) plus exactly these. Proxy URLs can contain credentials.
+   * This limits accidental inheritance; it does not isolate a hostile child.
+   */
   env?: Record<string, string>;
+
+  /**
+   * Escape hatch: pass the host's entire environment (including secrets) to
+   * the stdio child, as older versions did. Only for servers that genuinely
+   * need it. Default false.
+   */
+  inheritEnv?: boolean;
 
   /**
    * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
@@ -198,10 +262,36 @@ export interface McplServerConfig {
    */
   token?: string;
 
-  /** Feature sets to enable on connect */
+  /**
+   * Lazily resolves the connection credential at EVERY dial — first connect
+   * and each background reconnect — overriding `token` when it returns a
+   * value (null/throw falls back to `token`). Host-attached plumbing, never
+   * serialized: the point is that credentials stay out of the agent's
+   * context entirely (the agent asks for access by name; the host fetches
+   * something fresh each redial, which also makes short-lived credentials
+   * viable where a static `token` forced long ones).
+   */
+  accessProvider?: () => Promise<string | null>;
+
+  /**
+   * Host-owned authority for the `host/command` admin surface (undo / hide /
+   * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
+   * grant cannot confer it — only this config, decided by the operator, can
+   * (PR #79 review blocker 9). The one legitimate fleet user is
+   * discord-mcpl's slash-command relay.
+   */
+  allowHostCommands?: boolean;
+
+  /**
+   * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
+   * every declared set is a candidate. `[]`: none. Either way a set is
+   * enabled only if its declared `uses` are recognized capabilities the
+   * grant covers (§6.4) — a set declaring no `uses` stays disabled even when
+   * listed here (logged, and traced as `mcpl:feature-set-disabled`).
+   */
   enabledFeatureSets?: string[];
 
-  /** Feature sets to explicitly disable on connect */
+  /** Feature sets to explicitly disable on connect (wins over enabledFeatureSets). */
   disabledFeatureSets?: string[];
 
   /**
@@ -221,6 +311,37 @@ export interface McplServerConfig {
    * Wins over enabledTools on conflict.
    */
   disabledTools?: string[];
+
+  /**
+   * Capability allow-list: dotted paths as the server advertises them in its
+   * initialize response (`pushEvents`, `contextHooks.beforeInference`,
+   * `contextHooks.afterInference`, `inferenceRequest`, `modelInfo`,
+   * `channels`, `channels.streaming`, …). `*` matches one dot-segment
+   * (feature-set pattern rules), and a pattern matching a parent
+   * (`contextHooks`) covers every flag beneath it.
+   *
+   * If set, only advertised capabilities matching at least one pattern
+   * survive the handshake; everything else behaves as if the server had
+   * never advertised it. This is the host-side gate on hook fan-out: a
+   * server whose `contextHooks.afterInference` is masked never receives
+   * turn text, no matter what it self-advertises. Masked server-initiated
+   * capabilities (`pushEvents`, `inferenceRequest`, whole-`channels`) are
+   * also enforced inbound — the connection rejects those methods with
+   * CAPABILITY_DISABLED (-32002).
+   *
+   * `disabledCapabilities` takes precedence on conflict. `version` and
+   * `featureSets` are not maskable here — feature sets have their own
+   * enable/disable knobs above.
+   */
+  enabledCapabilities?: string[];
+
+  /**
+   * Capability deny-list (same paths and wildcard syntax as
+   * enabledCapabilities). Wins over enabledCapabilities on conflict.
+   * `disabledCapabilities: ['contextHooks.*']` is the one-line "this server
+   * gets no hook visibility" switch.
+   */
+  disabledCapabilities?: string[];
 
   /** Scope configurations per feature set */
   scopes?: Record<string, ScopeConfig>;
@@ -273,11 +394,15 @@ export interface McplServerConfig {
 
   /**
    * Tool name prefix for this server's tools.
-   * Tools are exposed as `{toolPrefix}:{toolName}`.
+   * Tools are exposed as `{toolPrefix}--{toolName}`.
    *
-   * Default: `mcpl:{id}` (e.g., `mcpl:zk:lobby_start_game`).
+   * Default: `mcpl--{id}` (e.g., `mcpl--zk--lobby_start_game`).
    * Set to the server ID for cleaner names (e.g., `toolPrefix: 'zk'`
-   * gives `zk:lobby_start_game`).
+   * gives `zk--lobby_start_game`).
+   *
+   * Tool-name patterns elsewhere (`toolClassOverrides` keys,
+   * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
+   * `disabledTools` use the bare server-side names.
    *
    * Must not collide with any module name or another server's prefix.
    */
@@ -289,6 +414,21 @@ export interface McplServerConfig {
    * Chronicle and changed with channel_open/channel_close.
    */
   channelSubscription?: 'auto' | 'manual' | string[];
+  /** RFC-005 autofetch envelope for this server: per-fetch eager ceiling and
+   *  cumulative per-server byte budget (reference-fetcher.ts defaults apply
+   *  when absent). */
+  autofetch?: { maxBytes?: number; maxTotalBytes?: number };
+
+  /**
+   * RFC-007 tool lifecycle policy for this server: narrowing for the
+   * `toolLifecycle.observe` and `toolLifecycle.inputs` grants, and the
+   * `input` size bound. Both paths are DENIED BY DEFAULT; stating a key here
+   * (or naming the path in enabledCapabilities) is the explicit grant.
+   * `inputs` without a `tools` or `classes` term delivers no arguments, and
+   * `comms` or unclassed tools never carry arguments whatever it says.
+   * See src/mcpl/tool-lifecycle.ts.
+   */
+  toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
 }
 
 // ============================================================================
@@ -341,15 +481,50 @@ export interface FeatureSetDeclaration {
  * Spec Section 6.7.
  */
 export interface FeatureSetsUpdateParams {
-  /** Feature sets to enable */
+  /**
+   * The effective capability grant (§5.4) — the sole normative allowlist.
+   * Full §6.2 paths. Absence of a path is denial. In the Request form an
+   * absent FIELD is a grant of nothing (§5.3 as pinned 2026-08-02), never
+   * "no change".
+   */
+  effectiveCapabilities?: string[];
+
+  /** Advertised-but-denied paths. Diagnostic only (§5.4) — MUST NOT
+   *  participate in any authorization decision on either side. */
+  deniedCapabilities?: string[];
+
+  /** Feature sets to enable. Absent = no constraint (derivation governs);
+   *  present = allowlist (§5.3 as pinned). */
   enabled?: string[];
 
   /** Feature sets to disable */
   disabled?: string[];
-
-  /** Scope configurations per feature set */
-  scopes?: Record<string, ScopeConfig>;
 }
+
+/**
+ * featureSets/update result — the degradation receipt (§6.7). Consequence
+ * testimony, never policy authority: the host MUST NOT widen any grant in
+ * response to anything in here.
+ */
+export type FeatureSetsUpdateResult =
+  | {
+      accepted: true;
+      /** Omitted when nothing degraded (§6.7). */
+      mode?: 'degraded';
+      unavailableFeatures?: Array<{
+        featureSet: string;
+        missingCapabilities: string[];
+        effect: string;
+      }>;
+      notes?: string[];
+    }
+  | {
+      accepted: false;
+      /** REQUIRED on refusal (§6.7): the server names which applies. */
+      fallback: 'mcp-only' | 'close';
+      missingCapabilities?: string[];
+      reason?: string;
+    };
 
 /**
  * featureSets/changed params (Server → Host, Notification).
@@ -499,6 +674,21 @@ export interface StateRollbackResult {
  * Spec Section 9.1.
  */
 export interface PushEventParams {
+  /** RFC-006 event coalescing (mcpl PR #5, revision 7). */
+  coalesce?: {
+    /** Subject key, 1..256 UTF-8 bytes, opaque to the host. */
+    key: string;
+    /** push/event only: address a registered channel's subject namespace. */
+    channelId?: string;
+    /** push/event only: deferred mode — the host calls push/render at assembly. */
+    deferred?: boolean;
+    /** The subject ceased to exist; `payload.content` is the deletion notice. */
+    retract?: boolean;
+    /** No earlier occurrence of this subject was ever sent (§3.3). */
+    initial?: boolean;
+    /** deferred only; ≤ 4 KiB serialized; server-private, echoed by push/render. */
+    data?: unknown;
+  };
   /** Declaring feature set */
   featureSet: string;
 
@@ -526,6 +716,10 @@ export interface PushEventParams {
  * Spec Section 9.3.
  */
 export interface PushEventResult {
+  coalesce?: {
+    outcome: 'first' | 'replaced' | 'appended' | 'retracted' | 'noted' | 'consumed';
+    priorEventId?: string;
+  };
   /** Whether the event was accepted */
   accepted: boolean;
 
@@ -545,18 +739,48 @@ export interface PushEventResult {
  * Distinct from membrane's ModelInfo which tracks requested vs actual model.
  * Spec Section 10.1.
  */
+/**
+ * inference/lifecycle params (Host → Server, Notification). SPEC §10.5.
+ *
+ * BEST-EFFORT: the host attempts exactly one terminal phase per `started`
+ * on every exit path it controls, but an unacknowledged Notification cannot
+ * guarantee delivery — consumers MUST dedupe by inferenceId and MUST retain
+ * a safety timeout. Carries no content: `modifiedResponse` and the blocking
+ * hook form are gone with context/afterInference.
+ */
+export interface InferenceLifecycleParams {
+  inferenceId: string;
+  conversationId: string;
+  turnIndex: number;
+  phase: 'started' | 'completed' | 'aborted' | 'failed';
+}
+
+/** mcpl/manifestChanged params (Server → Host, Notification). §17.3. */
+export interface ManifestChangedParams {
+  /** §17.2 canonical content digest. Untrusted; equality-only. */
+  revision: string;
+  /** Subset of the three §17.1 domains. A hint the host MAY ignore. */
+  domains: Array<'capabilities' | 'featureSets' | 'tagOntology'>;
+}
+
 export interface McplModelInfo {
   /** Model identifier (e.g., "claude-opus-4-5-20251101") */
   id: string;
 
-  /** Model vendor (e.g., "anthropic") */
-  vendor: string;
+  /** Model vendor (e.g., "anthropic"). Omitted when the host has no
+   *  truthful source — never fabricated. */
+  vendor?: string;
 
-  /** Context window size in tokens */
-  contextWindow: number;
+  /** Context window size in tokens. Omitted when unknown (a numeric field
+   *  cannot express "unknown", and a fabricated 200000 was false for
+   *  residents configured at 300k/600k — PR #79 review). The §12.2
+   *  model/info RESULT requires it, which is why this host does not
+   *  advertise modelInfo; hook params carry honesty-over-completeness. */
+  contextWindow?: number;
 
-  /** Model capabilities (e.g., ["vision", "tools"]) */
-  capabilities: string[];
+  /** Model capabilities (e.g., ["vision", "tools"]). Omitted when the
+   *  host has no truthful source. */
+  capabilities?: string[];
 }
 
 /**
@@ -616,53 +840,6 @@ export interface BeforeInferenceResult {
 
   /** Context injections to apply */
   contextInjections: McplContextInjection[];
-}
-
-/**
- * context/afterInference params (Host → Server, Request or Notification).
- * Spec Section 10.5.
- */
-export interface AfterInferenceParams {
-  /** Inference identifier (matches beforeInference) */
-  inferenceId: string;
-
-  /** Persistent across turns */
-  conversationId: string;
-
-  /** 0-indexed turn number */
-  turnIndex: number;
-
-  /** Original user input */
-  userMessage: string | null;
-
-  /** Generated assistant response */
-  assistantMessage: string;
-
-  /** Model metadata */
-  model: McplModelInfo;
-
-  /** Token usage */
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheCreationTokens?: number;
-    cacheReadTokens?: number;
-  };
-}
-
-/**
- * context/afterInference result (Server → Host, only for blocking hooks).
- * Spec Section 10.5.
- */
-export interface AfterInferenceResult {
-  /** Feature set that provided this response */
-  featureSet: string;
-
-  /** Modified response text (replaces assistantMessage if present) */
-  modifiedResponse?: string;
-
-  /** Arbitrary metadata */
-  metadata?: Record<string, unknown>;
 }
 
 // ============================================================================
@@ -850,7 +1027,14 @@ export interface ChannelsRegisterParams {
  * channels/register result (Host → Server).
  */
 export interface ChannelsRegisterResult {
+  /** Legacy pre-0.5 field: ids accepted. Kept for un-migrated servers. */
   registered: string[];
+  /**
+   * §14.5 itemized results — one entry per SUBMITTED descriptor. 0.5
+   * servers key off this: a missing verdict is not a verdict, and a result
+   * without `results` is read by strict servers as accepting nothing.
+   */
+  results: Array<{ id: string; accepted: boolean; reason?: string }>;
 }
 
 /**
@@ -972,6 +1156,8 @@ export interface ChannelsPublishResult {
  * Spec Section 14.3.
  */
 export interface ChannelIncomingMessage {
+  eventId?: string;
+  coalesce?: Omit<NonNullable<PushEventParams['coalesce']>, 'channelId' | 'deferred'>;
   /** Channel this message came from */
   channelId: string;
 
@@ -1019,9 +1205,12 @@ export interface ChannelsIncomingResult {
 
 /** Result for a single incoming message. */
 export interface ChannelIncomingMessageResult {
+  coalesce?: PushEventResult['coalesce'];
   messageId: string;
   accepted: boolean;
   conversationId?: string;
+  /** §14.5: why a message was rejected (e.g. unknown/unregistered channel). */
+  reason?: string;
 }
 
 // ============================================================================
@@ -1055,9 +1244,13 @@ export const McplMethod = {
   // Push events (Server → Host)
   PushEvent: 'push/event',
 
-  // Context hooks (Host → Server)
+  // Context hooks (Host → Server). context/afterInference is gone with the
+  // rest of its surface: removed from the spec in 0.5.0 (§10.5, replaced by
+  // inference/lifecycle), never sent by the runtime, and not part of the
+  // package's public API. Pre-0.5 SERVERS' wire handlers for it are their
+  // own compatibility surface, retired on the fleet-on-0.5 evidence
+  // schedule, not here.
   BeforeInference: 'context/beforeInference',
-  AfterInference: 'context/afterInference',
 
   // Server-initiated inference (Server → Host / Host → Server)
   InferenceRequest: 'inference/request',
@@ -1065,6 +1258,25 @@ export const McplMethod = {
 
   // Model info (Server → Host)
   ModelInfo: 'model/info',
+
+  // Inference lifecycle (Host → Server, Notification) — §10.5, replaces
+  // context/afterInference. Metadata only; BEST-EFFORT delivery.
+  InferenceLifecycle: 'inference/lifecycle',
+
+  // Tool lifecycle (RFC-007). tools/lifecycle is Host → Server,
+  // Notification, metadata plus (under its own grant) requested argument
+  // fields — never results. tools/observe is Server → Host, Request: the
+  // server's filter over what it is sent (interest, never authority).
+  ToolsLifecycle: 'tools/lifecycle',
+  ToolsObserve: 'tools/observe',
+
+  // Server manifest changes (§17). manifestChanged is S→H Notification —
+  // an opaque revision plus changed domains, NO payload, deliberately
+  // ungated (§17.3: gating it would silence exactly the servers whose
+  // grants just narrowed). manifest is H→S Request returning the complete
+  // current experimental.mcpl object, never a delta.
+  ManifestChanged: 'mcpl/manifestChanged',
+  Manifest: 'mcpl/manifest',
 
   // Feature sets
   FeatureSetsUpdate: 'featureSets/update',
@@ -1124,4 +1336,10 @@ export interface McpToolResultContent {
   data?: string;
   mimeType?: string;
   uri?: string;
+  /** RFC-005 §3 reference testimony (uri form only; server claims). */
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }

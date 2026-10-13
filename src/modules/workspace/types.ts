@@ -25,6 +25,8 @@ export interface MountConfig {
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
   watchDebounceMs?: number;
+  /** Poll interval in ms for checking watched root identity changes (default: 2000) */
+  watchRootPollMs?: number;
   /**
    * Simple ignore patterns (NOT full gitignore syntax). Supported forms:
    * - Exact name match: ".git", "node_modules"
@@ -131,6 +133,11 @@ export interface ReadInput {
   offset?: number;
   /** Number of lines to read (optional) */
   limit?: number;
+  /** Zero-based UTF-16 offset; selects character paging. Cannot mix with line offset/limit. */
+  offsetChars?: number;
+  /** Character page size in UTF-16 code units (default 2000); selects character paging.
+   * May include one extra code unit to keep a surrogate pair intact. */
+  limitChars?: number;
 }
 
 export interface ReadImageInput {
@@ -198,6 +205,13 @@ export interface MaterializeInput {
   path?: string;
   /** Specific mount (optional — defaults to all read-write mounts) */
   mount?: string;
+  /**
+   * Materialize even when the current branch has genuinely diverged from the
+   * branch last materialized to disk (default: false). Not needed for linear
+   * continuations (child branches forked at or after the last materialized
+   * point) — those pass the guard automatically.
+   */
+  force?: boolean;
 }
 
 export interface SyncInput {

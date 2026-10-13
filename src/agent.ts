@@ -1,10 +1,32 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
-import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { createHash } from 'node:crypto';
+import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
+import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
+import {
+  indexSilentTickRows,
+  separateSilentHeartbeatTicks,
+  silentHeartbeatSeparatorTurn,
+  type SilentHeartbeatTick,
+  type SilentTickIndex,
+  type StoredRowLike,
+} from './silent-heartbeat.js';
+import {
+  toolResultDataToHistoryString,
+  truncateForHistory,
+  DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
+} from './tool-result-history.js';
+
+export interface ActivationRequestOptions {
+  /** The silent heartbeat tick this request answers, if any. */
+  silentHeartbeat?: SilentHeartbeatTick;
+}
 
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
+  drainKvSubmissionIds?: () => string[];
 }
 import type {
   ContextManager,
@@ -13,6 +35,7 @@ import type {
   CompileResult,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageMetadata,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -32,6 +55,18 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentRuntimeSettingsOverrides,
 } from './types/index.js';
+
+function stableHash(value: unknown): string {
+  const encode = (item: unknown): string => {
+    if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${encode(record[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(item) ?? 'null';
+  };
+  return createHash('sha256').update(encode(value)).digest('hex');
+}
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
@@ -62,8 +97,17 @@ export class Agent {
   readonly thinking: AgentConfig['thinking'];
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
+  readonly toolResultGuard: ToolResultGuard;
+  /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
+  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  /** Exact whole-response known-tool wrapper containment (default off). */
+  readonly toolWrapperProseGuard: boolean;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
+  /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
+  readonly promptCaching: boolean;
+  /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
+  readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
@@ -71,8 +115,23 @@ export class Agent {
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
   private _streamId = 0;
+  /** kv-unified receipt flights opened by the CURRENT activation and not yet
+   * settled by a usage event. Held on the agent (not only in the stream's
+   * closure) so the next activation can close whatever its predecessor left
+   * open — see failOpenKvSubmissions. */
+  private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
   lastStreamInputTokens = 0;
+  /** Real prefix size of the last usage event: fresh + cache creation +
+   *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
+   *  omits cached tokens, which are most of a warm stream's window. */
+  lastStreamRealInputTokens = 0;
+  /** Output tokens of the last usage event — the prior round's generated
+   *  thinking/text/tool_use, which becomes part of the NEXT round's input
+   *  and so belongs in the physical-window projection. */
+  lastStreamOutputTokens = 0;
   maxStreamTokens: number;
+  /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
+  readonly physicalWindowTokens?: number;
   /** Per-agent context compile budget (input tokens). When unset, the
    * ContextManager's built-in default applies. reserveForResponse uses
    * this agent's maxTokens. */
@@ -100,10 +159,16 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
+    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard);
+    this.proseRouting = config.proseRouting ?? 'locus';
+    this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
     this.cacheTtl = config.cacheTtl ?? '1h';
+    this.promptCaching = config.promptCaching ?? true;
+    this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
+    this.physicalWindowTokens = config.physicalWindowTokens;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -177,6 +242,20 @@ export class Agent {
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
 
+  /** Compile budget with the tool-result guard's reservation applied. While
+   * a batch is pending the strategy selects against short placeholders, but
+   * prepareRequest substitutes the originals on the wire; reserve their real
+   * cost so the final request still fits (a budget restart that recompiles
+   * small must not re-inflate past the same window). */
+  private compileBudget(budget?: TokenBudget): TokenBudget | undefined {
+    const resolved = this.resolveBudget(budget);
+    const reserve = this.toolResultGuard.pendingWireReserveTokens;
+    if (reserve === 0) return resolved;
+    // Mirrors ContextManager.compile's own default when no budget is set.
+    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+  }
+
   /** Structural compatibility keeps lightweight test/host ContextManager
    * doubles working while making the new capability optional at runtime. */
   private getHotContextSettings(): HotContextSettingsStatus | null {
@@ -228,6 +307,75 @@ export class Agent {
     return { ...this.runtimeSettingsOverrides };
   }
 
+  /**
+   * Read-only mirror of `updateRuntimeSettings`' budget semantics: derive what
+   * the next compile would actually plan at if `patch` were applied, WITHOUT
+   * mutating anything. This is the settings→config mapping a feasibility
+   * preview must share with the live path — previewing `patch.contextBudgetTokens`
+   * directly models the wrong compile for a paced descent (a non-immediate
+   * decrease never changes the compile budget; it only arms a prepared-window
+   * transition — see the else-branch in updateRuntimeSettings).
+   *
+   * - `path: 'immediate'` — the patch changes the compile budget (increase, or
+   *   decrease with `immediate: true`); `effectiveBudgetTokens` = patch value.
+   * - `path: 'paced'` — non-immediate decrease; `effectiveBudgetTokens` stays
+   *   at the live budget and `advisoryTargetTokens` carries the descent target.
+   * - `path: 'none'` — patch absent or budget untouched.
+   *
+   * `overrides` uses strategy-config names (`recentWindowTokens`,
+   * `kvStableReachTokens`) suitable for `previewContext`. `preparedWindowTokens`
+   * is deliberately never mapped: it is strategy instance state, not config,
+   * and cannot be simulated by a preview. A `kvStableReachTokens` override is
+   * omitted while a prepared window is in flight — the live runtime pace
+   * shadows the config value there, so the override would not be observed.
+   */
+  planRuntimeSettings(patch?: AgentRuntimeSettingsPatch): {
+    effectiveBudgetTokens: number;
+    /** The budget compiles currently plan at — the baseline the patch moves
+     *  from. Lets callers distinguish a lowering from a no-op or an increase
+     *  (an increase on an already-wedged agent never makes things worse). */
+    liveBudgetTokens: number;
+    advisoryTargetTokens?: number;
+    path: 'immediate' | 'paced' | 'none';
+    overrides: Record<string, unknown>;
+  } {
+    if (patch && Object.keys(patch).length > 0) {
+      this.validateRuntimeSettingsPatch(patch);
+    }
+    const hot = this.getHotContextSettings();
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+
+    const overrides: Record<string, unknown> = {};
+    if (patch?.tailTokens !== undefined) {
+      overrides.recentWindowTokens = patch.tailTokens;
+    }
+    if (
+      patch?.transitionPaceTokens !== undefined &&
+      hot?.preparedWindowTokens === undefined
+    ) {
+      overrides.kvStableReachTokens = patch.transitionPaceTokens;
+    }
+
+    if (patch?.contextBudgetTokens === undefined) {
+      return { effectiveBudgetTokens: live, liveBudgetTokens: live, path: 'none', overrides };
+    }
+    if (patch.contextBudgetTokens >= live || patch.immediate) {
+      return {
+        effectiveBudgetTokens: patch.contextBudgetTokens,
+        liveBudgetTokens: live,
+        path: 'immediate',
+        overrides,
+      };
+    }
+    return {
+      effectiveBudgetTokens: live,
+      liveBudgetTokens: live,
+      advisoryTargetTokens: patch.contextBudgetTokens,
+      path: 'paced',
+      overrides,
+    };
+  }
+
   getEffectiveSameRoundThinkTextPolicy(): SameRoundThinkTextPolicy {
     return this.runtimeSettingsOverrides.sameRoundThinkTextPolicy
       ?? this.configuredSameRoundThinkTextPolicy
@@ -261,7 +409,11 @@ export class Agent {
 
     if (patch.contextBudgetTokens !== undefined) {
       const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      if (patch.contextBudgetTokens >= live) {
+      if (patch.contextBudgetTokens >= live || patch.immediate) {
+        // Increases are always immediate. Decreases take this path only with
+        // the explicit `immediate` flag: the next compile plans straight at
+        // the new budget — one-shot fold-down, KV invalidation paid this
+        // turn — and any in-flight descent is cancelled.
         nextContextBudget = patch.contextBudgetTokens;
         nextContextTarget = undefined;
         if (this.getHotContextSettings()) hotPatch.preparedWindowTokens = null;
@@ -289,6 +441,7 @@ export class Agent {
     }
     for (const [key, value] of Object.entries(patch)) {
       if (key === 'sameRoundThinkTextPolicy') continue;
+      if (key === 'immediate') continue; // a mode for this apply, never a persisted setting
       if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, unknown>)[key] = value;
     }
     if (patch.sameRoundThinkTextPolicy !== undefined) {
@@ -400,8 +553,50 @@ export class Agent {
     this.updateHotContextSettings({ preparedWindowTokens: null });
   }
 
+  /**
+   * RFC-006 consumed watermark: the newest stored message at the last compile
+   * of a model request, per branch. Everything above it has never been in a
+   * request and may still be replaced or withdrawn in place by its sender.
+   */
+  private consumedWatermark: { branch: string; sequence: number } | null = null;
+
+  getConsumedWatermark(): { branch: string; sequence: number } | null {
+    return this.consumedWatermark;
+  }
+
+  /** Mark everything currently stored as consumed (boot, branch switch). */
+  markContextConsumed(): void {
+    // Tolerates partial context-manager doubles (tests build Agents over
+    // stubs): without a watermark nothing is ever treated as unread.
+    this.consumedWatermark = this.pendingWatermark();
+  }
+
+  /** The watermark a successful compile will establish (taken before, applied after). */
+  private pendingWatermark(): { branch: string; sequence: number } | null {
+    const cm = this.contextManager as Partial<ContextManager>;
+    try {
+      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
+      // The chronicle head, not this slot's last message: a compile reads
+      // everything stored on the branch so far, including messages merged in
+      // from another slot (the subconscious reads the residents' shared slot).
+      const store = typeof cm.getStore === 'function' ? cm.getStore() as { currentSequence?: () => number } : undefined;
+      let sequence = typeof store?.currentSequence === 'function' ? store.currentSequence() : undefined;
+      if (sequence === undefined) {
+        const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+        sequence = count > 0 ? cm.getAllMessages().at(-1)?.sequence ?? 0 : 0;
+      }
+      return { branch: cm.currentBranch().name, sequence };
+    } catch {
+      return null;
+    }
+  }
+
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
-    const result = await this.contextManager.compile(this.resolveBudget(budget));
+    // RFC-006 §3.3: consumption is determined at assembly — a compile that
+    // fails assembled nothing, so the watermark moves only on success.
+    const watermark = this.pendingWatermark();
+    const result = await this.contextManager.compile(this.compileBudget(budget));
+    if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -413,9 +608,14 @@ export class Agent {
    */
   async compileWithInjections(
     budget?: TokenBudget,
-    injections?: ContextInjection[]
+    injections?: ContextInjection[],
+    opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
-    const result = await this.contextManager.compile(this.resolveBudget(budget), injections);
+    const watermark = this.pendingWatermark();
+    const result = await this.contextManager.compile(
+      this.compileBudget(budget), injections, opts as never,
+    );
+    if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -454,20 +654,33 @@ export class Agent {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
     }
 
+    this.toolResultGuard.flushUnrecorded();
+
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
+
+    // The direct Agent API uses the same admission rules as framework-driven
+    // streams. Stage before compiling so compression only sees placeholders.
+    const guardedResults = this._state.status === 'ready' && this.toolResultGuard.enabled;
+    if (guardedResults && this._state.status === 'ready') {
+      const content = this.buildToolResultMessages(this._state.toolResults)[0].content;
+      const wireResults = content.flatMap((block) => block.type === 'tool_result'
+        // buildToolResultMessages serializes every payload to a string.
+        ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
+      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
+    }
 
     // Compile context (with optional injections)
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
     // If we have pending tool results, add them
-    if (this._state.status === 'ready') {
+    if (this._state.status === 'ready' && !guardedResults) {
       const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
       messages.push(...toolResultMessages);
     }
 
     const request: NormalizedRequest = {
-      messages,
+      messages: this.toolResultGuard.prepareRequest(messages, true),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -523,6 +736,7 @@ export class Agent {
     } catch (error) {
       // On error, go back to idle
       this._state = { status: 'idle' };
+      this.toolResultGuard.recovering = false;
       throw error;
     }
   }
@@ -583,18 +797,40 @@ export class Agent {
   async buildActivationRequest(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
-    // Keep the context manager's view of the live tool surface current: the
+    // Compression may revisit hidden tools in recorded history. Keep its full
+    // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
     // summarizer/compression requests, or transcripts containing tool blocks
     // are refused by Anthropic's reasoning_extraction classifier (labclaude
     // incident, 2026-07-09). Optional chaining: older context-manager
     // versions don't have the hook.
     (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
-      .setToolDefinitions?.(availableTools);
+      .setToolDefinitions?.(compressionTools);
 
-    let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as {
+      beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
+      isKvUnifiedEnabled?: () => boolean;
+    };
+    const kvUnified = strategy?.isKvUnifiedEnabled?.() === true;
+    const prospectiveSystemInjections = (injections ?? [])
+      .filter((injection) => injection.position === 'system')
+      .flatMap((injection) => injection.content);
+    const immutablePrefixHash = kvUnified
+      ? stableHash({
+          tools: availableTools.length > 0 ? availableTools : undefined,
+          system: this.buildSystemPrompt(prospectiveSystemInjections),
+        })
+      : undefined;
+    let { messages, systemInjections } = await this.compileWithInjections(
+      budget,
+      injections,
+      immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : undefined,
+    );
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -618,10 +854,24 @@ export class Agent {
       }))
       .filter((m) => m.content.length > 0);
 
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+    // Silent heartbeat ticks store no prompt row. Render a request-only
+    // separator before each tick's first surviving row so the wire formatter
+    // cannot merge the tick into the previous assistant message (see
+    // silent-heartbeat.ts for what can and cannot be matched). This agent's
+    // own first request for a tick ends on that same turn, so the prefix it
+    // caches is the one every later compile renders. "First" is per agent: a
+    // broadcast tick shares its eventId with every resident.
+    const ticks = this.indexSilentHeartbeatTicks();
+    messages = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    const openingTick = options.silentHeartbeat !== undefined
+      && !ticks.started.has(options.silentHeartbeat.eventId);
+
+    if (openingTick) {
+      messages = [...messages, silentHeartbeatSeparatorTurn()];
+    } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      // Safety: ensure messages don't end with an assistant message.
+      // Some models reject trailing assistant messages ("prefill not supported"),
+      // and after context compression a stale assistant turn can end up last.
       messages = [...messages, {
         participant: 'user',
         content: [{ type: 'text', text: '[Continue]' }],
@@ -629,7 +879,7 @@ export class Agent {
     }
 
     return {
-      messages,
+      messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -638,11 +888,33 @@ export class Agent {
         ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
-      promptCaching: true,
+      promptCaching: this.promptCaching,
+      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
       cacheTtl: this.cacheTtl,
+      ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
+  }
+
+  /** Stored silent-tick rows, memoized on the store's cached message array
+   * (ContextManager returns the same array until the store changes). */
+  private silentTickIndex: { source: readonly unknown[]; index: SilentTickIndex } | null = null;
+
+  private indexSilentHeartbeatTicks(): SilentTickIndex {
+    const empty: SilentTickIndex = { rows: new Map(), started: new Set() };
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return empty;
+    try {
+      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      if (this.silentTickIndex?.source === stored) return this.silentTickIndex.index;
+      const index = indexSilentTickRows(stored, this.name);
+      this.silentTickIndex = { source: stored, index };
+      return index;
+    } catch (error) {
+      console.error(`[silent-heartbeat] ${this.name}: could not index tick rows; separators omitted:`, error);
+      return empty;
+    }
   }
 
   /**
@@ -652,26 +924,121 @@ export class Agent {
   async startStreamWithInjections(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
 
+    // Retry accepted history edits before assembling a real request. Pure
+    // preview/compile entry points must not perform these writes.
+    this.toolResultGuard.flushUnrecorded();
+
+    // A new activation supersedes every receipt flight the previous one left
+    // open. Membrane fires the kv-unified wire receipt per provider attempt,
+    // BEFORE the adapter call; only that attempt's usage event settles it.
+    // When the attempt dies without usage (transport error, idle timeout,
+    // framework cancel for a budget restart or endTurn) the flight stays open
+    // until the old driveStream's `finally` runs — and every successor path
+    // (error-policy retry, budget restart, the next wake after an abort)
+    // starts the new stream BEFORE that `finally`. The successor's first
+    // receipt then met the ledger's single-flight guard and failed the
+    // recovery itself: "kv-unified submission devops:46:…:4 is still in
+    // flight" (devops agent, 2026-09-16 07:33Z, no provider error logged).
+    this.failOpenKvSubmissions();
+
     this._streamId++;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
+    // Reset the cache-inclusive counters too: a new stream must not inherit
+    // the prior stream's window size — on the physical-window restart path
+    // that inherited value IS the oversized number that caused the restart,
+    // and projecting on it before this stream's first usage event would
+    // restart again (loop). The `> 0` guard downstream means "no usage
+    // observed on THIS stream yet" only because of this reset.
+    this.lastStreamRealInputTokens = 0;
+    this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget);
+    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
+    request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
+    const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as {
+      beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
+      isKvUnifiedEnabled?: () => boolean;
+    };
+    const kvEnabled = receiptAware?.isKvUnifiedEnabled?.() === true;
+    const kvQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> = [];
+    let kvCall = 0;
+    if (kvEnabled) {
+      this.kvOpenQueue = kvQueue;
+      const layoutHash = stableHash(request.messages);
+      const kvRequest = request as NormalizedRequest & KvUnifiedRequestHooks;
+      kvRequest.onCacheWireReceipt = (receipt) => {
+        const submissionId = `${this.name}:${this._streamId}:${Date.now()}:${kvCall++}`;
+        receiptAware.beginKvUnifiedSubmission!({
+          submissionId,
+          requestHash: receipt.requestHash,
+          layoutHash,
+        });
+        kvQueue.push({ submissionId, wireReceipt: receipt });
+      };
+    }
+
+    const agent = this;
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      // Retry a content-policy refusal at the provider seam rather than at
+      // the framework level: membrane replays the SAME request immediately
+      // (cache-warm), where a framework-level requeue would recompile and
+      // land a different window. The framework's driveStream handles the
+      // resulting `retrying` event by discarding the abandoned attempt.
+      // Membrane reads this per physical round, including after settings
+      // tools run. A guarded result must reach the host on its FIRST refusal;
+      // never spend retries resubmitting unchanged guarded content.
+      get refusalRetries() {
+        return agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering
+          ? 0 : agent.refusalHandling?.retries ?? 0;
+      },
     });
 
     this._state = { status: 'streaming', stream };
-    return { stream, request };
+    return {
+      stream,
+      request,
+      ...(kvEnabled
+        ? {
+            takeKvSubmission: () => kvQueue.shift(),
+            drainKvSubmissionIds: () => kvQueue.splice(0).map((item) => item.submissionId),
+          }
+        : {}),
+    };
+  }
+
+  /** Close every kv-unified receipt flight the previous activation left
+   * unsettled. Idempotent: the framework's driveStream `finally` drains the
+   * same per-stream queue, so whichever runs first empties it and the other
+   * finds nothing. Failing an already-settled id is a no-op in the ledger. */
+  private failOpenKvSubmissions(): void {
+    const open = this.kvOpenQueue?.splice(0) ?? [];
+    this.kvOpenQueue = null;
+    if (open.length === 0) return;
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as { reportKvUnifiedFailed?: (submissionId: string) => void } | undefined;
+    for (const { submissionId } of open) {
+      console.error(
+        `[kv-unified] ${this.name}: closing receipt flight ${submissionId} left open by the previous activation`,
+      );
+      try {
+        strategy?.reportKvUnifiedFailed?.(submissionId);
+      } catch (err) {
+        console.error(`[kv-unified] ${this.name}: could not close flight ${submissionId}:`, err);
+      }
+    }
   }
 
   /**
@@ -695,8 +1062,33 @@ export class Agent {
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[]): void {
-    this.contextManager.addMessage(this.name, content);
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
+    // A turn whose entire output is thinking blocks produced NOTHING: no
+    // speech, no tool call. That is what a refusal looks like on the wire —
+    // the provider returns signed thinking (often with empty text, the
+    // fable-5 hidden-CoT packaging) and no content. Persisting it records an
+    // action that never happened, and two such records landing adjacent are
+    // actively toxic: formatters merge consecutive same-role messages
+    // (membrane `mergeConsecutiveRoles`), producing one assistant message
+    // carrying signed thinking from two different responses, which the
+    // provider cannot verify — 400 "`thinking` or `redacted_thinking` blocks
+    // in the latest assistant message cannot be modified", unrecoverable by
+    // retry (labclaude, 2026-07-27: hard down ~4h on exactly this pair).
+    //
+    // Refused turns are surfaced by the refusal path (stderr, failures.log,
+    // the [inference-failed] notice); the store does not also need a
+    // content-free artifact of them. Loud, never silent.
+    if (content.length > 0 && content.every(
+      (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
+    )) {
+      console.error(
+        `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
+        `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
+        `output. See the refusal/inference-failed record for why.`,
+      );
+      return;
+    }
+    this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**
@@ -789,9 +1181,32 @@ export class Agent {
     request: NormalizedRequest,
     signal?: AbortSignal
   ): Promise<InferenceResult> {
-    const response = await this.membrane.stream(request, { signal });
+    let response = await this.membrane.stream(request, { signal });
+    // Usage of a refused attempt abandoned by the guard; it was billed and
+    // is added to the retry's usage below rather than overwritten.
+    let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
+    if (!isAbortedResponse(response) && response.stopReason === 'refusal') {
+      // A staged batch never on the wire cannot have caused the refusal.
+      this.toolResultGuard.settleUnsubmitted('unknown');
+      const ids = this.toolResultGuard.withhold('unknown');
+      if (ids) {
+        abandonedUsage = response.usage;
+        const withheld = new Set(ids);
+        request = { ...request, messages: request.messages.map((message) => ({
+          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
+            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
+        })) };
+        response = await this.membrane.stream(request, { signal });
+      }
+    }
 
     if (isAbortedResponse(response)) {
+      // Interrupted before a clean response: settle, never leave pending.
+      try {
+        this.toolResultGuard.abandon('aborted');
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${this.name} failed to record aborted batch:`, error);
+      }
       const partialContent = response.partialContent ?? [];
       const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(partialContent);
       return {
@@ -804,16 +1219,24 @@ export class Agent {
       };
     }
 
-    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(response.content);
+    const guardedRefusal = response.stopReason === 'refusal' && this.toolResultGuard.recovering;
+    if (response.stopReason !== 'refusal') this.toolResultGuard.accept();
+    this.toolResultGuard.recovering = false;
+    const content = guardedRefusal ? [] : response.content;
+    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(content);
 
     // Add assistant response to context
-    this.contextManager.addMessage(this.name, response.content);
+    if (!guardedRefusal) this.contextManager.addMessage(this.name, content);
 
     return {
       toolCalls,
       speechContent,
       raw: response.raw,
-      usage: response.usage,
+      usage: abandonedUsage && response.usage ? {
+        ...response.usage,
+        inputTokens: response.usage.inputTokens + abandonedUsage.inputTokens,
+        outputTokens: response.usage.outputTokens + abandonedUsage.outputTokens,
+      } : response.usage,
       stopReason: response.stopReason,
     };
   }
@@ -844,12 +1267,17 @@ export class Agent {
     // Tool results go as a user message with tool_result blocks. The history
     // serializer turns MCP image blocks into `[image: type, size]` so the
     // persisted transcript stays small and survives truncation.
+    //
+    // This is the direct-Agent-API path (the framework stores results itself
+    // via buildStoredToolResultContent, with workspace spill). No workspace
+    // is reachable from here, so the house default cap applies as plain
+    // truncation — bounded beats unbounded, for errors too.
     const content = results.map((r) => ({
       type: 'tool_result' as const,
       toolUseId: r.id,
       content: r.result.isError
-        ? r.result.error ?? 'Unknown error'
-        : toolResultDataToHistoryString(r.result.data),
+        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+        : toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
       isError: r.result.isError,
     }));
 

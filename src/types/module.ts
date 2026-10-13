@@ -64,6 +64,18 @@ export interface Module {
   getTools(): ToolDefinition[];
 
   /**
+   * Utilities: agent-invocable operations that deliberately do NOT get a
+   * first-class tool slot. Every tool schema taxes every inference; a
+   * capability used twice a month shouldn't. Utilities are listed, described,
+   * and invoked through the framework's single `utils` tool instead — same
+   * ToolDefinition shape, same un-prefixed names, and dispatch arrives at the
+   * SAME handleToolCall as getTools() output, so a tool migrates between
+   * surfaces by moving its definition from one list to the other and nothing
+   * else. Optional; omitting it means the module contributes no utilities.
+   */
+  getUtilities?(): ToolDefinition[];
+
+  /**
    * Handle a tool call.
    * Tool name is without module prefix.
    */
@@ -298,6 +310,18 @@ export interface ModuleContext {
    * leaking listeners across teardown/recreate (e.g. session switch).
    */
   onTrace(listener: TraceEventListener): () => void;
+
+  /**
+   * Raise an operator-facing ops alert through the framework's ops channel
+   * (failures.log + `ops:alert` trace + the ops webhook, when configured).
+   * For module actions that change durable state the operator would otherwise
+   * discover by surprise — e.g. subscription GC closing a channel. Keep the
+   * message privacy-minimal: identifiers and thresholds, not content.
+   *
+   * Optional so modules built against this version degrade gracefully on an
+   * older framework: call as `ctx.notifyOps?.(...)`.
+   */
+  notifyOps?(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void;
 }
 
 /**

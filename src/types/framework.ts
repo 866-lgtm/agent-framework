@@ -31,7 +31,74 @@ export interface ProcessLoggingConfig {
 /**
  * Configuration for the agent framework.
  */
+/**
+ * Client-side programmatic tool calling: a synthesized `code_execution` tool
+ * that runs model-authored Python on the host, with every framework tool
+ * injected as an async function. Mirrors the trained surface of Anthropic's
+ * server-side PTC; inner tool results never enter the model context.
+ *
+ * Robustness boundary, not a security sandbox (same doctrine as gate.js —
+ * the agent already has broader host access through its tools).
+ */
+export interface CodeExecutionConfig {
+  /** Master switch — the tool is only synthesized when true. */
+  enabled: boolean;
+  /** Python interpreter to spawn (default: 'python3' from PATH). */
+  pythonPath?: string;
+  /**
+   * Per-inner-tool-call timeout; exceeding it raises TimeoutError inside the
+   * script (default 270_000 ms, mirroring the managed runtime's message).
+   */
+  toolCallTimeoutMs?: number;
+  /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
+  scriptTimeoutMs?: number;
+  /**
+   * Longest deadline an agent may ask for on one call with `time_limit_ms`
+   * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
+   * raised). Longer requests are capped, and the result says so.
+   */
+  maxScriptTimeoutMs?: number;
+  /**
+   * Idle interpreter reclaim — script globals are lost after this much
+   * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
+   * 0 disables reclaim.
+   */
+  idleReclaimMs?: number;
+  /** Max concurrent background (daemon) scripts per agent (default 3). */
+  maxBackgroundScripts?: number;
+  /** Background script lifetime ceiling, ms (default 86_400_000 = 24h). */
+  backgroundMaxLifetimeMs?: number;
+  /** Minimum interval between wake_agent() deliveries, ms (default 60_000).
+   *  Early wakes are delayed, not dropped (backpressure inside the script). */
+  wakeMinIntervalMs?: number;
+  /** Max wake_agent() calls per background script (default 100); further
+   *  calls raise RuntimeError inside the script. */
+  maxWakesPerScript?: number;
+}
+
+/** See `FrameworkConfig.providerHold`. */
+export interface ProviderHold {
+  holdMs: number;
+  /** Operator-facing explanation, logged with the hold. */
+  reason?: string;
+}
+/** What the framework knows about the failing call. */
+export interface ProviderHoldContext {
+  /** Model of the agent whose call failed — a quota window may be model-scoped. */
+  model?: string;
+}
+export type ProviderHoldHook = (
+  error: Error, agentName: string, context: ProviderHoldContext,
+) => ProviderHold | undefined;
+
 export interface FrameworkConfig {
+  /**
+   * The subconscious resident (issue #77): a persistent side-agent that
+   * receives diverted traffic from tuned-out channels and reports to the
+   * resident in its own voice. See src/tune-out/tools.ts.
+   */
+  subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
+
   /**
    * IANA zone used only when rendering wall-clock times for the agent.
    * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
@@ -49,8 +116,35 @@ export interface FrameworkConfig {
    */
   discordAwarenessOutboxPath?: string;
 
+  /**
+   * Branch-INDEPENDENT record of the host's quiesce state (issue #122).
+   * Defaults to `<storePath>/recovery/host-mode.json`. Lives outside the
+   * chronicle because a historical rollback (branchAt + switchBranch) would
+   * otherwise move the active branch to a version of `framework/state`
+   * predating the marker, and a restart would boot SERVING mid-surgery. Set
+   * explicitly when providing an app-owned `store` without `storePath`;
+   * without either, the branch-local slot is used with a one-time warning.
+   */
+  hostModePath?: string;
+
+  /**
+   * Branch-independent durable queue of context writes deferred while
+   * quiesced. Defaults to `<storePath>/recovery/deferred-writes.json`; same
+   * rationale and fallback as `hostModePath`.
+   */
+  deferredWritesPath?: string;
+
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;
+
+  /**
+   * Durable JSONL record of operator-initiated mutations (rollback, suppress,
+   * undo/hide, settings, quiesce). Defaults to
+   * `<storePath>/operator-actions.jsonl`; set explicitly when providing an
+   * app-owned `store` without `storePath`. `false` disables the file (actions
+   * still emit `operator:action` traces).
+   */
+  operatorLogPath?: string | false;
 
   /**
    * Mandatory deadline for each Discord awareness marker tools/call. This is
@@ -77,6 +171,27 @@ export interface FrameworkConfig {
   /** Custom error policy */
   errorPolicy?: ErrorPolicy;
 
+  /**
+   * Host verdict on a failed inference: "this cannot succeed until later".
+   * Consulted before the error policy and before the built-in
+   * organization-acceleration classification, for a persistent agent's
+   * primary inference and for its auxiliary (compression) calls. Ephemeral
+   * runs (subagents) and conversation forks are NOT covered: they have no
+   * provider-admission gate and keep the ordinary error policy. A hold parks the agent's provider
+   * admission (primary and auxiliary) instead of retrying, and — like the
+   * built-in organization-acceleration cooldown — records no failed turn and
+   * does not feed the hard-down streak. The motivating case is a subscription
+   * credential whose quota window is spent: its 429 looks like a throttle,
+   * but retrying cannot help until the window resets.
+   *
+   * Holds are served in slices of at most 10 minutes. When a slice expires
+   * the hook is consulted again with the same error, before any inference is
+   * attempted; it extends the hold by returning another, or releases it by
+   * returning undefined. Must be synchronous and cheap; a throwing hook is
+   * treated as "no hold".
+   */
+  providerHold?: ProviderHoldHook;
+
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
 
@@ -92,6 +207,51 @@ export interface FrameworkConfig {
 
   /** MCPL server configurations. If omitted or empty, no MCPL subsystems are created. */
   mcplServers?: McplServerConfig[];
+
+  /**
+   * Client-side programmatic tool calling (`code_execution` tool). Omitted or
+   * `enabled: false` → tool absent, no python is ever spawned.
+   */
+  codeExecution?: CodeExecutionConfig;
+
+  /**
+   * Durable inline cap (chars) for tool results — successes AND errors — and
+   * background-script wake payloads. Content over the cap is written to a
+   * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
+   * name, overwritten on collision, retained until the workspace owner
+   * deletes it — never auto-GC'd) and replaced inline by a bounded preview
+   * plus the file reference; with no writable workspace the fallback is
+   * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
+   * >= 1000. A resident's own agent_settings value
+   * `tool_result_inline_max_chars` (durable, persisted in framework state)
+   * takes precedence over this for that agent; the EFFECTIVE cap for every
+   * source is min(desired, strategy bound) — desired values above the
+   * strategy-derived bound (maxMessageTokens * 4) are hard-clamped to it,
+   * with the clamp reported via agent_settings get.
+   */
+  toolResultInlineMaxChars?: number;
+
+  /**
+   * MCPL RFC-008 operator class overrides: RFC-007 §6.2 patterns over the
+   * model-facing tool name → classes. Highest-precedence source of a tool's
+   * effective class (first matching pattern wins); replaces, never merges
+   * with, what the providing server declared. Use it to correct or tighten a
+   * misclassed tool.
+   *
+   * MCPL tools are named `<toolPrefix>--<tool>`, and toolPrefix defaults to
+   * `mcpl--<serverId>`: server `search` without a toolPrefix needs
+   * `mcpl--search--*`, not `search--*`. A pattern that matches no tool is
+   * reported once its servers have listed their tools.
+   */
+  toolClassOverrides?: Record<string, string[]>;
+
+  /**
+   * MCPL RFC-008 host knowledge for tools the EMBEDDING host implements (its
+   * own modules), same shape as toolClassOverrides. Consulted before the
+   * framework's built-in table and never for MCPL-provided tools, whose
+   * class comes from an override or their server's `_meta["mcpl/class"]`.
+   */
+  hostToolClasses?: Record<string, string[]>;
 
   /** Inference routing policy for server-initiated inference (optional). */
   inferenceRouting?: InferenceRoutingPolicy;
@@ -127,6 +287,13 @@ export interface FrameworkConfig {
    * messages route to per-channel fork agents spawned from the template
    * agent instead of the primary conversation. If omitted, behavior is
    * unchanged (all messages go to the primary agent).
+   *
+   * @deprecated Per-channel conversation routing is deprecated and will be
+   * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+   * rule reads `metadata.mentioned`, which not every channel server sets
+   * (discord-mcpl does not), so on those channels an @-mention neither binds
+   * a fork nor triggers a bound one. Routing still works for now; the
+   * framework logs one `[deprecated]` line at creation when this is set.
    */
   conversations?: ConversationRouterConfig;
 }
