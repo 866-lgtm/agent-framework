@@ -13,8 +13,8 @@
   the rest private until a destination is named), a same-round private
   `think` in a native round (where that policy applies: XML tool mode routes
   such prose as ordinary speech, so a send holds it as a draft), silent turns
-  and `proseRouting: disabled` narration stay private and are counted in the
-  receipt.
+  and `proseRouting: disabled` narration stay private. The turn's receipt
+  counts them, except a silent turn's: a silent turn writes no receipt.
 - In hybrid mode a send withholds publication, not what an envelope does: a
   held `>>>` envelope moves the routing state as live routing would (a
   destination it names becomes the sticky target), `>>>skip_reply {{unsent}}`
@@ -32,19 +32,24 @@
 - A private notice names held drafts at the next tool boundary when the live
   stream presents mid-turn messages (a draft holding words copied from one
   that may already have been posted is named with that risk and the
-  `confirmDuplicate` its resend needs), and the turn-end `[delivered]` receipt
-  names every draft held in the turn, in any of its streams (a framework
-  retry, or the compile a provider-capacity hold defers the turn to), by its
-  state at turn end: still held
+  `confirmDuplicate` its resend needs). In locus and hybrid modes the
+  turn-end `[delivered]` receipt names every draft held in the turn, in any
+  of its streams (a framework retry, or the compile a provider-capacity hold
+  defers the turn to), by id and by its state at turn end: still held
   ("held as drafts d-… (not sent …)"), delivered by the resident's resend
   (listed where it landed), unconfirmed, or dismissed. A dismissed draft
   whose own attempt may already have been posted is named with that risk,
   and counts like an unconfirmed one: a receipt that names one, with nothing
-  confirmed delivered, reads "nothing confirmed", not "nothing". A draft
-  counts as named while a message naming it is on the current branch, so one
-  no notice reached (a crash, an aborted turn), or whose notices a rollback
-  or branch move took away, is named at the next turn's start: every such
-  open draft by id, the newest eight with its state and why it was held. Notices
+  confirmed delivered, reads "nothing confirmed", not "nothing". Explicit
+  mode writes no receipt: its drafts are named by their bounce and refusal
+  notices. A draft counts as named while a message naming it is on the
+  current branch, so one no notice reached (a crash, an aborted turn), or
+  whose notices a rollback or branch move took away, is named at the next
+  turn's start: every such open draft by id, the newest eight with its state
+  and why it was held. That catch-up reads the recent history (the newest
+  500 messages): it records a notice it finds there, including one that
+  landed after its turn had ended, and it leaves out the drafts of a turn
+  still open and those a notice waiting to be written names. Notices
   name drafts and say how to resend or dismiss them, and quote none of their
   words; the `drafts` tool's `list` and `read` show the words.
 - A draft is never published except by its resident's explicit resend (or

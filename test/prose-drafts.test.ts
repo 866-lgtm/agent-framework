@@ -465,13 +465,16 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       assert.deepEqual(h.drafts(), []);
-      assert.ok(h.texts().some((t) => t === '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply)'));
+      assert.ok(h.texts().some((t) => t === '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)'));
       await h.turn([
         createMockResponse([text('Prose beside a private think.'), call('t1', 'think', { thought: 'hmm' }), explicitSend('s1')], 'tool_use'),
         createMockResponse([]),
       ]);
       assert.deepEqual(h.drafts(), [], 'a same-round private think keeps its prose private, even beside a send');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
+        '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)',
+        'the receipt counts it, and says a private think may be why');
     } finally {
       await h.close();
     }
@@ -811,7 +814,7 @@ describe('held prose drafts, end to end', () => {
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours are unnamed on this branch of your history: /);
+      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice on this branch names: /);
       assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); explicit send in the same round\)/);
       assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in the same round\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
@@ -829,7 +832,7 @@ describe('held prose drafts, end to end', () => {
       const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}`, source }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours are unnamed on this branch of your history: /);
+      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
       const named = [...notice.matchAll(/(d-[a-z2-9]{5}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
@@ -854,7 +857,7 @@ describe('held prose drafts, end to end', () => {
       ]);
       const [draft] = h.drafts();
       assert.ok(h.texts().some((t) => t.includes(`held as draft ${draft!.id}`)), 'the turn-end receipt names it');
-      const catchUps = () => h.texts().filter((t) => t.includes('unnamed on this branch of your history'));
+      const catchUps = () => h.texts().filter((t) => t.includes('that no recent notice on this branch names'));
       assert.deepEqual(catchUps(), []);
       // The rollback takes the turn, and its notices, off the branch; the
       // draft stays, as drafts do.
@@ -862,7 +865,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice on this branch names: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
       assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
@@ -1146,7 +1149,7 @@ describe('draft notices and turn-end settlement', () => {
     const cm = agent.getContextManager();
     const catchUps = () => cm.getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
-      .filter((t) => t.includes('unnamed on this branch'));
+      .filter((t) => t.includes('that no recent notice on this branch names'));
     return { framework, internals, agent, cm, catchUps, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
   };
 
@@ -1163,6 +1166,29 @@ describe('draft notices and turn-end settlement', () => {
       assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
       assert.ok(!catchUp!.includes(late!.id), `the one its notice names is not: ${catchUp}`);
     } finally {
+      await t.close();
+    }
+  });
+
+  it('the catch-up leaves out a draft that a notice still waiting to be written names', async () => {
+    const t = await catchUpFixture();
+    const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;
+    try {
+      const [waiting, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'waiting', source }, { text: 'lost', source }], 'bounced').held;
+      // A bounce notice deferred while a turn is alive: not in the history
+      // yet, but on its way.
+      queue.push({
+        id: 'deferred-notice', seq: 1, participant: 'user',
+        content: [{ type: 'text', text: '[prose-routing] …' }],
+        metadata: { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [waiting!.id] },
+        forAgent: 'scout',
+      });
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
+      assert.ok(!catchUp!.includes(waiting!.id), `the one a waiting notice names is not: ${catchUp}`);
+    } finally {
+      queue.length = 0;
       await t.close();
     }
   });
@@ -1600,7 +1626,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       ]);
       assert.equal((h.framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('scout')?.pin, ROOM,
         'the named destination is the sticky target again, as live routing would leave it');
-      assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply\)$/);
+      assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply or a private think\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.
       const before = h.drafts().length;
@@ -1611,7 +1637,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.equal(h.drafts().length, before, 'nothing private was drafted');
       // "still thinking" is the one kept private (live routing does not count
       // the `>>>skip_reply` envelope itself).
-      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply)');
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)');
     } finally {
       await h.close();
     }

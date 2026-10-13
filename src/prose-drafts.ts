@@ -68,11 +68,13 @@ export type DraftReason =
 export interface DraftSource {
   /** Chronicle branch current when the words were held. */
   branch: string;
-  /** The resident's logical turn (process-local counter). */
+  /** The turn token (a process-local counter) of the stream whose round
+   *  wrote the words; a budget restart or a retry has a token of its own. */
   turn: number;
   /** Round within this stream; numbering restarts at a budget restart. */
   round: number;
-  /** Position of the segment within its round's speech. */
+  /** Position of these words among those held together, in one hold of a
+   *  round's speech; a bounce holds its words alone, at 0. */
   segment: number;
 }
 

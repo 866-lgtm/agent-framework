@@ -637,6 +637,8 @@ function freshTurnRouting(): TurnRouting {
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
   routing: TurnRouting;
+  /** The turn token current when the round was built: a held draft's provenance (DraftSource.turn). */
+  turn: number;
   round?: number;
   notice: 'now' | 'later';
   keepPrivate?: boolean;
@@ -9369,7 +9371,7 @@ export class AgentFramework {
     agent: Agent,
     texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
-    opts: { routing: TurnRouting; round?: number; note?: string; notice: 'now' | 'later' },
+    opts: { routing: TurnRouting; turn: number; round?: number; note?: string; notice: 'now' | 'later' },
   ): Draft[] {
     const segments = texts
       .map((t) => (typeof t === 'string'
@@ -9377,7 +9379,7 @@ export class AgentFramework {
         : { text: t.text, note: t.note ?? opts.note, inheritedRisk: t.inheritedRisk }))
       .filter((t) => t.text.trim().length > 0);
     if (segments.length === 0) return [];
-    const turn = this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0;
+    const turn = opts.turn;
     let branch = 'unknown';
     try {
       branch = this.store.currentBranch().name;
@@ -9554,14 +9556,22 @@ export class AgentFramework {
    * shows them. A draft a recent message already names is recorded as
    * noticed rather than named again: its notice landed after its turn ended,
    * as a bounce does when a delivery runs after a tool ends an explicit turn.
-   * The open logical turn's own drafts are left to its receipt and its
-   * settlement (settleTurnDrafts).
+   * It reads only the recent history (draftsNamedInHistory), so its notice
+   * claims no more than that. Left out are the open logical turn's own
+   * drafts, which its receipt names and its settlement records
+   * (settleTurnDrafts), and drafts a notice still waiting in the deferred
+   * queue names.
    */
   private noticeUnnoticedDrafts(agent: Agent): void {
     const cm = agent.getContextManager();
-    const own = new Set(this.openLogical.get(agent.name)?.drafts.map((d) => d.id));
+    const leftOut = new Set(this.openLogical.get(agent.name)?.drafts.map((d) => d.id));
+    for (const msg of this.deferredMessages) {
+      const meta = msg.metadata as { draftOwner?: unknown; draftIds?: unknown } | undefined;
+      if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
+      for (const id of meta.draftIds) if (typeof id === 'string') leftOut.add(id);
+    }
     const unnoticed = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null)
-      .filter((d) => !own.has(d.id));
+      .filter((d) => !leftOut.has(d.id));
     if (unnoticed.length === 0) return;
     const named = this.draftsNamedInHistory(agent, unnoticed.map((d) => d.id));
     this.recordDraftNotices(agent, named);
@@ -9573,7 +9583,7 @@ export class AgentFramework {
     const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
     const text =
       `[drafts] ${agent.name}: ${pending.length === 1 ? 'an open draft' : `${pending.length} open drafts`} of yours ` +
-      `${pending.length === 1 ? 'is' : 'are'} unnamed on this branch of your history: ${shown.join(' · ')}${more}. ` +
+      `that no recent notice on this branch names: ${shown.join(' · ')}${more}. ` +
       'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
     let mid: string;
     try {
@@ -10001,8 +10011,10 @@ export class AgentFramework {
     // said only of drafts still held.
     const current = drafts.map((d) => this.proseDrafts.get(agent.name, d.id) ?? d);
     const inState = (state: DraftState): Draft[] => current.filter((d) => draftState(d) === state);
-    const idList = (ds: Draft[]): string =>
-      ds.slice(0, 8).map((d) => d.id).join(', ') + (ds.length > 8 ? `, and ${ds.length - 8} more` : '');
+    // Every draft by id: the receipt's metadata names them all, so
+    // settleTurnDrafts records each one as noticed, and no later catch-up
+    // names one the text left out.
+    const idList = (ds: Draft[]): string => ds.map((d) => d.id).join(', ');
     const held = inState('held');
     if (held.length > 0) {
       notes.push(
@@ -10040,7 +10052,7 @@ export class AgentFramework {
         'the words remain only in your history',
       );
     }
-    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply)`);
+    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
@@ -10216,9 +10228,11 @@ export class AgentFramework {
     rawText: string,
     round: { notice?: 'now' | 'later'; keepPrivate?: boolean } = {},
   ): Promise<void> {
-    // The direct entry delivers under the live turn's routing.
+    // The direct entry delivers as a live round does: under the live turn's
+    // routing and turn token.
     await this.deliverAdmittedProse(agent, this.admitProse(rawText), {
       routing: this.routingOf(agent.name),
+      turn: this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0,
       notice: round.notice ?? 'later',
       keepPrivate: round.keepPrivate,
     });
@@ -10317,12 +10331,17 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
         'bounced',
-        { routing: round.routing, round: round.round, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
+        { routing: round.routing, turn: round.turn, round: round.round, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
       )[0];
-    const kept = held
-      ? ` Your message is held as draft ${held.id}, with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
-        'can be resent only with confirmDuplicate: true, after that.'
-      : '';
+    // A bare {{unsent}} holds nothing new; otherwise say whether the
+    // envelope's own words were held, since explicit mode writes no receipt
+    // to report a hold that failed.
+    const kept = 'draft' in words
+      ? ''
+      : held
+        ? ` Your message is held as draft ${held.id}, with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
+          'can be resent only with confirmDuplicate: true, after that.'
+        : ' Your message could not be held as a draft; its words remain in your history.';
     const text = `[prose-routing] {{unsent}} is draft ${draft.id}, ${why.startsWith('which') ? why : `and ${why}`}. ` +
       `Nothing was sent; ${next}.${kept}`;
     try {
@@ -10743,7 +10762,7 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(inherited ? { inheritedRisk: inherited } : {}) }],
         'bounced',
-        { routing: round.routing, round: round.round, note: reason, notice: 'later' },
+        { routing: round.routing, turn: round.turn, round: round.round, note: reason, notice: 'later' },
       )[0];
     }
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
@@ -11467,6 +11486,9 @@ export class AgentFramework {
     this.guardRetryTurnSilenced.delete(agent.name);
     /** Provider rounds of this physical stream, for draft provenance. */
     let draftRound = 0;
+    /** This stream's turn token, for draft provenance: a round queued here
+     *  keeps it even when its hold runs after a later turn has started. */
+    const draftTurn = this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0;
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -11807,7 +11829,7 @@ export class AgentFramework {
                 const presentsInjections =
                   (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
                 // Queued under this turn's routing, whenever it posts.
-                const holdOpts: ProseRound = { routing: streamRouting, round: draftRound, notice: presentsInjections ? 'now' : 'later' };
+                const holdOpts: ProseRound = { routing: streamRouting, turn: draftTurn, round: draftRound, notice: presentsInjections ? 'now' : 'later' };
                 // Routing publishes trimmed segments; held drafts keep the
                 // runs exactly as written.
                 const roundRuns = splitProseRuns(assistantBlocks);
@@ -12346,7 +12368,7 @@ export class AgentFramework {
             if (speechContent.length > 0 && this.channelRegistry) {
               const speechRuns = finalSpeechRuns;
               const speechSegments = finalSpeechSegments;
-              const textOnlyHold: ProseRound = { routing: finalRouting, round: draftRound + 1, notice: 'later' };
+              const textOnlyHold: ProseRound = { routing: finalRouting, turn: draftTurn, round: draftRound + 1, notice: 'later' };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
@@ -12424,7 +12446,7 @@ export class AgentFramework {
                 : turnSilenced || fallbackCause !== null;
               const trailingCause: 'send' | 'private' | null =
                 silenceCause === 'private' || fallbackCause === 'private' ? 'private' : (silenceCause ?? fallbackCause);
-              const trailingHold: ProseRound = { routing: finalRouting, round: draftRound + 1, notice: 'later' };
+              const trailingHold: ProseRound = { routing: finalRouting, turn: draftTurn, round: draftRound + 1, notice: 'later' };
 
               const runs = finalRuns;
               const segments = finalSegments;
