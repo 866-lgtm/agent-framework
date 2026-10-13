@@ -10203,13 +10203,13 @@ export class AgentFramework {
             // not bounced, so its words are not re-held as a fresh draft that
             // invites a duplicate.
             if (outcome.status === 'failed') {
-              this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>>', hold, unsent.draft);
+              this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>>', hold, { substituted: unsent.draft });
             }
           }
         } catch (err) {
           this.proseTargetPins.delete(agent.name);
           this.proseHybridSuppressed.set(agent.name, 'failed');
-          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', hold, unsent.draft);
+          this.bounceProse(agent, parsed.body, `sending to ${resolved.channelId} threw: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', hold, { substituted: unsent.draft, outcome: 'unknown' });
         }
         continue;
       }
@@ -10356,10 +10356,10 @@ export class AgentFramework {
       } else if (outcome.status === 'failed') {
         // Unknown deliveries are marker-only: offering a fresh draft would
         // invite a duplicate. Keep the authored body for the re-bounce rule.
-        this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>', hold, unsent.draft);
+        this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>', hold, { substituted: unsent.draft });
       }
     } catch (err) {
-      this.bounceProse(agent, envelopeBody, `delivery to ${targetChannel} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>', hold, unsent.draft);
+      this.bounceProse(agent, envelopeBody, `sending to ${targetChannel} threw: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>', hold, { substituted: unsent.draft, outcome: 'unknown' });
     }
   }
 
@@ -10437,11 +10437,12 @@ export class AgentFramework {
     candidates?: string[],
     prefix: '>>' | '>>>' = '>>',
     hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
-    /** The draft a failed send substituted for `{{unsent}}` (unsentWords). */
-    substituted?: Draft,
+    /** After a send: the draft it substituted for `{{unsent}}`
+     *  (unsentWords), and whether its outcome is unknown (it threw). */
+    after: { substituted?: Draft; outcome?: 'unknown' } = {},
   ): void {
     const name = agent.name;
-    const words = this.unsentWords(agent, text, substituted);
+    const words = this.unsentWords(agent, text, after.substituted);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;
     if ('draft' in words) {
@@ -10482,9 +10483,14 @@ export class AgentFramework {
       : ownRisk
         ? ` Its last send's outcome isn't known, so it may already have been posted: resend it only with ` +
           'confirmDuplicate: true, after checking that channel.'
-        : '';
+        : after.outcome === 'unknown'
+          ? ' The send may have gone out, so check that channel before resending.'
+          : '';
+    // A send that threw has no known outcome: the notice doesn't say it
+    // wasn't delivered.
+    const delivered = after.outcome === 'unknown' ? 'may not have been delivered' : 'was not delivered';
     const notice =
-      `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ${kept}${risky}` +
+      `[prose-routing] Your text (${text.length} chars) ${delivered} — ${reason}.${cand} ${kept}${risky}` +
       (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
     try {
       // Through framework.addMessage, NOT the context manager directly: while

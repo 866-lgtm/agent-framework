@@ -472,12 +472,58 @@ describe('explicit prose routing', () => {
       assert.equal(copy.inheritedRisk?.draftId, original.id);
       assert.equal(draftState(copy), 'unconfirmed', 'a fresh draft cannot erase its source attempt risk');
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes(copy.id))!;
+      assert.doesNotMatch(notice, /was not delivered/, 'an unconfirmed send is not also declared undelivered');
       assert.ok(notice.includes(`draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true`), notice);
       assert.ok(!notice.includes('{{unsent}}'), `{{unsent}} would refuse it, so the notice doesn't offer it: ${notice}`);
     } finally {
       await framework.stop();
     }
   });
+
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    for (const failure of ['false', 'throw'] as const) {
+      it(`${mode}: a ${failure === 'false' ? 'failed' : 'thrown'} {{unsent}} send re-holds the draft it substituted, though a newer bounce landed while it waited`, async () => {
+        const framework = await createFramework(mode);
+        try {
+          stubRegistry(framework, [failure]);
+          const store = draftsOf(framework);
+          const original = store.hold('assistant', [{ text: 'ORIGINAL WORDS', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced').held[0]!;
+          const internals = framework as unknown as {
+            channelRegistry: { deliverSpeech: (...args: unknown[]) => Promise<unknown> };
+            deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+            deliverHybridProse(a: unknown, text: string, locus: string | null, allowLocus: boolean, hold: { notice: 'later' }): Promise<void>;
+          };
+          const deliver = internals.channelRegistry.deliverSpeech;
+          let release!: () => void;
+          const held = new Promise<void>((resolve) => { release = resolve; });
+          let entered!: () => void;
+          const reached = new Promise<void>((resolve) => { entered = resolve; });
+          internals.channelRegistry.deliverSpeech = async (...args: unknown[]) => {
+            entered();
+            await held;
+            return deliver(...args);
+          };
+          const agent = framework.getAgent('assistant')!;
+          const sending = mode === 'explicit'
+            ? internals.deliverProse(agent, '>>#alpha {{unsent}} plus a line', { notice: 'later' })
+            : internals.deliverHybridProse(agent, '>>>#alpha {{unsent}} plus a line', null, true, { notice: 'later' });
+          await reached;
+          // A newer bounce becomes the latest while the send waits.
+          store.hold('assistant', [{ text: 'NEW WORDS', source: { branch: 'main', turn: 2, round: 1, segment: 0 } }], 'bounced');
+          release();
+          await sending;
+          const texts = store.open('assistant').map((d) => d.text);
+          assert.ok(texts.includes('ORIGINAL WORDS plus a line'), `it re-holds the words it attempted: ${JSON.stringify(texts)}`);
+          assert.ok(!texts.includes('NEW WORDS plus a line'), 'not the newer bounce');
+          const copy = store.open('assistant').find((d) => d.text === 'ORIGINAL WORDS plus a line')!;
+          if (failure === 'throw') assert.equal(copy.inheritedRisk?.draftId, original.id, "a thrown send's copy carries its source's risk");
+          else assert.equal(copy.inheritedRisk, undefined);
+        } finally {
+          await framework.stop();
+        }
+      });
+    }
+  }
 
   it("{{unsent}} puts a draft's words in exactly, `$&` and `$$` included", async () => {
     const framework = await createFramework();
@@ -511,6 +557,8 @@ describe('explicit prose routing', () => {
       assert.equal(draftState(store.get('assistant', original.id)!), 'unconfirmed');
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes(original.id))!;
       assert.match(notice, /may already have been posted/);
+      assert.doesNotMatch(notice, /was not delivered/, 'an unconfirmed send is not also declared undelivered');
+      assert.match(notice, /may not have been delivered/);
       assert.ok(notice.includes(`draftIds: ["${original.id}"], destination: "#channel", confirmDuplicate: true`), notice);
       assert.ok(!notice.includes('{{unsent}}'), notice);
     } finally {
