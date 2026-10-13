@@ -166,8 +166,11 @@ export class Agent {
    * there with a fit or a refusal, whether or not what it showed was
    * credited. Of two compiles at one budget, the later-started one planned
    * at the newer store, so an earlier-started one that ends after it is
-   * ignored. (Injections are added after the context manager selects against
-   * the budget, so compiles with and without them plan alike.) An entry is
+   * ignored. That rests on the context manager selecting at the start of
+   * `compile`, before anything it awaits, so start order is selection order;
+   * a context manager that awaits before its select breaks it. (Injections
+   * are added after the select, so compiles with and without them plan
+   * alike.) An entry is
    * kept only while a compile that started before it is still running, the
    * only kind it can turn away, so the map is empty whenever no compile
    * runs.

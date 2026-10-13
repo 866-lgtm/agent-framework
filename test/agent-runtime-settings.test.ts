@@ -514,7 +514,9 @@ describe('a reached budget across a restart', () => {
   /**
    * Two compiles at 60k, the first held until `between` has run: `firstFits`
    * says how the first ends, and the second, started after it, ends the
-   * other way.
+   * other way. Each selects at its start, as the context manager does (a fit
+   * calls the real compile then, a refusal is decided then); only the
+   * first's outcome is held.
    */
   async function twoCompilesAt60k(f: AgentFramework, firstFits: boolean, between: () => Promise<void>) {
     const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
@@ -524,9 +526,10 @@ describe('a reached budget across a restart', () => {
     let calls = 0;
     await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
       const isFirst = ++calls === 1;
+      const outcome = isFirst !== firstFits ? Promise.reject(refusal) : original.apply(this, args);
+      outcome.catch(() => {}); // returned below
       if (isFirst) await held;
-      if (isFirst !== firstFits) throw refusal;
-      return original.apply(this, args);
+      return outcome;
     }, async () => {
       const first = compile(f);
       first.catch(() => {}); // asserted below; if between() fails, its refusal is not left unhandled
@@ -601,9 +604,11 @@ describe('a reached budget across a restart', () => {
       let calls = 0;
       await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
         const n = calls++;
+        // Each selects at its start; only its outcome is held.
+        const outcome = n === 0 ? Promise.reject(refusal) : original.apply(this, args);
+        outcome.catch(() => {}); // returned below
         await held[n];
-        if (n === 0) throw refusal;
-        return original.apply(this, args);
+        return outcome;
       }, async () => {
         // Both plan at 60k. The second fits while the budget moves to 70k
         // unpersisted, so nothing credits it; the first is refused after it.
@@ -672,8 +677,10 @@ describe('a reached budget across a restart', () => {
       let calls = 0;
       await withPatched('compile', async function (this: unknown, ...args: unknown[]) {
         if (++calls > 1) throw refusal;
+        // The first selects at its start; only its outcome is held.
+        const outcome = original.apply(this, args);
         await held;
-        return original.apply(this, args);
+        return outcome;
       }, async () => {
         // Both plan at 100k. The second is refused there first; the first
         // then fits and settles the descent to 60k.
