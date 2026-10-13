@@ -23,15 +23,17 @@
   that another event started meanwhile runs first. Before, hybrid mode
   started it only after the next turn, and explicit mode dropped it, or,
   when its delivery ran late, started it after the next turn.
-- A framework retry, the start that consumes unstreamed tool results
-  (whichever wake the scheduler starts it with), or the later start a
-  provider-capacity hold defers a turn to, begins the turn's sticky
-  destination and hybrid's hold afresh, as before, but continues its
-  logical turn: a ` !` asked for before it still stands, in explicit mode
-  too, and the receipt at the turn's end reports the earlier stream's
-  deliveries, including ones that land after the new stream began. Before,
-  explicit mode dropped that ` !`, and the receipt counted only the
-  deliveries that landed after the new start.
+- A logical turn now stays open from the start that opens it until the turn
+  settles (it completes, a tool ends it, or it fails or is abandoned), and
+  every start while it is open continues it: a framework retry, the start
+  that consumes unstreamed tool results (whichever wake the scheduler starts
+  it with), the later start a provider-capacity hold defers a turn to. Each
+  begins the sticky destination and hybrid's hold afresh, as before, but a
+  ` !` asked for earlier in the turn still stands, in explicit mode too, and
+  the receipt at the turn's end reports every stream's deliveries, including
+  ones that land after a new stream began. Before, explicit mode dropped
+  that ` !`, and the receipt counted only the deliveries that landed after
+  the new start.
 - A turn that completes now waits for its queued deliveries before its
   receipt and its continuation check, in every mode, whatever its last
   response. Before, only a completion with final text waited, so in hybrid
