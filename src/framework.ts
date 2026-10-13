@@ -2203,8 +2203,9 @@ export class AgentFramework {
     this.cancelProviderAdmission();
     // An open logical turn doesn't survive a stop: a start after a restart
     // on this instance opens a new one rather than continuing the old turn's
-    // routing (openLogical). A resume still keeps its turn's routing state
-    // (turnRouting): it carries that turn's own request on.
+    // routing (openLogical). A resume still continues its turn, with its
+    // routing state (turnRouting), since it carries that turn's own request
+    // on: beginAgentTurn opens the turn again for it.
     this.openLogical.clear();
 
     // Cancel all active streams
@@ -7154,8 +7155,10 @@ export class AgentFramework {
           // classifier-safe D-class from the 2026-07-24 ablation). It also
           // updates lastAnnouncedLocus so the next turn's announce-on-change
           // diffs against what the agent was actually last told.
-          // The stream's own mode: a silent turn routes no prose, whatever
-          // the agent's mode, so its boundary neither re-pins nor notes.
+          // The turn's own mode: a silent turn routes no prose, whatever the
+          // agent's mode, so its boundary neither re-pins nor notes. The
+          // trigger is this stream's: its start holds the agent's turn token
+          // while the agent waits on this round's tools.
           const routesLocus = (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid')
             && !this.activeTurnTriggers.get(agent.name)?.suppressProse;
           if (routesLocus && !shouldEndTurn && !overBudget && currentState.stream) {
@@ -8958,7 +8961,6 @@ export class AgentFramework {
       if (!hasBaseline) this.lastAnnouncedLocus.set(agentName, locus);
       return;
     }
-    this.lastAnnouncedLocus.set(agentName, locus);
 
     const agent = this.agents.get(agentName);
     if (!agent) return;
@@ -8985,6 +8987,9 @@ export class AgentFramework {
         [{ type: 'text', text }],
         { system: true, kind: 'routing-notice' },
       );
+      // The baseline is what the agent was told: it moves once the notice is
+      // stored, so a notice that fails is announced again at the next turn.
+      this.lastAnnouncedLocus.set(agentName, locus);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(
         `[routing] ${agentName}: locus ${prev ?? '(none)'} -> ${locus ?? '(none)'} (announced in window)`,
@@ -9567,13 +9572,16 @@ export class AgentFramework {
     } catch (error) {
       // A throw outside the stream's own failure handling (the checkpoint,
       // locus resolution, the typing indicator) drops this start's trigger,
-      // and nothing retries it. Its logical turn ends with it, as a failure
-      // in beginAgentTurn's own catch settles it, so the agent's next start
-      // opens a turn of its own rather than continuing this one's routing.
-      // A silent start has no part in an open turn.
-      const routing = this.turnRouting.get(agent.name);
-      if (!trigger?.suppressProse && routing && this.openLogical.get(agent.name) === routing) {
-        this.openLogical.delete(agent.name);
+      // and nothing retries or holds it. The agent's open logical turn is the
+      // one this start was opening, continuing or resuming, so it ends here,
+      // as a terminal failure in beginAgentTurn's own catch ends its turn:
+      // the next start opens a turn of its own rather than continuing this
+      // one's routing, and an ephemeral run fails with the error rather than
+      // waiting out its watchdog. A silent start has no part in an open turn.
+      if (!trigger?.suppressProse) {
+        this.settleAgent(agent.name, {
+          stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
+        }, this.openLogical.get(agent.name));
       }
       throw error;
     } finally {
@@ -9598,7 +9606,7 @@ export class AgentFramework {
           } catch (err) {
             console.error(
               `[deferred-flush] failed-start flush failed to store a message for ${agent.name} ` +
-              `(participant=${msg.participant}):`,
+              `(participant=${msg.participant}, id=${msg.id}):`,
               err,
             );
           }
@@ -9720,7 +9728,8 @@ export class AgentFramework {
     // This start's routing: its logical turn's (TurnRouting), which holds
     // everything the turn has decided about where its speech goes.
     //  - A resume (a budget restart, a tool-result-guard retry) carries its
-    //    turn's request on and keeps the turn's object as it is.
+    //    turn's request on and keeps the turn's object as it is, and the
+    //    turn stays, or after a stop() becomes again, the agent's open turn.
     //  - A silent start routes no prose. It gets an object of its own, with
     //    no locus, so it neither takes nor disturbs an open turn's. Its
     //    object is the agent's live routing while it runs, and the open
@@ -9745,6 +9754,9 @@ export class AgentFramework {
     let opensTurn = false;
     if (resumesTurn) {
       routing = this.routingOf(agent.name);
+      // The turn a resume continues is open, unless a stop() ended every
+      // open turn since: it opens again, so its later starts continue it.
+      if (!trigger?.suppressProse && !this.openLogical.has(agent.name)) this.openLogical.set(agent.name, routing);
     } else if (trigger?.suppressProse) {
       routing = freshTurnRouting();
       opensTurn = true;
@@ -13860,8 +13872,9 @@ export class AgentFramework {
         // channel hijacks it. An opening start resolves the turn's locus from
         // it (the trigger channel then), and the channel context names it, so
         // a later start of the turn is told where its unprefixed speech lands
-        // unless a hybrid `>>>` destination takes it. Empty for heartbeat /
-        // no-trigger turns → correct global fallback.
+        // unless a hybrid `>>>` destination takes it. Empty for a heartbeat /
+        // no-trigger turn until its locus is resolved, so that resolution
+        // takes the global fallback; the turn then keeps that channel.
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
           return routing?.locus ?? routing?.triggerChannel;
@@ -15749,8 +15762,10 @@ export class AgentFramework {
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
     // The turn that called: a channel_open's result moves its locus, even
-    // if that result arrives after the turn has ended.
+    // if that result arrives after the turn has ended. A silent turn routes
+    // no prose, so its open moves no locus.
     const callingTurn = this.routingOf(agentName);
+    const callingSilent = this.activeTurnTriggers.get(agentName)?.suppressProse === true;
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
@@ -15776,7 +15791,8 @@ export class AgentFramework {
           if (opened) {
             callingTurn.triggerChannel = opened;
             const openerAgent = this.agents.get(agentName);
-            if (openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
+            if (openerAgent && !callingSilent
+              && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
               callingTurn.locus = opened;
               // The announce baseline is the agent's, across turns: it takes
               // only a move this result tells the agent, while its turn runs.

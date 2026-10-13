@@ -520,8 +520,9 @@ interface ChannelRegistryOptions {
    * process-global `defaultPublishChannel`, which tracks the most-recent inbound
    * across ALL channels and misroutes a reply to whichever channel last spoke
    * under concurrency (item-3 redux). The framework keeps both on the live
-   * turn's routing state and exposes them here; resolves to undefined for a
-   * heartbeat / no-trigger turn, which correctly keeps the global fallback.
+   * turn's routing state and exposes them here. For a heartbeat / no-trigger
+   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * resolution takes the global fallback, which the turn then keeps.
    * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
    * `defaultPublishChannel`.
    */

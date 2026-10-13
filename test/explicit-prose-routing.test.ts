@@ -910,6 +910,7 @@ describe('explicit prose routing', () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {
       openLogical: Map<string, RoutingState>;
+      turnRouting: Map<string, RoutingState>;
       settleAgent(name: string, outcome: { stopReason: 'completed'; speech: string }, closes: RoutingState | undefined): void;
     };
     const open: RoutingState = routingState({ continuation: true });
@@ -923,8 +924,10 @@ describe('explicit prose routing', () => {
     internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, open);
     assert.equal(internals.openLogical.has('assistant'), false, "the turn's own settle closes it");
     internals.openLogical.set('assistant', open);
+    internals.turnRouting.set('assistant', open);
     await framework.stop();
     assert.equal(internals.openLogical.size, 0, 'stop() clears every open logical turn');
+    assert.equal(internals.turnRouting.get('assistant'), open, 'and keeps the live routing state, for a resume that continues its turn');
   });
 
   it('a silent start neither takes nor disturbs an open logical turn, and leaves it to the next start that routes prose', async () => {

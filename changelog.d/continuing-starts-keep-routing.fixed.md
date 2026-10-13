@@ -27,9 +27,10 @@
   `[routing]` notice to its stream.
 - For a trunk agent, the channel context passed to `beforeInference` hooks
   (`channels.defaultOutgoing`) names the turn's locus once the turn has one.
-  After a re-pin, a later start of the turn reports the channel its
-  unprefixed speech is published in, not the channel that triggered the
-  turn. A conversation fork still reports its home channel.
+  After a re-pin, a later start of the turn reports the locus it moved to,
+  where its unprefixed speech is published unless a hybrid `>>>` destination
+  takes it, not the channel that triggered the turn. A conversation fork
+  still reports its home channel.
 - A start that fails before its stream exists now lands the messages
   deferred during it, as a stream's end does. Before, they waited for the
   agent's next start and landed after any message stored in between. A

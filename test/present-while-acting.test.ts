@@ -1005,6 +1005,229 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("a start that continues the turn and throws before it takes the turn's routing still ends the turn", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    failStream(1, accelerationLimit);
+    feedStart(framework, 2, [{ type: 'text', text: 'A new turn.' }] as ContentBlock[]);
+    const internals = framework as unknown as {
+      openLogical: Map<string, unknown>;
+      recordTurnCheckpoint(agentName: string): void;
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.equal(internals.openLogical.has('assistant'), true, 'the held turn is open');
+    // The deferred compile's checkpoint fails before the start takes the turn.
+    const checkpoint = internals.recordTurnCheckpoint.bind(framework);
+    internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
+    await assert.rejects(release(framework), /checkpoint failed/);
+    internals.recordTurnCheckpoint = checkpoint;
+    assert.equal(internals.openLogical.has('assistant'), false, 'the held turn ended with its failed compile');
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'A new turn.', locus: 'chan-live-2' }],
+      'the next start opened its own turn and resolved its own locus');
+
+    await framework.stop();
+  });
+
+  it("a silent start that throws leaves an open prose turn alone", async () => {
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    type Routing = { locus?: string; engaged: Set<string>; [field: string]: unknown };
+    const internals = framework as unknown as {
+      openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
+      recordTurnCheckpoint(agentName: string): void;
+    };
+    const open: Routing = {
+      locus: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
+      continuation: false, deliveries: [], suppressed: 0,
+    };
+    internals.openLogical.set('assistant', open);
+    internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
+    internals.pendingRequests.push({
+      agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true,
+    } as InferenceRequest);
+
+    await assert.rejects(framework.runUntilIdle(), /checkpoint failed/);
+    assert.equal(internals.openLogical.get('assistant'), open);
+
+    await framework.stop();
+  });
+
+  it("a resume after stop() continues its turn, and opens it again for the turn's later starts", async () => {
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    failStream(1, () => new Error('synthetic transient stream error'));
+    feedStart(framework, 2, [{ type: 'text', text: 'After the retry.' }] as ContentBlock[]);
+    type Routing = { locus?: string; engaged: Set<string>; [field: string]: unknown };
+    const internals = framework as unknown as {
+      turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
+    };
+    // A turn that crossed its budget before a stop(): its routing state is
+    // live, and stop() ended every open turn. Its budget restart now runs,
+    // and its stream fails and is retried.
+    const turn: Routing = {
+      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
+      continuation: false, deliveries: [], suppressed: 0,
+    };
+    internals.turnRouting.set('assistant', turn);
+    internals.pendingRequests.push({
+      agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(),
+    } as InferenceRequest);
+
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'the restart was retried');
+    assert.equal(internals.openLogical.get('assistant'), undefined, "the turn completed");
+    assert.deepEqual(routed, [{ text: 'After the retry.', locus: 'chan-turn' }],
+      "the retry continued the resumed turn's routing");
+
+    await framework.stop();
+  });
+
+  it("a silent turn's over-budget boundary leaves no arrival on an open prose turn", async () => {
+    const overBudget = createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+    membrane.pushResponse(overBudget);
+    const framework = await createFramework({ maxStreamTokens: 20 });
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question for you';
+    module.interjectionMetadata = addressed('discord:dm:antra');
+    feedStart(framework, 2, [{ type: 'text', text: 'quiet' }] as ContentBlock[]);
+    type Routing = { locus?: string; engaged: Set<string>; arrival?: string; [field: string]: unknown };
+    const internals = framework as unknown as {
+      openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
+    };
+    // Built by hand, as #312's silent-start test does: production runs no
+    // silent turn while a prose turn is open.
+    const open: Routing = {
+      locus: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
+      continuation: false, deliveries: [], suppressed: 0,
+    };
+    internals.openLogical.set('assistant', open);
+    internals.pendingRequests.push({
+      agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true,
+    } as InferenceRequest);
+
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'the silent turn crossed its budget and restarted');
+    assert.deepEqual(routed, [], 'and its restart stayed silent');
+    assert.equal(module.interjection, null, 'the DM arrived during its tool round');
+    assert.equal(open.arrival, undefined, "the silent turn's injections are no arrival of the prose turn");
+
+    await framework.stop();
+  });
+
+  it("a failed start's flush stores each deferred message on its own, so one failure loses no other", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    let hostHolds = 0;
+    (framework as unknown as { providerHoldHook: (error: Error) => { holdMs: number; reason: string } | undefined })
+      .providerHoldHook = (error) => error.message === 'stream setup failed' && hostHolds++ === 0
+        ? { holdMs: 60_000, reason: 'host hold' } : undefined;
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let calls = 0;
+    membrane.streamYielding = (request, options) => {
+      const n = ++calls;
+      if (n === 2) throw new Error('stream setup failed');
+      const stream = makeStream(request, options);
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && n === 1) {
+            yield { type: 'error' as const, error: accelerationLimit(request) };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    const store = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts?: { deferredWriteId?: string }): string;
+    };
+    const add = store.addMessage.bind(framework);
+    // The store refuses the first message when the failed start's flush lands it.
+    store.addMessage = (participant, content, metadata, opts) => {
+      if (opts?.deferredWriteId && (content[0] as { text?: string }).text === 'poison') throw new Error('store refused');
+      return add(participant, content, metadata, opts);
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    module.startHook = async () => {
+      store.addMessage('Antra', [{ type: 'text', text: 'poison' }] as ContentBlock[], {});
+      store.addMessage('Antra', [{ type: 'text', text: 'second' }] as ContentBlock[], {});
+    };
+    await release(framework);
+
+    assert.equal(calls, 2, 'the second start failed before its stream');
+    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    assert.ok(texts.includes('second'), 'the message behind the refused one was stored');
+    assert.ok(!texts.includes('poison'));
+
+    await framework.stop();
+  });
+
+  for (const [label, notice] of [
+    ['a re-pin', 'The conversation moved to'],
+    ["a turn's announcement", 'Your plain speech now lands in'],
+  ] as const) {
+    it(`the announce baseline moves only once ${label}'s notice is stored`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }] as ContentBlock[]));
+      const framework = await createFramework();
+      stubChannelRegistry(framework);
+      module.toolDelayMs = 25;
+      if (notice === 'The conversation moved to') {
+        // Someone addresses the agent mid-turn from a DM: the turn re-pins.
+        module.interjection = 'quick question for you';
+        module.interjectionMetadata = addressed('discord:dm:antra');
+      }
+      const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+        addMessage(participant: string, content: ContentBlock[], metadata?: unknown): string;
+      };
+      const add = cm.addMessage.bind(cm);
+      cm.addMessage = (participant, content, metadata) => {
+        if ((content[0] as { text?: string })?.text?.includes(notice)) throw new Error('store refused');
+        return add(participant, content, metadata);
+      };
+      const baseline = (framework as unknown as { lastAnnouncedLocus: Map<string, string | null> }).lastAnnouncedLocus;
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      if (notice === 'The conversation moved to') {
+        assert.equal(baseline.get('assistant'), 'chan-live-1', 'the agent was last told of the locus the turn opened at');
+      } else {
+        assert.equal(baseline.has('assistant'), false, 'the agent was never told a locus');
+      }
+
+      await framework.stop();
+    });
+  }
+
   // A tool's late write lands in the turn that called it: a send's engaged
   // channel, and a channel_open's move of the locus. (The dispatch functions
   // run on a bare framework, as checkpoint-attribution.test.ts's harness does.)
@@ -1014,6 +1237,7 @@ describe('present while acting', () => {
     framework.pushEvent = () => {};
     framework.conversationAgentHomes = new Map();
     framework.lastAnnouncedLocus = new Map();
+    framework.activeTurnTriggers = new Map();
     return framework;
   }
   const until = async (done: () => boolean, label: string): Promise<void> => {
@@ -1081,7 +1305,38 @@ describe('present while acting', () => {
     assert.equal(calling.triggerChannel, 'discord:guild:observatory');
     assert.equal(calling.locus, 'discord:guild:observatory');
     assert.deepEqual(next, { engaged: new Set(), locus: 'chan-next' }, 'the next turn is untouched');
+    assert.equal((framework.lastAnnouncedLocus as Map<string, string>).has('assistant'), false,
+      "the agent's announce baseline moves only for a result its turn is told");
   });
+
+  for (const [label, silent, expected] of [
+    ['while its turn runs moves the locus and the announce baseline, and says so', false, 'discord:guild:observatory'],
+    ['in a silent turn moves no locus, and claims none', true, 'chan-before'],
+  ] as const) {
+    it(`a channel_open ${label}`, async () => {
+      const calling: { engaged: Set<string>; triggerChannel?: string; locus?: string } = { engaged: new Set(), locus: 'chan-before' };
+      const framework = bareFramework();
+      framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
+      framework.channelRegistry = {
+        handleChannelToolCall: async () => ({ success: true, data: { channelId: 'discord:guild:observatory' } }),
+      };
+      framework.turnRouting = new Map([['assistant', calling]]);
+      (framework.activeTurnTriggers as Map<string, unknown>).set('assistant', silent ? { suppressProse: true } : {});
+      const results: Array<{ result: { data?: { routing?: string } } }> = [];
+      framework.pushEvent = (event: { type: string }) => {
+        if (event.type === 'tool-result') results.push(event as unknown as { result: { data?: { routing?: string } } });
+      };
+
+      framework.dispatchChannelToolCall('assistant', {
+        id: 'open-1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' },
+      });
+      await until(() => results.length > 0, 'the tool result');
+
+      assert.equal(calling.locus, expected);
+      assert.equal((framework.lastAnnouncedLocus as Map<string, string>).get('assistant'), silent ? undefined : 'discord:guild:observatory');
+      assert.equal(results[0]!.result.data?.routing !== undefined, !silent, 'the result tells the agent only of a move it made');
+    });
+  }
 
   it('a prose turn ends with a [delivered] receipt naming where the prose landed', async () => {
     // Explicit sends receipt themselves via tool_result; auto-routed prose
