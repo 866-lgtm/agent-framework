@@ -18,10 +18,10 @@
   `branch.switch`, `undo` and `redo`, and `host/command` turn undo, return
   once the branch has moved, and their marks follow behind the same gate.
   Each starts its delivery through
-  `startDiscordAwarenessDelivery(after, agentName?)`, now public, which a
-  host can call after its own branch moves. A delivery that fails to start
-  raises a `discord-awareness-delivery` ops alert instead of failing the
-  command, and the next sync, reconnect or start delivers what is still
+  `startDiscordAwarenessDelivery(after, agentName?)`, a new public method
+  that a host can call after its own branch moves. A delivery that fails to
+  start raises a `discord-awareness-delivery` ops alert instead of failing
+  the command, and the next sync, reconnect or start delivers what is still
   pending. (The web switch used to be acknowledged only after its marks were
   attempted.)
 - A gate installed while a drain is still running (restoring the source
