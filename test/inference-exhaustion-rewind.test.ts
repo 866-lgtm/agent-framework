@@ -110,8 +110,9 @@ test('retryable / unknown-retryability failures NEVER shed history (outages cost
 test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER shed history', () => {
   // The breaker keys on the membrane error type and the HTTP status
   // (shedMayHelp), not on `retryable`. membrane marks auth (expired key),
-  // context_length, abort, safety and unsupported all non-retryable, but none
-  // of them is a request the provider refused as malformed. Shedding good exchanges,
+  // context_length, abort, safety and unsupported all non-retryable, but for
+  // none of them, with no status, is shedding the newest exchange likely to
+  // help. Shedding good exchanges,
   // with a rewind marker saying the API kept refusing them, on an expired API
   // key is exactly the category error this guards.
   for (const errorType of ['auth', 'context_length', 'abort', 'safety', 'unsupported']) {
@@ -237,9 +238,9 @@ test('the current failure decides the shed, whatever failed before it in the str
   assert.deepEqual([...ending400.removed].sort(), ['a1', 'r1'], '404, 404, 400: the 400 sheds at the third failure');
 });
 
-test('a 413 sheds whatever membrane calls it, and a context_length at 400 or 422 keeps the history', () => {
+test('a 413 sheds under either label it arrives with, and a context_length at 400 or 422 keeps the history', () => {
   // membrane 0.5.86's Responses adapter files a 413 as invalid_request, and
-  // membrane #56 as context_length: the arm keys on the status.
+  // membrane #56 as context_length: the arm takes both.
   for (const errorType of ['invalid_request', 'context_length']) {
     const tooLarge = makeHarness();
     try {
