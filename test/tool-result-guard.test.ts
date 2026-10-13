@@ -672,7 +672,9 @@ test("a fresh turn that delivers nothing still replaces an earlier turn's speech
     { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
   ] as ContentBlock[], 'tool_use');
   quiet.usage = { inputTokens: 100, outputTokens: 5 };
-  const h = await harness([[quiet], [answer()]], { proseRouting: 'explicit', maxStreamTokens: 20 });
+  // The reply names its destination, so nothing bounces into another turn.
+  const reply = createMockResponse([{ type: 'text', text: '>>#alpha continued' }] as ContentBlock[], 'end_turn');
+  const h = await harness([[quiet], [reply]], { proseRouting: 'explicit', maxStreamTokens: 20 });
   (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
     .proseSpeechChains.set('assistant', new Promise<void>(() => {}));
   const routed: string[] = [];
@@ -691,6 +693,7 @@ test("a fresh turn that delivers nothing still replaces an earlier turn's speech
     assert.notEqual(await Promise.race([run.then(() => 'done' as const), timeout]), 'timeout',
       'the resumed turn finishes');
     assert.equal(h.membrane.requests.length, 2);
+    assert.deepEqual(routed.map((text) => text.trim()), ['continued']);
   } finally {
     await h.framework.stop();
   }
