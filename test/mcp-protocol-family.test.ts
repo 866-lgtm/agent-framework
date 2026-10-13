@@ -328,20 +328,25 @@ test('recorded server text: the token as a url carries it, credential-named env 
   for (const form of [token, 'tok%20en%2Bx%2F123%3D', 'tok+en%2Bx%2F123%3D']) {
     assert.equal(redactServerText(`refused: ${form}`, tokenConfig), 'refused: redacted', form);
   }
-  // A stdio server's env: a value whose name has a credential word as a whole
-  // part of it, and no other (GIT_AUTHOR_NAME holds 'auth' inside a word).
+  // A stdio server's env: a value whose name has a part ending in a credential
+  // word (plural, or with digits after it, too), and no other
+  // (GIT_AUTHOR_NAME's part AUTHOR doesn't end in 'auth').
   const env = cfg({ command: 'srv', env: {
     GITHUB_TOKEN: 'ghp_abcdef123456', API_KEY: 'k3y-abcdefgh', PGPASSWORD: 'pgpass-abcdefgh', ACCESSTOKEN: 'acc-abcdefgh12',
     DB_PASS: 'dbpass-abcdefgh', SSH_KEY_PASSPHRASE: 'phrase-abcdefgh',
+    AUTHORIZATION: 'Bearer-abcdefgh', API_KEYS: 'k1-abcdefgh9', TOKEN2: 'tok2-abcdefgh', API_KEY_ID: 'keyid-abcdefgh', GITHUB_PAT: 'pat-abcdefgh12',
     PATH: '/usr/local/bin', GIT_AUTHOR_NAME: 'Somebody Longname', KEYBOARD_LAYOUT: 'dvorak-programmer', TOKENIZERS_PARALLELISM: 'parallel-false',
   } });
   assert.equal(
-    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 dbpass-abcdefgh phrase-abcdefgh /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
-    'auth redacted redacted redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
+    redactServerText('auth ghp_abcdef123456 k3y-abcdefgh pgpass-abcdefgh acc-abcdefgh12 dbpass-abcdefgh phrase-abcdefgh Bearer-abcdefgh k1-abcdefgh9 tok2-abcdefgh keyid-abcdefgh pat-abcdefgh12 /usr/local/bin Somebody Longname dvorak-programmer parallel-false', env),
+    'auth redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted redacted /usr/local/bin Somebody Longname dvorak-programmer parallel-false');
   // A short pair only where no letter or digit adjoins it; any other string
   // wherever it occurs, after a percent escape, an ANSI code or a JSON escape too.
   const pair = cfg({ url: 'https://h/api/s/pathSecret0123456789/mcp?v=2' });
   assert.equal(redactServerText('dev=2 ready; v=2 sent', pair), 'dev=2 ready; redacted sent');
+  // A long pair too: only as its own name=value.
+  const longPair = cfg({ url: 'https://h/mcp?v=12345678' });
+  assert.equal(redactServerText('dev=12345678 ready; v=12345678 sent', longPair), 'dev=12345678 ready; redacted sent');
   assert.equal(redactServerText('a%2FpathSecret0123456789 \u001b[31mpathSecret0123456789 "\\npathSecret0123456789"', pair),
     'a%2Fredacted \u001b[31mredacted "\\nredacted"');
   // A ws:// url's userinfo, as for wss://.

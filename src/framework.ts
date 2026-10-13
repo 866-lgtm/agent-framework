@@ -394,7 +394,7 @@ import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverTextRedactor } from './mcpl/protocol-family.js';
+import { asText, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverTextRedactor } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import type {
   McplServerConfig,
@@ -14158,8 +14158,12 @@ export class AgentFramework {
     announce: { revision?: string; domains?: string[] },
   ): Promise<void> {
     // The server's configuration as it is now, before any await: a record
-    // made later keeps it, whatever becomes of the server meanwhile.
-    const recorded = serverTextRedactor(this.mcplServerConfigs.get(connection.id) ?? {});
+    // made later keeps it, whatever becomes of the server meanwhile. A server
+    // with no configuration has been removed, and its manifest isn't
+    // refreshed.
+    const config = this.mcplServerConfigs.get(connection.id);
+    if (!config) return;
+    const recorded = serverTextRedactor(config);
     const st = this.manifestRefreshState.get(connection.id)
       ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
     this.manifestRefreshState.set(connection.id, st);
@@ -14605,8 +14609,12 @@ export class AgentFramework {
    * server removed meanwhile still has its credentials replaced.
    */
   private everyServerRedactor(): (text: unknown) => string {
-    const redactors = [...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config));
-    return (text) => redactors.reduce<string>((recorded, redact) => redact(recorded), typeof text === 'string' ? text : String(text));
+    const snapshot = [...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config));
+    // The configurations present when the operation began, then those present
+    // now: a server removed meanwhile and one connected meanwhile are both
+    // covered.
+    return (text) => [...snapshot, ...[...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config))]
+      .reduce<string>((recorded, redact) => redact(recorded), asText(text));
   }
 
   /** Why a connect for this id is refused, or null when the id is free. One

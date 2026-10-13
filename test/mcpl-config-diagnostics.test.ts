@@ -363,7 +363,7 @@ test("a refused initial policy's reason is recorded without the server's configu
 
 test("the initial policy's other records keep the credentials out too", async () => {
   const secret = 'srvSecret0123456789';
-  const run = async (answer: () => Promise<unknown>, mutate?: (config: McplServerConfig) => void) => {
+  const run = async (answer: () => Promise<unknown>) => {
     const fw = Object.create(AgentFramework.prototype) as any;
     fw.traceListeners = [];
     fw.featureSetManager = new FeatureSetManager();
@@ -376,7 +376,7 @@ test("the initial policy's other records keep the credentials out too", async ()
       capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
       mcpToolsAdvertised: false,
       establishGrant: () => {},
-      sendFeatureSetsUpdateRequest: async () => { mutate?.(config); return answer(); },
+      sendFeatureSetsUpdateRequest: async () => answer(),
       close: async () => {},
     };
     const capture = captureConsoleError();

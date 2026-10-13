@@ -118,9 +118,10 @@ export function redactUrl(url: string | undefined): string {
  * - a stdio server's environment values whose names say they're credentials.
  * A string replaced on its own has at least 8 characters, since a shorter
  * one can't be told from ordinary text, and it is replaced wherever it
- * occurs, after an escape or inside a longer token too. A short query value
- * is replaced only with its name, as one name=value, and only where no
- * letter or digit adjoins the pair, so v=2 leaves dev=2 alone. One
+ * occurs, after an escape or inside a longer token too. A query parameter is
+ * also replaced as its whole name=value, only where no letter or digit
+ * adjoins the pair, so v=2 leaves dev=2 alone; a short value goes only that
+ * way. One
  * longest-first pass never scans its own replacement. A credential the
  * configuration doesn't hold, such as the token an access provider fetches
  * or another origin's, is outside it. JSON-RPC answers, and the error a
@@ -135,30 +136,35 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * pattern built once: for a connection's records, such as each stderr line.
  */
 export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
-  // Strings replaced wherever they occur, and short name=value pairs, which
-  // are replaced only where no letter or digit adjoins them, so a pair such as
-  // v=2 leaves dev=2 alone.
+  // Strings replaced wherever they occur (after an escape or inside a longer
+  // token too), and name=value pairs, replaced only where no letter or digit
+  // adjoins them, so a pair such as v=2 leaves dev=2 alone. A pair's value is
+  // also replaced on its own when it's a credential, wherever it occurs.
   const secrets = new Set<string>();
-  const shortPairs = new Set<string>();
+  const pairs = new Set<string>();
   const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
   const decode = (value: string, query = false): string => {
     try { return decodeURIComponent(query ? value.replace(/\+/g, ' ') : value); }
     catch { return value; }
   };
+  // A string as written and percent-encoded (a string encodeURIComponent
+  // refuses, such as one with an unpaired surrogate, has no encoded form).
+  const withEncoded = (value: string): void => {
+    standalone(value);
+    try { standalone(encodeURIComponent(value)); } catch { /* no percent-encoded form */ }
+  };
   // The token as sent: raw in a header, and percent- or form-encoded where a
-  // transport puts it in a url (a token that can't be encoded, such as one
-  // with an unpaired surrogate, has no encoded form).
+  // transport puts it in a url.
   const token = config.token ?? '';
-  standalone(token);
-  try { standalone(encodeURIComponent(token)); } catch { /* no percent-encoded form */ }
-  try { standalone(new URLSearchParams({ t: token }).toString().slice(2)); } catch { /* no form-encoded form */ }
+  withEncoded(token);
+  standalone(new URLSearchParams({ t: token }).toString().slice(2));
   // A stdio server's environment values whose names say they carry a
   // credential: a part of the name that ends with a credential word
   // (GITHUB_TOKEN, API_KEY, PGPASSWORD, ACCESSTOKEN), and not one where the
   // word only begins or sits inside a part (GIT_AUTHOR_NAME, KEYBOARD_LAYOUT,
   // TOKENIZERS_PARALLELISM).
   for (const [name, value] of Object.entries(config.env ?? {})) {
-    if (name.split(/[_\-.]/).some((part) => CREDENTIAL_NAME_PART.test(part))) standalone(value);
+    if (name.split(/[_\-.]/).some((part) => CREDENTIAL_NAME_PART.test(part))) withEncoded(value);
   }
   let url: URL | undefined;
   try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
@@ -184,9 +190,8 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
         standalone(value);
       }
       if (value !== '') {
-        for (const pair of [`${encodedName}=${encodedValue}`, `${name}=${value}`]) {
-          (value.length >= 8 ? secrets : shortPairs).add(pair);
-        }
+        pairs.add(`${encodedName}=${encodedValue}`);
+        pairs.add(`${name}=${value}`);
       }
     }
     if (url.protocol === 'ws:' || url.protocol === 'wss:') {
@@ -196,24 +201,24 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
       }
     }
   }
-  if (secrets.size === 0 && shortPairs.size === 0) return asText;
+  if (secrets.size === 0 && pairs.size === 0) return asText;
   const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const alternatives = [
     ...[...secrets].map(value => ({ value, source: escape(value) })),
-    ...[...shortPairs].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
+    ...[...pairs].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
   ].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
   const pattern = new RegExp(alternatives.join('|'), 'g');
   return (text) => asText(text).replace(pattern, 'redacted');
 }
 
 /** Any value as text: a value that can't be printed reads as a placeholder. */
-function asText(text: unknown): string {
+export function asText(text: unknown): string {
   if (typeof text === 'string') return text;
   try { return String(text); } catch { return '[a value that cannot be printed]'; }
 }
 
-/** A part of an environment variable's name that ends with a credential word. */
-const CREDENTIAL_NAME_PART = /(?:token|key|secret|password|passwd|pass|passphrase|auth|signature|credentials?)$/i;
+/** A part of an environment variable's name that ends with a credential word, in the singular or plural, with any digits after it. */
+const CREDENTIAL_NAME_PART = /(?:tokens?|keys?|secrets?|passwords?|passwd|pass|passphrases?|pat|auth|authorization|authentication|signatures?|credentials?)\d*$/i;
 
 /**
  * A credential provider's failure as a log line may show it: the error's

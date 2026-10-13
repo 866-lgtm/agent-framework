@@ -220,6 +220,11 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   const everyServer = framework.everyServerRedactor();
   framework.mcplServerConfigs = new Map();
   assert.equal(everyServer(`closed ${secret} and otherSecret0123456789`), 'closed redacted and redacted');
+  // A server connected after it was made is covered too.
+  framework.mcplServerConfigs = new Map([['late', { id: 'late', url: 'https://k/api/s/lateSecret0123456789/mcp' }]]);
+  assert.equal(everyServer('closed lateSecret0123456789'), 'closed redacted');
+  // A value that can't be printed reads as a placeholder.
+  assert.equal(everyServer(Object.create(null)), '[a value that cannot be printed]');
   framework.mcplServerConfigs = new Map([[config.id, config]]);
 
   // The model's dispatch: the tool:failed trace (message and stack) and the
