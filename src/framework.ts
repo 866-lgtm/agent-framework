@@ -13590,6 +13590,7 @@ export class AgentFramework {
    *  rethrows the startup failure itself, so a cleanup failure never takes
    *  its place. */
   private async closeMcpConnectionsAfterFailedStartup(): Promise<void> {
+    const recorded = this.everyServerRedactor();
     const outcomes = await Promise.allSettled([
       this.mcplServerRegistry?.closeAll() ?? Promise.resolve(),
       this.closeModernMcpConnections(),
@@ -13597,7 +13598,7 @@ export class AgentFramework {
     for (const outcome of outcomes) {
       if (outcome.status === 'rejected') {
         console.error('[mcpl] after a failed startup, some MCP connections could not be closed:',
-          this.recordedForEveryServer(outcome.reason instanceof Error ? outcome.reason.message : outcome.reason));
+          recorded(outcome.reason instanceof Error ? outcome.reason.message : outcome.reason));
       }
     }
   }
@@ -14152,6 +14153,9 @@ export class AgentFramework {
     connection: McplServerConnection,
     announce: { revision?: string; domains?: string[] },
   ): Promise<void> {
+    // The server's configuration as it is now, before any await: a record
+    // made later keeps it, whatever becomes of the server meanwhile.
+    const recorded = serverTextRedactor(this.mcplServerConfigs.get(connection.id) ?? {});
     const st = this.manifestRefreshState.get(connection.id)
       ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
     this.manifestRefreshState.set(connection.id, st);
@@ -14189,7 +14193,7 @@ export class AgentFramework {
       try {
         fetched = await connection.sendManifestRequest();
       } catch (err) {
-        console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${this.recordedFor(connection.id, err instanceof Error ? err.message : err)}`);
+        console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${recorded(err instanceof Error ? err.message : err)}`);
         return;
       }
       if (!fetched || typeof fetched !== 'object') {
@@ -14574,16 +14578,15 @@ export class AgentFramework {
     await this.connectMcplServer(config);
   }
 
-  /** A server's text as the framework records it ({@link serverTextRedactor}). */
-  private recordedFor(serverId: string, text: unknown): string {
-    return redactServerText(text, this.mcplServerConfigs.get(serverId) ?? {});
-  }
-
-  /** Text that may come from any configured server, with every server's credentials replaced. */
-  private recordedForEveryServer(text: unknown): string {
-    let recorded = typeof text === 'string' ? text : String(text);
-    for (const config of this.mcplServerConfigs.values()) recorded = redactServerText(recorded, config);
-    return recorded;
+  /**
+   * A redactor for text that may come from any configured server, with every
+   * server's credentials replaced. It is built from the configurations as
+   * they are when it's made, so an operation makes it before it waits, and a
+   * server removed meanwhile still has its credentials replaced.
+   */
+  private everyServerRedactor(): (text: unknown) => string {
+    const redactors = [...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config));
+    return (text) => redactors.reduce<string>((recorded, redact) => redact(recorded), typeof text === 'string' ? text : String(text));
   }
 
   /** Why a connect for this id is refused, or null when the id is free. One
@@ -14844,7 +14847,7 @@ export class AgentFramework {
     // payload and no authority; everything below acts on FETCHED content.
     connection.on('manifest-changed', (params: { revision?: string; domains?: string[] }) => {
       void this.handleManifestChanged(connection, params).catch((err) => {
-        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, this.recordedFor(connection.id, err instanceof Error ? err.message : err));
+        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, recorded(err instanceof Error ? err.message : err));
       });
     });
 
@@ -14867,7 +14870,7 @@ export class AgentFramework {
       const parsed = parseToolObserveParams(params);
       if (!parsed.ok) {
         if (responder?.respondError) responder.respondError(-32602, parsed.message, parsed.data);
-        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${this.recordedFor(connection.id, parsed.message)}`);
+        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${recorded(parsed.message)}`);
         return;
       }
       connection.toolObserveFilter = parsed.rules;
@@ -14959,7 +14962,7 @@ export class AgentFramework {
         } catch (error) {
           console.error(
             `MCPL server "${connection.id}" re-registration after reconnect failed:`,
-            this.recordedFor(connection.id, error instanceof Error ? error.message : error),
+            recorded(error instanceof Error ? error.message : error),
           );
         }
         this.releaseMcplDataPlaneGate(awarenessBarrier);
@@ -15372,13 +15375,14 @@ export class AgentFramework {
 
     this.mcplToolRefreshInFlight = true;
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+    const recorded = this.everyServerRedactor();
 
     this.refreshMcplTools()
       .then(() => {
         this.emitMcplToolDiff(oldToolNames, serverId);
       })
       .catch((error) => {
-        console.error('MCPL tool refresh error:', this.recordedForEveryServer(error instanceof Error ? error.message : error));
+        console.error('MCPL tool refresh error:', recorded(error instanceof Error ? error.message : error));
       })
       .finally(() => {
         this.mcplToolRefreshInFlight = false;
@@ -15458,10 +15462,12 @@ export class AgentFramework {
     const startTime = Date.now();
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
 
+    const dispatchRedactor = serverTextRedactor(config ?? {});
     const failDispatch = (error: unknown) => {
       const raw = error instanceof Error ? error : new Error(String(error));
-      // Server and transport text, as every record of it is.
-      const recorded = (text: unknown) => this.recordedFor(serverId, text);
+      // Server and transport text, as every record of it is, with the
+      // configuration the call was dispatched under.
+      const recorded = dispatchRedactor;
       const err = { message: recorded(raw.message), stack: raw.stack === undefined ? undefined : recorded(raw.stack) };
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
       // RFC-007: transport error, closed connection or timeout — no result.

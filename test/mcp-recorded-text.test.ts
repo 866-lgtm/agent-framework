@@ -197,7 +197,12 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   const result = await framework.executeMcplToolCall({ id: 'c1', name: 'mcpl--remote--echo', input: {} }, config);
   assert.equal(result.success, false);
   assert.match(String(result.error), /socket closed: 1008 \/api\/mcp\/s\/redacted\/mcp/);
-  assert.equal(framework.recordedForEveryServer(`closed ${secret}`), 'closed redacted');
+  // A redactor for any server's text is made before an operation waits, so
+  // a server removed meanwhile still has its credentials replaced.
+  const everyServer = framework.everyServerRedactor();
+  framework.mcplServerConfigs = new Map();
+  assert.equal(everyServer(`closed ${secret}`), 'closed redacted');
+  framework.mcplServerConfigs = new Map([[config.id, config]]);
 
   // The model's dispatch: the tool:failed trace (message and stack) and the
   // result the model gets.
@@ -207,6 +212,9 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   const modern = { callTool: async () => { throw new Error(`HTTP 500 at /api/mcp/s/${secret}/mcp with ${config.token}`); } };
   framework.modernServers = () => new Map([[config.id, modern]]);
   framework.dispatchMcplToolCall('assistant', { id: 'c2', name: 'mcpl--remote--echo', input: {} }, config.id, 'mcpl--remote');
+  // The server is disconnected while the call is in flight: its failure is
+  // still recorded with the configuration it was dispatched under.
+  framework.mcplServerConfigs.delete(config.id);
   await new Promise((resolve) => setTimeout(resolve, 20));
   const failed = traces.find((event) => event.type === 'tool:failed');
   assert.ok(failed, 'the failure is traced');
