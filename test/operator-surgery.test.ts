@@ -262,7 +262,9 @@ describe('live operator surgery', () => {
     const originalSwitch = c.switchBranch;
     let releaseSwitch!: () => void;
     const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
-    c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
+    let entered!: () => void;
+    const inSwitch = new Promise<void>((resolve) => { entered = resolve; });
+    c.switchBranch = async (name: string) => { entered(); await gate; return originalSwitch.call(c, name); };
     const internals = framework as unknown as {
       surgeryHold: unknown;
       deferredWritesPersisted: boolean;
@@ -273,7 +275,7 @@ describe('live operator surgery', () => {
     internals.deferredWritesPersisted = true;
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
-      await new Promise((resolve) => setImmediate(resolve));
+      await inSwitch;
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
       assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'deferred');
       // Another agent's tool cycle says nothing about scout's window.

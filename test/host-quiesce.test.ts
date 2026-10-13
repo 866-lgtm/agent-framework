@@ -722,6 +722,75 @@ test('resume flushes deferred writes in order: a poison write stays queued with 
   });
 });
 
+test("resume cuts each target at its own stuck write, naming it at every flush, and other targets' writes land", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-targets-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [
+      { name: 'agent', model: 'test-model', systemPrompt: 'test' },
+      { name: 'scout', model: 'test-model', systemPrompt: 'test' },
+    ],
+    modules: [],
+  });
+  const lines: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await framework.quiesce({ reason: 'refold' });
+    const internals = framework as unknown as {
+      deferredSeq: number;
+      deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; forAgent?: string }>;
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { forAgent?: string }): unknown;
+    };
+    // Residents share one message slot, so each one's context manager reads
+    // what either stored; each stores through its own.
+    const agentCm = framework.getAgent('agent')!.getContextManager();
+    const before = agentCm.getAllMessages().length;
+    const stored = () => agentCm.getAllMessages().slice(before).map((m) => (m.content[0] as { text: string }).text);
+    // A malformed entry the store rejects, as only a queue persisted by other
+    // code could carry (addMessage refuses a null block): the log line still
+    // names it, and it still goes back into the queue.
+    internals.deferredMessages.push({
+      id: 'stuck-1', seq: ++internals.deferredSeq, participant: 'user',
+      content: [{ type: 'text', text: 'stuck' }, null], forAgent: 'agent',
+    });
+    internals.addMessage('user', [{ type: 'text', text: 'for scout' }], undefined, { forAgent: 'scout' });
+    internals.addMessage('user', [{ type: 'text', text: 'behind the stuck one' }], undefined, { forAgent: 'agent' });
+    internals.addMessage('user', [{ type: 'text', text: 'also for scout' }], undefined, { forAgent: 'scout' });
+    assert.equal(framework.getHostModeStatus().deferredWrites, 4);
+
+    const realAdd = agentCm.addMessage.bind(agentCm);
+    (agentCm as unknown as { addMessage: typeof agentCm.addMessage }).addMessage = ((participant, content, metadata, causedBy) => {
+      if ((content[0] as { text?: string }).text === 'stuck') throw new Error('store write failed');
+      return realAdd(participant, content, metadata, causedBy);
+    }) as typeof agentCm.addMessage;
+    const named = () => lines.filter((line) =>
+      line.includes('deferred write stuck-1 (user: text+malformed) for agent could not be stored')).length;
+
+    let status = await framework.resume();
+    // Queued after agent's stuck write, scout's land; agent's own later
+    // write is held behind it.
+    assert.deepEqual(stored(), ['for scout', 'also for scout'], "scout's writes land; agent's stuck write holds what is queued behind it for agent");
+    assert.equal(status.deferredWrites, 2);
+    assert.equal(named(), 1, 'the flush names the stuck write: its id and block types');
+
+    // A second flush with the store still refusing it: held again, named again.
+    await framework.quiesce({ reason: 'refold' });
+    status = await framework.resume();
+    assert.deepEqual(stored(), ['for scout', 'also for scout'], 'still nothing lands ahead of it');
+    assert.equal(status.deferredWrites, 2);
+    assert.equal(named(), 2, 'every flush names it');
+  } finally {
+    try {
+      await framework.stop();
+    } finally {
+      console.error = error;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test('context writes deferred while quiesced survive a restart and land at resume', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-deferred-'));
   const storePath = join(dir, 'store');

@@ -501,6 +501,18 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       compiles++;
       throw new Error('boom');
     };
+    // The retry re-enters startAgentStream after its delay; count those
+    // re-entries, so a retry that was never granted can't pass for one that
+    // was refused.
+    const retries: number[] = [];
+    const frames = framework as unknown as {
+      startAgentStream(agent: unknown, trigger?: unknown, attempt?: number, held?: boolean): Promise<void>;
+    };
+    const startAgentStream = frames.startAgentStream.bind(framework);
+    frames.startAgentStream = (a, trigger, attempt = 0, held = false) => {
+      if (attempt > 0) retries.push(attempt);
+      return startAgentStream(a, trigger, attempt, held);
+    };
     framework.start();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await inDelay;
@@ -508,6 +520,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const error = console.error;
     console.error = () => {};
     try { await framework.stop(); } finally { console.error = error; }
+    assert.deepEqual(retries, [1], 'the retry was granted, and re-entered once stop() had begun');
     assert.equal(compiles, 1, 'the retry was refused, not compiled');
 
     const reopened = await createFramework();

@@ -151,15 +151,54 @@ describe('runEphemeralToCompletion settle signal', () => {
       await inCompile;
       const stopped = framework.stop();
       release();
-      const refusedAt = Date.now();
+      // Ended by the refusal, not by its startup watchdog, whose rejection
+      // names a zombie instead.
       await assert.rejects(run, /refused: the framework is stopping/);
-      assert.ok(Date.now() - refusedAt < 5_000, 'ended at once, not at its startup watchdog');
       await stopped;
       await assert.rejects(
         framework.runEphemeralToCompletion(later.agent, later.contextManager),
         /framework is stopping: refusing new ephemeral run/,
       );
       later.cleanup();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a run waiting to retry when stop() begins gives up before compiling again', async () => {
+    // An ephemeral run doesn't hold the primary's provider gate, so the
+    // refusal at the top of startAgentStream is the only check its retry
+    // meets before it would compile, and start a stream, again.
+    const { tempDir, storePath } = tempStorePath('ephemeral-retry-stopping-');
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          return attempt < 1 ? { retry: true, delayMs: 50 } : { retry: false };
+        },
+      },
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      let compiles = 0;
+      (agent as unknown as { startStreamWithInjections: () => Promise<never> }).startStreamWithInjections = async () => {
+        compiles++;
+        throw new Error('boom');
+      };
+      const run = runStartedEphemeral(framework, agent, contextManager);
+      await inDelay;
+      const stopped = framework.stop();
+      await assert.rejects(run, /refused: the framework is stopping/);
+      await stopped;
+      assert.equal(compiles, 1, 'the retry was refused, not compiled');
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

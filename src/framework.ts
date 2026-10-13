@@ -481,9 +481,19 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
-/** A deferred entry as a log line names it: its id, participant and block types. */
+/** A deferred entry as a log line names it: its id, participant and block
+ *  types. It never throws: it describes the entries the store rejected, which
+ *  may be malformed (a block that isn't an object with a type reads as
+ *  `malformed`). */
 function describeDeferredWrite(msg: { id: string; participant: string; content: ContentBlock[] }): string {
-  return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map((b) => b.type))].join('+') || 'empty'})`;
+  const content: unknown = msg.content;
+  const types = Array.isArray(content)
+    ? [...new Set(content.map((b: unknown) => {
+      const type = b && typeof b === 'object' ? (b as { type?: unknown }).type : undefined;
+      return typeof type === 'string' ? type : 'malformed';
+    }))].join('+') || 'empty'
+    : 'malformed';
+  return `${msg.id} (${msg.participant}: ${types})`;
 }
 
 /** Whether a deferred message can join a live stream at a tool boundary:
@@ -2277,17 +2287,20 @@ export class AgentFramework {
       }
     }
 
-    // No stream is left: from the start of stop() none registers and no turn
-    // starts (providerAdmissionClosed, checked for every agent), and every
-    // stream registered before was cancelled and awaited above. So nothing
-    // else will deliver what is still deferred: a message held for a turn's
-    // end whose flush found the target busy again, or one that arrived for an
-    // idle agent and was deferred behind its own state. Land each at its
+    // No stream is left: from the start of stop() none registers and no
+    // agent turn starts (providerAdmissionClosed, checked for every agent),
+    // and every stream registered before was cancelled and awaited above.
+    // What is still deferred (a message held for a turn's end whose flush
+    // found the target busy again, or one deferred behind its target's own
+    // state) would wait for a flush that may never come. Land each at its
     // registered target now, while the store is open; a memory-only queue
     // would otherwise lose it at exit. It goes past the deferral: a frame
-    // stop() doesn't wait for (a puppet call, or a turn started outside the
-    // event loop) can still hold its target's turn token, but no reply can
-    // follow the entry in any stream. A quiesced host defers it again
+    // stop() doesn't wait for (a turn started outside the event loop, or a
+    // puppet call) can still hold its target's turn token, but no reply can
+    // follow the entry in any stream. stop() neither refuses nor waits for a
+    // puppet call, as before this drain: one still running stores its pair
+    // when its tool returns, after these entries, and on a store closed
+    // below that write fails. A quiesced host defers it again
     // instead, into the persisted queue, for boot recovery. A write that
     // throws stays queued with what follows it (writeDrainedInOrder), and a
     // memory-only queue still loses it at exit. An entry for a target no
@@ -3664,8 +3677,10 @@ export class AgentFramework {
    * after every message). A crash mid-flush therefore replays exactly the
    * un-acked remainder at the next boot — no loss, no duplicates. A write
    * the store rejects stays queued, logged, with what is queued behind it for
-   * its target (writeDrainedInOrder), so a target's entries never land out of
-   * order; a boot that meets it again logs it and goes on.
+   * its target (writeDrainedInOrder), so the flush never stores a target's
+   * later entries ahead of it (a write that arrives while its target is idle
+   * isn't deferred, though, and can land ahead of it); a boot that meets it
+   * again logs it and goes on.
    *
    * Per-target: an agent whose turn is still alive keeps ITS messages
    * deferred for its own turn boundary; everyone else's flush now.
@@ -13253,12 +13268,13 @@ export class AgentFramework {
       write();
       return true;
     } catch (error) {
+      // Back into the queue before anything else can go wrong here.
+      this.requeueDrained([msg]);
       console.error(
         `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
         `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} could not be stored; it stays queued, ` +
         `holding what is queued behind it for that agent: ${error instanceof Error ? error.message : String(error)}`,
       );
-      this.requeueDrained([msg]);
       return false;
     }
   }
@@ -13281,11 +13297,19 @@ export class AgentFramework {
   /**
    * Write one agent's drained entries in queue order, each through
    * writeDrained. The drain cuts at the first that can't be stored: it and
-   * every later entry go back into the queue, so nothing lands ahead of an
-   * earlier entry and a queued pair stays together. An entry that keeps
-   * failing holds its agent's later writes, logged at each flush, rather than
-   * letting them land out of order. Returns what was written, a prefix of
-   * `entries`.
+   * every later entry go back into the queue, so none of them lands ahead of
+   * an earlier one, and a queued tool_use that can't be stored keeps its
+   * tool_result from being stored alone. (A tool_use that is stored, followed
+   * by a tool_result that can't be, stays stored without it until the
+   * tool_result lands at a later flush. The only queued pair is
+   * puppetToolCall's defensive one, which no path reaches today.) An
+   * entry that keeps failing holds its agent's later queued writes, logged
+   * at each flush, rather than letting them land out of order. The hold is
+   * the queue's alone: a write that arrives while its agent is idle isn't
+   * deferred (addMessage stores it at once), so it can land ahead of a held
+   * entry, and an entry that keeps failing holds only what is deferred
+   * behind it while its agent's turn, stream or tool cycle is alive, or the
+   * host is quiesced. Returns what was written, a prefix of `entries`.
    */
   private writeDrainedInOrder(entries: DeferredWrite[], where: string, write: (msg: DeferredWrite) => void): DeferredWrite[] {
     for (let i = 0; i < entries.length; i++) {

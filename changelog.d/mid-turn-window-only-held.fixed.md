@@ -34,20 +34,29 @@
   cycle holds them.
 - `stop()` now stores what is still deferred for each registered agent
   before the store closes; before, a memory-only queue lost it. Once `stop()`
-  begins, no turn starts and no stream registers, for any agent: a turn that
-  was mid-compile when the streams were cancelled, or one waiting to retry,
-  is refused rather than left running, and an ephemeral run refused this way
+  begins, no agent turn starts and no stream registers: a turn that was
+  mid-compile when the streams were cancelled, or one waiting to retry, is
+  refused rather than left running, and an ephemeral run refused this way
   ends at once rather than at its startup watchdog. Since no reply can then
-  follow a stored entry, `stop()` stores each one even while a frame it
-  doesn't wait for, such as a puppet call, still holds its target's turn. A
-  quiesced host keeps what is deferred in its persisted queue for boot
-  recovery. An entry for a target no longer registered (a disposed fork) is
-  dropped from a memory-only queue at exit, as before.
+  follow a stored entry in a stream, `stop()` stores each one even while a
+  frame it doesn't wait for still holds its target's turn: a turn started
+  outside the event loop, or a puppet call. `stop()` neither refuses nor
+  waits for a puppet call, as before, so one still running stores its pair
+  when its tool returns, after those entries, and on a store `stop()` has
+  closed that write fails. A quiesced host keeps what is deferred in its
+  persisted queue for boot recovery. An entry for a target no longer
+  registered (a disposed fork) is dropped from a memory-only queue at exit,
+  as before.
 - A deferred write whose store throws goes back into the queue under its
-  id, and so does every entry queued behind it for that agent, so none lands
-  out of order and a queued `tool_use` and its `tool_result` stay together.
-  The log line names the entry, and one that keeps throwing holds the
-  agent's later deferred writes until it can be stored. Before, it stayed in
+  id, and so does every entry queued behind it for that agent, so none of
+  them lands ahead of an earlier one, and a queued `tool_use` that can't be
+  stored keeps its `tool_result` from being stored alone. The log line names
+  the entry at each flush, and one that keeps throwing holds what is deferred
+  behind it for that agent until it can be stored. The hold is the queue's:
+  a write that arrives while the agent is idle isn't deferred, so it is
+  stored at once and can land ahead of a held entry, and an entry that keeps
+  throwing holds only what is deferred during the agent's turns (or while the
+  host is quiesced). Before, it stayed in
   the un-acked set and the next acknowledgement dropped it from the
   persisted queue (at a turn start or a flush it was lost even from memory).
   At a tool boundary, nothing from it on is injected. While the framework
