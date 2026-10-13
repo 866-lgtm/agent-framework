@@ -9474,10 +9474,18 @@ export class AgentFramework {
       // A restart continues the same logical turn and keeps them.
       this.turnEngagedChannels.delete(agent.name);
       // A new routing state for the new turn, in every mode: the sticky
-      // destination, the turn's destination, hybrid's hold and a continuation
-      // start empty. The previous turn's object isn't cleared: prose it left
-      // queued still reads and writes its own.
-      this.turnRouting.set(agent.name, freshTurnRouting());
+      // destination, the turn's destination, hybrid's hold and the receipt
+      // tallies start empty. The previous turn's object isn't cleared: prose
+      // it left queued still reads and writes its own.
+      const fresh = freshTurnRouting();
+      // A framework retry, or a re-inference after tool results that weren't
+      // streamed, is the same logical turn on a new stream: a ` !` an earlier
+      // stream asked for still stands, as it did when the flag was per agent.
+      const previous = this.turnRouting.get(agent.name);
+      if ((attempt > 0 || trigger?.reason === 'tool_results_ready') && previous?.continuation) {
+        fresh.continuation = true;
+      }
+      this.turnRouting.set(agent.name, fresh);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
         // Explicit and disabled prose routing have no inferred locus.
         // Explicit mode uses a turn-scoped `>>` target; disabled mode has no

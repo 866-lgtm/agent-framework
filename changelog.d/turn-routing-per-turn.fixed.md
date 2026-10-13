@@ -19,7 +19,9 @@
 - In explicit and hybrid mode, a ` !` continuation that an earlier round
   asked for now starts when a tool ends the turn, once that turn's
   deliveries have run, unless the framework has stopped or the agent has
-  been disposed by then (a dropped one is logged). In explicit mode a turn
+  been disposed by then (a dropped one is logged). One asked for before a
+  framework retry or a re-inference after unstreamed tool results still
+  stands. In explicit mode a turn
   that another event
   started meanwhile runs first. Before, hybrid mode started it only after
   the next turn, and explicit mode dropped it, or, when its delivery ran

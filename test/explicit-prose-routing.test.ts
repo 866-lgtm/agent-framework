@@ -680,6 +680,36 @@ describe('explicit prose routing', () => {
     });
   }
 
+  it("hybrid: a ' !' asked for before a re-inference after unstreamed tool results still starts its continuation", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') turns++;
+    });
+    feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
+    const internals = framework as unknown as {
+      turnRouting: Map<string, RoutingState>; pendingRequests: InferenceRequest[];
+    };
+    try {
+      // The turn's earlier stream asked for a continuation; the turn goes on
+      // in a re-inference, which starts a new stream with a fresh routing
+      // state.
+      internals.turnRouting.set('assistant', { destination: null, hybridHold: false, continuation: true, deliveries: [], suppressed: 0 });
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
+      await framework.runUntilIdle();
+      for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await framework.runUntilIdle();
+      }
+      assert.deepEqual(routed.map((r) => r.text.trim()), ['carrying on']);
+      assert.equal(turns, 2, 'the re-inference completes, then the continuation it carried starts');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   for (const boundary of ['stop', 'dispose'] as const) {
     it(`a tool-ended explicit turn's late ' !' takes no new turn after ${boundary === 'stop' ? 'stop()' : 'its agent is disposed'}`, async () => {
       membrane.pushResponse(createMockResponse([
