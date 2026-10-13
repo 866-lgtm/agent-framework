@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import type { McplServerConfig } from '../src/mcpl/types.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
@@ -79,8 +80,10 @@ function wireHarness() {
   ) => McplServerConnection;
   const connection = new Connection('observer', null, transport);
   const framework = Object.create(AgentFramework.prototype) as {
+    mcplServerConfigs: Map<string, McplServerConfig>;
     wireMcplEvents(connection: McplServerConnection): void;
   };
+  framework.mcplServerConfigs = new Map([['observer', { id: 'observer', command: 'unused' }]]);
   framework.wireMcplEvents(connection);
   connection.establishGrant(new CapabilityGrant(new Set(['toolLifecycle.observe']), []));
   connection.ready();
