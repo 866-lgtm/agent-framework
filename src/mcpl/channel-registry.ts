@@ -61,6 +61,12 @@ const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
  */
 const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
 
+/** A channel's refusals for being unregistered print at most one host line
+ *  this often (each is still traced); the throttle tracks this many channels
+ *  before it starts over. */
+const UNKNOWN_CHANNEL_LINE_EVERY_MS = 60_000;
+const UNKNOWN_CHANNEL_LINE_KEYS = 1_000;
+
 type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
 /**
@@ -592,6 +598,10 @@ export class ChannelRegistry {
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
 
+  /** For each `{serverId}:{channelId}` refused as unregistered: when its last
+   *  host line printed, and how many refusals it has had since. */
+  private unknownChannelLines = new Map<string, { at: number; since: number }>();
+
   /**
    * Most-recently-known label per channelId, replayed from
    * `CHANNEL_LABEL_HISTORY_LOG_ID` (last sighting wins) and kept current by
@@ -963,17 +973,30 @@ export class ChannelRegistry {
       // routable entry rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
-        // Loud, coalesced or not, like every other refusal of a message.
-        console.error(
-          `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
-          `messageId=${logValue(message.messageId)} reason=unknown-channel (not registered, §14.5)`,
-        );
+        // Loud, coalesced or not, like every other refusal of a message, but
+        // throttled per channel: a server that never registered a busy
+        // channel would otherwise print a line for every message in it. Its
+        // first refusal prints; after that, at most one line a minute, with
+        // how many were refused since the last. Every refusal is traced.
+        const now = Date.now();
+        const last = this.unknownChannelLines.get(incomingKey);
+        if (!last || now - last.at >= UNKNOWN_CHANNEL_LINE_EVERY_MS) {
+          if (!last && this.unknownChannelLines.size >= UNKNOWN_CHANNEL_LINE_KEYS) this.unknownChannelLines.clear();
+          this.unknownChannelLines.set(incomingKey, { at: now, since: 0 });
+          console.error(
+            `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
+            `messageId=${logValue(message.messageId)} reason=unknown-channel ` +
+            `(not registered, §14.5${last?.since ? `; ${last.since} more since the last line` : ''})`,
+          );
+        } else {
+          last.since++;
+        }
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',
           serverId,
           channelId: message.channelId,
           messageId: message.messageId,
-          reason: 'unknown channel — not registered (§14.5)',
+          reason: 'unknown-channel',
         });
         results.push({
           messageId: message.messageId,

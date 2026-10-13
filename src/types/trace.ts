@@ -217,13 +217,16 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
-  /** A push/event refused at the MCPL boundary: visibly-empty content, or a
-   *  coalesced occurrence the host refused. Its reason follows the code the
-   *  producer was answered with: `coalesce-invalid` when the occurrence was
-   *  the producer's to fix (-32602 malformed; -32017 or -32023 for a channel
-   *  not permitted or not registered), `coalesce-failed` when the host itself
-   *  failed (-32000, -32603), each with the failing `field` and the error's
-   *  message in `detail`. A missing `eventId` is traced as `''`. */
+  /** A push/event refused at the MCPL boundary for visibly-empty content
+   *  (`empty-content`, answered -32602), or a coalesced occurrence the host
+   *  refused. A refused occurrence's reason follows the code the producer
+   *  was answered with: `coalesce-invalid` when the occurrence was the
+   *  producer's to fix (-32602 malformed; -32017 or -32023 for a channel not
+   *  permitted or not registered), `coalesce-failed` when the host itself
+   *  failed (-32000, -32603). It carries the error's message in `detail`, and
+   *  the failing `field` when the error names one. A missing `eventId` is
+   *  traced as `''`. A push refused for its feature set, or as a duplicate,
+   *  gets a `[push-event-rejected]` line and no trace. */
   | (TraceEventBase & {
       type: 'mcpl:push-event-rejected';
       serverId: string;
@@ -233,12 +236,16 @@ export type TraceEvent =
       field?: string;
       detail?: string;
     })
-  /** A channels/incoming message refused at the MCPL boundary: unregistered
-   *  channel (§14.5), visibly-empty content, or a coalesced item the host
-   *  refused (`coalesce-invalid` / `coalesce-failed`, with `field` and
-   *  `detail` as for a push; `coalesce-invalid` is the per-message
-   *  `coalesce_invalid` result). `messageId` is set whenever the message
-   *  carries one. */
+  /** A channels/incoming message refused at the MCPL boundary: an
+   *  unregistered channel (`unknown-channel`, §14.5), visibly-empty content
+   *  (`empty-content`), or a coalesced item the host refused
+   *  (`coalesce-invalid` / `coalesce-failed`, with `detail`, and `field` when
+   *  the error names one, as for a push). A coalesced item refused with
+   *  -32602 (malformed) is answered `coalesce_invalid`, and one refused
+   *  otherwise (-32000, or an internal error) with the error's own message.
+   *  `messageId` is set whenever the message carries one. An uncoalesced
+   *  message without a channelId or messageId is answered `invalid
+   *  channel/message identity`, with no line and no trace. */
   | (TraceEventBase & {
       type: 'mcpl:channel-incoming-rejected';
       serverId: string;

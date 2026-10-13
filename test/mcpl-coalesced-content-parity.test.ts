@@ -431,18 +431,33 @@ test('a coalesced push without an eventId, or with one that is not a string, is 
   assert(lines.some((l) => l.startsWith('[push-event-rejected] server=editor featureSet=doc eventId="{\\"toString\\":1}" reason=coalesce-invalid field=payload.content:')), lines.join('\n'));
 });
 
-test('a message for an unregistered channel is named on the host, coalesced or not, and its trace carries the message id', async (t) => {
+test('a message for an unregistered channel is traced with its message id, coalesced or not, and named on the host at most once a minute per channel', async (t) => {
   const f = await fixture(); t.after(f.close);
   const lines = captureConsoleError(t);
   const rejected: Rejection[] = [];
   f.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
-  const plain = { channelId: 'nowhere', messageId: 'p1', timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'hi' }] };
-  const r = await f.send('channels/incoming', { messages: [plain, f.channel('e1', 'hi', { initial: true }, 'nowhere', 'c1')] });
-  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [false, false]);
-  assert.deepEqual(rejected.map(({ messageId }) => messageId), ['p1', 'c1']);
+  const plain = (channelId: string, messageId: string) => ({
+    channelId, messageId, timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'hi' }],
+  });
+  const r = await f.send('channels/incoming', { messages: [
+    plain('nowhere', 'p1'), f.channel('e1', 'hi', { initial: true }, 'nowhere', 'c1'), plain('nowhere', 'p2'), plain('elsewhere', 'q1'),
+  ] });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [false, false, false, false]);
+  // A minute on, the channel's next refusal prints again, with how many came since.
+  const now = Date.now;
+  Date.now = () => now() + 60_000;
+  try {
+    await f.send('channels/incoming', { messages: [plain('nowhere', 'p3')] });
+  } finally {
+    Date.now = now;
+  }
+  assert.deepEqual(rejected.map(({ messageId, reason }) => [messageId, reason]), [
+    ['p1', 'unknown-channel'], ['c1', 'unknown-channel'], ['p2', 'unknown-channel'], ['q1', 'unknown-channel'], ['p3', 'unknown-channel'],
+  ]);
   assert.deepEqual(lines.filter((l) => l.startsWith('[channel-incoming-rejected]')), [
     '[channel-incoming-rejected] server=editor channel=nowhere messageId=p1 reason=unknown-channel (not registered, §14.5)',
-    '[channel-incoming-rejected] server=editor channel=nowhere messageId=c1 reason=unknown-channel (not registered, §14.5)',
+    '[channel-incoming-rejected] server=editor channel=elsewhere messageId=q1 reason=unknown-channel (not registered, §14.5)',
+    '[channel-incoming-rejected] server=editor channel=nowhere messageId=p3 reason=unknown-channel (not registered, §14.5; 2 more since the last line)',
   ]);
 });
 
