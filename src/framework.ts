@@ -1044,10 +1044,12 @@ const THROWN_TEXT_LIMIT = 500;
  * The text is bounded, since a provider or handler error can carry a whole
  * request body.
  */
-function thrownText(error: unknown): string {
+function thrownText(error: unknown, recorded: (text: unknown) => string = asText): string {
   let text: string;
   try {
-    text = String(error instanceof Error ? error.message : error);
+    // Redacted before it's cut, so no part of a credential across the cut
+    // is kept.
+    text = recorded(String(error instanceof Error ? error.message : error));
   } catch {
     text = '(a value that could not be read)';
   }
@@ -1059,15 +1061,15 @@ function thrownText(error: unknown): string {
  * handler failed" and what it threw (nothing, for `undefined`). Telling an
  * Error apart is itself guarded, since instanceof throws on a revoked Proxy.
  */
-function handlerFailureText(error: unknown): string {
+function handlerFailureText(error: unknown, recorded?: (text: unknown) => string): string {
   let isError = false;
   try {
     isError = error instanceof Error;
   } catch {
     // Not an Error that can be read; thrownText says so.
   }
-  if (isError) return thrownText(error);
-  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error)}`;
+  if (isError) return thrownText(error, recorded);
+  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error, recorded)}`;
 }
 
 /** A server's responder, and whether the request it belongs to has been answered yet. */
@@ -2626,10 +2628,12 @@ export class AgentFramework {
     serverId: string,
     answer: AnswerOnce,
     outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+    /** The connection's redactor: a handler's error can quote what the server sent. */
+    recorded: (text: unknown) => string,
   ): void {
     // Optional chaining: prototype-built harnesses leave the queue unset.
     const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
-    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error);
+    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error, recorded);
     const reason = outcome.kind === 'refused'
       ? 'the host is stopping'
       : stopping
@@ -15206,12 +15210,12 @@ export class AgentFramework {
         // Checked here, after the barrier and before anything records the
         // push as accepted: a stopped host refuses it.
         if (this.queue?.isClosed) {
-          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.pushHandler?.handlePushEvent(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -15237,7 +15241,7 @@ export class AgentFramework {
           // A stopping host starts no inference for a server: refused, like a
           // push, before the router runs.
           if (this.queue?.isClosed) {
-            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' });
+            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' }, recorded);
             return;
           }
           await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
@@ -15246,7 +15250,7 @@ export class AgentFramework {
             requestId: responder.id,
           });
         } catch (error) {
-          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error });
+          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error }, recorded);
         }
       }
     });
@@ -15259,12 +15263,12 @@ export class AgentFramework {
       const answer = answerOnce(responder, 'channels/register', connection.id);
       try {
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.channelRegistry?.handleRegister(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -15279,12 +15283,12 @@ export class AgentFramework {
       const answer = answerOnce(responder, 'channels/changed', connection.id);
       try {
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.channelRegistry?.handleChanged(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -15351,12 +15355,12 @@ export class AgentFramework {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.channelRegistry?.handleIncoming(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -15373,13 +15377,13 @@ export class AgentFramework {
         // A stopping host runs no host command: refused like the requests
         // above, before its handler runs.
         if (this.queue?.isClosed) {
-          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         const result = await this.handleHostCommand(connection.id, params ?? {});
         answer.responder!.respond(result);
       } catch (error) {
-        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
