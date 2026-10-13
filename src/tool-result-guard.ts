@@ -14,24 +14,24 @@ export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
  *  workspace isn't answering (`workspace_unanswered`: an earlier write is
  *  still under way past the host's deadline) or because the workspace had
  *  left the stub's branch when the file would have been committed
- *  (`branch_changed`); or null when no file is written at all (no writable
+ *  (`branch_changed`), or because the batch used its deadline before this
+ *  write could start (`batch_deadline`); or null when no file is written at all (no writable
  *  workspace, or the host is stopping). */
 export type WithheldSpill =
   | { path: string; error?: string; unfinished?: true }
-  | { skipped: 'workspace_unanswered' | 'branch_changed' }
+  | { skipped: 'workspace_unanswered' | 'branch_changed' | 'batch_deadline' }
   | null;
 
-/** Writes one withheld original as a workspace file (the framework's
- *  tool-results spill). It reports a failed write rather than throwing, and
- *  it settles within a bounded time: a write still under way at the host's
- *  deadline is reported as unfinished, and until that write settles the host
- *  starts no other (each is `workspace_unanswered`), so a stalled workspace
- *  costs one deadline however many results and batches queue behind it. The
- *  file lands on `branch`, the branch the stub is on, or isn't written: the
- *  workspace checks the branch where it commits the file
- *  (WorkspaceModule.writeBinary), and a write it declines is
- *  `branch_changed`. */
-export type WithheldSpiller = (label: string, text: string, branch: string) => Promise<WithheldSpill>;
+/**
+ * Writes one withheld original as a workspace file, using what remains of
+ * the batch's absolute deadline. A write still running then is unfinished.
+ * Once a write reaches that deadline, later spills are workspace_unanswered
+ * until all overdue writes settle. Other batches can start before that gate
+ * closes. An exhausted batch starts no write (batch_deadline).
+ * The tree entry lands on branch or the write is declined (branch_changed).
+ * The mount's disk directory is shared across branches.
+ */
+export type WithheldSpiller = (label: string, text: string, branch: string, deadline: number) => Promise<WithheldSpill>;
 
 /** What a host gives a guard for its withheld results: where originals are
  *  written, where each annotation is registered, so the host's stop can
@@ -39,6 +39,8 @@ export type WithheldSpiller = (label: string, text: string, branch: string) => P
  *  guard says whether it has work left. */
 export interface WithheldHost {
   spill: WithheldSpiller;
+  /** Absolute deadline for one batch, captured when its annotation starts. */
+  deadline(): number;
   track(annotation: Promise<void>): void;
   /** Whether the guard is idle (see ToolResultGuard.idle), told after each
    *  change that can alter it: when an annotation starts or ends, and after
@@ -133,17 +135,17 @@ export class ToolResultGuard {
    *  failed and waits in the storage queue, retried in order until it lands
    *  or an operator's change supersedes it (until then the stub is the bare
    *  notice, kept out of summaries by its compression hold, and the audit
-   *  record names the place). It never rejects. Its wait is bounded: the host
-   *  reports a write still under way at its deadline as unfinished and starts
-   *  no other until that write settles. */
+   *  record names the place). It never rejects. Each batch has one deadline
+   *  for all its workspace writes; queued batches are annotated in order.
+   *  A request may carry an unfinished-write notice once that deadline passes. */
   whenAnnotated(): Promise<void> { return this.annotating ?? Promise.resolve(); }
 
   /**
    * Runs `read` (a compile of the context) once no withheld stub is still
    * being annotated, and again if an annotation began while it ran, since a
    * settlement can land during the compile's own awaits, such as a previous
-   * frame's teardown abandoning its batch. Every compile of a
-   * request that is sent goes through it: the agent's activations, its direct
+   * frame's teardown abandoning its batch. The framework's sent-request
+   * compiles go through it: the agent's activations, its direct
    * API calls and their refusal retry, and a conversation fork's seed from its
    * template. A request preview doesn't, so it never waits on a
    * workspace write.
@@ -202,7 +204,9 @@ export class ToolResultGuard {
 
   /** Ordered storage work, separate from batches awaiting a provider verdict.
    * A failed acceptance edit retains both the payload and its compression
-   * hold here; it can never re-arm refusal handling or tool submission. */
+   * hold here; it can never re-arm refusal handling or tool submission.
+   * Any failed head, including an audit-only record, blocks later queued
+   * edits and their holds until that operation succeeds. */
   private unrecorded: AuditOperation[] = [];
 
   /** Retry edits and audit writes before a new activation, a compile of a
@@ -471,6 +475,7 @@ export class ToolResultGuard {
       // it when the edit lands or is superseded.
       let holdQueued = false;
       try {
+        const deadline = this.host?.deadline() ?? Infinity;
         const date = new Date().toISOString().slice(0, 10);
         // A file is named by its batch and its place in the batch, ahead of
         // anything the writer may cut or substitute: results of one batch
@@ -492,8 +497,9 @@ export class ToolResultGuard {
           // skipped, and its original stays in the audit record. Nothing
           // yields from here to the edit's own branch check, so while the
           // store is away the stub stays as it is. A write already under way
-          // when the branch changes is refused where it commits, since it
-          // names the batch's branch, so no file lands elsewhere.
+          // when the branch changes is refused before its tree entry is set,
+          // since it names the batch's branch. Once set, that entry stays on
+          // its branch; its disk copy uses the mount's shared directory.
           if (branchLeft || this.cm.currentBranch().name !== pending.branch) {
             branchLeft = true;
             spills.set(index, { skipped: 'branch_changed' });
@@ -505,7 +511,7 @@ export class ToolResultGuard {
           let spill: WithheldSpill = null;
           if (this.host) {
             try {
-              spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original, pending.branch);
+              spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original, pending.branch, deadline);
             } catch (error) {
               // The host reports a failed write rather than throwing; a throw
               // is recorded all the same, without a path.

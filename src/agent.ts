@@ -113,6 +113,8 @@ export class Agent {
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
 
   private _state: AgentState = { status: 'idle' };
+  /** Owns request assembly while retaining any ready tool results underneath. */
+  private compilingRequest = false;
   private _inferenceStartedAt = 0;
   private _streamId = 0;
   /** kv-unified receipt flights opened by the CURRENT activation and not yet
@@ -185,6 +187,11 @@ export class Agent {
   get state(): AgentState {
     return this._state;
   }
+
+  /** The framework scheduler keeps a wake queued while this agent is
+   * assembling a request. This is compilation ownership, not a replacement
+   * for the agent's public status. */
+  get isCompilingRequest(): boolean { return this.compilingRequest; }
 
   /**
    * Monotonically increasing stream generation counter.
@@ -646,6 +653,9 @@ export class Agent {
     budget?: TokenBudget,
     options?: InferenceOptions
   ): Promise<InferenceResult> {
+    if (this.compilingRequest || this._state.status === 'streaming') {
+      throw new Error(`Agent ${this.name} cannot run inference in state ${this.compilingRequest ? 'compiling' : this._state.status}`);
+    }
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
@@ -670,10 +680,6 @@ export class Agent {
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
     }
 
-    // Pending tool results the guard isn't holding follow the compiled context.
-    const unguardedResults = this._state.status === 'ready' && !guardedResults
-      ? this.buildToolResultMessages(this._state.toolResults) : [];
-
     // Compile the context (with optional injections) into a request. The
     // guard's refusal retry is assembled the same way, afresh. It is compiled
     // only once each withheld stub's annotation has finished, including one
@@ -683,7 +689,11 @@ export class Agent {
     const assemble = async (): Promise<NormalizedRequest> => {
       const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections));
-      messages.push(...unguardedResults);
+      // Read after the awaited compile: results may have become ready while
+      // it was running. A retry takes a fresh read too.
+      if (this._state.status === 'ready' && !guardedResults) {
+        messages.push(...this.buildToolResultMessages(this._state.toolResults));
+      }
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
@@ -698,7 +708,13 @@ export class Agent {
         assistantParticipant: this.name,
       };
     };
-    const request = await assemble();
+    let request: NormalizedRequest;
+    this.compilingRequest = true;
+    try {
+      request = await assemble();
+    } finally {
+      this.compilingRequest = false;
+    }
 
     const abortController = new AbortController();
     if (options?.signal) {
@@ -939,99 +955,103 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
-    if (this._state.status !== 'idle') {
-      throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
+    if (this.compilingRequest || this._state.status !== 'idle') {
+      throw new Error(`Agent ${this.name} cannot start stream in state ${this.compilingRequest ? 'compiling' : this._state.status}`);
     }
+    this.compilingRequest = true;
+    try {
+      // Retry accepted history edits before assembling a real request. Pure
+      // preview/compile entry points must not perform these writes.
+      this.toolResultGuard.flushUnrecorded();
 
-    // Retry accepted history edits before assembling a real request. Pure
-    // preview/compile entry points must not perform these writes.
-    this.toolResultGuard.flushUnrecorded();
+      // A new activation supersedes every receipt flight the previous one left
+      // open. Membrane fires the kv-unified wire receipt per provider attempt,
+      // BEFORE the adapter call; only that attempt's usage event settles it.
+      // When the attempt dies without usage (transport error, idle timeout,
+      // framework cancel for a budget restart or endTurn) the flight stays open
+      // until the old driveStream's `finally` runs — and every successor path
+      // (error-policy retry, budget restart, the next wake after an abort)
+      // starts the new stream BEFORE that `finally`. The successor's first
+      // receipt then met the ledger's single-flight guard and failed the
+      // recovery itself: "kv-unified submission devops:46:…:4 is still in
+      // flight" (devops agent, 2026-09-16 07:33Z, no provider error logged).
+      this.failOpenKvSubmissions();
 
-    // A new activation supersedes every receipt flight the previous one left
-    // open. Membrane fires the kv-unified wire receipt per provider attempt,
-    // BEFORE the adapter call; only that attempt's usage event settles it.
-    // When the attempt dies without usage (transport error, idle timeout,
-    // framework cancel for a budget restart or endTurn) the flight stays open
-    // until the old driveStream's `finally` runs — and every successor path
-    // (error-policy retry, budget restart, the next wake after an abort)
-    // starts the new stream BEFORE that `finally`. The successor's first
-    // receipt then met the ledger's single-flight guard and failed the
-    // recovery itself: "kv-unified submission devops:46:…:4 is still in
-    // flight" (devops agent, 2026-09-16 07:33Z, no provider error logged).
-    this.failOpenKvSubmissions();
+      this._streamId++;
+      this._inferenceStartedAt = Date.now();
+      this.lastStreamInputTokens = 0;
+      // Reset the cache-inclusive counters too: a new stream must not inherit
+      // the prior stream's window size — on the physical-window restart path
+      // that inherited value IS the oversized number that caused the restart,
+      // and projecting on it before this stream's first usage event would
+      // restart again (loop). The `> 0` guard downstream means "no usage
+      // observed on THIS stream yet" only because of this reset.
+      this.lastStreamRealInputTokens = 0;
+      this.lastStreamOutputTokens = 0;
 
-    this._streamId++;
-    this._inferenceStartedAt = Date.now();
-    this.lastStreamInputTokens = 0;
-    // Reset the cache-inclusive counters too: a new stream must not inherit
-    // the prior stream's window size — on the physical-window restart path
-    // that inherited value IS the oversized number that caused the restart,
-    // and projecting on it before this stream's first usage event would
-    // restart again (loop). The `> 0` guard downstream means "no usage
-    // observed on THIS stream yet" only because of this reset.
-    this.lastStreamRealInputTokens = 0;
-    this.lastStreamOutputTokens = 0;
+      // Compiled only once each withheld stub's annotation has finished,
+      // including one that began during the compile, and after a stub edit that
+      // failed has been retried (see afterAnnotations).
+      const request = await this.toolResultGuard.afterAnnotations(
+        () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
+      request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
-    // Compiled only once each withheld stub's annotation has finished,
-    // including one that began during the compile, and after a stub edit that
-    // failed has been retried (see afterAnnotations).
-    const request = await this.toolResultGuard.afterAnnotations(
-      () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
-    request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
-
-    const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
-      .getStrategy?.() as {
-      beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
-      isKvUnifiedEnabled?: () => boolean;
-    };
-    const kvEnabled = receiptAware?.isKvUnifiedEnabled?.() === true;
-    const kvQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> = [];
-    let kvCall = 0;
-    if (kvEnabled) {
-      this.kvOpenQueue = kvQueue;
-      const layoutHash = stableHash(request.messages);
-      const kvRequest = request as NormalizedRequest & KvUnifiedRequestHooks;
-      kvRequest.onCacheWireReceipt = (receipt) => {
-        const submissionId = `${this.name}:${this._streamId}:${Date.now()}:${kvCall++}`;
-        receiptAware.beginKvUnifiedSubmission!({
-          submissionId,
-          requestHash: receipt.requestHash,
-          layoutHash,
-        });
-        kvQueue.push({ submissionId, wireReceipt: receipt });
+      const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
+        .getStrategy?.() as {
+        beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
+        isKvUnifiedEnabled?: () => boolean;
       };
+      const kvEnabled = receiptAware?.isKvUnifiedEnabled?.() === true;
+      const kvQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> = [];
+      let kvCall = 0;
+      if (kvEnabled) {
+        this.kvOpenQueue = kvQueue;
+        const layoutHash = stableHash(request.messages);
+        const kvRequest = request as NormalizedRequest & KvUnifiedRequestHooks;
+        kvRequest.onCacheWireReceipt = (receipt) => {
+          const submissionId = `${this.name}:${this._streamId}:${Date.now()}:${kvCall++}`;
+          receiptAware.beginKvUnifiedSubmission!({
+            submissionId,
+            requestHash: receipt.requestHash,
+            layoutHash,
+          });
+          kvQueue.push({ submissionId, wireReceipt: receipt });
+        };
+      }
+
+      const agent = this;
+      const stream = this.membrane.streamYielding(request, {
+        emitTokens: true,
+        emitBlocks: false,
+        emitUsage: true,
+        // Retry a content-policy refusal at the provider seam rather than at
+        // the framework level: membrane replays the SAME request immediately
+        // (cache-warm), where a framework-level requeue would recompile and
+        // land a different window. The framework's driveStream handles the
+        // resulting `retrying` event by discarding the abandoned attempt.
+        // Membrane reads this per physical round, including after settings
+        // tools run. A guarded result must reach the host on its FIRST refusal;
+        // never spend retries resubmitting unchanged guarded content.
+        get refusalRetries() {
+          return agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering
+            ? 0 : agent.refusalHandling?.retries ?? 0;
+        },
+      });
+
+      this._state = { status: 'streaming', stream };
+      return {
+        stream,
+        request,
+        ...(kvEnabled
+          ? {
+              takeKvSubmission: () => kvQueue.shift(),
+              drainKvSubmissionIds: () => kvQueue.splice(0).map((item) => item.submissionId),
+            }
+          : {}),
+      };
+    } finally {
+      this.compilingRequest = false;
     }
-
-    const agent = this;
-    const stream = this.membrane.streamYielding(request, {
-      emitTokens: true,
-      emitBlocks: false,
-      emitUsage: true,
-      // Retry a content-policy refusal at the provider seam rather than at
-      // the framework level: membrane replays the SAME request immediately
-      // (cache-warm), where a framework-level requeue would recompile and
-      // land a different window. The framework's driveStream handles the
-      // resulting `retrying` event by discarding the abandoned attempt.
-      // Membrane reads this per physical round, including after settings
-      // tools run. A guarded result must reach the host on its FIRST refusal;
-      // never spend retries resubmitting unchanged guarded content.
-      get refusalRetries() {
-        return agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering
-          ? 0 : agent.refusalHandling?.retries ?? 0;
-      },
-    });
-
-    this._state = { status: 'streaming', stream };
-    return {
-      stream,
-      request,
-      ...(kvEnabled
-        ? {
-            takeKvSubmission: () => kvQueue.shift(),
-            drainKvSubmissionIds: () => kvQueue.splice(0).map((item) => item.submissionId),
-          }
-        : {}),
-    };
   }
 
   /** Close every kv-unified receipt flight the previous activation left
@@ -1198,7 +1218,9 @@ export class Agent {
     /** Compiles the context into a request again, for the guard's retry. */
     reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
-    let response = await this.membrane.stream(request, { signal });
+    let response = signal?.aborted
+      ? { aborted: true as const, reason: 'user' as const }
+      : await this.membrane.stream(request, { signal });
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -1212,7 +1234,10 @@ export class Agent {
         // annotation has finished (agent-framework #277), and against the
         // budget without the batch's reservation, so a stub longer than its
         // original can't carry the request past the budget.
-        response = await this.membrane.stream(await reassemble(), { signal });
+        const retry = await reassemble();
+        response = signal?.aborted
+          ? { aborted: true, reason: 'user', partialUsage: response.usage }
+          : await this.membrane.stream(retry, { signal });
       }
     }
 

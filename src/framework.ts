@@ -815,10 +815,9 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
-/** How long the tool-result guard waits for a withheld original's workspace
- *  write before its stub says the write was still under way. A local
- *  write takes milliseconds; this bounds a stalled mount, which would otherwise
- *  hold every later request of the agent and the framework's stop. */
+/** Total time one withheld batch may spend awaiting workspace writes.
+ *  At the deadline its unfinished write is named as such, and later
+ *  originals stay in the audit. This bound applies to withheld spills. */
 const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 /** Poll pending context-strategy maintenance independently of user activity. */
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
@@ -1062,6 +1061,8 @@ export class AgentFramework {
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
+  /** Invalidates framework turns still assembling when stop begins. */
+  private lifecycleGeneration = 0;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -1987,6 +1988,7 @@ export class AgentFramework {
 
     this.running = true;
     this.providerAdmissionClosed = false;
+    this.guardSpillsClosed = false;
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -2049,6 +2051,7 @@ export class AgentFramework {
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
+    this.lifecycleGeneration++;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
 
@@ -2875,7 +2878,8 @@ export class AgentFramework {
     agent.toolResultGuard.setOverride(enabled);
     const guard = agent.toolResultGuard;
     guard.setHost({
-      spill: (label, text, branch) => this.spillWithheld(label, text, branch),
+      spill: (label, text, branch, deadline) => this.spillWithheld(label, text, branch, deadline),
+      deadline: () => Date.now() + this.withheldSpillDeadlineMs,
       track: (annotation) => {
         this.guardAnnotations.add(annotation);
         void annotation.finally(() => this.guardAnnotations.delete(annotation));
@@ -8538,7 +8542,7 @@ export class AgentFramework {
         requests = [...providerCooldown.heldRequests, ...requests];
       }
 
-      // Skip if agent is busy (inferring, streaming, or waiting for tools) —
+      // Skip if agent is busy (compiling, inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
       // goes idle at endTurn's reset while driveStream teardown is still
       // pending, and a successor turn dequeued in that gap compiles while the
@@ -8604,7 +8608,7 @@ export class AgentFramework {
       // Truthiness, not `!== null`: prototype-built harnesses (and any field
       // added later) leave the slot undefined, which must read as "not held".
       const surgeryHeld = !!this.surgeryHold;
-      if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+      if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.isCompilingRequest || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long.
         // Suppressed while quiesced: a drain-phase busy requeue is expected,
         // not a wedge tell.
@@ -9361,6 +9365,7 @@ export class AgentFramework {
     turnToken: number,
     ownsProviderGate: boolean,
   ): Promise<boolean> {
+    const lifecycle = this.lifecycleGeneration;
     const continuingTurn = resumesLogicalTurn(trigger?.reason);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
@@ -9656,11 +9661,12 @@ export class AgentFramework {
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
-      // The compile can wait for a withheld batch's annotation, up to the
-      // spill deadline (see ToolResultGuard.afterAnnotations), so check both
-      // again. Membrane's yielding stream starts its request when it is first
+      // The compile can wait for annotations (each batch has one spill
+      // deadline), so check ownership, admission, and the lifecycle again.
+      // A stop followed by start must not revive this earlier turn.
+      // Membrane's yielding stream starts its request when it is first
       // iterated, so cancelling it here, before driveStream, sends nothing.
-      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
         stream.cancel();
         agent.cancelStream();
         if (this.agents.get(agent.name) === agent) {
@@ -12087,23 +12093,28 @@ export class AgentFramework {
   }
 
   /**
-   * The guard's spill of a withheld original (agent-framework #277): the
-   * tool-results file, waited for at most withheldSpillDeadlineMs. A write
-   * still under way then is reported as unfinished at its path. Nothing waits
-   * for it after that, stop() included: it goes on by itself and may finish
-   * or fail after the workspace has stopped, and its record says only that
-   * it was unfinished. Until it settles, the workspace isn't answering, and no
-   * other write is started: each later spill, of any agent's batch, is
-   * reported unanswered at once, so a stalled mount costs one deadline. A
-   * write the workspace declines because it had left `branch` is reported
-   * as such, with no path, since no file was written. Once stop() has let the
-   * running annotations finish, no new write is started.
+   * A withheld original uses the remaining time in its batch's deadline.
+   * A write still under way at that deadline is reported as unfinished and
+   * continues independently, including after stop. From then until every
+   * overdue write settles, new withheld spills are workspace_unanswered.
+   * Writes from other batches can start before the first deadline fires.
+   * An exhausted batch starts no more writes even if none is overdue.
+   * The inline cap's spills use writeToolResultFile without this deadline.
    */
-  private async spillWithheld(label: string, text: string, branch: string): Promise<WithheldSpill> {
+  private async spillWithheld(label: string, text: string, branch: string,
+    deadline = Date.now() + this.withheldSpillDeadlineMs): Promise<WithheldSpill> {
     if (this.guardSpillsClosed) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
-    if (this.stalledSpills.size > 0) return { skipped: 'workspace_unanswered' };
+    if (this.stalledSpills.size > 0) {
+      console.error(`[spill] ${place.path} skipped: workspace_unanswered (${this.stalledSpills.size} withheld write(s) past deadline)`);
+      return { skipped: 'workspace_unanswered' };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      console.error(`[spill] ${place.path} skipped: batch_deadline`);
+      return { skipped: 'batch_deadline' };
+    }
     const write = this.writeToolResultFile(label, text, branch);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<'late'>((resolve) => {
@@ -12112,8 +12123,9 @@ export class AgentFramework {
         // spill that starts after it finds the workspace answering.
         const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => this.stalledSpills.delete(stalled));
         this.stalledSpills.add(stalled);
+        console.error(`[spill] ${place.path} still being written at the withheld batch deadline`);
         resolve('late');
-      }, this.withheldSpillDeadlineMs);
+      }, remaining);
       timer.unref?.();
     });
     try {
@@ -12153,7 +12165,9 @@ export class AgentFramework {
       // the stub or the truncation note sends there. The workspace
       // reports the disk failure itself (workspace:materialize-failed).
       if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
-        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${result.error}`);
+        const error = (result.error ?? 'disk copy failed').slice(0, 200);
+        this.emitTrace({ type: 'tool:spill_failed', label: safeLabel, path, contentLength: content.length, error });
+        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but its copy on disk failed: ${error}`);
         return { path };
       }
       // Declined, not failed: the store left the branch the file is for, so
@@ -16300,7 +16314,8 @@ export class AgentFramework {
           const destination = pathFor(image.rangeOffset);
           const bytes = Buffer.from(image.data, 'base64');
           const result = await workspace.writeBinary(destination, bytes, image.mediaType);
-          if (!result.success) {
+          const inChronicle = (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
+          if (!result.success && !inChronicle) {
             finish({
               success: false,
               error:
@@ -16314,6 +16329,10 @@ export class AgentFramework {
           }
           savedFiles.push({
             ...(result.data as Record<string, unknown>),
+            path: destination,
+            size: bytes.byteLength,
+            mimeType: image.mediaType,
+            ...(!result.success ? { diskCopyError: result.error ?? 'disk copy failed' } : {}),
             imageIndex: index + image.rangeOffset,
             ...image.receipt,
           });

@@ -147,6 +147,7 @@ async function startTurn(opts: {
   seedHistory?: (framework: AgentFramework) => void;
   toolResultInlineMaxChars?: number;
   world?: (module: SnapModule) => void;
+  workspace?: (workspace: WorkspaceModule) => void;
 }): Promise<Harness> {
   const tempDir = mkdtempSync(join(tmpdir(), opts.prefix));
   const mountDir = join(tempDir, 'mount');
@@ -180,6 +181,7 @@ async function startTurn(opts: {
     { type: 'image', source: { type: 'base64', data: GIF.toString('base64'), mediaType: 'image/gif' } },
   ] as ContentBlock[]);
   opts.seedHistory?.(framework);
+  opts.workspace?.(workspace);
   framework.start();
   framework.pushEvent({
     type: 'external-message',
@@ -814,3 +816,43 @@ describe('ToolImageLedger', () => {
     );
   });
 });
+
+for (const secondFails of [false, true]) {
+  it(`#281 round: a tree-only image save ${secondFails ? 'appears in a later failure receipt' : 'succeeds with a disk-copy warning'}`, async () => {
+    const h = await startTurn({
+      prefix: 'sri-tree-only-',
+      responses: [
+        [snapCall('call_snap')],
+        [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+        done,
+      ],
+      workspace: (workspace) => {
+        const write = workspace.writeBinary.bind(workspace);
+        let writes = 0;
+        workspace.writeBinary = async (...args) => {
+          if (++writes === 2 && secondFails) return { success: false, error: 'tree unavailable', isError: true };
+          const result = await write(...args);
+          assert.equal(result.success, true);
+          return { success: false, data: { inChronicle: true }, error: 'injected disk-copy failure', isError: true };
+        };
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      if (secondFails) {
+        assert.equal(result.isError, true);
+        assert.match(result.content, /tree unavailable/);
+        assert.match(result.content, /already saved: files\/images-0.png/);
+      } else {
+        const files = saved(result);
+        assert.equal(files.length, 2);
+        assert.equal(files[0].path, 'files/images-0.png');
+        assert.equal(files[0].inChronicle, true);
+        assert.match(String(files[0].diskCopyError), /injected disk-copy failure/);
+        assert.equal(files[0].size, PNG.byteLength);
+        assert.equal(files[0].mimeType, 'image/png');
+      }
+      assert.ok((await fileBytes(h, 'files/images-0.png'))?.equals(PNG));
+    } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+  });
+}

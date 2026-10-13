@@ -1455,8 +1455,16 @@ export class WorkspaceModule implements Module {
         return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
       }
       const blobHash = store.storeBlob(data, mimeType);
-      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
-      if (materializeError) {
+      let committed = false;
+      let materializeError: string | null;
+      try {
+        materializeError = await this.commitToolChange(mount, relativePath,
+          { kind: 'set', blobHash, size: data.byteLength }, () => { committed = true; });
+      } catch (error) {
+        if (!committed) throw error;
+        materializeError = error instanceof Error ? error.message : String(error);
+      }
+      if (materializeError !== null) {
         // The file is in the Chronicle tree, where the workspace's tools read
         // it; only its copy on disk failed. `inChronicle` lets a caller that
         // needs the file readable tell this from a write that never happened
@@ -1918,6 +1926,7 @@ export class WorkspaceModule implements Module {
     mount: MountState,
     relativePath: string,
     change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
+    onCommitted?: () => void,
   ): Promise<string | null> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
@@ -1927,6 +1936,9 @@ export class WorkspaceModule implements Module {
     const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
     if (change.kind === 'set') {
       store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+      // A later intent update or disk push can throw; the tree entry is
+      // already readable, even if the active branch changes during the push.
+      onCommitted?.();
       intents.update(relativePath, (cur) => {
         const next = { ...cur };
         delete next.tombstone;
