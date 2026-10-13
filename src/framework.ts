@@ -1143,8 +1143,10 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
     else {
       let json: string | undefined;
       try { json = failureJson(value); } catch { bounded[key] = describeFailure(value); continue; }
-      bounded[key] = json === undefined ? undefined
-        : json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
+      // A value JSON writes nothing for (a function, undefined) is left out,
+      // as the log's JSON leaves it out.
+      if (json === undefined) continue;
+      bounded[key] = json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
     }
   }
   return bounded;
@@ -2426,7 +2428,10 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
-      const reason = boundFailureText(error instanceof Error ? error.message : failureDescription(error));
+      // The alert cuts its own copies from the whole message, so the
+      // webhook's states the whole length.
+      const wholeReason = error instanceof Error ? String(error.message) : failureDescription(error);
+      const reason = boundFailureText(wholeReason);
       console.error(
         '[context-maintenance] pass failed:',
         reason,
@@ -2434,7 +2439,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-maintenance-failed',
         'framework',
-        reason,
+        wholeReason,
         { data: { scope: 'pass' } },
       );
     });
@@ -2493,12 +2498,13 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          record.error = boundFailureText(error instanceof Error ? error.message : failureDescription(error));
+          const wholeError = error instanceof Error ? String(error.message) : failureDescription(error);
+          record.error = boundFailureText(wholeError);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
             agent.name,
-            record.error,
+            wholeError,
             {
               data: {
                 scope: 'agent',
@@ -12884,8 +12890,8 @@ export class AgentFramework {
   ): void {
     // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
     // that isn't a string; it's described as a thrown value is, rather than
-    // thrown on.
-    const wholeMessage = typeof rawMessage === 'string' ? rawMessage : failureDescription(rawMessage);
+    // thrown on (a string is its own description).
+    const wholeMessage = failureDescription(rawMessage);
     const message = boundFailureText(wholeMessage);
     // The caller's data goes to failures.log and to trace listeners, bounded
     // the same way for both. A JavaScript caller's null is no data, and data

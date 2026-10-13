@@ -408,6 +408,7 @@ test("a thrown value that isn't an Error logs its own text, or its JSON when its
     ['an object with no fields but its tag', { [Symbol.toStringTag]: 'ZzTagged' }, '[object ZzTagged]'],
     ['an object whose String is empty', { toString: () => '' }, '[object Object]'],
     ['an object with neither a String nor fields', Object.create(null), '[object Object]'],
+    ['an object whose JSON is nothing', { toJSON: () => undefined }, '[object Object]'],
   ];
   for (const [what, thrown, logged] of cases) {
     assert.equal(await kickedWith(thrown), `${prefix}${logged}`, what);
@@ -558,19 +559,46 @@ test('a provider hold keeps a bounded reason, and a failed resume logs the bound
   assert.match(line, /\n {4}at /);
 });
 
+/** Runs `body` with the ops webhook set and fetch stubbed; returns what it posted. */
+async function withWebhook(body: () => Promise<void> | void): Promise<string[]> {
+  const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+  const realFetch = globalThis.fetch;
+  const posted: string[] = [];
+  process.env.CONNECTOME_OPS_WEBHOOK = 'http://zz.invalid/hook';
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    posted.push(JSON.parse(String(init?.body)).content);
+    return new Response(null);
+  }) as typeof fetch;
+  try {
+    await body();
+  } finally {
+    globalThis.fetch = realFetch;
+    if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK;
+    else process.env.CONNECTOME_OPS_WEBHOOK = hook;
+  }
+  return posted;
+}
+
 test('a failed maintenance pass logs and alerts a bounded reason', async () => {
   const { fw, traces, rawArgs, restore } = makeHarness();
   fw.running = true;
   fw.maintenancePass = null;
-  fw.runQueuedMaintenance = async () => { throw hugeProviderError(); };
-  try {
-    fw.startQueuedMaintenance();
-    await settle();
-  } finally { restore(); }
+  const error = hugeProviderError();
+  fw.runQueuedMaintenance = async () => { throw error; };
+  const posted = await withWebhook(async () => {
+    try {
+      fw.startQueuedMaintenance();
+      await settle();
+    } finally { restore(); }
+  });
   assert.match(assertBoundedStrings(rawArgs, '[context-maintenance] pass failed:'), /pass failed: Bad request: zz-head/);
   const alert = traces.find((t) => t.type === 'ops:alert' && t.kind === 'context-maintenance-failed');
   assert.ok(alert && alert.message.length <= 2_000);
   assert.deepEqual(alert.data, { scope: 'pass' });
+  // The webhook's copy is cut from the whole message, so it states its length.
+  const webhook = '\u{1F6A8} **framework** context-maintenance-failed: ';
+  assert.ok(posted[0]?.startsWith(webhook), posted[0]?.slice(0, 80));
+  assertCut(error.message, posted[0].slice(webhook.length), 500, 'maintenance webhook');
 
   // A thrown value that isn't an Error is described as the other logs
   // describe one, with no String() to throw on it.
@@ -625,26 +653,14 @@ test('alert data of null, from a JavaScript caller, is no data: the alert is sti
 });
 
 test('an alert message that is not a string, from a JavaScript caller, is described as a thrown value is', async () => {
-  const hook = process.env.CONNECTOME_OPS_WEBHOOK;
-  const realFetch = globalThis.fetch;
-  const posted: string[] = [];
-  process.env.CONNECTOME_OPS_WEBHOOK = 'http://zz.invalid/hook';
-  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
-    posted.push(JSON.parse(String(init?.body)).content);
-    return new Response(null);
-  }) as typeof fetch;
   const { fw, traces, logged, restore } = makeHarness();
-  try {
-    fw.notifyOpsAlert('zz-untyped', 'cairn', undefined, { count: 1 });
-    // One with no String of its own, which String() throws on.
-    fw.notifyOpsAlert('zz-bare', 'cairn', Object.assign(Object.create(null), { code: 'zz_bare' }));
-    await settle();
-  } finally {
-    restore();
-    globalThis.fetch = realFetch;
-    if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK;
-    else process.env.CONNECTOME_OPS_WEBHOOK = hook;
-  }
+  const posted = await withWebhook(() => {
+    try {
+      fw.notifyOpsAlert('zz-untyped', 'cairn', undefined, { count: 1 });
+      // One with no String of its own, which String() throws on.
+      fw.notifyOpsAlert('zz-bare', 'cairn', Object.assign(Object.create(null), { code: 'zz_bare' }));
+    } finally { restore(); }
+  });
   assert.deepEqual(traces.filter((t) => t.type === 'ops:alert').map((t) => t.message), ['undefined', '{"code":"zz_bare"}']);
   assert.deepEqual(logged, [
     { agent: 'cairn', kind: 'zz-untyped', reason: 'undefined', count: 1 },
@@ -700,6 +716,8 @@ test('alert data is bounded field by field, on the trace and the failures.log re
       held: new Map([['zz', echo()]]), at: new Date(0),
       // An Error inside a value is its projection too, in an array as well.
       wrapped: { cause: new Error('zz-small'), list: [new Error('zz-item')] },
+      // A value JSON writes nothing for is left out, as the log's JSON leaves it out.
+      callback: () => 'zz',
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
@@ -709,6 +727,7 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     // It is cut once, so its marker states the head and the whole message.
     assertCut(`${HUGE_ERROR_HEAD}: ${error.message}`, fields.error, 2_000, `${sink}: error`);
     assert.deepEqual(fields.wrapped, { cause: 'Error: zz-small', list: ['Error: zz-item'] }, `${sink}: nested Errors`);
+    assert.equal('callback' in fields, false, `${sink}: a function is left out`);
     // A value whose JSON is too long becomes its JSON, bounded.
     assert.equal(typeof fields.nested, 'string', `${sink}: nested`);
     assert.ok(fields.nested.length <= 2_000 && fields.nested.startsWith('{"items":[{"i":0,'), `${sink}: nested`);
@@ -1032,43 +1051,63 @@ test('an ephemeral run rejects with the bounded failure text', async () => {
   }
 });
 
-class HugeFailureStrategy implements ContextStrategy {
-  readonly name = 'huge-failure-maintenance-test';
+class FailingStrategy implements ContextStrategy {
+  readonly name = 'failing-maintenance-test';
+  constructor(private readonly make: () => unknown) {}
   checkReadiness(): ReadinessState { return { ready: false, description: 'compression blocked' }; }
-  async tick(_ctx: StrategyContext): Promise<void> { throw hugeProviderError(); }
+  async tick(_ctx: StrategyContext): Promise<void> { throw this.make(); }
   select(_store: MessageStoreView, _log: ContextLogView, _budget: TokenBudget): ContextEntry[] { return []; }
 }
 
-test('a ~1 MB maintenance failure: bounded record, ops alert and stderr', async () => {
+/** A real framework's first maintenance pass, its agent's tick throwing `make()`, with the ops webhook set. */
+async function runFailingMaintenance(make: () => unknown) {
   const dir = mkdtempSync(join(tmpdir(), 'af-failure-bounds-'));
   const cwd = process.cwd();
   process.chdir(dir);
   const { errs, rawArgs, restore } = spyConsoleError();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new HugeFailureStrategy() }],
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new FailingStrategy(make) }],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 10,
   });
   const traces: any[] = [];
   framework.onTrace((e) => traces.push(e));
   try {
-    framework.start();
-    const deadline = Date.now() + 5_000;
-    while (framework.getContextMaintenanceSnapshot().history.length === 0 && Date.now() < deadline) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    }
-    const record = framework.getContextMaintenanceSnapshot().history[0].agents[0];
-    assert.ok(typeof record.error === 'string' && record.error.length <= 2_000, `maintenance record error is ${record.error?.length} chars`);
-    assert.match(record.error!, /^Bad request: zz-head/);
-    const alert = traces.find((t) => t.type === 'ops:alert' && t.kind === 'context-maintenance-failed');
-    assert.ok(alert && alert.message.length <= 2_000);
-    const longest = errs.reduce((max, e) => Math.max(max, e.length), 0);
-    assert.ok(longest < 4_500, `longest stderr line is ${longest} chars`);
-    assertNoObjectPrinted(rawArgs);
+    let record: any;
+    const posted = await withWebhook(async () => {
+      framework.start();
+      const deadline = Date.now() + 5_000;
+      while (framework.getContextMaintenanceSnapshot().history.length === 0 && Date.now() < deadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      record = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+    });
+    return { record, traces, errs, rawArgs, posted };
   } finally {
     await framework.stop();
     restore();
     process.chdir(cwd);
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+test('a ~1 MB maintenance failure: bounded record, ops alert and stderr', async () => {
+  const error = hugeProviderError();
+  const { record, traces, errs, rawArgs, posted } = await runFailingMaintenance(() => error);
+  assert.ok(typeof record.error === 'string' && record.error.length <= 2_000, `maintenance record error is ${record.error?.length} chars`);
+  assert.match(record.error, /^Bad request: zz-head/);
+  const alert = traces.find((t) => t.type === 'ops:alert' && t.kind === 'context-maintenance-failed');
+  assert.ok(alert && alert.message.length <= 2_000);
+  const longest = errs.reduce((max, e) => Math.max(max, e.length), 0);
+  assert.ok(longest < 4_500, `longest stderr line is ${longest} chars`);
+  assertNoObjectPrinted(rawArgs);
+  // The webhook's copy is cut from the whole message, so it states its length.
+  const webhook = '\u{1F6A8} **agent** context-maintenance-failed: ';
+  const content = posted.find((c) => c.startsWith(webhook));
+  assert.ok(content, 'the webhook posted the alert');
+  assertCut(error.message, content.slice(webhook.length), 500, 'maintenance webhook');
+
+  // A thrown value that isn't an Error is described as the other logs describe one.
+  const bare = await runFailingMaintenance(() => Object.assign(Object.create(null), { code: 'zz_bare' }));
+  assert.equal(bare.record.error, '{"code":"zz_bare"}');
 });
