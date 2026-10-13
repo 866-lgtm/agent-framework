@@ -41,7 +41,7 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
+       * The turn-frozen outbound locus (TurnRouting.locus) — the channel this
        * turn's plain prose will be routed to. Omitted for turns with no locus
        * (heartbeats with no default channel). Observability only, like every
        * trace field; lets external taps (e.g. a TTS relay) tag the whole

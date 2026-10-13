@@ -21,8 +21,8 @@
  *
  * Three modes, mirroring proseRouting:
  *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
- *              one that resumes a turn starts at the turn's destination, and
- *              each round's end returns the stream to it (retarget).
+ *              a later stream of the turn starts at the turn's destination,
+ *              and each round's end returns the stream to it (retarget).
  *  - hybrid:   parse `>>>` envelopes, with the frozen turn locus as the
  *              fallback. An envelope with no target, or `>>>skip_reply`,
  *              holds back what follows until a later `>>>` names a target.
@@ -54,7 +54,7 @@ export class ProseStreamRouter {
       mode: 'explicit' | 'hybrid' | 'locus';
       /** Initial destination: the frozen turn locus (locus and hybrid mode); in
        *  explicit mode, null on a fresh turn, or the turn's destination on a
-       *  stream that resumes one. */
+       *  later stream of the turn. */
       initialTarget: string | null;
       /** Resolve a `>>spec` to a channelId, or null (unresolved/ambiguous). */
       resolve: (spec: string) => string | null;

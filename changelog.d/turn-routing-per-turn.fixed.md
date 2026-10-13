@@ -29,9 +29,8 @@
   every start that routes prose while it is open continues it: a framework
   retry, the start that consumes unstreamed tool results (whichever wake
   the scheduler starts it with), the later start a provider-capacity hold
-  defers a turn to. Each begins the sticky destination and hybrid's hold
-  afresh, as before, but a ` !` asked for earlier in the turn still stands,
-  in explicit mode too, and in hybrid and locus mode the receipt at the
+  defers a turn to. A ` !` asked for earlier in the turn still stands, in
+  explicit mode too, and in hybrid and locus mode the receipt at the
   turn's end reports every stream's deliveries, including ones that land
   after a new stream began. Before, explicit mode dropped that ` !`, and the
   receipt counted only the deliveries that landed after the new start.

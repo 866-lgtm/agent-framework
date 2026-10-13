@@ -23,7 +23,9 @@ A prose segment's FIRST line may carry a routing prefix:
 
 - Body may start on the same line (`>>#ops deploy done`) or the next.
 - **Sticky within the turn:** the first resolved target applies to later
-  unprefixed segments of the SAME turn. Cross-turn, nothing is implicit.
+  unprefixed segments of the SAME turn, including those a later stream of it
+  writes, such as a framework retry's, a budget restart's or the compile a
+  provider-capacity hold defers the turn to. Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
   ends, instead of the default pause-until-next-event. Gives prose the same

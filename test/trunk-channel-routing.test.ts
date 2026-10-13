@@ -25,10 +25,10 @@ import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
-/** Reach the private per-turn triggering-channel map + the pure channel-deriver. */
+/** Reach the private per-turn routing state (its triggering channel) + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    activeTriggerChannels: Map<string, string>;
+    turnRouting: Map<string, { triggerChannel?: string }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -314,7 +314,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     assert.equal(membrane.calls.length, 1, 'the trunk should have run one turn');
     assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
+      internals(framework).turnRouting.get('scout')?.triggerChannel,
       'discord:guild:chanA',
       'the turn must be routed to the channel that triggered it',
     );
@@ -330,7 +330,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     assert.equal(membrane.calls.length, 1, 'the trunk should wake for the DM');
     assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
+      internals(framework).turnRouting.get('scout')?.triggerChannel,
       'discord:dm:42',
       'the DM reply must route to the DM channel, not the global locus',
     );
@@ -346,7 +346,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans A' }]));
     framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
     await framework.runUntilIdle();
-    assert.equal(i.activeTriggerChannels.get('scout'), 'discord:guild:chanA');
+    assert.equal(i.turnRouting.get('scout')?.triggerChannel, 'discord:guild:chanA');
 
     // ...then a DM turn OVERWRITES it — the next turn's reply must never inherit
     // the previous turn's channel (the concurrency hazard this fix removes).
@@ -355,9 +355,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 2, 'both turns should have run');
     assert.equal(
-      i.activeTriggerChannels.get('scout'),
+      i.turnRouting.get('scout')?.triggerChannel,
       'discord:dm:42',
-      'the map must reflect the CURRENT turn’s channel, not chanA',
+      'the routing state must reflect the CURRENT turn’s channel, not chanA',
     );
     await framework.stop();
   });
@@ -371,7 +371,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     // turn (an InferenceRequest with no channelId). startAgentStream must clear
     // the entry up front so routeSpeech falls back to the global locus rather
     // than replaying the stale channel.
-    i.activeTriggerChannels.set('scout', 'discord:guild:stale');
+    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:stale' });
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as {
       startAgentStream(agent: unknown, trigger?: unknown): Promise<void>;
@@ -381,8 +381,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
 
     assert.equal(
-      i.activeTriggerChannels.has('scout'),
-      false,
+      i.turnRouting.get('scout')?.triggerChannel,
+      undefined,
       'a no-trigger turn must clear any stale triggering channel',
     );
     await framework.stop();

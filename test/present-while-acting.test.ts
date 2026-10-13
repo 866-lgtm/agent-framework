@@ -30,10 +30,12 @@ import type {
   ToolDefinition,
   ToolCall,
   ToolResult,
+  InferenceRequest,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
 // ---------------------------------------------------------------------------
 // Test module: tools that optionally emit a mid-turn external message
@@ -413,13 +415,13 @@ describe('present while acting', () => {
     };
     // Simulate an explicit send into #portables earlier in THIS turn (the
     // production record happens on the MCPL send path; the harness module's
-    // tools are not MCPL, so seed the turn-scoped set mid-turn — after the
-    // turn-start clear, before the injection boundary).
+    // tools are not MCPL, so seed the turn's engaged set mid-turn — after
+    // the turn opens, before the injection boundary).
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
       (framework as unknown as {
-        turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:portables']));
+        turnRouting: Map<string, { engaged: Set<string> }>;
+      }).turnRouting.get('assistant')!.engaged.add('discord:guild:portables');
       return origHandle(call);
     };
 
@@ -457,8 +459,8 @@ describe('present while acting', () => {
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
       (framework as unknown as {
-        turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:hospital']));
+        turnRouting: Map<string, { engaged: Set<string> }>;
+      }).turnRouting.get('assistant')!.engaged.add('discord:guild:hospital');
       return origHandle(call);
     };
 
@@ -532,6 +534,177 @@ describe('present while acting', () => {
 
     await framework.stop();
   });
+
+  // -------------------------------------------------------------------------
+  // A start that continues the turn keeps its locus
+  // -------------------------------------------------------------------------
+  // A framework retry, the compile a capacity hold defers a turn to, and the
+  // re-inference on unstreamed tool results each continue the logical turn:
+  // the locus stays where the turn decided, re-pins included. A wake that
+  // arrived after the turn opened can still move it by the mid-turn re-pin
+  // rule: addressed, or from a channel the turn engaged.
+
+  /** Make stream `index` (1-based) end with `error` instead of completing. */
+  function failStream(index: number, error: (request: NormalizedRequest) => Error): void {
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const n = ++streams;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && n === index) {
+            yield { type: 'error' as const, error: error(request) };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+  }
+
+  /** Feed a response to the Nth turn start (1-based) the moment it begins. */
+  function feedStart(framework: AgentFramework, start: number, blocks: ContentBlock[]): void {
+    let starts = 0;
+    framework.onTrace((event) => {
+      if (event.type === 'inference:started' && ++starts === start) membrane.pushResponse(createMockResponse(blocks));
+    });
+  }
+
+  const routingNotices = (framework: AgentFramework): string[] =>
+    framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+
+  it("a framework retry keeps the turn's locus, a mid-turn re-pin included", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question for you';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+    failStream(1, () => new Error('synthetic transient stream error'));
+    feedStart(framework, 2, [{ type: 'text', text: 'Answering after the retry.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'the error was retried');
+    assert.deepEqual(routed, [
+      { text: 'Answering after the retry.', locus: 'discord:dm:antra' },
+    ], 'the retry speaks where the re-pin moved the turn, not at a re-resolved locus');
+
+    await framework.stop();
+  });
+
+  for (const [label, arrival, expected] of [
+    ['an addressed message from another channel moves the locus there, with the notice',
+      { channelId: 'discord:dm:antra', addressed: true }, 'discord:dm:antra'],
+    ['ambient traffic in another channel leaves the locus where it was',
+      { channelId: 'discord:guild:lounge', addressed: false }, 'chan-live-1'],
+  ] as const) {
+    it(`during a capacity hold, ${label}`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'On it.' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+      module.toolDelayMs = 25;
+      const internals = framework as unknown as {
+        pendingRequests: InferenceRequest[];
+        providerAccelerationCooldowns: Map<string, unknown>;
+        releaseProviderAccelerationCooldown(agentName: string): void;
+      };
+      failStream(1, (request) => new MembraneError({
+        type: 'rate_limit', retryable: true, httpStatus: 429,
+        message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+        rawError: { status: 429 }, rawRequest: request,
+      }));
+      feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
+
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.ok(internals.providerAccelerationCooldowns.has('assistant'), 'the turn is held');
+      // A message arrives during the hold; its wake waits with the turn's.
+      internals.pendingRequests.push({
+        agentName: 'assistant', reason: 'channel-message', source: 'test', timestamp: Date.now(), ...arrival,
+      } as InferenceRequest);
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 1, 'the arrival waits in the hold');
+      // What the cooldown's timer does when it fires.
+      internals.releaseProviderAccelerationCooldown('assistant');
+      await framework.runUntilIdle();
+
+      assert.equal(membrane.calls.length, 2, 'one deferred compile');
+      assert.deepEqual(routed, [
+        { text: 'On it.', locus: 'chan-live-1' },
+        { text: 'Here is the rest.', locus: expected },
+      ]);
+      const moved = routingNotices(framework).filter((t) => t.includes('The conversation moved to'));
+      assert.deepEqual(moved, arrival.addressed
+        ? ['[routing] The conversation moved to discord:dm:antra — your plain speech now lands there for the rest of this turn. Other channels need an explicit send tool.']
+        : [], arrival.addressed ? 'the re-pin tells the agent' : 'no re-pin, so no notice');
+
+      await framework.stop();
+    });
+  }
+
+  for (const [label, arrivals, expected] of [
+    ['keeps the turn\'s locus', [], 'chan-turn'],
+    ['moves it to the newest addressed arrival', [
+      { channelId: 'discord:dm:antra', addressed: true, at: 1 },
+      { channelId: 'discord:dm:q', addressed: true, at: 2 },
+    ], 'discord:dm:q'],
+    ['moves it to a follow-up in a channel the turn engaged', [
+      { channelId: 'discord:guild:portables', addressed: false, at: 1 },
+    ], 'discord:guild:portables'],
+    ['leaves it for an addressed wake from before the turn opened', [
+      { channelId: 'discord:dm:antra', addressed: true, at: -1 },
+    ], 'chan-turn'],
+  ] as const) {
+    it(`a re-inference on unstreamed tool results ${label}`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+      type Routing = { locus?: string; engaged: Set<string>; openedAt: number; [field: string]: unknown };
+      const internals = framework as unknown as {
+        turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
+      };
+      // The turn's earlier stream left its tool results pending for the
+      // non-streaming fallback's re-inference. The turn opened at `openedAt`,
+      // froze `chan-turn` as its locus, and sent into #portables.
+      const openedAt = Date.now() - 10_000;
+      const open: Routing = {
+        locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']), openedAt,
+        destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
+      };
+      internals.turnRouting.set('assistant', open);
+      internals.openLogical.set('assistant', open);
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
+      for (const { at, ...wake } of arrivals) {
+        internals.pendingRequests.push({
+          agentName: 'assistant', reason: 'channel-message', source: 'test', timestamp: openedAt + at * 1000, ...wake,
+        } as InferenceRequest);
+      }
+
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed, [{ text: 'Carrying on.', locus: expected }]);
+      const moved = routingNotices(framework).filter((t) => t.includes('The conversation moved to'));
+      assert.equal(moved.length, expected === 'chan-turn' ? 0 : 1, 'a re-pin leaves its notice');
+
+      await framework.stop();
+    });
+  }
 
   it('a prose turn ends with a [delivered] receipt naming where the prose landed', async () => {
     // Explicit sends receipt themselves via tool_result; auto-routed prose
