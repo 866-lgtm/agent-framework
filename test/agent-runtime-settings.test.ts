@@ -950,24 +950,38 @@ describe('a reached budget across a restart', () => {
   });
 
   it("the fallback runs once: if the recipe's budget is refused too, its compile reports that refusal", { timeout: 20_000 }, async () => {
-    await run(async (h) => {
-      const restarted = await provenAtBoot(h, 60_000);
-      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
-      const planned: number[] = [];
-      const log = quietErrors();
-      try {
-        await withPatched('compile', async function (this: unknown, budget?: { maxTokens: number }) {
-          planned.push(budget?.maxTokens ?? -1);
-          throw refusal;
-        }, async () => {
-          await assert.rejects(compile(restarted), /over budget/);
-        });
-      } finally {
-        log.restore();
-      }
-      assert.deepEqual(planned, [60_000, 100_000], 'one fallback, then the refusal at the recipe\'s budget');
-      assert.equal(budgets(restarted).target, 60_000, 'the descent to the boot budget stays armed');
-    });
+    // Restored paced, and kept set where the strategy can't prepare a smaller window.
+    for (const canPace of [true, false]) {
+      await run(async (h) => {
+        const restarted = await provenAtBoot(h, 60_000);
+        if (!canPace) {
+          const cm = restarted.getAgent('agent')!.getContextManager() as unknown as {
+            updateHotContextSettings: (update: { preparedWindowTokens?: number | null }) => unknown;
+          };
+          const hot = cm.updateHotContextSettings.bind(cm);
+          cm.updateHotContextSettings = (update) => {
+            if (typeof update.preparedWindowTokens === 'number') throw new Error('no smaller window here');
+            return hot(update);
+          };
+        }
+        const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+        const planned: number[] = [];
+        const log = quietErrors();
+        try {
+          await withPatched('compile', async function (this: unknown, budget?: { maxTokens: number }) {
+            planned.push(budget?.maxTokens ?? -1);
+            throw refusal;
+          }, async () => {
+            await assert.rejects(compile(restarted), /over budget/);
+          });
+        } finally {
+          log.restore();
+        }
+        assert.deepEqual(planned, [60_000, 100_000], `one fallback, then the refusal at the recipe's budget (canPace ${canPace})`);
+        assert.equal(log.lines.filter((l) => l.includes('the context manager refused')).length, 1, `one fallback line (canPace ${canPace})`);
+        assert.equal(budgets(restarted).target, 60_000, 'the boot budget stays set');
+      });
+    }
   });
 
   it('a budget at or above the recipe\'s, applied at once at boot, has no paced restore to fall back to: its refusal is the compile\'s', async () => {
