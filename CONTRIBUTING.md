@@ -140,6 +140,11 @@ never do.
   consumers run github-clone checkouts, so release notes must exist even
   when npm publish fails. Version bumps are a maintainer release-time
   action, not part of feature PRs.
+- **Release holds.** When releasing `main` as it stands would harm
+  someone running it, open an issue that says what has to happen first,
+  label it `release-hold`, and close it once that's happened. While one is
+  open, `npm version` stops before it bumps anything, and the publish
+  workflow refuses the tag.
 
 ## Building and testing
 
