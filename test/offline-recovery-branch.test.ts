@@ -512,13 +512,20 @@ test('an offline recovery onto an existing branch is refused before any intent, 
     try {
       await assert.rejects(
         createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
-        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created fresh2/,
+        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created fresh2, and until then a branch with that name is refused unless the batch is cancelled first \(--awareness cancel \S+\)/,
       );
     } finally {
       ContextManager.prototype.branchAt = branchAt;
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded', 'prepared'] });
+    // A retry under the same name is refused while the batch is prepared, and
+    // the refusal says how to cancel it: the retry's branch would arm it.
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
+      /^Error: Recovery branch fresh2 is the target of awareness batch (\S+), which is still prepared: a branch made under that name would arm it at the next start\. Cancel the batch first \(--awareness cancel \1\), or choose another --branch$/,
+    );
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded', 'prepared'] }, 'the refusal prepared nothing');
     const reopened = JsStore.open({ path: storePath });
     try {
       const exists = (name: string) => reopened.listBranches().some((branch) => branch.name === name);
@@ -528,6 +535,11 @@ test('an offline recovery onto an existing branch is refused before any intent, 
     } finally {
       reopened.close();
     }
+    // Retired by that start, the batch no longer claims the name.
+    const retried = await createOfflineRecoveryBranch({
+      storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2',
+    });
+    assert.equal(retried.targetBranch, 'fresh2');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

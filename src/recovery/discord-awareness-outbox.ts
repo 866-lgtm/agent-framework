@@ -623,7 +623,7 @@ export class DiscordAwarenessOutbox {
       // Durable before the surgery's switch, so startup can crash-complete it.
       this.append([{ t: 'batch', at: batch.createdAt, batch }], { durable: true });
     } catch (error) {
-      throw new Error(this.failedPrepare(batch.id, error), { cause: error });
+      throw new Error(this.failedPrepare(batch, error), { cause: error });
     }
     return { ...structuredClone(batch), status: 'prepared' };
   }
@@ -631,24 +631,50 @@ export class DiscordAwarenessOutbox {
   /**
    * What a prepare whose write failed leaves, for the surgery's error (the
    * surgery then doesn't run): nothing; the batch, retired at once when it is
-   * in this process's view; or, after a write that failed inside the store, a
-   * batch this process can't see, which the next start retires: its surgery
-   * never created its target branch, so none of its messages were removed.
+   * in this process's view; or a batch left prepared, which the next start
+   * retires, since its surgery never created its target branch and so none
+   * of its messages were removed. Until then a branch made under that name
+   * would arm it. Where this process can read the batch, every way the
+   * framework makes a branch refuses that name until the batch is cancelled
+   * (preparedFor). After a write that failed inside the store it can't, so
+   * the error says to use another name.
    */
-  private failedPrepare(batchId: string, error: unknown): string {
-    const detail = `recording awareness batch ${batchId} failed: ${errorText(error)}`;
-    const retired = 'the next start retires it, since its surgery never created its branch';
+  private failedPrepare(batch: DiscordAwarenessBatchRecord, error: unknown): string {
+    const detail = `recording awareness batch ${batch.id} failed: ${errorText(error)}`;
+    const retired = `the next start retires it, since its surgery never created ${batch.targetBranch}`;
+    const unseen = `, and until then a branch named ${batch.targetBranch} would arm it, so use another name`;
     if (this.journal.needsReopen) {
       return `${detail}; the batch may be in the store, unseen until the store is reopened, ` +
-        `and if so ${retired}`;
+        `and if so ${retired}${unseen}`;
     }
     if (!this.journal.needsReconcile) return detail;
     try {
-      return this.discard(batchId) ? `${detail}; it reached the journal and is retired` : detail;
+      return this.discard(batch.id) ? `${detail}; it reached the journal and is retired` : detail;
     } catch (retireError) {
       return `${detail}; it reached the journal, and retiring it also failed (${errorText(retireError)}), ` +
-        `so ${retired}`;
+        `so ${retired}${this.journal.needsReopen ? unseen : ', and until then a branch with that name is refused unless the batch is cancelled first'}`;
     }
+  }
+
+  /**
+   * The prepared batches, not cancelled, whose target is `branch`. Startup
+   * completes such a batch when its target is the active branch, and only
+   * the batch's own surgery may make that branch: one made under its name by
+   * anything else would mark messages it never removed. So the framework
+   * refuses a new branch with such a name (checkDiscordAwarenessBranchName),
+   * as does the offline recovery. Reads the journal, so it throws when the
+   * journal can't be read.
+   */
+  preparedFor(branch: string): DiscordAwarenessBatch[] {
+    return [...this.load().batches.values()]
+      .filter((batch) => batch.status === 'prepared' && !batch.cancelled && batch.targetBranch === branch)
+      .map((batch) => structuredClone(batch));
+  }
+
+  /** Whether this process can read the journal: not after a write that
+   *  failed inside the store, until the store is reopened (see load). */
+  get readable(): boolean {
+    return !this.journal.needsReopen;
   }
 
   /**
@@ -826,9 +852,10 @@ export class DiscordAwarenessOutbox {
    *   it counts toward the bound: `givenUp` is how many operations it
    *   brought there, which won't be sent again;
    * - a prepared batch whose target branch doesn't exist (`branchExists`,
-   *   when given) is retired: its surgery ended before it created that
-   *   branch, which is its body change, so nothing it would mark was
-   *   removed;
+   *   when given) is retired, since none of its marks apply. Either its
+   *   surgery ended before it created that branch, which is its body change,
+   *   so nothing it would mark was removed, or the branch was deleted later
+   *   (the API's `branch.delete`), and its removals with it;
    * - a prepared batch whose target is exactly the active branch completes
    *   its crash window (activated), except a suppression, whose resume
    *   completes its body first;

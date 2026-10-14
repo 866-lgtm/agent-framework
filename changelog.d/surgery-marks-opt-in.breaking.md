@@ -63,9 +63,11 @@
   for a host to start the marks' delivery after its own branch moves. It is
   removed: a branch move adds or removes no marks now, so there is nothing
   for it to start. Queued work is delivered in the background on its own,
-  after a surgery and on a connect, a reconnect or a tools list change;
-  `syncDiscordAwarenessMarkers()` delivers what is queued now and waits for
-  that pass.
+  after a surgery, an operator's retract or release, and on a connect, a
+  reconnect or a tools list change. `syncDiscordAwarenessMarkers()`
+  delivers what is queued now and waits for that pass. Once `stop()` has
+  begun it rejects, where the removed method logged and returned, so await
+  it, or catch its refusal.
 - **`createOfflineRecoveryBranch` and `agent-framework-recover`:** the result
   (and the CLI's JSON output) no longer has `outboxPath`, since the journal is
   in the store. `discordMarkersQueued` is the marks queued (planned, for a dry

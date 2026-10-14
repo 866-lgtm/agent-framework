@@ -446,7 +446,7 @@ test('startup records a crash-completion activation only after syncing the store
   assert.deepEqual(h.reopen().recoverAtStartup('rollback/cairn/1').activated, [batch.id]);
 }));
 
-test('startup retires a prepared batch whose surgery never created its target branch, and says why it holds the others', withJournal((outbox, h) => {
+test('startup retires a prepared batch whose target branch doesn\'t exist, and says why it holds the others', withJournal((outbox, h) => {
   const prepare = (sourceBranch: string, targetBranch: string, messageId: string) => outbox.prepare({
     agentName: 'cairn', sourceBranch, targetBranch, refs: [ref(messageId)], scope: 'all',
   })!;
@@ -1606,11 +1606,33 @@ test('a prepare whose write failed says what the journal may hold, and retires a
   // Written but out of this view: the next start retires it, since its
   // surgery never created its branch, and the error says so.
   seams.fail('append', 'unindexed', () => true);
-  assert.throws(() => outbox.prepare(input(2)), /may be in the store, unseen until the store is reopened, and if so the next start retires it, since its surgery never created its branch/);
+  assert.throws(() => outbox.prepare(input(2)), /may be in the store, unseen until the store is reopened, and if so the next start retires it, since its surgery never created rollback\/cairn\/2, and until then a branch named rollback\/cairn\/2 would arm it, so use another name$/);
   const fresh = new DiscordAwarenessOutbox(h.store);
   const recovered = fresh.recoverAtStartup('main', (name) => name === 'main');
   assert.equal(recovered.retired.length, 1);
   assert.deepEqual(recovered.held, []);
+}));
+
+test('a prepare whose write and retirement both failed leaves its branch name claimed until the batch is cancelled', withJournal((_outbox, h) => {
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store);
+  outbox.batches();
+  // The record reached this view and its durability barrier failed; the
+  // retirement that follows fails at the sync before its write, which leaves
+  // the journal readable here.
+  seams.fail('sync', 'before', rightAfterAppend);
+  seams.fail('sync', 'before', (calls) => calls.filter((call) => call === 'sync').length === 1);
+  assert.throws(
+    () => outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'fix-1', refs: [ref('m1')], scope: 'all' }),
+    /recording awareness batch \S+ failed: injected sync failure; it reached the journal, and retiring it also failed \(injected sync failure\), so the next start retires it, since its surgery never created fix-1, and until then a branch with that name is refused unless the batch is cancelled first$/,
+  );
+  // This process reads the batch, so the framework's name check can refuse fix-1.
+  const [claimed] = outbox.preparedFor('fix-1');
+  assert.equal(claimed?.status, 'prepared');
+  assert.deepEqual(outbox.preparedFor('fix-2'), []);
+  outbox.cancel(claimed.id);
+  assert.deepEqual(outbox.preparedFor('fix-1'), [], 'a cancelled batch claims no name');
+  assert.equal(outbox.batches()[0].status, 'prepared', 'cancelled, it stays prepared and is never activated');
 }));
 
 test('an operation\'s status says first what Discord may have: an add on the wire that a retract superseded is dispatching, then unknown', withJournal((outbox, h) => {

@@ -26,6 +26,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
+import { ApiServer } from '../src/api/server.js';
 import { DISCORD_AWARENESS_RECORD_TYPE } from '../src/recovery/discord-awareness-outbox.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -596,7 +597,7 @@ describe('surgery and awareness marks', () => {
     try {
       await assert.rejects(
         framework.suppressMessages('resident', { messageIds: [removed[0]], marks: { scope: 'all' } }),
-        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created \S+: injected fork failure$/,
+        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created \S+, and until then a branch with that name is refused unless the batch is cancelled first: injected fork failure$/,
       );
     } finally {
       live.fork = realFork;
@@ -730,6 +731,52 @@ describe('surgery and awareness marks', () => {
       /Suppression branch taken already exists/,
     );
     assert.equal(outbox().batches().length, 0);
+  });
+
+  it('a branch name a prepared batch names is refused until the batch is cancelled, so no other surgery arms it', async () => {
+    await start(true);
+    const { tail, removed } = seed(3);
+    const sourceBranch = cm().currentBranch().name;
+    // What a failed or crashed attempt leaves: its batch prepared, and its
+    // surgery never having made fix-1.
+    const first = outbox().prepare({
+      agentName: 'resident', sourceBranch, targetBranch: 'fix-1',
+      refs: [0, 1, 2].map((i) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: `amb-${i}` })),
+      scope: 'all',
+    })!;
+    const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+      && error.message === `Branch fix-1 is the target of awareness batch ${first.id}, which is still prepared: a branch `
+        + 'made under that name would arm it at the next start. Cancel the batch first, or choose another name';
+    await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-1' }), refused);
+    await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'fix-1' }), refused);
+    const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
+    await assert.rejects(api.cmdBranchCreate({ name: 'fix-1' }), refused);
+    assert.equal(cm().currentBranch().name, sourceBranch, 'nothing moved');
+    assert.ok(!framework.getStore().listBranches().some((branch) => branch.name === 'fix-1'), 'no branch was made');
+    // Cancelled, the batch is never activated, and the name is free.
+    framework.cancelDiscordAwareness(first.id);
+    const retry = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-1' });
+    assert.equal(retry.targetBranch, 'fix-1');
+    await framework.stop();
+    // The next start, on fix-1, completes nothing: the surgery that ran chose no marks.
+    await start(true);
+    assert.equal(cm().currentBranch().name, 'fix-1');
+    await framework.syncDiscordAwarenessMarkers();
+    assert.deepEqual(calls().filter((call) => call.name === 'add_reaction'), []);
+    assert.deepEqual(outbox().operations(), []);
+  });
+
+  it("when the journal can't be read, the branch name check refuses nothing: a surgery doesn't wait on the journal", async () => {
+    await start(false);
+    const { tail } = seed(1);
+    const preparedFor = DiscordAwarenessOutbox.prototype.preparedFor;
+    DiscordAwarenessOutbox.prototype.preparedFor = function () { throw new Error('injected unreadable journal'); };
+    try {
+      const result = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' });
+      assert.equal(result.targetBranch, 'fix-2');
+    } finally {
+      DiscordAwarenessOutbox.prototype.preparedFor = preparedFor;
+    }
   });
 
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {

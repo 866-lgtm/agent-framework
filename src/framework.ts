@@ -2256,7 +2256,8 @@ export class AgentFramework {
       console.error(
         `[discord-awareness] startup: activated ${recovered.activated.length} interrupted batch(es) ` +
           `for ${store.currentBranch().name}, held ${recovered.held.length}, ` +
-          `retired ${recovered.retired.length} whose surgery never created its branch, ` +
+          `retired ${recovered.retired.length} whose target branch doesn't exist (its surgery never created it, ` +
+          'or it was deleted), ' +
           `recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
       );
     }
@@ -7809,14 +7810,19 @@ export class AgentFramework {
       // Its surgery didn't happen, so its messages are still in context: a
       // release would mark them. A start holds the batch, for the operator to
       // cancel, when its branch exists, and retires it when its surgery never
-      // created that branch (recoverAtStartup).
+      // created that branch (recoverAtStartup). Until then a branch made
+      // under that name would arm it: while this process can read the batch,
+      // checkDiscordAwarenessBranchName refuses one, and when it can't, the
+      // operator is told to use another name.
       let forked = true;
       try {
         forked = this.store.listBranches().some((branch) => branch.name === batch.targetBranch);
       } catch { /* unknown: say what a start on an existing branch does, whose cancel is right either way */ }
       const what = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, and ` + (forked
         ? `a start on ${sourceBranch} holds it: cancel it then, not release it, since its messages were never removed`
-        : `the next start retires it, since its surgery never created ${batch.targetBranch}`);
+        : `the next start retires it, since its surgery never created ${batch.targetBranch}, ` + (this.discordAwarenessOutbox.readable
+          ? 'and until then a branch with that name is refused unless the batch is cancelled first'
+          : `and until then a branch named ${batch.targetBranch} would arm it, so use another name`));
       this.opsAlert('discord-awareness-unresolved', agentName, `A failed surgery's ${what}`, { data: { batchId: batch.id } });
       return `; ${what}`;
     }
@@ -7913,6 +7919,7 @@ export class AgentFramework {
       if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
         throw new OperatorActionError('invalid', `Rollback branch ${targetBranch} already exists`);
       }
+      this.checkDiscordAwarenessBranchName(targetBranch);
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the switch has landed and its marker scheduling has been
@@ -8064,6 +8071,7 @@ export class AgentFramework {
       if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
         throw new OperatorActionError('invalid', `Suppression branch ${targetBranch} already exists`);
       }
+      this.checkDiscordAwarenessBranchName(targetBranch);
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the fork is fully redacted and its marker scheduling has been
       // recorded or reported, or the source is restored. Remote delivery is
@@ -8275,6 +8283,32 @@ export class AgentFramework {
   /** The awareness journal's batches and retract requests, for operator surfaces. */
   listDiscordAwareness(): DiscordAwarenessView[] {
     return this.discordAwarenessOutbox.view();
+  }
+
+  /**
+   * Refuse a name for a new branch that a prepared awareness batch, not
+   * cancelled, names as its target (`OperatorActionError`, `invalid`, naming
+   * the batch). Startup completes a prepared batch whose target is the active
+   * branch, and only the batch's own surgery may make that branch: one made
+   * under its name by anything else would mark messages it never removed.
+   * Rollback and suppression check their target with it, and the API's
+   * `branch.create` checks its name; a host that creates branches in the
+   * store itself calls it first. When the journal can't be read, it refuses
+   * nothing, so making a branch never waits on the journal.
+   */
+  checkDiscordAwarenessBranchName(name: string): void {
+    let claimed: DiscordAwarenessBatch[];
+    try {
+      claimed = this.discordAwarenessOutbox.preparedFor(name);
+    } catch {
+      return;
+    }
+    if (claimed.length === 0) return;
+    throw new OperatorActionError(
+      'invalid',
+      `Branch ${name} is the target of awareness batch ${claimed[0].id}, which is still prepared: a branch made ` +
+        'under that name would arm it at the next start. Cancel the batch first, or choose another name',
+    );
   }
 
   /**

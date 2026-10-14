@@ -18,10 +18,14 @@
   for one reaction, the later authorization wins, whenever each was
   created. A batch whose surgery was interrupted before its branch switch
   was recorded is held at startup until an operator releases or cancels
-  it, unless its surgery never created its target branch: none of its
-  messages were removed, so startup retires it. An interrupted
-  suppression's redactions are resumed whenever its branch is active at
-  startup, independent of what happened to its marks.
+  it, unless its target branch doesn't exist: then none of its marks apply,
+  since its surgery never created that branch or the branch was deleted
+  later, and startup retires it. Until then a rollback, a suppression, an
+  offline recovery or the API's `branch.create` refuses that branch name
+  unless the batch is cancelled first, since a branch made under it would
+  arm the batch. An interrupted suppression's redactions are resumed
+  whenever its branch is active at startup, independent of what happened to
+  its marks.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch, or the batch a `hide` or turn
   `undo` records after its change) is now written only after that change is

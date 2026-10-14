@@ -214,6 +214,21 @@ export async function createOfflineRecoveryBranch(
     const outbox = new DiscordAwarenessOutbox(store, {
       legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath),
     });
+    // Only a batch's own recovery may make its target branch: a prepared
+    // batch naming this one, left by a run that never made it, would be armed
+    // at the next start by the branch made here. When the journal can't be
+    // read, the recovery goes ahead, as the host's surgeries do.
+    let claimed: ReturnType<DiscordAwarenessOutbox['preparedFor']> = [];
+    try {
+      claimed = outbox.preparedFor(targetBranch);
+    } catch { /* unreadable: go ahead */ }
+    if (claimed.length > 0) {
+      throw new Error(
+        `Recovery branch ${targetBranch} is the target of awareness batch ${claimed[0].id}, which is still prepared: ` +
+          'a branch made under that name would arm it at the next start. Cancel the batch first ' +
+          `(--awareness cancel ${claimed[0].id}), or choose another --branch`,
+      );
+    }
     const batch = outbox.prepare({
       agentName: options.agentName,
       sourceBranch,
@@ -278,6 +293,8 @@ export async function createOfflineRecoveryBranch(
           } catch (discardError) {
             // A start holds the batch when its branch exists, and retires it
             // when this recovery never created that branch (recoverAtStartup).
+            // Until then, a recovery or surgery onto that name, from a later
+            // process that reads the batch, is refused unless it's cancelled.
             let forked = true;
             try {
               forked = store.listBranches().some((branch) => branch.name === targetBranch);
@@ -287,7 +304,8 @@ export async function createOfflineRecoveryBranch(
             )}); it stays prepared, and ` + (forked
               ? `a start on ${sourceBranch} holds it: cancel it then (--awareness cancel ${batch.id}), not release it, ` +
                 'since its messages were never removed'
-              : `the next start retires it, since its surgery never created ${targetBranch}`);
+              : `the next start retires it, since its surgery never created ${targetBranch}, and until then a branch ` +
+                `with that name is refused unless the batch is cancelled first (--awareness cancel ${batch.id})`);
           }
         }
       }

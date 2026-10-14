@@ -17,6 +17,13 @@
     requests whose outcome is unknown and imported history that leaves
     outcomes unrecorded.
   - `releaseDiscordAwareness(batch)` queues a held batch.
+  - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for a
+    new branch that a prepared batch, not cancelled, names as its target: a
+    branch made under that name would arm the batch at the next start.
+    Rollback, suppression, the offline recovery and the API's
+    `branch.create` check their names with it, and a host that creates
+    branches in the store itself calls it first. When the journal can't be
+    read it refuses nothing.
 
   Each control is recorded in the operator log. A request the journal won't
   carry out (an unknown batch, or one in the wrong state) is refused as
