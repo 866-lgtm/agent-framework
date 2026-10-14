@@ -631,16 +631,14 @@ export class Agent {
     // consumed watermark stays, and a prepared budget change waits for the
     // compile that is sent.
     //
-    // Context-manager 0.13 still leaves some of a select's effects behind on
-    // a dry run, as on any compile. A chunk that closes is recorded, durably,
-    // and queued for compression; a compression hold past its deadline is
-    // released. Its adaptive select also leaves its in-memory bookkeeping as
-    // the dry run set it, until the next compile: for example the compile
-    // estimate a usage report is calibrated against and that sample's arming,
-    // its transition and render bookkeeping, and a pending kv-unified draft's
-    // marker indices, which the draft's submission records as the markers
-    // its receipt is checked against. Context-manager 0.14.0 restores all of
-    // that after a dry run except the hold release.
+    // Context-manager 0.14 leaves what a select leaves behind as the last
+    // committing compile left it, on every path out of a dry run, throws
+    // included: no chunk record and no compression queued for a chunk the
+    // dry run closes, no calibration, and none of the bookkeeping the next
+    // compile or an observer reads (its `SelectOptions.dryRun` gives the
+    // contract). The one thing a dry run can still leave is the release of a
+    // compression hold whose deadline has passed, which `compile` does for
+    // any compile before it selects.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
     const result = await this.contextManager.compile(
       this.compileBudget(budget), injections, opts as never,

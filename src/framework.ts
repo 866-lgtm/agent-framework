@@ -4137,16 +4137,11 @@ export class AgentFramework {
    * watermark and any prepared budget change are left alone; and once
    * context-manager's thinking binding (context-manager#160, not yet
    * released) ships, no stamps are committed and no compile awaits
-   * acceptance. A dry run still leaves what context-manager 0.13 leaves on
-   * any compile (see `Agent.compileWithInjections`): a chunk that closes is
-   * recorded in the store, which is Chronicle's, and queued for compression;
-   * an expired compression hold is released; and the adaptive select's
-   * in-memory bookkeeping stays as the preview set it. So a preview between
-   * a sent compile and that request's first usage report replaces the
-   * estimate the report is judged against, and settings readers see the
-   * preview's transition values until the next compile. The preview keeps
-   * in-memory bookkeeping of its own too, such as handing the context manager
-   * the compression tool definitions, as every activation request does.
+   * acceptance. In context-manager 0.14 its dry run leaves nothing else
+   * behind but the release of an expired compression hold, as any compile
+   * does (see `Agent.compileWithInjections`). The preview keeps in-memory
+   * bookkeeping of its own, such as handing the context manager the
+   * compression tool definitions, as every activation request does.
    * Under the autobiographical strategy, a budget the context can't fit
    * still throws, as for a committing compile: a dry run skips only
    * context-manager's post-pick check, and an adaptive fold plan that
@@ -4241,14 +4236,11 @@ export class AgentFramework {
    *
    * Unlike `previewActivation` (which renders a request), this returns the
    * picker's plan: resulting tokens, whether it fits, how many summaries would
-   * have to be produced first, and the per-chunk fold levels. It commits none
-   * of the plan: no resolution persistence, none of the summary or merge work
-   * the plan calls for, and its transition and render bookkeeping put back —
-   * see `AutobiographicalStrategy.previewContext`. Its select is a dry run,
-   * so in context-manager 0.13 it still leaves the rest of what a dry run
-   * leaves (see `Agent.compileWithInjections`): a chunk that closes is
-   * recorded and queued for compression, and the calibration estimate and a
-   * pending kv-unified draft's marker indices stay as it set them.
+   * have to be produced first, and the per-chunk fold levels. It commits
+   * nothing: its select is a dry run, which in context-manager 0.14 leaves
+   * what a select leaves behind as the last committing compile left it —
+   * see `AutobiographicalStrategy.previewContext` and
+   * `Agent.compileWithInjections`.
    *
    * Returns null when the agent's strategy has no fold plan (non-adaptive).
    */
@@ -7944,12 +7936,10 @@ export class AgentFramework {
       // while the template may be mid-stream, where a committing compile
       // would commit fold resolutions and queue the compression its fold plan
       // calls for (and, once context-manager's thinking binding ships, fence
-      // its stream's replies). A dry run still leaves what context-manager
-      // 0.13 leaves on any compile (see Agent.compileWithInjections). Among
-      // that, its adaptive select replaces the template's compile estimate
-      // and re-arms its calibration sample, so a usage report for a request
-      // the template has in flight is judged against this compile's estimate
-      // rather than its own request's.
+      // its stream's replies). In context-manager 0.14 a dry run leaves
+      // nothing else behind but the release of an expired compression hold
+      // (see Agent.compileWithInjections), so the template's request in
+      // flight keeps its calibration estimate.
       // The template's compile runs at context-manager's default budget (none
       // is passed), and a dry run still refuses a budget it can't fit: it
       // skips only the post-pick check, and an adaptive fold plan that

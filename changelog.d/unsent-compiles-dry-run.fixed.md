@@ -12,19 +12,11 @@
   prepared budget change alone, as `previewActivation` already promised; a
   preview at the live window used to settle a converging budget change.
   `ActivationRequestOptions` gains `dryRun`.
-- Context-manager 0.13 still leaves some of a select's effects behind on a dry
-  run, as on any compile: a chunk that closes is recorded in the store and
-  queued for compression, a compression hold past its deadline is released,
-  and the adaptive select leaves its in-memory bookkeeping as the dry run set
-  it until the next compile, for example the compile estimate a usage report
-  is calibrated against and that sample's arming, its transition and render
-  bookkeeping, and a pending kv-unified draft's marker indices. So a dry run
-  between a sent compile and that request's first usage report replaces the
-  estimate the report is judged against, and under kv-unified one between a
-  sent compile and its submission changes the markers its receipt is checked
-  against. Context-manager 0.14.0 restores all of that after a dry run except
-  the hold release (anima-research/context-manager#161 and #114); this change
-  keeps the `^0.13.0` floor.
+- With context-manager 0.14, a dry run leaves what a select leaves behind as
+  the last committing compile left it: no chunk record, no calibration, and
+  none of the bookkeeping the next compile or an observer reads. The one thing
+  it can still leave is the release of a compression hold whose deadline has
+  passed, as any compile does.
 - Under the autobiographical strategy, a dry run still refuses a budget the
   context can't fit, as a committing compile does: context-manager skips only
   its post-pick check, and an adaptive fold plan that doesn't fit then
