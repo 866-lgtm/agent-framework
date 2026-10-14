@@ -151,9 +151,12 @@ never do.
   stops before it bumps anything, `npm publish` refuses, and the publish
   workflow refuses both its npm publish and its GitHub release notes,
   each checking when it runs. The check also stops a release when it
-  can't read the holds from GitHub, and says why. npm's `--ignore-scripts`
-  skips it, as it skips every lifecycle script, and so does publishing a
-  tarball made earlier with `npm pack`, which runs no lifecycle script.
+  can't read the holds from GitHub, and says why. Closing the hold is
+  the way past it. npm's `--ignore-scripts` skips the check, but on
+  `npm version` it skips the changelog fold too, so the tag lands
+  without its changelog section and the publish workflow's changelog
+  check fails it. Publishing a tarball made earlier with `npm pack` runs
+  no lifecycle script, so no check sees it.
 
 ## Building and testing
 
