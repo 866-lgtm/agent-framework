@@ -9217,9 +9217,10 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     for (let i = routing.arrivals.length - 1; i >= 0; i--) {
       const { messageId, channelId } = routing.arrivals[i]!;
-      let stored: StoredMessage | null;
-      try { stored = cm.getMessage(messageId); } catch { stored = null; }
-      if (stored) return channelId;
+      // The store answers null for a message that isn't there. A store that
+      // can't be read throws here, as anywhere else in the start, rather
+      // than have its candidates read as withdrawn.
+      if (cm.getMessage(messageId)) return channelId;
     }
     return undefined;
   }

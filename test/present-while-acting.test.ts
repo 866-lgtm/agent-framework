@@ -739,6 +739,47 @@ describe('present while acting', () => {
     });
   }
 
+  it("during a capacity hold, a store that can't be read at the deferred compile fails the start rather than drop the arrival", async () => {
+    // Adapted from a reviewer's probe: a read that fails says nothing about
+    // whether the message is there, so it can't count as a withdrawal.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'On it.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    failStream(1, accelerationLimit);
+    // Were the failed read taken as a withdrawal, the compile would run and
+    // answer here, at the turn's old channel.
+    feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    await say(framework, 'a question for you', addressed('discord:dm:antra'));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const arrival = cm.getAllMessages().find((m) =>
+      m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'a question for you'))!;
+    const getMessage = cm.getMessage.bind(cm);
+    cm.getMessage = (id) => {
+      if (id === arrival.id) throw new Error('store unavailable');
+      return getMessage(id);
+    };
+    try {
+      await assert.rejects(release(framework), /store unavailable/);
+    } finally {
+      cm.getMessage = getMessage;
+    }
+
+    assert.equal(membrane.calls.length, 1, 'the deferred compile never ran');
+    assert.deepEqual(routed, [{ text: 'On it.', locus: 'chan-live-1' }], 'and the turn spoke nowhere else');
+    assert.deepEqual(movedTo(framework), [], 'nor told the agent of a move');
+
+    await framework.stop();
+  });
+
   it("a message a tool boundary already weighed doesn't take the locus back at a later start", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
