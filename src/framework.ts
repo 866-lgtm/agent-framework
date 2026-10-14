@@ -1442,13 +1442,17 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
  *   415, 422 …) as invalid_request, so it alone produces an invalid_request
  *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
- * - From membrane #56 (merged, not yet in a release), one table serves every
- *   adapter. Auth codes and context overflow are checked on a 400 or 422
- *   first, a 404 is invalid_request, a 413 is context_length, and other 4xx
- *   are invalid_request. So a 413 still sheds, an Anthropic one included,
- *   while a context_length at 400 or 422, a token overflow, keeps the
- *   history. The 422 arm then also covers an OpenAI-compatible server, such
- *   as a FastAPI one, that answers a validation failure with 422.
+ * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, one
+ *   table serves every adapter. Auth codes, account refusals (a balance too
+ *   low, usage limits reached) and context overflow are checked on a 400 or
+ *   422 first, a 404 is invalid_request, a 413 is context_length, and other
+ *   4xx are invalid_request. So a 413 still sheds, an Anthropic one
+ *   included, while a context_length at 400 or 422, a token overflow, keeps
+ *   the history, and so does an account refusal, which is auth. The 422 arm
+ *   then also covers an OpenAI-compatible server, such as a FastAPI one,
+ *   that answers a validation failure with 422. The test of real provider
+ *   answers through membrane's classifier, beside the table test, pins how
+ *   the two meet at the floor.
  *
  * An error with no status, from a membrane that reports none, keeps the rule
  * the breaker had before: the type alone.

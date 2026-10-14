@@ -15,6 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { errorFromProviderStatus } from '@animalabs/membrane';
 import { AgentFramework, shedMayHelp } from '../src/framework.js';
 
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
@@ -288,5 +289,31 @@ test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a
         || (type === 'context_length' && status === 413);
       assert.equal(shedMayHelp(type, status), expected, `${String(type)} at ${String(status)}`);
     }
+  }
+});
+
+test("real provider answers, as this package's membrane floor classifies them, shed only where a shed may help", () => {
+  // Anthropic's error body; membrane reads its type and message.
+  const anthropic = (type: string, message: string) => ({ type: 'error', error: { type, message } });
+  const rows: Array<[string, number, unknown, boolean]> = [
+    // Refusals of the account, the key or the model: no shed can fix them.
+    ['a balance too low', 400, anthropic('invalid_request_error', 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'), false],
+    ['usage limits reached', 400, anthropic('invalid_request_error', 'You have reached your specified API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.'), false],
+    ['a model that does not exist', 404, anthropic('not_found_error', 'model: claude-nonexistent-1'), false],
+    ['a key the provider refuses', 401, anthropic('authentication_error', 'invalid x-api-key'), false],
+    // A token overflow at 400 keeps the history; a body too large at 413 may be fixed by a shed.
+    ['a prompt over the context window', 400, anthropic('invalid_request_error', 'prompt is too long: 250123 tokens > 200000 maximum'), false],
+    ['a request body too large', 413, anthropic('request_too_large', 'Request exceeds the maximum allowed number of bytes.'), true],
+    // Refusals of the request's content.
+    ['an unpaired tool result', 400, anthropic('invalid_request_error', 'messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.'), true],
+    ['a changed thinking block', 400, anthropic('invalid_request_error', 'messages.1.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.'), true],
+    ['a validation failure at 422', 422, { detail: [{ loc: ['body', 'messages'], msg: 'field required', type: 'value_error.missing' }] }, true],
+    // Waits and outages.
+    ['a rate limit', 429, anthropic('rate_limit_error', 'Number of request tokens has exceeded your per-minute rate limit'), false],
+    ['an overloaded provider', 529, anthropic('overloaded_error', 'Overloaded'), false],
+  ];
+  for (const [name, status, body, sheds] of rows) {
+    const error = errorFromProviderStatus({ provider: 'anthropic', status, body });
+    assert.equal(shedMayHelp(error.type, error.httpStatus), sheds, `${name}: ${error.type} at ${String(error.httpStatus)}`);
   }
 });
