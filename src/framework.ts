@@ -594,14 +594,16 @@ interface TurnRouting {
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
   /**
-   * The messages that arrived between the turn's streams and would re-pin
-   * the locus (repinChannel), in the order they were stored. No tool
-   * boundary weighs such a message, since none of the turn's streams was
+   * The messages that would re-pin the locus (repinChannel) that no tool
+   * boundary of the turn weighs, in the order they were stored. One stored
+   * for this agent is such a message when none of the turn's streams was
    * running: it was stored during a capacity hold or the wait for a
    * re-inference, or flushed at the end of a stream that didn't settle the
-   * turn, or by the start that continues it (noteArrival). A message
-   * tune-out diverted isn't one, since a resident's compiled view leaves it
-   * out. The turn's next start clears them all, and in locus or hybrid mode
+   * turn, or by the start that continues it (noteArrival). One stored for
+   * another resident always is, since residents read one message slot and a
+   * boundary weighs only the messages drained for its own agent
+   * (noteForOtherResidents). A message tune-out diverted isn't one, since a
+   * resident's compiled view leaves it out. The turn's next start clears them all, and in locus or hybrid mode
    * first re-pins to the newest one still in the agent's store, as a
    * boundary would have weighed its injections (remainingArrival). One
    * removed meanwhile, such as an unread coalesced message its server
@@ -8595,6 +8597,8 @@ export class AgentFramework {
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 const id = agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+                // This boundary weighs it for this agent; the other residents read it too.
+                this.noteForOtherResidents(agent, msg.metadata, id);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -10630,9 +10634,8 @@ export class AgentFramework {
   }
 
   /**
-   * Weigh a message stored for an agent whose logical turn is open while
-   * none of the turn's streams is running, so that no tool boundary will
-   * weigh it: one that would re-pin the locus becomes one of the turn's
+   * Weigh a message that no tool boundary of the agent's open logical turn
+   * will weigh: one that would re-pin the locus becomes one of the turn's
    * arrivals (TurnRouting.arrivals). A message tune-out diverted
    * (metadata.tuneOut) never enters a resident's compiled view, so the agent
    * won't see it, and it moves nothing.
@@ -10643,6 +10646,21 @@ export class AgentFramework {
     if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
     const channelId = this.repinChannel(metadata, open);
     if (channelId) open.arrivals.push({ messageId, channelId });
+  }
+
+  /**
+   * Weigh a message just stored in `agent`'s store for every other resident's
+   * open turn, running or not. Residents read one message slot
+   * (sharedSlotAgents), and a tool boundary weighs only the messages drained
+   * for its own agent, so no boundary of another resident's turn weighs it.
+   * The subconscious reads that slot through a merged view, but its own
+   * store is isolated, as a fork's or an ephemeral agent's is.
+   */
+  private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
+    if (!this.sharedSlotAgents.has(agent) || agent.name === this.subconsciousAgentName) return;
+    for (const reader of this.sharedSlotAgents) {
+      if (reader !== agent && this.agents.get(reader.name) === reader) this.noteArrival(reader.name, metadata, messageId);
+    }
   }
 
   /**
@@ -11333,6 +11351,7 @@ export class AgentFramework {
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
             this.noteArrival(agent.name, msg.metadata, id);
+            this.noteForOtherResidents(agent, msg.metadata, id);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -15134,6 +15153,7 @@ export class AgentFramework {
     if (!this.activeTurnTokens.has(agent.name) || opts?.bypassDeferralFor === agent.name) {
       this.noteArrival(agent.name, metadata, stored);
     }
+    this.noteForOtherResidents(agent, metadata, stored);
     return stored;
   }
 
