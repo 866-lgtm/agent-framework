@@ -820,6 +820,25 @@ export class ResumeBlockedError extends Error {
   }
 }
 
+/**
+ * How `runEphemeralToCompletion` rejects when the provider states a wait
+ * longer than an ephemeral run sleeps in its turn (600 s): the run ends at
+ * once, without retrying inside the wait. `retryAfterMs` is the wait the
+ * provider stated, in milliseconds: `Infinity` when it is longer than can be
+ * represented, and `NaN` when it isn't a number. The message says the same in
+ * words. A host can test `instanceof` or the `name`, which also holds for an
+ * error from another copy of this package.
+ */
+export class ProviderWaitNotSleptError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number,
+  ) {
+    super(message);
+    this.name = 'ProviderWaitNotSleptError';
+  }
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
@@ -3078,17 +3097,24 @@ export class AgentFramework {
     return undefined;
   }
   /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
-   *  for its caller. */
-  private statedWaitNotSlept(error: Error): string {
+   *  for its caller: the text, and the wait itself, which its rejection
+   *  carries (ProviderWaitNotSleptError). */
+  private statedWaitNotSlept(error: Error): { error: string; statedWaitMs: number } {
     const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
     if (typeof stated !== 'number' || Number.isNaN(stated)) {
-      return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
-        `stated wait of ${cap} or less, so it ends now)`;
+      return {
+        error: `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+          `stated wait of ${cap} or less, so it ends now)`,
+        statedWaitMs: Number.NaN,
+      };
     }
     const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
-    return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
-      `longer than ${cap}, so it ends now)`;
+    return {
+      error: `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+        `longer than ${cap}, so it ends now)`,
+      statedWaitMs: stated,
+    };
   }
   /** When a hold's timer next fires: at its deadline, stepped past what one
    *  timer can hold. A hold with no deadline (a wait held until released, or
@@ -5740,7 +5766,14 @@ export class AgentFramework {
    *  per-stream local survives budget restarts. */
   private settleAgent(
     agentName: string,
-    outcome: { stopReason: AgentSettleResult['stopReason']; speech: string; error?: string },
+    outcome: {
+      stopReason: AgentSettleResult['stopReason'];
+      speech: string;
+      error?: string;
+      /** An ephemeral run that ended rather than sleep the provider's stated
+       *  wait: that wait (statedWaitNotSlept). */
+      statedWaitMs?: number;
+    },
     /** The settling stream's logical turn, when that stream still owns the
      *  agent: it ends here, so the agent's next fresh start opens a new one.
      *  A settle from a stream a newer one replaced closes nothing. */
@@ -5754,7 +5787,10 @@ export class AgentFramework {
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
       // The caller may log or relay the message, which can echo the whole request.
-      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
+      const message = boundFailureText(outcome.error ?? 'Unknown error');
+      run.settle.reject(outcome.statedWaitMs === undefined
+        ? new Error(message)
+        : new ProviderWaitNotSleptError(message, outcome.statedWaitMs));
       return;
     }
     run.settle.resolve({
@@ -11573,7 +11609,7 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+          ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, startLogical);
         this.emitTrace({
           type: 'inference:exhausted',
@@ -12781,7 +12817,7 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+                ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
@@ -13042,7 +13078,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+        ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting.logical);
       this.emitTrace({
         type: 'inference:exhausted',
