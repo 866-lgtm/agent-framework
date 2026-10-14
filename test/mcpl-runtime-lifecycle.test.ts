@@ -49,6 +49,10 @@ process.stdin.on('data', (c) => {
 });
 `;
 
+/** The framework's inner disconnect, which a restart's own teardown calls
+ *  (the public disconnectMcplServer is an operator operation around it). */
+type Inner = { runDisconnectMcplServer(id: string): Promise<void> };
+
 function serverConfig(id: string, extra?: Record<string, unknown>) {
   return { id, command: process.execPath, args: ['-e', STDIO_SERVER], ...extra };
 }
@@ -171,11 +175,11 @@ test('restartMcplServer under a new id may keep the tool prefix the restarted se
 
 test('restartMcplServer refuses once stop() has begun, before it disconnects anything', async (t) => {
   await withFramework(true, async (framework) => {
-    const disconnect = t.mock.method(framework, 'disconnectMcplServer');
+    const disconnect = t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer');
     const stopping = framework.stop();
     await assert.rejects(
       framework.restartMcplServer('first'),
-      /MCP server "first" was not restarted: the framework is stopping or stopped/,
+      /restart MCPL server refused: the framework is stopping/,
     );
     await stopping;
     assert.equal(disconnect.mock.callCount(), 0, 'the restart disconnected nothing');
@@ -185,7 +189,7 @@ test('restartMcplServer refuses once stop() has begun, before it disconnects any
 test('restartMcplServer of an id whose disconnect is in flight is refused before it tears anything down', async (t) => {
   await withFramework(true, async (framework) => {
     const disconnecting = framework.disconnectMcplServer('first');
-    const disconnect = t.mock.method(framework, 'disconnectMcplServer');
+    const disconnect = t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer');
     await assert.rejects(
       framework.restartMcplServer('first'),
       /MCP server "first" was not restarted: it is being disconnected; restart it once that has finished/,
@@ -226,7 +230,7 @@ test('restartMcplServer of an id whose connect is in flight is refused before it
   // MCPL is up, so the connect holds its id before its first await.
   await withFramework(true, async (framework) => {
     const connecting = framework.connectMcplServer(serverConfig('later') as never);
-    const disconnect = t.mock.method(framework, 'disconnectMcplServer');
+    const disconnect = t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer');
     await assert.rejects(
       framework.restartMcplServer('later', serverConfig('renamed') as never),
       /MCP server "later" was not restarted: it is being connected; restart it once that has finished/,
@@ -266,9 +270,9 @@ test('a connect started during a restart is refused the id the restart moves to,
 
 test("a connect between a restart's disconnect and its connect is refused the id the restart keeps", async (t) => {
   await withFramework(true, async (framework) => {
-    const disconnect = framework.disconnectMcplServer.bind(framework);
+    const disconnect = (framework as unknown as Inner).runDisconnectMcplServer.bind(framework);
     let racing: Promise<unknown> | undefined;
-    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+    t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async (id: string) => {
       await disconnect(id);
       // The old server is gone and its disconnect holds nothing now.
       racing = framework.connectMcplServer(serverConfig('first', { toolPrefix: 'other' }) as never)
@@ -286,10 +290,10 @@ test("a connect between a restart's disconnect and its connect is refused the id
 test('a restart of an id another restart holds is refused before it tears anything down', async (t) => {
   await withFramework(true, async (framework) => {
     await framework.connectMcplServer(serverConfig('second') as never);
-    const disconnect = framework.disconnectMcplServer.bind(framework);
+    const disconnect = (framework as unknown as Inner).runDisconnectMcplServer.bind(framework);
     let during: (() => Promise<void>) | undefined;
     const refusals: string[] = [];
-    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+    t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async (id: string) => {
       await disconnect(id);
       // Between the restart's disconnect and its connect, only its claims hold these ids.
       const attempt = during;
@@ -331,7 +335,7 @@ test('a module is refused a name a server holds as its tool prefix, or a restart
 
 test('a restart that fails releases the id and the tool prefix it held', async (t) => {
   await withFramework(true, async (framework) => {
-    t.mock.method(framework, 'disconnectMcplServer', async () => {
+    t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async () => {
       throw new Error('disconnect failed for the test');
     });
     await assert.rejects(
@@ -350,9 +354,9 @@ test('a restart that fails releases the id and the tool prefix it held', async (
 test('a restart moving to an id or a tool prefix another restart holds is refused before it tears anything down', async (t) => {
   await withFramework(true, async (framework) => {
     await framework.connectMcplServer(serverConfig('second') as never);
-    const disconnect = framework.disconnectMcplServer.bind(framework);
+    const disconnect = (framework as unknown as Inner).runDisconnectMcplServer.bind(framework);
     const refusals: string[] = [];
-    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+    t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async (id: string) => {
       await disconnect(id);
       if (id !== 'first') return;
       // Between first's disconnect and its connect, only its claims hold "moved" and "xx".
@@ -397,12 +401,17 @@ test('a restart whose connect fails leaves the server down, configured and not c
 for (const when of ['teardown', 'gap', 'connect'] as const) {
   test(`a disconnect that begins during a restart's ${when} ends it: the server stays disconnected and the holds are released`, async (t) => {
     await withFramework(true, async (framework) => {
-      const disconnect = framework.disconnectMcplServer.bind(framework);
+      const disconnect = (framework as unknown as Inner).runDisconnectMcplServer.bind(framework);
       let host: Promise<unknown> | undefined;
+      // The host's disconnect, an operator operation of its own.
       const hostDisconnect = () => {
-        host = disconnect('first').then(() => 'disconnected', (error: unknown) => error);
+        host = framework.disconnectMcplServer('first').then(() => 'disconnected', (error: unknown) => error);
       };
-      t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+      let restarts = true;
+      t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async (id: string) => {
+        // The host's disconnect goes through as it is.
+        if (!restarts) return disconnect(id);
+        restarts = false;
         // The restart's own disconnect.
         const own = disconnect(id);
         if (when === 'teardown') hostDisconnect();
@@ -429,9 +438,9 @@ for (const when of ['teardown', 'gap', 'connect'] as const) {
 
 test("a stop() that begins in a restart's gap ends it, and the restart says the server is down", async (t) => {
   await withFramework(true, async (framework) => {
-    const disconnect = framework.disconnectMcplServer.bind(framework);
+    const disconnect = (framework as unknown as Inner).runDisconnectMcplServer.bind(framework);
     let stopping: Promise<void> | undefined;
-    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+    t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async (id: string) => {
       await disconnect(id);
       stopping = framework.stop();
     });

@@ -497,7 +497,11 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    const { messages } = await contextManager.compile();
+    // A dry run: listed, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for (see
+    // Agent.compileWithInjections for what a dry run still leaves, and for
+    // context-manager#160's thinking binding).
+    const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
     const offset = params?.offset ?? 0;
@@ -569,32 +573,40 @@ export class ApiServer {
     }
 
     const store = this.framework.getStore();
-    const previousBranch = this.currentBranch;
+    const from = store.isClosed() ? this.currentBranch : store.currentBranch().name;
 
-    store.switchBranch(params.name);
-    this.currentBranch = params.name;
-
-    // Reversible Discord awareness markers are part of the branch projection.
-    // The switch is acknowledged once it has landed: delivery of the marks it
-    // adds and removes starts behind the MCPL data-plane gate, which holds
-    // channel traffic that arrives after it until they are attempted, or
-    // deferred while their server is disconnected, and a failure is an ops
-    // alert rather than a failed switch. (It used to await the awareness
-    // sync, which after a large rollback took the drain's whole length.)
-    this.framework.startDiscordAwarenessDelivery('branch switch');
-
-    // Materialize config files from the new branch
-    const ws = this.framework.getModule('workspace');
-    if (ws && 'materializeMount' in ws) {
-      await (ws as any).materializeMount('_config');
+    // The framework switches the store, starts the delivery of its Discord
+    // awareness marks behind the data-plane gate, and re-materializes the
+    // config mount. It refuses during a live turn or once stop() has begun,
+    // and stop() waits for one already running.
+    // The store has moved when the call returns, before its promise settles
+    // (a refusal moves nothing). The branch read then is this switch's
+    // destination: another switch can move the store before this one's
+    // awaited steps end, so the event names what was read here.
+    const switching = this.framework.switchBranch(params.name);
+    void switching.catch(() => {}); // awaited below; handled even if the next line throws
+    this.followStoreBranch();
+    const to = this.currentBranch;
+    const moved = to !== from;
+    let switched = false;
+    try {
+      await switching;
+      switched = true;
+    } finally {
+      // A later step can fail after the store has moved: clients still hear
+      // where it went. A refusal moved nothing, so there's nothing to tell.
+      if (switched || moved) {
+        this.broadcast('branch:switched', { from, to });
+      }
     }
 
-    this.broadcast('branch:switched', {
-      from: previousBranch,
-      to: params.name,
-    });
-
     return { switched: true };
+  }
+
+  /** Take the current branch from the store, while it's open. */
+  private followStoreBranch(): void {
+    const store = this.framework.getStore();
+    if (!store.isClosed()) this.currentBranch = store.currentBranch().name;
   }
 
   private async cmdBranchCurrent(): Promise<{ name: string }> {
@@ -705,10 +717,21 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
+    // A dry run: shown, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for, at a
+    // hypothetical budget least of all (see Agent.compileWithInjections for
+    // what a dry run still leaves). Under the autobiographical strategy, a
+    // budget the context can't fit still throws: a dry run skips only
+    // context-manager's post-pick check, and an adaptive fold plan that
+    // doesn't fit then overruns at the middle's emission. Windowed
+    // passthrough's newest message alone is the one window that comes back
+    // larger than the budget.
     const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }
-        : undefined
+        : undefined,
+      undefined,
+      { dryRun: true },
     );
 
     return { context: messages };

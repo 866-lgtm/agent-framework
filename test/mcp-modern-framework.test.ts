@@ -496,7 +496,7 @@ test('the framework owns a modern connect in flight: stop() ends it, and a secon
     const before = lines(log).length;
     await assert.rejects(
       framework.connectMcplServer({ ...config, id: 'late' }),
-      /was not connected: the framework is stopping or stopped/,
+      /connect MCPL server refused: the framework is stopping/,
     );
     await new Promise((r) => setTimeout(r, 200));
     assert.equal(lines(log).length, before, 'no launch after stop');
