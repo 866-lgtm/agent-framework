@@ -15,6 +15,7 @@ import { openTransport, type McplTransport, type TransportCloseInfo } from './tr
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED } from './errors.js';
+import { logValue } from './log-value.js';
 
 import type {
   McplServerConfig,
@@ -456,7 +457,7 @@ export class McplServerConnection extends EventEmitter {
         if (responder?.respondError) {
           responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
         } else {
-          console.error(`[mcpl] ${this.id}: discarded ${name} — "${requiredCap}" ${phase}`);
+          console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
         }
         return true;
       }
@@ -673,7 +674,7 @@ export class McplServerConnection extends EventEmitter {
       // had never been advertised (hooks, streaming, queries all read this).
       const { capabilities: scoped, dropped } = maskNegotiatedCapabilities(capabilities, config);
       if (dropped.length > 0) {
-        console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.join(', ')}`);
+        console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.map(logValue).join(', ')}`);
       }
 
       return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };

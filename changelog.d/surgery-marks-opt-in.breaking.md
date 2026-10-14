@@ -58,6 +58,13 @@
   - An operator control the outbox won't carry out throws
     `DiscordAwarenessRefusal`; any other error is a failure to read or write
     the journal.
+- **Hosts that call `startDiscordAwarenessDelivery()`:** 0.22.1 added it
+  for a host to start the marks' delivery after its own branch moves. It is
+  removed: a branch move adds or removes no marks now, so there is nothing
+  for it to start. Queued work is delivered in the background on its own,
+  after a surgery and on a connect, a reconnect or a tools list change;
+  `syncDiscordAwarenessMarkers()` delivers what is queued now and waits for
+  that pass.
 - **`createOfflineRecoveryBranch` and `agent-framework-recover`:** the result
   (and the CLI's JSON output) no longer has `outboxPath`, since the journal is
   in the store. `discordMarkersQueued` is the marks queued (planned, for a dry

@@ -56,4 +56,4 @@ jobs:
       # closed"). These files run unforced so that class fails here, not in a
       # later PR's qualification.
       - name: Test unforced (work in flight at stop)
-        run: node --test dist/test/stop-with-work-in-flight.test.js dist/test/conversation-routing.test.js
+        run: node --test dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js

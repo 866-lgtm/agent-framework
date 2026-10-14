@@ -1048,6 +1048,8 @@ function hostCommandFramework(h: ReturnType<typeof storeHarness>, messages: Arra
   framework.nextTurnToken = 1;
   framework.deferredMessages = [];
   framework.pendingAssistantBlocks = new Map();
+  // A host/command and a store surgery are operations stop() waits for.
+  framework.operatorOperations = new Set();
   framework.operatorLog = new OperatorLog(undefined);
   framework.opsAlert = () => {};
   return { framework, removed, setBranch: (name: string) => { currentBranch = name; } };
@@ -1104,7 +1106,7 @@ test('turn-based host/command undo honours the marks choice for the messages its
     ];
     const { framework, removed } = hostCommandFramework(h, messages);
     let turns = 1;
-    framework.undoLastTurn = () => {
+    framework.runUndoLastTurn = () => {
       if (turns === 0) return { undone: false };
       turns--;
       removed.add('i1');
@@ -1144,7 +1146,7 @@ test('a turn undo records its marks choice and what it scheduled in the operator
     const { framework, removed } = hostCommandFramework(h, messages);
     // Each stubbed turn undo removes the next of these from the context.
     let undoable = ['i1', 'i2'];
-    framework.undoLastTurn = () => {
+    framework.runUndoLastTurn = () => {
       const next = undoable[0];
       if (!next) return { undone: false };
       undoable = undoable.slice(1);
@@ -1625,6 +1627,8 @@ test('a sync for one server drains only that server', async () => {
     framework.discordAwarenessDrains = new Map();
     framework.discordAwarenessDeadlineMs = 1000;
     framework.mcplServerRegistry = { getServer: (id: string) => connection(id) };
+    // A sync is an operator's operation, which stop() waits for.
+    framework.operatorOperations = new Set();
     await muted(() => framework.syncDiscordAwarenessMarkers('discord-b'));
     assert.deepEqual(calls, ['discord-b:n1']);
     await muted(() => framework.syncDiscordAwarenessMarkers());

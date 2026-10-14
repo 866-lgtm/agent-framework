@@ -1,12 +1,12 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -61,11 +61,12 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
-import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage } from './shutdown.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
+import { logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -88,6 +89,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
@@ -637,6 +639,80 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   );
 }
 
+/** Messages copied into another conversation (a fork's seed) without their
+ *  `thinking` and `redacted_thinking` blocks: a fork inherits the template's
+ *  conversation, not its reasoning. A signed block was minted under the
+ *  template's prefix, which the fork's doesn't promise to match; unsigned
+ *  reasoning (text-only providers, XML mode) goes by the same rule. On the
+ *  OpenAI Responses path a removed block also carried the reasoning item
+ *  (`rawItem`) the message's other items were paired with by id, so in a
+ *  message that lost its thinking those items lose their `rawItem` and render
+ *  from their fields, without ids; an opaque carrier (a text block whose raw
+ *  item isn't a `message`, such as a compaction) keeps it, since the raw item
+ *  is its whole content. An Anthropic or XML-mode message's thinking carries
+ *  no raw item, and its only raw items are such carriers (membrane keeps a
+ *  block it has no type for, such as a `server_tool_use`, that way), so it
+ *  loses only its thinking. A message with no content left, whether
+ *  the filter emptied it or it was already empty, is left out, since a
+ *  request can't carry an empty message; any other message without thinking
+ *  is kept as it was. */
+function withoutThinking<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
+  const out: M[] = [];
+  for (const message of messages) {
+    const content = message.content.filter((b) => !isThinkingBlock(b));
+    if (content.length === 0) continue;
+    out.push(content.length === message.content.length
+      ? message
+      : { ...message, content: content.map(releasePairedRawItem) });
+  }
+  return out;
+}
+
+function isThinkingBlock(block: ContentBlock): boolean {
+  return block.type === 'thinking' || block.type === 'redacted_thinking';
+}
+
+function rawItemOf(block: ContentBlock): unknown {
+  return (block as { rawItem?: unknown }).rawItem;
+}
+
+/** A block without the provider-native item it was parsed from, unless that
+ *  item is the block's whole content: an opaque carrier, a text block whose
+ *  raw item isn't a `message` item (membrane keeps compaction and other items
+ *  it has no block for that way). */
+function releasePairedRawItem(block: ContentBlock): ContentBlock {
+  const raw = rawItemOf(block);
+  if (raw === undefined) return block;
+  const rawType = typeof raw === 'object' && raw !== null ? (raw as { type?: unknown }).type : undefined;
+  if (block.type === 'text' && rawType !== 'message') return block;
+  const { rawItem: _released, ...rest } = block as ContentBlock & { rawItem?: unknown };
+  return rest as ContentBlock;
+}
+
+/** One log line for a fork's seed that left something out, so an operator who
+ *  sees a fork answer differently from its template has something to check:
+ *  the template's thinking blocks, and the tool blocks the pairing pass
+ *  dropped (calls with no result in the seed, results whose call isn't in
+ *  it). `withoutReasoning` is the seed before that pass, `seed` after it. */
+function logSeedOmissions(
+  fork: string,
+  template: string,
+  compiled: readonly { content: ContentBlock[] }[],
+  withoutReasoning: readonly { content: ContentBlock[] }[],
+  seed: readonly { content: ContentBlock[] }[],
+): void {
+  const count = (messages: readonly { content: ContentBlock[] }[], test: (b: ContentBlock) => boolean) =>
+    messages.reduce((n, m) => n + m.content.filter(test).length, 0);
+  const thinking = count(compiled, isThinkingBlock);
+  const calls = count(withoutReasoning, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
+  const results = count(withoutReasoning, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
+  if (thinking + calls + results === 0) return;
+  console.log(
+    `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
+    `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
+  );
+}
+
 class DiscordAwarenessAccountingError extends Error {
   constructor(operation: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
@@ -881,6 +957,23 @@ function describeRequester(r: OperatorRequester | undefined): string {
   return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
 }
 
+/** What a held call or turn says of the wait that holds it: no call was
+ *  made. The refusal of an auxiliary call and the trace of a turn held once
+ *  compiled say it the same way. */
+function providerWaitText(agentName: string, model: string, wait: ProviderWait): string {
+  return `Provider wait: ${model} is held for ${agentName} ` +
+    `${wait.until === null ? 'until an operator releases it' : `until ${new Date(wait.until).toISOString()}`} ` +
+    `(recorded ${new Date(wait.setAt).toISOString()}: ${wait.reason}); no call was made`;
+}
+
+/** Who asked for an operator act, as a durable record and a log line carry
+ *  it. The name comes from a caller, so a control character (a forged log
+ *  line) becomes a space, and it is bounded. */
+function operatorLabel(by: string): string {
+  const label = safeSlice(withoutControls(by).trim(), 0, 120);
+  return label === '' ? 'operator' : label;
+}
+
 function hostCommandRequester(serverId: string, params: HostCommandParams): OperatorRequester {
   return {
     via: `host-command:${serverId}`,
@@ -906,11 +999,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
   maxRetries = 3;
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (error instanceof MembraneError && !error.retryable) {
+    if (isMembraneError(error) && error.retryable === false) {
       return { retry: false };
     }
     if (attempt < this.maxRetries) {
-      const delayMs = error instanceof MembraneError && error.retryAfterMs !== undefined
+      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
         ? error.retryAfterMs
         : Math.pow(2, attempt) * 1000;
       return { retry: true, delayMs };
@@ -952,6 +1045,17 @@ interface ProviderAccelerationCooldown {
   /** Armed by an auxiliary (compression) failure with no primary involved:
    *  release reopens auxiliary admission without synthesising an inference. */
   auxiliaryOrigin?: boolean;
+  /** Set when this hold is a provider wait (a stated retry-after) for the
+   *  agent's primary model: it holds primary turns only. Auxiliary calls are
+   *  admitted per model by the provider waits themselves, so a compression
+   *  model the provider did not limit keeps working. */
+  waitModel?: string;
+  /** Set on an acceleration hold whose length is the provider's stated wait
+   *  (recorded for `model`), which replaced AF's own pacing for the failure.
+   *  `ownUntil` is when that pacing alone would have ended the hold: a
+   *  release of the stated wait shortens the hold to it, never past it. A
+   *  host hold never carries this: its length is the host's. */
+  statedWait?: { model: string; ownUntil: number };
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -973,10 +1077,33 @@ interface ProviderAccelerationReceipt {
   stopReason: string;
 }
 const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
+/** Cap on waits the framework chooses itself. A provider's stated wait is
+ *  never capped: it is a lower bound (see ProviderWaits). It is also the
+ *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
+ *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
+/** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
+ *  a longer timer fires almost at once, so longer waits re-arm in steps. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** A stated wait recorded to hold a model longer than this, or until
+ *  released, raises an ops alert. It is honoured in full either way: a hold
+ *  that long is a quota-scale event or a provider's mistake, and a person
+ *  decides which (release-provider-wait). Shorter waits are pacing. */
+const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
+/**
+ * A MembraneError, from this framework's copy of membrane or from another: the
+ * host supplies the Membrane instance (config.membrane), so with two copies
+ * installed its errors are instances of a class this framework's `instanceof`
+ * doesn't match. Recognised by name as well, as context-manager's errors are;
+ * its fields are the same, so callers still check each one's type.
+ */
+function isMembraneError(error: unknown): error is MembraneError {
+  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
+}
+
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
-  if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
+  if (!isMembraneError(error) || error.type !== 'rate_limit') return false;
   return (
     /organization(?:'s)?[^\n]{0,120}maximum(?:\s+usage)?\s+increase\s+rate/i.test(error.message) ||
     /organization(?:'s)?[^\n]{0,120}acceleration(?:\s+limit)?/i.test(error.message)
@@ -1060,6 +1187,9 @@ interface HostCommandParams {
   abandon?: boolean;
   /** For the `resume` command: override a failing feasibility verdict. */
   force?: boolean;
+  /** For the `release-provider-wait` command: the model whose wait to release
+   *  (every model's when omitted). */
+  model?: string;
   requesterId?: string;
   requesterName?: string;
 }
@@ -1118,11 +1248,256 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
-/** Cap an API error message for inline use in a rewind marker: keep enough to
- *  identify the failure class without pasting a wall of provider JSON into the
- *  agent's context. */
-function truncateReason(reason: string, max = 160): string {
-  return reason.length <= max ? reason : reason.slice(0, max) + '…';
+/**
+ * Longest failure text the inference-failure pipeline writes to one sink: the
+ * reason in the exhaustion stderr line, a field of a logs/failures.log record,
+ * an ops alert's message, the inference log's `error`, and a trace event's
+ * `error` and `stack`. A failure's text is whatever its source put in
+ * `Error.message`, and a provider can echo the entire rejected request there
+ * (one OpenAI-compatible 400 echoed ~1.7 MB). The sinks with shorter bounds
+ * name them below, and every cut goes through boundFailureText. This bound
+ * doesn't depend on membrane bounding its own errors.
+ */
+const FAILURE_TEXT_MAX_CHARS = 2_000;
+/** Longest failure reason written into an agent's own context (the
+ *  `[inference-failed]` marker): enough for a provider's explanation, not a
+ *  self-dump the agent then carries in every later request. */
+const FAILURE_MARKER_REASON_MAX_CHARS = 600;
+/** Longest failure reason in the rewind marker, also the agent's own context:
+ *  enough to identify the failure class without a wall of provider JSON. */
+const REWIND_MARKER_REASON_MAX_CHARS = 160;
+/** Longest failure reason in an agent's status (`lastInference.lastError`) and
+ *  in the compile-refused ops alert. */
+const FAILURE_SUMMARY_MAX_CHARS = 300;
+/** Longest alert message posted to the ops webhook. */
+const OPS_WEBHOOK_MESSAGE_MAX_CHARS = 500;
+/** Longest provider error code recorded verbatim; real codes are short tokens.
+ *  A failure's name and type are bounded the same way. */
+const PROVIDER_ERROR_CODE_MAX_CHARS = 128;
+
+const isHighSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xd800 && code <= 0xdbff;
+};
+const isLowSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xdc00 && code <= 0xdfff;
+};
+/** Whether a cut before `index` would separate the halves of a surrogate pair. */
+const splitsPair = (text: string, index: number): boolean =>
+  index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
+
+/**
+ * `text` when it fits within `max` characters; otherwise its head and tail
+ * around a marker stating how many of how many characters were omitted, the
+ * whole within `max`. A cut that would separate a surrogate pair moves toward
+ * omission, so the result never holds half of a pair the text held whole, and
+ * bounding bounded text returns it as is. Each sink cuts the whole text, so
+ * its marker states the whole length.
+ */
+function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const markerLength = ` …[${text.length} of ${text.length} characters omitted]… `.length;
+  const budget = Math.max(0, max - markerLength);
+  const tailLength = Math.floor(budget / 4);
+  let headEnd = budget - tailLength;
+  if (splitsPair(text, headEnd)) headEnd--;
+  let tailStart = text.length - tailLength;
+  if (splitsPair(text, tailStart)) tailStart++;
+  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+/** A provider error code, verbatim when token-sized; otherwise bounded. */
+function boundProviderErrorCode(code: unknown): string | undefined {
+  if (typeof code !== 'string') return undefined;
+  return boundFailureText(code, PROVIDER_ERROR_CODE_MAX_CHARS);
+}
+
+/**
+ * A value's JSON for a failure sink, with every Error inside it written as its
+ * whole projection (failureDescription): serialising an Error writes its own
+ * fields, a MembraneError's whole `rawRequest` among them. The projection is
+ * left uncut, as a nested string is, so the sink's one cut of the JSON states
+ * its whole length. An Error is recognised by instanceof, so one from another
+ * realm (a vm context) is written as its own JSON, as any object is. Throws,
+ * or returns undefined, as JSON.stringify does.
+ */
+function failureJson(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? failureDescription(nested) : nested));
+}
+
+/**
+ * The whole text describeFailure cuts. For an Error, its head (name,
+ * classification, status, provider code, each bounded) and its whole
+ * message. For a primitive, its String. For another object, its String when
+ * that's text of its own (a Buffer, an Error from another realm, a class
+ * with its own toString). An array, or an object whose String is empty or
+ * only its tag, such as `[object Object]`, is its JSON instead
+ * (failureJson), so its fields and elements are kept; its tag stands when
+ * JSON can't write it or finds nothing in it.
+ */
+function failureDescription(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) {
+      if (typeof error !== 'object' || error === null) return String(error);
+      if (!Array.isArray(error)) {
+        let text: string | undefined;
+        try { text = String(error); } catch { /* no String of its own: its JSON, below */ }
+        if (text && !/^\[object [^\]]*\]$/.test(text)) return text;
+      }
+      try {
+        const json = failureJson(error);
+        if (json !== undefined && json !== '{}') return json;
+      } catch { /* its tag, below */ }
+      return Object.prototype.toString.call(error);
+    }
+    const fields = error as Error & {
+      type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
+    };
+    // Every component is remote or caller-supplied text, the name included.
+    const classification = [
+      typeof fields.type === 'string' ? boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) : undefined,
+      typeof fields.httpStatus === 'number' ? `HTTP ${fields.httpStatus}` : undefined,
+      boundProviderErrorCode(fields.providerErrorCode),
+      typeof fields.retryable === 'boolean' ? `retryable=${fields.retryable}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
+    const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
+    return `${head}: ${String(error.message)}`;
+  } catch {
+    return '[failure could not be described]';
+  }
+}
+
+/**
+ * A bounded string describing a failure, for logs that would otherwise print
+ * the error object; it is one line unless one of its parts has newlines, as a
+ * message can. Printing the object prints its message whole, in the stack,
+ * and every own field: a MembraneError's `rawRequest` is the whole request
+ * that failed, and Node's console prints each of its strings, a long system
+ * prompt among them, up to 10,000 characters. The projection keeps what a
+ * reader needs (name, classification, status, provider code, message) and
+ * nothing else. The head's parts are bounded each, and the whole
+ * (failureDescription) is cut once, so its marker states the length of the
+ * head and the whole message.
+ */
+function describeFailure(error: unknown): string {
+  return boundFailureText(failureDescription(error));
+}
+
+/** A stack frame's line: an indent of spaces or tabs, then `at `. The indent
+ *  never crosses a line break, so a run of blank lines isn't rescanned from
+ *  each line's start. */
+const FRAME_LINE = /^[ \t]+at /m;
+
+/**
+ * describeFailure, then the error's stack frames, bounded, on the lines
+ * below: for a log of a failure the framework's own code may have thrown,
+ * where the frames say where. The stack opens with the message, and a
+ * message's own lines can look like frames (an echoed request quoting a stack
+ * trace), so when the message is the stack's header, before its first frame
+ * line, the frames are the stack from its first frame line after the
+ * message. Otherwise (a stack without its header, a message that isn't in
+ * the stack or is empty) they are the stack from its first frame line. The
+ * leak the projection closes was the object's own fields, not its stack.
+ */
+function describeFailureWithFrames(error: unknown): string {
+  let frames: string | undefined;
+  try {
+    const stack = error instanceof Error ? error.stack : undefined;
+    if (typeof stack === 'string') {
+      const message = String((error as Error).message);
+      // The message is the stack's header only before its first frame: a
+      // stack without its header (copied, or frames only) can hold the
+      // message's text inside a frame's name.
+      const firstFrame = stack.search(FRAME_LINE);
+      const at = message ? stack.indexOf(message) : -1;
+      const frameLine = new RegExp(FRAME_LINE.source, 'gm');
+      frameLine.lastIndex = at >= 0 && (firstFrame < 0 || at < firstFrame) ? at + message.length : 0;
+      const found = frameLine.exec(stack);
+      if (found) frames = boundFailureText(stack.slice(found.index));
+    }
+  } catch { /* the projection alone */ }
+  const described = describeFailure(error);
+  return frames === undefined ? described : `${described}\n${frames}`;
+}
+
+/**
+ * A failure record's fields, each bounded, for logs/failures.log and the
+ * ops:alert trace: a string to FAILURE_TEXT_MAX_CHARS; an Error to its
+ * projection, since serialising one writes its own fields, a MembraneError's
+ * whole `rawRequest` among them; any other value to its JSON, with each Error
+ * inside it as its projection (failureJson), as the plain data that JSON
+ * describes when it fits FAILURE_TEXT_MAX_CHARS and as the JSON text,
+ * bounded, when it doesn't. So the trace's data is what failures.log writes:
+ * a Map or an object with toJSON whose JSON is small never hands a listener
+ * the value itself.
+ */
+function boundFailureFields(record: Record<string, unknown>): Record<string, unknown> {
+  const bounded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === 'string') bounded[key] = boundFailureText(value);
+    else if (value instanceof Error) bounded[key] = describeFailure(value);
+    else {
+      let json: string | undefined;
+      try { json = failureJson(value); } catch { bounded[key] = describeFailure(value); continue; }
+      // A value JSON writes nothing for (a function, undefined) is left out,
+      // as the log's JSON leaves it out.
+      if (json === undefined) continue;
+      bounded[key] = json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
+    }
+  }
+  return bounded;
+}
+
+/**
+ * Whether the poison-history breaker may shed the newest exchange for a
+ * failure: an `invalid_request` at HTTP 400, 413 or 422 or with no status, or
+ * a `context_length` at 413. The status is a heuristic for when a shed may
+ * help, not proof that the history is at fault.
+ *
+ * 400 and 422 are how a provider answers a request that fails its
+ * validation, as a history it can't accept does, but other refusals come
+ * back the same way, such as Anthropic's 400 for a credit balance that's too
+ * low. A 413 is the request's size. When the newest exchange made it too
+ * large, as an oversized attachment does, shedding that exchange may bring
+ * the request back under the limit, and nothing else in the framework
+ * recovers a 413; when the history as a whole is too large, the shed doesn't
+ * help, and the breaker stops at its rewind cap. The 413 arm takes both
+ * labels a 413 arrives under, invalid_request and context_length, because
+ * membrane's label for a 413 differs by version and adapter. Other statuses
+ * keep the history, since shed history can't be got back and the status
+ * gives no sign that a shed would help: a 404 is a model or an endpoint that
+ * doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the
+ * resource, as a rule, rather than the conversation.
+ *
+ * The table test in test/inference-exhaustion-rewind.test.ts is this
+ * predicate's contract. The notes below on which membrane version gives which
+ * label are its history, and will go stale as hosts move to newer releases.
+ *
+ * Which failures reach the gate with which label depends on the membrane:
+ * - As membrane 0.5.86 classifies them: Anthropic files a 400 as
+ *   invalid_request (after its context check) and its other 4xx as unknown.
+ *   The chat adapters never file one as invalid_request, since they classify
+ *   by the error's message text, and a context_length they file that way
+ *   carries status 400 whatever the response's was. The raw-fetch Responses
+ *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
+ *   415, 422 …) as invalid_request, so it alone produces an invalid_request
+ *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
+ * - From membrane #56 (merged, not yet in a release), one table serves every
+ *   adapter. Auth codes and context overflow are checked on a 400 or 422
+ *   first, a 404 is invalid_request, a 413 is context_length, and other 4xx
+ *   are invalid_request. So a 413 still sheds, an Anthropic one included,
+ *   while a context_length at 400 or 422, a token overflow, keeps the
+ *   history. The 422 arm then also covers an OpenAI-compatible server, such
+ *   as a FastAPI one, that answers a validation failure with 422.
+ *
+ * An error with no status, from a membrane that reports none, keeps the rule
+ * the breaker had before: the type alone.
+ */
+export function shedMayHelp(errorType: string | undefined, httpStatus: number | undefined): boolean {
+  if (httpStatus === 413) return errorType === 'invalid_request' || errorType === 'context_length';
+  return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
 }
 
 /** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
@@ -1219,6 +1594,10 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
+  /** An operator's operations in flight, and the config materializations they
+   * start. stop() waits until this set is empty before it tears down, unless
+   * its wait budget runs out. */
+  private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -1265,6 +1644,10 @@ export class AgentFramework {
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
+  /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
+  private providerWaits: ProviderWaits | undefined;
+  /** Wakers for error-policy retry waits in progress: stop() ends them. */
+  private retryWaitWakers = new Set<() => void>();
   private providerAdmissionClosed = false;
   /** Invalidates framework turns still assembling when stop begins. */
   private lifecycleGeneration = 0;
@@ -1694,6 +2077,15 @@ export class AgentFramework {
     this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
+    // Unreadable recorded waits hold every agent's provider calls, and a
+    // persistent cause never reads again: a person has to hear of it.
+    this.providerWaits = new ProviderWaits(store, {
+      onUnreadable: (error) => this.opsAlert('provider-wait', 'framework',
+        `recorded provider waits could not be read (${error}): no provider call is admitted for any agent ` +
+        'until they read again (re-read every 30 s) or an operator releases an agent\'s waits with ' +
+        'release-provider-wait; such a release lasts for this process only',
+        { data: { model: EVERY_MODEL, until: null } }),
+    });
     this.membrane = membrane;
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
@@ -2228,17 +2620,26 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. Failed module/MCPL cleanup can be retried with its
-   * original context; storage stays open until that cleanup succeeds.
-   * @param teardownTimeoutMs Optional module/MCPL wait budget. Omit to wait
-   * until cleanup settles, as required by existing module/child contracts. This
-   * does not bound earlier stream or event-loop quiescence, or cancel cleanup.
+   * Stop the event loop. After a failed or timed-out wait on operator, module
+   * or MCPL cleanup, storage stays open and stop() can be called again. A
+   * timed-out wait lets teardown go on while that work may still act on what
+   * is being torn down.
+   * @param teardownTimeoutMs Optional budget for each wait on cleanup: an
+   * operator's operations already running, then modules and MCPL together.
+   * Omit to wait until cleanup settles, as required by existing module/child
+   * contracts. This does not bound earlier stream or event-loop quiescence, or
+   * cancel cleanup.
    */
   stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     try { validateShutdownTimeout(teardownTimeoutMs); }
     catch (error) { return Promise.reject(error); }
     if (this.stopPromise) return this.stopPromise;
-    const attempt = this.stopOwned(teardownTimeoutMs);
+    // Claim the attempt before any of its body runs: stopOwned's synchronous
+    // start can emit traces (the push coalescer's suspend() does), and a
+    // listener that calls stop() there must get this attempt, not start a
+    // second teardown beside it.
+    let settle!: { resolve: () => void; reject: (error: unknown) => void };
+    const attempt = new Promise<void>((resolve, reject) => { settle = { resolve, reject }; });
     this.stopPromise = attempt;
     void attempt.then(() => { this.stopCompleted = true; }, () => {});
     // Failed cleanup can be retried while its original store is open. A
@@ -2246,6 +2647,9 @@ export class AgentFramework {
     void attempt.catch(() => {
       if (!this.ownedStoreClosed && this.stopPromise === attempt) this.stopPromise = null;
     });
+    // The body still starts in this call, so its synchronous steps (closing
+    // the queue among them) happen before stop() returns.
+    this.stopOwned(teardownTimeoutMs).then(settle.resolve, settle.reject);
     return attempt;
   }
 
@@ -2257,6 +2661,56 @@ export class AgentFramework {
     }
   }
 
+  /** Register before invoking the body, so the set holds the operation for
+   * its whole life: its synchronous trace callbacks can reenter stop(), and
+   * that stop() must find it. Invocation stays in this stack, preserving
+   * immediate mode changes; the returned promise carries its result to the
+   * caller. */
+  private trackOperatorOperation<T>(label: string, run: () => Promise<T>): Promise<T> {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (error: unknown) => void;
+    const operation = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    const entry = { label, promise: operation.then(() => {}, () => {}) };
+    this.operatorOperations.add(entry);
+    void entry.promise.then(() => { this.operatorOperations.delete(entry); });
+    try { resolve(run()); } catch (error) { reject(error); }
+    return operation;
+  }
+
+  /** Whether stop() has begun: an attempt in flight (stopPromise is set before
+   * its body runs, which emits traces before the queue closes) or a closed
+   * queue (after a failed or completed stop()). The admission rule for every
+   * operator entry point, the host/command listener included. */
+  private stopHasBegun(): boolean {
+    return !!this.stopPromise || !!this.queue?.isClosed;
+  }
+
+  private refuseOperatorAfterStop(verb: string): void {
+    if (this.stopHasBegun()) throw new Error(verb + ' refused: the framework is stopping');
+  }
+
+  /** Wait in rounds until the set is empty: admitted work can still start work
+   * of its own. All rounds share the caller's deadline rather than renewing
+   * its budget. */
+  private async waitForOperatorOperations(timeoutMs: number | undefined): Promise<void> {
+    const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+    while (this.operatorOperations.size > 0) {
+      const remaining = deadline === undefined ? undefined : Math.ceil(deadline - performance.now());
+      const timedOut = () => new ShutdownTimeoutError(
+        [...this.operatorOperations].map(({ label }) => label), timeoutMs!, [],
+      );
+      if (remaining !== undefined && remaining < 1) throw timedOut();
+      try {
+        await waitForShutdown([...this.operatorOperations], remaining);
+      } catch (error) {
+        // Report the original budget and everything still pending, including
+        // child work added after this round's snapshot.
+        if (error instanceof ShutdownTimeoutError) throw timedOut();
+        throw error;
+      }
+    }
+  }
+
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
@@ -2265,6 +2719,7 @@ export class AgentFramework {
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
+    for (const wake of [...this.retryWaitWakers]) wake();
     this.lifecycleGeneration++;
     // The generation this stop ends; withheld spills close for it alone, so a
     // start() made before this stop finishes reopens them for its own.
@@ -2332,6 +2787,19 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
+    // Admission closed when stop() began. What admitted operations start now,
+    // such as a surgery's config materialization, joins the set, so wait until
+    // the set is empty. This comes after the streams and the event loop, which
+    // a quiesce or a surgery may be waiting on. If the budget runs out,
+    // teardown goes on while the operation may still act on what it tears
+    // down, and the store stays open for another stop().
+    let operatorOperationsTimedOut: unknown;
+    try {
+      await this.waitForOperatorOperations(teardownTimeoutMs);
+    } catch (error) {
+      operatorOperationsTimedOut = error;
+    }
+
     // Stop typing indicators
     this.channelRegistry?.stopAll();
 
@@ -2358,7 +2826,7 @@ export class AgentFramework {
     }
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
-    const shutdownErrors: unknown[] = [];
+    const shutdownErrors: unknown[] = operatorOperationsTimedOut === undefined ? [] : [operatorOperationsTimedOut];
     for (const result of await Promise.allSettled(shutdownPromises)) {
       if (result.status === 'rejected') shutdownErrors.push(result.reason);
     }
@@ -2433,7 +2901,13 @@ export class AgentFramework {
   private providerGateBlocked(agentName: string): boolean {
     const gate = this.providerGates.get(agentName);
     return (gate?.primaryDepth ?? 0) > 0 || (gate?.primaryPending ?? false) ||
-      this.providerAccelerationCooldowns.has(agentName);
+      this.cooldownBlocksAuxiliary(agentName);
+  }
+  /** Acceleration and host holds park the whole agent; a provider wait holds
+   *  only its own model, which auxiliary admission checks per call. */
+  private cooldownBlocksAuxiliary(agentName: string): boolean {
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    return cooldown !== undefined && cooldown.waitModel === undefined;
   }
   private acquirePrimaryProviderGate(agentName: string): void {
     const gate = this.providerGate(agentName); gate.primaryPending = false; gate.primaryDepth++;
@@ -2444,7 +2918,7 @@ export class AgentFramework {
   }
   private flushAuxiliaryAdmission(agentName: string): void {
     const gate = this.providerGate(agentName);
-    if (gate.primaryDepth > 0 || gate.primaryPending || this.providerAccelerationCooldowns.has(agentName)) return;
+    if (gate.primaryDepth > 0 || gate.primaryPending || this.cooldownBlocksAuxiliary(agentName)) return;
     for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
   }
   private async waitForAuxiliaryIdle(agentName: string): Promise<void> {
@@ -2452,8 +2926,9 @@ export class AgentFramework {
     if (gate.auxiliaryInFlight === 0) return;
     await new Promise<void>((resolve) => gate.idleWaiters.push(resolve));
   }
-  private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T> {
+  private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T> {
     const gate = this.providerGate(agentName);
+    this.refuseHeldProviderModel(agentName, model);
     if (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
       try {
@@ -2465,14 +2940,20 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
     }
+    // A wait recorded while this call was parked binds it too.
+    this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
     try { return await run(); }
     catch (error) {
       // Compression can be the first call to find a spent quota (idle agent,
-      // scheduled maintenance). Arm the host hold so later passes wait at the
-      // gate instead of retrying into it; this pass still fails to its caller.
+      // scheduled maintenance). Record a stated wait for this call's model,
+      // and arm the host hold so later passes wait at the gate instead of
+      // retrying into it; this pass still fails to its caller.
       const agent = this.agents.get(agentName);
-      if (agent && error instanceof Error) this.holdProviderAcceleration(agent, error, undefined, true);
+      if (agent && error instanceof Error) {
+        if (model !== undefined) this.recordProviderWait(agentName, model, error);
+        this.holdProviderAcceleration(agent, error, undefined, true);
+      }
       throw error;
     }
     finally {
@@ -2481,21 +2962,58 @@ export class AgentFramework {
     }
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
+  }
+  /**
+   * A conversation agent's auxiliary calls (its context manager's
+   * compression). A conversation agent takes no provider gate: admission
+   * belongs to the persistent resident, and a generation-unique fork must not
+   * leave a gate behind. But its stated waits are recorded for (agent, model)
+   * as a resident's are, so they bind its auxiliary calls too: a held model
+   * is refused without a call, and an auxiliary call's own stated wait is
+   * recorded for it. (An ephemeral run records nothing, its name being
+   * single-use, so its context manager keeps the plain membrane.)
+   */
+  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting(async (run, model) => {
+      this.refuseHeldProviderModel(agentName, model);
+      try { return await run(); }
+      catch (error) {
+        if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
+        throw error;
+      }
+    });
+  }
+  /** The framework's membrane, with each complete() call passed through
+   *  `admit` along with the model it names. */
+  private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
       const value = Reflect.get(obj, prop, receiver);
       if (prop === 'complete' && typeof value === 'function') {
-        return (...args: unknown[]) => this.withAuxiliaryAdmission(
-          agentName, () => Reflect.apply(value, this.membrane, args) as Promise<unknown>);
+        return (...args: unknown[]) => {
+          const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
+          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+            typeof model === 'string' ? model : undefined);
+        };
       }
       return typeof value === 'function' ? value.bind(this.membrane) : value;
     }}) as unknown as Membrane;
   }
-  private accelerationCooldownMs(agentName: string, error: MembraneError): number {
-    const base = error.retryAfterMs ?? this.providerAccelerationDefaultCooldownMs;
+  /** An acceleration hold's length: AF's own pacing (`ownMs`: its default
+   *  plus jitter, capped), or the provider's stated wait in its place
+   *  (`stated`). The stated wait is a lower bound: jitter only adds to it,
+   *  and the cap applies only to AF's own default. A negative stated wait is
+   *  a stated 0, as in ProviderWaits: the 1 s floor, plus jitter. */
+  private accelerationCooldownMs(agentName: string, error: MembraneError): { delayMs: number; ownMs: number; stated: boolean } {
     let hash = 0; for (const ch of agentName) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
     const jitter = this.providerAccelerationJitterMs > 0 ? hash % (this.providerAccelerationJitterMs + 1) : 0;
-    return Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, base) + jitter);
+    const ownMs = Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, this.providerAccelerationDefaultCooldownMs) + jitter);
+    const stated = error.retryAfterMs;
+    if (typeof stated === 'number' && Number.isFinite(stated)) {
+      return { delayMs: Math.max(1_000, stated) + jitter, ownMs, stated: true };
+    }
+    return { delayMs: ownMs, ownMs, stated: false };
   }
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
@@ -2506,10 +3024,14 @@ export class AgentFramework {
     try {
       const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
       if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      // The reason is printed, kept in the cooldown and shown in the status
+      // snapshot (cooldownReason); without the host's own, it is the error's
+      // message, which can echo the whole request.
       return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
-        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
+        reason: boundFailureText(typeof hold.reason === 'string' && hold.reason ? hold.reason : String(error.message)) };
     } catch (err) {
-      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      // The hook is handed the model's error, and may throw it back.
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold: ${describeFailureWithFrames(err)}`);
       return undefined;
     }
   }
@@ -2521,7 +3043,7 @@ export class AgentFramework {
     if (!hold) return false;
     clearTimeout(cooldown.timer);
     cooldown.until = Date.now() + hold.holdMs;
-    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), hold.holdMs);
+    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), Math.min(hold.holdMs, MAX_TIMER_DELAY_MS));
     cooldown.timer.unref?.();
     if (hold.reason !== cooldown.reason) {
       cooldown.reason = hold.reason;
@@ -2531,21 +3053,39 @@ export class AgentFramework {
   }
   private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest, auxiliary = false): boolean {
     if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
+    // A provider's stated wait binds later calls to the primary model, across
+    // restarts. (An auxiliary call records its own model's wait at the gate.)
+    const wait = auxiliary ? undefined : this.recordProviderWait(agent.name, agent.model, error);
     // The host knows more than the message wording does: ask it first. An
     // auxiliary failure arms host holds only — the built-in acceleration
     // cooldown stays a primary-path mechanism.
     const hostHold = this.consultProviderHold(error, agent.name);
-    const acceleration = !hostHold && !auxiliary && isOrganizationAccelerationRateLimit(error);
-    if (!acceleration && !hostHold) return false;
-    const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
+    // A failure the provider says may not be retried keeps its terminal
+    // disposition, whatever its wording (a stated wait still binds after it).
+    const acceleration = !hostHold && !auxiliary && (error as MembraneError).retryable !== false
+      && isOrganizationAccelerationRateLimit(error);
+    // The stated wait binds later calls whatever the failure was. Retaining
+    // and retrying THIS request is for a failure the provider says may be
+    // retried: a non-retryable one keeps its terminal disposition (marker,
+    // failure streak), and the wait applies to the calls that follow it.
+    if (!acceleration && !hostHold) {
+      return wait !== undefined && isMembraneError(error) && error.retryable === true
+        && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true);
+    }
+    const now = Date.now();
+    const pacing = hostHold ? undefined : this.accelerationCooldownMs(agent.name, error as MembraneError);
+    const delayMs = hostHold ? hostHold.holdMs : pacing!.delayMs;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
     if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
     if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
+    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? boundFailureText(String(error.message)),
       failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
+      // The stated wait (recorded above for agent.model) set this hold's
+      // length: an operator release of it returns the hold to AF's own pacing.
+      ...(pacing?.stated ? { statedWait: { model: agent.model, ownUntil: now + pacing.ownMs } } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
     if (auxiliary && !existing) {
       console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
@@ -2554,16 +3094,96 @@ export class AgentFramework {
     }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
+      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: boundFailureText(String(error.message)) });
     console.error(`[provider-cooldown] agent=${agent.name} ` +
       `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
   }
+  /**
+   * A provider's stated wait on a turn that doesn't own provider admission:
+   * a conversation agent's or an ephemeral run's. Left to the error policy,
+   * which returns a stated wait as it is, a 429 stating two hours would hold
+   * the turn asleep two hours, up to three times, with nothing recorded and
+   * nothing raised (membrane #56 review, M3). So:
+   * - A conversation agent's turns come through the scheduler as a resident's
+   *   do, so it treats the wait as a resident does: recorded for (agent,
+   *   model), alerted past PROVIDER_WAIT_ALERT_MS, and the turn held until the
+   *   wait passes or an operator releases it ('held'). A non-retryable failure
+   *   records the wait for the calls after it and keeps its own disposition.
+   * - An ephemeral run's name is single-use, so a wait recorded for it would
+   *   bind nothing, and its caller is waiting on it. A retryable stated wait
+   *   up to PROVIDER_ACCELERATION_MAX_COOLDOWN_MS is left to the error policy,
+   *   slept and retried. A longer one, or one that can't be represented, ends
+   *   the run now ('fail'): it is never retried before the provider's time,
+   *   and the caller hears why at once.
+   * Anything else is the error policy's.
+   */
+  private nonOwningProviderWait(agent: Agent, error: Error, trigger?: InferenceRequest): 'held' | 'fail' | undefined {
+    // From either copy of membrane (isMembraneError), a wait is stated only
+    // as a number, as the default error policy reads it.
+    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
+    if (this.conversationAgentHomes.has(agent.name)) {
+      const wait = this.recordProviderWait(agent.name, agent.model, error);
+      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true)
+        ? 'held'
+        : undefined;
+    }
+    if (this.ephemeralRuns.has(agent.name) && error.retryable === true
+      && !(error.retryAfterMs <= PROVIDER_ACCELERATION_MAX_COOLDOWN_MS)) {
+      return 'fail';
+    }
+    return undefined;
+  }
+  /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
+   *  for its caller. */
+  private statedWaitNotSlept(error: Error): string {
+    const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
+    const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
+    if (typeof stated !== 'number' || Number.isNaN(stated)) {
+      return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+        `stated wait of ${cap} or less, so it ends now)`;
+    }
+    const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
+    return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+      `longer than ${cap}, so it ends now)`;
+  }
+  /** When a hold's timer next fires: at its deadline, stepped past what one
+   *  timer can hold. A hold with no deadline (a wait held until released, or
+   *  the stand-in for unreadable records) asks again as often as unreadable
+   *  records are read again: records that read again end it, and nothing
+   *  announces that. */
+  private providerHoldTimerMs(remaining: number): number {
+    return Number.isFinite(remaining)
+      ? Math.min(remaining, MAX_TIMER_DELAY_MS)
+      : this.providerWaits?.retryReadMs ?? MAX_TIMER_DELAY_MS;
+  }
   private releaseProviderAccelerationCooldown(agentName: string): void {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
+    // A wait hold lasts exactly as long as its wait binds: longer once the
+    // wait is extended, while it is indefinite, and over once no wait binds
+    // (passed, released, or the stand-in for unreadable records lifted because
+    // they read again). A different primary model now is not bound by it.
+    if (cooldown.waitModel !== undefined && this.agents.get(agentName)?.model === cooldown.waitModel) {
+      const wait = this.providerWaits?.active(agentName, cooldown.waitModel);
+      cooldown.until = wait ? (wait.until ?? Number.POSITIVE_INFINITY) : Date.now();
+    }
+    const remaining = cooldown.until - Date.now();
+    if (remaining > 0 && (cooldown.waitModel === undefined || this.agents.get(agentName)?.model === cooldown.waitModel)) {
+      clearTimeout(cooldown.timer);
+      cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), this.providerHoldTimerMs(remaining));
+      cooldown.timer.unref?.();
+      return;
+    }
     if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    if (cooldown.waitModel !== undefined) {
+      const model = this.agents.get(agentName)?.model;
+      console.error(`[provider-wait] agent=${agentName} model=${cooldown.waitModel} ` +
+        (model !== undefined && model !== cooldown.waitModel
+          ? `no longer holds primary turns: the primary model is now ${model} (the wait stays recorded)`
+          : `primary hold ended after ${Date.now() - cooldown.startedAt}ms`));
+    }
     if (cooldown.auxiliaryOrigin && cooldown.heldRequests.length === 0) {
       // Nobody asked for an inference while parked: just reopen the gate.
       console.error(`[provider-cooldown] agent=${agentName} auxiliary hold released after ${Date.now() - cooldown.startedAt}ms`);
@@ -2578,6 +3198,201 @@ export class AgentFramework {
     console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
       `fresh compile queued with ${requests.length} retained request(s)`);
   }
+  /**
+   * Wait an error policy's retry delay, all of it: the delay can be a
+   * provider's retry-after, and a single timer past 2^31-1 ms fires almost at
+   * once. Steps through longer waits; stop() wakes it so a shutting-down
+   * framework is never left with a wait parked for days.
+   */
+  private async waitForRetry(ms: number): Promise<void> {
+    // An infinite delay waits until stop(), like any wait too long to end; a
+    // delay that isn't a number, or is 0 or less, waits none.
+    let remaining = ms > 0 ? ms : 0;
+    while (remaining > 0 && !this.providerAdmissionClosed) {
+      const step = Math.min(remaining, MAX_TIMER_DELAY_MS);
+      remaining -= step;
+      await new Promise<void>((resolve) => {
+        const wakers = this.retryWaitWakers;
+        const done = (): void => { clearTimeout(timer); wakers.delete(done); resolve(); };
+        const timer = setTimeout(done, step);
+        wakers.add(done);
+      });
+    }
+  }
+
+  /**
+   * Record a provider's stated wait (a classified error carrying
+   * `retryAfterMs`) for (agent, model). Returns the wait that binds now,
+   * which is the longer of this one and any outstanding one. A wait that
+   * newly binds past PROVIDER_WAIT_ALERT_MS, or until released, raises an
+   * ops alert.
+   */
+  private recordProviderWait(agentName: string, model: string, error: Error): ProviderWait | undefined {
+    // From either copy of membrane: the host supplies the Membrane instance,
+    // and a wait is stated only as a number, as the default policy reads it.
+    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number' || !this.providerWaits) return undefined;
+    // The provider's words, bounded; a line break in them must not start a
+    // line that reads as the framework's own where the reason is logged.
+    const reason = safeSlice(withoutControls(error.message), 0, 300);
+    const { wait, changed } = this.providerWaits.set(agentName, model, error.retryAfterMs, reason);
+    // A wait already over (0, or a negative "retry now") holds nothing to report.
+    const remaining = wait.until === null ? Number.POSITIVE_INFINITY : wait.until - Date.now();
+    if (changed && remaining > 0) {
+      const until = wait.until === null
+        ? 'until an operator releases it (the stated wait cannot be represented as an instant)'
+        : `until ${new Date(wait.until).toISOString()}`;
+      const stated = `${error.type}${error.httpStatus !== undefined ? ` HTTP ${error.httpStatus}` : ''}, retry-after ${String(error.retryAfterMs)}ms`;
+      console.error(`[provider-wait] agent=${agentName} model=${model} holds ${until}: ${stated}`);
+      if (remaining > PROVIDER_WAIT_ALERT_MS) {
+        this.opsAlert('provider-wait', agentName,
+          `provider wait on ${model} holds ${until} (${stated}: ${reason}); ` +
+          'if the provider did not mean that, release it with release-provider-wait',
+          { data: { model, until: wait.until === null ? null : new Date(wait.until).toISOString() } });
+      }
+    }
+    return wait;
+  }
+
+  /**
+   * Hold this agent's primary turns for a provider wait on its model. The
+   * requests are kept and released together, into one fresh compile, when
+   * the wait ends: the same path an acceleration cooldown takes, without
+   * parking auxiliary calls to other models.
+   */
+  private holdForProviderWait(agent: Agent, wait: ProviderWait, requests: InferenceRequest[], failed = false): boolean {
+    const now = Date.now();
+    const until = wait.until ?? Number.POSITIVE_INFINITY;
+    if (until <= now) return false;
+    const existing = this.providerAccelerationCooldowns.get(agent.name);
+    const held = existing?.heldRequests ?? [];
+    for (const request of requests) {
+      if (!held.some((r) => this.sameInferenceRequest(r, request))) held.push(request);
+    }
+    // An acceleration or host hold already parks the whole agent; its release
+    // re-checks this wait at admission.
+    if (existing && existing.waitModel === undefined) return true;
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), this.providerHoldTimerMs(until - now));
+    timer.unref?.();
+    this.providerAccelerationCooldowns.set(agent.name, {
+      startedAt: existing?.startedAt ?? now, until, timer, heldRequests: held,
+      // A failed call counts; a turn arriving at a wait recorded earlier doesn't.
+      reason: wait.reason, failures: (existing?.failures ?? 0) + (failed ? 1 : 0), waitModel: wait.model,
+    });
+    if (!existing) {
+      console.error(`[provider-wait] agent=${agent.name} model=${wait.model} holding primary turns ` +
+        `${wait.until === null ? 'until released' : `until ${new Date(wait.until).toISOString()}`}; ${held.length} request(s) retained`);
+    }
+    return true;
+  }
+
+  /**
+   * Refuse an auxiliary call to a model the provider asked this agent to wait
+   * on, without calling it. The refusal is a retryable rate limit carrying
+   * the remaining wait, so a caller that paces (context-manager's compression
+   * lane, from its corrective round #138 on) waits it out instead of spending
+   * a call. It is marked
+   * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
+   * the wait without counting a failed call (room-225 #47927).
+   */
+  private refuseHeldProviderModel(agentName: string, model: string | undefined): void {
+    // A call that names no model can't be matched to a model's wait, but the
+    // hold that stands for unreadable records binds every model, so it binds
+    // that call too (EVERY_MODEL: only that hold, or a release of it, says so).
+    const wait = this.providerWaits?.active(agentName, model ?? EVERY_MODEL);
+    if (!wait) return;
+    const now = Date.now();
+    throw Object.assign(new MembraneError({
+      type: 'rate_limit',
+      retryable: true,
+      ...(wait.until !== null ? { retryAfterMs: Math.max(0, wait.until - now) } : {}),
+      message: providerWaitText(agentName, model ?? EVERY_MODEL, wait),
+      rawError: undefined,
+    }), { providerAdmission: 'deferred' as const });
+  }
+
+  /**
+   * Release provider waits: one model's for an agent, or every model's. The
+   * explicit operator override for a wait that should not be honoured (the
+   * passing of time needs no call). Recorded, so a restart does not bring the
+   * wait back; held primary turns are released into one fresh compile. An
+   * acceleration hold the released wait lengthened keeps only AF's own pacing
+   * for its failure; a host hold stays the host's.
+   */
+  releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
+    model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
+  }> {
+    // A release names one of this framework's agents, or the agent of a wait
+    // the listing shows (a disposed conversation fork's wait stays recorded):
+    // an operator can release anything the listing shows. Any other name (a
+    // typo, or '*' and 'framework', which stand for the hold on unreadable
+    // records in its listing and its alert) is refused before anything is
+    // recorded: it would lift nothing and still read as a success. That hold
+    // is lifted one agent at a time.
+    if (!this.agents.has(agentName) && !this.providerWaits?.recorded(agentName)) {
+      throw new Error(`Unknown agent: ${safeSlice(JSON.stringify(agentName), 0, 120)}. A release names one of this ` +
+        "framework's agents or an agent with a recorded wait, and the hold on unreadable provider waits is lifted " +
+        'one agent at a time');
+    }
+    by = operatorLabel(String(by));
+    // '*' (EVERY_MODEL, as providerWaits lists the unreadable-records hold)
+    // names every model, the same as omitting it, everywhere below.
+    if (model === EVERY_MODEL) model = undefined;
+    const released = this.providerWaits?.release(agentName, model, by) ?? [];
+    for (const { wait, release } of released) {
+      console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
+    }
+    // The agent's context strategy may pace its own provider calls by the
+    // same stated wait (context-manager's compression lane, from its
+    // corrective round #138 on; 0.14.0 has no releaseCompressionPause, so this
+    // calls nothing there). The release is the operator's word on that wait
+    // too, so it is offered to the lane with its scope even when no wait
+    // binds here: the lane can hold a pause after
+    // this framework's own wait is gone (the records read again, the wait
+    // passed, or it was released in another process). The strategy's own
+    // backoff stays, and the receipt still lists only waits released here.
+    // Read inside the try: the release is already recorded, so a strategy
+    // that throws must not keep the hold below from being released.
+    try {
+      const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
+        { releaseCompressionPause?: (model?: string) => boolean } | undefined;
+      if (strategy?.releaseCompressionPause?.(model)) {
+        console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
+      }
+    } catch (error) {
+      console.error(`[provider-wait] agent=${agentName} could not offer the release to the compression lane: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
+    }
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    const covers = (held: string | undefined): boolean => held !== undefined && (model === undefined || held === model);
+    if (cooldown && covers(cooldown.waitModel)) {
+      // A wait hold asks its wait again: released, the hold ends.
+      this.releaseProviderAccelerationCooldown(agentName);
+    } else if (cooldown?.statedWait && covers(cooldown.statedWait.model)) {
+      // An acceleration hold the stated wait lengthened keeps only AF's own
+      // pacing for that failure, and is never lengthened by a release. A host
+      // hold carries no stated wait: its length stays the host's.
+      cooldown.until = Math.min(cooldown.until, cooldown.statedWait.ownUntil);
+      console.error(`[provider-wait] agent=${agentName} model=${cooldown.statedWait.model} acceleration hold keeps AF's own pacing only, ` +
+        (cooldown.until > Date.now() ? `until ${new Date(cooldown.until).toISOString()}` : 'which has passed'));
+      delete cooldown.statedWait;
+      this.releaseProviderAccelerationCooldown(agentName);
+    }
+    return released.map(({ wait, release }) => ({
+      model: wait.model, until: wait.until === null ? null : new Date(wait.until).toISOString(), release,
+    }));
+  }
+
+  /** Provider waits binding now, for health and doctor tooling. */
+  providerWaitSnapshot(agentName?: string): Array<{ agent: string; model: string; until: string | null; reason: string; setAt: string }> {
+    return (this.providerWaits?.list(agentName) ?? []).map((wait) => ({
+      agent: wait.agent,
+      model: wait.model,
+      until: wait.until === null ? null : new Date(wait.until).toISOString(),
+      reason: wait.reason,
+      setAt: new Date(wait.setAt).toISOString(),
+    }));
+  }
+
   private recordProviderAccelerationRecovery(agent: Agent, request: NormalizedRequest | undefined, stopReason: string): void {
     const recovery = this.providerAccelerationRecoveries.get(agent.name); if (!recovery?.releasedAt) return;
     this.providerAccelerationRecoveries.delete(agent.name);
@@ -2612,7 +3427,10 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
-      const reason = error instanceof Error ? error.message : String(error);
+      // The alert cuts its own copies from the whole message, so the
+      // webhook's states the whole length.
+      const wholeReason = error instanceof Error ? String(error.message) : failureDescription(error);
+      const reason = boundFailureText(wholeReason);
       console.error(
         '[context-maintenance] pass failed:',
         reason,
@@ -2620,7 +3438,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-maintenance-failed',
         'framework',
-        reason,
+        wholeReason,
         { data: { scope: 'pass' } },
       );
     });
@@ -2690,12 +3508,13 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          record.error = error instanceof Error ? error.message : String(error);
+          const wholeError = error instanceof Error ? String(error.message) : failureDescription(error);
+          record.error = boundFailureText(wholeError);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
             agent.name,
-            record.error,
+            wholeError,
             {
               data: {
                 scope: 'agent',
@@ -3011,14 +3830,27 @@ export class AgentFramework {
    *  says fetch_reference instead of a path. */
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
-    const fetcher = this.getReferenceFetcher();
-    const eligible: import('./mcpl/references.js').ReferenceRecord[] = [];
+    // Register every block first, then judge each uri once, by its latest
+    // record. The registry keys records by uri and evicts the one registered
+    // least recently, so a uri this result mentions keeps its record through
+    // the result's later blocks, short of more distinct references in one
+    // result than the registry holds; past that, a uri can get a second
+    // record here, hence the key by uri. A uri that any of this result's
+    // blocks calls expired takes no slot, whichever block registered last. A
+    // later result's fresh expiry still supersedes, through register().
+    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      if (eager && fetcher.isEagerEligible(record)) eligible.push(record);
+      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
+      byUri.set(c.testimony.uri, { record, expiredHere });
     }
+    if (!eager) return;
+    const fetcher = this.getReferenceFetcher();
+    const eligible = [...byUri.values()]
+      .filter(({ record, expiredHere }) => !expiredHere && fetcher.isEagerEligible(record))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -3473,7 +4305,7 @@ export class AgentFramework {
     }
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
-      this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+      this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     }
     this.recordOperatorAction({
       kind: 'settings-update',
@@ -3494,7 +4326,7 @@ export class AgentFramework {
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.resetRuntimeSettings(keys);
     if (opts?.persist !== false) {
-      this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+      this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     }
     this.recordOperatorAction({
       kind: 'settings-reset',
@@ -3513,7 +4345,7 @@ export class AgentFramework {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.cancelRuntimeSettingsTransition();
-    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     this.recordOperatorAction({
       kind: 'settings-cancel-transition',
       agent: agentName,
@@ -3597,6 +4429,15 @@ export class AgentFramework {
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
+    this.refuseOperatorAfterStop('quiesce');
+    return this.trackOperatorOperation('host:quiesce', () => this.runQuiesce(opts));
+  }
+
+  private async runQuiesce(opts?: {
+    reason?: string;
+    timeoutMs?: number;
+    abandon?: boolean;
+  }): Promise<HostModeStatus> {
     if (this.quiesced) {
       // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
       // out undrained must be escalatable with a second quiesce({abandon})
@@ -3651,6 +4492,7 @@ export class AgentFramework {
     // continuation's quiesce recheck requeues it — wait for that to happen).
     while (
       this.quiesced &&
+      !this.queue?.isClosed &&
       (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0) &&
       Date.now() < deadline
     ) {
@@ -3663,6 +4505,13 @@ export class AgentFramework {
     // the host is no longer in.
     if (!this.quiesced) {
       console.error('[host-mode] quiesce superseded by a concurrent resume during drain');
+      return this.getHostModeStatus();
+    }
+    // Stop cuts this drain short, including any requested abandon. It cancels
+    // streams and waits for the event loop; a token with no stream settles
+    // on its own. Return the status as it stands and keep the durable quiesce.
+    if (this.queue?.isClosed) {
+      console.error('[host-mode] quiesce stopped waiting for its drain: the framework is stopping');
       return this.getHostModeStatus();
     }
 
@@ -3724,9 +4573,11 @@ export class AgentFramework {
         );
       }
     }
-    // Bounded grace for the cancelled streams' teardown to settle.
+    // Bounded grace for cancelled streams. Stop cancels streams too; a turn
+    // with no stream settles on its own. Report the abandon that already ran,
+    // even if stop cuts its grace short.
     const grace = Date.now() + 10_000;
-    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < grace) {
+    while (this.quiesced && !this.queue?.isClosed && this.activeTurnTokens.size > 0 && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
     // Only turns still alive after the grace are worth reporting.
@@ -3743,6 +4594,11 @@ export class AgentFramework {
    * strategy cannot preview would hold hosts hostage to a diagnostic.
    */
   async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
+    this.refuseOperatorAfterStop('resume');
+    return this.trackOperatorOperation('host:resume', () => this.runResume(opts));
+  }
+
+  private async runResume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     if (!this.quiesced) return this.getHostModeStatus();
 
     // The canonical operator flow is `maintain; resume`, and a timer-driven
@@ -3769,6 +4625,12 @@ export class AgentFramework {
           `(${preview.reason}) — proceeding without a verdict`,
         );
       }
+    }
+    // stop() closes the queue first. If it has begun, before this call or
+    // during the waits above, leave the host quiesced, as it will boot,
+    // rather than reopen what stop() is closing.
+    if (this.queue?.isClosed) {
+      throw new Error('resume refused: the framework is stopping, so the host stays quiesced');
     }
     if (failing.length > 0 && !opts?.force) {
       const detail = failing.map(({ agentName, preview }) =>
@@ -3824,7 +4686,9 @@ export class AgentFramework {
       // mid-quiesce boots quiesced but with these queues empty (sources like
       // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
       // Deferred context WRITES are persisted while quiesced and survive.
-      console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+      console.error(this.queue?.isClosed
+        ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
+        : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
     }
     return this.getHostModeStatus();
   }
@@ -4121,9 +4985,12 @@ export class AgentFramework {
    * true in quiesce mode precisely so this machinery stays hot.
    */
   async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
+    // A pass already running is stop()'s to wait for; a new one isn't started.
+    this.refuseOperatorAfterStop('maintain');
     if (!this.running) {
-      // startQueuedMaintenance no-ops on a stopped/never-started framework —
-      // a bare snapshot would masquerade as a completed pass, so say so.
+      // startQueuedMaintenance no-ops on a framework that was never started
+      // (a stopping one is refused above): a bare snapshot would masquerade
+      // as a completed pass, so say so.
       console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
       return { ...this.getContextMaintenanceSnapshot(), ran: false };
     }
@@ -4159,13 +5026,28 @@ export class AgentFramework {
    * were activated right now — WITHOUT running inference, opening a stream, or
    * mutating agent state. Intended for debug/preview tooling.
    *
-   * Transparency contract (default): the preview is side-effect-free and
-   * leaves no trace on the system. It does only read-only work —
-   * `ContextManager.compile` (which never triggers compression itself;
-   * compression runs in the background out-of-band), tool filtering, and
-   * system-prompt assembly — then delegates to `Agent.buildActivationRequest`.
-   * No tokens are spent, nothing is written to Chronicle, and no external
-   * MCPL server is contacted.
+   * What a preview commits (default): nothing of its own. It compiles as a
+   * dry run (`dryRun`), filters tools and assembles the system prompt, then
+   * delegates to `Agent.buildActivationRequest`. No tokens are spent, no
+   * external MCPL server is contacted, no fold resolution is persisted and
+   * none of the compression its fold plan calls for is queued; the consumed
+   * watermark and any prepared budget change are left alone; and once
+   * context-manager's thinking binding (context-manager#160, not yet
+   * released) ships, no stamps are committed and no compile awaits
+   * acceptance. In context-manager 0.14 its dry run leaves nothing else
+   * behind but the release of an expired compression hold, as any compile
+   * does (see `Agent.compileWithInjections`). The preview keeps in-memory
+   * bookkeeping of its own, such as handing the context manager the
+   * compression tool definitions, as every activation request does.
+   * Under the autobiographical strategy, a budget the context can't fit
+   * still throws, as for a committing compile: a dry run skips only
+   * context-manager's post-pick check, and an adaptive fold plan that
+   * doesn't fit then overruns at the middle's emission, with a refusal that
+   * names the tokens and the limit. Windowed passthrough's newest message
+   * alone is the one window that comes back larger than the budget. For a
+   * verdict instead of the refusal, `previewContextSettings` returns
+   * context-manager's own at a budget, with the agent's `maxTokens` reserved
+   * for the response.
    *
    * The trade-off is fidelity: the dynamically-gathered ContextInjection[]
    * (module `gatherContext` + MCPL `beforeInference` hooks) are NOT included
@@ -4196,13 +5078,15 @@ export class AgentFramework {
     };
 
     // An explicit budget compiles against a HYPOTHETICAL window instead of the
-    // agent's live one. That also suppresses transition-settling in
-    // compileWithInjections (which only settles when no budget is passed), so
-    // previewing a smaller window cannot advance a converging descent.
-    // Default: no dynamic injection gathering → fully transparent (no
-    // inference, no Chronicle writes, no external RPC). Opt in explicitly.
+    // agent's live one. Every preview is a dry run, so none of them settles
+    // a converging descent or commits what a sent compile commits (see the
+    // doc comment above).
+    // Default: no dynamic injection gathering → no inference, no Chronicle
+    // writes of its own, no external RPC. Opt in explicitly.
     if (!opts?.injections) {
-      return capture(await agent.buildActivationRequest(tools, undefined, opts?.budget, presentation?.available ?? tools));
+      return capture(await agent.buildActivationRequest(
+        tools, undefined, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+      ));
     }
 
     // Full-fidelity path: mirrors startAgentStream's injection gathering.
@@ -4237,7 +5121,9 @@ export class AgentFramework {
       }
     }
 
-    return capture(await agent.buildActivationRequest(tools, injections, opts?.budget, presentation?.available ?? tools));
+    return capture(await agent.buildActivationRequest(
+      tools, injections, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+    ));
   }
 
   /**
@@ -4247,9 +5133,11 @@ export class AgentFramework {
    *
    * Unlike `previewActivation` (which renders a request), this returns the
    * picker's plan: resulting tokens, whether it fits, how many summaries would
-   * have to be produced first, and the per-chunk fold levels. Commits nothing:
-   * no resolution persistence, no compression enqueue, no transition
-   * bookkeeping — see `AutobiographicalStrategy.previewContext`.
+   * have to be produced first, and the per-chunk fold levels. It commits
+   * nothing: its select is a dry run, which in context-manager 0.14 leaves
+   * what a select leaves behind as the last committing compile left it —
+   * see `AutobiographicalStrategy.previewContext` and
+   * `Agent.compileWithInjections`.
    *
    * Returns null when the agent's strategy has no fold plan (non-adaptive).
    */
@@ -4261,6 +5149,15 @@ export class AgentFramework {
   ): unknown {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    return this.previewContextFor(agent, budgetTokens, overrides, opts);
+  }
+
+  private previewContextFor(
+    agent: Agent,
+    budgetTokens: number,
+    overrides?: Record<string, unknown>,
+    opts?: { render?: boolean },
+  ): unknown {
     const cm = agent.getContextManager() as unknown as {
       previewContext?: (
         budget: TokenBudget,
@@ -4304,6 +5201,14 @@ export class AgentFramework {
   ): RuntimeSettingsPreview {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    return this.previewRuntimeSettingsFor(agent, patch);
+  }
+
+  /** previewAgentRuntimeSettings for an agent in hand: boot restore previews one not yet registered. */
+  private previewRuntimeSettingsFor(
+    agent: Agent,
+    patch?: AgentRuntimeSettingsPatch,
+  ): RuntimeSettingsPreview {
     const plan = agent.planRuntimeSettings(patch);
     const settings = agent.getRuntimeSettings();
     const base: RuntimeSettingsPreview = {
@@ -4319,8 +5224,8 @@ export class AgentFramework {
       reason?: string;
     } => {
       try {
-        const result = this.previewContextSettings(
-          agentName,
+        const result = this.previewContextFor(
+          agent,
           budgetTokens,
           Object.keys(plan.overrides).length > 0 ? plan.overrides : undefined,
         );
@@ -4477,22 +5382,41 @@ export class AgentFramework {
     }
   }
 
+  /** An agent's persisted record, or null when it has none; throws when the store can't be read. */
   private readAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsOverrides | null {
-    try {
-      const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
-        agentRuntimeSettings?: Record<string, AgentRuntimeSettingsOverrides>;
-      } | null;
-      const stored = data?.agentRuntimeSettings?.[agentName];
-      return stored ? { ...stored } : null;
-    } catch {
-      return null;
-    }
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
+      agentRuntimeSettings?: Record<string, AgentRuntimeSettingsOverrides>;
+    } | null;
+    const stored = data?.agentRuntimeSettings?.[agentName];
+    return stored ? { ...stored } : null;
   }
 
   private validatePersistedAgentRuntimeSettings(
     agentName: string,
     overrides: AgentRuntimeSettingsOverrides,
   ): AgentRuntimeSettingsOverrides {
+    // A malformed number is dropped, with a line that names the value's kind,
+    // never its content. It could never apply: a budget, tail or pace kept
+    // unapplied would be reported and written back as it is, and a marker
+    // that can't be read isn't trusted, so the budget restores paced.
+    const numbers = [
+      ['contextBudgetReachedTokens', 1],
+      ['contextBudgetTokens', 1],
+      ['tailTokens', 0],
+      ['transitionPaceTokens', 1],
+    ] as const;
+    for (const [key, least] of numbers) {
+      const value = overrides[key] as unknown;
+      if (value === undefined || (Number.isSafeInteger(value) && (value as number) >= least)) continue;
+      const kind = typeof value === 'number' ? `a number that isn't a ${least > 0 ? 'positive' : 'non-negative'} safe integer`
+        : value === null ? 'null'
+          : Array.isArray(value) ? 'an array'
+            : typeof value === 'object' ? 'an object'
+              : `a ${typeof value}`;
+      console.error(`[agent-settings] ignoring an invalid persisted ${key} for agent "${agentName}": ${kind}`);
+      const { [key]: _ignored, ...rest } = overrides;
+      overrides = rest;
+    }
     if (
       overrides.sameRoundThinkTextPolicy !== undefined &&
       overrides.sameRoundThinkTextPolicy !== 'public' &&
@@ -4541,6 +5465,138 @@ export class AgentFramework {
     if (Object.keys(all).length === 0) delete state.toolResultInlineCaps;
     else state.toolResultInlineCaps = all;
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+  }
+
+  /**
+   * Apply an agent's persisted settings at boot, each on its own, the budget
+   * last. A persisted setting never stops the agent booting, except a
+   * think-text policy, which fails closed: an invalid one is refused before
+   * this (validatePersistedAgentRuntimeSettings), and a valid one always
+   * applies. A tail, pace or budget that can't be applied now (a tail or pace
+   * on a strategy without live settings, a budget no longer above maxTokens,
+   * a lower one restored paced on a strategy that can't prepare a smaller
+   * window) is kept set but unapplied (Agent.keepRuntimeSettings), so a later
+   * persisting write keeps it in the record.
+   *
+   * A budget below the recipe's restores as a paced descent from it, unless
+   * the record carries its marker (`contextBudgetReachedTokens`, written when
+   * a compile fit at it) and the preflight says it fits now: then it is
+   * applied at once. The preflight plans the stored context as the context
+   * manager will, with the restored tail and pace, so it sees what a restart
+   * can change there: a new maxTokens (the response reserve) or strategy
+   * configuration. It also sees a context that grew while the agent ran at
+   * another budget after the record was written, through a persist: false
+   * change. The system prompt, tools and injections are outside the context
+   * manager's budget, so they don't enter it (context-manager #162). If a
+   * compile at a budget applied at once this way is refused, the agent
+   * restores it paced then (armed by Agent.restoreRuntimeSettings, run in
+   * Agent.compileAtLiveBudgetNoting). A budget at or above the recipe's is
+   * applied at once with or without the marker, as an increase always is.
+   *
+   * When a marked budget isn't applied at once or a setting can't be
+   * applied, one line says why, what couldn't be applied, and the budget set
+   * beside the one compiles plan at.
+   */
+  private restorePersistedRuntimeSettings(
+    agentName: string,
+    agent: Agent,
+    overrides: AgentRuntimeSettingsOverrides,
+  ): void {
+    const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, ...settings } = overrides;
+    if (sameRoundThinkTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundThinkTextPolicy });
+    const unapplied: string[] = [];
+    /** Restore one setting, or keep it set but unapplied; true if it applied. */
+    const restore = (part: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>) => {
+      try {
+        agent.restoreRuntimeSettings(part);
+        return true;
+      } catch (error) {
+        agent.keepRuntimeSettings(part);
+        unapplied.push(Object.entries(part).map(([key, value]) => `${key}=${value}`).join(', ') + ` (${messageOf(error)})`);
+        return false;
+      }
+    };
+    if (settings.tailTokens !== undefined) restore({ tailTokens: settings.tailTokens });
+    if (settings.transitionPaceTokens !== undefined) restore({ transitionPaceTokens: settings.transitionPaceTokens });
+    const budget = settings.contextBudgetTokens;
+    let atOnce: string | undefined;
+    let appliedAtOnce = false;
+    if (budget !== undefined && reached === budget) {
+      const patch: AgentRuntimeSettingsPatch = { contextBudgetTokens: budget, immediate: true };
+      let why: string | undefined;
+      try {
+        const preview = this.previewRuntimeSettingsFor(agent, patch);
+        if (!preview.available) why = `whether it fits now can't be checked (${preview.reason ?? 'no preview'})`;
+        else if (preview.effective?.fits !== true) why = `the folded floor renders ${preview.effective?.finalTokens} tokens against it now`;
+      } catch (error) {
+        why = `whether it fits now can't be checked (${messageOf(error)})`;
+      }
+      if (why === undefined) {
+        try {
+          agent.restoreRuntimeSettings(patch, { provenBudget: budget });
+          appliedAtOnce = true;
+        } catch (error) {
+          why = `applying it at once failed (${messageOf(error)}), though the preflight says it fits now`;
+        }
+      }
+      if (why !== undefined) atOnce = `its record says a compile fit at contextBudgetTokens=${budget}, but ${why}`;
+    }
+    const budgetKept = budget !== undefined && !appliedAtOnce && !restore({ contextBudgetTokens: budget });
+    if (atOnce === undefined && unapplied.length === 0) return;
+    const now = agent.getRuntimeSettings();
+    const said: string[] = [];
+    if (atOnce !== undefined) {
+      said.push(budgetKept ? atOnce : `${atOnce}; restored it ${now.transition === 'stable' ? 'without that proof' : 'paced instead'}`);
+    }
+    if (unapplied.length > 0) {
+      said.push(`${unapplied.join(', ')} can't be applied now, so ${unapplied.length === 1 ? 'it stays' : 'they stay'} set but unapplied`);
+    }
+    console.error(
+      `[agent-settings] ${agentName}: ${said.join('; ')}: contextBudgetTokens is ${now.contextBudgetTokens}, ` +
+        `and compiles plan at ${now.effectiveContextBudgetTokens}${now.transition === 'stable' ? '' : ` (${now.transition})`}`,
+    );
+  }
+
+  /**
+   * What persists for an agent: its overrides, and `contextBudgetReachedTokens`
+   * when the agent's proof stands for the overridden budget: a compile fit at
+   * it, or the boot applied it at once on the record's proof, and the live
+   * budget hasn't changed since (context-manager #162). A
+   * change of budget, immediate or not, carries none until a compile at it
+   * fits; arming or cancelling a descent leaves the proof as it was.
+   */
+  private persistedRuntimeSettingsOf(agent: Agent): AgentRuntimeSettingsOverrides {
+    const overrides = agent.getRuntimeSettingsOverrides();
+    const proven = agent.getProvenContextBudgetTokens();
+    return overrides.contextBudgetTokens !== undefined && proven === overrides.contextBudgetTokens
+      ? { ...overrides, contextBudgetReachedTokens: proven }
+      : overrides;
+  }
+
+  /**
+   * A compile at the agent's live budget came out differently from the last
+   * (Agent.onContextBudgetCompiled). Keep the persisted record's
+   * `contextBudgetReachedTokens` true to it: written when a compile fits at
+   * the record's own budget, withdrawn when the context manager refuses that
+   * budget. Nothing else in the record changes, and a budget other than the
+   * record's (one applied with `persist: false`, or a descent's starting
+   * budget) writes nothing. A record that can't be read, or written, is
+   * logged, and the next compile at that budget tells it again.
+   */
+  private recordCompiledContextBudget(agentName: string, budget: number, fit: boolean): boolean {
+    try {
+      const persisted = this.readAgentRuntimeSettings(agentName);
+      if (!persisted || persisted.contextBudgetTokens !== budget) return true;
+      if ((persisted.contextBudgetReachedTokens === budget) === fit) return true;
+      const { contextBudgetReachedTokens: _previous, ...settings } = persisted;
+      this.persistAgentRuntimeSettings(agentName, fit ? { ...settings, contextBudgetReachedTokens: budget } : settings);
+      return true;
+    } catch (error) {
+      // The next compile at this budget tells it again.
+      console.error(`[agent-settings] couldn't record ${agentName}'s compile at budget ${budget}:`, error);
+      return false;
+    }
   }
 
   private persistAgentRuntimeSettings(
@@ -4738,7 +5794,8 @@ export class AgentFramework {
     if (!run) return;
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
-      run.settle.reject(new Error(outcome.error ?? 'Unknown error'));
+      // The caller may log or relay the message, which can echo the whole request.
+      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
       return;
     }
     run.settle.resolve({
@@ -5319,7 +6376,7 @@ export class AgentFramework {
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) {
         console.error(
-          `[inference-refusal] reaction skipped: no MCPL server for locus "${incoming.channelId}" (agent=${agentName})`,
+          `[inference-refusal] reaction skipped: no MCPL server for locus ${logValue(incoming.channelId)} (agent=${agentName})`,
         );
         return;
       }
@@ -5435,9 +6492,10 @@ export class AgentFramework {
       ? `the model refused on them (content filter: ${category}). Their content is ` +
         `not reproduced here (so this note can't re-trigger the filter); the ` +
         `originals remain in the raw record`
-      : `the model API kept rejecting the conversation on them (${category}). ` +
-        `Their content is not reproduced here (so this note can't re-trigger the ` +
-        `rejection); the originals remain in the raw record`;
+      : `the model API kept refusing the requests that carried them (${category}), ` +
+        `so that the conversation could go on. Their content is not reproduced ` +
+        `here (so this note can't trigger the same refusal); the originals remain ` +
+        `in the raw record`;
     const text =
       `[refusal-rewind] The ${count} most recent turn(s) were set aside because ` +
       `${why}. You are clear to continue — if you ` +
@@ -5600,8 +6658,20 @@ export class AgentFramework {
    *
    *   host-status — report the quiesce state (drained / parked wakes /
    *   running background scripts).
+   *
+   *   release-provider-wait — end an agent's provider wait (a provider's
+   *   stated retry-after, kept across restarts) for one `model` or all, as an
+   *   explicit, recorded operator override.
    */
-  private async handleHostCommand(
+  private handleHostCommand(
+    serverId: string,
+    params: HostCommandParams,
+  ): ReturnType<AgentFramework['runHostCommand']> {
+    return this.trackOperatorOperation(`host/command:${String(params.command)}`, () => this.runHostCommand(serverId, params));
+  }
+
+  /** handleHostCommand's work, run where stop() can wait for it. */
+  private async runHostCommand(
     serverId: string,
     params: HostCommandParams,
   ): Promise<{
@@ -5646,6 +6716,8 @@ export class AgentFramework {
     /** For `nudge`: agent state at queue time ('idle' = runs immediately,
      *  else it runs once the current turn settles). */
     agentStatus?: string;
+    /** For `release-provider-wait`: the waits released. */
+    released?: Array<{ model: string; until: string | null }>;
   }> {
     if (
       params.command !== 'undo' &&
@@ -5656,7 +6728,8 @@ export class AgentFramework {
       params.command !== 'resume' &&
       params.command !== 'maintain' &&
       params.command !== 'host-status' &&
-      params.command !== 'marks'
+      params.command !== 'marks' &&
+      params.command !== 'release-provider-wait'
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
@@ -5726,6 +6799,30 @@ export class AgentFramework {
     }
     if (params.command === 'host-status') {
       return { ok: true, hostMode: this.getHostModeStatus() };
+    }
+    // A release names its agent, as host.releaseProviderWait does: the first
+    // agent by default could lift the wrong agent's waits. The name may be an
+    // agent the framework no longer has whose wait the listing still shows
+    // (a disposed conversation fork); releaseProviderWait decides that.
+    if (params.command === 'release-provider-wait') {
+      if (typeof params.agentName !== 'string' || params.agentName === '') {
+        return { ok: false, error: 'release-provider-wait: agentName must name the agent whose waits to release' };
+      }
+      // Only an omitted model, or '*', releases every model: a malformed one
+      // is refused here, before anything changes, never widened.
+      if (!isReleaseModel(params.model)) {
+        return { ok: false, error: "release-provider-wait: model must be a model name, or '*' (or omitted) for every model" };
+      }
+      const by = operatorLabel(String(requester));
+      let released: ReturnType<AgentFramework['releaseProviderWait']>;
+      try {
+        released = this.releaseProviderWait(params.agentName, params.model, by);
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      console.error(`[host-command] release-provider-wait agent=${params.agentName} model=${params.model ?? '*'} by=${by} ` +
+        `(server=${serverId}): ${released.length} wait(s) lifted`);
+      return { ok: true, released };
     }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
@@ -5977,7 +7074,7 @@ export class AgentFramework {
       const before = this.addressingSnapshot(agentName);
       try {
         for (let i = 0; i < requested; i++) {
-          const r = this.undoLastTurn(agentName, hostCommandRequester(serverId, params));
+          const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params), true);
           if (!r.undone) break;
           undone++;
         }
@@ -5985,7 +7082,7 @@ export class AgentFramework {
         // e.g. "Cannot undo while agent is streaming" — report what happened,
         // including any turns already undone before the failure.
         const msg = error instanceof Error ? error.message : String(error);
-        if (undone === 0) return { ok: false, error: msg };
+        if (undone === 0) return { ok: false, error: msg, ...(error instanceof OperatorActionError ? { code: error.code } : {}) };
         console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
       }
 
@@ -6351,8 +7448,36 @@ export class AgentFramework {
   }
 
   // ==========================================================================
-  // Undo / Redo
+  // Branch switch, Undo / Redo
   // ==========================================================================
+
+  /**
+   * Switch the store to an existing branch and re-materialize the config
+   * mount from it. A switch adds or removes no Discord awareness marks: they
+   * are one-shot, a surgery's or an operator's explicit choice. Resolves once
+   * the mount has run; if it fails, it rejects with the store already moved.
+   * The store has moved by the time the call returns, before its promise
+   * settles, and a refusal moves nothing. An operator's operation: refused
+   * once stop() has begun, and waited for by stop() while it runs.
+   *
+   * The branch moves under every agent sharing the store, so the switch
+   * reserves the store as a surgery does: every agent must be idle, or it is
+   * refused (OperatorActionError 'agent-busy'), and no turn starts until the
+   * switch is done.
+   */
+  async switchBranch(name: string): Promise<void> {
+    this.refuseOperatorAfterStop('switch branch');
+    const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    try {
+      this.store.switchBranch(name);
+      const ws = this.moduleRegistry.getModule('workspace');
+      if (ws && 'materializeMount' in ws) {
+        await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
+      }
+    } finally {
+      release();
+    }
+  }
 
   /**
    * Undo the last inference turn for an agent.
@@ -6370,12 +7495,30 @@ export class AgentFramework {
     fromBranch?: string;
     toBranch?: string;
   } {
+    this.refuseOperatorAfterStop('undo');
+    return this.runUndoLastTurn(agentName, requester);
+  }
+
+  /** undoLastTurn's work, for a host/command undo already admitted: a stop()
+   *  begun by a trace of one of its turns doesn't refuse the next. That undo
+   *  holds the store for all its turns (`holdsStore`); any other caller is
+   *  refused while a surgery or a branch switch holds it. */
+  private runUndoLastTurn(agentName: string, requester?: OperatorRequester, holdsStore = false): {
+    undone: boolean;
+    turnIndex?: number;
+    fromBranch?: string;
+    toBranch?: string;
+  } {
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
       throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+    }
+    // A surgery or a branch switch holds the store while it awaits its steps.
+    if (this.surgeryHold && !holdsStore) {
+      throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -6392,11 +7535,7 @@ export class AgentFramework {
     this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
     this.store.switchBranch(undoBranchName);
 
-    // Materialize config files from the new branch (fire-and-forget; gate picks up via mtime)
-    const wsUndo = this.moduleRegistry.getModule('workspace');
-    if (wsUndo && 'materializeMount' in wsUndo) {
-      (wsUndo as any).materializeMount('_config').catch(() => {});
-    }
+    this.materializeConfigMountAfterBranchSwitch();
 
     // Push onto redo stack
     let redoStack = this.redoStacks.get(agentName);
@@ -6440,12 +7579,17 @@ export class AgentFramework {
     fromBranch?: string;
     toBranch?: string;
   } {
+    this.refuseOperatorAfterStop('redo');
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
       throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+    }
+    // A surgery or a branch switch holds the store while it awaits its steps.
+    if (this.surgeryHold) {
+      throw new OperatorActionError('agent-busy', `Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
     const redoStack = this.redoStacks.get(agentName);
@@ -6458,11 +7602,7 @@ export class AgentFramework {
 
     this.store.switchBranch(branchName);
 
-    // Materialize config files from the restored branch (fire-and-forget; gate picks up via mtime)
-    const wsRedo = this.moduleRegistry.getModule('workspace');
-    if (wsRedo && 'materializeMount' in wsRedo) {
-      (wsRedo as any).materializeMount('_config').catch(() => {});
-    }
+    this.materializeConfigMountAfterBranchSwitch();
 
     // Restore the checkpoint
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -6584,10 +7724,16 @@ export class AgentFramework {
     // arrivals during the awaited switch (see surgeryHold).
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
+    // stop() waits for the release (see stopOwned): a surgery admitted before
+    // stop() began finishes, flush included, before the store closes.
+    let settle!: () => void;
+    void this.trackOperatorOperation(`surgery:${verb}`, () => new Promise<void>((resolve) => { settle = resolve; }));
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      // The release runs to its end before stop() can go on.
+      settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
@@ -6728,6 +7874,7 @@ export class AgentFramework {
     markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
+    this.refuseOperatorAfterStop('roll back');
     const logBase: OperatorLogInput = {
       kind: 'rollback',
       agent: agentName,
@@ -6877,6 +8024,7 @@ export class AgentFramework {
     markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
+    this.refuseOperatorAfterStop('suppress');
     const requestedIds = [...new Set(opts.messageIds.map(String))];
     const logBase: OperatorLogInput = {
       kind: 'suppress',
@@ -7326,13 +8474,24 @@ export class AgentFramework {
    * in the same synchronous run (the first request can be written before
    * this returns) and continues independently. Delivery never gates MCPL
    * traffic or turns; a failure is logged and raised as an ops alert, and
-   * the queued work stays in the journal for the next pass.
+   * the queued work stays in the journal for the next pass. It isn't an
+   * operator's operation, as syncDiscordAwarenessMarkers is: stop() waits
+   * for running drains only before the store closes, and once stop() has
+   * begun none is started, since the teardown would cut it off. The next
+   * start delivers what is due.
    */
   private deliverDiscordAwarenessInBackground(
     occasion: 'rollback' | 'suppress' | 'hide' | 'undo' | 'retract' | 'release' | 'startup' | 'connect' | 'list-change' | 'reconnect',
     agentName: string,
   ): void {
-    this.syncDiscordAwarenessMarkers().catch((error) => {
+    if (this.stopHasBegun()) {
+      console.error(
+        `[discord-awareness] delivery after ${occasion} agent=${agentName} not started: ` +
+          'the framework is stopping; the next start delivers what is due',
+      );
+      return;
+    }
+    this.runDiscordAwarenessSync().catch((error) => {
       const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       console.error(`[discord-awareness] delivery after ${occasion} failed: ${detail}`);
       this.opsAlert(
@@ -7343,14 +8502,19 @@ export class AgentFramework {
     });
   }
 
-  /** Re-materialize config files from the (new) active branch — fire and
-   *  forget; the gate picks changes up via mtime. Mirrors undoLastTurn. */
+  /** Start config file IO without holding the caller or a surgery's store
+   * reservation. The gate picks it up by mtime; stop() still waits for it. */
   private materializeConfigMountAfterBranchSwitch(): void {
     const ws = this.moduleRegistry.getModule('workspace');
     if (ws && 'materializeMount' in ws) {
-      (ws as { materializeMount: (m: string) => Promise<void> })
-        .materializeMount('_config')
-        .catch(() => {});
+      void this.trackOperatorOperation('config:materialize',
+        () => (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config'),
+      ).catch((error) => {
+        console.error(
+          '[workspace] re-materializing the config mount after a branch switch failed:',
+          error instanceof Error ? error.message : error,
+        );
+      });
     }
   }
 
@@ -7534,12 +8698,23 @@ export class AgentFramework {
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
-    const restoredSettings = this.readAgentRuntimeSettings(config.name);
+    let restoredSettings: AgentRuntimeSettingsOverrides | null = null;
+    try {
+      restoredSettings = this.readAgentRuntimeSettings(config.name);
+    } catch (error) {
+      console.error(
+        `[agent-settings] ${config.name}: its persisted settings can't be read ` +
+          `(${error instanceof Error ? error.message : String(error)}); it boots at the recipe's`,
+      );
+    }
     if (restoredSettings) {
-      agent.restoreRuntimeSettings(
+      this.restorePersistedRuntimeSettings(
+        config.name,
+        agent,
         this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
       );
     }
+    agent.onContextBudgetCompiled((budget, fit) => this.recordCompiledContextBudget(config.name, budget, fit));
     this.agents.set(config.name, agent);
     this.agentConfigs.set(config.name, config);
 
@@ -8213,7 +9388,7 @@ export class AgentFramework {
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
     if (isVisiblyEmptyContent(event.content)) {
-      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${event.channelId} messageId=${event.messageId} reason=empty-content`);
+      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${logValue(event.channelId)} messageId=${logValue(event.messageId)} reason=empty-content`);
       this.emitTrace({
         type: 'mcpl:empty-content-dropped', lane: 'channel', serverId: event.serverId,
         channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
@@ -8399,7 +9574,7 @@ export class AgentFramework {
         });
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Failed to spawn conversation agent for ${event.channelId}:`, err);
+        console.error(`Failed to spawn conversation agent for ${logValue(event.channelId)}:`, err);
         this.emitTrace({
           type: 'mcpl:conversation-spawn-failed',
           channelId: event.channelId,
@@ -8452,9 +9627,10 @@ export class AgentFramework {
   /**
    * Spawn a persistent per-channel conversation agent ("fork") from the
    * template agent: own ContextManager under `conversations/{name}`, seeded
-   * with a copy of the template's compiled context (the SubagentModule
-   * wholesale-copy pattern), registered in the event loop like any agent —
-   * but never primary.
+   * with the template's compiled context without its thinking or its unpaired
+   * tool blocks (the SubagentModule wholesale-copy pattern; see the seeding
+   * comment below), registered in the event loop like any agent — but never
+   * primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
     const router = this.conversationRouter!;
@@ -8475,10 +9651,10 @@ export class AgentFramework {
         isolate: true,
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
-        // Dynamic conversation forks retain the established provider policy in
-        // this bounded first slice. Provider cooldown ownership belongs to the
-        // persistent resident only; generation-unique forks must not leak gates.
-        membrane: this.membrane,
+        // Provider cooldown ownership belongs to the persistent resident only;
+        // generation-unique forks must not leak gates. A fork's own recorded
+        // provider waits still bind its compression calls.
+        membrane: this.conversationAuxiliaryMembraneFor(name),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -8488,14 +9664,54 @@ export class AgentFramework {
       // persisted precisely so names aren't reused, but if this namespace has
       // history anyway (counter state lost, crash between spawn and persist),
       // seeding again would stack another template copy on top of it.
-      const { messages: existing } = await contextManager.compile();
+      //
+      // Both compiles are dry runs: neither is sent, and the template's runs
+      // while the template may be mid-stream, where a committing compile
+      // would commit fold resolutions and queue the compression its fold plan
+      // calls for (and, once context-manager's thinking binding ships, fence
+      // its stream's replies). In context-manager 0.14 a dry run leaves
+      // nothing else behind but the release of an expired compression hold
+      // (see Agent.compileWithInjections), so the template's request in
+      // flight keeps its calibration estimate.
+      // The template's compile runs at context-manager's default budget (none
+      // is passed), and a dry run still refuses a budget it can't fit: it
+      // skips only the post-pick check, and an adaptive fold plan that
+      // doesn't fit then overruns at the middle's emission. So a template
+      // whose fold plan doesn't fit that budget fails the spawn with
+      // context-manager's refusal, which names the tokens and the limit, as
+      // a committing compile failed it. Only a windowed-passthrough template
+      // whose newest message alone exceeds it seeds that message, larger than
+      // the budget. The fork's own compiles meet its window by its strategy's
+      // rule: passthrough, the fork's default, keeps the newest messages that
+      // fit; an adaptive strategy folds to fit or throws over_budget for the
+      // drain breaker.
+      // The seed leaves out the template's thinking (withoutThinking): a
+      // signed block verifies only while everything before it is what it was
+      // minted under, and a fork's system, tools and scoped injections don't
+      // promise that, while its own namespace holds no stamps that could
+      // vouch for the copies. On models that don't bind thinking to its
+      // prefix a copy would have been kept, so there the fork loses the
+      // template's reasoning.
+      // Then context-manager's stripUnpairedToolBlocks drops each call whose
+      // result isn't in the seed and each result whose call isn't, keeping
+      // the rest of their messages (a message left with nothing becomes its
+      // "[tool call omitted]" placeholder). A fork spawned while the template
+      // is between a round's call and its results (the coalescer can spawn
+      // one outside the event loop) would otherwise give the fork's first
+      // request an unanswered call: the passthrough strategies have no
+      // pairing pass, and an adaptive template's compile has been through its
+      // own.
+      const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
       if (existing.length === 0) {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
         const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
-          () => template.getContextManager().compile());
-        for (const msg of compiled) {
+          () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const withoutReasoning = withoutThinking(compiled);
+        const seed = stripUnpairedToolBlocks(withoutReasoning);
+        logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
+        for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
         }
@@ -8546,6 +9762,18 @@ export class AgentFramework {
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
+    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
+    // its timer would requeue held wakes for an agent that is gone, and a wait
+    // held until released would re-arm for the name indefinitely. The recorded
+    // wait stays, and binds the name if its channel binds again.
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown) {
+      clearTimeout(cooldown.timer);
+      this.providerAccelerationCooldowns.delete(agentName);
+      console.error(`[provider-wait] agent=${agentName} disposed while held` +
+        `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
+        `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
+    }
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -8762,7 +9990,21 @@ export class AgentFramework {
         if (!server?.isConnected) throw new Error('server disconnected');
         return server.sendPushRender(params);
       },
-      audit: (record) => this.emitTrace({ type: 'mcpl:coalescing', ...record }),
+      audit: (record) => {
+        // A render result the host refused falls back to the occurrence's own
+        // content; say so on the host, with the server, the subject and the
+        // failing field, not only in the trace. The error is a field like the
+        // rest (logValue, spaces escaped), not a host-message tail: a server
+        // that answers push/render with an error chooses its message.
+        if (record.kind === 'render-failed') {
+          console.error(
+            `[push-render-failed] server=${logValue(record.serverId ?? '')} subject=${logValue(record.subject ?? '')} ` +
+            `eventId=${logValue(record.eventId ?? '')}${record.field !== undefined ? ` field=${logValue(record.field)}` : ''}: ` +
+            `${logValue(record.error ?? '')} (the occurrence's own content is delivered instead)`,
+          );
+        }
+        this.emitTrace({ type: 'mcpl:coalescing', ...record });
+      },
       save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
       recordReceipt: (record) => {
         // Written now, not at the throttled flush: an acknowledged acceptance
@@ -8869,7 +10111,7 @@ export class AgentFramework {
         throw new CoalesceError('eventId', 'eventId is required with coalesce');
       }
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(message.content, undefined, { allowEmpty: message.coalesce.retract === true });
+      validateCoalescedContent(message.content, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
       const result = await this.pushCoalescer.accept({
         serverId,
@@ -8896,7 +10138,7 @@ export class AgentFramework {
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
       if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(params.payload?.content, undefined, {
+      validateCoalescedContent(params.payload?.content, {
         allowEmpty: params.coalesce.retract === true || isSilentHeartbeatMarker({
           serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content,
         }),
@@ -8985,7 +10227,7 @@ export class AgentFramework {
         this.persistConversationRouterState();
         return [decision.agentName];
       } catch (err) {
-        console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
+        console.error(`[coalescing] could not spawn a conversation agent for ${logValue(occ.scope.id)}:`, err);
         return [];
       }
     }
@@ -9193,7 +10435,7 @@ export class AgentFramework {
     // model would wake to `[Continue]` or an older message re-presented as
     // the newest, a wake with no visible cause.
     if (isVisiblyEmptyContent(event.content) && !isSilentHeartbeatMarker(event)) {
-      console.error(`[push-event-dropped] server=${event.serverId} eventId=${event.eventId} reason=empty-content`);
+      console.error(`[push-event-dropped] server=${event.serverId} eventId=${logValue(event.eventId ?? '')} reason=empty-content`);
       this.emitTrace({ type: 'mcpl:empty-content-dropped', lane: 'push', serverId: event.serverId, eventId: event.eventId });
       return undefined;
     }
@@ -9258,7 +10500,7 @@ export class AgentFramework {
       const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
-      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
+      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
 
     if (event.triggerInference) {
@@ -9404,7 +10646,10 @@ export class AgentFramework {
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
       if (providerCooldown) {
-        if (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown)) {
+        // A provider wait binds its own model; with a different primary model
+        // selected now, the turn proceeds (the wait stays recorded).
+        const otherModel = providerCooldown.waitModel !== undefined && providerCooldown.waitModel !== agent.model;
+        if (!otherModel && (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown))) {
           for (const req of requests) {
             if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
               providerCooldown.heldRequests.push(req);
@@ -9423,6 +10668,12 @@ export class AgentFramework {
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
       }
+      // A provider's stated wait on this agent's primary model, including one
+      // recorded before a restart, holds the turn until it passes. An
+      // ephemeral run records nothing, its name being single-use, so no wait,
+      // known or unreadable, binds it (as at the last boundary).
+      const providerWait = this.providerWaits?.active(agentName, agent.model);
+      if (providerWait && !this.ephemeralRuns.has(agentName) && this.holdForProviderWait(agent, providerWait, requests)) continue;
 
       // Skip if agent is busy (inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
@@ -10190,6 +11441,12 @@ export class AgentFramework {
   ): Promise<void> {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
+    // A stopping framework starts no turn, whoever owns provider admission
+    // (conversation agents and ephemeral runs do not take the gate).
+    if (this.providerAdmissionClosed) {
+      if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      return;
+    }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
@@ -10236,12 +11493,41 @@ export class AgentFramework {
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
-          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
+          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
         return;
       }
       if (this.providerAdmissionClosed) {
         this.releasePrimaryProviderGate(agent.name);
+        return;
+      }
+    }
+    // The last admission boundary before this primary call. With the gate
+    // held and no auxiliary call in flight, no new provider wait can be
+    // recorded for this agent before the call (auxiliary admission waits on
+    // the gate). But one may have been recorded since the scheduler's check:
+    // an auxiliary call this wake parked behind can fail with a stated wait
+    // on the primary model. That wait binds this wake too: hold it, don't call.
+    // A conversation agent's waits are recorded and held as a resident's are
+    // (nonOwningProviderWait), and its retries and in-turn restarts reach this
+    // boundary without the scheduler: a wait recorded meanwhile, by its own
+    // auxiliary call or a non-retryable failure, binds them here too. An
+    // ephemeral run records nothing, so nothing binds it here. A frame whose
+    // agent was replaced or removed (a fork disposed while its retry slept)
+    // installs no hold: its turn is dropped after the compile, as main drops
+    // any such turn.
+    if (!this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent) {
+      const wait = this.providerWaits?.active(agent.name, agent.model);
+      if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+        if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+        // A retry or an in-turn restart arrives with its turn still open at
+        // the event gate: the failed attempt, or the predecessor that kept
+        // liveness for it, leaves closing it to this frame. Held here, no
+        // frame would close it, and while it is open every gate event
+        // buffers, for every agent, until the wait ends.
+        this.eventGate?.onInferenceEnded(agent.name);
+        console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds at admission ` +
+          `(recorded after the wake was scheduled); wake held, not started`);
         return;
       }
     }
@@ -10620,6 +11906,28 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
       }
+      // A conversation agent takes no provider gate, so its own compression
+      // can record a wait while this turn compiles, after the last boundary
+      // checked. Check its waits again here, where nothing has been sent, and
+      // hold the turn as the boundary would rather than send it into the wait.
+      if (this.conversationAgentHomes.has(agent.name)) {
+        const wait = this.providerWaits?.active(agent.name, agent.model);
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+          console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
+            `(recorded while the turn compiled); turn held, nothing sent`);
+          // The turn emitted inference:started before its compile; every turn
+          // that does gets one terminal event, which listeners (a typing loop)
+          // rely on, as the failure sites' holds emit inference:failed.
+          this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: providerWaitText(agent.name, agent.model, wait) });
+          stream.cancel();
+          agent.cancelStream();
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+          this.channelRegistry?.stopTyping();
+          this.eventGate?.onInferenceEnded(agent.name);
+          return false;
+        }
+      }
 
       const handle = this.driveStream(
         agent,
@@ -10657,10 +11965,28 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
       }
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (statedWait === 'held') {
+        // A conversation agent held by the provider's stated wait, as a
+        // resident is: the hold's release owns the later compile.
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
 
-      const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+      const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
-        await new Promise((resolve) => setTimeout(resolve, action.delayMs));
+        // A policy's delay can be a provider's retry-after: wait all of it.
+        await this.waitForRetry(action.delayMs);
+        if (this.providerAdmissionClosed) {
+          // stop() ended the wait: that cancels the retry, it does not hasten
+          // it. Nothing is written (the store is closing); this frame still
+          // owns its token, since no retry frame replaced it.
+          if (this.activeTurnTokens.get(agent.name) === turnToken) {
+            this.activeTurnTokens.delete(agent.name);
+            this.activeTurnTriggers.delete(agent.name);
+          }
+          return false;
+        }
         // The retry re-enters startAgentStream, which replaces this frame's
         // turn token with its own; cleanup belongs to the innermost frame.
         await this.startAgentStream(agent, trigger, attempt + 1);
@@ -10677,16 +12003,18 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          error: err.message,
+          error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
         }, startLogical);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
-          // Drives the poison-history breaker (`invalid_request`: a 400-class
-          // rejection of the history itself — retrying the same context can
-          // never succeed; auth/abort/context_length are also non-retryable
-          // but must NOT cost history) and the OverBudget drain breaker
+          // Drives the poison-history breaker (shedMayHelp: an
+          // `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
+          // `context_length` at 413, suggests the provider refused the
+          // request's content or size, which a shed of the newest exchange may
+          // fix; auth/abort and other context_length failures are also
+          // non-retryable but must NOT cost history) and the OverBudget drain breaker
           // (`over_budget`: compile refused to fit the hard budget — this is
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
@@ -11865,25 +13193,37 @@ export class AgentFramework {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
+            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            if (statedWait === 'held') {
+              lifecyclePhase = 'failed';
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+              break;
+            }
 
-            const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
-              await new Promise((resolve) => setTimeout(resolve, action.delayMs));
-              await this.startAgentStream(agent, trigger, attempt + 1);
+              // A policy's delay can be a provider's retry-after: wait all of it.
+              await this.waitForRetry(action.delayMs);
+              // stop() ending the wait cancels the retry (this frame's finally
+              // clears the token); it is never permission to retry at once.
+              if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: err.message,
+                error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: err.message,
                 // Drives the poison-history breaker. `retryable` is kept for
-                // observability, but the breakers gate on `errorType` — only an
-                // `invalid_request` (a 400-class rejection of the history
-                // itself) means retrying the same context can never succeed.
+                // observability, but the breaker gates on
+                // shedMayHelp(errorType, httpStatus): only an `invalid_request`
+                // at HTTP 400, 413 or 422 or with no status, or a
+                // `context_length` at 413, suggests the provider refused the
+                // request's content or size, which a shed of the newest
+                // exchange may fix.
                 ...this.classifyInferenceError(err),
               });
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -12109,6 +13449,20 @@ export class AgentFramework {
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
+      // The same rule for a turn that doesn't own provider admission as at
+      // the other two failure sites: a conversation agent's stated wait is
+      // recorded and its turn held; an ephemeral run whose wait it won't sleep
+      // says why it ends.
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (statedWait === 'held') {
+        this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+          error: `Provider wait: ${err.message}`,
+          request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
+        this.abortAgentScript(agent.name, 'provider wait');
+        lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+        return;
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -12118,7 +13472,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        error: err.message,
+        error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
       }, streamRouting.logical);
       this.emitTrace({
         type: 'inference:exhausted',
@@ -12330,6 +13684,16 @@ export class AgentFramework {
    *   the operator's call; the princess precedent was disclosed first.
    */
   async puppetToolCall(
+    agentName: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<{ toolUseId: string; result: ToolResult }> {
+    this.refuseOperatorAfterStop('puppet');
+    return this.trackOperatorOperation('puppet:tool-call', () => this.runPuppetToolCall(agentName, toolName, input));
+  }
+
+  /** puppetToolCall's work, run where stop() can wait for it. */
+  private async runPuppetToolCall(
     agentName: string,
     toolName: string,
     input: Record<string, unknown>,
@@ -13550,6 +14914,9 @@ export class AgentFramework {
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
+    // The failure text is stored inline in every record; the request that
+    // produced it is already stored separately as a blob.
+    if (typeof entryToStore.error === 'string') entryToStore.error = boundFailureText(entryToStore.error);
 
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
@@ -14134,6 +15501,10 @@ export class AgentFramework {
         (event.error as string) ?? 'unknown error',
         event.retryable as boolean | undefined,
         event.errorType as string | undefined,
+        {
+          httpStatus: event.httpStatus as number | undefined,
+          providerErrorCode: event.providerErrorCode as string | undefined,
+        },
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
@@ -14152,6 +15523,13 @@ export class AgentFramework {
       ...event,
       timestamp: Date.now(),
     } as TraceEvent;
+    // Listeners (web UI, subagent observers, host loggers) receive bounded
+    // failure text. An event's `error` and `stack` strings are whatever its
+    // source's Error carried, which for a provider failure can be an echo of
+    // the whole request.
+    const bounded = traceEvent as unknown as Record<string, unknown>;
+    if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
+    if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
 
     // An event goes to the subscriptions present when its delivery starts,
     // each one only if it is still active when its turn comes, as the DOM's
@@ -14187,15 +15565,18 @@ export class AgentFramework {
    *      inference, so this never causes a retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
-   *   4. breaker — when the failures are an `invalid_request` (a 400-class
-   *      rejection of the history itself, e.g. corrupted tool_use/tool_result
-   *      pairing or an oversized attachment), retrying the same context can
-   *      never succeed: every new push event wakes the agent onto the same
-   *      poisoned history forever. At the hard-down threshold, automatically
-   *      quarantine: shed the newest complete exchange (the same forced-rewind
-   *      primitive `/unstick` uses — shedNewestTurn never orphans a
-   *      tool_use/thinking block) and retry, bounded by the same rewind cap so
-   *      the breaker can never eat the whole history.
+   *   4. breaker — when a failure at or past the hard-down threshold suggests
+   *      the provider refused the request's content or size (shedMayHelp:
+   *      an `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
+   *      `context_length` at 413, such as a provider's answer to a corrupted
+   *      tool_use/tool_result pairing or an oversized attachment), retrying
+   *      the same context is likely to fail the same way, and every new push
+   *      event would wake the agent onto that same history. At the hard-down
+   *      threshold, automatically quarantine: shed the newest complete
+   *      exchange (the same forced-rewind primitive `/unstick` uses —
+   *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
+   *      bounded by the same rewind cap so the breaker can never eat the
+   *      whole history.
    */
   /**
    * Live health snapshot for /healthz and doctor tooling: gate state, queued
@@ -14220,11 +15601,14 @@ export class AgentFramework {
             primaryPending: gate?.primaryPending ?? false,
             auxiliaryInFlight: gate?.auxiliaryInFlight ?? 0,
             auxiliaryDeferred: gate?.deferredAuxiliary ?? 0,
-            cooldownUntil: cooldown?.until ?? null,
+            // Null while none, and while a provider wait holds until released.
+            cooldownUntil: cooldown !== undefined && Number.isFinite(cooldown.until) ? cooldown.until : null,
             cooldownReason: cooldown?.reason ?? null,
             hostHold: cooldown?.hostHoldError !== undefined,
             heldRequests: cooldown?.heldRequests.length ?? 0,
             lastRecovery: this.providerAccelerationLastRecovery?.get(name) ?? null,
+            /** Provider waits (stated retry-after) binding this agent now, per model. */
+            providerWaits: this.providerWaitSnapshot(name).map(({ agent: _agent, ...wait }) => wait),
           };
         })(),
         lastInference: this.lastInferenceAt.get(name) ?? null,
@@ -14240,10 +15624,14 @@ export class AgentFramework {
    *  and kind-specific fields (additive only — doctor parses by regex). */
   private logFailure(record: Record<string, unknown>): void {
     try {
+      // Every field is bounded: `reason` is conventionally free text, and any
+      // caller's field may carry an error message, or an Error whose own
+      // fields include the whole request.
+      const bounded = boundFailureFields(record);
       mkdirSync('logs', { recursive: true });
       appendFileSync(
         'logs/failures.log',
-        JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n',
+        JSON.stringify({ at: new Date().toISOString(), ...bounded }) + '\n',
       );
     } catch { /* best-effort */ }
   }
@@ -14276,13 +15664,27 @@ export class AgentFramework {
   private opsAlert(
     kind: string,
     agentName: string,
-    message: string,
+    rawMessage: string,
     opts?: { data?: Record<string, unknown>; skipLog?: boolean },
   ): void {
+    // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
+    // that isn't a string; it's described as a thrown value is, rather than
+    // thrown on (a string is its own description).
+    const wholeMessage = failureDescription(rawMessage);
+    const message = boundFailureText(wholeMessage);
+    // The caller's data goes to failures.log and to trace listeners, bounded
+    // the same way for both. A JavaScript caller's null is no data, and data
+    // that isn't a plain object (a string, an array, a Buffer) is kept as one
+    // field, `data`, rather than spread into a field per character or element.
+    const rawData: unknown = opts?.data;
+    const plain = typeof rawData === 'object' && rawData !== null &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(rawData));
+    const data = rawData == null ? undefined
+      : boundFailureFields(plain ? rawData as Record<string, unknown> : { data: rawData });
     if (!opts?.skipLog) {
-      this.logFailure({ agent: agentName, kind, reason: message, ...opts?.data });
+      this.logFailure({ agent: agentName, kind, reason: message, ...data });
     }
-    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data: opts?.data });
+    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data });
 
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
@@ -14295,7 +15697,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${message.slice(0, 500)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
@@ -14348,9 +15750,12 @@ export class AgentFramework {
 
   /**
    * Classify a terminal inference error for the `inference:exhausted` trace.
-   * Single-sourced for every emit site: the downstream breakers (poison-history
-   * quarantine, OverBudget drain kick) gate on `errorType`, so classification
-   * drift between sites would silently disable a safety net.
+   * Single-sourced for every emit site that has an error to classify (a
+   * stream the framework aborted has none): the downstream breakers gate on
+   * what it returns (the poison-history quarantine on `errorType` and
+   * `httpStatus`, through shedMayHelp; the OverBudget drain kick on
+   * `errorType`), so classification drift between sites would silently
+   * change when a safety net acts.
    *
    * context-manager's refusal errors are matched by a real `instanceof` since
    * CM exports them from its package root (context-manager#41 / #71; floor
@@ -14361,9 +15766,23 @@ export class AgentFramework {
    * Deliberately NOT a message match: the message wording belongs to CM and
    * can be reworded without warning.
    */
-  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
-    if (err instanceof MembraneError) {
-      return { retryable: err.retryable, errorType: err.type };
+  private classifyInferenceError(err: Error): {
+    retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
+  } {
+    // From either copy of membrane (isMembraneError). The fields are read as
+    // data, and the type is bounded like describeFailure's, for every sink the
+    // classification reaches (the trace, the marker, the logs).
+    if (isMembraneError(err)) {
+      const fields = err as Error & {
+        retryable?: unknown; type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown;
+      };
+      const providerErrorCode = boundProviderErrorCode(fields.providerErrorCode);
+      return {
+        ...(typeof fields.retryable === 'boolean' ? { retryable: fields.retryable } : {}),
+        ...(typeof fields.type === 'string' ? { errorType: boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+        ...(typeof fields.httpStatus === 'number' ? { httpStatus: fields.httpStatus } : {}),
+        ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+      };
     }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
@@ -14391,25 +15810,70 @@ export class AgentFramework {
 
   private noteInferenceExhausted(
     agentName: string,
-    reason: string,
+    rawReason: string,
     retryable?: boolean,
-    errorType?: string,
+    rawErrorType?: string,
+    detail?: { httpStatus?: number; providerErrorCode?: string },
   ): void {
+    // The reason is the failure's own message, and a provider can echo the
+    // whole rejected request in it: one household's [inference-failed]
+    // marker carried ~1.7 MB of its own request back into its context. Every
+    // sink below gets an excerpt cut from the whole reason at its own bound
+    // (boundFailureText, so its marker states the whole length): the stderr
+    // line, failures.log and the hard-down alert FAILURE_TEXT_MAX_CHARS, the
+    // [inference-failed] marker FAILURE_MARKER_REASON_MAX_CHARS, the status's
+    // lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS, and
+    // the rewind marker REWIND_MARKER_REASON_MAX_CHARS. The classification
+    // travels as structured fields beside the text.
+    //
+    // A reason that isn't a string (the stream paths always pass a message)
+    // is described rather than allowed to throw before anything is recorded.
+    // Its whole description is the whole reason, cut once by each sink.
+    const wholeReason: string = typeof rawReason === 'string' ? rawReason : failureDescription(rawReason);
+    // The type is bounded wherever it's written, as classifyInferenceError
+    // bounds the types it reads, since a caller can pass one it didn't classify.
+    const errorType = typeof rawErrorType === 'string'
+      ? boundFailureText(rawErrorType, PROVIDER_ERROR_CODE_MAX_CHARS) : rawErrorType;
+    const reason = boundFailureText(wholeReason);
+    const markerReason = boundFailureText(wholeReason, FAILURE_MARKER_REASON_MAX_CHARS);
+    const httpStatus = typeof detail?.httpStatus === 'number' ? detail.httpStatus : undefined;
+    const providerErrorCode = boundProviderErrorCode(detail?.providerErrorCode);
+    const classification: Record<string, unknown> = {
+      ...(errorType !== undefined ? { errorType } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+    };
+    // Each excerpt says how long the whole was when it was cut.
+    const cutAt = (excerpt: string): Record<string, unknown> =>
+      excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
-    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
-    console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+    const labels = [
+      errorType !== undefined ? `type=${errorType}` : undefined,
+      httpStatus !== undefined ? `status=${httpStatus}` : undefined,
+      providerErrorCode !== undefined ? `code=${providerErrorCode}` : undefined,
+    ].filter((label): label is string => label !== undefined);
+    console.error(
+      `[inference-failed] agent=${agentName} consecutive=${streak}` +
+      `${labels.length > 0 ? ` ${labels.join(' ')}` : ''}: ${reason}`,
+    );
 
     // (1b) Machine-greppable durable record, independent of journald/unit log
     // redirects: logs/failures.log under the host's working directory. This is
-    // what connectome-doctor reads. Legacy fields kept; `kind` is additive.
-    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted' });
+    // what connectome-doctor reads. Legacy fields kept; `kind` and the
+    // classification fields are additive.
+    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+      const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+        .filter((part): part is string => part !== undefined)
+        .join(', ');
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -14417,15 +15881,15 @@ export class AgentFramework {
             type: 'text',
             text:
               `[inference-failed] Your previous turn did not complete: the model ` +
-              `call failed and produced no response, so nothing was sent. Reason: ` +
-              `${reason}. If this recurs with the same cause, change approach ` +
+              `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
+              `${markerReason}. If this recurs with the same cause, change approach ` +
               `rather than retrying identically (e.g. drop an oversized attachment ` +
               `or an unsupported setting).`,
           }],
-          { system: true, kind: 'inference-failed', reason, consecutive: streak },
+          { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
       } catch (err) {
-        console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
+        console.error(`[inference-failed] could not record chronicle marker for ${agentName}: ${describeFailureWithFrames(err)}`);
       }
     }
 
@@ -14444,10 +15908,16 @@ export class AgentFramework {
     // (e.g. a reason string that crossed a serialization boundary). It matches
     // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
     // errorType gate is the one that's load-bearing.
+    //
+    // The fallback applies only to an unclassified reason. A classified
+    // failure (a provider's 400, say) already says what it is, and its
+    // message is the provider's text, which can quote anything, including
+    // these phrases from the agent's own context.
     const overBudget =
       errorType === 'over_budget' ||
       errorType === 'context_refusal' ||
-      /exceed hard budget|no summary covers/i.test(reason);
+      // Decided on the whole reason: presentation bounds never change it.
+      (errorType === undefined && /exceed hard budget|no summary covers/i.test(wholeReason));
     // Observability: a refused compile means the agent cannot think AT ALL
     // this turn — surface it on the ops-alert pipeline (ops:alert trace +
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
@@ -14457,7 +15927,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (${errorType ?? 'unclassified'}): ${reason.slice(0, 300)} — ` +
+        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${agent ? 'kicking' : 'unavailable (no agent handle)'}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
         { skipLog: true },
@@ -14475,7 +15945,7 @@ export class AgentFramework {
           }
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
         } catch (err) {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks:`, err);
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
@@ -14492,24 +15962,32 @@ export class AgentFramework {
       // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
       // a hard-down agent re-posts every ~15 min, not on every failed retry.
       // failures.log already got the per-exhaustion record above.
+      // The excerpt leaves room for the prefix, so the alert's own bound
+      // never cuts it a second time.
+      const hardDown = `${streak} consecutive inference failures. Last reason: `;
       this.opsAlert(
         'hard-down',
         agentName,
-        `${streak} consecutive inference failures. Last reason: ${reason}`,
+        hardDown + boundFailureText(wholeReason, FAILURE_TEXT_MAX_CHARS - hardDown.length),
         { skipLog: true },
       );
 
-      // (4) Poison-history breaker: ONLY for `invalid_request` — a 400-class
-      // rejection of the history itself. Deliberately NOT keyed on
-      // `retryable === false`, which membrane also returns for auth (expired
-      // key), abort (deliberate cancel), context_length (compression's job,
-      // and shedding newest is the wrong direction), safety and unsupported —
-      // none of which mean the history is poisoned, and all of which would
-      // otherwise shed good exchanges and stamp a false "the API kept
-      // rejecting your history" marker. `retryable` is kept only for the trace.
+      // (4) Poison-history breaker: ONLY when shedMayHelp(errorType,
+      // httpStatus) holds, for an `invalid_request` at HTTP 400, 413 or 422 or
+      // with no status, or a `context_length` at 413, which suggests the
+      // provider refused the request's content or size. The current failure
+      // decides, whatever failed before it in the streak. Deliberately NOT
+      // keyed on `retryable === false`, which membrane also returns for auth
+      // (expired key), abort (deliberate cancel), a context_length at 400 or
+      // 422 (a token overflow, which the context budget exists to prevent;
+      // shedding the newest exchange is the wrong direction for it), safety
+      // and unsupported. For none of them is shedding the newest exchange
+      // likely to help, and each would otherwise shed good exchanges and
+      // stamp a rewind marker saying the API kept refusing them.
+      // `retryable` is kept only for the trace.
       void retryable;
-      if (errorType === 'invalid_request' && agent) {
-        this.quarantinePoisonedHistory(agent, reason);
+      if (agent && shedMayHelp(errorType, httpStatus)) {
+        this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
   }
@@ -14520,14 +15998,14 @@ export class AgentFramework {
    * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
    * the single consolidated episode marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next
-   * push event to wake the agent onto the same poisoned context.
+   * push event to wake the agent onto the same context.
    *
    * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
    * sheds per failure episode; the budget resets on any successful inference.
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
-  private quarantinePoisonedHistory(agent: Agent, reason: string): void {
+  private quarantinePoisonedHistory(agent: Agent, wholeReason: string): void {
     const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
     const used = this.exhaustionRewinds.get(agent.name) ?? 0;
     if (used >= cap) {
@@ -14548,7 +16026,8 @@ export class AgentFramework {
     }
 
     this.exhaustionRewinds.set(agent.name, used + 1);
-    const count = this.updateRewindMarker(agent, truncateReason(reason), 'inference-failure');
+    const count = this.updateRewindMarker(
+      agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
       `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
@@ -14778,12 +16257,20 @@ export class AgentFramework {
 
   /**
    * Deliver every server's queued awareness operations now (or only
-   * `onlyServerId`'s) and wait for this pass. Delivery never gates MCPL
-   * traffic or turns: callers that do not need to wait use the background
-   * form. A server that is not connected is skipped (its work stays queued
-   * until it connects).
+   * `onlyServerId`'s) and wait for this pass. Like the other operator entry
+   * points, it's refused once stop() has begun, and stop() waits for one
+   * already running. Delivery never gates MCPL traffic or turns: the
+   * framework's own deliveries run in the background
+   * (deliverDiscordAwarenessInBackground). A server that is not connected is
+   * skipped (its work stays queued until it connects).
    */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
+    this.refuseOperatorAfterStop('awareness sync');
+    return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
+  }
+
+  /** One delivery pass over every server with due work, or only `onlyServerId`'s. */
+  private async runDiscordAwarenessSync(onlyServerId?: string): Promise<void> {
     const serverIds = [...new Set(
       this.readDiscordAwarenessDispatches(onlyServerId).map((dispatch) => dispatch.key.serverId),
     )];
@@ -14893,9 +16380,9 @@ export class AgentFramework {
         // A route that went away (shutdown, or a disconnect that will
         // reconnect) leaves the rest queued: claiming would only write
         // attempts that cannot be sent. A host that is stopping starts
-        // nothing new either (providerAdmissionClosed is set from the moment
-        // stop() begins): its due marks wait for the next start.
-        if (!connection.isConnected || this.providerAdmissionClosed) break;
+        // nothing new either (stopHasBegun, the operator entry points' own
+        // rule): its due marks wait for the next start.
+        if (!connection.isConnected || this.stopHasBegun()) break;
         // One dispatch at a time, chosen and written ahead in one step from
         // the journal as it is now: a cancel or retract made while the
         // previous request was on the wire takes effect here.
@@ -15586,6 +17073,13 @@ export class AgentFramework {
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    this.refuseOperatorAfterStop('connect MCPL server');
+    return this.trackOperatorOperation('mcpl:connect', () => this.runConnectMcplServer(config));
+  }
+
+  private async runConnectMcplServer(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
     // Lazily bring up the MCPL subsystem — a framework that started with zero
     // configured servers can still deploy its first one at runtime.
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
@@ -15621,6 +17115,11 @@ export class AgentFramework {
    * No-op-ish if the server is not connected (still clears routing state).
    */
   async disconnectMcplServer(id: string): Promise<void> {
+    this.refuseOperatorAfterStop('disconnect MCPL server');
+    return this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(id));
+  }
+
+  private async runDisconnectMcplServer(id: string): Promise<void> {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
@@ -15655,6 +17154,14 @@ export class AgentFramework {
     id: string,
     newConfig?: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    this.refuseOperatorAfterStop('restart MCPL server');
+    return this.trackOperatorOperation('mcpl:restart', () => this.runRestartMcplServer(id, newConfig));
+  }
+
+  private async runRestartMcplServer(
+    id: string,
+    newConfig?: import('./mcpl/types.js').McplServerConfig,
+  ): Promise<void> {
     const config = newConfig ?? this.mcplServerConfigs.get(id);
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
@@ -15665,8 +17172,8 @@ export class AgentFramework {
     // baseline of its own, or a WebSocket one, restarts whatever the journal's
     // state: awareness never gates MCPL.
     if (this.derivesReactionBaseline(config)) this.getPlacedReactionBaseline();
-    await this.disconnectMcplServer(id);
-    await this.connectMcplServer(config);
+    await this.runDisconnectMcplServer(id);
+    await this.runConnectMcplServer(config);
   }
 
   /**
@@ -15956,8 +17463,8 @@ export class AgentFramework {
       const answer = answerOnce(responder, 'host/command', connection.id);
       try {
         // A stopping host runs no host command: refused like the requests
-        // above, before its handler runs.
-        if (this.queue?.isClosed) {
+        // above, before its handler runs, from the moment stop() has begun.
+        if (this.stopHasBegun()) {
           this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
           return;
         }
@@ -17126,6 +18633,7 @@ export class AgentFramework {
       | {
         kind: 'reference';
         refId: string;
+        /** The type as the stub shows it (a label), lowercased: `image/…`. */
         mediaType: string;
         toolCallId: string;
         toolName: string;
@@ -17179,10 +18687,22 @@ export class AgentFramework {
             };
           }
           if (candidate.kind === 'reference') {
+            // Point at fetch_reference only where it can deliver: not for a
+            // reference this process holds no record of (fetch_reference
+            // looks the id up in the same registry), nor, as the stub does,
+            // for an unfetched one the fetcher would refuse as expired.
+            const record = referenceRegistry.get(candidate.refId);
+            const expiry = record && !record.fetchedPath ? referenceExpiry(record.testimony) : null;
             throw new Error(
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
-              'Fetch it with fetch_reference and save the materialized file instead.',
+              (!record
+                ? 'This process holds no record of it (a restart or an eviction drops records, and a stub quoted ' +
+                  "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
+                  'it again, re-run that tool for a fresh reference.'
+                : expiry
+                  ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
+                  : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }
           if (candidate.ref === null) {
@@ -17294,13 +18814,15 @@ export class AgentFramework {
               consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
               continue;
             }
-            // Reference stub: the registry's testimony (when this process
-            // still has the record) says whether it was an image; the
-            // sniffed stub text is the fallback. Non-image references
-            // are not slots.
-            const testimony = referenceRegistry.get(ph.refId)?.testimony.mimeType?.toLowerCase() ?? ph.mediaType;
-            if (!testimony || !testimony.startsWith('image/')) continue;
-            consider({ kind: 'reference', refId: ph.refId, mediaType: testimony, toolCallId, toolName, messagesBack });
+            // Reference stub: the registry's claimed type (when this process
+            // still has the record), else the first image/ token in the
+            // stub's text, which can come from its name, says whether it was
+            // an image. Either is read as the stub shows a type, sanitized
+            // and bounded. Non-image references are not slots.
+            const claimed = referenceRegistry.get(ph.refId)?.testimony.mimeType ?? ph.mediaType ?? undefined;
+            const mediaType = referenceTypeLabel(claimed).toLowerCase();
+            if (!mediaType.startsWith('image/')) continue;
+            consider({ kind: 'reference', refId: ph.refId, mediaType, toolCallId, toolName, messagesBack });
           }
         };
 
@@ -17353,10 +18875,14 @@ export class AgentFramework {
               };
               if (block?.type === 'image') {
                 const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
+                // The sender's word, shown in the receipt and stored with the
+                // file, so it's taken as a label; with nothing left of it, it
+                // counts as absent.
+                const claimed = block.source?.mediaType;
                 consider({
                   kind: 'attachment',
                   data: inline ? block.source!.data! : null,
-                  mediaType: block.source?.mediaType ?? 'image/png',
+                  mediaType: (typeof claimed === 'string' ? sanitizeLabel(claimed, REFERENCE_LIMITS.mimeType) : '') || 'image/png',
                   messagesBack,
                 });
               } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
