@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -62,7 +62,7 @@ import type {
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage } from './shutdown.js';
-import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
+import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -395,6 +395,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -413,12 +414,14 @@ import {
   DiscordAwarenessOutbox,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  type DiscordAwarenessBatch,
 } from './recovery/discord-awareness-outbox.js';
 import {
   OperatorActionError,
   OperatorLog,
   capIds,
   defaultOperatorLogPath,
+  type SurgeryMarkerReceipt,
   type OperatorLogEntry,
   type OperatorLogInput,
   type OperatorRequester,
@@ -607,6 +610,21 @@ interface DiscordAwarenessBarrier {
   generation: number;
   requiresBarrier: boolean;
   promise: Promise<DiscordAwarenessDrainOutcome>;
+}
+
+/** Several drains' outcomes as one: unavailable only if every one was. */
+function combineDrainOutcomes(outcomes: DiscordAwarenessDrainOutcome[]): DiscordAwarenessDrainOutcome {
+  if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
+    return {
+      status: 'unavailable',
+      accounted: outcomes.reduce((count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0), 0),
+    };
+  }
+  return {
+    status: 'delivered',
+    delivered: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0), 0),
+    failed: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0), 0),
+  };
 }
 
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
@@ -815,6 +833,13 @@ function bodyGroupRun(
   };
 }
 
+function describeMarkers(m: SurgeryMarkerReceipt): string {
+  if (m.status === 'queued') return `queued:${m.queued}`;
+  if (m.status === 'not-scheduled') return 'not-scheduled(batch retired)';
+  if (m.status === 'unresolved') return `unresolved(batch ${m.batchId} may still be delivered)`;
+  return 'none';
+}
+
 function describeRequester(r: OperatorRequester | undefined): string {
   if (!r) return 'unknown';
   return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
@@ -857,11 +882,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
   maxRetries = 3;
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (error instanceof MembraneError && !error.retryable) {
+    if (isMembraneError(error) && error.retryable === false) {
       return { retry: false };
     }
     if (attempt < this.maxRetries) {
-      const delayMs = error instanceof MembraneError && error.retryAfterMs !== undefined
+      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
         ? error.retryAfterMs
         : Math.pow(2, attempt) * 1000;
       return { retry: true, delayMs };
@@ -949,9 +974,19 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
  *  that long is a quota-scale event or a provider's mistake, and a person
  *  decides which (release-provider-wait). Shorter waits are pacing. */
 const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
+/**
+ * A MembraneError, from this framework's copy of membrane or from another: the
+ * host supplies the Membrane instance (config.membrane), so with two copies
+ * installed its errors are instances of a class this framework's `instanceof`
+ * doesn't match. Recognised by name as well, as context-manager's errors are;
+ * its fields are the same, so callers still check each one's type.
+ */
+function isMembraneError(error: unknown): error is MembraneError {
+  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
+}
 
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
-  if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
+  if (!isMembraneError(error) || error.type !== 'rate_limit') return false;
   return (
     /organization(?:'s)?[^\n]{0,120}maximum(?:\s+usage)?\s+increase\s+rate/i.test(error.message) ||
     /organization(?:'s)?[^\n]{0,120}acceleration(?:\s+limit)?/i.test(error.message)
@@ -1051,6 +1086,14 @@ interface Deferred<T> {
   reject: (reason?: unknown) => void;
 }
 
+/** One onTrace subscription. Removing it, by its unsubscribe or by offTrace,
+ *  clears `active` as it splices it out, so a delivery already under way
+ *  skips it (see emitTrace). */
+interface TraceRegistration {
+  listener: TraceEventListener;
+  active: boolean;
+}
+
 /** Per-run state for a framework-driven ephemeral agent: the settle signal
  *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
  *  the stream driver share. One map entry per run — created and torn down in
@@ -1079,11 +1122,206 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
-/** Cap an API error message for inline use in a rewind marker: keep enough to
- *  identify the failure class without pasting a wall of provider JSON into the
- *  agent's context. */
-function truncateReason(reason: string, max = 160): string {
-  return reason.length <= max ? reason : reason.slice(0, max) + '…';
+/**
+ * Longest failure text the inference-failure pipeline writes to one sink: the
+ * reason in the exhaustion stderr line, a field of a logs/failures.log record,
+ * an ops alert's message, the inference log's `error`, and a trace event's
+ * `error` and `stack`. A failure's text is whatever its source put in
+ * `Error.message`, and a provider can echo the entire rejected request there
+ * (one OpenAI-compatible 400 echoed ~1.7 MB). The sinks with shorter bounds
+ * name them below, and every cut goes through boundFailureText. This bound
+ * doesn't depend on membrane bounding its own errors.
+ */
+const FAILURE_TEXT_MAX_CHARS = 2_000;
+/** Longest failure reason written into an agent's own context (the
+ *  `[inference-failed]` marker): enough for a provider's explanation, not a
+ *  self-dump the agent then carries in every later request. */
+const FAILURE_MARKER_REASON_MAX_CHARS = 600;
+/** Longest failure reason in the rewind marker, also the agent's own context:
+ *  enough to identify the failure class without a wall of provider JSON. */
+const REWIND_MARKER_REASON_MAX_CHARS = 160;
+/** Longest failure reason in an agent's status (`lastInference.lastError`) and
+ *  in the compile-refused ops alert. */
+const FAILURE_SUMMARY_MAX_CHARS = 300;
+/** Longest alert message posted to the ops webhook. */
+const OPS_WEBHOOK_MESSAGE_MAX_CHARS = 500;
+/** Longest provider error code recorded verbatim; real codes are short tokens.
+ *  A failure's name and type are bounded the same way. */
+const PROVIDER_ERROR_CODE_MAX_CHARS = 128;
+
+const isHighSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xd800 && code <= 0xdbff;
+};
+const isLowSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xdc00 && code <= 0xdfff;
+};
+/** Whether a cut before `index` would separate the halves of a surrogate pair. */
+const splitsPair = (text: string, index: number): boolean =>
+  index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
+
+/**
+ * `text` when it fits within `max` characters; otherwise its head and tail
+ * around a marker stating how many of how many characters were omitted, the
+ * whole within `max`. A cut that would separate a surrogate pair moves toward
+ * omission, so the result never holds half of a pair the text held whole, and
+ * bounding bounded text returns it as is. Each sink cuts the whole text, so
+ * its marker states the whole length.
+ */
+function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const markerLength = ` …[${text.length} of ${text.length} characters omitted]… `.length;
+  const budget = Math.max(0, max - markerLength);
+  const tailLength = Math.floor(budget / 4);
+  let headEnd = budget - tailLength;
+  if (splitsPair(text, headEnd)) headEnd--;
+  let tailStart = text.length - tailLength;
+  if (splitsPair(text, tailStart)) tailStart++;
+  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+/** A provider error code, verbatim when token-sized; otherwise bounded. */
+function boundProviderErrorCode(code: unknown): string | undefined {
+  if (typeof code !== 'string') return undefined;
+  return boundFailureText(code, PROVIDER_ERROR_CODE_MAX_CHARS);
+}
+
+/**
+ * A value's JSON for a failure sink, with every Error inside it written as its
+ * whole projection (failureDescription): serialising an Error writes its own
+ * fields, a MembraneError's whole `rawRequest` among them. The projection is
+ * left uncut, as a nested string is, so the sink's one cut of the JSON states
+ * its whole length. An Error is recognised by instanceof, so one from another
+ * realm (a vm context) is written as its own JSON, as any object is. Throws,
+ * or returns undefined, as JSON.stringify does.
+ */
+function failureJson(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? failureDescription(nested) : nested));
+}
+
+/**
+ * The whole text describeFailure cuts. For an Error, its head (name,
+ * classification, status, provider code, each bounded) and its whole
+ * message. For a primitive, its String. For another object, its String when
+ * that's text of its own (a Buffer, an Error from another realm, a class
+ * with its own toString). An array, or an object whose String is empty or
+ * only its tag, such as `[object Object]`, is its JSON instead
+ * (failureJson), so its fields and elements are kept; its tag stands when
+ * JSON can't write it or finds nothing in it.
+ */
+function failureDescription(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) {
+      if (typeof error !== 'object' || error === null) return String(error);
+      if (!Array.isArray(error)) {
+        let text: string | undefined;
+        try { text = String(error); } catch { /* no String of its own: its JSON, below */ }
+        if (text && !/^\[object [^\]]*\]$/.test(text)) return text;
+      }
+      try {
+        const json = failureJson(error);
+        if (json !== undefined && json !== '{}') return json;
+      } catch { /* its tag, below */ }
+      return Object.prototype.toString.call(error);
+    }
+    const fields = error as Error & {
+      type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
+    };
+    // Every component is remote or caller-supplied text, the name included.
+    const classification = [
+      typeof fields.type === 'string' ? boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) : undefined,
+      typeof fields.httpStatus === 'number' ? `HTTP ${fields.httpStatus}` : undefined,
+      boundProviderErrorCode(fields.providerErrorCode),
+      typeof fields.retryable === 'boolean' ? `retryable=${fields.retryable}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
+    const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
+    return `${head}: ${String(error.message)}`;
+  } catch {
+    return '[failure could not be described]';
+  }
+}
+
+/**
+ * A bounded string describing a failure, for logs that would otherwise print
+ * the error object; it is one line unless one of its parts has newlines, as a
+ * message can. Printing the object prints its message whole, in the stack,
+ * and every own field: a MembraneError's `rawRequest` is the whole request
+ * that failed, and Node's console prints each of its strings, a long system
+ * prompt among them, up to 10,000 characters. The projection keeps what a
+ * reader needs (name, classification, status, provider code, message) and
+ * nothing else. The head's parts are bounded each, and the whole
+ * (failureDescription) is cut once, so its marker states the length of the
+ * head and the whole message.
+ */
+function describeFailure(error: unknown): string {
+  return boundFailureText(failureDescription(error));
+}
+
+/** A stack frame's line: an indent of spaces or tabs, then `at `. The indent
+ *  never crosses a line break, so a run of blank lines isn't rescanned from
+ *  each line's start. */
+const FRAME_LINE = /^[ \t]+at /m;
+
+/**
+ * describeFailure, then the error's stack frames, bounded, on the lines
+ * below: for a log of a failure the framework's own code may have thrown,
+ * where the frames say where. The stack opens with the message, and a
+ * message's own lines can look like frames (an echoed request quoting a stack
+ * trace), so when the message is the stack's header, before its first frame
+ * line, the frames are the stack from its first frame line after the
+ * message. Otherwise (a stack without its header, a message that isn't in
+ * the stack or is empty) they are the stack from its first frame line. The
+ * leak the projection closes was the object's own fields, not its stack.
+ */
+function describeFailureWithFrames(error: unknown): string {
+  let frames: string | undefined;
+  try {
+    const stack = error instanceof Error ? error.stack : undefined;
+    if (typeof stack === 'string') {
+      const message = String((error as Error).message);
+      // The message is the stack's header only before its first frame: a
+      // stack without its header (copied, or frames only) can hold the
+      // message's text inside a frame's name.
+      const firstFrame = stack.search(FRAME_LINE);
+      const at = message ? stack.indexOf(message) : -1;
+      const frameLine = new RegExp(FRAME_LINE.source, 'gm');
+      frameLine.lastIndex = at >= 0 && (firstFrame < 0 || at < firstFrame) ? at + message.length : 0;
+      const found = frameLine.exec(stack);
+      if (found) frames = boundFailureText(stack.slice(found.index));
+    }
+  } catch { /* the projection alone */ }
+  const described = describeFailure(error);
+  return frames === undefined ? described : `${described}\n${frames}`;
+}
+
+/**
+ * A failure record's fields, each bounded, for logs/failures.log and the
+ * ops:alert trace: a string to FAILURE_TEXT_MAX_CHARS; an Error to its
+ * projection, since serialising one writes its own fields, a MembraneError's
+ * whole `rawRequest` among them; any other value to its JSON, with each Error
+ * inside it as its projection (failureJson), as the plain data that JSON
+ * describes when it fits FAILURE_TEXT_MAX_CHARS and as the JSON text,
+ * bounded, when it doesn't. So the trace's data is what failures.log writes:
+ * a Map or an object with toJSON whose JSON is small never hands a listener
+ * the value itself.
+ */
+function boundFailureFields(record: Record<string, unknown>): Record<string, unknown> {
+  const bounded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === 'string') bounded[key] = boundFailureText(value);
+    else if (value instanceof Error) bounded[key] = describeFailure(value);
+    else {
+      let json: string | undefined;
+      try { json = failureJson(value); } catch { bounded[key] = describeFailure(value); continue; }
+      // A value JSON writes nothing for (a function, undefined) is left out,
+      // as the log's JSON leaves it out.
+      if (json === undefined) continue;
+      bounded[key] = json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
+    }
+  }
+  return bounded;
 }
 
 /** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
@@ -1210,7 +1448,7 @@ export class AgentFramework {
   private quiesced = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
-  private traceListeners: TraceEventListener[] = [];
+  private traceListeners: TraceRegistration[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private maintenanceIntervalMs: number;
@@ -1687,14 +1925,16 @@ export class AgentFramework {
     });
 
     // Initialize module registry with callbacks
-    this.moduleRegistry = new ModuleRegistry(store, this.queue, {
+    // A module's events, through pushEvent() or its deprecated queue handle,
+    // go through pushModuleEvent(), which names the module.
+    this.moduleRegistry = new ModuleRegistry(store, { push: (event, moduleName) => this.pushModuleEvent(event, moduleName, false) }, {
       getAgents: () => Array.from(this.agents.values()),
       addMessage: (p, c, m) => this.addMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter) => this.queryMessages(filter),
-      pushEvent: (event) => this.pushEvent(event),
+      pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
@@ -2513,10 +2753,14 @@ export class AgentFramework {
     try {
       const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
       if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      // The reason is printed, kept in the cooldown and shown in the status
+      // snapshot (cooldownReason); without the host's own, it is the error's
+      // message, which can echo the whole request.
       return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
-        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
+        reason: boundFailureText(typeof hold.reason === 'string' && hold.reason ? hold.reason : String(error.message)) };
     } catch (err) {
-      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      // The hook is handed the model's error, and may throw it back.
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold: ${describeFailureWithFrames(err)}`);
       return undefined;
     }
   }
@@ -2566,7 +2810,7 @@ export class AgentFramework {
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? boundFailureText(String(error.message)),
       failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
       // The stated wait (recorded above for agent.model) set this hold's
       // length: an operator release of it returns the hold to AF's own pacing.
@@ -2579,7 +2823,7 @@ export class AgentFramework {
     }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
+      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: boundFailureText(String(error.message)) });
     console.error(`[provider-cooldown] agent=${agent.name} ` +
       `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
@@ -2910,7 +3154,10 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
-      const reason = error instanceof Error ? error.message : String(error);
+      // The alert cuts its own copies from the whole message, so the
+      // webhook's states the whole length.
+      const wholeReason = error instanceof Error ? String(error.message) : failureDescription(error);
+      const reason = boundFailureText(wholeReason);
       console.error(
         '[context-maintenance] pass failed:',
         reason,
@@ -2918,7 +3165,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-maintenance-failed',
         'framework',
-        reason,
+        wholeReason,
         { data: { scope: 'pass' } },
       );
     });
@@ -2988,12 +3235,13 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          record.error = error instanceof Error ? error.message : String(error);
+          const wholeError = error instanceof Error ? String(error.message) : failureDescription(error);
+          record.error = boundFailureText(wholeError);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
             agent.name,
-            record.error,
+            wholeError,
             {
               data: {
                 scope: 'agent',
@@ -3104,17 +3352,39 @@ export class AgentFramework {
   }
 
   /**
+   * A module's event. stop() closes the queue before it stops modules, so a
+   * module's event can arrive after that: from a listener that fires while
+   * stop() runs, or from the module's own stop(). Nothing will process it,
+   * and a throw there can go unhandled or fail stop(), so it's dropped with a
+   * log line naming the module. Otherwise it's queued as pushEvent() queues
+   * it, or, through the deprecated queue handle, without the trace.
+   */
+  private pushModuleEvent(event: ProcessEvent, moduleName: string | undefined, traced: boolean): void {
+    if (this.queue.isClosed) {
+      // A tool result takes pushEvent()'s own drop, whose line names the
+      // call, the tool and its outcome.
+      if (event.type === 'tool-result') {
+        this.pushEvent(event);
+        return;
+      }
+      console.error(`[framework] a '${event.type}' event from module ${moduleName ?? '(unnamed)'} arrived after stop() began — dropped`);
+      return;
+    }
+    if (traced) this.pushEvent(event);
+    else this.queue.push(event);
+  }
+
+  /**
    * Add a trace event listener for observability.
    */
   onTrace(listener: TraceEventListener): () => void {
-    this.traceListeners.push(listener);
+    const registration: TraceRegistration = { listener, active: true };
+    this.traceListeners.push(registration);
     // Return an unsubscribe so callers with a bounded lifetime (e.g. modules
     // that get torn down and recreated on session switch) don't leak
     // listeners. Existing callers that ignore the return value are unaffected.
-    return () => {
-      const idx = this.traceListeners.indexOf(listener);
-      if (idx >= 0) this.traceListeners.splice(idx, 1);
-    };
+    // It removes this subscription, whatever else the same function holds.
+    return () => this.removeTraceRegistration(registration);
   }
 
   /**
@@ -3128,13 +3398,18 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a trace event listener.
+   * Remove a trace event listener: its first subscription, if it holds more
+   * than one.
    */
   offTrace(listener: TraceEventListener): void {
-    const index = this.traceListeners.indexOf(listener);
-    if (index >= 0) {
-      this.traceListeners.splice(index, 1);
-    }
+    const registration = this.traceListeners.find((r) => r.listener === listener);
+    if (registration) this.removeTraceRegistration(registration);
+  }
+
+  private removeTraceRegistration(registration: TraceRegistration): void {
+    registration.active = false;
+    const index = this.traceListeners.indexOf(registration);
+    if (index >= 0) this.traceListeners.splice(index, 1);
   }
 
   /**
@@ -3282,14 +3557,27 @@ export class AgentFramework {
    *  says fetch_reference instead of a path. */
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
-    const fetcher = this.getReferenceFetcher();
-    const eligible: import('./mcpl/references.js').ReferenceRecord[] = [];
+    // Register every block first, then judge each uri once, by its latest
+    // record. The registry keys records by uri and evicts the one registered
+    // least recently, so a uri this result mentions keeps its record through
+    // the result's later blocks, short of more distinct references in one
+    // result than the registry holds; past that, a uri can get a second
+    // record here, hence the key by uri. A uri that any of this result's
+    // blocks calls expired takes no slot, whichever block registered last. A
+    // later result's fresh expiry still supersedes, through register().
+    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      if (eager && fetcher.isEagerEligible(record)) eligible.push(record);
+      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
+      byUri.set(c.testimony.uri, { record, expiredHere });
     }
+    if (!eager) return;
+    const fetcher = this.getReferenceFetcher();
+    const eligible = [...byUri.values()]
+      .filter(({ record, expiredHere }) => !expiredHere && fetcher.isEagerEligible(record))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -5025,7 +5313,8 @@ export class AgentFramework {
     if (!run) return;
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
-      run.settle.reject(new Error(outcome.error ?? 'Unknown error'));
+      // The caller may log or relay the message, which can echo the whole request.
+      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
       return;
     }
     run.settle.resolve({
@@ -5596,7 +5885,8 @@ export class AgentFramework {
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
-      const emoji = REFUSAL_REACTIONS[category] ?? REFUSAL_REACTION_FALLBACK;
+      // Own names only: an inherited one such as 'constructor' takes the fallback.
+      const emoji = Object.hasOwn(REFUSAL_REACTIONS, category) ? REFUSAL_REACTIONS[category] : REFUSAL_REACTION_FALLBACK;
       // Resolve the MCPL server that owns the locus channel and call
       // tools/call directly on its connection (bare tool name — no prefix
       // games), bypassing the agent event queue so no synthetic tool-result
@@ -5909,6 +6199,9 @@ export class AgentFramework {
     /** Discord addresses removed by message-granular undo. The durable outbox
      *  owns eventual delivery; this is also returned for immediate surfaces. */
     removedRefs?: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** For message-granular undo: whether awareness marks were scheduled
+     *  (not whether Discord has accepted them). */
+    markers?: SurgeryMarkerReceipt;
     hidden?: number;
     /** For `hide`: the Discord (channelId, messageId) of each removed message
      *  that carried one — so the surface can mark them with a reaction. */
@@ -6179,6 +6472,7 @@ export class AgentFramework {
           ok: true,
           messagesRemoved: r.messagesRemoved,
           removedRefs: r.removedRefs,
+          markers: r.markers,
           lastVisible: r.lastVisible,
         };
       } catch (error) {
@@ -6215,7 +6509,9 @@ export class AgentFramework {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
 
-    await this.syncDiscordAwarenessMarkers();
+    // The branch has moved: delivery of the marks it changes starts behind
+    // the data-plane gate, and the command doesn't wait for Discord.
+    this.startDiscordAwarenessDelivery('turn undo', agentName);
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -6810,6 +7106,12 @@ export class AgentFramework {
    * Discord messages that left the live context get awareness markers via the
    * durable outbox, exactly as message-granular `undo` does.
    *
+   * Returns once the switch has landed: the body is applied, with a
+   * marker-scheduling receipt (`markers`). It does not wait for Discord to
+   * accept the reactions: delivery is started, behind the MCPL data-plane
+   * gate, and continues without the caller or the store reservation waiting
+   * on it; its per-message outcomes stay in the outbox ledger.
+   *
    * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
    * agent must be idle; nothing is queued.
    */
@@ -6832,6 +7134,8 @@ export class AgentFramework {
      *  the group's last shard so the sharded message stays whole. */
     tailMessageId: string;
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** Whether awareness marks were scheduled; never a delivery claim. */
+    markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
     const logBase: OperatorLogInput = {
@@ -6869,9 +7173,12 @@ export class AgentFramework {
       }
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the switch has landed or been rolled back.
+      // until the switch has landed and its marker scheduling has been
+      // recorded or reported, or the switch has been rolled back. Remote
+      // delivery is not waited on.
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
+      let markers: SurgeryMarkerReceipt;
       try {
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
@@ -6902,8 +7209,14 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-        await this.syncDiscordAwarenessMarkers();
+        // The body change has landed. Nothing after this point turns the
+        // rollback into a failure: marks are an outbox outcome, reported
+        // apart from the body (`markers`).
+        markers = this.activateSurgeryMarkers(markerBatch, 'rollback', agentName);
+        // Installs the MCPL data-plane gate synchronously, before the store is
+        // released, and starts delivery without awaiting it (the first
+        // reaction request may already be on the wire when this returns).
+        this.startDiscordAwarenessDelivery('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6912,7 +7225,8 @@ export class AgentFramework {
       console.error(
         `[operator] rollback agent=${agentName} to=${tailMessageId}` +
           `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
-          ` removed=${messagesRemoved} branch=${branchName} by=${describeRequester(opts.requester)}`,
+          ` removed=${messagesRemoved} branch=${branchName} marks=${describeMarkers(markers)}` +
+          ` by=${describeRequester(opts.requester)}`,
       );
       this.recordOperatorAction({
         ...logBase,
@@ -6922,6 +7236,7 @@ export class AgentFramework {
           tailMessageId,
           messagesRemoved,
           discordRefs: removedRefs.length,
+          markers,
         },
       });
       return {
@@ -6931,6 +7246,7 @@ export class AgentFramework {
         messagesRemoved,
         tailMessageId,
         removedRefs,
+        markers,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
     } catch (error) {
@@ -6946,6 +7262,9 @@ export class AgentFramework {
    * removed together. Discord originals get awareness markers via the outbox;
    * the batch is `explicit`-activated only after every removal succeeded, and
    * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
+   * Like rollbackToMessage, it returns once the body change has landed, with
+   * a marker-scheduling receipt (`markers`); delivery continues without the
+   * caller waiting on it.
    *
    * Not retroactive over derived state: a message already folded into an
    * autobiographical summary stays in that summary — roll back to before it
@@ -6967,6 +7286,8 @@ export class AgentFramework {
     messagesRemoved: number;
     removedIds: string[];
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** Whether awareness marks were scheduled; never a delivery claim. */
+    markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
     const requestedIds = [...new Set(opts.messageIds.map(String))];
@@ -7019,9 +7340,12 @@ export class AgentFramework {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the fork is fully redacted or the source is restored.
+      // until the fork is fully redacted and its marker scheduling has been
+      // recorded or reported, or the source is restored. Remote delivery is
+      // not waited on.
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
+      let markers: SurgeryMarkerReceipt;
       try {
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
@@ -7062,7 +7386,6 @@ export class AgentFramework {
             if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
             else cm.removeMessage(iv.fromId as MessageId);
           }
-          if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
         } catch (error) {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
@@ -7075,7 +7398,19 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        await this.syncDiscordAwarenessMarkers();
+        // Every redaction committed: the body change has landed and the fork
+        // is safe to serve from. Activating the marker batch is bookkeeping
+        // about a world-side effect; if it fails, the suppression still
+        // stands, and the receipt says what became of the marks: not
+        // scheduled once the batch is retired, or unresolved if it can't be.
+        // (The batch's resume journal has nothing left to do, since every
+        // interval has committed, so retiring the batch gives up only the
+        // marks.)
+        markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
+        // Installs the MCPL data-plane gate synchronously, before the store is
+        // released, and starts delivery without awaiting it (the first
+        // reaction request may already be on the wire when this returns).
+        this.startDiscordAwarenessDelivery('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -7083,7 +7418,7 @@ export class AgentFramework {
 
       console.error(
         `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
-          `by=${describeRequester(opts.requester)}`,
+          `marks=${describeMarkers(markers)} by=${describeRequester(opts.requester)}`,
       );
       const loggedIds = capIds(removedIds);
       this.recordOperatorAction({
@@ -7095,6 +7430,7 @@ export class AgentFramework {
           removedIds: loggedIds.ids,
           ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
           discordRefs: removedRefs.length,
+          markers,
         },
       });
       return {
@@ -7104,12 +7440,115 @@ export class AgentFramework {
         messagesRemoved,
         removedIds,
         removedRefs,
+        markers,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
     } catch (error) {
       this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
+  }
+
+  /**
+   * Record a surgery's prepared marker batch as active once its body change
+   * has landed, and say what happened. Never throws: the body is already
+   * applied, so a ledger failure here is reported in the receipt rather than
+   * as a failed surgery an operator might retry. A batch that could not be
+   * activated is retired, so no later reconciliation can deliver it behind a
+   * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
+   * too, the receipt says only that the outcome is `unresolved`: the batch is
+   * retained, and it may still be delivered. A rollback's batch
+   * (activated by target branch) may be promoted by the very next
+   * reconciliation, the one the delivery it starts runs; a suppression's
+   * (activated explicitly) waits for the next start.
+   *
+   * A batch with no refs (a suppression journal with nothing addressable) is
+   * still activated, which closes its resume journal. It schedules no marks,
+   * so it reports `none` whatever the ledger does. If it can be neither
+   * activated nor retired, its journal is left prepared and closes at the
+   * next start: every interval it names has already committed, so the resume
+   * skips them all and activates it.
+   */
+  private activateSurgeryMarkers(
+    batch: DiscordAwarenessBatch | null,
+    verb: 'rollback' | 'suppress',
+    agentName: string,
+  ): SurgeryMarkerReceipt {
+    if (!batch) return { status: 'none', queued: 0 };
+    try {
+      this.discordAwarenessOutbox!.activate(batch.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      let retired = false;
+      let retireDetail = '';
+      try {
+        retired = this.discordAwarenessOutbox!.discard(batch.id);
+      } catch (discardError) {
+        retireDetail = discardError instanceof Error ? discardError.message : String(discardError);
+      }
+      console.error(
+        `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
+          `could not be activated (${detail}); ` +
+          (retired ? 'batch retired' : `batch retained${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
+      );
+      if (batch.refs.length === 0) return { status: 'none', queued: 0 };
+      this.opsAlert(
+        retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
+        agentName,
+        retired
+          ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
+            `(batch ${batch.id} retired): ${detail}`
+          : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
+            `neither activated nor retired; it may still be delivered: ${detail}`,
+        { data: { batchId: batch.id, retired } },
+      );
+      return retired
+        ? { status: 'not-scheduled', queued: 0, error: detail }
+        : { status: 'unresolved', queued: 0, batchId: batch.id, error: detail };
+    }
+    if (batch.refs.length === 0) return { status: 'none', queued: 0 };
+    return { status: 'queued', queued: batch.refs.length, batchId: batch.id };
+  }
+
+  /**
+   * Start awareness delivery after a branch move (a surgery, a switch, an
+   * undo or redo) without the caller awaiting it. No operator response waits
+   * for Discord to accept marks: the MCPL data-plane gate alone holds channel
+   * traffic that arrives after it until they are attempted.
+   * `syncDiscordAwarenessMarkers` installs that gate synchronously, before
+   * its first await, so calling this while a surgery still holds the store
+   * puts the gate up before the store is released. With no drain running, the
+   * drain starts in the same synchronous run (the first reaction request can
+   * be written before this returns); with one running, this generation's pass
+   * follows it (drainForGeneration). Either way delivery continues
+   * independently: the caller's response and any store reservation stop
+   * waiting on remote reactions. A turn may run during delivery when its wake
+   * carries no channel traffic (a scheduler timer, a provider admission), and
+   * also when its channel traffic was admitted before the gate went up
+   * (queued when a surgery began, or arriving during its switch or fork): the
+   * surgery's store reservation, which used to hold such a turn through the
+   * drain, now ends once the gate is up. A failure is accounted by the gate
+   * itself: the current generation's failure recycles the connections, and a
+   * superseded one leaves that to the newer generation, whose own pass meets
+   * the same ledger. Here it is logged and raised as an ops alert, and the
+   * next sync, reconnect or start delivers what is still pending.
+   *
+   * @param after What moved the branch, for the log and the alert
+   *   ("rollback", "branch switch", "undo" …).
+   * @param agentName The agent the move was for, or "framework" for a
+   *   branch switch that names none.
+   */
+  startDiscordAwarenessDelivery(after: string, agentName = 'framework'): void {
+    if (!this.discordAwarenessOutbox) return;
+    this.syncDiscordAwarenessMarkers().catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[discord-awareness] delivery after ${after} agent=${agentName} failed: ${detail}`);
+      this.opsAlert(
+        'discord-awareness-delivery',
+        agentName,
+        `Awareness mark delivery after ${after} failed: ${detail}`,
+      );
+    });
   }
 
   /** Re-materialize config files from the (new) active branch — fire and
@@ -10032,7 +10471,7 @@ export class AgentFramework {
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
-          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
+          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
         return;
       }
@@ -11445,7 +11884,7 @@ export class AgentFramework {
               // border is close, rather than noise on every near-threshold
               // flip. (It must not re-enter any agent's context — the emoji
               // is suppressed at the surface via
-              // DISCORD_SUPPRESS_REACTION_EMOJIS; without that, marking a
+              // DISCORD_SUPPRESSED_REACTIONS_BASELINE; without that, marking a
               // refusal feeds the next one.)
               if (!handledByRewind) {
                 void this.reactToRefusal(agent.name, category);
@@ -13434,6 +13873,9 @@ export class AgentFramework {
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
+    // The failure text is stored inline in every record; the request that
+    // produced it is already stored separately as a blob.
+    if (typeof entryToStore.error === 'string') entryToStore.error = boundFailureText(entryToStore.error);
 
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
@@ -14018,6 +14460,10 @@ export class AgentFramework {
         (event.error as string) ?? 'unknown error',
         event.retryable as boolean | undefined,
         event.errorType as string | undefined,
+        {
+          httpStatus: event.httpStatus as number | undefined,
+          providerErrorCode: event.providerErrorCode as string | undefined,
+        },
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
@@ -14036,8 +14482,26 @@ export class AgentFramework {
       ...event,
       timestamp: Date.now(),
     } as TraceEvent;
+    // Listeners (web UI, subagent observers, host loggers) receive bounded
+    // failure text. An event's `error` and `stack` strings are whatever its
+    // source's Error carried, which for a provider failure can be an echo of
+    // the whole request.
+    const bounded = traceEvent as unknown as Record<string, unknown>;
+    if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
+    if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
 
-    for (const listener of this.traceListeners) {
+    // An event goes to the subscriptions present when its delivery starts,
+    // each one only if it is still active when its turn comes, as the DOM's
+    // EventTarget delivers: a subscription made during delivery waits for the
+    // next event, and one removed during delivery is skipped if its turn
+    // hasn't come. Each onTrace call is a subscription of its own, so a
+    // function subscribed twice is called twice. Iterating the live array let
+    // an unsubscribe during delivery make the listener after the one being
+    // called miss the event, since splice shifts the rest under the iterator.
+    for (const registration of [...this.traceListeners]) {
+      if (!registration.active) continue;
+      // Called as a plain function, as before, so the registration isn't its `this`.
+      const { listener } = registration;
       try {
         listener(traceEvent);
       } catch (error) {
@@ -14116,10 +14580,14 @@ export class AgentFramework {
    *  and kind-specific fields (additive only — doctor parses by regex). */
   private logFailure(record: Record<string, unknown>): void {
     try {
+      // Every field is bounded: `reason` is conventionally free text, and any
+      // caller's field may carry an error message, or an Error whose own
+      // fields include the whole request.
+      const bounded = boundFailureFields(record);
       mkdirSync('logs', { recursive: true });
       appendFileSync(
         'logs/failures.log',
-        JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n',
+        JSON.stringify({ at: new Date().toISOString(), ...bounded }) + '\n',
       );
     } catch { /* best-effort */ }
   }
@@ -14152,13 +14620,27 @@ export class AgentFramework {
   private opsAlert(
     kind: string,
     agentName: string,
-    message: string,
+    rawMessage: string,
     opts?: { data?: Record<string, unknown>; skipLog?: boolean },
   ): void {
+    // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
+    // that isn't a string; it's described as a thrown value is, rather than
+    // thrown on (a string is its own description).
+    const wholeMessage = failureDescription(rawMessage);
+    const message = boundFailureText(wholeMessage);
+    // The caller's data goes to failures.log and to trace listeners, bounded
+    // the same way for both. A JavaScript caller's null is no data, and data
+    // that isn't a plain object (a string, an array, a Buffer) is kept as one
+    // field, `data`, rather than spread into a field per character or element.
+    const rawData: unknown = opts?.data;
+    const plain = typeof rawData === 'object' && rawData !== null &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(rawData));
+    const data = rawData == null ? undefined
+      : boundFailureFields(plain ? rawData as Record<string, unknown> : { data: rawData });
     if (!opts?.skipLog) {
-      this.logFailure({ agent: agentName, kind, reason: message, ...opts?.data });
+      this.logFailure({ agent: agentName, kind, reason: message, ...data });
     }
-    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data: opts?.data });
+    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data });
 
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
@@ -14171,7 +14653,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${message.slice(0, 500)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
@@ -14237,9 +14719,23 @@ export class AgentFramework {
    * Deliberately NOT a message match: the message wording belongs to CM and
    * can be reworded without warning.
    */
-  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
-    if (err instanceof MembraneError) {
-      return { retryable: err.retryable, errorType: err.type };
+  private classifyInferenceError(err: Error): {
+    retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
+  } {
+    // From either copy of membrane (isMembraneError). The fields are read as
+    // data, and the type is bounded like describeFailure's, for every sink the
+    // classification reaches (the trace, the marker, the logs).
+    if (isMembraneError(err)) {
+      const fields = err as Error & {
+        retryable?: unknown; type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown;
+      };
+      const providerErrorCode = boundProviderErrorCode(fields.providerErrorCode);
+      return {
+        ...(typeof fields.retryable === 'boolean' ? { retryable: fields.retryable } : {}),
+        ...(typeof fields.type === 'string' ? { errorType: boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+        ...(typeof fields.httpStatus === 'number' ? { httpStatus: fields.httpStatus } : {}),
+        ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+      };
     }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
@@ -14267,25 +14763,70 @@ export class AgentFramework {
 
   private noteInferenceExhausted(
     agentName: string,
-    reason: string,
+    rawReason: string,
     retryable?: boolean,
-    errorType?: string,
+    rawErrorType?: string,
+    detail?: { httpStatus?: number; providerErrorCode?: string },
   ): void {
+    // The reason is the failure's own message, and a provider can echo the
+    // whole rejected request in it: one household's [inference-failed]
+    // marker carried ~1.7 MB of its own request back into its context. Every
+    // sink below gets an excerpt cut from the whole reason at its own bound
+    // (boundFailureText, so its marker states the whole length): the stderr
+    // line, failures.log and the hard-down alert FAILURE_TEXT_MAX_CHARS, the
+    // [inference-failed] marker FAILURE_MARKER_REASON_MAX_CHARS, the status's
+    // lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS, and
+    // the rewind marker REWIND_MARKER_REASON_MAX_CHARS. The classification
+    // travels as structured fields beside the text.
+    //
+    // A reason that isn't a string (the stream paths always pass a message)
+    // is described rather than allowed to throw before anything is recorded.
+    // Its whole description is the whole reason, cut once by each sink.
+    const wholeReason: string = typeof rawReason === 'string' ? rawReason : failureDescription(rawReason);
+    // The type is bounded wherever it's written, as classifyInferenceError
+    // bounds the types it reads, since a caller can pass one it didn't classify.
+    const errorType = typeof rawErrorType === 'string'
+      ? boundFailureText(rawErrorType, PROVIDER_ERROR_CODE_MAX_CHARS) : rawErrorType;
+    const reason = boundFailureText(wholeReason);
+    const markerReason = boundFailureText(wholeReason, FAILURE_MARKER_REASON_MAX_CHARS);
+    const httpStatus = typeof detail?.httpStatus === 'number' ? detail.httpStatus : undefined;
+    const providerErrorCode = boundProviderErrorCode(detail?.providerErrorCode);
+    const classification: Record<string, unknown> = {
+      ...(errorType !== undefined ? { errorType } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+    };
+    // Each excerpt says how long the whole was when it was cut.
+    const cutAt = (excerpt: string): Record<string, unknown> =>
+      excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
-    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
-    console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+    const labels = [
+      errorType !== undefined ? `type=${errorType}` : undefined,
+      httpStatus !== undefined ? `status=${httpStatus}` : undefined,
+      providerErrorCode !== undefined ? `code=${providerErrorCode}` : undefined,
+    ].filter((label): label is string => label !== undefined);
+    console.error(
+      `[inference-failed] agent=${agentName} consecutive=${streak}` +
+      `${labels.length > 0 ? ` ${labels.join(' ')}` : ''}: ${reason}`,
+    );
 
     // (1b) Machine-greppable durable record, independent of journald/unit log
     // redirects: logs/failures.log under the host's working directory. This is
-    // what connectome-doctor reads. Legacy fields kept; `kind` is additive.
-    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted' });
+    // what connectome-doctor reads. Legacy fields kept; `kind` and the
+    // classification fields are additive.
+    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+      const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+        .filter((part): part is string => part !== undefined)
+        .join(', ');
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -14293,15 +14834,15 @@ export class AgentFramework {
             type: 'text',
             text:
               `[inference-failed] Your previous turn did not complete: the model ` +
-              `call failed and produced no response, so nothing was sent. Reason: ` +
-              `${reason}. If this recurs with the same cause, change approach ` +
+              `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
+              `${markerReason}. If this recurs with the same cause, change approach ` +
               `rather than retrying identically (e.g. drop an oversized attachment ` +
               `or an unsupported setting).`,
           }],
-          { system: true, kind: 'inference-failed', reason, consecutive: streak },
+          { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
       } catch (err) {
-        console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
+        console.error(`[inference-failed] could not record chronicle marker for ${agentName}: ${describeFailureWithFrames(err)}`);
       }
     }
 
@@ -14320,10 +14861,16 @@ export class AgentFramework {
     // (e.g. a reason string that crossed a serialization boundary). It matches
     // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
     // errorType gate is the one that's load-bearing.
+    //
+    // The fallback applies only to an unclassified reason. A classified
+    // failure (a provider's 400, say) already says what it is, and its
+    // message is the provider's text, which can quote anything, including
+    // these phrases from the agent's own context.
     const overBudget =
       errorType === 'over_budget' ||
       errorType === 'context_refusal' ||
-      /exceed hard budget|no summary covers/i.test(reason);
+      // Decided on the whole reason: presentation bounds never change it.
+      (errorType === undefined && /exceed hard budget|no summary covers/i.test(wholeReason));
     // Observability: a refused compile means the agent cannot think AT ALL
     // this turn — surface it on the ops-alert pipeline (ops:alert trace +
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
@@ -14333,7 +14880,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (${errorType ?? 'unclassified'}): ${reason.slice(0, 300)} — ` +
+        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${agent ? 'kicking' : 'unavailable (no agent handle)'}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
         { skipLog: true },
@@ -14351,7 +14898,7 @@ export class AgentFramework {
           }
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
         } catch (err) {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks:`, err);
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
@@ -14368,10 +14915,13 @@ export class AgentFramework {
       // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
       // a hard-down agent re-posts every ~15 min, not on every failed retry.
       // failures.log already got the per-exhaustion record above.
+      // The excerpt leaves room for the prefix, so the alert's own bound
+      // never cuts it a second time.
+      const hardDown = `${streak} consecutive inference failures. Last reason: `;
       this.opsAlert(
         'hard-down',
         agentName,
-        `${streak} consecutive inference failures. Last reason: ${reason}`,
+        hardDown + boundFailureText(wholeReason, FAILURE_TEXT_MAX_CHARS - hardDown.length),
         { skipLog: true },
       );
 
@@ -14385,7 +14935,7 @@ export class AgentFramework {
       // rejecting your history" marker. `retryable` is kept only for the trace.
       void retryable;
       if (errorType === 'invalid_request' && agent) {
-        this.quarantinePoisonedHistory(agent, reason);
+        this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
   }
@@ -14403,7 +14953,7 @@ export class AgentFramework {
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
-  private quarantinePoisonedHistory(agent: Agent, reason: string): void {
+  private quarantinePoisonedHistory(agent: Agent, wholeReason: string): void {
     const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
     const used = this.exhaustionRewinds.get(agent.name) ?? 0;
     if (used >= cap) {
@@ -14424,7 +14974,8 @@ export class AgentFramework {
     }
 
     this.exhaustionRewinds.set(agent.name, used + 1);
-    const count = this.updateRewindMarker(agent, truncateReason(reason), 'inference-failure');
+    const count = this.updateRewindMarker(
+      agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
       `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
@@ -14664,7 +15215,11 @@ export class AgentFramework {
     await this.refreshMcplTools();
   }
 
-  /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
+  /**
+   * Reconcile the durable ledger with Chronicle, then deliver every server's
+   * work. A drain still running is waited for and then followed by a fresh
+   * pass (drainForGeneration).
+   */
   async syncDiscordAwarenessMarkers(_onlyServerId?: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
     // A targeted retry may discover pending work for other Discord servers
@@ -14879,46 +15434,70 @@ export class AgentFramework {
       throw new DiscordAwarenessAccountingError('branch reconciliation', error);
     }
     const pending = this.readDiscordAwarenessPending();
-    if (pending.length === 0) {
+    // A drain that is still running holds operations it read before this
+    // reconciliation, and it sends them whatever the ledger now says. A branch
+    // move can hide them from `pending`: restoring a rollback's source makes
+    // its marks undesired, and an add whose reply has not arrived is not yet
+    // present, so the ledger shows nothing to do while the drain goes on to
+    // send its saved adds and then the removals they need. So a generation
+    // accounts for every running drain as well as for every pending
+    // operation, and waits for those drains instead of releasing the data
+    // planes beside them (drainForGeneration).
+    const serverIds = [...new Set([
+      ...pending.map((operation) => operation.ref.serverId),
+      ...this.discordAwarenessDrains.keys(),
+    ])];
+    if (serverIds.length === 0) {
       return {
         requiresBarrier: false,
         promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
       };
     }
-    const serverIds = [...new Set(pending.map((operation) => operation.ref.serverId))];
     const promise = Promise.all(
-      serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)),
-    ).then((outcomes): DiscordAwarenessDrainOutcome => {
-      if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
-        return {
-          status: 'unavailable',
-          accounted: outcomes.reduce(
-            (count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0),
-            0,
-          ),
-        };
-      }
-      return {
-        status: 'delivered',
-        delivered: outcomes.reduce(
-          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0),
-          0,
-        ),
-        failed: outcomes.reduce(
-          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0),
-          0,
-        ),
-      };
-    });
+      serverIds.map((serverId) => this.drainForGeneration(serverId)),
+    ).then(combineDrainOutcomes);
     return { requiresBarrier: true, promise };
   }
 
   /**
+   * One server's drain for a new generation: a gate completes only after
+   * every operation pending when it was armed has been attempted. A drain
+   * already running can't promise that. It never re-sends a key it has
+   * attempted, so an operation re-pended while it runs (a rollback, its undo,
+   * then a redo, all mid-drain) stays pending, and it may already have made
+   * its last read of the ledger, missing a batch activated since. So a
+   * generation that finds a drain running waits for it, then drains again
+   * with a fresh pass that reads the ledger anew. Two generations waiting on
+   * the same drain share the fresh pass that follows it.
+   */
+  private drainForGeneration(serverId: string): Promise<DiscordAwarenessDrainOutcome> {
+    const running = this.discordAwarenessDrains.get(serverId);
+    if (!running) return this.drainDiscordAwarenessOutbox(serverId);
+    return running.then((first) => this.drainDiscordAwarenessOutbox(serverId)
+      .then((fresh) => combineDrainOutcomes([first, fresh])));
+  }
+
+  /**
+   * Wait out the awareness gate for an inbound event: the generation current
+   * now, and any generation installed while waiting, until none is current
+   * or the current one is one already waited for. A handler that waited only
+   * for the generation it first saw would go on behind a newer one armed
+   * meanwhile. Rejects as the generation it waited for rejects.
+   */
+  private async awaitDiscordAwarenessBarriers(): Promise<void> {
+    let waited: DiscordAwarenessBarrier | null = null;
+    for (let barrier = this.discordAwarenessBarrier; barrier && barrier !== waited; barrier = this.discordAwarenessBarrier) {
+      waited = barrier;
+      await barrier.promise;
+    }
+  }
+
+  /**
    * Install one framework-global Discord-awareness generation before releasing
-   * any inference-bearing event. With pending work, every MCPL data plane is
-   * paused while all control planes remain live. With no pending work, ready()
-   * runs synchronously so request responders preserve their historical
-   * same-stack behavior.
+   * any inference-bearing event. With pending work or a drain still running,
+   * every MCPL data plane is paused while all control planes remain live.
+   * With neither, ready() runs synchronously so request responders preserve
+   * their historical same-stack behavior.
    */
   private installMcplDataPlaneGate(): DiscordAwarenessBarrier {
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
@@ -15021,6 +15600,14 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
 
+    // Every connect needs a readable awareness ledger: a runtime connect's
+    // awareness barrier reconciles it, and a stdio child taking the
+    // protective default derives that from it. Read it first, so an
+    // unreadable ledger refuses the connect before anything is registered
+    // under its id or spawned (a reconnecting server would otherwise be left
+    // registered as a closed stub). With no outbox configured nothing is read.
+    this.getPlacedReactionBaseline();
+
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl).
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
@@ -15036,7 +15623,33 @@ export class AgentFramework {
       );
     }
 
-    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    // A stdio child's protective reaction default, DISCORD_SUPPRESSED_REACTIONS_BASELINE
+    // (WebSocket servers own their environment outside this process). The
+    // caller's config stays unchanged, so a runtime restart derives afresh.
+    // The default is derived at each spawn: the env below is a getter, which
+    // the transport reads at first connect, at every automatic reconnect and
+    // at a stub's retry, so retained markers added since the last spawn are
+    // covered.
+    let connectionConfig = config;
+    if (!isWebSocketTransport(config)) {
+      const declared = this.declaredReactionBaseline(config);
+      if (declared) {
+        console.error(
+          `[mcpl] ${config.id}: DISCORD_SUPPRESSED_REACTIONS_BASELINE ${declared.source === 'env' ? 'from its env' : 'inherited from the host'} ` +
+            `replaces the framework's protective default`,
+        );
+      }
+      connectionConfig = { ...config };
+      Object.defineProperty(connectionConfig, 'env', {
+        enumerable: true,
+        configurable: true,
+        get: () => ({
+          ...config.env,
+          DISCORD_SUPPRESSED_REACTIONS_BASELINE: declared?.value ?? this.getPlacedReactionBaseline().join(','),
+        }),
+      });
+    }
+    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -15403,6 +16016,92 @@ export class AgentFramework {
   // ==========================================================================
 
   /**
+   * Snapshot the protective Discord reaction default for this deployment, as
+   * suppression tokens: the forms the Discord adapter's suppression matcher
+   * reads, not marker payloads for an add, a remove or a replay. It covers
+   * the reactions the framework places: refusal markers, the adapter's own
+   * default awareness marker, the configured awareness marker, and retained
+   * outbox markers (including offline recovery choices and marks that can
+   * later be removed or replayed). A custom emoji appears as its bare ID,
+   * which suppression matches even after a rename; stored markers and the
+   * actual add/remove payloads stay unchanged. Explicit adapter or operator
+   * suppression settings still take precedence. Throws on an unreadable
+   * ledger rather than reporting a partial baseline.
+   */
+  getPlacedReactionBaseline(): readonly string[] {
+    let retained: string[];
+    try {
+      retained = this.discordAwarenessOutbox?.batches().map((batch) => batch.emoji) ?? [];
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
+    }
+    // Discord events carry the custom emoji's name and ID separately. Full
+    // marker forms belong in add/remove calls, but suppression matches their
+    // stable ID (including after a rename), rather than the composite token.
+    const suppressionToken = (emoji: string): string => {
+      const custom = /^(?:<a?:\w+:(\d{17,20})>|(?:a:)?\w+:(\d{17,20}))$/.exec(emoji.trim());
+      return custom?.[1] ?? custom?.[2] ?? emoji;
+    };
+    return [...new Set([
+      ...REFUSAL_REACTION_BASELINE,
+      DEFAULT_DISCORD_AWARENESS_EMOJI,
+      this.discordAwarenessEmoji,
+      ...retained,
+    ].map(suppressionToken))].filter((emoji) => emoji.length > 0);
+  }
+
+  /**
+   * The reaction baseline an operator chose for a stdio server, if any: a
+   * value declared in its env, or one inherited from the host with
+   * `inheritEnv`, the declared one first. A value with no tokens, as
+   * discord-mcpl's parser reads them, counts as unset: the adapter splits on
+   * commas and keeps a token only when its normalizer leaves something of it
+   * (blank, `:`, `::` and a lone U+FE0F leave nothing), so such a value (an
+   * empty systemd `Environment=`, say, or `${A},${B}` or `:${NAME}:` with the
+   * variables empty) would otherwise turn the protective default off without
+   * anyone choosing that.
+   *
+   * Windows names are matched in both sources: Workers expose a case-
+   * sensitive `process.env` copy. Within one source, Node's spawn keeps the
+   * first spelling in sorted order, so each source is resolved that way.
+   *
+   * A value is read as the child will see it. A config loaded from JSON can
+   * carry a non-string there despite the type, and spawn writes every
+   * defined value as its string form, so a number is a declared value, not a
+   * failed connect. A null counts as unset, like a blank: written in JSON it
+   * means no value, and read as spawn's "null" it would replace the
+   * protective default with a list that suppresses nothing.
+   */
+  private declaredReactionBaseline(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): { value: string; source: 'env' | 'inherited' } | undefined {
+    // A token as discord-mcpl's parser keeps one: `parseSuppressionEnvTokens`
+    // trims each comma-separated token and keeps it when
+    // `normalizeReactionEmoji` (discord-mcpl `src/filters.ts`) leaves
+    // something, after it strips U+FE0F, trims, and strips one leading and one
+    // trailing colon. The same steps in the same order, so the two can be
+    // compared when either changes.
+    const isToken = (token: string): boolean =>
+      token.trim().replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '') !== '';
+    const valueIn = (env: NodeJS.ProcessEnv | undefined): string | undefined => {
+      let raw: unknown;
+      if (process.platform !== 'win32') raw = env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+      else {
+        const key = Object.keys(env ?? {}).sort()
+          .find((name) => name.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE');
+        raw = key === undefined ? undefined : env?.[key];
+      }
+      if (raw === undefined || raw === null) return undefined;
+      const value = String(raw);
+      return value.split(',').some(isToken) ? value : undefined;
+    };
+    const declared = valueIn(config.env);
+    if (declared !== undefined) return { value: declared, source: 'env' };
+    const inherited = config.inheritEnv ? valueIn(process.env) : undefined;
+    return inherited !== undefined ? { value: inherited, source: 'inherited' } : undefined;
+  }
+
+  /**
    * Connect a new MCPL server at runtime. Refreshes the tool list and
    * notifies the agent of newly available tools. Throws if the MCPL
    * subsystem is not initialized, the id is already connected, or the
@@ -15484,6 +16183,12 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
+    // Every connect reads the awareness ledger: its awareness barrier
+    // reconciles it, and a stdio child taking the protective default derives
+    // that from it. Read it before disconnecting, so an unreadable ledger
+    // refuses the restart and leaves the running child up, whatever the
+    // server's baseline or transport. (No outbox configured: nothing to read.)
+    this.getPlacedReactionBaseline();
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
   }
@@ -15613,8 +16318,10 @@ export class AgentFramework {
     ) => {
       const answer = answerOnce(responder, 'push/event', connection.id);
       try {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
+        // Only when a generation is current: with none, the event is handled in
+        // the turn it arrives, as it always was (the push coalescer's ordering of
+        // a push against its retraction depends on that).
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         // Checked here, after the barrier and before anything records the
         // push as accepted: a stopped host refuses it.
         if (this.queue?.isClosed) {
@@ -15644,8 +16351,7 @@ export class AgentFramework {
       if (this.inferenceRouter && responder) {
         const answer = answerOnce(responder, 'inference/request', connection.id);
         try {
-          const barrier = this.discordAwarenessBarrier;
-          if (barrier) await barrier.promise;
+          if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
           // A stopping host starts no inference for a server: refused, like a
           // push, before the router runs.
           if (this.queue?.isClosed) {
@@ -15760,8 +16466,7 @@ export class AgentFramework {
     ) => {
       const answer = answerOnce(responder, 'channels/incoming', connection.id);
       try {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         if (this.queue?.isClosed) {
           this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
           return;
@@ -15780,8 +16485,7 @@ export class AgentFramework {
       if (!responder) return;
       const answer = answerOnce(responder, 'host/command', connection.id);
       try {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         // A stopping host runs no host command: refused like the requests
         // above, before its handler runs.
         if (this.queue?.isClosed) {
@@ -15828,7 +16532,7 @@ export class AgentFramework {
       // grant) before the data-plane barrier releases — otherwise the first
       // post-reconnect events land while the grant is still empty and are
       // rejected fail-closed instead of delivered.
-      void (async () => {
+      const reregistered = (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
           if (config) {
@@ -15843,7 +16547,11 @@ export class AgentFramework {
         this.releaseMcplDataPlaneGate(awarenessBarrier);
         this.handleToolsListChanged(connection.id);
       })();
-      void awarenessBarrier.promise.then(() => {
+      // The gate completes, and the data planes go ready, only once both the
+      // awareness drain and the re-registration have finished. A drain can
+      // settle first (one already running, or little to send), and the grant
+      // must exist before the first data-plane event flows.
+      void Promise.all([awarenessBarrier.promise, reregistered]).then(() => {
         if (
           awarenessBarrier.requiresBarrier
           && !this.completeMcplDataPlaneGate(awarenessBarrier)
@@ -16963,6 +17671,7 @@ export class AgentFramework {
       | {
         kind: 'reference';
         refId: string;
+        /** The type as the stub shows it (a label), lowercased: `image/…`. */
         mediaType: string;
         toolCallId: string;
         toolName: string;
@@ -17016,10 +17725,22 @@ export class AgentFramework {
             };
           }
           if (candidate.kind === 'reference') {
+            // Point at fetch_reference only where it can deliver: not for a
+            // reference this process holds no record of (fetch_reference
+            // looks the id up in the same registry), nor, as the stub does,
+            // for an unfetched one the fetcher would refuse as expired.
+            const record = referenceRegistry.get(candidate.refId);
+            const expiry = record && !record.fetchedPath ? referenceExpiry(record.testimony) : null;
             throw new Error(
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
-              'Fetch it with fetch_reference and save the materialized file instead.',
+              (!record
+                ? 'This process holds no record of it (a restart or an eviction drops records, and a stub quoted ' +
+                  "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
+                  'it again, re-run that tool for a fresh reference.'
+                : expiry
+                  ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
+                  : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }
           if (candidate.ref === null) {
@@ -17131,13 +17852,15 @@ export class AgentFramework {
               consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
               continue;
             }
-            // Reference stub: the registry's testimony (when this process
-            // still has the record) says whether it was an image; the
-            // sniffed stub text is the fallback. Non-image references
-            // are not slots.
-            const testimony = referenceRegistry.get(ph.refId)?.testimony.mimeType?.toLowerCase() ?? ph.mediaType;
-            if (!testimony || !testimony.startsWith('image/')) continue;
-            consider({ kind: 'reference', refId: ph.refId, mediaType: testimony, toolCallId, toolName, messagesBack });
+            // Reference stub: the registry's claimed type (when this process
+            // still has the record), else the first image/ token in the
+            // stub's text, which can come from its name, says whether it was
+            // an image. Either is read as the stub shows a type, sanitized
+            // and bounded. Non-image references are not slots.
+            const claimed = referenceRegistry.get(ph.refId)?.testimony.mimeType ?? ph.mediaType ?? undefined;
+            const mediaType = referenceTypeLabel(claimed).toLowerCase();
+            if (!mediaType.startsWith('image/')) continue;
+            consider({ kind: 'reference', refId: ph.refId, mediaType, toolCallId, toolName, messagesBack });
           }
         };
 
@@ -17190,10 +17913,14 @@ export class AgentFramework {
               };
               if (block?.type === 'image') {
                 const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
+                // The sender's word, shown in the receipt and stored with the
+                // file, so it's taken as a label; with nothing left of it, it
+                // counts as absent.
+                const claimed = block.source?.mediaType;
                 consider({
                   kind: 'attachment',
                   data: inline ? block.source!.data! : null,
-                  mediaType: block.source?.mediaType ?? 'image/png',
+                  mediaType: (typeof claimed === 'string' ? sanitizeLabel(claimed, REFERENCE_LIMITS.mimeType) : '') || 'image/png',
                   messagesBack,
                 });
               } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
