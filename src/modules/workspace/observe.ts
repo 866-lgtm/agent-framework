@@ -919,6 +919,10 @@ export async function walkScope(
       return null;
     }
     listings.set(rel, null);
+    // Reading a directory is a check of it too, and replaces an earlier proof
+    // that it was missing: the scope's own directory, read afresh on the
+    // wrap, has no check of its own.
+    walk.missing.delete(rel);
     let entries;
     try {
       entries = await readdir(dir.real, { withFileTypes: true });

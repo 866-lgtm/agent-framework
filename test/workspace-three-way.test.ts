@@ -2632,6 +2632,32 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.equal(await contentOf(m, 'm/1.txt'), 'm/1.txt edited while it was gone');
   });
 
+  test('a directory sync whose own directory is gone when the after stretch lists it, and another by the wrap, proves nothing absent', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['d/1.txt', 'd/2.txt', 'd/3.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', { path: 'work/d' }); // takes d/1, d/2: the place is d/2.txt
+    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', 'd'), 'd/2.txt');
+    // d/ is there when the walk checks it and gone when the after stretch
+    // lists it, so the walk proves it missing; by the wrap's listing another
+    // d/ holds the same three files.
+    let calls = 0;
+    let synced: any;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith(`${'/'}d`)) {
+        calls++;
+        if (calls === 1) renameSync(env.disk('d'), join(env.root, 'd-away'));
+        if (calls === 2) for (const f of ['d/1.txt', 'd/2.txt', 'd/3.txt']) env.writeDisk(f, f);
+      }
+      return readdir(path, ...rest);
+    }, async () => {
+      synced = await call(m, 'sync', { path: 'work/d' });
+    });
+    assert.ok(calls >= 2, 'the wrap listed d/ again');
+    for (const f of ['d/1.txt', 'd/2.txt', 'd/3.txt']) assert.notEqual(env.store.treeGet(TREE, f), null, `${f} is on disk in the new d/: not proven absent`);
+    assert.ok(synced.incomplete.some((r: { path: string; reason: string }) => r.path === 'd' && /changed while the walk ran/.test(r.reason)), JSON.stringify(synced.incomplete));
+  });
+
   test('an accepted new root starts with no place', async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);
