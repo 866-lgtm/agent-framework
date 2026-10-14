@@ -32,9 +32,9 @@
   earlier one for the primary, and a fork's, subagent's or the
   subconscious's tools held the primary's writes, which protected nothing in
   the primary's window. Each flush, at a turn's end, after surgery, after a
-  withdrawn turn and after a puppet call, now delivers the agent's deferred
-  messages while another agent's tool cycle is pending; only the agent's own
-  state holds them. The flush after surgery stores several agents' entries in
+  withdrawn turn, after a start that ends before its stream and after a
+  puppet call, now delivers the agent's deferred messages while another
+  agent's tool cycle is pending; only the agent's own state holds them. The flush after surgery stores several agents' entries in
   the order they arrived, where it went agent by agent: residents share one
   message slot, so that reordered their shared transcript.
 - `stop()` now stores what is still deferred for each registered agent
