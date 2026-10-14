@@ -17968,8 +17968,11 @@ export class AgentFramework {
     // The turn that called: a channel_open's result records its trigger
     // channel there, however late it arrives, and moves its locus while the
     // turn is still open, even once another start's routing is the agent's
-    // live one. A silent turn routes no prose, and its routing state is never
-    // the open turn's (openLogical), so its open moves no locus.
+    // live one. A silent turn's open moves no locus: no silent start or
+    // resume registers its routing state as the open turn (openLogical), and
+    // a non-silent resume that does, a budget restart batched with an
+    // ordinary wake, starts only once its over-budget boundary has every
+    // result of the round.
     const callingTurn = this.routingOf(agentName);
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
