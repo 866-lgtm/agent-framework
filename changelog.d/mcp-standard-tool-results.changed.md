@@ -116,13 +116,14 @@
   meanwhile is refused them, and a module added meanwhile is refused that
   prefix, each naming the restart, rather than taking them while the old
   server is torn down. The id and prefix it moves the server from are free
-  once its disconnect is done. A disconnect of either id, or a `stop()`,
-  that begins during the restart ends it, as a disconnect ends a connect in
-  flight, and the restart's error says the server is down. A restart whose
-  connect fails leaves the server down, configured under the new
-  configuration and holding its tool prefix, as any failed connect does:
-  it's listed as not connected, `restartMcplServer(id)` tries it again, and
-  `disconnectMcplServer(id)` removes it. `addModule` also refuses a name a
+  once its disconnect is done. A disconnect of the id it moves the server
+  to (its own, for a restart under the same id), or a `stop()`, that begins
+  during the restart ends it, as a disconnect ends a connect in flight, and
+  the restart's error says the server is down. A restart whose connect
+  fails leaves the server down, configured under the new configuration and
+  its id, and holding its tool prefix, as any failed connect does: it's
+  listed as not connected, and a restart or a disconnect under that id
+  tries it again or removes it. `addModule` also refuses a name a
   server's tool prefix holds, as `create()` does at startup. A disconnect
   releases the tool-prefix claims its own server holds. Treat a submitted
   configuration as immutable while the server uses it: change settings with

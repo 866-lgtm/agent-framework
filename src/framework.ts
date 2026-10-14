@@ -16671,13 +16671,14 @@ export class AgentFramework {
    * prefix it moves the server from are free once its disconnect is done, as
    * after any disconnect.
    *
-   * A disconnect of either id, or a `stop()`, that begins during the restart
-   * ends it, as a disconnect ends a connect in flight: the restart rejects,
-   * saying the server is down, and its holds are released. A restart whose
-   * connect fails leaves the server down, configured under the new
-   * configuration and holding its tool prefix, as any failed connect does:
-   * `listMcplServers()` lists it as not connected, `restartMcplServer(id)`
-   * tries it again, and `disconnectMcplServer(id)` removes it.
+   * A disconnect of the id the restart moves the server to (its own id, for
+   * a restart under the same id), or a `stop()`, that begins during the
+   * restart ends it, as a disconnect ends a connect in flight: the restart
+   * rejects, saying the server is down, and its holds are released. A
+   * restart whose connect fails leaves the server down, configured under the
+   * new configuration and its id, and holding its tool prefix, as any failed
+   * connect does: `listMcplServers()` lists it as not connected, and a
+   * restart or a disconnect under that id tries it again or removes it.
    *
    * Treat a submitted configuration and its nested values as immutable for
    * as long as the server uses them. Apply changed settings with
@@ -16696,8 +16697,9 @@ export class AgentFramework {
     // checks through its connect, the restart holds the id and the tool
     // prefix it moves the server to (mcpRestartClaims), so no connect,
     // restart or module added meanwhile takes them while the old server is
-    // torn down. A stop() or a disconnect that begins after these checks
-    // isn't held off: it ends the restart, as it would end a connect.
+    // torn down. A stop(), or a disconnect of the id it moves the server to,
+    // that begins after these checks isn't held off: it ends the restart, as
+    // it would end a connect.
     if (this.mcpServerAdmissionClosed) {
       throw new Error(`MCP server "${id}" was not restarted: the framework is stopping or stopped`);
     }
