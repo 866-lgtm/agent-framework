@@ -138,7 +138,8 @@ never do.
   `@animalabs/agent-framework` to npm, and creates the GitHub release with
   that section as its notes. The two release jobs are independent: some
   consumers run github-clone checkouts, so release notes must exist even
-  when npm publish fails. The one thing that stops both is an open release
+  when npm publish fails. Besides a tag with no changelog section, which
+  neither job can release, the one thing that stops both is an open release
   hold (below). Version bumps are a maintainer release-time action, not
   part of feature PRs.
 - **Release holds.** When releasing `main` as it stands would harm

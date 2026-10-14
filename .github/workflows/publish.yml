@@ -108,7 +108,8 @@ jobs:
     needs: build-and-test
     # Deliberately independent of the npm publish job: some consumers run
     # github-clone checkouts, and release notes must exist even when npm
-    # publish fails — the two jobs succeed or fail on their own. The one
+    # publish fails — the two jobs succeed or fail on their own. Besides a
+    # tag with no changelog section, which neither can release, the one
     # thing that stops both is an open release hold, which each checks.
     if: startsWith(github.ref, 'refs/tags/v')
 
