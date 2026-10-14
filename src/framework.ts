@@ -4657,7 +4657,7 @@ export class AgentFramework {
     // ("already running"), which used to degrade the gate to "no opinion".
     // Wait for the pass first, then retry a few times for the case where a
     // fresh pass started in between.
-    await this.settleMaintenancePass();
+    if (this.maintenancePass) await this.settleMaintenancePass();
     const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
     for (const agentName of this.agents.keys()) {
       let preview: RuntimeSettingsPreview;
@@ -7828,7 +7828,7 @@ export class AgentFramework {
       let markers: SurgeryMarkerReceipt;
       try {
         // A maintenance tick already running finishes before the switch.
-        await this.settleMaintenancePass();
+        if (this.maintenancePass) await this.settleMaintenancePass();
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
         // promotes this batch by matching targetBranch to the active branch.
@@ -7998,7 +7998,7 @@ export class AgentFramework {
       let markers: SurgeryMarkerReceipt;
       try {
         // A maintenance tick already running finishes before the fork.
-        await this.settleMaintenancePass();
+        if (this.maintenancePass) await this.settleMaintenancePass();
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
           sourceBranch,
