@@ -88,7 +88,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { ProviderWaits, EVERY_MODEL, isReleaseModel, type ProviderWait } from './provider-waits.js';
+import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
@@ -824,7 +824,7 @@ function describeRequester(r: OperatorRequester | undefined): string {
  *  it. The name comes from a caller, so a control character (a forged log
  *  line) becomes a space, and it is bounded. */
 function operatorLabel(by: string): string {
-  const label = safeSlice(by.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ').trim(), 0, 120);
+  const label = safeSlice(withoutControls(by).trim(), 0, 120);
   return label === '' ? 'operator' : label;
 }
 
@@ -2622,11 +2622,14 @@ export class AgentFramework {
    *  for its caller. */
   private statedWaitNotSlept(error: Error): string {
     const stated = error instanceof MembraneError ? error.retryAfterMs : undefined;
-    const asked = typeof stated === 'number' && Number.isFinite(stated)
-      ? `${Math.ceil(stated / 1000)} s`
-      : 'longer than can be represented';
+    const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
+    if (typeof stated !== 'number' || Number.isNaN(stated)) {
+      return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+        `stated wait of ${cap} or less, so it ends now)`;
+    }
+    const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
     return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
-      `longer than ${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s, so it ends now)`;
+      `longer than ${cap}, so it ends now)`;
   }
   /** When a hold's timer next fires: at its deadline, stepped past what one
    *  timer can hold. A hold with no deadline (a wait held until released, or
@@ -2709,7 +2712,9 @@ export class AgentFramework {
    */
   private recordProviderWait(agentName: string, model: string, error: Error): ProviderWait | undefined {
     if (!(error instanceof MembraneError) || error.retryAfterMs === undefined || !this.providerWaits) return undefined;
-    const reason = safeSlice(error.message, 0, 300);
+    // The provider's words, bounded; a line break in them must not start a
+    // line that reads as the framework's own where the reason is logged.
+    const reason = safeSlice(withoutControls(error.message), 0, 300);
     const { wait, changed } = this.providerWaits.set(agentName, model, error.retryAfterMs, reason);
     // A wait already over (0, or a negative "retry now") holds nothing to report.
     const remaining = wait.until === null ? Number.POSITIVE_INFINITY : wait.until - Date.now();
@@ -2766,7 +2771,8 @@ export class AgentFramework {
    * Refuse an auxiliary call to a model the provider asked this agent to wait
    * on, without calling it. The refusal is a retryable rate limit carrying
    * the remaining wait, so a caller that paces (context-manager's compression
-   * lane) waits it out instead of spending a call. It is marked
+   * lane, from its corrective round #138 on) waits it out instead of spending
+   * a call. It is marked
    * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
    * the wait without counting a failed call (room-225 #47927).
    */
@@ -2799,14 +2805,17 @@ export class AgentFramework {
   releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
     model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
   }> {
-    // A release names one of this framework's agents. Any other name (a typo,
-    // or '*' and 'framework', which stand for the hold on unreadable records
-    // in its listing and its alert) is refused before anything is recorded:
-    // it would lift nothing and still read as a success. That hold is lifted
-    // one agent at a time.
-    if (!this.agents.has(agentName)) {
+    // A release names one of this framework's agents, or the agent of a wait
+    // the listing shows (a disposed conversation fork's wait stays recorded):
+    // an operator can release anything the listing shows. Any other name (a
+    // typo, or '*' and 'framework', which stand for the hold on unreadable
+    // records in its listing and its alert) is refused before anything is
+    // recorded: it would lift nothing and still read as a success. That hold
+    // is lifted one agent at a time.
+    if (!this.agents.has(agentName) && !this.providerWaits?.recorded(agentName)) {
       throw new Error(`Unknown agent: ${safeSlice(JSON.stringify(agentName), 0, 120)}. A release names one of this ` +
-        "framework's agents, and the hold on unreadable provider waits is lifted one agent at a time");
+        "framework's agents or an agent with a recorded wait, and the hold on unreadable provider waits is lifted " +
+        'one agent at a time');
     }
     by = operatorLabel(String(by));
     // '*' (EVERY_MODEL, as providerWaits lists the unreadable-records hold)
@@ -2834,7 +2843,7 @@ export class AgentFramework {
         console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
       }
     } catch (error) {
-      console.error(`[provider-wait] agent=${agentName} could not release the compression lane's wait: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
+      console.error(`[provider-wait] agent=${agentName} could not offer the release to the compression lane: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     const covers = (held: string | undefined): boolean => held !== undefined && (model === undefined || held === model);
@@ -5964,22 +5973,34 @@ export class AgentFramework {
     if (params.command === 'host-status') {
       return { ok: true, hostMode: this.getHostModeStatus() };
     }
-
-    const agentName = params.agentName ?? [...this.agents.keys()][0];
-    if (!agentName || !this.agents.has(agentName)) {
-      return { ok: false, error: `Unknown agent: ${String(agentName)}` };
-    }
-
+    // A release names its agent, as host.releaseProviderWait does: the first
+    // agent by default could lift the wrong agent's waits. The name may be an
+    // agent the framework no longer has whose wait the listing still shows
+    // (a disposed conversation fork); releaseProviderWait decides that.
     if (params.command === 'release-provider-wait') {
+      if (typeof params.agentName !== 'string' || params.agentName === '') {
+        return { ok: false, error: 'release-provider-wait: agentName must name the agent whose waits to release' };
+      }
       // Only an omitted model, or '*', releases every model: a malformed one
       // is refused here, before anything changes, never widened.
       if (!isReleaseModel(params.model)) {
         return { ok: false, error: "release-provider-wait: model must be a model name, or '*' (or omitted) for every model" };
       }
       const by = operatorLabel(String(requester));
-      console.error(`[host-command] release-provider-wait agent=${agentName} model=${params.model ?? '*'} by=${by} (server=${serverId})`);
-      const released = this.releaseProviderWait(agentName, params.model, by);
+      let released: ReturnType<AgentFramework['releaseProviderWait']>;
+      try {
+        released = this.releaseProviderWait(params.agentName, params.model, by);
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      console.error(`[host-command] release-provider-wait agent=${params.agentName} model=${params.model ?? '*'} by=${by} ` +
+        `(server=${serverId}): ${released.length} wait(s) lifted`);
       return { ok: true, released };
+    }
+
+    const agentName = params.agentName ?? [...this.agents.keys()][0];
+    if (!agentName || !this.agents.has(agentName)) {
+      return { ok: false, error: `Unknown agent: ${String(agentName)}` };
     }
 
     // nudge: queue an inference on the current context — no message, no
@@ -9187,9 +9208,11 @@ export class AgentFramework {
         requests = [...providerCooldown.heldRequests, ...requests];
       }
       // A provider's stated wait on this agent's primary model, including one
-      // recorded before a restart, holds the turn until it passes.
+      // recorded before a restart, holds the turn until it passes. An
+      // ephemeral run records nothing, its name being single-use, so no wait,
+      // known or unreadable, binds it (as at the last boundary).
       const providerWait = this.providerWaits?.active(agentName, agent.model);
-      if (providerWait && this.holdForProviderWait(agent, providerWait, requests)) continue;
+      if (providerWait && !this.ephemeralRuns.has(agentName) && this.holdForProviderWait(agent, providerWait, requests)) continue;
 
       // Skip if agent is busy (inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
@@ -10028,8 +10051,11 @@ export class AgentFramework {
     // (nonOwningProviderWait), and its retries and in-turn restarts reach this
     // boundary without the scheduler: a wait recorded meanwhile, by its own
     // auxiliary call or a non-retryable failure, binds them here too. An
-    // ephemeral run records nothing, so nothing binds it here.
-    if (!this.ephemeralRuns.has(agent.name)) {
+    // ephemeral run records nothing, so nothing binds it here. A frame whose
+    // agent was replaced or removed (a fork disposed while its retry slept)
+    // installs no hold: its turn is dropped after the compile, as main drops
+    // any such turn.
+    if (!this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent) {
       const wait = this.providerWaits?.active(agent.name, agent.model);
       if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
         if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
@@ -10418,6 +10444,24 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
+      }
+      // A conversation agent takes no provider gate, so its own compression
+      // can record a wait while this turn compiles, after the last boundary
+      // checked. Check its waits again here, where nothing has been sent, and
+      // hold the turn as the boundary would rather than send it into the wait.
+      if (this.conversationAgentHomes.has(agent.name)) {
+        const wait = this.providerWaits?.active(agent.name, agent.model);
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+          console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
+            `(recorded while the turn compiled); turn held, nothing sent`);
+          stream.cancel();
+          agent.cancelStream();
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+          this.channelRegistry?.stopTyping();
+          this.eventGate?.onInferenceEnded(agent.name);
+          return false;
+        }
       }
 
       const handle = this.driveStream(

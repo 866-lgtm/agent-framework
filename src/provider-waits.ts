@@ -14,10 +14,10 @@
  *   outstanding longer one: the binding deadline is the maximum. Requests
  *   that finish at different times can carry different hints.
  * - A negative wait is already over (a provider's "retry now", or an HTTP
- *   date already past): it binds nothing, the same as 0.
- * - A wait that cannot be represented as an instant (not a finite number, or
- *   past the last instant a Date can hold) becomes an indefinite wait rather
- *   than a shorter one, held until explicitly released.
+ *   date already past), -Infinity included: it binds nothing, the same as 0.
+ * - A wait that cannot be represented as an instant (NaN, +Infinity, or past
+ *   the last instant a Date can hold) becomes an indefinite wait rather than
+ *   a shorter one, held until explicitly released.
  * - A wait ends when its instant passes (nothing is written), or when an
  *   operator releases it (recorded). Selecting a different model is not a
  *   release: that model proceeds, and the old model's wait still applies if it
@@ -108,7 +108,8 @@ export interface ProviderWaitChange {
  * - 'recorded': the release is durably recorded, so a restart keeps it;
  * - 'pending': it binds in this process, but its record has not landed yet
  *   and is offered again at the next act (a restart before then restores the
- *   wait);
+ *   wait). Once the journal can't be written again (an append that threw
+ *   inside the store), it is offered no more in this process;
  * - 'in-process override': the hold that stands for unreadable recorded
  *   waits, lifted for this process only (a restart that still cannot read
  *   them holds again). The release itself is still offered to the journal,
@@ -130,14 +131,24 @@ const RETRY_READ_MS = 30_000;
  */
 export const EVERY_MODEL = '*';
 
+/** A control character (C0, C1, U+2028, U+2029): in a log line, one can start
+ *  a line that reads as the framework's own. */
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/** Text from a caller or a provider, with each control character a space, so
+ *  it can't forge a log line where it is printed. */
+export function withoutControls(text: string): string {
+  return text.replace(new RegExp(CONTROL_CHARACTER.source, 'g'), ' ');
+}
+
 /**
  * Whether a release's `model`, as an operator surface receives it, names a
  * scope: omitted or EVERY_MODEL for every model, any other nonempty string
- * for that model. Anything else is malformed and is refused, never taken as
- * "every model".
+ * without a control character for that model. Anything else is malformed and
+ * is refused, never taken as "every model" (and never logged).
  */
 export function isReleaseModel(model: unknown): model is string | undefined {
-  return model === undefined || (typeof model === 'string' && model !== '');
+  return model === undefined || (typeof model === 'string' && model !== '' && !CONTROL_CHARACTER.test(model));
 }
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -190,7 +201,9 @@ export class ProviderWaits {
    * they were made. They bind here from the moment they are made, and are
    * offered to the journal, in order, at every later act until one lands.
    * Once the journal can't be written again (an append that threw inside the
-   * store: RecordJournal.needsReopen), they hold in this process only.
+   * store: RecordJournal.needsReopen), they are offered no more: the act that
+   * threw may still be in the store's log, where the next start finds it,
+   * and every later one holds in this process only.
    */
   private readonly pending: ProviderWaitEntry[] = [];
   /** What binds in this process: `durable` with `pending` applied in order. */
@@ -246,6 +259,17 @@ export class ProviderWaits {
     if (this.unreadable && !this.waived(agent, model)) return this.unreadableWait(agent, model);
     const wait = live(this.view.get(keyOf(agent, model)), this.now());
     return wait ? { ...wait } : undefined;
+  }
+
+  /**
+   * Whether a recorded wait binds this agent now, unreadable history aside:
+   * the agent of a wait the listing shows, even one the framework no longer
+   * has (a disposed conversation fork), which a release can then name.
+   */
+  recorded(agent: string): boolean {
+    const now = this.now();
+    for (const wait of this.view.values()) if (wait.agent === agent && live(wait, now)) return true;
+    return false;
   }
 
   /**
@@ -426,7 +450,7 @@ export class ProviderWaits {
    * checkpoint that throws inside the store leaves the journal unwritable
    * until the store is reopened (RecordJournal.needsReopen), so nothing is
    * written after it: that is said once, where it happens, and the acts stay
-   * pending, holding in this process only. A checkpoint records the
+   * pending, binding in this process. A checkpoint records the
    * journal's own reduction, never this process's unrecorded acts, and never
    * while the history is unreadable (it would cover entries that were never
    * reduced).
@@ -448,7 +472,7 @@ export class ProviderWaits {
         this.journal.append(entry, { durable: true });
       } catch (error) {
         if (this.journal.needsReopen) {
-          this.reportUnwritable(error);
+          this.reportUnwritable(error, `${entry.kind === 'set' ? 'a wait' : 'a release'} for agent=${entry.agent} model=${entry.model ?? EVERY_MODEL}`);
           return;
         }
         this.log(`[provider-wait] could not record ${entry.kind} for agent=${entry.agent} model=${entry.model ?? EVERY_MODEL} ` +
@@ -464,7 +488,7 @@ export class ProviderWaits {
       this.journal.checkpoint({ waits: [...this.durable.values()].filter((wait) => live(wait, now)) }, { durable: true });
     } catch (error) {
       if (this.journal.needsReopen) {
-        this.reportUnwritable(error);
+        this.reportUnwritable(error, 'a checkpoint');
         return;
       }
       this.log(`[provider-wait] could not checkpoint provider waits; the journal still replays in full: ${safeSlice(errorText(error), 0, 300)}`);
@@ -475,17 +499,20 @@ export class ProviderWaits {
    * Say that the journal can't be written again: the store's append threw
    * inside the store, and only a reopen (as at the next start) reads its log
    * back. Called where that first happens; flush() writes nothing after it,
-   * so it is said once for the journal's life. A stated wait still holds
-   * here, which is always safe; only its record is lost, so after a restart
-   * the agent's next call goes to the provider, and a wait it states again
-   * starts a new hold. No alert: a failed write is log-only.
+   * so it is said once for the journal's life. What `writing` names may still
+   * be in the store's log, and the next start loads it if so. A stated wait
+   * still holds here, which is always safe; a later act loses only its
+   * record, so after a restart the agent's next call goes to the provider,
+   * and a wait it states again starts a new hold. No alert: a failed write
+   * is log-only.
    */
-  private reportUnwritable(error: unknown): void {
+  private reportUnwritable(error: unknown, writing: string): void {
     this.log(`[provider-wait] nothing more is written to the provider-wait journal until the store is reopened, ` +
-      `as at the next start: an append failed inside the store (${safeSlice(errorText(error), 0, 300)}). ` +
-      `Until then every wait and release holds in this process only (${this.pending.length} pending now). ` +
-      'After a restart, a wait not recorded no longer binds: the agent\'s next call to that model goes to the provider, ' +
-      'and a wait the provider states again starts a new hold. A release not recorded no longer lifts its wait');
+      `as at the next start: the store's append of ${writing} failed (${safeSlice(errorText(error), 0, 300)}), and that ` +
+      `record may still be in the store's log, where the next start finds it. Every wait and release after it holds ` +
+      `in this process only (${this.pending.length} act(s) pending now). After a restart, such a wait no longer binds: ` +
+      'the agent\'s next call to that model goes to the provider, and a wait the provider states again starts a new hold. ' +
+      'Such a release no longer lifts its wait');
   }
 }
 

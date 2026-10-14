@@ -181,12 +181,14 @@ describe('ProviderWaits', () => {
 
 /** The store's journal surface, with failures a test can arm. */
 function flaky(store: JsStore) {
-  const fail = { appendJson: 0, checkpoint: 0, sync: 0, read: false };
+  const fail = { appendJson: 0, appendAfter: 0, checkpoint: 0, sync: 0, read: false };
   const surface = {
     getRecordIdsByType: (type: string) => { if (fail.read) throw new Error('zz unreadable record'); return store.getRecordIdsByType(type); },
     getRecord: (id: string) => store.getRecord(id),
     appendJson: (type: string, data: unknown) => {
       if (fail.appendJson > 0) { fail.appendJson--; throw new Error('zz append refused'); }
+      // Written, then thrown: as when the store's periodic sync fails after its log has the record.
+      if (fail.appendAfter > 0) { fail.appendAfter--; store.appendJson(type, data); throw new Error('zz append threw after writing'); }
       if (fail.checkpoint > 0 && type !== PROVIDER_WAIT_RECORD_TYPE) { fail.checkpoint--; throw new Error('zz checkpoint refused'); }
       return store.appendJson(type, data);
     },
@@ -306,6 +308,28 @@ describe('ProviderWaits: durable and pending acts (room-225 #46276)', () => {
       assert.equal(reopened.active('ada', 'zz-model'), undefined, 'a reopened store has none of the acts that held in process only');
       assert.equal(reopened.active('bob', 'zz-model'), undefined);
       assert.ok(reopened.active('ada', 'zz-recorded'), 'and a release not recorded no longer lifts its wait');
+    } finally { if (!store.isClosed()) store.close(); }
+  }));
+
+  it('after an append that throws once its record reached the store, the next start has that act, and only it', () => withStoreDir((path) => {
+    const time = clock();
+    let store = JsStore.openOrCreate({ path });
+    try {
+      const lines: string[] = [];
+      const { surface, fail } = flaky(store);
+      const waits = new ProviderWaits(surface, { now: time.now, log: (line) => lines.push(line) });
+      fail.appendAfter = 1;
+      waits.set('ada', 'zz-landed', 600_000, 'zz written, then the append threw');
+      waits.set('ada', 'zz-later', 600_000, 'zz after the throw');
+      assert.ok(waits.active('ada', 'zz-landed'));
+      assert.ok(waits.active('ada', 'zz-later'), 'both bind in this process');
+      assert.equal(lines.filter((line) => line.includes("may still be in the store's log")).length, 1, 'said once');
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      const reopened = new ProviderWaits(store, { now: time.now, ...quiet });
+      assert.ok(reopened.active('ada', 'zz-landed'), 'the act whose append threw after writing: the next start has it');
+      assert.equal(reopened.active('ada', 'zz-later'), undefined, 'a later act held in this process only');
     } finally { if (!store.isClosed()) store.close(); }
   }));
 
@@ -1010,8 +1034,7 @@ test('a non-retryable failure with a stated wait keeps its terminal disposition;
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'a later wake is held by the stated wait');
 
-      await sleep(550);
-      await fw.runUntilIdle();
+      await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
       assert.equal(membrane.primary, 2, 'and runs once after it');
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1038,13 +1061,16 @@ test('a primary wake parked behind an auxiliary call is held by the wait that ca
 
       fail(rateLimited(400));
       await aux;
-      await sleep(100);
+      // The run started above drives the parked wake to the boundary.
+      for (let i = 0; i < 500 && !log.lines.some((line) => /binds at admission/.test(line)); i++) await sleep(10);
+      assert.ok(log.lines.some((line) => /binds at admission/.test(line)), 'the parked wake reached the boundary');
       assert.equal(membrane.primary, 0, 'not started into the wait its parked-behind call recorded');
-      assert.ok(log.lines.some((line) => /binds at admission/.test(line)));
 
-      await sleep(500);
-      await fw.runUntilIdle();
+      // The hold's timer releases it after the wait, and queues the wake again.
+      for (let i = 0; i < 500 && internal.providerAccelerationCooldowns.has('resident'); i++) await sleep(10);
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold ended with the wait');
       await run;
+      await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'the held wake runs once after the wait');
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1250,7 +1276,7 @@ test('a malformed release model is refused at both operator surfaces, never wide
       const api = new ApiServer(fw) as unknown as {
         executeCommand(ws: unknown, command: string, params?: Record<string, unknown>): Promise<unknown>;
       };
-      for (const model of ['', null, 42, ['zz-model'], {}]) {
+      for (const model of ['', null, 42, ['zz-model'], {}, 'zz-model\n[provider-wait] agent=resident model=zz-forged released by nobody']) {
         const label = JSON.stringify(model);
         const refused = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model, requesterName: 'zz-operator' });
         assert.equal(refused.ok, false, `host command, model ${label}`);
@@ -1290,6 +1316,9 @@ test('a release names one of the agents, the API verb takes the admin token, and
         const refused = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName, requesterName: 'zz-operator' });
         assert.equal(refused.ok, false, `host command, ${agentName}`);
       }
+      const unnamed = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', requesterName: 'zz-operator' });
+      assert.equal(unnamed.ok, false, 'a host command that names no agent releases nothing, not the first agent');
+      assert.match(String(unnamed.error), /agentName must name the agent/);
       assert.equal(records(), before, 'nothing was recorded');
       assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'nothing was released');
 
@@ -1535,6 +1564,7 @@ class FailingAt extends WaitingMembrane {
 
 type NonOwning = Internal & {
   conversationAgentHomes: Map<string, string>;
+  retryWaitWakers: Set<() => void>;
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
   startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
   disposeConversationAgent(agentName: string): void;
@@ -1682,7 +1712,7 @@ test("a conversation agent's retry is held at the last boundary by a wait record
     const nonOwning = internal as NonOwning;
     try {
       void conversationTurn(fw, nonOwning, 'zz-first').catch(() => {});
-      await waitFor(fw, () => membrane.primary >= 1, 'the first call');
+      await waitFor(fw, () => nonOwning.retryWaitWakers.size > 0, 'the turn asleep before its retry');
       // While the turn sleeps before its retry, a wait is recorded for its
       // model, as its own compression call's stated wait would be.
       internal.providerWaits.set('resident', 'zz-model', 2_500, 'zz recorded while the turn slept');
@@ -1720,7 +1750,7 @@ for (const who of ['resident', 'conversation agent'] as const) {
           fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-first' }]);
           internal.pendingRequests.push({ agentName: 'resident', reason: 'test', source: 'test', timestamp: Date.now() });
         } else void conversationTurn(fw, internal, 'zz-first').catch(() => {});
-        await waitFor(fw, () => membrane.primary >= 1, 'the first call');
+        await waitFor(fw, () => internal.retryWaitWakers.size > 0, 'the turn asleep before its retry');
         internal.providerWaits.set('resident', 'zz-model', 3_000, 'zz recorded while the turn slept');
         await waitFor(fw, () => membrane.primary >= 2 || internal.providerAccelerationCooldowns.has('resident'),
           'the retry, sent or held');
@@ -1818,19 +1848,24 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
   });
 }
 
-test("an ephemeral run whose stated wait can't be represented ends at once too", async () => {
-  await withStoreDir(async (path) => {
-    const log = silence();
-    const membrane = new FailingAt(1, 'stream', () => rateLimited(Number.NaN));
-    const { fw } = await framework(path, membrane);
-    try {
-      const outcome = await ephemeralRun(fw, 'zz-ephemeral-nan');
-      assert.ok('error' in outcome, 'the run ends with an error');
-      assert.match(outcome.error.message, /the provider asked to wait longer than can be represented/);
-      assert.equal(membrane.primary, 1);
-    } finally { await fw.stop(); log.restore(); }
+for (const [stated, says] of [
+  [Number.NaN, /the provider's stated wait is not a number/],
+  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented/],
+] as const) {
+  test(`an ephemeral run whose stated wait can't be represented (${stated}) ends at once too`, async () => {
+    await withStoreDir(async (path) => {
+      const log = silence();
+      const membrane = new FailingAt(1, 'stream', () => rateLimited(stated));
+      const { fw } = await framework(path, membrane);
+      try {
+        const outcome = await ephemeralRun(fw, `zz-ephemeral-${stated}`);
+        assert.ok('error' in outcome, 'the run ends with an error');
+        assert.match(outcome.error.message, says);
+        assert.equal(membrane.primary, 1);
+      } finally { await fw.stop(); log.restore(); }
+    });
   });
-});
+}
 
 test('an ephemeral run sleeps a stated wait within the framework cap and retries', async () => {
   await withStoreDir(async (path) => {
@@ -1842,6 +1877,125 @@ test('an ephemeral run sleeps a stated wait within the framework cap and retries
       assert.ok('result' in outcome, `the run completes${'error' in outcome ? `: ${outcome.error.message}` : ''}`);
       assert.match(outcome.result.speech, /zz-recovered/);
       assert.equal(membrane.primary, 2, 'one retry, after the stated wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+/** Records a wait for the agent as membrane is handed the compiled request,
+ *  as the agent's own compression call's stated wait would land while a turn
+ *  compiles, and counts how often a stream is iterated: membrane sends then. */
+class WaitDuringCompile extends WaitingMembrane {
+  sent = 0;
+  constructor(private readonly during: () => void) { super(0, undefined); }
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.during();
+    const stream = super.streamYielding(request);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    Object.defineProperty(stream, Symbol.asyncIterator, { value: () => { this.sent++; return iterate(); } });
+    return stream;
+  }
+}
+
+test("a conversation agent's turn is held, sending nothing, when its own wait is recorded while the turn compiles", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
+    const { fw, internal } = await framework(path, membrane);
+    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    const nonOwning = internal as NonOwning;
+    try {
+      await conversationTurn(fw, nonOwning, 'zz-first');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held, as at the boundary');
+      assert.ok(log.lines.some((line) => /binds after the compile/.test(line)));
+
+      await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
+      assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('a release can name a disposed conversation agent whose wait the listing shows, and a name with neither is refused', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(600_000));
+    const { fw, internal } = await framework(path, membrane);
+    const nonOwning = internal as NonOwning;
+    const records = () => internal.store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
+    try {
+      await conversationTurn(fw, nonOwning, 'zz-first');
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
+      nonOwning.disposeConversationAgent('resident');
+      assert.equal(fw.getAgent('resident'), null, 'the agent is gone');
+      assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'its recorded wait is listed');
+      const before = records();
+
+      const refused = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'zz-typo', requesterName: 'zz-operator' });
+      assert.equal(refused.ok, false, 'neither an agent nor the agent of a recorded wait');
+      assert.match(String(refused.error), /Unknown agent/);
+      assert.throws(() => fw.releaseProviderWait('zz-typo'), /Unknown agent/);
+      assert.equal(records(), before, 'nothing is recorded for it');
+
+      const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', requesterName: 'zz-operator' });
+      assert.equal(released.ok, true, String(released.error));
+      assert.deepEqual((released.released as Array<{ model: string; release: string }>).map((w) => [w.model, w.release]), [['zz-model', 'recorded']]);
+      assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'what the listing showed is released');
+      assert.equal(records(), before + 1, 'and the release is recorded');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('an ephemeral run is not held by the hold for unreadable records: it records nothing, so nothing is unknown for it', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      unreadableWaits(internal);
+      assert.ok(internal.providerWaits.active('resident', 'zz-model'), 'the records are unreadable, so a resident is held');
+      const outcome = await ephemeralRun(fw, 'zz-ephemeral-unreadable');
+      assert.ok('result' in outcome, `the run completes${'error' in outcome ? `: ${outcome.error.message}` : ''}`);
+      assert.equal(membrane.primary, 1, 'its call went out');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("the last boundary holds no agent the framework no longer has: a disposed fork's late retry installs no hold", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const { fw, internal } = await framework(path, membrane);
+    const nonOwning = internal as NonOwning;
+    try {
+      const agent = fw.getAgent('resident')!;
+      nonOwning.conversationAgentHomes.set('resident', 'world:zz');
+      internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz recorded for the fork');
+      nonOwning.disposeConversationAgent('resident');
+      // Its retry wakes after the disposal and reaches the boundary.
+      await nonOwning.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'no hold under a name no agent has');
+      assert.ok(!log.lines.some((line) => /binds at admission/.test(line)));
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a provider's reason is kept on one line: a line break in it can't start a line of the framework's own", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const forged = () => new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000,
+      message: 'zz rate limited\n[provider-wait] agent=resident model=zz-forged released by nobody', rawError: { status: 429 },
+    });
+    const membrane = new FailingAt(1, 'stream', forged);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const [wait] = fw.providerWaitSnapshot('resident');
+      assert.equal(wait?.reason, 'zz rate limited [provider-wait] agent=resident model=zz-forged released by nobody');
+      const refusal = await internal.auxiliaryMembraneFor('resident').complete(auxRequest('zz-model')).then(() => undefined, (error: Error) => error);
+      assert.ok(refusal && !/[\r\n]/.test(refusal.message), 'the refusal that quotes the reason is one line');
     } finally { await fw.stop(); log.restore(); }
   });
 });
