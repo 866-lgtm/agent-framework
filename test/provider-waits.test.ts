@@ -1904,11 +1904,18 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
     const { fw, internal } = await framework(path, membrane);
     record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
     const nonOwning = internal as NonOwning;
+    const traces: Array<{ type: string; error?: string }> = [];
+    fw.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'resident') traces.push(event as { type: string; error?: string });
+    });
     try {
       await conversationTurn(fw, nonOwning, 'zz-first');
       assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held, as at the boundary');
       assert.ok(log.lines.some((line) => /binds after the compile/.test(line)));
+      // The turn started, so it ends with one terminal event, as a failure site's hold does.
+      assert.deepEqual(traces.map((t) => t.type), ['inference:started', 'inference:failed']);
+      assert.match(traces[1]!.error!, /^Provider wait: zz-model is held for resident until .*; no call was made$/);
 
       await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
       assert.equal(membrane.sent, 1, 'it is sent once, after the wait');

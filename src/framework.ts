@@ -845,6 +845,15 @@ function describeRequester(r: OperatorRequester | undefined): string {
   return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
 }
 
+/** What a held call or turn says of the wait that holds it: no call was
+ *  made. The refusal of an auxiliary call and the trace of a turn held once
+ *  compiled say it the same way. */
+function providerWaitText(agentName: string, model: string, wait: ProviderWait): string {
+  return `Provider wait: ${model} is held for ${agentName} ` +
+    `${wait.until === null ? 'until an operator releases it' : `until ${new Date(wait.until).toISOString()}`} ` +
+    `(recorded ${new Date(wait.setAt).toISOString()}: ${wait.reason}); no call was made`;
+}
+
 /** Who asked for an operator act, as a durable record and a log line carry
  *  it. The name comes from a caller, so a control character (a forged log
  *  line) becomes a space, and it is bounded. */
@@ -3035,9 +3044,7 @@ export class AgentFramework {
       type: 'rate_limit',
       retryable: true,
       ...(wait.until !== null ? { retryAfterMs: Math.max(0, wait.until - now) } : {}),
-      message: `Provider wait: ${model ?? EVERY_MODEL} is held for ${agentName} ` +
-        `${wait.until === null ? 'until an operator releases it' : `until ${new Date(wait.until).toISOString()}`} ` +
-        `(recorded ${new Date(wait.setAt).toISOString()}: ${wait.reason}); no call was made`,
+      message: providerWaitText(agentName, model ?? EVERY_MODEL, wait),
       rawError: undefined,
     }), { providerAdmission: 'deferred' as const });
   }
@@ -10897,6 +10904,10 @@ export class AgentFramework {
         if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
           console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
             `(recorded while the turn compiled); turn held, nothing sent`);
+          // The turn emitted inference:started before its compile; every turn
+          // that does gets one terminal event, which listeners (a typing loop)
+          // rely on, as the failure sites' holds emit inference:failed.
+          this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: providerWaitText(agent.name, agent.model, wait) });
           stream.cancel();
           agent.cancelStream();
           this.activeStreams.delete(agent.name);
