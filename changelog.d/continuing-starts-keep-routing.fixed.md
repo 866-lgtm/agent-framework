@@ -25,11 +25,12 @@
   and system markers don't move it. Neither does a message the agent won't
   see: one that tune-out diverts, or one removed before that start, such as
   an unread coalesced message its server retracted. The newest qualifying
-  message that remains decides. Residents read one message slot, so each
-  resident's open turn weighs such a message by its own rule, whichever
-  agent it was stored for. A second resident's locus also moves at its
-  turn's next start for a message stored while that turn ran, which no tool
-  boundary of its own weighs.
+  message that remains decides. Residents read one message slot, and a
+  tool boundary weighs only the messages drained for its own agent, so each
+  resident's open turn also takes, by the same rule, a message stored for
+  another resident whenever it lands, including one that resident's
+  boundary drained. A message tagged as addressed addresses the account the
+  residents share, so it can move any resident's turn.
 - A silent turn's tool boundary no longer re-pins its locus or adds a
   `[routing]` notice to its stream.
 - For a trunk agent, the channel context passed to `beforeInference` hooks

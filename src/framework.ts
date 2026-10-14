@@ -595,16 +595,19 @@ interface TurnRouting {
   suppressed: number;
   /**
    * The messages that would re-pin the locus (repinChannel) that no tool
-   * boundary of the turn weighs, in the order they were stored. One stored
-   * for this agent is such a message when none of the turn's streams was
-   * running: it was stored during a capacity hold or the wait for a
-   * re-inference, or flushed at the end of a stream that didn't settle the
-   * turn, or by the start that continues it (noteArrival). One stored for
-   * another resident always is, since residents read one message slot and a
-   * boundary weighs only the messages drained for its own agent
-   * (noteForOtherResidents). A message tune-out diverted isn't one, since a
-   * resident's compiled view leaves it out. The turn's next start clears them all, and in locus or hybrid mode
-   * first re-pins to the newest one still in the agent's store, as a
+   * boundary of the turn weighed, in the order they were stored
+   * (noteArrival). A message stored for this agent is one when none of the
+   * turn's streams was running: stored during a capacity hold or the wait
+   * for a re-inference, flushed at the end of a stream that didn't settle
+   * the turn, or stored by the start that continues it. So is one a boundary
+   * drained but couldn't re-pin for, being over budget or without a live
+   * stream. A message stored for another ordinary resident is one whenever
+   * it lands, since residents read one message slot and a boundary weighs
+   * only the messages drained for its own agent (noteForOtherResidents). A
+   * message tune-out diverted isn't one, since a resident's compiled view
+   * leaves it out. A boundary that re-pins clears them, since what it injects
+   * is newer. The turn's next start clears them all, and in locus or hybrid
+   * mode first re-pins to the newest one still in the agent's store, as a
    * boundary would have weighed its injections (remainingArrival). One
    * removed meanwhile, such as an unread coalesced message its server
    * retracted, isn't there for the agent to answer.
@@ -8597,7 +8600,8 @@ export class AgentFramework {
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 const id = agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-                // This boundary weighs it for this agent; the other residents read it too.
+                // Every other resident reads what this boundary stores; for its
+                // own agent, the boundary weighs what it injects below.
                 this.noteForOtherResidents(agent, msg.metadata, id);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
@@ -8720,6 +8724,9 @@ export class AgentFramework {
             let newLocus: string | undefined;
             for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
             if (newLocus) {
+              // What this boundary just stored is newer than any arrival the
+              // turn holds, so the arrivals can't move the locus back.
+              routing.arrivals = [];
               const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed');
               if (notice) midTurnInjections.push(notice);
             }
@@ -10623,7 +10630,7 @@ export class AgentFramework {
    * reaction or a system marker) that addressed the agent, or that follows
    * up in a channel the turn sent into (TurnRouting.engaged). Undefined for
    * any other message. A tool boundary weighs the messages it injects by it,
-   * and noteArrival the ones that arrive between the turn's streams.
+   * and noteArrival the ones no boundary of the turn weighs.
    */
   private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): string | undefined {
     if (!isConversationalInjection(metadata)) return undefined;
@@ -10649,17 +10656,27 @@ export class AgentFramework {
   }
 
   /**
-   * Weigh a message just stored in `agent`'s store for every other resident's
-   * open turn, running or not. Residents read one message slot
-   * (sharedSlotAgents), and a tool boundary weighs only the messages drained
-   * for its own agent, so no boundary of another resident's turn weighs it.
-   * The subconscious reads that slot through a merged view, but its own
-   * store is isolated, as a fork's or an ephemeral agent's is.
+   * Whether `agent`'s store is the residents' one message slot, which every
+   * ordinary resident reads (sharedSlotAgents). The subconscious reads that
+   * slot through a merged view, but its own store is isolated, as a fork's
+   * or an ephemeral agent's is.
+   */
+  private isOrdinaryResident(agent: Agent): boolean {
+    return this.sharedSlotAgents.has(agent) && agent.name !== this.subconsciousAgentName;
+  }
+
+  /**
+   * Weigh a message just stored in an ordinary resident's store for every
+   * other ordinary resident's open turn, running or not: residents read one
+   * message slot, and a tool boundary weighs only the messages drained for
+   * its own agent, so no boundary of another resident's turn weighs it.
    */
   private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
-    if (!this.sharedSlotAgents.has(agent) || agent.name === this.subconsciousAgentName) return;
+    if (!this.isOrdinaryResident(agent)) return;
     for (const reader of this.sharedSlotAgents) {
-      if (reader !== agent && this.agents.get(reader.name) === reader) this.noteArrival(reader.name, metadata, messageId);
+      if (reader !== agent && this.agents.get(reader.name) === reader && this.isOrdinaryResident(reader)) {
+        this.noteArrival(reader.name, metadata, messageId);
+      }
     }
   }
 
@@ -11505,9 +11522,9 @@ export class AgentFramework {
       }
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
-      // that continues the open turn. A message that arrived while none of
-      // the turn's streams was running can still move it, as it would have
-      // at a tool boundary: no boundary drained it (TurnRouting.arrivals).
+      // that continues the open turn. A message no tool boundary of the turn
+      // weighed can still move it, as it would have at a boundary
+      // (TurnRouting.arrivals).
       // Only a turn that has a locus reads its arrivals' messages.
       const arrival = turnProseRouting === 'locus' || turnProseRouting === 'hybrid'
         ? this.remainingArrival(agent, routing)

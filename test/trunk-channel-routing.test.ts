@@ -553,7 +553,7 @@ describe('Residents read one message slot', () => {
   });
 
   type Internals = {
-    addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>): string;
+    addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
     turnRouting: Map<string, { triggerChannel?: string }>;
     activeTurnTokens: Map<string, number>;
     deferredMessages: unknown[];
@@ -670,6 +670,9 @@ describe('Residents read one message slot', () => {
     await framework.runUntilIdle();
     framework.pushEvent(residentIncoming('discord:guild:lounge', 'unrelated chatter', 'shade', false));
     await framework.runUntilIdle();
+    assert.ok(framework.getAgent('shade')!.getContextManager().getAllMessages()
+      .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'unrelated chatter')),
+    'shade reads the ambient message in the slot');
     await release('shade');
 
     assert.deepEqual(routed, [{ agent: 'shade', text: 'Here I am.', locus: 'discord:guild:chanA' }]);
@@ -722,8 +725,32 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
+  it("a boundary that re-pins supersedes an arrival from another resident's store", async () => {
+    const { framework, i, routed, release } = await residents('scout', { 2: hereIAm }, [
+      [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
+      [] as ContentBlock[],
+    ]);
+    // While scout's tool runs, a message for shade is stored at once, an
+    // arrival for scout's turn. Then one for scout waits in its queue, and
+    // scout's boundary stores it after, re-pinning the turn there.
+    pause.during = async () => {
+      i.addMessage('Antra', [{ type: 'text', text: 'shade, a word' }],
+        { channelId: 'discord:dm:xenia', tags: ['chat:addressed'] }, { forAgent: 'shade' });
+      i.addMessage('Antra', [{ type: 'text', text: 'scout, over here please' }],
+        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+    };
+    framework.pushEvent(residentIncoming('discord:guild:chanA', 'scout, take a look', 'scout', false));
+    await framework.runUntilIdle();
+    assert.equal(pause.during, null, "scout's tool ran");
+    await release('scout');
+
+    assert.deepEqual(routed, [{ agent: 'scout', text: 'Here I am.', locus: 'discord:dm:antra' }],
+      "the boundary's re-pin stands at the turn's next start");
+    await framework.stop();
+  });
+
   it("a second resident's held turn weighs a message the primary's tool boundary drains", async () => {
-    const { framework, routed, release } = await residents('shade', {
+    const { framework, i, routed, release } = await residents('shade', {
       2: [
         [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
         [{ type: 'text', text: 'scout done' }] as ContentBlock[],
@@ -734,13 +761,16 @@ describe('Residents read one message slot', () => {
     await framework.runUntilIdle();
     // The message comes while scout's tool runs, so it waits in scout's queue
     // until scout's boundary stores it.
+    let queued = -1;
     pause.during = async () => {
-      framework.pushEvent(residentIncoming('discord:dm:antra', 'shade, over here please', 'shade', true));
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
+        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+      queued = i.deferredMessages.length;
     };
     framework.pushEvent(residentIncoming('discord:guild:chanC', 'scout, a word', 'scout', false));
     await framework.runUntilIdle();
-    assert.equal(pause.during, null, "scout's tool ran");
+    assert.equal(queued, 1, "the message waited in scout's queue while its tool ran");
+    assert.equal(i.deferredMessages.length, 0, "scout's boundary stored it");
     await release('shade');
 
     assert.deepEqual(routed.filter((r) => r.agent === 'shade'),
