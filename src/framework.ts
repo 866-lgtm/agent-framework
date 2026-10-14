@@ -2798,7 +2798,7 @@ export class AgentFramework {
     // retried: a non-retryable one keeps its terminal disposition (marker,
     // failure streak), and the wait applies to the calls that follow it.
     if (!acceleration && !hostHold) {
-      return wait !== undefined && error instanceof MembraneError && error.retryable === true
+      return wait !== undefined && isMembraneError(error) && error.retryable === true
         && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true);
     }
     const now = Date.now();
@@ -2849,7 +2849,9 @@ export class AgentFramework {
    * Anything else is the error policy's.
    */
   private nonOwningProviderWait(agent: Agent, error: Error, trigger?: InferenceRequest): 'held' | 'fail' | undefined {
-    if (!(error instanceof MembraneError) || error.retryAfterMs === undefined) return undefined;
+    // From either copy of membrane (isMembraneError), a wait is stated only
+    // as a number, as the default error policy reads it.
+    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
     if (this.conversationAgentHomes.has(agent.name)) {
       const wait = this.recordProviderWait(agent.name, agent.model, error);
       return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true)
@@ -2865,7 +2867,7 @@ export class AgentFramework {
   /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
    *  for its caller. */
   private statedWaitNotSlept(error: Error): string {
-    const stated = error instanceof MembraneError ? error.retryAfterMs : undefined;
+    const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
     if (typeof stated !== 'number' || Number.isNaN(stated)) {
       return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
@@ -2955,7 +2957,9 @@ export class AgentFramework {
    * ops alert.
    */
   private recordProviderWait(agentName: string, model: string, error: Error): ProviderWait | undefined {
-    if (!(error instanceof MembraneError) || error.retryAfterMs === undefined || !this.providerWaits) return undefined;
+    // From either copy of membrane: the host supplies the Membrane instance,
+    // and a wait is stated only as a number, as the default policy reads it.
+    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number' || !this.providerWaits) return undefined;
     // The provider's words, bounded; a line break in them must not start a
     // line that reads as the framework's own where the reason is logged.
     const reason = safeSlice(withoutControls(error.message), 0, 300);

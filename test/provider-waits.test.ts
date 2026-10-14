@@ -1999,3 +1999,67 @@ test("a provider's reason is kept on one line: a line break in it can't start a 
     } finally { await fw.stop(); log.restore(); }
   });
 });
+
+/** A MembraneError from another copy of membrane: the same name and fields,
+ *  another class, as when the host's membrane isn't the framework's copy. */
+const foreignRateLimit = (retryAfterMs: unknown) => Object.assign(new Error('zz rate limited, from another copy'), {
+  name: 'MembraneError', type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs,
+});
+
+for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) {
+  test(`a 429 from another copy of membrane that states a wait is recorded, not slept in the turn (${who})`, async () => {
+    await withStoreDir(async (path) => {
+      const log = silence();
+      // An ephemeral run doesn't record: a wait past its cap ends it at once.
+      const stated = who === 'ephemeral run' ? 1_200_000 : 400;
+      const membrane = new FailingAt(1, 'stream', () => foreignRateLimit(stated));
+      const { fw, internal } = await framework(path, membrane);
+      const nonOwning = internal as NonOwning;
+      try {
+        if (who === 'ephemeral run') {
+          const outcome = await ephemeralRun(fw, 'zz-ephemeral-foreign');
+          assert.ok('error' in outcome, 'the run ends with an error');
+          assert.match(outcome.error.message, /the provider asked to wait 1200 s/);
+          assert.equal(membrane.primary, 1, 'never retried inside the stated wait');
+          return;
+        }
+        if (who === 'resident') {
+          fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+          await fw.runUntilIdle();
+        } else {
+          await conversationTurn(fw, nonOwning, 'zz-first');
+        }
+        assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded');
+        assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held by it');
+        assert.equal(membrane.primary, 1, 'not retried inside the wait');
+        await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the wait');
+        assert.equal(membrane.primary, 2, 'run once after it');
+      } finally { await fw.stop(); log.restore(); }
+    });
+  });
+}
+
+test('from another copy of membrane, a wait is stated only as a number, as the default policy reads it', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const { fw, internal } = await framework(path, new WaitingMembrane(0, undefined));
+    const paths = internal as unknown as {
+      ephemeralRuns: Map<string, unknown>;
+      recordProviderWait(agentName: string, model: string, error: Error): unknown;
+      nonOwningProviderWait(agent: unknown, error: Error): 'held' | 'fail' | undefined;
+    };
+    const name = 'zz-ephemeral-unstated';
+    try {
+      const created = await fw.createEphemeralAgent({ name, model: 'zz-model', systemPrompt: 'Do the task.' });
+      paths.ephemeralRuns.set(name, {});
+      for (const unstated of [null, '1200000', undefined]) {
+        const label = `retryAfterMs ${JSON.stringify(unstated)}`;
+        assert.equal(paths.recordProviderWait('resident', 'zz-model', foreignRateLimit(unstated)), undefined, `recorded: ${label}`);
+        assert.equal(paths.nonOwningProviderWait(created.agent, foreignRateLimit(unstated)), undefined, `left to the policy: ${label}`);
+      }
+      assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'nothing is held, least of all until released');
+      assert.ok(paths.recordProviderWait('resident', 'zz-model', foreignRateLimit(60_000)), 'a number is a stated wait');
+      assert.equal(paths.nonOwningProviderWait(created.agent, foreignRateLimit(1_200_000)), 'fail', 'and past the cap ends the run');
+    } finally { paths.ephemeralRuns.delete(name); await fw.stop(); log.restore(); }
+  });
+});
