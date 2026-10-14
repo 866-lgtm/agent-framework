@@ -4976,15 +4976,18 @@ export class AgentFramework {
       }
       // An entry the queue's readers can't handle has no place in it: one whose
       // participant isn't text, whose content isn't an array, or that holds a
-      // null or undefined block, whose type can't be read (at the tool
-      // boundary, in the store, or in membrane's formatters), is dropped here
-      // with a line naming it, rather than held. A string or number block is
-      // restored with the rest of its entry: the store keeps it as given, and
-      // every formatter leaves it out of its requests.
+      // block that isn't an object, is dropped here with a line naming it,
+      // rather than held. Reading a null block's type throws, at the tool
+      // boundary and in the store. The store keeps a string or number block as
+      // given, but the context manager's token estimate keys a WeakMap on each
+      // block, which such a value can't be: once one is stored, every compile
+      // for that agent throws, and a restart doesn't clear it. What a block
+      // holds, such as a tool result's content, isn't checked here, as it isn't
+      // for a fresh write.
       const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
         !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
           && Array.isArray((m as { content?: unknown }).content)
-          && (m as { content: unknown[] }).content.every((b) => b !== null && b !== undefined);
+          && (m as { content: unknown[] }).content.every((b) => !!b && typeof b === 'object');
       const malformed = data.filter((m) => !wellFormed(m));
       for (const m of malformed) {
         // What the entry holds there: a value that isn't text by its type.

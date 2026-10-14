@@ -842,7 +842,7 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
   }
 });
 
-test('boot recovery drops a malformed recovered deferred write, naming it, and restores the rest, a string block among them', { timeout: 60_000 }, async () => {
+test('boot recovery drops a malformed recovered deferred write, naming it, and restores the rest, after which the agent compiles', { timeout: 60_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-malformed-'));
   const storePath = join(dir, 'store');
   const config = () => ({
@@ -863,35 +863,38 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
     await framework.stop();
 
     // Entries no write of the framework's makes, as other code could leave
-    // them in the recovery file: a null block, content that isn't blocks, and
-    // a participant that isn't text, which the line names by its type. An
-    // entry with a string block beside a text block is restored and lands:
-    // the store keeps the string as given.
+    // them in the recovery file: a null block, a string block and a number
+    // block beside a text block, content that isn't blocks, and a participant
+    // that isn't text, which the line names by its type. Once stored, a string
+    // or number block would make every compile for the agent throw, since the
+    // context manager's token estimate keys a WeakMap on each block.
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
+    const dropped = ['null-block', 'string-block', 'number-block', 'not-blocks', 'number-participant'];
     doc.pending.splice(1, 0,
       { id: 'null-block', seq: 100, participant: 'user', content: [{ type: 'text', text: 'x' }, null] },
-      { id: 'not-blocks', seq: 101, participant: 'user', content: 'x' },
-      { id: 'number-participant', seq: 102, participant: 42, content: [{ type: 'text', text: 'x' }] },
-      { id: 'string-block', seq: 103, participant: 'user', content: [{ type: 'text', text: 'kept' }, 'a bare string'] },
+      { id: 'string-block', seq: 101, participant: 'user', content: [{ type: 'text', text: 'x' }, 'a bare string'] },
+      { id: 'number-block', seq: 102, participant: 'user', content: [{ type: 'text', text: 'x' }, 42] },
+      { id: 'not-blocks', seq: 103, participant: 'user', content: 'x' },
+      { id: 'number-participant', seq: 104, participant: 42, content: [{ type: 'text', text: 'x' }] },
     );
     writeFileSync(file, JSON.stringify(doc));
 
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
     framework = await AgentFramework.create(config());
     console.error = error;
-    assert.equal(framework.getHostModeStatus().deferredWrites, 3, 'the well-formed entries are restored, the one with a string block among them');
-    for (const entry of ['null-block (user)', 'not-blocks (user)', 'number-participant (participant of type number)']) {
+    assert.equal(framework.getHostModeStatus().deferredWrites, 2, 'the well-formed entries are restored');
+    for (const entry of ['null-block (user)', 'string-block (user)', 'number-block (user)', 'not-blocks (user)', 'number-participant (participant of type number)']) {
       assert.ok(lines.some((line) => line.includes(`malformed and was dropped: ${entry}`)), `${entry} is named:\n${lines.join('\n')}`);
     }
     const rewritten = readFileSync(file, 'utf8');
-    assert.ok(!['null-block', 'not-blocks', 'number-participant'].some((id) => rewritten.includes(id)), 'the recovery file is rewritten without them');
-    assert.ok(rewritten.includes('string-block'), 'and keeps the entry with a string block');
+    assert.ok(!dropped.some((id) => rewritten.includes(id)), 'the recovery file is rewritten without them');
     await framework.resume();
-    const landed = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before);
-    assert.deepEqual(landed.map((m) => (m.content[0] as { text: string }).text), ['first', 'second', 'kept']);
-    assert.deepEqual(landed[2]!.content, [{ type: 'text', text: 'kept' }, 'a bare string'], 'the string block is stored as given');
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second']);
+    await assert.doesNotReject(framework.getAgent('agent')!.compileContext(), 'and the agent compiles');
   } finally {
     console.error = error;
     await framework.stop();
