@@ -138,17 +138,21 @@ never do.
   `@animalabs/agent-framework` to npm, and creates the GitHub release with
   that section as its notes. The two release jobs are independent: some
   consumers run github-clone checkouts, so release notes must exist even
-  when npm publish fails. Version bumps are a maintainer release-time
-  action, not part of feature PRs.
+  when npm publish fails. The one thing that stops both is an open release
+  hold (below). Version bumps are a maintainer release-time action, not
+  part of feature PRs.
 - **Release holds.** When releasing `main` as it stands would harm
   someone running it, open an issue that says what has to happen first
   and label it `release-hold`, or ask a maintainer to label it. Close it
-  once that's happened, or if it no longer applies. While one is open,
-  `npm version` stops before it bumps anything, `npm publish` refuses,
-  and the publish workflow refuses both its npm publish and its GitHub
-  release notes. The check also stops a release when it can't read the
-  holds from GitHub, and says why. npm's `--ignore-scripts` skips it, as
-  it skips every lifecycle script.
+  once that's happened, or if it no longer applies. When what has to
+  happen is a fix that this package itself must release, close the hold
+  once the fix is merged, then release. While one is open, `npm version`
+  stops before it bumps anything, `npm publish` refuses, and the publish
+  workflow refuses both its npm publish and its GitHub release notes,
+  each checking when it runs. The check also stops a release when it
+  can't read the holds from GitHub, and says why. npm's `--ignore-scripts`
+  skips it, as it skips every lifecycle script, and so does publishing a
+  tarball made earlier with `npm pack`, which runs no lifecycle script.
 
 ## Building and testing
 
