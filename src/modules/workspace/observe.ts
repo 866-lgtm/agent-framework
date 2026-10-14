@@ -848,8 +848,12 @@ export async function walkScope(
     ? opts.resumeAfter
     : undefined;
 
-  type Listing = { files: string[]; subdirs: string[] };
-  /** Each directory is listed once: a resumed walk visits the ones holding its position on both sides of it. */
+  type Listing = { files: string[]; subdirs: string[]; dev: string; ino: string };
+  /**
+   * Each directory is listed once: a resumed walk visits the ones holding its
+   * position on both sides of it, and the second visit reuses the listing
+   * while the directory is still the one it was read from.
+   */
   const listings = new Map<string, Listing | null>();
   const visited = new Set<string>();
   /** Paths already reported as errors, so a second visit doesn't report them again. */
@@ -865,7 +869,17 @@ export async function walkScope(
   const list = async (dir: CheckedDir): Promise<Listing | null> => {
     const rel = dir.rel;
     const known = listings.get(rel);
-    if (known !== undefined) return known;
+    if (known === null) return null;
+    if (known !== undefined) {
+      const now = dir.identity();
+      if (known.dev === now.dev && known.ino === now.ino) return known;
+      // Replaced since its listing was read: that listing says nothing about
+      // the directory there now, so it proves nothing absent.
+      walk.complete.delete(rel);
+      listings.set(rel, null);
+      fail(rel, CHANGED_WALK);
+      return null;
+    }
     listings.set(rel, null);
     let entries;
     try {
@@ -915,7 +929,7 @@ export async function walkScope(
     for (const [p, why] of others) walk.others.set(p, why);
     walk.incomplete.push(...regions);
     walk.complete.add(rel);
-    const listing = { files, subdirs };
+    const listing = { files, subdirs, ...dir.identity() };
     listings.set(rel, listing);
     return listing;
   };
@@ -959,7 +973,6 @@ export async function walkScope(
     await visit(top.dir, 'after');
     if (left > 0) await visit(top.dir, 'upto');
   }
-  if (left === 0 && lastTaken !== undefined) walk.stoppedAfter = lastTaken;
 
   // What the cap left: directories holding files not taken, and directories
   // a listing showed that weren't listed. A walk that doesn't descend leaves
@@ -970,12 +983,17 @@ export async function walkScope(
   for (const d of holdingUntaken) {
     walk.incomplete.push({ path: d, reason: `${capped} before every file here was taken`, kind: 'cap' });
   }
+  let unlisted = 0;
   if (recursive) {
     for (const d of walk.dirs) {
       if (visited.has(d) || walk.missing.has(d) || failed.has(d)) continue;
+      unlisted++;
       walk.incomplete.push({ path: d, reason: `not visited: ${capped}`, kind: 'cap' });
     }
   }
+  // The cap stopped the walk only if it left something: a walk whose last
+  // file used up the cap covered its scope.
+  if (left === 0 && lastTaken !== undefined && (holdingUntaken.size > 0 || unlisted > 0)) walk.stoppedAfter = lastTaken;
   return walk;
 }
 

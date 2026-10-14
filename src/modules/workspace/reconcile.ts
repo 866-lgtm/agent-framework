@@ -651,8 +651,13 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       continue;
     }
     if (walk && !walk.files.has(path) && !walk.others.has(path)) {
-      // Beneath a region the walk didn't reach: unproven either way.
-      const region = walk.incomplete.find((r) => r.path === '' || path === r.path || path.startsWith(r.path + '/'));
+      // Beneath a region the walk didn't reach: unproven either way. The
+      // nearest region holding it says why.
+      let region: Walk['incomplete'][number] | undefined;
+      for (const r of walk.incomplete) {
+        if (r.path !== '' && path !== r.path && !path.startsWith(r.path + '/')) continue;
+        if (region === undefined || r.path.length > region.path.length) region = r;
+      }
       gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
       continue;
     }
@@ -808,9 +813,15 @@ export async function reconcilePass(
   }
   // Where the walk stopped, once what it observed is decided: the next pass
   // of this scope resumes after it, or starts afresh once this one covered
-  // the scope.
-  const resumeAfter = opts.resume && walk && scope.kind === 'dir' && scope.recursive ? walk.stoppedAfter ?? null : undefined;
-  if (resumeAfter !== undefined && scope.kind === 'dir') agreement.recordWalk(mount.name, scope.dir, resumeAfter);
+  // the scope. A walk that couldn't list its scope's own directory covered
+  // none of it, and leaves the place as it was. Like evidence, a place is
+  // recorded after the root it was gathered under.
+  let resumeAfter: string | null | undefined;
+  if (opts.resume && walk && scope.kind === 'dir' && scope.recursive && walk.complete.has(scope.dir)) {
+    resumeAfter = walk.stoppedAfter ?? null;
+    if (gathered.rootIdentity) agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
+    agreement.recordWalk(mount.name, scope.dir, resumeAfter);
+  }
 
   // 5. Durable before returning. An agreement advance (D = S) has no pending
   // intent to recover from, so losing its append would leave an older P that
@@ -835,11 +846,15 @@ export async function reconcilePass(
   }
   if (walk) {
     const tracked = [...result.reports.values()].filter((r) => r.state === 'unverified').map((r) => r.path);
-    const resumes = typeof resumeAfter === 'string' ? `; the next sync or scan here resumes after ${mount.name}/${resumeAfter}` : '';
+    if (typeof resumeAfter === 'string' && scope.kind === 'dir') {
+      result.incomplete.push({
+        path: scope.dir,
+        reason: `the file cap (${opts.cap ?? mount.walkCap}) was reached: the next sync or scan of this scope resumes after ${mount.name}/${resumeAfter}`,
+      });
+    }
     for (const region of walk.incomplete) {
       const hides = tracked.some((p) => p === region.path || p.startsWith(region.path + '/'));
-      if (region.kind === 'cap') result.incomplete.push({ path: region.path, reason: region.reason + resumes });
-      else if (region.kind === 'error' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
+      if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
       // An ignored name that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
       // (agent-framework #276). A symlink region isn't counted: the link

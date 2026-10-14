@@ -655,7 +655,11 @@ export class WorkspaceModule implements Module {
     for (const mount of config.mounts) {
       const cap: unknown = mount.walkCap;
       if (cap !== undefined && !(Number.isSafeInteger(cap) && (cap as number) > 0)) {
-        throw new Error(`[workspace] Mount "${mount.name}": walkCap must be a positive integer, not ${JSON.stringify(cap) ?? String(cap)}`);
+        // Numbers as JavaScript writes them (JSON would say null for NaN), anything else as JSON.
+        const shown = typeof cap === 'number' ? String(cap) : typeof cap === 'bigint' ? `${cap}n` : JSON.stringify(cap) ?? String(cap);
+        throw new Error(
+          `[workspace] Mount "${mount.name}": walkCap must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER}, not ${shown}`,
+        );
       }
     }
     // Detect overlapping mount paths: if mount A contains mount B,
@@ -1221,7 +1225,8 @@ export class WorkspaceModule implements Module {
         description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
           + 'rechecked and nothing pending in the workspace is discarded. A sync takes up to the mount\'s walk '
           + 'cap of files (5000 unless configured); past it, what this one didn\'t reach is listed under '
-          + '`incomplete`, and the next sync resumes where it stopped. With a path (file or directory), '
+          + '`incomplete`, and the next sync of the same mount or directory resumes where it stopped. With a '
+          + 'path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
           + 'Each workspace change it gives up is listed under `discarded`, with the state it had and, as `op`, '

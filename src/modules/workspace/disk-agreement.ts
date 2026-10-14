@@ -275,8 +275,10 @@ export class DiskAgreement {
 
   /**
    * Record where a walk of `scope` stopped (`after`), or that one covered it
-   * (null). Kept with the evidence so a restart resumes there too; a lost
-   * entry only costs the walk its place.
+   * (null). Kept with the evidence so a restart resumes there too. A place
+   * that's lost costs coverage, never a decision: an append that didn't land
+   * loses one, and a checkpoint written by a version that doesn't keep them
+   * (0.22) loses them all, and each scope's walks start at its top again.
    */
   recordWalk(mount: string, scope: string, after: string | null): void {
     if ((this.walkResumesAfter(mount, scope) ?? null) === after) return;
