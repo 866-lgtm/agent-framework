@@ -22,9 +22,10 @@
   arrives during a capacity hold or before a re-inference, and one drained
   at a budget restart's over-budget boundary, which before never moved the
   locus. Ambient traffic in a channel the turn hasn't sent into, reactions
-  and system markers don't move it, and neither does a message removed
-  before that start, such as an unread coalesced message its server
-  retracted: the newest qualifying message that remains decides.
+  and system markers don't move it. Neither does a message the agent won't
+  see: one that tune-out diverts, or one removed before that start, such as
+  an unread coalesced message its server retracted. The newest qualifying
+  message that remains decides.
 - A silent turn's tool boundary no longer re-pins its locus or adds a
   `[routing]` notice to its stream.
 - For a trunk agent, the channel context passed to `beforeInference` hooks
@@ -41,6 +42,8 @@
   (`runEphemeralToCompletion`) whose start throws that way fails at once
   with the start's error. Before, the run waited for its watchdog: 30 s by
   default before its inference started, or 15 minutes once it had.
-- A send's engaged channel, and a `channel_open`'s move of the locus, are
-  recorded on the turn that called the tool, even when the tool's result, or
-  the open that follows a send, comes after that turn has ended.
+- A send's engaged channel is recorded on the turn that called the tool,
+  even when the open that follows the send comes after that turn has ended.
+  A `channel_open` moves the locus of the turn that called it while that
+  turn is open. Its result tells the agent of the move, so one that comes
+  after the turn ended moves nothing: the result is dropped unread.

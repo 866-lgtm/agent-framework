@@ -670,6 +670,12 @@ describe('present while acting', () => {
       addressed('discord:dm:antra'), 'discord:dm:antra'],
     ['ambient traffic in another channel leaves the locus where it was',
       ambient('discord:guild:lounge'), 'chan-live-1'],
+    // Tune-out stamps a message it diverts, and a resident's compiled view
+    // leaves it out, so the agent never sees it.
+    ['an addressed message that tune-out diverts leaves the locus where it was',
+      { ...addressed('discord:dm:antra'), tuneOut: { epochId: 'epoch-1' } }, 'chan-live-1'],
+    ['an addressed system marker from another channel leaves the locus where it was',
+      { ...addressed('discord:dm:antra'), system: true }, 'chan-live-1'],
   ] as const) {
     it(`during a capacity hold, ${label}`, async () => {
       membrane.pushResponse(createMockResponse([
@@ -944,31 +950,44 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('a budget restart re-pins to an addressed message its over-budget boundary left unweighed', async () => {
-    const overBudget = createMockResponse([
-      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
-    ] as ContentBlock[], 'tool_use');
-    overBudget.usage = { inputTokens: 100, outputTokens: 5 };
-    membrane.pushResponse(overBudget);
+  for (const [label, withdrawn, expected] of [
+    ['re-pins to an addressed message its over-budget boundary left unweighed', false, 'discord:dm:antra'],
+    ['moves nothing for such a message withdrawn before it starts', true, 'chan-live-1'],
+  ] as const) {
+    it(`a budget restart ${label}`, async () => {
+      const overBudget = createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use');
+      overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+      membrane.pushResponse(overBudget);
 
-    const framework = await createFramework({ maxStreamTokens: 20 });
-    const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
-    module.interjection = 'quick question for you';
-    module.interjectionMetadata = addressed('discord:dm:antra');
-    feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+      const framework = await createFramework({ maxStreamTokens: 20 });
+      const routed = stubChannelRegistry(framework);
+      module.toolDelayMs = 25;
+      module.interjection = 'quick question for you';
+      module.interjectionMetadata = addressed('discord:dm:antra');
+      feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+      if (withdrawn) {
+        // The boundary has stored the message and left it to the restart as
+        // an arrival, by the id it was stored under; it leaves the store
+        // before the restart starts.
+        framework.onTrace((event) => {
+          if (event.type === 'inference:stream_restarted') withdraw(framework, 'quick question for you');
+        });
+      }
 
-    trigger(framework);
-    await framework.runUntilIdle();
+      trigger(framework);
+      await framework.runUntilIdle();
 
-    assert.equal(membrane.calls.length, 2, 'the turn restarted for its budget');
-    assert.deepEqual(routed, [
-      { text: 'After the restart.', locus: 'discord:dm:antra' },
-    ]);
-    assert.deepEqual(movedTo(framework), ['discord:dm:antra']);
+      assert.equal(membrane.calls.length, 2, 'the turn restarted for its budget');
+      assert.deepEqual(routed, [
+        { text: 'After the restart.', locus: expected },
+      ]);
+      assert.deepEqual(movedTo(framework), withdrawn ? [] : [expected]);
 
-    await framework.stop();
-  });
+      await framework.stop();
+    });
+  }
 
   for (const [label, messages, expected] of [
     ["keeps the turn's locus", [], 'chan-turn'],
@@ -1501,64 +1520,53 @@ describe('present while acting', () => {
     assert.deepEqual([...next.engaged], [], "the next turn didn't send there");
   });
 
-  it("a channel_open moves the locus of the turn that called it, however late its result arrives", async () => {
-    const calling: { engaged: Set<string>; triggerChannel?: string; locus?: string } = { engaged: new Set(), locus: 'chan-before' };
-    const next: { engaged: Set<string>; triggerChannel?: string; locus?: string } = { engaged: new Set(), locus: 'chan-next' };
-    let resolveOpen!: (result: { success: boolean; data: { channelId: string } }) => void;
-    const framework = bareFramework();
-    framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
-    framework.channelRegistry = {
-      handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
-    };
-    framework.turnRouting = new Map([['assistant', calling]]);
-    framework.openLogical = new Map([['assistant', calling]]);
-    const results: unknown[] = [];
-    framework.pushEvent = (event: { type: string }) => { if (event.type === 'tool-result') results.push(event); };
+  // A channel_open's result can land after a later start has made another
+  // object the agent's live routing. While the turn that called is open, the
+  // result moves that turn's locus and tells the agent. Once the turn has
+  // ended, the tool-result handler drops the result, so the agent never reads
+  // it, and nothing moves, whether or not a later start has come yet.
+  for (const [label, after, moves] of [
+    ['moves the locus of its turn, still open, when a silent start\'s routing is the live one', 'silent start', true],
+    ['moves no locus once its turn has ended and the next turn has opened', 'next turn', false],
+    ['moves no locus once its turn has settled, before any later start', 'settled', false],
+  ] as const) {
+    it(`a channel_open whose result lands late ${label}`, async () => {
+      type Routing = { engaged: Set<string>; triggerChannel?: string; locus?: string };
+      const calling: Routing = { engaged: new Set(), locus: 'chan-before' };
+      const other: Routing = { engaged: new Set(), locus: 'chan-next' };
+      let resolveOpen!: (result: { success: boolean; data: { channelId: string } }) => void;
+      const framework = bareFramework();
+      framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
+      framework.channelRegistry = {
+        handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      };
+      framework.turnRouting = new Map([['assistant', calling]]);
+      framework.openLogical = new Map([['assistant', calling]]);
+      const results: Array<{ result: { data?: { routing?: string } } }> = [];
+      framework.pushEvent = (event: { type: string }) => {
+        if (event.type === 'tool-result') results.push(event as unknown as { result: { data?: { routing?: string } } });
+      };
 
-    framework.dispatchChannelToolCall('assistant', {
-      id: 'open-1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' },
+      framework.dispatchChannelToolCall('assistant', {
+        id: 'open-1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' },
+      });
+      await until(() => resolveOpen !== undefined, 'the open to start');
+      const turnRouting = framework.turnRouting as Map<string, unknown>;
+      const openLogical = framework.openLogical as Map<string, unknown>;
+      if (after === 'silent start') turnRouting.set('assistant', other);
+      if (after === 'next turn') { turnRouting.set('assistant', other); openLogical.set('assistant', other); }
+      if (after === 'settled') openLogical.delete('assistant');
+      resolveOpen({ success: true, data: { channelId: 'discord:guild:observatory' } });
+      await until(() => results.length > 0, 'the tool result');
+
+      assert.equal(calling.triggerChannel, 'discord:guild:observatory', 'the turn that called records the channel it opened');
+      assert.equal(calling.locus, moves ? 'discord:guild:observatory' : 'chan-before');
+      assert.deepEqual(other, { engaged: new Set(), locus: 'chan-next' }, 'the other routing state is untouched');
+      assert.equal((framework.lastAnnouncedLocus as Map<string, string>).get('assistant'),
+        moves ? 'discord:guild:observatory' : undefined, "the announce baseline moves with the locus, for a move the agent is told");
+      assert.equal(results[0]!.result.data?.routing !== undefined, moves, 'and the result says so only then');
     });
-    await until(() => resolveOpen !== undefined, 'the open to start');
-    (framework.turnRouting as Map<string, unknown>).set('assistant', next);
-    (framework.openLogical as Map<string, unknown>).set('assistant', next);
-    resolveOpen({ success: true, data: { channelId: 'discord:guild:observatory' } });
-    await until(() => results.length > 0, 'the tool result');
-
-    assert.equal(calling.triggerChannel, 'discord:guild:observatory');
-    assert.equal(calling.locus, 'discord:guild:observatory');
-    assert.deepEqual(next, { engaged: new Set(), locus: 'chan-next' }, 'the next turn is untouched');
-    assert.equal((framework.lastAnnouncedLocus as Map<string, string>).has('assistant'), false,
-      "the agent's announce baseline moves only for a result its turn is told");
-  });
-
-  it("a channel_open whose result lands after its turn settled, before any later start, leaves the announce baseline", async () => {
-    // The turn's routing state is still the agent's live one, since no later
-    // start has replaced it, but the turn is no longer open: the tool-result
-    // handler drops the result, so the agent never reads that it moved.
-    const calling: { engaged: Set<string>; triggerChannel?: string; locus?: string } = { engaged: new Set(), locus: 'chan-before' };
-    let resolveOpen!: (result: { success: boolean; data: { channelId: string } }) => void;
-    const framework = bareFramework();
-    framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
-    framework.channelRegistry = {
-      handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
-    };
-    framework.turnRouting = new Map([['assistant', calling]]);
-    framework.openLogical = new Map([['assistant', calling]]);
-    const results: unknown[] = [];
-    framework.pushEvent = (event: { type: string }) => { if (event.type === 'tool-result') results.push(event); };
-
-    framework.dispatchChannelToolCall('assistant', {
-      id: 'open-1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' },
-    });
-    await until(() => resolveOpen !== undefined, 'the open to start');
-    (framework.openLogical as Map<string, unknown>).delete('assistant');
-    resolveOpen({ success: true, data: { channelId: 'discord:guild:observatory' } });
-    await until(() => results.length > 0, 'the tool result');
-
-    assert.equal(framework.turnRouting.get('assistant'), calling, "no later start replaced the turn's routing state");
-    assert.equal((framework.lastAnnouncedLocus as Map<string, string>).has('assistant'), false,
-      "so the agent's next turn still announces where its speech lands");
-  });
+  }
 
   for (const [label, silent, expected] of [
     ['while its turn runs moves the locus and the announce baseline, and says so', false, 'discord:guild:observatory'],

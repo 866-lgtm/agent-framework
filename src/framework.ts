@@ -589,16 +589,18 @@ interface TurnRouting {
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
   /**
-   * Locus and hybrid mode: the messages that arrived between the turn's
-   * streams and would re-pin the locus (repinChannel), in the order they
-   * were stored. No tool boundary weighs such a message, since none of the
-   * turn's streams was running: it was stored during a capacity hold or the
-   * wait for a re-inference, or flushed at the end of a stream that didn't
-   * settle the turn, or by the start that continues it (noteArrival). The
-   * turn's next start re-pins to the newest one still in the agent's store
-   * and clears them all, as a boundary would have weighed its injections
-   * (remainingArrival). One removed meanwhile, such as an unread coalesced
-   * message its server retracted, isn't there for the agent to answer.
+   * The messages that arrived between the turn's streams and would re-pin
+   * the locus (repinChannel), in the order they were stored. No tool
+   * boundary weighs such a message, since none of the turn's streams was
+   * running: it was stored during a capacity hold or the wait for a
+   * re-inference, or flushed at the end of a stream that didn't settle the
+   * turn, or by the start that continues it (noteArrival). A message
+   * tune-out diverted isn't one, since a resident's compiled view leaves it
+   * out. The turn's next start clears them all, and in locus or hybrid mode
+   * first re-pins to the newest one still in the agent's store, as a
+   * boundary would have weighed its injections (remainingArrival). One
+   * removed meanwhile, such as an unread coalesced message its server
+   * retracted, isn't there for the agent to answer.
    */
   arrivals: Arrival[];
 }
@@ -9196,11 +9198,14 @@ export class AgentFramework {
    * Weigh a message stored for an agent whose logical turn is open while
    * none of the turn's streams is running, so that no tool boundary will
    * weigh it: one that would re-pin the locus becomes one of the turn's
-   * arrivals (TurnRouting.arrivals).
+   * arrivals (TurnRouting.arrivals). A message tune-out diverted
+   * (metadata.tuneOut) never enters a resident's compiled view, so the agent
+   * won't see it, and it moves nothing.
    */
   private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
+    if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
     const channelId = this.repinChannel(metadata, open);
     if (channelId) open.arrivals.push({ messageId, channelId });
   }
@@ -10014,11 +10019,12 @@ export class AgentFramework {
       // that continues the open turn. A message that arrived while none of
       // the turn's streams was running can still move it, as it would have
       // at a tool boundary: no boundary drained it (TurnRouting.arrivals).
-      const arrival = this.remainingArrival(agent, routing);
+      // Only a turn that has a locus reads its arrivals' messages.
+      const arrival = turnProseRouting === 'locus' || turnProseRouting === 'hybrid'
+        ? this.remainingArrival(agent, routing)
+        : undefined;
       routing.arrivals = [];
-      if (arrival && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
-        this.repinTurnLocus(agent, routing, arrival, 'arrival');
-      }
+      if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
     }
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
@@ -16099,9 +16105,10 @@ export class AgentFramework {
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
-    // The turn that called: a channel_open's result moves its locus, even
-    // if that result arrives after the turn has ended. A silent turn routes
-    // no prose, so its open moves no locus.
+    // The turn that called: a channel_open's result records its trigger
+    // channel there, however late it arrives, and moves its locus while the
+    // turn is still open, even once another start's routing is the agent's
+    // live one. A silent turn routes no prose, so its open moves no locus.
     const callingTurn = this.routingOf(agentName);
     const callingSilent = this.activeTurnTriggers.get(agentName)?.suppressProse === true;
 
@@ -16129,15 +16136,18 @@ export class AgentFramework {
           if (opened) {
             callingTurn.triggerChannel = opened;
             const openerAgent = this.agents.get(agentName);
+            // The move is one this result tells the agent, so it needs the
+            // turn that called still open. A result that lands after the turn
+            // settled is dropped, so the agent never reads it, whether or not
+            // a later start has replaced the turn's routing state yet: the
+            // turn's locus stays where the agent was last told, for a resume
+            // that opens the turn again, and so does the announce baseline,
+            // which is the agent's across turns.
             if (openerAgent && !callingSilent
-              && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
+              && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
+              && this.openLogical.get(agentName) === callingTurn) {
               callingTurn.locus = opened;
-              // The announce baseline is the agent's, across turns: it takes
-              // only a move this result tells the agent, which needs its turn
-              // still open. A result that lands after the turn settled is
-              // dropped, so the agent never reads it, whether or not a later
-              // start has replaced the turn's routing state yet.
-              if (this.openLogical.get(agentName) === callingTurn) this.lastAnnouncedLocus.set(agentName, opened);
+              this.lastAnnouncedLocus.set(agentName, opened);
               result = {
                 ...result,
                 data: {
