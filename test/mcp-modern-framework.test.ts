@@ -487,7 +487,10 @@ test('the framework owns a modern connect in flight: stop() ends it, and a secon
     await waitFor('the launch waiting on discover', () => lines(log).some((l) => l.includes('server/discover')));
     await assert.rejects(framework.connectMcplServer(config), /already registered/);
     const pid = (JSON.parse(lines(log)[0]!) as { pid: number }).pid;
+    // stop() ends the connect in flight rather than waiting for its handshake.
+    const stopping = Date.now();
     await framework.stop();
+    assert.ok(Date.now() - stopping < 10_000, `stop() took ${Date.now() - stopping} ms, as if it waited out the connect`);
     const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
     assert.equal(alive(pid), false, 'the launch in flight was reaped by stop()');
     await pending.catch(() => {});

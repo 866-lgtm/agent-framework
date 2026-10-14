@@ -87,7 +87,12 @@
     (`reconnect-failed`, `permanent: true`). Reconnect attempts run one at
     a time, and never start before the previous child has exited.
   - `close()` during a reconnect handshake ends that launch before it
-    resolves, a WebSocket dial still opening included.
+    resolves, a WebSocket dial still opening included. In the framework,
+    `stop()` and a disconnect of the id end a first connect still in its
+    handshake the same way, and a WebSocket dial still waiting for its
+    access provider: `connect()`, `connectWithReconnect()` and
+    `McplServerRegistry.addServer()` take an optional `AbortSignal`, and an
+    aborted `connectWithReconnect()` makes no retry stub.
   - `McplServerRegistry` holds an id until its child is confirmed exited:
     `removeServer` frees it only once the close succeeds, a second
     `addServer` for an id still connecting is refused, and `closeAll()`

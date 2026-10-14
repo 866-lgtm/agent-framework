@@ -2032,6 +2032,10 @@ export class AgentFramework {
   /** Connects and disconnects in flight, by server id (holdMcpServerId);
    *  created on first use, like modernMcpConnections. */
   private mcpServerOps: Map<string, { kind: 'connect' | 'disconnect'; settled: Promise<void> }> | undefined;
+  /** Each legacy connect in flight's own abort (connectHeldMcplServer):
+   *  stop() and a disconnect of its id end it at once, its launch reaped,
+   *  rather than waiting out its handshake. */
+  private legacyConnectAborts = new Map<string, AbortController>();
   /** The ids and tool prefixes restarts hold, each with the claim of the
    *  restart holding it, from the restart's checks through its connect
    *  (restartMcplServer): no other connect or restart takes them while the
@@ -2691,16 +2695,18 @@ export class AgentFramework {
     return !!this.stopPromise || !!this.queue?.isClosed;
   }
 
-  /** stop()'s first step for a modern connect still in flight, whose
-   *  connection is registered before it starts (connectHeldMcplServer):
-   *  close it, so the connect fails at once and finds the stop begun. A
-   *  legacy connect still in its handshake can't be ended early; it ends with
-   *  its handshake and then closes itself. The close's outcome is the
-   *  teardown's to report (closeModernMcpConnections). */
-  private closeModernConnectsInFlight(): void {
+  /** stop()'s first step for each connect still in flight, in either engine:
+   *  end it, so it fails at once and its operation ends, its launch reaped,
+   *  rather than holding stop()'s wait until its handshake's deadline. A
+   *  modern connect's connection is registered before it starts and is
+   *  closed; a legacy one's handshake, and the access provider a WebSocket
+   *  dial waits for, are aborted (legacyConnectAborts). A modern close's
+   *  outcome is the teardown's to report (closeModernMcpConnections). */
+  private endConnectsInFlight(): void {
     for (const [id, op] of this.mcpServerOps ?? []) {
       if (op.kind !== 'connect') continue;
       this.modernServers().get(id)?.close().catch(() => { /* reported by the teardown's close */ });
+      this.legacyConnectAborts.get(id)?.abort();
     }
   }
 
@@ -2733,10 +2739,11 @@ export class AgentFramework {
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
     // No MCP server is admitted from here on (stopHasBegun): none is launched
     // or dialed while the rest are being closed, so none outlives the
-    // framework. A modern connect still in flight is closed now, so it fails
-    // at once and its operator operation ends, rather than holding the wait
-    // for operator operations below until its handshake's deadline.
-    this.closeModernConnectsInFlight();
+    // framework. A connect still in flight is ended now, in either engine,
+    // so it fails at once and its operator operation ends, rather than
+    // holding the wait for operator operations below until its handshake's
+    // deadline.
+    this.endConnectsInFlight();
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -16628,13 +16635,17 @@ export class AgentFramework {
       });
     }
     let connection: McplServerConnection;
+    const abort = new AbortController();
+    this.legacyConnectAborts.set(config.id, abort);
     try {
-      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities, abort.signal);
     } catch (error) {
       // The registry keeps a failed launch that may still be running, as the
       // closed connection that owns it.
       if (error instanceof McplUnreapedLaunchError) throw AgentFramework.unreapedConnectFailure(config.id, error);
       throw error;
+    } finally {
+      if (this.legacyConnectAborts.get(config.id) === abort) this.legacyConnectAborts.delete(config.id);
     }
     // stop() began while the handshake ran: its teardown has already
     // collected the registry, so this connection would outlive it. Or a
@@ -17182,11 +17193,13 @@ export class AgentFramework {
     const hold = this.holdMcpServerId(id, 'disconnect');
     try {
       // Close what the id has now, so a connect in flight ends rather than
-      // being waited out: a modern connect is ended by its close, and a
-      // legacy one already registered (setting up after its handshake)
-      // fails its requests. A legacy connect still handshaking ends when its
-      // handshake does, finding itself displaced. The registry's removal is
-      // the legacy close: a failed one stays registered.
+      // being waited out: a modern connect is ended by its close, a legacy
+      // one still in its handshake (or a WebSocket dial waiting for its
+      // access provider) by its abort, its launch reaped, and a legacy one
+      // already registered (setting up after its handshake) fails its
+      // requests and finds itself displaced. The registry's removal is the
+      // legacy close: a failed one stays registered.
+      this.legacyConnectAborts.get(id)?.abort();
       const modern = this.modernServers().get(id);
       const closing = [modern?.close(), registry.removeServer(id)];
       for (const pending of closing) pending?.catch(() => { /* its verdict is awaited below */ });

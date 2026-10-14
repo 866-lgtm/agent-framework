@@ -317,10 +317,18 @@ export class WebSocketTransport extends McplTransport {
     // connect AND reconnect, so rotation happens at the transport layer and
     // nothing above it ever holds a credential.
     let token: string | null = config.token ?? null;
+    const abandoned = (): Error =>
+      new Error(`MCPL server "${config.id}" WebSocket connect abandoned: the connection was closed (${redactUrl(config.url)})`);
     if (config.accessProvider) {
+      if (signal?.aborted) throw abandoned();
       try {
-        token = (await config.accessProvider()) ?? token;
+        // A dial whose connection is closed meanwhile stops waiting for the
+        // provider; whatever the provider does later is ignored.
+        const provided = Promise.resolve(config.accessProvider());
+        provided.catch(() => { /* a late failure after the dial was abandoned */ });
+        token = (signal ? await Promise.race([provided, rejectOnAbort(signal)]) : await provided) ?? token;
       } catch (err) {
+        if (signal?.aborted) throw abandoned();
         // Fall back to the static token (if any) rather than failing the dial
         // outright — the server will refuse a stale credential loudly anyway.
         // The provider's own text may quote the credential, so it isn't logged.
@@ -454,6 +462,14 @@ export function isWebSocketTransport(config: McplServerConfig): boolean {
  * The returned transport is connected at the byte level but has NOT
  * performed the MCPL handshake.
  */
+/** A promise that rejects once `signal` aborts, and never settles otherwise. */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+}
+
 export async function openTransport(config: McplServerConfig, signal?: AbortSignal): Promise<McplTransport> {
   const binding = resolveServerBinding(config);
   if (binding.family !== 'legacy') {

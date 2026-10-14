@@ -662,20 +662,24 @@ export class McplServerConnection extends EventEmitter {
   static async connect(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
     McplServerConnection.checkConfig(config);
-    return McplServerConnection.connectChecked(config, hostCapabilities);
+    return McplServerConnection.connectChecked(config, hostCapabilities, signal);
   }
 
   /** {@link connect}, for a configuration its caller has already checked
-   *  (and warned about) once. */
+   *  (and warned about) once. `signal` ends the connect at once, its launch
+   *  reaped as for any failed handshake: its caller's stop() or a
+   *  disconnect of its id. */
   private static async connectChecked(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
-      established = await McplServerConnection.handshake(config, hostCapabilities);
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
     } catch (error) {
       if (!(error instanceof HandshakeCleanupError)) throw error;
       // The launch may still be running. A connection owns it, closed and
@@ -880,15 +884,18 @@ export class McplServerConnection extends EventEmitter {
   static async connectWithReconnect(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
     // Outside the retry path below: a configuration error is never retried.
     McplServerConnection.checkConfig(config);
     try {
-      return await McplServerConnection.connectChecked(config, hostCapabilities);
+      return await McplServerConnection.connectChecked(config, hostCapabilities, signal);
     } catch (error) {
       // No common protocol revision is a configuration fact, not an outage:
-      // a retry stub would restart the server forever for nothing.
-      if (!config.reconnect || error instanceof McplProtocolVersionError) {
+      // a retry stub would restart the server forever for nothing. A connect
+      // its caller ended (stop(), or a disconnect of its id) isn't retried
+      // either.
+      if (!config.reconnect || error instanceof McplProtocolVersionError || signal?.aborted) {
         throw error;
       }
 

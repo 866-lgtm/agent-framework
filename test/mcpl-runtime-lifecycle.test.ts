@@ -452,6 +452,47 @@ test("a stop() that begins in a restart's gap ends it, and the restart says the 
   });
 });
 
+/** A stdio server that reads its input and never answers, so a connect waits in its handshake. */
+const SILENT = { id: 'silent', command: process.execPath, args: ['-e', 'process.stdin.resume()'] };
+
+for (const ending of ['stop()', 'a disconnect'] as const) {
+  test(`${ending} ends a legacy connect stuck in its handshake at once`, async () => {
+    await withFramework(true, async (framework) => {
+      const connecting = framework.connectMcplServer(SILENT as never).then(() => null, (error: unknown) => error as Error);
+      // The child is up and its initialize sent.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const started = Date.now();
+      if (ending === 'stop()') await framework.stop();
+      else await framework.disconnectMcplServer('silent');
+      const took = Date.now() - started;
+      assert.ok(took < 10_000, `${ending} took ${took} ms, as if it waited out the handshake`);
+      const refused = await connecting;
+      assert.match(refused?.message ?? 'connected', /MCPL server "silent" was closed while connecting/);
+      if (ending === 'a disconnect') assert.ok(!framework.listMcplServers().some(s => s.id === 'silent'), 'nothing is left of it');
+    });
+  });
+}
+
+test("stop() ends a WebSocket dial still waiting for its access provider", async () => {
+  await withFramework(true, async (framework) => {
+    let asked = false;
+    const waiting = {
+      id: 'dial',
+      url: 'ws://127.0.0.1:9/mcp',
+      // A provider that never settles.
+      accessProvider: () => { asked = true; return new Promise<string>(() => {}); },
+    };
+    const connecting = framework.connectMcplServer(waiting as never).then(() => null, (error: unknown) => error as Error);
+    for (let i = 0; i < 50 && !asked; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(asked, 'the dial is waiting for its provider');
+    const started = Date.now();
+    await framework.stop();
+    assert.ok(Date.now() - started < 10_000, 'stop() did not wait for the provider');
+    const refused = await connecting;
+    assert.match(refused?.message ?? 'connected', /MCPL server "dial" was closed while connecting/);
+  });
+});
+
 test('connectMcplServer rejects a duplicate id and a colliding prefix', async () => {
   await withFramework(true, async (framework) => {
     await assert.rejects(

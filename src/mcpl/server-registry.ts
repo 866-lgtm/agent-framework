@@ -44,6 +44,7 @@ export class McplServerRegistry {
   async addServer(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
     if (this.servers.has(config.id) || this.adding.has(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
@@ -53,8 +54,8 @@ export class McplServerRegistry {
     let connection: McplServerConnection;
     try {
       connection = config.reconnect
-        ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
-        : await McplServerConnection.connect(config, hostCapabilities);
+        ? await McplServerConnection.connectWithReconnect(config, hostCapabilities, signal)
+        : await McplServerConnection.connect(config, hostCapabilities, signal);
     } catch (error) {
       if (error instanceof McplUnreapedLaunchError) this.register(config, error.connection);
       throw error;
