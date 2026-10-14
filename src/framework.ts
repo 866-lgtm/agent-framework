@@ -2212,8 +2212,11 @@ export class AgentFramework {
     return operation;
   }
 
+  /** From the moment stop() has begun: an attempt in flight (stopPromise is
+   * set before its body runs, which emits traces before the queue closes) or
+   * a closed queue (after a failed or completed stop()). */
   private refuseOperatorAfterStop(verb: string): void {
-    if (this.queue?.isClosed) throw new Error(verb + ' refused: the framework is stopping');
+    if (this.stopPromise || this.queue?.isClosed) throw new Error(verb + ' refused: the framework is stopping');
   }
 
   /** Wait in rounds until the set is empty: admitted work can still start work
@@ -2223,6 +2226,11 @@ export class AgentFramework {
   private async waitForOperatorOperations(timeoutMs: number | undefined, stopWait: object): Promise<void> {
     const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
     try {
+      // Yield once, even with nothing to wait for: when nothing before this
+      // wait awaited, the window would otherwise close inside stop()'s own
+      // call, and a sync its caller makes next (the API server's, after an
+      // undo whose trace started stop()) would be refused.
+      await null;
       while (this.operatorOperations.size > 0) {
         const remaining = deadline === undefined ? undefined : Math.ceil(deadline - performance.now());
         const timedOut = () => new ShutdownTimeoutError(
@@ -5913,7 +5921,7 @@ export class AgentFramework {
       // e.g. "Cannot undo while agent is streaming" — report what happened,
       // including any turns already undone before the failure.
       const msg = error instanceof Error ? error.message : String(error);
-      if (undone === 0) return { ok: false, error: msg };
+      if (undone === 0) return { ok: false, error: msg, ...(error instanceof OperatorActionError ? { code: error.code } : {}) };
       console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
     }
 
@@ -6301,7 +6309,7 @@ export class AgentFramework {
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
     if (this.surgeryHold) {
-      throw new Error(`Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
+      throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -6372,7 +6380,7 @@ export class AgentFramework {
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
     if (this.surgeryHold) {
-      throw new Error(`Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
+      throw new OperatorActionError('agent-busy', `Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
     const redoStack = this.redoStacks.get(agentName);

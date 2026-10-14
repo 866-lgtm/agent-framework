@@ -24,7 +24,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
+import { AgentFramework, OperatorActionError, ShutdownTimeoutError } from '../src/index.js';
 import { ApiServer } from '../src/api/server.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -58,6 +58,7 @@ interface Internals {
   operatorOperations: Set<{ label: string; promise: Promise<void> }>;
   moduleRegistry: { getModule(name: string): unknown };
   saveTurnCheckpoints(name: string, checkpoints: unknown[]): void;
+  getTurnCheckpoints(name: string): unknown[];
   discordAwarenessBarrier: unknown;
 }
 const internals = (framework: AgentFramework): Internals => framework as unknown as Internals;
@@ -433,11 +434,16 @@ describe('stop() with an operator operation in flight', () => {
       },
     };
     let inner: Promise<void> | undefined;
+    let undoInside: unknown;
     framework.onTrace((event) => {
-      if ((event as { type?: string }).type === 'mcpl:coalescing' && !inner) inner = framework.stop();
+      if ((event as { type?: string }).type !== 'mcpl:coalescing' || inner) return;
+      inner = framework.stop();
+      // stop() has begun, though its queue isn't closed yet.
+      try { framework.undoLastTurn('agent'); } catch (error) { undoInside = error; }
     });
     const outer = framework.stop();
     assert.equal(inner, outer, 'the reentrant stop() gets the attempt already running');
+    assert.match(String(undoInside), /^Error: undo refused: the framework is stopping$/);
     await outer;
     assert.deepEqual(order, ['modules stopped'], 'one teardown');
     assert.equal(framework.getStore().isClosed(), true);
@@ -759,6 +765,24 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
+  it("a successful switch from the API server names the store's branch as where it moved from, even with a stale cache", async () => {
+    const framework = await create();
+    try {
+      const api = new ApiServer(framework) as unknown as {
+        cmdBranchCreate(params: { name: string }): Promise<unknown>;
+        cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+        broadcast(event: string, data: unknown): void;
+      };
+      await api.cmdBranchCreate({ name: 'side' });
+      const broadcasts: Array<[string, unknown]> = [];
+      api.broadcast = (event, data) => { broadcasts.push([event, data]); };
+      // As after a rollback made outside the API server.
+      (api as unknown as { currentBranch: string }).currentBranch = 'stale';
+      await api.cmdBranchSwitch({ name: 'side' });
+      assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'side' }]]);
+    } finally { await framework.stop(); }
+  });
+
   it("the API server's current branch is the store's while a switch is still running", { timeout: 20_000 }, async () => {
     const framework = await create();
     try {
@@ -783,8 +807,10 @@ describe('stop() with an operator operation in flight', () => {
         assert.equal((await api.cmdBranchCurrent()).name, 'side');
         await assert.rejects(api.cmdBranchDelete({ name: 'side' }), /Cannot delete current branch/);
         // The switch holds the store through its mount.
-        assert.throws(() => framework.undoLastTurn('agent'), /^Error: Cannot undo: the store is under live switch branch for every agent$/);
-        assert.throws(() => framework.redo('agent'), /^Error: Cannot redo: the store is under live switch branch for every agent$/);
+        assert.throws(() => framework.undoLastTurn('agent'), (error: unknown) => error instanceof OperatorActionError
+          && error.code === 'agent-busy' && error.message === 'Cannot undo: the store is under live switch branch for every agent');
+        assert.throws(() => framework.redo('agent'), (error: unknown) => error instanceof OperatorActionError
+          && error.code === 'agent-busy' && error.message === 'Cannot redo: the store is under live switch branch for every agent');
       } finally { release(); }
       await switching;
     } finally { await framework.stop(); }
@@ -1017,6 +1043,40 @@ describe('stop() with an operator operation in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
+  it("the API server's undo whose trace starts stop() still syncs the markers, and stop() waits for that sync", async () => {
+    const framework = await create();
+    const fw = internals(framework);
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const record = (fw as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(fw);
+    record('agent');
+    cm.addMessage('user', [{ type: 'text', text: 'a turn' }]);
+    let deliver: (() => void) | undefined;
+    fw.beginDiscordAwarenessBarrier = () => ({
+      requiresBarrier: true,
+      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 0, failed: 0 }); }),
+    });
+    let stopping: Promise<void> | undefined;
+    framework.onTrace((event) => {
+      if (event.type === 'undo:completed' && !stopping) stopping = framework.stop();
+    });
+    const api = new ApiServer(framework) as unknown as {
+      cmdUndo(params: { agentName: string }): Promise<{ undone: boolean }>;
+      broadcast(event: string, data: unknown): void;
+    };
+    api.broadcast = () => {};
+    // Nothing in this framework's stop() awaits before its wait on the
+    // operator set, so only the wait's own yield keeps the sync admitted.
+    const undoing = api.cmdUndo({ agentName: 'agent' });
+    void undoing.catch(() => {});
+    await until(() => deliver !== undefined || order.includes('modules stopped'), 'the sync to reach its barrier');
+    assert.ok(deliver, "the undo's sync was admitted");
+    await releaseWhenStopWaits(deliver);
+    assert.equal((await undoing).undone, true);
+    await stopping;
+    assert.ok(order.includes('modules stopped'));
+    assert.deepEqual(rejections, []);
+  });
+
   it('a multi-turn host/command undo whose first turn starts stop() still undoes every turn it was asked for', async () => {
     const framework = await create();
     const fw = internals(framework);
@@ -1034,14 +1094,23 @@ describe('stop() with an operator operation in flight', () => {
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
     fw.wireMcplEvents(connection);
     let answer: { ok?: boolean; undone?: number; requested?: number } | undefined;
+    // Read as the answer goes out: stop() closes the store once the undo is done.
+    let checkpoints: unknown[] | undefined;
+    let texts: string[] = [];
     connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 2 }, {
       id: 10,
-      respond: (result: typeof answer) => { answer = result; },
+      respond: (result: typeof answer) => {
+        answer = result;
+        checkpoints = fw.getTurnCheckpoints('agent');
+        texts = cm.getAllMessages().map((m) => JSON.stringify(m.content));
+      },
       respondError: () => { order.push('undo failed'); },
     });
     await until(() => answer !== undefined || order.includes('undo failed'), 'the undo to answer');
     assert.equal(answer?.ok, true, JSON.stringify(answer));
     assert.equal(answer?.undone, 2, JSON.stringify(answer));
+    assert.deepEqual(checkpoints, [], 'both turns were rolled back');
+    assert.ok(!texts.some((t) => t.includes('turn one') || t.includes('turn two')), texts.join(' | '));
     assert.ok(stopping, 'the first turn started stop()');
     await stopping;
     assert.deepEqual(rejections, []);

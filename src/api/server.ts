@@ -543,8 +543,8 @@ export class ApiServer {
     // markers and re-materializes the config mount. It refuses during a live
     // turn or once stop() has begun, and stop() waits for one already running.
     // The store has moved when the call returns, before its promise settles
-    // (a refusal moves nothing), so the current branch follows it through the
-    // awaited steps.
+    // (a refusal moves nothing), and the switch holds the store until it's
+    // done, so the branch read here is current through the awaited steps.
     const switching = this.framework.switchBranch(params.name);
     void switching.catch(() => {}); // awaited below; handled even if the next line throws
     this.followStoreBranch();

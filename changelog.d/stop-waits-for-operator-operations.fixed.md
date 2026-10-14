@@ -18,12 +18,15 @@
     `maintenanceTick()`, `puppetToolCall()`, `connectMcplServer()`,
     `disconnectMcplServer()` and `restartMcplServer()` refuse with "<verb>
     refused: the framework is stopping" before they read or change
-    anything, as a `host/command` already did.
+    anything, as a `host/command` already did. That includes a call made
+    from a trace emitted inside `stop()`'s own start, before its queue has
+    closed.
   - The exception is `syncDiscordAwarenessMarkers()`, which each `stop()`
     attempt admits until it has finished waiting, because its callers have
     already changed the store when they call it: the API server's undo and
     redo call it after `undoLastTurn()` or `redo()`, sometimes from inside a
-    trace listener that started `stop()`. `stop()` waits for a sync
+    trace listener that started `stop()`, so such a sync is admitted even
+    when nothing in `stop()` had awaited yet. `stop()` waits for a sync
     admitted then, and refuses one that starts once it can no longer wait
     for it. An operation already admitted runs its own sync without that
     check, so a surgery whose branch move outlasted a budget still
@@ -50,8 +53,9 @@
     as on its completion trace, and `stop()` still waits for that operation.
     A multi-turn `host/command` undo stopped that way still undoes every
     turn it was asked for.
-  - `undoLastTurn()` and `redo()` refuse while a surgery or a branch switch
-    holds the store, instead of moving the branch beneath it.
+  - `undoLastTurn()` and `redo()` refuse with `OperatorActionError`
+    (`agent-busy`) while a surgery or a branch switch holds the store,
+    instead of moving the branch beneath it.
   - A `stop()` called from a trace emitted inside `stop()`'s own start, as
     the push coalescer's suspension emits for a render in flight, gets the
     attempt already running. Before, it started a second teardown beside
