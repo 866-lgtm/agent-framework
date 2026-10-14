@@ -1015,6 +1015,14 @@ interface Deferred<T> {
   reject: (reason?: unknown) => void;
 }
 
+/** One onTrace subscription. Removing it, by its unsubscribe or by offTrace,
+ *  clears `active` as it splices it out, so a delivery already under way
+ *  skips it (see emitTrace). */
+interface TraceRegistration {
+  listener: TraceEventListener;
+  active: boolean;
+}
+
 /** Per-run state for a framework-driven ephemeral agent: the settle signal
  *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
  *  the stream driver share. One map entry per run — created and torn down in
@@ -1185,7 +1193,7 @@ export class AgentFramework {
   private quiesced = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
-  private traceListeners: TraceEventListener[] = [];
+  private traceListeners: TraceRegistration[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private maintenanceIntervalMs: number;
@@ -2846,14 +2854,13 @@ export class AgentFramework {
    * Add a trace event listener for observability.
    */
   onTrace(listener: TraceEventListener): () => void {
-    this.traceListeners.push(listener);
+    const registration: TraceRegistration = { listener, active: true };
+    this.traceListeners.push(registration);
     // Return an unsubscribe so callers with a bounded lifetime (e.g. modules
     // that get torn down and recreated on session switch) don't leak
     // listeners. Existing callers that ignore the return value are unaffected.
-    return () => {
-      const idx = this.traceListeners.indexOf(listener);
-      if (idx >= 0) this.traceListeners.splice(idx, 1);
-    };
+    // It removes this subscription, whatever else the same function holds.
+    return () => this.removeTraceRegistration(registration);
   }
 
   /**
@@ -2867,13 +2874,18 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a trace event listener.
+   * Remove a trace event listener: its first subscription, if it holds more
+   * than one.
    */
   offTrace(listener: TraceEventListener): void {
-    const index = this.traceListeners.indexOf(listener);
-    if (index >= 0) {
-      this.traceListeners.splice(index, 1);
-    }
+    const registration = this.traceListeners.find((r) => r.listener === listener);
+    if (registration) this.removeTraceRegistration(registration);
+  }
+
+  private removeTraceRegistration(registration: TraceRegistration): void {
+    registration.active = false;
+    const index = this.traceListeners.indexOf(registration);
+    if (index >= 0) this.traceListeners.splice(index, 1);
   }
 
   /**
@@ -13741,7 +13753,18 @@ export class AgentFramework {
       timestamp: Date.now(),
     } as TraceEvent;
 
-    for (const listener of this.traceListeners) {
+    // An event goes to the subscriptions present when its delivery starts,
+    // each one only if it is still active when its turn comes, as the DOM's
+    // EventTarget delivers: a subscription made during delivery waits for the
+    // next event, and one removed during delivery is skipped if its turn
+    // hasn't come. Each onTrace call is a subscription of its own, so a
+    // function subscribed twice is called twice. Iterating the live array let
+    // an unsubscribe during delivery make the listener after the one being
+    // called miss the event, since splice shifts the rest under the iterator.
+    for (const registration of [...this.traceListeners]) {
+      if (!registration.active) continue;
+      // Called as a plain function, as before, so the registration isn't its `this`.
+      const { listener } = registration;
       try {
         listener(traceEvent);
       } catch (error) {
