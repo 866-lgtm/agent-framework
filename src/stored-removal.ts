@@ -6,8 +6,7 @@ type Removals = Pick<ContextManager, 'removeMessage' | 'removeMessages'>;
 /**
  * Remove the stored messages `first`..`last` (inclusive, in store order).
  *
- * A single message outside any body goes through `removeMessage`, whose
- * remove event also drops the context-log entries copied from it.
+ * A single message outside any body goes through `removeMessage`.
  * context-manager's `removeMessage` refuses any message that carries a body
  * group id, a one-shard body's included, so a shard, and any longer interval,
  * goes through `removeMessages`, which refuses an interval that splits a
@@ -19,6 +18,24 @@ export function removeStoredMessages(cm: Removals, first: StoredLike, last: Stor
     return;
   }
   cm.removeMessages(first.id, last.id);
+}
+
+/**
+ * Remove one stored message by its id, with the rest of its body when it's
+ * in one: a module or a coalescer removes a message it added by the id
+ * `addMessage` returned, which for a long message stored in shards is its
+ * first shard's.
+ */
+export function removeStoredMessage(cm: ContextManager, id: MessageId): void {
+  const message = cm.getMessage(id) as StoredLike | null;
+  if (!message?.bodyGroupId) {
+    cm.removeMessage(id);
+    return;
+  }
+  const all = cm.getAllMessages();
+  const at = all.findIndex((m) => m.id === id);
+  const { from, to } = bodyRangeIn(all, at);
+  removeStoredMessages(cm, all[from] as StoredLike, all[to] as StoredLike);
 }
 
 /** removeStoredMessages for an interval known by its ids. */

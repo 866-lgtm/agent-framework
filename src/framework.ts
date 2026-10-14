@@ -19,7 +19,7 @@ import type {
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
-import { bodyRangeIn, removeStoredMessages } from './stored-removal.js';
+import { bodyRangeIn, removeStoredMessage, removeStoredMessages } from './stored-removal.js';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -10192,7 +10192,7 @@ export class AgentFramework {
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
-      agent.getContextManager().removeMessage(p.messageId);
+      removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
       return true;
     } catch (err) {
@@ -15224,7 +15224,7 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
-    agent.getContextManager().removeMessage(id);
+    removeStoredMessage(agent.getContextManager(), id);
   }
 
   private getMessage(id: MessageId): StoredMessage | null {

@@ -452,6 +452,17 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  it("a module's removal of a message in a body takes the whole body, and a plain message alone", async () => {
+    const [b0, b1, b2] = appendShards('g-mod', ['b0', 'b1', 'b2']);
+    const plain = String(cm().addMessage('user', [{ type: 'text', text: 'plain' }]));
+    const internals = framework as unknown as { removeMessage(id: string): void };
+    internals.removeMessage(b1);
+    for (const id of [b0, b1, b2]) assert.equal(cm().getMessage(id as never), null);
+    internals.removeMessage(plain);
+    assert.equal(cm().getMessage(plain as never), null);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
   it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
     const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
     const internals = framework as unknown as {
