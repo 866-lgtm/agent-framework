@@ -211,18 +211,25 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a run waiting to retry when stop() begins gives up before compiling again', { timeout: 60_000 }, async () => {
+  it('a run waiting to retry when stop() begins gives up before its turn starts again', { timeout: 60_000 }, async () => {
     // An ephemeral run doesn't hold the primary's provider gate, so the
-    // refusal at the top of startAgentStream is the only check its retry
-    // meets before it would compile, and start a stream, again.
+    // refusal at the top of startAgentStream is the first check its retry
+    // meets. The refusal before the compile would stop it too, but only once
+    // the turn had started again: its context gathered, its hooks run.
     const { tempDir, storePath } = tempStorePath('ephemeral-retry-stopping-');
     let waiting!: () => void;
     const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    let gathered = 0;
+    const contextModule: Module = new EphemeralToolModule();
+    contextModule.gatherContext = async () => {
+      gathered++;
+      return [];
+    };
     const framework = await AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
       agents: [],
-      modules: [new EphemeralToolModule()],
+      modules: [contextModule],
       syncIntervalMs: 0,
       errorPolicy: {
         maxRetries: 1,
@@ -245,6 +252,7 @@ describe('runEphemeralToCompletion settle signal', () => {
       await assert.rejects(run, /refused: the framework is stopping/);
       await stopped;
       assert.equal(compiles, 1, 'the retry was refused, not compiled');
+      assert.equal(gathered, 1, 'the retry was refused before its turn started');
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
