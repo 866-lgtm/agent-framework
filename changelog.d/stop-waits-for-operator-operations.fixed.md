@@ -5,8 +5,10 @@
   disconnect admitted before `stop()` began now finishes before the event
   gate, the modules, the MCPL connections and the store go, unless a budget
   runs out first (see the operators' note below). An MCPL connect still in
-  flight is ended instead, in either engine: `stop()` closes it at once,
-  its launch reaped, rather than waiting out its handshake. A restart in
+  flight is ended instead, in either engine, rejecting with "was not
+  connected: the framework stopped while it was connecting": `stop()`
+  doesn't wait on a server for it, in its handshake (its launch reaped),
+  its setup or its tool listing, which asks every server. A restart in
   flight ends too, its connect refused once `stop()` has begun, so the
   server it was restarting is down.
   Before, such an operation kept running through the teardown. A resume

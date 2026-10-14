@@ -31,6 +31,7 @@ class NamedModule implements Module {
 // NDJSON on stdin, answers initialize / tools/list / tools/call on stdout.
 const STDIO_SERVER = `
 let buf = '';
+const answered = {};
 process.stdin.on('data', (c) => {
   buf += c.toString('utf8');
   let i;
@@ -38,6 +39,14 @@ process.stdin.on('data', (c) => {
     const line = buf.slice(0, i); buf = buf.slice(i + 1);
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
+    // Requests a test's server never answers, named in SILENT_ON, and one it
+    // answers a number of times and then never again (SILENT_AFTER=method:n).
+    if ((process.env.SILENT_ON || '').split(',').includes(m.method)) continue;
+    const [afterMethod, afterCount] = (process.env.SILENT_AFTER || ':').split(':');
+    if (m.method === afterMethod) {
+      answered[m.method] = (answered[m.method] || 0) + 1;
+      if (answered[m.method] > Number(afterCount)) continue;
+    }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
     if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
     else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
@@ -474,6 +483,39 @@ for (const ending of ['stop()', 'a disconnect'] as const) {
     });
   });
 }
+
+for (const silentOn of ['featureSets/update', 'tools/list'] as const) {
+  test(`stop() ends a legacy connect past its handshake whose server never answers ${silentOn}, with no request timeout`, async () => {
+    await withFramework(true, async (framework) => {
+      const config = serverConfig('late', { env: { SILENT_ON: silentOn }, requestTimeoutMs: 0 });
+      const connecting = framework.connectMcplServer(config as never).then(() => null, (error: unknown) => error as Error);
+      // Past the handshake, waiting for the answer that never comes.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const started = Date.now();
+      await framework.stop();
+      const took = Date.now() - started;
+      assert.ok(took < 10_000, `stop() took ${took} ms, as if it waited on the server`);
+      const refused = await connecting;
+      assert.match(refused?.message ?? 'connected', /^MCP server "late" was not connected: the framework stopped while it was connecting$/);
+    });
+  });
+}
+
+test("stop() ends a connect whose tool listing waits on another server that stopped answering", async () => {
+  await withFramework(false, async (framework) => {
+    // Lists its tools once, at its own connect, and never again.
+    await framework.connectMcplServer(serverConfig('quiet', { env: { SILENT_AFTER: 'tools/list:1' }, requestTimeoutMs: 0 }) as never);
+    const connecting = framework.connectMcplServer(serverConfig('late') as never).then(() => null, (error: unknown) => error as Error);
+    // The new connect is listing every server's tools, and waits on "quiet".
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const started = Date.now();
+    await framework.stop();
+    const took = Date.now() - started;
+    assert.ok(took < 10_000, `stop() took ${took} ms, as if it waited on the other server`);
+    const refused = await connecting;
+    assert.match(refused?.message ?? 'connected', /^MCP server "late" was not connected: the framework stopped while it was connecting$/);
+  });
+});
 
 test("stop() ends a WebSocket dial still waiting for its access provider", async () => {
   await withFramework(true, async (framework) => {

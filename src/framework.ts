@@ -2707,7 +2707,39 @@ export class AgentFramework {
     for (const [id, op] of this.mcpServerOps ?? []) {
       if (op.kind !== 'connect') continue;
       this.modernServers().get(id)?.close().catch(() => { /* reported by the teardown's close */ });
-      this.legacyConnectAborts().get(id)?.abort();
+      const abort = this.legacyConnectAborts().get(id);
+      if (abort) {
+        abort.abort();
+      } else if (this.mcplServerRegistry?.getServer(id)) {
+        // Past its handshake, setting up: the registered connection's close,
+        // as a disconnect's, fails what the setup waits for.
+        this.mcplServerRegistry.removeServer(id).catch(() => { /* reported by the teardown's close */ });
+      }
+    }
+    // A connect waiting on other servers, listing every server's tools, stops
+    // waiting (untilStopBegins).
+    for (const wake of [...(this.stopWaiters ?? [])]) wake();
+  }
+
+  /** Wakers for the waits a connect makes that a stop() ends: see
+   *  untilStopBegins. Made on first use. */
+  private stopWaiters: Set<() => void> | undefined;
+
+  /** `work`, or undefined once stop() has begun, whichever comes first: a
+   *  connect's last step (its tool listing, which asks every server) needn't
+   *  hold stop()'s wait for operator operations on a server that doesn't
+   *  answer. The work goes on; the teardown's close ends what it waits for. */
+  private async untilStopBegins<T>(work: Promise<T>): Promise<T | undefined> {
+    work.catch(() => { /* its caller has stopped waiting, or reads it below */ });
+    if (this.stopHasBegun()) return undefined;
+    const waiters = (this.stopWaiters ??= new Set());
+    let wake!: () => void;
+    const stopped = new Promise<undefined>((resolve) => { wake = () => resolve(undefined); });
+    waiters.add(wake);
+    try {
+      return await Promise.race([work, stopped]);
+    } finally {
+      waiters.delete(wake);
     }
   }
 
@@ -17176,7 +17208,13 @@ export class AgentFramework {
 
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     await this.connectMcplServerInternal(config, false, claim);
-    await this.refreshMcplTools();
+    // A stop() that began during the connect's setup or its tool listing
+    // ends the connect: it doesn't wait on a server for a framework that is
+    // stopping, and the teardown closes what the connect set up.
+    const stopped = () => new Error(`MCP server "${config.id}" was not connected: the framework stopped while it was connecting`);
+    if (this.stopHasBegun()) throw stopped();
+    await this.untilStopBegins(this.refreshMcplTools());
+    if (this.stopHasBegun()) throw stopped();
     this.emitMcplToolDiff(oldToolNames, config.id);
   }
 
@@ -18128,11 +18166,15 @@ export class AgentFramework {
           });
         }
       } catch (error) {
-        this.emitTrace({
-          type: 'mcpl:server-error',
-          serverId: server.id,
-          error: `tools/list failed: ${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}`,
-        });
+        // A listing the teardown closed under a stop() isn't the server's
+        // error (untilStopBegins lets such a listing go on after stop()).
+        if (!this.stopHasBegun()) {
+          this.emitTrace({
+            type: 'mcpl:server-error',
+            serverId: server.id,
+            error: `tools/list failed: ${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}`,
+          });
+        }
       }
     }
 

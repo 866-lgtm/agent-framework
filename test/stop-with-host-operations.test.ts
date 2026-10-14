@@ -929,7 +929,15 @@ describe('stop() with an operator operation in flight', () => {
       await until(() => entered, 'MCPL operation');
       const stopping = framework.stop();
       await releaseWhenStopWaits(release);
-      await running;
+      // A disconnect finishes. A connect, or a restart's connect, that stop()
+      // overtook says so rather than reporting a connection the teardown is
+      // about to close.
+      if (action === 'disconnect') await running;
+      else {
+        await assert.rejects(running, action === 'connect'
+          ? /^Error: MCP server "srv" was not connected: the framework stopped while it was connecting$/
+          : /^Error: MCP server "srv" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "srv" was not connected: the framework stopped while it was connecting$/);
+      }
       await stopping;
       assert.equal(connected, false);
       const settled = action === 'disconnect' ? 'connection removed' : 'connection opened';
