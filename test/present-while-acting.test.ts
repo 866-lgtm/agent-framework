@@ -1039,6 +1039,38 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("an ephemeral run whose start throws outside its stream fails with that error, not by its watchdog", async () => {
+    // Adapted from a reviewer's probe. On main the run waited for its startup
+    // watchdog (30 s by default), which fails it as a zombie.
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'ephemeral.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [],
+      syncIntervalMs: 0,
+    });
+    const internals = framework as unknown as { recordTurnCheckpoint(agentName: string): void };
+    const checkpoint = internals.recordTurnCheckpoint.bind(framework);
+    internals.recordTurnCheckpoint = (agentName) => {
+      if (agentName === 'worker') throw new Error('checkpoint store unavailable');
+      checkpoint(agentName);
+    };
+    const error = console.error;
+    console.error = () => {};
+    try {
+      const { agent, contextManager } = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 3_000 });
+      framework.start();
+      await assert.rejects(run, /checkpoint store unavailable/, "the run fails with its start's error");
+    } finally {
+      console.error = error;
+      await framework.stop();
+    }
+  });
+
   it("a silent start that throws leaves an open prose turn alone", async () => {
     const framework = await createFramework();
     stubChannelRegistry(framework);
@@ -1084,10 +1116,20 @@ describe('present while acting', () => {
     internals.pendingRequests.push({
       agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(),
     } as InferenceRequest);
+    // The retry of a resume is a resume too, and takes the turn's routing
+    // state whatever is open. The turn must be open while its streams run, so
+    // that its other later starts, such as a re-inference on unstreamed tool
+    // results, continue it rather than open a new one.
+    const openAtStart: unknown[] = [];
+    framework.onTrace((event) => {
+      if (event.type === 'inference:started') openAtStart.push(internals.openLogical.get('assistant'));
+    });
 
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 2, 'the restart was retried');
+    assert.deepEqual(openAtStart.map((open) => open === turn), [true, true],
+      'the resumed turn was open again while each of its streams ran');
     assert.equal(internals.openLogical.get('assistant'), undefined, "the turn completed");
     assert.deepEqual(routed, [{ text: 'After the retry.', locus: 'chan-turn' }],
       "the retry continued the resumed turn's routing");

@@ -35,7 +35,10 @@
   deferred during it, as a stream's end does. Before, they waited for the
   agent's next start and landed after any message stored in between. A
   start that throws outside its stream's failure handling ends its logical
-  turn, so the agent's next start opens its own.
+  turn, so the agent's next start opens its own, and an ephemeral run
+  (`runEphemeralToCompletion`) whose start throws that way fails at once
+  with the start's error. Before, the run waited for its watchdog: 30 s by
+  default before its inference started, or 15 minutes once it had.
 - A send's engaged channel, and a `channel_open`'s move of the locus, are
   recorded on the turn that called the tool, even when the tool's result, or
   the open that follows a send, comes after that turn has ended.
