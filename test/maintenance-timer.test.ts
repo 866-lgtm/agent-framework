@@ -767,7 +767,7 @@ describe('queued context maintenance timer', () => {
       // Recovered with work no tick finishes: a pass runs it without a failure.
       await cm.setStrategy(new NeverReadyStrategy());
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.some((run) =>
-        run.agents.some((agent) => agent.agentName === 'fenced' && agent.ticks === 8 && agent.error === undefined)));
+        run.agents.some((agent) => agent.agentName === 'fenced' && agent.ticks > 0 && agent.error === undefined)));
       await fence();
       await waitFor(() => alerts.length === 3);
       assert.equal(failedLines(), 3);

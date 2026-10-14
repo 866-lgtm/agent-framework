@@ -704,8 +704,10 @@ framework.
     (shown in `RenderStats.calibration`). Two kinds of store can then refuse
     every compile with `OverBudgetError` before inference. One holds no
     carriers and kept a multiplier last learned before its host moved to
-    context-manager 0.11.0; its record can't show that, so tell it by when
-    the host moved. The other holds carriers and had learned a multiplier
+    context-manager 0.11.0. Its record can't show that; the host's own
+    history can, in its lockfile's or its deployments' history: a host that
+    went from a context-manager older than 0.11.0 straight to 0.14.0 can
+    hold one. The other holds carriers and had learned a multiplier
     below 1, which its `reset.discardedMultiplier` shows. With the host
     stopped, reset the first kind's multiplier once, and re-stamp the second
     kind's checked value, as the **Operators** entry of context-manager
