@@ -297,8 +297,8 @@ export class McplServerConnection extends EventEmitter {
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
-  // registration (and answer host tools/call requests) while startup/reconnect
-  // reconciliation keeps agent wakes behind a durable barrier.
+  // registration (and answer host tools/call requests) while its data plane
+  // stays held, as through a quiesce.
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
@@ -371,8 +371,8 @@ export class McplServerConnection extends EventEmitter {
     this.flushDepth++;
     try {
       for (const { event, args } of pending) {
-        // Re-enter the gate for every buffered item. A control handler (notably
-        // tools/list_changed) may install a newer data-plane barrier while this
+        // Re-enter the gate for every buffered item. A control handler (a
+        // host/command quiesce, say) may pause the data plane while this
         // snapshot is being flushed; later data items must observe that pause.
         this.emit(event, ...args);
       }
@@ -468,7 +468,8 @@ export class McplServerConnection extends EventEmitter {
     // responder-LESS events are ever dropped — a buffered server→host REQUEST
     // holds a live responder the server is blocking on, and dropping it would
     // strand that call forever (the server timing out and reconnecting is the
-    // accepted bound there, and reconnect re-runs the barrier funnel).
+    // accepted bound there, and a reconnect runs the policy exchange again
+    // before its planes open).
     if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
       const hasResponder = McplServerConnection.hasResponder;
       if (!hasResponder({ args })) {
