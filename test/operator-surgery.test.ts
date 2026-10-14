@@ -372,6 +372,42 @@ describe('live operator surgery', () => {
     void s0;
   });
 
+  it('hide removes a one-shard body, which removeMessage alone refuses', async () => {
+    const [lone] = (['lone'] as const).map((text) =>
+      (cm() as unknown as ShardStore).messageStore.append(
+        'user',
+        [{ type: 'text', text }],
+        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-lone' },
+        undefined,
+        { bodyGroupId: 'g-lone', shardIndex: 0 },
+      ).id,
+    );
+    const internals = framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    const r = await internals.handleHostCommand('discord', {
+      command: 'hide',
+      agentName: 'scout',
+      fromMessageId: 'd-lone',
+      requesterName: 'antra',
+    });
+    assert.equal(r.ok, true, String(r.error));
+    assert.equal(r.hidden, 1);
+    assert.equal(cm().getMessage(lone as never), null);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
+    const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
+    const internals = framework as unknown as {
+      shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+    };
+    const record = internals.shedNewestTurn(framework.getAgent('scout'));
+    assert.ok(record);
+    assert.deepEqual(record.removedIds, [s2, s1, s0]);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
   // --- failure path ----------------------------------------------------------
 
   it('a failed suppression restores the source branch, retires its outbox batch, and leaves the store bootable', async () => {

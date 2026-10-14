@@ -1,5 +1,6 @@
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, continuesBody, type BodyShard } from '@animalabs/context-manager';
+import { removeStoredInterval } from '../stored-removal.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
@@ -202,13 +203,12 @@ export async function createOfflineRecoveryBranch(
     const createdBranch = contextManager.branchAt(target.id, targetBranch);
     try {
       await contextManager.switchBranch(createdBranch);
-      // Work from newest to oldest so earlier redactions never perturb the
-      // live positions used by later range endpoints.
-      // Each interval goes as a range, a single message included: removing one
-      // message alone is refused for any shard, a one-shard body's too, and
-      // the range removal refuses a bisected body itself.
+      // Each interval is removed by its messages' ids, so the order doesn't
+      // change the result. removeStoredInterval takes a single message outside
+      // any body through removeMessage, and a shard or a longer interval as a
+      // range, which refuses one that splits a body.
       for (const interval of [...suppression.intervals].reverse()) {
-        contextManager.removeMessages(interval.fromId, interval.toId);
+        removeStoredInterval(contextManager, interval.fromId, interval.toId);
       }
       if (batch) outbox.activate(batch.id);
     } catch (error) {

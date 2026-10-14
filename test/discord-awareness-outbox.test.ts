@@ -143,6 +143,58 @@ test('framework resumes an interrupted suppression before activating its markers
   }
 });
 
+test('a resumed suppression removes a one-shard body as a range and a message outside any body alone', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-resume-shard-'));
+  const path = join(dir, 'outbox.json');
+  try {
+    const outbox = new DiscordAwarenessOutbox(path);
+    const batch = outbox.prepare({
+      agentName: 'cairn',
+      sourceBranch: 'main',
+      targetBranch: 'recovery/cairn/suppressed',
+      activationPolicy: 'explicit',
+      suppressionIntervals: [
+        { fromId: 'plain', toId: 'plain' },
+        { fromId: 'shard', toId: 'shard' },
+      ],
+      refs: [
+        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' },
+      ],
+    })!;
+    const present = new Set(['plain', 'shard']);
+    const removals: string[] = [];
+    // As context-manager 0.14 does, removeMessage refuses a shard, a
+    // one-shard body's included.
+    const cm = {
+      getMessage: (id: string) => present.has(id)
+        ? { id, ...(id === 'shard' ? { bodyGroupId: 'doc', shardIndex: 0 } : {}) }
+        : null,
+      removeMessage: (id: string) => {
+        if (id === 'shard') throw new Error(`Cannot remove shard ${id} in isolation: it is part of bodyGroup doc.`);
+        present.delete(id);
+        removals.push(id);
+      },
+      removeMessages: (from: string, to: string) => {
+        present.delete(from); present.delete(to); removals.push(`${from}..${to}`);
+      },
+    };
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = outbox;
+    framework.store = {
+      currentBranch: () => ({ name: 'recovery/cairn/suppressed' }),
+      listBranches: () => [],
+    };
+    framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
+
+    await framework.resumePreparedDiscordSuppressions();
+
+    assert.deepEqual(removals, ['shard..shard', 'plain']);
+    assert.equal(outbox.batches().find((candidate) => candidate.id === batch.id)?.status, 'active');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('framework drain records failures per ref and continues past permanent failures', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-drain-'));
   const path = join(dir, 'outbox.json');

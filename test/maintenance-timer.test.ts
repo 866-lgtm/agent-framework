@@ -23,6 +23,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { OperatorActionError } from '../src/operator-log.js';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 
 class QueuedStrategy implements ContextStrategy {
@@ -200,6 +201,86 @@ class HookedTickStrategy implements ContextStrategy {
   async tick(_ctx: StrategyContext): Promise<void> {
     this.ticks++;
     this.onTick?.();
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+/** A strategy with no maintenance to do. */
+class ReadyStrategy implements ContextStrategy {
+  readonly name = 'ready-test';
+
+  checkReadiness(): ReadinessState {
+    return { ready: true };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {}
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+/** A strategy whose first tick waits on a gate, and that notes what it sees. */
+class GatedTickStrategy implements ContextStrategy {
+  readonly name = 'gated-tick-test';
+  ticks = 0;
+  ticksUnderHold = 0;
+  branchAtFirstTickEnd?: string;
+  framework?: AgentFramework;
+  private open?: () => void;
+  private readonly gate = new Promise<void>((resolve) => { this.open = resolve; });
+
+  release(): void {
+    this.open?.();
+  }
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'gated tick queued' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    this.ticks++;
+    if ((this.framework as unknown as { surgeryHold: unknown }).surgeryHold) this.ticksUnderHold++;
+    if (this.ticks === 1) {
+      await this.gate;
+      this.branchAtFirstTickEnd = this.framework!.getAgent('agent')!.getContextManager().currentBranch().name;
+    }
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+/** A strategy whose ticks succeed and whose readiness can't be read once all of a pass's ticks have run. */
+class RefusesAfterTicksStrategy implements ContextStrategy {
+  readonly name = 'refuses-after-ticks-test';
+  ticks = 0;
+  failTick = false;
+
+  checkReadiness(): ReadinessState {
+    if (this.ticks >= 8 || (this.failTick && this.ticks > 0)) throw new Error('readiness refused after the ticks');
+    return { ready: false, description: 'work queued' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    this.ticks++;
+    if (this.failTick) throw new Error('tick failed');
   }
 
   select(
@@ -438,11 +519,12 @@ describe('queued context maintenance timer', () => {
           pending: 'compression blocked',
         },
       });
-      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length > 0);
-      assert.equal(
-        framework.getContextMaintenanceSnapshot().history[0].agents[0].error,
-        'provider rejected maintenance request',
-      );
+      // Every pass meets the same failure and records it; it is alerted once.
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 3);
+      for (const run of framework.getContextMaintenanceSnapshot().history) {
+        assert.equal(run.agents[0].error, 'provider rejected maintenance request');
+      }
+      assert.equal(alerts.length, 1);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -577,6 +659,208 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it('whatever throws while one agent\'s maintenance is prepared is that agent\'s failure alone', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-prepare-throws-'));
+    const healthy = new QueuedStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [
+        { name: 'broken', model: 'test-model', systemPrompt: 'test', strategy: new QueuedStrategy() },
+        { name: 'healthy', model: 'test-model', systemPrompt: 'test', strategy: healthy },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
+    (framework as any).opsAlert = (
+      kind: string,
+      agentName: string,
+      _message: string,
+      opts?: { data?: Record<string, unknown> },
+    ) => alerts.push({ kind, agentName, data: opts?.data });
+    const internals = framework as unknown as { providerGateBlocked: (name: string) => boolean };
+    const gateBlocked = internals.providerGateBlocked.bind(framework);
+    internals.providerGateBlocked = (name: string) => {
+      if (name === 'broken') throw new Error('gate read failed');
+      return gateBlocked(name);
+    };
+    try {
+      framework.start();
+      await waitFor(() => healthy.ticks >= 2);
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.some(
+        (run) => run.agents.some((agent) => agent.agentName === 'broken' && agent.error !== undefined),
+      ));
+      const run = framework.getContextMaintenanceSnapshot().history.find(
+        (candidate) => candidate.agents.some((agent) => agent.agentName === 'broken'),
+      )!;
+      const broken = run.agents.find((agent) => agent.agentName === 'broken')!;
+      assert.equal(broken.error, 'gate read failed');
+      assert.equal(broken.ticks, 0);
+      assert.ok(alerts.some((alert) => alert.agentName === 'broken' && alert.data?.scope === 'agent'));
+      assert.equal(alerts.some((alert) => alert.data?.scope === 'pass'), false);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a failure that lasts is logged and alerted once, and again once the agent has recovered', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-lasting-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'fenced', model: 'test-model', systemPrompt: 'test', strategy: new QueuedStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (kind: string, agentName: string) => alerts.push(`${kind}:${agentName}`);
+    const internals = framework as unknown as { runQueuedMaintenance: () => Promise<void> };
+    let passes = 0;
+    const runPass = internals.runQueuedMaintenance.bind(framework);
+    internals.runQueuedMaintenance = () => { passes++; return runPass(); };
+    const logged = t.mock.method(console, 'error', () => {});
+    const failedLines = () => logged.mock.calls.filter((call) =>
+      String(call.arguments[0]).includes('[context-maintenance] agent=fenced failed:')).length;
+    const runsWithError = () => framework.getContextMaintenanceSnapshot().history.filter((run) =>
+      run.agents.some((agent) => agent.agentName === 'fenced' && agent.error !== undefined)).length;
+    const cm = framework.getAgent('fenced')!.getContextManager();
+    const fence = () => assert.rejects(cm.setStrategy(new RefusingInitStrategy()), /strategy initialization failed for the test/);
+    await fence();
+    try {
+      framework.start();
+      await waitFor(() => runsWithError() >= 3);
+      assert.deepEqual(alerts, ['context-maintenance-failed:fenced']);
+      assert.equal(failedLines(), 1);
+
+      // Recovered with nothing to do: passes find it ready and skip it.
+      await cm.setStrategy(new ReadyStrategy());
+      const after = passes;
+      await waitFor(() => passes >= after + 3);
+      await fence();
+      await waitFor(() => alerts.length === 2);
+      assert.equal(failedLines(), 2);
+
+      // Recovered with work no tick finishes: a pass runs it without a failure.
+      await cm.setStrategy(new NeverReadyStrategy());
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.some((run) =>
+        run.agents.some((agent) => agent.agentName === 'fenced' && agent.ticks === 8 && agent.error === undefined)));
+      await fence();
+      await waitFor(() => alerts.length === 3);
+      assert.equal(failedLines(), 3);
+      assert.deepEqual(new Set(alerts), new Set(['context-maintenance-failed:fenced']));
+    } finally {
+      logged.mock.restore();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a readiness refusal read after an agent\'s last tick is that agent\'s failure, alerted once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-after-ticks-'));
+    const strategy = new RefusesAfterTicksStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      // start() runs one pass at once; none follows within the test.
+      maintenanceIntervalMs: 60_000,
+    });
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (kind: string, agentName: string, message: string) => alerts.push(`${kind}:${agentName}:${message}`);
+    try {
+      framework.start();
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      assert.equal(run.ticks, 8);
+      assert.equal(run.error, 'readiness refused after the ticks');
+      assert.equal(run.readyAfter, undefined);
+      assert.deepEqual(alerts, ['context-maintenance-failed:agent:readiness refused after the ticks']);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a run records an agent\'s first failure: a readiness refusal after a failed tick isn\'t reported again', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-first-failure-'));
+    const strategy = new RefusesAfterTicksStrategy();
+    strategy.failTick = true;
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 60_000,
+    });
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (kind: string, agentName: string, message: string) => alerts.push(`${kind}:${agentName}:${message}`);
+    try {
+      framework.start();
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      assert.equal(run.ticks, 0);
+      assert.equal(run.error, 'tick failed');
+      assert.deepEqual(alerts, ['context-maintenance-failed:agent:tick failed']);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const surgery of [
+    { verb: 'roll back', run: (framework: AgentFramework, first: string) => framework.rollbackToMessage('agent', { messageId: first }) },
+    { verb: 'suppress', run: (framework: AgentFramework, first: string) => framework.suppressMessages('agent', { messageIds: [first] }) },
+  ]) {
+    it(`a ${surgery.verb} that begins during a tick waits for it before it moves the branch, and resume waits for the ${surgery.verb}`, { timeout: 10_000 }, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-waits-'));
+      const strategy = new GatedTickStrategy();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane,
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 10,
+      });
+      strategy.framework = framework;
+      const cm = framework.getAgent('agent')!.getContextManager();
+      const first = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
+      cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+      const internals = framework as unknown as { surgeryHold: unknown };
+      try {
+        await framework.quiesce();
+        framework.start();
+        await waitFor(() => strategy.ticks === 1);
+        const moved = surgery.run(framework, first);
+        await waitFor(() => internals.surgeryHold !== null);
+        await assert.rejects(
+          framework.resume(),
+          (error: unknown) => error instanceof OperatorActionError && error.code === 'agent-busy'
+            && error.message.includes(`a live ${surgery.verb} for agent holds the store`),
+        );
+        assert.equal(cm.currentBranch().name, 'main', `the ${surgery.verb} waits for the running tick`);
+        strategy.release();
+        await moved;
+        assert.equal(strategy.branchAtFirstTickEnd, 'main');
+        assert.equal(strategy.ticksUnderHold, 0, `the pass starts no tick while the ${surgery.verb} holds the store`);
+        assert.notEqual(cm.currentBranch().name, 'main');
+        const status = await framework.resume();
+        assert.equal(status.quiesced, false);
+      } finally {
+        strategy.release();
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
   it('no pass starts while a surgery holds the store', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-hold-'));
     const strategy = new QueuedStrategy();
@@ -588,11 +872,18 @@ describe('queued context maintenance timer', () => {
       syncIntervalMs: 0,
       maintenanceIntervalMs: 10,
     });
-    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    const internals = framework as unknown as {
+      surgeryHold: { verb: string; agentName: string; since: number } | null;
+      runQueuedMaintenance: () => Promise<void>;
+    };
     internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    // Count the passes the timer starts while the store is held.
+    let passes = 0;
+    const runPass = internals.runQueuedMaintenance.bind(framework);
+    internals.runQueuedMaintenance = () => { passes++; return runPass(); };
     try {
       framework.start();
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await waitFor(() => passes >= 3);
       assert.equal(strategy.ticks, 0);
       assert.equal(framework.getContextMaintenanceSnapshot().history.length, 0);
       internals.surgeryHold = null;
@@ -604,7 +895,7 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  it('a pass starts no new tick once a surgery holds the store, and reads nothing after its ticks', async () => {
+  it('a pass starts no new tick once a surgery holds the store', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-mid-pass-'));
     const strategy = new HookedTickStrategy();
     const framework = await AgentFramework.create({
@@ -628,8 +919,10 @@ describe('queued context maintenance timer', () => {
       assert.equal(strategy.ticks, 1);
       assert.equal(run.ticks, 1);
       assert.equal(run.error, undefined);
-      assert.equal(run.readyAfter, undefined);
-      assert.equal(run.pendingAfter, undefined);
+      // The surgery waits for the pass before it switches, so reading the
+      // agent's readiness after its tick is safe.
+      assert.equal(run.readyAfter, false);
+      assert.equal(run.pendingAfter, 'hooked tick queued');
       assert.deepEqual(alerts, []);
     } finally {
       internals.surgeryHold = null;
@@ -638,7 +931,7 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  it('a failure met while a surgery holds the store is recorded and logged, without an alert', async () => {
+  it('a failure a pass meets while a surgery waits for it is reported as any failure', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-failure-'));
     const strategy = new HookedTickStrategy();
     const framework = await AgentFramework.create({
@@ -654,7 +947,7 @@ describe('queued context maintenance timer', () => {
     (framework as any).opsAlert = (kind: string) => alerts.push(kind);
     strategy.onTick = () => {
       internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
-      throw new Error('the store switched branches under the tick');
+      throw new Error('the tick failed while a surgery waited');
     };
     const logged: string[] = [];
     const consoleError = console.error;
@@ -664,12 +957,11 @@ describe('queued context maintenance timer', () => {
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
       const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
       assert.equal(run.ticks, 0);
-      assert.equal(run.error, 'the store switched branches under the tick');
-      assert.equal(run.readyAfter, undefined);
-      assert.deepEqual(alerts, []);
+      assert.equal(run.error, 'the tick failed while a surgery waited');
+      assert.deepEqual(alerts, ['context-maintenance-failed']);
       assert.ok(logged.some((line) =>
-        line.includes('agent=agent stopped while a rollback holds the store')
-        && line.includes('the store switched branches under the tick')));
+        line.includes('[context-maintenance] agent=agent failed:')
+        && line.includes('the tick failed while a surgery waited')));
     } finally {
       console.error = consoleError;
       internals.surgeryHold = null;

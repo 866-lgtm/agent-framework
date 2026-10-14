@@ -511,3 +511,90 @@ test('suppressing a one-shard copy of a reposted document keeps the other', asyn
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a suppressed message outside any body is removed alone, and a one-shard copy as a range', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-removal-kind-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    const plain = String(cm.addMessage('user', [{ type: 'text', text: 'plain' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-plain',
+    }));
+    appendShards(cm, 'one-shard-group', ['m-doc-1']);
+    const [copy] = appendShards(cm, 'one-shard-group', ['m-doc-2']);
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    // removeMessage's remove event also drops the context-log entries copied
+    // from the message; context-manager refuses it for any shard.
+    const removeMessage = t.mock.method(ContextManager.prototype, 'removeMessage');
+    const removeMessages = t.mock.method(ContextManager.prototype, 'removeMessages');
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressMessageIds: ['m-plain', 'm-doc-2'],
+    });
+
+    assert.equal(result.messagesSuppressed, 2);
+    assert.deepEqual(removeMessage.mock.calls.map((call) => String(call.arguments[0])), [plain]);
+    assert.deepEqual(removeMessages.mock.calls.map((call) => call.arguments.map(String)), [[copy, copy]]);
+    removeMessage.mock.restore();
+    removeMessages.mock.restore();
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-doc-1', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an anchor at the end of a write that was cut short keeps that partial body and leaves out its retry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-cut-short-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    // Two of a body's shards, written before an interruption, then its retry
+    // from shard 0: the retry is a body of its own.
+    const partial = appendShards(cm, 'cut-group', ['m-cut-0', 'm-cut-1']);
+    appendShards(cm, 'cut-group', ['m-retry-0', 'm-retry-1', 'm-retry-2']);
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      contextId: partial[1],
+      branchName: 'recovery/cairn/cut-short',
+    });
+
+    assert.equal(result.messagesRemoved, 3);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-retry-0', 'm-retry-1', 'm-retry-2']);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-cut-0', 'm-cut-1'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

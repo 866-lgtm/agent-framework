@@ -339,9 +339,9 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     assert.equal(status.quiesced, false);
     assert.ok(warn.mock.calls.some((call) => {
       const line = String(call.arguments[0]);
-      return line.includes('feasibility preview unavailable for agent')
+      return line.includes("agent's settings can't be read")
         && line.includes('requires successful strategy initialization')
-        && line.includes('proceeding without a verdict');
+        && line.includes('proceeding without a verdict for it');
     }), 'resume warns, naming the agent and the error');
   });
 });
