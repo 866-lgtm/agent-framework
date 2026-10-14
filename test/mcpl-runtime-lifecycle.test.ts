@@ -376,7 +376,7 @@ test('a restart whose connect fails leaves the server down, configured and not c
     const exits = { id: 'renamed', command: process.execPath, args: ['-e', 'process.exit(3)'], toolPrefix: 'xx' };
     await assert.rejects(
       framework.restartMcplServer('first', exits as never),
-      /^MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: /,
+      /^Error: MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: /,
     );
     // As any failed connect leaves its server: listed as not connected, holding its prefix.
     assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]), [['renamed', false]]);
@@ -434,7 +434,7 @@ test("a stop() that begins in a restart's gap ends it, and the restart says the 
     });
     await assert.rejects(
       framework.restartMcplServer('first'),
-      /^MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "first" was not connected: the framework is stopping or stopped$/,
+      /^Error: MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "first" was not connected: the framework is stopping or stopped$/,
     );
     await stopping;
   });
