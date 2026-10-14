@@ -12,6 +12,8 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.22.1 — 2026-10-14
+
 **Operators upgrading from 0.22.0:** a provider's stated `retry-after` now
 holds the agent's turns, recorded in the store and kept across restarts,
 where 0.22.0 slept it inside the turn and `stop()` couldn't end the sleep. A
@@ -25,6 +27,165 @@ wait recorded before going back binds again if you return before it passes.
 Not tested: going back while the recorded waits can't be read (0.22.1 then
 holds every provider call), and going back under connectome-host rather than
 a bare framework.
+
+### Added
+
+- `McplServerConnection`'s `'close'` event now carries a third argument,
+  `McplConnectionCloseInfo` (`transport`, `code`, `signal`, `reason`,
+  `byHost`), so a host can see the WebSocket close code a networked MCPL
+  server sent (e.g. 4001 for an expired or refused credential) and refresh
+  what `accessProvider` hands the next dial instead of replaying it. The
+  first two `(code, signal)` arguments are unchanged; host-initiated closes
+  now pass `(null, null, info)` where they passed nothing. The type is
+  exported from the package root alongside `McplServerConnection`.
+
+### Fixed
+
+- Discord reaction suppression defaults include refusal markers, default/configured awareness markers, and retained recovery-outbox emojis. `framework.getPlacedReactionBaseline()` exposes that snapshot as suppression tokens, converting composite custom-emote markers to stable IDs; stored markers and reaction payloads remain unchanged. Stdio MCPL children get it by default, derived at each spawn (first connect, automatic reconnect, restart). Suppression is by emoji, so members' own reactions with 💤, the configured awareness emoji or a retained recovery emoji stop reaching the agent too, as members' 🛑 already did. When the awareness ledger can't be read, a runtime connect refuses before it registers or spawns anything (a startup connect, before it spawns), any restart refuses before it stops the running child, and an automatic reconnect of a child taking the default fails and retries rather than spawn without it. Explicit server env and intentionally inherited baseline values with tokens retain precedence, and the framework logs when one replaces the default; a value with no tokens, as discord-mcpl's parser reads them (blank, commas alone, or only tokens its normalizer reduces to nothing, such as `:`, `::` or a lone U+FE0F), or a null counts as unset, since the adapter would read it as suppression off (its filters file and legacy operator env are where suppression is turned off), and any other non-string value (a number from a JSON config) is read as its string form, as the child sees it, rather than failing the connect. On Windows, duplicate spellings resolve to the first in sorted order within each source, then declared values take precedence over inherited values. Hosts that inject the old refusal-only default must remove that default to adopt the framework-derived one; remote WebSocket adapters still need their own environment configuration (#95).
+
+- The inference-failure pipeline bounds the failure text it records. A failure's text is its source's `Error.message`, and a provider can echo the whole rejected request there: in one household an OpenAI-compatible 400 echoed ~1.7 MB, and the framework stored it in the resident's own context as an `[inference-failed]` marker (about 200K tokens, by the household's notes, which the resident then carried), wrote it to stderr and `logs/failures.log`, and traced it.
+  - Every cut this change makes follows one rule: the text's head and tail around a marker stating how many of how many characters were omitted. Each sink cuts the whole text, so its marker states the whole length, and no cut separates a surrogate pair.
+  - The `[inference-failed]` marker carries an excerpt of at most 600 characters. It also names the classification when there is one ("the model call failed (invalid_request, HTTP 400) …"). Its metadata adds `errorType`, `retryable`, `httpStatus` and `providerErrorCode`, plus `reasonChars` whenever the marker's excerpt was cut. A small unclassified failure produces exactly the marker it did before. Markers already stored keep their size until they're folded or removed.
+  - The rewind marker's reason is cut to 160 characters, an agent's `lastInference.lastError` and the compile-refused ops alert's to 300, and the ops webhook's copy of the alert's message to 500. Each bound includes the marker.
+  - Each of these is bounded to 2,000 characters:
+    - the reason excerpt in the exhaustion stderr line (the line also carries the agent, the streak and `type=… status=… code=…` labels when known);
+    - every field of a `logs/failures.log` record: a string to 2,000 characters, an `Error` as its projection (below), and any other value as its JSON, with any `Error` inside it written as its projection, kept as data when it fits and as bounded text when it doesn't. A record with a value JSON throws on, such as one with a cycle, is no longer lost: that value is described as a thrown value is (below). A value JSON writes nothing for, such as a function, is left out, as JSON leaves it out;
+    - ops alert messages, and an alert's `data` on its `ops:alert` trace, bounded field by field as a failures.log record is, so a trace listener gets the plain data the log writes: a `Date` as its ISO string, a `Map` as `{}`, an `Error` as its projection. Data that isn't a plain object, such as a string or an array from a JavaScript caller, is kept as one field, `data`, rather than spread into a field per character or element, and a message that isn't a string is described as a thrown value is (below) rather than thrown on;
+    - the inference log's `error`;
+    - every trace event's `error` and `stack` strings;
+    - the provider cooldown's reason, in its stderr lines and the status snapshot's `cooldownReason`;
+    - the error an ephemeral run (`runEphemeralToCompletion`) rejects with.
+
+    `inference:exhausted` traces and failures.log records add `httpStatus` and `providerErrorCode`, and a failures.log record adds `reasonChars` when its own excerpt was cut. The error type and the provider code are recorded to at most 128 characters each.
+  - The OverBudget drain kick, the marker write and the provider-cooldown resume used to print the error object when they failed, as did a host's `providerHold` hook when it threw (the hook is handed the model's error, and can throw it back). They now print a bounded projection instead: name, classification, status, provider code and message, cut once to 2,000 characters as one text after the name, type and provider code are bounded, on one line unless one of its parts has newlines, as a message can. A thrown value that isn't an `Error` is printed as its `String` when that's text of its own, as for a `Buffer`, an `Error` from another realm or a class with its own `toString`. An array, or an object whose `String` is empty or only its tag, such as `[object Object]`, is printed as its JSON, bounded, with any `Error` inside it as its projection, so a thrown plain object keeps its fields and an array its elements; the tag stands when JSON can't write the value or finds no fields in an object. Context maintenance describes one the same way, and its alert's copies, the webhook's included, are cut once from the whole message. The stack's frames follow on the lines below, also bounded to 2,000 characters: from after the message when the message is the stack's header, and otherwise from the stack's first frame line. Printing a `MembraneError` printed its message whole, in the stack, and its `rawRequest` with each string up to Node's 10,000-character limit, a long system prompt among them. Context maintenance records and logs a bounded message, in its existing format.
+  - The OverBudget drain breaker's message-text fallback now applies only to unclassified failures, and it is decided on the whole reason, never the excerpt. A classified provider error that quotes "exceed hard budget" or "no summary covers" (the agent's own context, echoed back) no longer kicks the compression drain.
+- This bound doesn't depend on membrane bounding its own errors.
+- A `MembraneError` from another copy of membrane is recognised by its name as well as by its class, since the host supplies the `Membrane` instance and two copies can be installed. Its failure is classified, and so gets the framework's recovery for its class: an invalid request now sheds the newest exchanges of the agent's history, up to the rewind cap, as the poisoned-history quarantine does for the framework's own copy. The default error policy reads its `retryable` and `retryAfterMs`, and an organization acceleration limit it reports is held, as for the framework's own copy. Before, each treated it as an unknown error: the default policy retried a non-retryable one up to three times, and its failure was then left unclassified.
+- Not covered by this change: an `Error` from another realm (a `vm` context) nested inside a value, which fails `instanceof Error` and so is written as its own JSON rather than its projection (at the top level, a thrown one is printed as its `String`); Discord-awareness log sites, the speech-route failure reason and `[discord-send-failed]` marker (kept whole as the delivery evidence a resident reads before resending), logs outside the inference-failure pipeline that still print an error object, in modules and in the framework's own code (among them the `beforeInference` hook's catch and its preview's, the event loop's catch, periodic and final sync, and the maintenance pass's retry of the tool-result guard's storage), and two plain slices: the health report's 400 characters of the inference log's stored error (already bounded to 2,000), and the tool-result spill's 200 characters of a workspace write's failure.
+
+- A provider's stated `retry-after` is now a lower bound on the next call to that model, for that agent, across restarts and branch switches. When a classified error carries `retryAfterMs` as a number, the framework records a provider wait for (agent, model) and calls that model no earlier. That includes an error from another copy of membrane than the framework's own, since the host supplies the Membrane instance:
+  - **Primary turns** are held, not retried and not counted as failures: no `[inference-failed]` marker and no hard-down streak. Wakes that arrive meanwhile join the held turn, and one fresh compile runs when the wait ends, the way an organization-acceleration cooldown already works. This applies to a failure the provider says may be retried; a non-retryable failure that states a wait keeps its terminal disposition (its marker and failure count), and the wait binds the calls after it.
+  - **Admission is checked at the last boundary before a primary call**, so a wait recorded after a wake was scheduled (by an auxiliary call the wake parked behind) holds that wake too.
+  - **Auxiliary calls** (context-manager compression through provider admission) to a held model are refused without calling the provider. The refusal is a retryable `rate_limit` `MembraneError` carrying the remaining wait as `retryAfterMs` (none for a wait held until released), marked `providerAdmission: 'deferred'` so a pacing caller can keep the wait without counting a failed call. context-manager reads that marker from its corrective round (#138) on. context-manager 0.14.0, the version this release requires, doesn't read it yet: it rethrows the refusal as it does any retryable error, and its next attempt meets the same admission, still without a call to the provider. A different model is not held: a compression model the provider did not limit keeps working, and changing an agent's primary model lets its turns proceed while the old model's wait stays recorded.
+  - **Durability:** waits are kept in typed Chronicle records (RecordJournal), so a restart honours them and a rollback or branch switch does not rewind them. A wait or release whose record could not be written still binds in this process, and is offered to the record again, in order, at every later act (and from admission checks every 30 s); an ambiguous write is reconciled before anything is decided against the record. If the store's append itself throws, the record journal writes nothing more until the store is reopened, as at the next start, and that is logged once. The record that append was writing may still be in the store's log, where the next start loads it. Every later act holds in this process only, and a restart doesn't keep it.
+  - **Unreadable records fail closed:** if the recorded waits cannot be read at startup, or a record parses but is not a well-formed provider wait, their absence is unknown, so no provider call is admitted for any resident or conversation agent until they can be read (retried every 30 s; held turns resume by themselves once they can) or an operator releases an agent's waits. An ephemeral run records no waits, so none can be unknown for it, and it isn't held. The hold names its cause in the log and in `providerWaits` (model `*`, which stands for every model), and inspection is unaffected. Such a release lifts exactly what it names (that model, or every model when none is given or it names `*`) for this process only, and a restart that still cannot read the records holds again. As the hold begins it raises a `provider-wait` ops alert for the whole framework (agent `framework`, model `*`), once per episode, since a cause that persists, such as a record this reader does not know, never reads again.
+  - **No shortening:**
+    - A later, shorter wait never shortens an outstanding longer one.
+    - A wait that cannot be represented as an instant becomes an indefinite wait, held until released.
+    - A negative stated wait (a provider's "retry now", or an HTTP date already past) is already over: it binds nothing, the same as 0. An organization-acceleration hold reads it as a stated 0 too (the 1 s floor, plus jitter).
+    - The organization-acceleration cooldown no longer caps a stated wait at 10 minutes. The cap still applies to the framework's own default wait.
+  - **Visibility:** `healthSnapshot().agents[].providerAdmission.providerWaits` lists the waits that bind now. Each wait, hold and release is logged once (`[provider-wait] …`). A wait's reason is the provider's message, bounded, with its control characters as spaces. A wait recorded to hold a model for more than an hour, or until released, also raises a `provider-wait` ops alert (a failures.log record, an `ops:alert` trace, and the ops webhook when configured), so a person can decide whether the provider meant it; it is honoured in full either way.
+  - **Operator override:** the `release-provider-wait` host command (`agentName`, optional `model`) and the `host.releaseProviderWait` API verb release a wait, and the release is recorded so a restart does not restore it. The API verb takes the server's `adminToken` when one is configured, as the other host verbs that change something do. A `model` that is not a nonempty string, or that holds a control character, is refused, never taken as every model. A release names its agent on both surfaces. An `agentName` that is neither one of the framework's agents nor the agent of a wait `host.providerWaits` lists (a disposed conversation agent's, say) is refused before anything is recorded, `*` and `framework` included: the hold for unreadable records is lifted one agent at a time. The release records who asked. Over the API that's `api`, or `api:<requester>` for a requester the caller names. Any requester is bounded, and its control characters become spaces. An organization-acceleration cooldown that the released wait lengthened falls back to the framework's own pacing for that failure; a host hold (`providerHold`) stays the host's. Each released wait's receipt says how far the release reaches: `recorded`, `pending` (binding here, its record not yet written), or `in-process override` (the unreadable-records hold). A context strategy that paces its own calls by the same wait and has `releaseCompressionPause` (context-manager's compression lane from its corrective round, #138, on; 0.14.0 has none, so nothing is called) is released with it, for the model the release names, even when no wait binds in the framework itself (the lane may still hold a pause the framework no longer has); the receipt lists only the framework's own waits. `host.providerWaits` lists the waits. Only the passing of the wait, or this explicit release, ends one, and an ordinary restart does not; the hold for unreadable records also ends once they read again.
+  - **Scope:** the guarantee covers the calls the framework makes for an agent: primary turns and auxiliary calls through provider admission. It covers the calls themselves, not membrane's retries inside one: membrane 0.5.87, the version this release requires, retries a rate-limited `complete()` call up to four times before throwing. Each retry waits the longer of its own backoff (1, 2, 4, then 8 s) and the stated wait, but no longer than `maxRetryDelayMs` (30 s by default), so a stated wait longer than that is retried inside, and an auxiliary call can reach the provider again inside the wait before the framework records it. membrane #102 stops that for a wait longer than its retry window; until a release carries it, a host's `hooks.onError` returning `'abort'` stops it. Primary turns go through `streamYielding()`, which has no retry loop. A wait binds the agent the provider answered. Another agent on the same model isn't held by it, and records its own wait from its own first refusal. Traffic a provider adapter makes on its own, such as membrane's Anthropic cache keepalive, is outside it. So is server-initiated inference through the MCPL inference router, which runs for an MCPL server rather than for an agent, so no agent's wait applies to it.
+- Error-policy retry waits no longer fire almost at once when a delay exceeds what one timer holds (about 24.8 days). They wait in steps, and `stop()` ends a wait in progress.
+
+- Live `rollbackToMessage` and `suppressMessages` (and message-granular
+  `host/command` undo, which rides on rollback) return once the body change
+  has landed, with a marker-scheduling receipt, instead of after every
+  awareness reaction (💤 by default) has been delivered. Previously the store
+  stayed reserved, and the operator got no answer, for the whole serial
+  drain. At the reported pace of about one reaction per second, 918 queued
+  marks would take roughly 15 minutes; the household's client timed out
+  after 60 seconds. Delivery now continues in the background, behind the
+  same MCPL data-plane gate as before, which holds channel traffic that
+  arrives after it until the marks are attempted, or deferred when their
+  server isn't connected. A turn may now run during delivery when it carries
+  no channel traffic, such as a scheduler timer or a provider admission, and
+  also when its channel traffic was admitted before the gate went up (queued
+  when the surgery began, or arriving during its switch or fork). Such a
+  turn used to wait for the whole drain, since the store stayed reserved;
+  now it can answer before the marks show.
+- The other branch moves no longer wait for Discord either: the web API's
+  `branch.switch`, `undo` and `redo`, and `host/command` turn undo, return
+  once the branch has moved, and their marks follow behind the same gate.
+  Each starts its delivery through
+  `startDiscordAwarenessDelivery(after, agentName?)`, a new public method
+  that a host can call after its own branch moves. A delivery that fails to
+  start raises a `discord-awareness-delivery` ops alert instead of failing
+  the command, and the next sync, reconnect or start delivers what is still
+  pending. (The web switch used to await the awareness sync before
+  answering.)
+- A gate installed while a drain is still running (restoring the source
+  branch mid-delivery, say) waits for that drain and then drains again from
+  the ledger. So before traffic is released, every mark pending when the
+  gate was armed is attempted, or deferred until its server is connected,
+  as before: the drain's remaining reactions, the removals they need, and an
+  add re-pended during the drain (a rollback, its undo, then a redo).
+  Inbound MCPL handlers wait out a generation installed while they wait, not
+  only the one they first saw, and a reconnect's gate opens only once both
+  its drain and the server's re-registration attempt have settled. So a
+  reconnect's `mcpl:server-reconnected` and `module:added` traces now come
+  once that attempt has settled, granted or not, where they came at once
+  when no marks were pending.
+- The result's new `markers` field (`none` | `queued` | `not-scheduled` |
+  `unresolved`, the exported `SurgeryMarkerReceipt` type) says whether marks
+  were scheduled, never that Discord accepted them. The `[operator]` stderr
+  line gains `marks=…` and the operator-actions log entry gains `markers`.
+  If the ledger write after the switch fails, the rollback that already
+  applied is no longer reported as failed: the batch is retired
+  (`not-scheduled`, with a `discord-awareness-not-scheduled` ops alert), or,
+  if even that write fails, the result says the batch may still be
+  delivered (`unresolved`, with a `discord-awareness-unresolved` ops alert). A
+  suppression whose redactions all committed is no longer undone by that
+  failure.
+
+- A result of the workspace's `materialize`, `sync` or `delete` that the
+  tool-result guard withholds now keeps what it acted on in its stub, after
+  where the original is ("Kept from its result: {…}"): what `materialize`
+  removed from disk and wrote to it, any root `sync` accepted and what it took
+  from disk, gave up or holds as a conflict, per mount, and the path `delete`
+  removed (a `delete` that failed keeps nothing, as any failed result). The
+  result as stored still goes where every withheld original goes. Past the
+  inline cap the kept fields are cut in that order, so a later list can be
+  cut away entirely, and the stub says so. While the store is away from the
+  batch's branch, the stub stays the bare notice, without the kept fields, as
+  every withheld stub does then. A tool marks which fields of its result's
+  data are kept with the new `ToolResult.keepWhenWithheld`; only these three
+  mark any. Before this, a withheld receipt hid even which files a write had
+  touched, such as the clobbered `LOG.md` in agent-framework #277.
+
+- A module's event that arrives after `stop()` began is dropped with a log line naming the module, through `ModuleContext.pushEvent()` or the deprecated `queue` handle alike, instead of throwing `Queue is closed`. `stop()` closes the event queue before it stops modules, so such an event comes from a listener that fires while `stop()` runs, where the throw can go unhandled, or from the module's own `stop()`, where it made the framework's `stop()` fail. A direct caller of `AgentFramework.pushEvent()` still gets the throw for anything but a tool result, and a module's tool result keeps that method's drop line, which names the call, the tool and its outcome. The deprecated `ModuleContext.queue` is now an object with `push` alone, as its `ProcessQueue` type always said; it was the framework's own queue object.
+
+- The poison-history breaker sheds history only for an `invalid_request` that came back as HTTP 400, 413 or 422 or that carries no status, and for a `context_length` at 413. The status is a heuristic for when shedding the newest exchange may help, not proof that the history is at fault. 400 and 422 are how a provider answers a request that fails its validation, as a history it can't accept does. A 413 is the request's size: when the newest exchange made it too large, as an oversized attachment does, shedding that exchange may recover, and nothing else in the framework does; when the history as a whole is too large, the shed doesn't help, and the breaker stops at its rewind cap. The 413 arm takes both labels a 413 arrives under, `invalid_request` and `context_length`, since membrane's label for a 413 differs by version and adapter. Other statuses keep the history, since shed history can't be got back and the status gives no sign that a shed would help: a 404 is a model or an endpoint that doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the resource, as a rule, rather than the conversation. The failure is still counted, logged and reported hard-down either way.
+  - As membrane 0.5.86 classifies them, Anthropic files only a 400 as `invalid_request`, and the chat adapters never file one, since they classify by the error's message text; a `context_length` they file that way carries status 400 whatever the response's was. So neither changes, and no 0.5.86 adapter produces a `context_length` at 413. The raw-fetch Responses adapter files every status it doesn't list as `invalid_request`, so it alone produces an `invalid_request` at 413 or 422 today: a 404, 405, 409, 410 or 415 from it no longer sheds history, and a 413 or 422 still does.
+  - From membrane #56 (merged, not yet in a release), one status table serves every adapter. An Anthropic 404 then arrives as `invalid_request`, which is the case this change is for: three failures for a misspelled model would otherwise shed the agent's newest exchanges, under a rewind marker saying "the model API kept rejecting the conversation on them". A 413 arrives as `context_length` and still sheds, so the breaker also sheds for an Anthropic 413, which no earlier version did. A `context_length` at 400 or 422 is a token overflow and keeps the history. A 422 from an OpenAI-compatible server that answers a validation failure with it, such as a FastAPI one, arrives as `invalid_request`. Hosts should take this change before a membrane release that includes #56.
+  - An error with no status, from a membrane that reports none, keeps the breaker's earlier rule, the type alone.
+  - Anthropic's "credit balance is too low" 400 still arrives as `invalid_request` at 400 and still sheds, until antra-tess/membrane#107, which classifies it as `auth`, is released and in agent-framework's membrane floor.
+  - The rewind marker the breaker writes into the agent's context says the turns were set aside because the model API kept refusing the requests that carried them, so that the conversation could go on. It used to say the API kept rejecting the conversation on them.
+
+- A provider's stated `retry-after` on a turn that doesn't own provider admission, a conversation agent's or an ephemeral run's, is no longer slept in the turn for as long as it says. Such a turn went to the error policy, which returns a stated wait as it is: a 429 stating two hours held the turn asleep two hours per attempt, up to three times, with nothing recorded and nothing raised.
+  - **Conversation agents** treat a stated wait as a resident does. The wait is recorded for (agent, model) and raises the `provider-wait` ops alert past an hour. The turn is held until the wait passes or `release-provider-wait` releases it, and one fresh compile runs then. A non-retryable failure that states a wait keeps its terminal disposition, and the wait binds the calls after it. This applies however the call fails, including a stream that throws.
+    - Its retries and in-turn restarts check its recorded waits at the last boundary before the call, as a resident's turns do. It takes no provider gate, so its own compression can record a wait while a turn compiles: each of its turns checks again once compiled, and a wait found then holds the turn before anything is sent.
+    - Its context manager's compression calls to a held model are refused without a call, and a compression call's own stated wait is recorded for it. A conversation agent still takes no provider gate: admission stays the resident's.
+  - **Ephemeral runs** sleep a stated wait of up to 10 minutes, the framework's own longest pacing, and retry, as before. A longer stated wait, or one that can't be represented, ends the run at once. It is never retried before the provider's time, and the run's error says why: `… (the provider asked to wait 7200 s; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now)`. Nothing is recorded for an ephemeral run, whose name is single-use.
+
+- MCPL references (RFC-005): display labels now drop the Arabic letter mark (U+061C) along with the other bidi controls, and are trimmed. `fetch_reference` shows the response's `Content-Type` and the server's claimed type as labels too, and `save_recent_image` shows a reference's claimed type in its refusal, and an attachment's media type in its receipt, as labels. The stub leaves out a label with nothing left once sanitized. A server's type such as `constructor` now saves the file as `.bin` instead of naming it with inherited function text.
+- An `expiresAt` rejected as a field (past its 64-character maximum, or not a string, null included) now fails closed like an unparseable one on the fetcher's paths: `fetch_reference`, the eager default and a code-execution script's result. The fetcher treats such a reference as already expired, never as immortal, and doesn't fetch it. It still serves a copy saved earlier while the host holds the reference's record. A restart or an eviction drops the record, and a reference sent again is then judged on its expiry. A uri-form image block that a converter hands the provider as a URL source is unchanged.
+- A reference that has already expired when it arrives gets a stub giving the case (an expiry that has passed, one that doesn't parse, or one rejected as a field) instead of offering `fetch_reference`. `save_recent_image`'s refusal of an expired reference, and the fetcher's refusal, give the same reasons. For a reference this process holds no record of (after a restart or an eviction, or a stub quoted from elsewhere), `save_recent_image`'s refusal says it can't be fetched, and to re-run its tool if the tool can produce it again. The eager default no longer gives one of a result's eight slots to an expired reference, to a uri that any of the result's blocks calls expired, or to a second block for a uri the result already listed.
+- The reference registry, past its 2000 records, now evicts the reference registered least recently, where it evicted the one registered first. Registering a reference it holds, as showing its stub does, makes that reference the newest, since the one the model was just shown is the likeliest to be fetched. A result with at most 2000 distinct references therefore no longer evicts a reference it has just named.
+
+- Unsubscribing a trace listener while an event is being delivered (through `onTrace`'s returned function or `offTrace`) no longer makes the next listener miss that event. Each event goes to the subscriptions present when its delivery starts, each one only if it is still subscribed when its turn comes, as the DOM's `EventTarget` delivers: a subscription made during delivery is first called for the next event, and a subscription removed during delivery is skipped if its turn hasn't come. Each `onTrace` call is a subscription of its own, so a listener subscribed twice is still called twice. The function `onTrace` returns now removes its own subscription, so calling it twice no longer removes a second subscription of the same listener.
+
+- Workspace `sync` says what it didn't look at (#276). A sync now counts,
+  under `passedOver`, what each mount's scan skipped by design and reported
+  nowhere else, by reason. Today that's the entries its ignore list covers
+  that hold nothing the workspace tracks; an ignored directory counts once,
+  and one that hides a tracked path is listed under `incomplete` instead. A
+  walk cut short, by the file cap or a directory that changed while it was
+  listed, is listed under `incomplete`, and counts only what it kept. So a
+  `totalSynced` of 0, with a `totalConflicts` of 0 and nothing under
+  `passedOver`, `incomplete` or `skipped`, means the sync looked everywhere
+  and nothing had changed; changed files it couldn't take in are listed
+  under `skipped`. A path the ignore list covers is synced when named, and
+  the result lists it under `ignored`: a sync without a path passes over it,
+  so nothing else keeps it current. Naming an ignored directory sets aside
+  the patterns that cover it or a directory above it; a pattern that covers
+  only something inside it still applies, so with `build/**` and `*.md`,
+  naming `build` takes `build/out.txt` and passes over `build/LOG.md`. A
+  symlink the ignore list doesn't cover isn't counted: the pass reports each
+  one by path, taken through the link when it's a file on a mount that
+  follows symlinks, and otherwise listed under `skipped`. One the ignore list
+  covers is passed over like any ignored entry.
 
 ## 0.22.0 — 2026-10-13
 
