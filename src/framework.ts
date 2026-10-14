@@ -6983,15 +6983,30 @@ export class AgentFramework {
       // so the surface can mark them. channelId here is whatever the ingest
       // path stored (raw id or "discord:guild:channel"); the surface
       // normalizes it.
-      const refsIn = (lo: number, hi: number) => {
+      // Each Discord message once, though every shard of a body carries it.
+      const refsIn = (runs: Array<{ from: number; to: number }>) => {
         const refs: Array<{ channelId: string; messageId: string }> = [];
-        for (let i = lo; i <= hi; i++) {
-          const md = all[i].metadata as { messageId?: unknown; channelId?: unknown } | undefined;
-          if (md?.messageId && md?.channelId) {
+        const seen = new Set<string>();
+        for (const { from, to } of runs) {
+          for (let i = from; i <= to; i++) {
+            const md = all[i].metadata as { messageId?: unknown; channelId?: unknown } | undefined;
+            if (!md?.messageId || !md?.channelId) continue;
+            const key = `${String(md.channelId)}\u0000${String(md.messageId)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
             refs.push({ channelId: String(md.channelId), messageId: String(md.messageId) });
           }
         }
         return refs;
+      };
+      // How many stored messages the runs hold, a body (a long message, in
+      // shards) counting once.
+      const messagesIn = (runs: Array<{ from: number; to: number }>) => {
+        let count = 0;
+        for (const { from, to } of runs) {
+          for (let i = from; i <= to; i = bodyRangeIn(all, i).to + 1) count++;
+        }
+        return count;
       };
 
       const fromIdx = byDiscordId(params.fromMessageId);
@@ -7012,11 +7027,12 @@ export class AgentFramework {
           // A message stored as a body (a long one, in shards) is hidden whole.
           const lo = bodyRangeIn(all, first).from;
           const hi = bodyRangeIn(all, last).to;
-          const refs = refsIn(lo, hi);
+          const refs = refsIn([{ from: lo, to: hi }]);
+          const hidden = messagesIn([{ from: lo, to: hi }]);
           const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
           removeStoredMessages(cm, all[lo], all[hi]);
           console.error(
-            `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
+            `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
           );
           const loggedRange = capIds(rangeIds);
@@ -7027,26 +7043,35 @@ export class AgentFramework {
             params: { fromMessageId: params.fromMessageId, toMessageId: params.toMessageId },
             result: {
               branch: this.store.currentBranch().name,
-              hidden: hi - lo + 1,
+              hidden,
               removedIds: loggedRange.ids,
               ...(loggedRange.truncated ? { removedIdsTruncated: true } : {}),
             },
           });
           return {
             ok: true,
-            hidden: hi - lo + 1,
+            hidden,
             hiddenRefs: refs,
             lastVisible: await this.lastVisiblePreview(agentName),
           };
         }
-        // A message stored as a body (a long one, in shards) is hidden whole:
-        // each shard carries its Discord id, and the first is found.
-        const { from: lo, to: hi } = bodyRangeIn(all, fromIdx);
-        const refs = refsIn(lo, lo);
-        const hiddenIds = all.slice(lo, hi + 1).map((m) => String(m.id));
-        removeStoredMessages(cm, all[lo], all[hi]);
+        // A message stored as a body (a long one, in shards) is hidden whole,
+        // and so is every copy of it: a write cut short leaves a partial body
+        // before its retry, both carrying the Discord id.
+        const runs: Array<{ from: number; to: number }> = [];
+        all.forEach((m, i) => {
+          if (String((m.metadata as { messageId?: unknown } | undefined)?.messageId) !== String(params.fromMessageId)) return;
+          const { from, to } = bodyRangeIn(all, i);
+          const last = runs[runs.length - 1];
+          if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
+          else runs.push({ from, to });
+        });
+        const refs = refsIn(runs);
+        const hidden = messagesIn(runs);
+        const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
+        for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
         console.error(
-          `[host-command] hide agent=${agentName} removed=${hi - lo + 1} (${params.fromMessageId}) ` +
+          `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
         this.recordOperatorAction({
@@ -7054,11 +7079,11 @@ export class AgentFramework {
           agent: agentName,
           requester: hostCommandRequester(serverId, params),
           params: { fromMessageId: params.fromMessageId },
-          result: { branch: this.store.currentBranch().name, hidden: hi - lo + 1, removedIds: hiddenIds },
+          result: { branch: this.store.currentBranch().name, hidden, removedIds: hiddenIds },
         });
         return {
           ok: true,
-          hidden: hi - lo + 1,
+          hidden,
           hiddenRefs: refs,
           lastVisible: await this.lastVisiblePreview(agentName),
         };

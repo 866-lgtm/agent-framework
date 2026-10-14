@@ -372,8 +372,55 @@ describe('live operator surgery', () => {
     void s0;
   });
 
-  it('hide removes a message stored as a body whole, a one-shard body included', async () => {
+  it('hide removes a message stored as a body whole, a one-shard body and every copy included', async () => {
     // Each shard of a long message carries its Discord message id.
+    const appendBody = (discordId: string, group: string, texts: string[], from = 0): string[] =>
+      texts.map((text, i) =>
+        (cm() as unknown as ShardStore).messageStore.append(
+          'user',
+          [{ type: 'text', text }],
+          { serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordId },
+          undefined,
+          { bodyGroupId: group, shardIndex: from + i },
+        ).id,
+      );
+    const [lone] = appendBody('d-lone', 'g-lone', ['lone']);
+    const long = appendBody('d-long', 'g-long', ['l0', 'l1', 'l2']);
+    // A write cut short after two shards, then its retry from shard 0.
+    const partial = appendBody('d-cut', 'g-cut', ['c0', 'c1']);
+    const retry = appendBody('d-cut', 'g-cut', ['c0', 'c1', 'c2']);
+    const internals = framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    const hide = (fromMessageId: string) => internals.handleHostCommand('discord', {
+      command: 'hide',
+      agentName: 'scout',
+      fromMessageId,
+      requesterName: 'antra',
+    });
+    const refsOf = (result: Record<string, unknown>) =>
+      (result.hiddenRefs as Array<{ messageId: string }>).map((ref) => ref.messageId);
+
+    const one = await hide('d-lone');
+    assert.equal(one.ok, true, String(one.error));
+    assert.equal(one.hidden, 1);
+    assert.equal(cm().getMessage(lone as never), null);
+
+    const whole = await hide('d-long');
+    assert.equal(whole.ok, true, String(whole.error));
+    assert.equal(whole.hidden, 1, 'one message, though stored in three shards');
+    assert.deepEqual(refsOf(whole), ['d-long']);
+    for (const id of long) assert.equal(cm().getMessage(id as never), null);
+
+    const copies = await hide('d-cut');
+    assert.equal(copies.ok, true, String(copies.error));
+    assert.equal(copies.hidden, 2, 'the partial copy and its retry');
+    assert.deepEqual(refsOf(copies), ['d-cut']);
+    for (const id of [...partial, ...retry]) assert.equal(cm().getMessage(id as never), null);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it('hide over a range widens both ends to whole bodies, and counts each message once', async () => {
     const appendBody = (discordId: string, group: string, texts: string[]): string[] =>
       texts.map((text, shardIndex) =>
         (cm() as unknown as ShardStore).messageStore.append(
@@ -384,28 +431,24 @@ describe('live operator surgery', () => {
           { bodyGroupId: group, shardIndex },
         ).id,
       );
-    const [lone] = appendBody('d-lone', 'g-lone', ['lone']);
-    const long = appendBody('d-long', 'g-long', ['l0', 'l1', 'l2']);
+    appendBody('d-a', 'g-a', ['a0', 'a1']);
+    cm().addMessage('user', [{ type: 'text', text: 'between' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-mid' });
+    appendBody('d-b', 'g-b', ['b0', 'b1', 'b2']);
     const internals = framework as unknown as {
       handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
     };
-    const hide = (fromMessageId: string) => internals.handleHostCommand('discord', {
+    // From the second body's first shard back to the first body's: both
+    // widen to their whole bodies.
+    const result = await internals.handleHostCommand('discord', {
       command: 'hide',
       agentName: 'scout',
-      fromMessageId,
+      fromMessageId: 'd-b',
+      toMessageId: 'd-a',
       requesterName: 'antra',
     });
-
-    const one = await hide('d-lone');
-    assert.equal(one.ok, true, String(one.error));
-    assert.equal(one.hidden, 1);
-    assert.equal(cm().getMessage(lone as never), null);
-
-    const whole = await hide('d-long');
-    assert.equal(whole.ok, true, String(whole.error));
-    assert.equal(whole.hidden, 3);
-    assert.deepEqual((whole.hiddenRefs as Array<{ messageId: string }>).map((ref) => ref.messageId), ['d-long']);
-    for (const id of long) assert.equal(cm().getMessage(id as never), null);
+    assert.equal(result.ok, true, String(result.error));
+    assert.equal(result.hidden, 3);
+    assert.deepEqual((result.hiddenRefs as Array<{ messageId: string }>).map((ref) => ref.messageId), ['d-a', 'd-mid', 'd-b']);
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
