@@ -169,7 +169,7 @@ export interface PassOptions {
   cap?: number;
   /**
    * A recursive directory pass of a sync or scan: its walk resumes after the
-   * last file the previous one of this scope took, and records where it
+   * last entry the previous one of this scope took, and records where it
    * stopped, so repeated passes cover a scope larger than the cap. A
    * listing's pass starts at its scope's start.
    */
@@ -633,9 +633,9 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
         ...(resumeAfter !== undefined ? { resumeAfter } : {}),
       });
       for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
-      // Ignored names are listed only when something tracks them (above).
-      // The other entries it took (a link, a socket…): ignored names are
-      // listed only when something tracks them (above).
+      // The other entries it took (a link, a socket…). Ignored names, and the
+      // entries the cap left, are listed only when something tracks them
+      // (above).
       for (const p of walk.othersTaken) if (inScope(p, scope)) candidates.add(p);
       for (const d of walk.dirs) if (inScope(d, { kind: 'dir', dir: scope.dir, recursive: false })) gathered.dirs.push(d);
     }
@@ -662,6 +662,8 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       let region: Walk['incomplete'][number] | undefined;
       for (const r of walk.incomplete) {
         if (r.path !== '' && path !== r.path && !path.startsWith(r.path + '/')) continue;
+        // A link's own region is about what lies beneath it, not the link.
+        if (r.kind === 'symlink' && r.path === path) continue;
         if (region === undefined || r.path.length > region.path.length) region = r;
       }
       gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
@@ -855,14 +857,17 @@ export async function reconcilePass(
       });
     }
     for (const region of walk.incomplete) {
-      const hides = tracked.some((p) => p === region.path || p.startsWith(region.path + '/'));
+      // A link's own region hides only what lies beneath it: the link itself
+      // is reported by path, with its own reason.
+      const hides = tracked.some((p) => (region.kind !== 'symlink' && p === region.path) || p.startsWith(region.path + '/'));
       if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
       // An ignored name that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
-      // (agent-framework #276). A symlink region isn't counted: the link
-      // itself is a candidate the pass reports by path, taken through the
+      // (agent-framework #276). A symlink region isn't counted: a link the
+      // walk took is a candidate the pass reports by path, taken through the
       // link when it's a file on a mount that follows symlinks, and
-      // otherwise listed under `skipped`.
+      // otherwise listed under `skipped`; a tracked link the cap left is
+      // unverified for the cap.
       else if (region.kind === 'ignored') result.passedOver.set(region.reason, (result.passedOver.get(region.reason) ?? 0) + 1);
     }
   }

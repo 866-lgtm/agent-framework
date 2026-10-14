@@ -2507,6 +2507,75 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.equal(await contentOf(m, 'l3'), 'target zz/t3.txt');
   });
 
+  test('a directory proven missing on the after stretch that is an in-mount link on the wrap proves nothing absent', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['m/1.txt', 'm/2.txt', 'm/3.txt', 'z/q.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', {}); // takes m/1, m/2: the place is m/2.txt
+    // After the root is listed, m/ moves to m-away/ (in the mount), so the
+    // after stretch proves m/ missing; while z/ is listed, m becomes a link
+    // to m-away/, which holds all three files.
+    let moved = false;
+    let linked = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!moved && String(path) === realpathSync(env.dir)) {
+        const listed = await readdir(path, ...rest);
+        moved = true;
+        renameSync(env.disk('m'), env.disk('m-away'));
+        return listed;
+      }
+      if (!linked && String(path).endsWith(`${'/'}z`)) {
+        linked = true;
+        symlinkSync(env.disk('m-away'), env.disk('m'));
+      }
+      return readdir(path, ...rest);
+    }, () => call(m, 'sync', {}));
+    assert.ok(moved && linked);
+    for (const f of ['m/1.txt', 'm/2.txt', 'm/3.txt']) assert.notEqual(env.store.treeGet(TREE, f), null, `${f} is on disk through the link m: not proven absent`);
+  });
+
+  test('a subdirectory proven missing on the after stretch stays missing when its parent is the same directory on the wrap', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['d/a.txt', 'd/b.txt', 'd/q/x.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', {}); // takes d/a, d/b: the place is d/b.txt; d/q is left
+    env.rmDisk('d/a.txt'); // so the next pass takes one of its two
+    // d/ is listed with q/ in it; q/ is gone by the time the after stretch
+    // checks it, so the walk proves d/q missing. d/ itself is untouched.
+    let removed = false;
+    let synced: any;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!removed && String(path).endsWith(`${'/'}d`)) {
+        const listed = await readdir(path, ...rest);
+        removed = true;
+        rmSync(env.disk('d/q'), { recursive: true });
+        return listed;
+      }
+      return readdir(path, ...rest);
+    }, async () => {
+      synced = await call(m, 'sync', {});
+    });
+    assert.ok(removed);
+    assert.ok(!(synced.incomplete ?? []).some((r: { reason: string }) => /walk cap/.test(r.reason)), `the pass took one of its two: ${JSON.stringify(synced.incomplete)}`);
+    assert.equal(env.store.treeGet(TREE, 'd/q/x.txt'), null, 'd/q was proven missing: d/q/x.txt is gone from disk');
+  });
+
+  test('a tracked link the cap leaves is unverified for the cap, as a tracked file is, and listed under incomplete only by its directory', async (t) => {
+    const env = new Env(t);
+    for (const f of ['zz/t1.txt', 'zz/t2.txt', 'zz/t3.txt']) env.writeDisk(f, `target ${f}`);
+    env.writeDisk('a.txt', 'a');
+    for (const n of ['1', '2', '3']) symlinkSync(env.disk(`zz/t${n}.txt`), env.disk(`l${n}`));
+    const m = await env.open({ walkCap: 2, followSymlinks: true });
+    await call(m, 'sync', {}); // a.txt, l1
+    await call(m, 'sync', {}); // l2, l3: the place is l3
+    const third = await call(m, 'sync', {}); // zz/t1.txt, zz/t2.txt
+    for (const p of ['a.txt', 'l1', 'l2', 'l3']) {
+      const reason = (third.skipped ?? []).find((x: { path: string }) => x.path === p)?.reason;
+      assert.match(reason ?? '', /walk cap \(2\) was reached/, `${p}: ${reason}`);
+    }
+    assert.ok(!(third.incomplete ?? []).some((r: { path: string }) => ['l1', 'l2', 'l3'].includes(r.path)), JSON.stringify(third.incomplete));
+  });
+
   test('an accepted new root starts with no place', async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);

@@ -94,7 +94,7 @@ type JournalEntry =
   | { t: 'set'; mount: string; path: string; value: Physical }
   | { t: 'forget'; mount: string; path: string }
   /**
-   * Where a capped walk of `scope` stopped (the last file it took), or null
+   * Where a capped walk of `scope` stopped (the last entry it took), or null
    * once a walk covered the scope. It carries no `path` field: agent-framework
    * 0.22 replays an entry it doesn't know as a `forget` of `entry.path`, and
    * so leaves the evidence alone when there is none.

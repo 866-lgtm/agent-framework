@@ -822,8 +822,8 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
  * proven absent, whichever files were taken. Once the cap is reached, no
  * further directory is listed.
  *
- * With `resumeAfter` (a file in the scope, from an earlier walk's
- * `stoppedAfter`), a recursive walk takes the files after it first, then
+ * With `resumeAfter` (an entry in the scope, from an earlier walk's
+ * `stoppedAfter`), a recursive walk takes the entries after it first, then
  * wraps to the start of the scope, so repeated walks cover a scope larger
  * than the cap.
  */
@@ -1002,9 +1002,12 @@ export async function walkScope(
       if (left === 0) break;
       if (!dirIn(stretch, sub)) continue;
       const child = await checkChild(view, rootReal, dir, sub);
+      // This check replaces what an earlier one proved of `sub` itself, such
+      // as missing on the after stretch and found again on the wrap. What was
+      // proven beneath a directory that is still the same one stands, and
+      // list() drops it from one that isn't.
+      walk.missing.delete(sub);
       if (child.kind === 'checked') {
-        // A directory found again, on the wrap, after it was proven missing.
-        for (const p of walk.missing) if (p === sub || p.startsWith(sub + '/')) walk.missing.delete(p);
         await visit(child.dir, stretch);
         continue;
       }
