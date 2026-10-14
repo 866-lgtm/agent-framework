@@ -370,9 +370,9 @@ export class PushHandler {
    * failing `field` and the error's message as `detail`. A missing eventId
    * prints as `""` and traces as `''`, as the channel lane's missing id does.
    * A channel-scoped push refused because its channel isn't declared or may
-   * not be used names the channel, and is refused for as long as that lasts,
-   * so its line prints at most once a minute per channel (RefusalLines);
-   * every refusal is traced.
+   * not be used names the channel on its line and its trace, and is refused
+   * for as long as that lasts, so its line prints at most once a minute per
+   * channel (RefusalLines); every refusal is traced.
    */
   private traceCoalesceRejection(
     serverId: string,
@@ -400,6 +400,7 @@ export class PushHandler {
       featureSet: params.featureSet,
       reason,
       ...(field ? { field } : {}),
+      ...(channelId === undefined ? {} : { channelId }),
       detail: error.message,
     });
   }

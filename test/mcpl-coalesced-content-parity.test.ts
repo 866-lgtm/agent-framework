@@ -22,7 +22,7 @@ import { RefusalLines } from '../src/mcpl/refusal-lines.js';
 /** Base64 for an image well over 1 MiB once serialized (a Retina screenshot). */
 const BIG_IMAGE = { type: 'image', data: 'A'.repeat(1_600_000), mimeType: 'image/png' };
 
-type Rejection = { type: string; reason?: string; field?: string; detail?: string; messageId?: string; eventId?: string };
+type Rejection = { type: string; reason?: string; field?: string; detail?: string; messageId?: string; eventId?: string; channelId?: string };
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
@@ -493,9 +493,11 @@ test('a channel-scoped push refused for its channel (-32023, -32017) is traced e
   }
   now += 60_000;
   await f.send('push/event', f.params('u4', 'to_nowhere', { initial: true, channelId: 'nope', key: 'u4' }));
-  assert.deepEqual(rejected.map(({ eventId, reason }) => [eventId, reason]), [
-    ['u1', 'coalesce-invalid'], ['u2', 'coalesce-invalid'], ['u3', 'coalesce-invalid'], ['v1', 'coalesce-invalid'],
-    ['m1', 'coalesce-invalid'], ['m2', 'coalesce-invalid'], ['d1', 'coalesce-invalid'], ['d2', 'coalesce-invalid'], ['u4', 'coalesce-invalid'],
+  // Each refusal is traced, and one refused for its channel names it.
+  assert.deepEqual(rejected.map(({ eventId, reason, channelId }) => [eventId, reason, channelId]), [
+    ['u1', 'coalesce-invalid', 'nope'], ['u2', 'coalesce-invalid', 'nope'], ['u3', 'coalesce-invalid', 'nope'], ['v1', 'coalesce-invalid', 'elsewhere'],
+    ['m1', 'coalesce-invalid', undefined], ['m2', 'coalesce-invalid', undefined],
+    ['d1', 'coalesce-invalid', 'chat'], ['d2', 'coalesce-invalid', 'chat'], ['u4', 'coalesce-invalid', 'nope'],
   ]);
   assert.deepEqual(lines.filter((l) => l.startsWith('[push-event-rejected]')), [
     '[push-event-rejected] server=editor featureSet=doc eventId=u1 channel=nope reason=coalesce-invalid field=coalesce.channelId: "Unknown channel"',
