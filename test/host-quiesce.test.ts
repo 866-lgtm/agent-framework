@@ -752,7 +752,10 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
     add('one', 'agent');
     add('two', 'scout');
     add('three', 'agent');
-    add('stuck', 'agent');
+    // Nothing checks a fresh write's blocks beyond reading each one's type,
+    // so a block that isn't an object can be queued; the log line names it
+    // by its JavaScript type.
+    internals.addMessage('user', [{ type: 'text', text: 'stuck' }, 'a bare string'], undefined, { forAgent: 'agent' });
     add('for scout', 'scout');
     add('behind the stuck one', 'agent');
     add('also for scout', 'scout');
@@ -767,7 +770,7 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
       return realAdd(participant, content, metadata, causedBy);
     }) as typeof agentCm.addMessage;
     const named = () => lines.filter((line) =>
-      line.includes(`deferred write ${stuckId} (user: text) for agent could not be stored`)
+      line.includes(`deferred write ${stuckId} (user: text+string) for agent could not be stored`)
       && line.includes('a thrown value that has no text')).length;
 
     let status = await framework.resume();

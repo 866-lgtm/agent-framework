@@ -484,12 +484,17 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
 }
 
 /** A deferred entry as a log line names it: its id, participant and block
- *  types. Reading a block's type throws only on a null or undefined block,
- *  and no queued entry has one: addMessage reads every block's type before
- *  it defers a fresh write, and a recovered entry whose content isn't an
- *  array of objects is dropped at load (restorePersistedDeferredWrites). */
+ *  types. A block that isn't an object is named by its JavaScript type, and
+ *  an object whose type isn't a string as untyped, so the line names whatever
+ *  a queued entry holds. */
 function describeDeferredWrite(msg: { id: string; participant: string; content: ContentBlock[] }): string {
-  return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map((b) => b.type))].join('+') || 'empty'})`;
+  const kind = (b: unknown): string => {
+    if (b === null) return 'null';
+    if (typeof b !== 'object') return typeof b;
+    const type = (b as { type?: unknown }).type;
+    return typeof type === 'string' ? type : 'untyped';
+  };
+  return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map(kind))].join('+') || 'empty'})`;
 }
 
 /** Whether a deferred message can join a live stream at a tool boundary:
@@ -2337,11 +2342,12 @@ export class AgentFramework {
     // fails.
     //
     // A quiesced host defers each entry again instead, into the persisted
-    // queue, for boot recovery. A write that throws stays queued with what
-    // follows it for its target, and a memory-only queue still loses it at
-    // exit. An entry for a target no longer registered (a disposed fork) is
-    // left: dropped with a memory-only queue at exit, and logged and dropped
-    // from a persisted one at boot.
+    // queue, for boot recovery. Past the deferral, a write that throws stays
+    // queued with what follows it for its target, and a memory-only queue
+    // still loses it at exit. An entry for a target no longer registered (a
+    // disposed fork) is left: dropped with a memory-only queue at exit, and
+    // logged and dropped from a persisted one by the boot or resume flush
+    // that meets it.
     if (this.deferredMessages.length > 0) {
       const entries = [...this.agents.keys()].flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
