@@ -2214,11 +2214,16 @@ export class AgentFramework {
     return operation;
   }
 
-  /** From the moment stop() has begun: an attempt in flight (stopPromise is
-   * set before its body runs, which emits traces before the queue closes) or
-   * a closed queue (after a failed or completed stop()). */
+  /** Whether stop() has begun: an attempt in flight (stopPromise is set before
+   * its body runs, which emits traces before the queue closes) or a closed
+   * queue (after a failed or completed stop()). The admission rule for every
+   * operator entry point, the host/command listener included. */
+  private stopHasBegun(): boolean {
+    return !!this.stopPromise || !!this.queue?.isClosed;
+  }
+
   private refuseOperatorAfterStop(verb: string): void {
-    if (this.stopPromise || this.queue?.isClosed) throw new Error(verb + ' refused: the framework is stopping');
+    if (this.stopHasBegun()) throw new Error(verb + ' refused: the framework is stopping');
   }
 
   /** Wait in rounds until the set is empty: admitted work can still start work
@@ -15522,8 +15527,8 @@ export class AgentFramework {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
         // A stopping host runs no host command: refused like the requests
-        // above, before its handler runs.
-        if (this.queue?.isClosed) {
+        // above, before its handler runs, from the moment stop() has begun.
+        if (this.stopHasBegun()) {
           this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
           return;
         }

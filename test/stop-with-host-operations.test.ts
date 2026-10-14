@@ -433,17 +433,30 @@ describe('stop() with an operator operation in flight', () => {
         fw.emitTrace({ type: 'mcpl:coalescing', phase: 'suspended' });
       },
     };
+    // A turn to undo, so an admitted undo would move the branch.
+    const record = (framework as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(framework);
+    record('agent');
+    framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'a turn' }]);
+    const connection = Object.assign(new EventEmitter(), { id: 'srv' });
+    internals(framework).wireMcplEvents(connection);
     let inner: Promise<void> | undefined;
     let undoInside: unknown;
+    let hostUndo: unknown;
     framework.onTrace((event) => {
       if ((event as { type?: string }).type !== 'mcpl:coalescing' || inner) return;
       inner = framework.stop();
       // stop() has begun, though its queue isn't closed yet.
       try { framework.undoLastTurn('agent'); } catch (error) { undoInside = error; }
+      connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 1 }, {
+        respond: (result: unknown) => { hostUndo = { respond: result }; },
+        respondError: (code: number, message: string) => { hostUndo = { code, message }; },
+      });
     });
     const outer = framework.stop();
     assert.equal(inner, outer, 'the reentrant stop() gets the attempt already running');
     assert.match(String(undoInside), /^Error: undo refused: the framework is stopping$/);
+    assert.deepEqual(hostUndo, { code: -32000, message: 'the host is stopping' });
+    assert.equal(framework.getStore().currentBranch().name, 'main', 'nothing moved the branch');
     await outer;
     assert.deepEqual(order, ['modules stopped'], 'one teardown');
     assert.equal(framework.getStore().isClosed(), true);

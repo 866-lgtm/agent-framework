@@ -20,7 +20,8 @@
     refused: the framework is stopping" before they read or change
     anything, as a `host/command` already did. That includes a call made
     from a trace emitted inside `stop()`'s own start, before its queue has
-    closed.
+    closed, and the MCPL listener now refuses a `host/command` from that
+    moment too.
   - The exception is `syncDiscordAwarenessMarkers()`, which each `stop()`
     attempt admits until it has finished waiting, because its callers have
     already changed the store when they call it: the API server's undo and
