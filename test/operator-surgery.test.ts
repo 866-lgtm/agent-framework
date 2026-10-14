@@ -418,6 +418,17 @@ describe('live operator surgery', () => {
     assert.deepEqual(refsOf(copies), ['d-cut']);
     for (const id of [...partial, ...retry]) assert.equal(cm().getMessage(id as never), null);
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+
+    // A body of more shards than the operator log keeps ids for: its entry
+    // keeps the first 50 and says the list is cut.
+    const huge = appendBody('d-huge', 'g-huge', Array.from({ length: 60 }, (_, i) => `h${i}`));
+    const big = await hide('d-huge');
+    assert.equal(big.ok, true, String(big.error));
+    assert.equal(big.hidden, 1);
+    const entry = readLog(framework.getOperatorLogPath()!).filter((e) => e.kind === 'hide').at(-1)!;
+    assert.deepEqual(entry.result?.removedIds, huge.slice(0, 50));
+    assert.equal(entry.result?.removedIdsTruncated, true);
+    for (const id of huge) assert.equal(cm().getMessage(id as never), null);
   });
 
   it('hide refuses while a surgery holds the store, and a missing Discord id matches nothing', async () => {

@@ -7071,12 +7071,20 @@ export class AgentFramework {
           `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
+        // Every shard of every copy goes, so the ids are bounded as the
+        // range form's are.
+        const loggedIds = capIds(hiddenIds);
         this.recordOperatorAction({
           kind: 'hide',
           agent: agentName,
           requester: hostCommandRequester(serverId, params),
           params: { fromMessageId: params.fromMessageId },
-          result: { branch: this.store.currentBranch().name, hidden, removedIds: hiddenIds },
+          result: {
+            branch: this.store.currentBranch().name,
+            hidden,
+            removedIds: loggedIds.ids,
+            ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
+          },
         });
         return {
           ok: true,
