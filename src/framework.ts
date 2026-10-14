@@ -484,10 +484,10 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
 }
 
 /** A deferred entry as a log line names it: its id, participant and block
- *  types. Every queued entry's blocks are objects: a fresh write with a null
- *  block throws in addMessage before it could be queued, and a recovered
- *  entry whose content isn't an array of objects is dropped at load
- *  (restorePersistedDeferredWrites). */
+ *  types. Reading a block's type throws only on a null or undefined block,
+ *  and no queued entry has one: addMessage reads every block's type before
+ *  it defers a fresh write, and a recovered entry whose content isn't an
+ *  array of objects is dropped at load (restorePersistedDeferredWrites). */
 function describeDeferredWrite(msg: { id: string; participant: string; content: ContentBlock[] }): string {
   return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map((b) => b.type))].join('+') || 'empty'})`;
 }

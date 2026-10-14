@@ -483,35 +483,40 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await reopened.stop();
   });
 
-  it("stop() stores several agents' deferred writes in the order they arrived", async () => {
-    // Residents share one message slot, so the order writes arrived in is the
-    // order every resident reads.
-    const agents = [
-      { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' },
-      { name: 'scout', model: 'test-model', systemPrompt: 'You scout.' },
-    ];
-    const framework = await createFramework({ agents });
-    const internals = internalsOf(framework);
-    // Frames stop() doesn't wait for hold both agents' turns.
-    internals.activeTurnTokens.set('assistant', 1);
-    internals.activeTurnTokens.set('scout', 2);
-    assert.equal(internals.addMessage('Antra', text('one')), '', 'deferred');
-    assert.equal(internals.addMessage('Antra', text('two'), undefined, { forAgent: 'scout' }), '', 'deferred');
-    assert.equal(internals.addMessage('Antra', text('three')), '', 'deferred');
-    // A turn-end flush of the assistant's entries while a successor holds its
-    // turn defers them again (the 2026-07-31 interleave). They keep their
-    // places in arrival order.
-    internals.readdDrained(internals.drainDeferredFor('assistant'), 'turn-end flush');
-    assert.equal(internals.deferredMessages.length, 3, 'deferred again');
-    await framework.stop();
+  for (const persisted of [false, true]) {
+    it(`stop() stores several agents' deferred writes in the order they arrived (${persisted ? 'persisted' : 'memory-only'} queue)`, async () => {
+      // Residents share one message slot, so the order writes arrived in is
+      // the order every resident reads.
+      const agents = [
+        { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' },
+        { name: 'scout', model: 'test-model', systemPrompt: 'You scout.' },
+      ];
+      const framework = await createFramework({ agents });
+      const internals = internalsOf(framework);
+      // A queue boot recovery restored, or one a quiesce persisted, stays
+      // persisted until it empties.
+      internals.deferredWritesPersisted = persisted;
+      // Frames stop() doesn't wait for hold both agents' turns.
+      internals.activeTurnTokens.set('assistant', 1);
+      internals.activeTurnTokens.set('scout', 2);
+      assert.equal(internals.addMessage('Antra', text('one')), '', 'deferred');
+      assert.equal(internals.addMessage('Antra', text('two'), undefined, { forAgent: 'scout' }), '', 'deferred');
+      assert.equal(internals.addMessage('Antra', text('three')), '', 'deferred');
+      // A turn-end flush of the assistant's entries while a successor holds
+      // its turn defers them again (the 2026-07-31 interleave). They keep
+      // their places in arrival order.
+      internals.readdDrained(internals.drainDeferredFor('assistant'), 'turn-end flush');
+      assert.equal(internals.deferredMessages.length, 3, 'deferred again');
+      await framework.stop();
 
-    const reopened = await createFramework({ agents });
-    assert.deepEqual(
-      windowOf(reopened).filter((line) => /^Antra: (one|two|three)$/.test(line)),
-      ['Antra: one', 'Antra: two', 'Antra: three'],
-    );
-    await reopened.stop();
-  });
+      const reopened = await createFramework({ agents });
+      assert.deepEqual(
+        windowOf(reopened).filter((line) => /^Antra: (one|two|three)$/.test(line)),
+        ['Antra: one', 'Antra: two', 'Antra: three'],
+      );
+      await reopened.stop();
+    });
+  }
 
   it('a turn waiting to retry when the framework stops gives up rather than compile again', { timeout: 60_000 }, async () => {
     let waiting!: () => void;

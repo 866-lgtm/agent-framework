@@ -70,7 +70,12 @@
   the next acknowledgement dropped it from the persisted queue (at a turn
   start or a flush it was lost even from memory). At a tool boundary,
   nothing from it on is injected. While the framework runs it is kept; a
-  memory-only queue still loses it when the process exits.
+  memory-only queue still loses it when the process exits. A persisted queue
+  (one a quiesce persisted, or boot recovery restored) keeps it across
+  restarts: each boot restores it and tries it again with the rest of the
+  queue, at once or at the resume after a quiesced boot, and logs it again.
+  While it's held the queue stays persisted, so every later deferral is
+  written to the recovery file. Only the host log names it.
 - Boot recovery drops a recovered deferred write whose content isn't an
   array of block objects, which the store could never take, and logs it by
   id and participant, rather than holding it in the queue. Before, an entry
