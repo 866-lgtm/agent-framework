@@ -1068,7 +1068,9 @@ describe('stop() with an operator operation in flight', () => {
     let deliver: (() => void) | undefined;
     fw.beginDiscordAwarenessBarrier = () => ({
       requiresBarrier: true,
-      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 0, failed: 0 }); }),
+      promise: new Promise((resolve) => {
+        deliver = () => { order.push('sync delivered'); resolve({ status: 'delivered', delivered: 0, failed: 0 }); };
+      }),
     });
     let stopping: Promise<void> | undefined;
     framework.onTrace((event) => {
@@ -1088,7 +1090,7 @@ describe('stop() with an operator operation in flight', () => {
     await releaseWhenStopWaits(deliver);
     assert.equal((await undoing).undone, true);
     await stopping;
-    assert.ok(order.includes('modules stopped'));
+    assert.ok(order.indexOf('sync delivered') >= 0 && order.indexOf('sync delivered') < order.indexOf('modules stopped'), order.join(', '));
     assert.deepEqual(rejections, []);
   });
 
