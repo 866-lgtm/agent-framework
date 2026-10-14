@@ -81,7 +81,8 @@ export type TraceEvent =
       /**
        * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length'),
        * at most 128 characters. The poison-history breaker fires only on
-       * 'invalid_request'.
+       * 'invalid_request' at HTTP 400, 413 or 422 or with no status, and on
+       * 'context_length' at 413 (shedMayHelp).
        */
       errorType?: string;
       /** The provider's HTTP status, when the failure carried one. */
