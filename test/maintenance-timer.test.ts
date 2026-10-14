@@ -868,6 +868,64 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it('a failure that lasts is posted to the webhook again a cooldown after its last post, whatever changed-text report came between', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-webhook-reminder-'));
+    const strategy = new SayingStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'saying', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const internals = framework as unknown as { runQueuedMaintenance: () => Promise<void> };
+    let passes = 0;
+    const runPass = internals.runQueuedMaintenance.bind(framework);
+    internals.runQueuedMaintenance = () => { passes++; return runPass(); };
+    const passed = async (n: number) => { const after = passes; await waitFor(() => passes >= after + n); };
+    // The real opsAlert, with a webhook whose posts are recorded.
+    const posts: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      posts.push(String(JSON.parse(String(init?.body)).content));
+      return new Response('{}');
+    }) as typeof fetch;
+    const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+    process.env.CONNECTOME_OPS_WEBHOOK = 'http://webhook.invalid/hook';
+    const realNow = Date.now;
+    const start = realNow();
+    let offset = 0;
+    Date.now = () => realNow() + offset;
+    const minute = 60_000;
+    const maintenancePosts = () => posts.filter((post) => post.includes('context-maintenance-failed'));
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      framework.start();
+      await waitFor(() => maintenancePosts().length === 1);
+      assert.match(maintenancePosts()[0]!, /the first refusal/);
+      // 14 minutes on, the text changes: it's reported, and the webhook,
+      // still within its cooldown, doesn't post it.
+      offset = 14 * minute;
+      strategy.says = 'the second refusal';
+      await passed(3);
+      assert.equal(maintenancePosts().length, 1);
+      // At 15 minutes the webhook's cooldown since its post has passed.
+      offset = 15 * minute + 1_000;
+      await waitFor(() => maintenancePosts().length === 2);
+      assert.match(maintenancePosts()[1]!, /the second refusal/);
+      assert.ok(Date.now() - start < 16 * minute);
+    } finally {
+      console.error = quiet;
+      Date.now = realNow;
+      globalThis.fetch = realFetch;
+      if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK; else process.env.CONNECTOME_OPS_WEBHOOK = hook;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a readiness refusal read after an agent\'s last tick is that agent\'s failure, alerted once', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-after-ticks-'));
     const strategy = new RefusesAfterTicksStrategy();

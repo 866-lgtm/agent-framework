@@ -3594,16 +3594,23 @@ export class AgentFramework {
    * with the whole text. A failure that lasts, such as a manager whose
    * strategy failed to initialize, meets every pass, a few seconds apart:
    * each run records it, and it is logged and alerted again only when its
-   * whole text changes, once opsAlert's cooldown for it has passed (so the
-   * webhook, which posts a kind at most once per cooldown, hears a failure
-   * that lasts), or after a pass in which that agent's maintenance went
-   * without a failure (maintenanceFailureReported).
+   * whole text changes, once opsAlert's cooldown for it has passed since the
+   * webhook last posted it (so the webhook, which posts a kind at most once
+   * per cooldown, hears a failure that lasts), or after a pass in which that
+   * agent's maintenance went without a failure (maintenanceFailureReported).
    */
   private reportMaintenanceFailure(agentName: string, record: ContextMaintenanceAgentRun, wholeError: string): void {
     record.error = boundFailureText(wholeError);
     const reported = this.maintenanceFailureReported.get(agentName);
     const now = Date.now();
-    if (reported && reported.text === wholeError && now - reported.at < this.opsAlertCooldownMs) return;
+    if (reported && reported.text === wholeError) {
+      // The same failure again is alerted once the webhook's cooldown for it
+      // has passed, counted from the webhook's last post of it: a report of
+      // changed text that the webhook didn't post doesn't push the reminder
+      // back. With no webhook, it's counted from this failure's last report.
+      const since = this.opsAlertLastSent.get(`${agentName}:context-maintenance-failed`) ?? reported.at;
+      if (now - since < this.opsAlertCooldownMs) return;
+    }
     this.maintenanceFailureReported.set(agentName, { text: wholeError, at: now });
     console.error(`[context-maintenance] agent=${agentName} failed:`, record.error);
     this.opsAlert(
