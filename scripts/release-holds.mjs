@@ -36,24 +36,27 @@ function githubRepository(field) {
   return { unreadable: value };
 }
 
+/** The repository to ask, and where it was named, for a message that has to
+ *  send a maintainer to the setting that named it. */
 function repository() {
+  const fromEnvironment = { repo: process.env.GITHUB_REPOSITORY, namedBy: "GITHUB_REPOSITORY" };
   let pkg;
   try {
     pkg = JSON.parse(readFileSync("package.json", "utf8"));
   } catch (error) {
-    if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
+    if (fromEnvironment.repo) return fromEnvironment;
     fail(`release-holds: can't read package.json (${error.message}), and GITHUB_REPOSITORY is unset`);
   }
   const named = githubRepository(pkg.repository);
-  if (named.repo) return named.repo;
+  if (named.repo) return { repo: named.repo, namedBy: "package.json's repository field" };
   if (named.unreadable) {
     fail(`release-holds: package.json's repository field (${named.unreadable}) names no GitHub repository this check can ask`);
   }
-  if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
+  if (fromEnvironment.repo) return fromEnvironment;
   fail("release-holds: package.json names no repository, and GITHUB_REPOSITORY is unset");
 }
 
-const repo = repository();
+const { repo, namedBy } = repository();
 const api = (process.env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, "");
 const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
 const where = `https://github.com/${repo}/issues?q=is%3Aissue+is%3Aopen+label%3A${LABEL}`;
@@ -70,8 +73,8 @@ function refusal(status) {
   }
   if (status === 404) {
     return token
-      ? `no repository ${repo} is visible to the token in GH_TOKEN or GITHUB_TOKEN; check package.json's repository field and the token's access`
-      : `no repository ${repo} is visible without a token; check package.json's repository field, or set GH_TOKEN if the repository is private`;
+      ? `no repository ${repo} is visible to the token in GH_TOKEN or GITHUB_TOKEN; check ${namedBy} and the token's access`
+      : `no repository ${repo} is visible without a token; check ${namedBy}, or set GH_TOKEN if the repository is private`;
   }
   if (status >= 500) return "GitHub had an error; run this again once it answers normally";
   return "this check doesn't know that answer; see what GitHub shows";

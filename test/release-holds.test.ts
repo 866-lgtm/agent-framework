@@ -226,6 +226,23 @@ test("GITHUB_REPOSITORY names the repository when package.json names none", asyn
   }
 });
 
+test("a repository GitHub doesn't know sends the maintainer to the setting that named it", async () => {
+  const cases: Array<{ pkg: Record<string, unknown>; says: RegExp }> = [
+    { pkg: PKG, says: /no repository owner\/repo is visible without a token; check package\.json's repository field, or set GH_TOKEN/ },
+    { pkg: { name: "fixture" }, says: /no repository gone\/place is visible without a token; check GITHUB_REPOSITORY, or set GH_TOKEN/ },
+  ];
+  for (const { pkg, says } of cases) {
+    const gh = await github(404, { message: "Not Found" });
+    try {
+      const result = await run(project(pkg), { GITHUB_API_URL: gh.url, GITHUB_REPOSITORY: "gone/place" });
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, says);
+    } finally {
+      await gh.close();
+    }
+  }
+});
+
 test("a package.json that isn't JSON stops the release, saying so", async () => {
   const result = await run(project("{ not json"), { GITHUB_API_URL: "http://127.0.0.1:1" });
   assert.equal(result.code, 1);
