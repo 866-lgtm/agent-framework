@@ -170,6 +170,47 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
+  it('a run whose turn stop() refuses before its compile ends at once', { timeout: 60_000 }, async () => {
+    // The turn waits on its modules' context when stop() begins, so it is
+    // refused before it compiles, not after.
+    const { tempDir, storePath } = tempStorePath('ephemeral-stopping-precompile-');
+    let gathering!: () => void;
+    const inGather = new Promise<void>((resolve) => { gathering = resolve; });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const contextModule: Module = new EphemeralToolModule();
+    contextModule.gatherContext = async () => {
+      gathering();
+      await released;
+      return [];
+    };
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [],
+      modules: [contextModule],
+      syncIntervalMs: 0,
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      let compiles = 0;
+      const start = agent.startStreamWithInjections.bind(agent);
+      (agent as unknown as { startStreamWithInjections: typeof start }).startStreamWithInjections = async (...args) => {
+        compiles++;
+        return start(...args);
+      };
+      const run = runStartedEphemeral(framework, agent, contextManager, STOPPED_RUN_WATCHDOGS);
+      await inGather;
+      const stopped = framework.stop();
+      release();
+      await assert.rejects(run, /refused: the framework is stopping/);
+      await stopped;
+      assert.equal(compiles, 0, 'the turn was refused before its compile');
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('a run waiting to retry when stop() begins gives up before compiling again', { timeout: 60_000 }, async () => {
     // An ephemeral run doesn't hold the primary's provider gate, so the
     // refusal at the top of startAgentStream is the only check its retry

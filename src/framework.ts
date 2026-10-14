@@ -10006,6 +10006,7 @@ export class AgentFramework {
       if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
+        if (this.providerAdmissionClosed) this.endEphemeralRunRefused(agent);
         return false;
       }
 
