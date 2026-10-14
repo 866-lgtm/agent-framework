@@ -45,15 +45,12 @@
   waiting for a watchdog. Since no turn starts or registers a stream once
   `stop()` begins, no reply can then follow a stored entry in a stream, so
   `stop()` stores each one even while a frame it doesn't wait for still
-  holds its target's turn: a turn started outside the event loop, or a
-  puppet call. `stop()` neither refuses nor waits for a puppet call, as
-  before. One still running stores its pair when its tool returns. If that's
-  before `stop()` stores the deferred entries, the pair lands first and the
-  puppet's own flush stores what was deferred behind it; if it's later, the
-  pair lands after them, and on a store `stop()` has closed that write
-  fails. A quiesced host keeps what is deferred in its persisted queue for
-  boot recovery. An entry for a target no longer registered (a disposed
-  fork) is dropped from a memory-only queue at exit, as before.
+  holds its target's turn, such as a turn started outside the event loop, or
+  a puppet call still running after `stop()`'s wait for operator operations
+  timed out; that call's pair then lands after them. A quiesced host keeps
+  what is deferred in its persisted queue for boot recovery. An entry for a
+  target no longer registered (a disposed fork) is dropped from a
+  memory-only queue at exit, as before.
 - A deferred write whose store throws goes back into the queue under its id,
   and so does every entry queued behind it for that agent, so none of them
   lands ahead of an earlier one, and a queued `tool_use` that can't be

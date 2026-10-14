@@ -472,8 +472,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   it("stop() stores what is deferred for an agent whose turn frame it doesn't wait for", async () => {
     const framework = await createFramework();
     const internals = internalsOf(framework);
-    // A frame stop() doesn't await, such as a puppet call still running,
-    // holds the agent's turn token.
+    // A frame stop() doesn't await, such as a turn started outside the
+    // event loop, holds the agent's turn token.
     internals.activeTurnTokens.set('assistant', 1);
     assert.equal(internals.addMessage('Antra', text('still to land')), '', 'deferred: the turn is alive');
     await framework.stop();

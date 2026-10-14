@@ -2834,15 +2834,14 @@ export class AgentFramework {
     // queue order (residents share one message slot), each target cut at its
     // own first entry that can't be stored (writeDrainedInOrder). They go
     // past the deferral: a frame stop() doesn't wait for (a turn started
-    // outside the event loop, or a puppet call) can still hold its target's
-    // turn token, but no reply can follow an entry in any stream.
+    // outside the event loop) can still hold its target's turn token, but no
+    // reply can follow an entry in any stream.
     //
-    // stop() neither refuses nor waits for a puppet call, as before this
-    // drain. One still running stores its pair when its tool returns. If
-    // that's before this drain runs, the pair lands first, and the puppet's
-    // own flush stores what was deferred behind it. If it's later, the pair
-    // lands after these entries, and on a store closed below that write
-    // fails.
+    // A puppet call in flight is one of the operator operations stop() waited
+    // for above, so its pair and the flush after it have landed by now. If
+    // that wait timed out, the call may still be running and holding its
+    // target's turn: its pair lands after these entries, on the store a
+    // timed-out wait leaves open.
     //
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
