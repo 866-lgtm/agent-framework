@@ -56,14 +56,21 @@ const turn = (): Promise<void> => new Promise((r) => setImmediate(() => setImmed
 
 /**
  * The tool-result scan: in each source, every object literal whose `type`
- * is the string 'tool-result', read as a syntax tree (Babel's TypeScript
- * parser) rather than as text. A key is read however it's written (an
- * identifier, or a string in any quoting, computed or not), and a value
- * through `as`, `satisfies`, `<T>`, `!` and parentheses, so no way of writing
- * the literal itself escapes; a value held elsewhere, such as in a const,
- * isn't the literal and isn't read. Each literal must carry toolName, and
- * where its callId and toolName both read a call's id and name (`X.id`,
- * `X?.name`, `X['id']`), they must read the same X.
+ * property is the string 'tool-result', read as a syntax tree (Babel's
+ * TypeScript parser) rather than as text, wherever the literal sits.
+ * - A property is read when it's written `key: value` or as a shorthand.
+ *   Its key is an identifier, or a string in any quoting, computed or not; a
+ *   computed key that isn't a string, a getter or a method, and a spread
+ *   aren't read.
+ * - A value is read through `as`, `satisfies`, `<T>`, `!` and parentheses,
+ *   and a string in any quoting, escapes included. A string built at run
+ *   time, by a template with substitutions or by `+`, or held in a const,
+ *   isn't read.
+ * Each literal must carry toolName. Where its callId reads a call's `id`
+ * and its toolName that call's `name`, as `X.id`, `X?.id` or `X['id']`
+ * through the same wrappers, they must read the same X, compared as source
+ * text. Any other callId or toolName (a string, a variable, a fallback with
+ * `??`) isn't compared.
  */
 function scanToolResults(sources: Array<{ name: string; text: string }>): {
   literals: string[];
@@ -77,7 +84,7 @@ function scanToolResults(sources: Array<{ name: string; text: string }>): {
   const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
   const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
   const unwrap = (e: Node | undefined): Node | undefined => {
-    while (e && ['TSAsExpression', 'TSSatisfiesExpression', 'TSTypeAssertion', 'TSNonNullExpression', 'ParenthesizedExpression'].includes(e.type)) {
+    while (e && ['TSAsExpression', 'TSSatisfiesExpression', 'TSTypeAssertion', 'TSNonNullExpression'].includes(e.type)) {
       e = child(e, 'expression');
     }
     return e;
@@ -103,9 +110,8 @@ function scanToolResults(sources: Array<{ name: string; text: string }>): {
   for (const { name, text } of sources) {
     let program: Node;
     try {
-      program = parse(text, {
-        sourceType: 'module', plugins: ['typescript'], createParenthesizedExpressions: true,
-      }).program as unknown as Node;
+      // Babel keeps no node for parentheses, so `(x)` reads as `x`.
+      program = parse(text, { sourceType: 'module', plugins: ['typescript'] }).program as unknown as Node;
     } catch (error) {
       throw new Error(`${name}: ${(error as Error).message}`);
     }
@@ -411,6 +417,7 @@ describe('stop() with work still in flight', () => {
       }
     };
     walk(src);
+    assert.ok(sources.some((s) => s.name.includes('/')), 'the walk reaches src\'s subdirectories');
     const { literals, paired, missing, mismatched } = scanToolResults(sources);
     assert.ok(literals.length > 20, `found ${literals.length} tool-result literals; the scan has lost them`);
     assert.deepEqual(missing, [], 'tool-result events without toolName');
@@ -419,7 +426,7 @@ describe('stop() with work still in flight', () => {
   });
 
   it('the tool-result scan reads every way the literal can be written, and reports what it should', () => {
-    const text = [
+    const a = [
       'declare const call: { id: string; name: string };',
       'declare const other: { id: string; name: string };',
       'declare const maybe: { id: string; name: string } | undefined;',
@@ -427,28 +434,48 @@ describe('stop() with work still in flight', () => {
       "  { type: 'tool-result', callId: call.id, toolName: call.name },",
       '  { type: "tool-result", callId: call.id, toolName: call.name },',
       '  { type: `tool-result`, callId: call.id, toolName: call.name },',
+      "  { type: 'tool\\x2dresult', callId: call.id, toolName: call.name },",
       "  { 'type': 'tool-result' as const, callId: call.id, toolName: call.name },",
       "  { type: ('tool-result') satisfies string, callId: call.id, toolName: call.name },",
       "  { ['type']: <const>'tool-result', callId: call.id, toolName: call.name },",
       "  { type: 'tool-result'!, callId: (call as typeof call).id as string, toolName: call!.name! },",
       "  { type: 'tool-result', callId: maybe?.id, toolName: maybe?.name },",
       "  { type: 'tool-result', callId: call['id'], toolName: call[`name`] },",
+      "  { type: 'tool-result', callId: ev.call.id, toolName: ev.call.name },",
       "  { type: 'tool-result', callId: call.id },",
       "  { type: 'tool-result', callId: call.id, toolName: other.name },",
       "  { type: 'tool-result', callId: (call).id, toolName: (other as typeof other).name },",
       "  { type: 'tool-result', callId: 'c1', toolName: 'read' },",
+      "  { type: 'tool-result', callId: call.id, toolName: call.id },",
+      "  { type: 'tool-result', callId: call[id], toolName: call.name },",
+      "  { type: 'tool-result', callId: call.id, toolName: other.name ?? 'read' },",
+      "  { type: 'tool-result', callId: call.id, [toolName]: call.name },",
+      "  { type: 'tool-result', callId: call.id, get toolName() { return call.name; } },",
+      "  { ...base, type: 'tool-result', callId: call.id },",
+      "  { [type]: 'tool-result', callId: call.id },",
+      '  { type: `tool-result${suffix}`, callId: call.id },',
       "  { type: 'tool-results', callId: call.id },",
       "  { kind: 'tool-result', callId: call.id },",
       '];',
     ].join('\n');
-    const result = scanToolResults([{ name: 'events.ts', text }]);
-    const lines = (...ns: number[]) => ns.map((n) => `events.ts:${n}`);
-    assert.deepEqual(result.literals, lines(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17), 'each spelling is a tool-result literal, and only those');
-    assert.deepEqual(result.missing, lines(14));
-    assert.equal(result.paired, 11, 'every pair of call reads, through wrappers and optional or computed members');
+    const b = [
+      'export function emit(wrap: (e: unknown) => void, call: { id: string; name: string }) {',
+      "  wrap({ inner: { type: 'tool-result', callId: call.id, toolName: call.name } });",
+      "  wrap({ type: 'tool-result', callId: call.id });",
+      '}',
+    ].join('\n');
+    const result = scanToolResults([{ name: 'a.ts', text: a }, { name: 'b.ts', text: b }]);
+    const at = (name: string, ...ns: number[]) => ns.map((n) => `${name}:${n}`);
+    assert.deepEqual(result.literals, [...at('a.ts', 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25), ...at('b.ts', 2, 3)],
+      'each spelling of the literal, wherever it sits, and nothing else');
+    // A computed variable key, a getter and a spread aren't read, so their toolName is missing.
+    assert.deepEqual(result.missing, [...at('a.ts', 16, 23, 24, 25), ...at('b.ts', 3)]);
+    // Through wrappers, optional and computed string members, and a member chain;
+    // not a wrong field, a variable index, a string or a fallback.
+    assert.equal(result.paired, 14, 'the call reads paired');
     assert.deepEqual(result.mismatched, [
-      'events.ts:15: callId reads call, toolName reads other',
-      'events.ts:16: callId reads call, toolName reads other',
+      'a.ts:17: callId reads call, toolName reads other',
+      'a.ts:18: callId reads call, toolName reads other',
     ]);
     // A source Babel can't parse fails the scan by name.
     assert.throws(() => scanToolResults([{ name: 'broken.ts', text: 'const = ;' }]), /^Error: broken\.ts: /);
