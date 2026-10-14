@@ -4955,9 +4955,12 @@ export class AgentFramework {
           && (m as { content: unknown[] }).content.every((b) => !!b && typeof b === 'object');
       const malformed = data.filter((m) => !wellFormed(m));
       for (const m of malformed) {
+        // What the entry holds there: a value that isn't text by its type.
         const field = (key: string): string => {
           const value = m && typeof m === 'object' ? (m as Record<string, unknown>)[key] : undefined;
-          return typeof value === 'string' ? value : `no ${key}`;
+          if (typeof value === 'string') return value;
+          if (value === undefined) return `no ${key}`;
+          return `${key} ${value === null ? 'null' : `of type ${typeof value}`}`;
         };
         console.error(
           `[host-mode] a recovered deferred context write is malformed and was dropped: ` +
@@ -15126,8 +15129,8 @@ export class AgentFramework {
    * being stored alone. (A tool_use that is stored, followed by a tool_result
    * that can't be, stays stored without it until the tool_result lands at a
    * later flush. The only queued pair is puppetToolCall's defensive one,
-   * which no path reaches today.) An entry that keeps failing holds its
-   * target's later queued writes, logged by id at each flush, rather than
+   * which no path reaches today.) An entry that keeps failing is logged by
+   * id at each flush, and holds its target's later queued writes rather than
    * letting them land out of order.
    *
    * The hold is the queue's alone. A write that isn't deferred is stored at

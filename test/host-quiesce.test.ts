@@ -722,6 +722,52 @@ test('resume flushes deferred writes in order: a poison write stays queued with 
   });
 });
 
+test('a write that fails at resume goes back into the queue once: the recovery file holds each entry once while the batch waits for its ack', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework, dir) => {
+    await framework.quiesce({ reason: 'refold' });
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const add = (framework as unknown as {
+      addMessage(participant: string, content: unknown[]): unknown;
+    }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'first' }]);
+    add('user', [{ type: 'text', text: 'poison' }]);
+    add('user', [{ type: 'text', text: 'third' }]);
+
+    const realAdd = cm.addMessage.bind(cm);
+    (cm as unknown as { addMessage: typeof cm.addMessage }).addMessage = ((participant, content, metadata, causedBy) => {
+      if ((content[0] as { text?: string }).text === 'poison') throw new Error('store write failed');
+      return realAdd(participant, content, metadata, causedBy);
+    }) as typeof cm.addMessage;
+    // The batch's ack syncs the store before it rewrites the recovery file
+    // without what landed. While that sync fails, the batch stays in the file
+    // as it was handed off, beside what went back into the queue.
+    const store = (framework as unknown as { store: { sync(): void } }).store;
+    const realSync = store.sync.bind(store);
+    let syncFails = true;
+    store.sync = () => {
+      if (syncFails) throw new Error('sync failed');
+      realSync();
+    };
+    try {
+      await framework.resume();
+    } finally {
+      syncFails = false;
+    }
+
+    const file = join(dir, 'store', 'recovery', 'deferred-writes.json');
+    const pending = (JSON.parse(readFileSync(file, 'utf8')) as {
+      pending: Array<{ id: string; content: Array<{ text: string }> }>;
+    }).pending;
+    assert.deepEqual(
+      pending.map((entry) => entry.content[0]!.text),
+      ['first', 'poison', 'third'],
+      'the entry that landed waits for its ack, and the two that went back are in the queue, each once',
+    );
+    assert.equal(new Set(pending.map((entry) => entry.id)).size, 3, 'no id is written twice');
+  });
+});
+
 test("resume stores several agents' writes in the order they arrived, and cuts each agent at its own stuck write, named at every flush", { timeout: 60_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-targets-'));
   const framework = await AgentFramework.create({
@@ -817,13 +863,15 @@ test('boot recovery drops a recovered deferred write the store could never take,
     await framework.stop();
 
     // Entries no write of the framework's makes, as other code could leave
-    // them in the recovery file: a null block, and content that isn't blocks.
+    // them in the recovery file: a null block, content that isn't blocks, and
+    // a participant that isn't text, which the line names by its type.
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
     doc.pending.splice(1, 0,
       { id: 'null-block', seq: 100, participant: 'user', content: [{ type: 'text', text: 'x' }, null] },
       { id: 'not-blocks', seq: 101, participant: 'user', content: 'x' },
+      { id: 'number-participant', seq: 102, participant: 42, content: [{ type: 'text', text: 'x' }] },
     );
     writeFileSync(file, JSON.stringify(doc));
 
@@ -831,11 +879,11 @@ test('boot recovery drops a recovered deferred write the store could never take,
     framework = await AgentFramework.create(config());
     console.error = error;
     assert.equal(framework.getHostModeStatus().deferredWrites, 2, 'the well-formed entries are restored');
-    for (const entry of ['null-block (user)', 'not-blocks (user)']) {
+    for (const entry of ['null-block (user)', 'not-blocks (user)', 'number-participant (participant of type number)']) {
       assert.ok(lines.some((line) => line.includes(`malformed and was dropped: ${entry}`)), `${entry} is named:\n${lines.join('\n')}`);
     }
     const rewritten = readFileSync(file, 'utf8');
-    assert.ok(!rewritten.includes('null-block') && !rewritten.includes('not-blocks'), 'the recovery file is rewritten without them');
+    assert.ok(!['null-block', 'not-blocks', 'number-participant'].some((id) => rewritten.includes(id)), 'the recovery file is rewritten without them');
     await framework.resume();
     const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
       .map((m) => (m.content[0] as { text: string }).text);

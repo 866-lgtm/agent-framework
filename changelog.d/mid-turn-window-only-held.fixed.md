@@ -75,7 +75,9 @@
   of the queue, at once or at the resume after a quiesced boot, and logs it
   again, unless it's one boot drops (below). While it's held the queue stays
   persisted, so every later deferral is written to the recovery file, up to
-  the file's size cap. Only the host log names it.
+  the file's size cap; past it the file isn't rewritten, as the host log
+  warns, and what's deferred after that is kept in memory only. Only the
+  host log names the held write.
 - Boot recovery drops a recovered deferred write whose participant isn't
   text or whose content isn't an array of block objects, which the store
   could never take, and logs it by id and participant, rather than holding
