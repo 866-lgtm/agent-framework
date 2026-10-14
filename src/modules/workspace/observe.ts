@@ -672,13 +672,23 @@ export function sniffImageMime(head: Buffer): string | undefined {
 // ===========================================================================
 
 export interface Walk {
-  /** Regular files seen. */
+  /** Regular files the walk took: the pass observes each one. */
   files: Set<string>;
+  /**
+   * Regular files a listing showed that the walk didn't take, past its file
+   * cap or outside the stretch a resumed walk covered: present, and not
+   * observed by this pass.
+   */
+  seen: Set<string>;
   /** Directories seen. */
   dirs: Set<string>;
   /** Names seen that are neither (symlinks, sockets…), or ignored: present, unproven. */
   others: Map<string, string>;
-  /** Directories listed completely. */
+  /**
+   * Directories whose listing the walk read whole, and that were still the
+   * directory at their path once it had: every name in one is in `files`,
+   * `seen`, `dirs` or `others`, so a name in none of them is absent.
+   */
   complete: Set<string>;
   /** Directories that don't exist (everything beneath them is absent). */
   missing: Set<string>;
@@ -690,6 +700,59 @@ export interface Walk {
    * never walked; the pass reports the link itself by path.
    */
   incomplete: Array<{ path: string; reason: string; kind: 'error' | 'cap' | 'ignored' | 'symlink' }>;
+  /**
+   * When the file cap stopped the walk, the last file it took. A walk that
+   * resumes after it takes the files after it first, in the walk's order
+   * (`compareInWalk`), then wraps to the start of its scope.
+   */
+  stoppedAfter?: string;
+}
+
+/** Names compare by UTF-16 code unit, the same on every platform and filesystem. */
+function compareNames(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Where file `a` falls against file `b` in the walk's order: in each
+ * directory, its files by name, then its subdirectories by name, each with
+ * everything beneath it. A resumed walk relies on visiting files in the
+ * order it compares positions by, so the walk sorts each listing itself
+ * rather than take `readdir`'s order, which is the platform's (Node returns
+ * UTF-8 byte order on Linux, which differs from this one for some names).
+ */
+function compareInWalk(a: string, b: string): number {
+  const x = a.split('/');
+  const y = b.split('/');
+  for (let i = 0; ; i++) {
+    const lastX = i === x.length - 1;
+    const lastY = i === y.length - 1;
+    if (x[i] !== y[i]) {
+      if (lastX && lastY) return compareNames(x[i]!, y[i]!);
+      if (lastX) return -1; // a directory's files come before its subdirectories
+      if (lastY) return 1;
+      return compareNames(x[i]!, y[i]!);
+    }
+    if (lastX && lastY) return 0;
+    if (lastX) return -1;
+    if (lastY) return 1;
+  }
+}
+
+/**
+ * Where the subtree of directory `dir` falls against file `at` in the walk's
+ * order: wholly before it, holding it (an ancestor of it), or wholly after it.
+ */
+function subtreeAgainst(dir: string, at: string): 'before' | 'holds' | 'after' {
+  if (dir === '') return 'holds';
+  const d = dir.split('/');
+  const p = at.split('/');
+  for (let i = 0; i < d.length; i++) {
+    // `at` is a file in the directory above d[i], whose files come first.
+    if (i === p.length - 1) return 'after';
+    if (d[i] !== p[i]) return compareNames(d[i]!, p[i]!) < 0 ? 'before' : 'after';
+  }
+  return 'holds';
 }
 
 /**
@@ -740,17 +803,30 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
 
 /**
  * List a directory scope ('' for the mount root), descending when recursive,
- * up to `cap` files in total. A scope that resolves outside the mount is not
- * listed at all; beneath it, the walk only descends real directories, never
- * symlinks. Each directory's listing counts only if, once listed, it is still
- * the directory at its path: a directory moved or replaced meanwhile is an
- * incomplete region, contributing no names and proving nothing absent.
+ * taking up to `cap` files in the walk's order (`compareInWalk`). A scope
+ * that resolves outside the mount is not listed at all; beneath it, the walk
+ * only descends real directories, never symlinks. Each directory's listing
+ * counts only if, once listed, it is still the directory at its path: a
+ * directory moved or replaced meanwhile is an incomplete region, contributing
+ * no names and proving nothing absent.
+ *
+ * Each listing is read whole and every name in it recorded, so the files the
+ * cap leaves are known present (`seen`) and a name the listing lacks is
+ * proven absent, whichever files were taken. Once the cap is reached, no
+ * further directory is listed.
+ *
+ * With `resumeAfter` (a file in the scope, from an earlier walk's
+ * `stoppedAfter`), a recursive walk takes the files after it first, then
+ * wraps to the start of the scope, so repeated walks cover a scope larger
+ * than the cap.
  */
 export async function walkScope(
   view: MountView, rootReal: string, scope: string, recursive: boolean, cap: number,
-  opts: { named?: boolean } = {},
+  opts: { named?: boolean; resumeAfter?: string } = {},
 ): Promise<Walk> {
-  const walk: Walk = { files: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(), incomplete: [] };
+  const walk: Walk = {
+    files: new Set(), seen: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(), incomplete: [],
+  };
   const top = await checkDir(view, rootReal, scope);
   if (top.kind === 'absent') {
     walk.missing.add(scope);
@@ -760,20 +836,37 @@ export async function walkScope(
     walk.incomplete.push({ path: scope, reason: top.outside ? 'the directory resolves outside the mount' : top.reason, kind: 'error' });
     return walk;
   }
-  let capped = false;
   // A scope a path sync names is walked even where the ignore list covers
   // it: a pattern covering the scope itself, or a directory above it, doesn't
   // apply beneath it. So a named directory's contents are synced, as a named
   // file is (agent-framework #276). A listing keeps the ignore: its pass
   // would otherwise start tracking what it lists.
   const ignore = opts.named ? view.ignore.filter((pattern) => !coveredByIgnore(scope, [pattern])) : view.ignore;
+  // A position outside the scope, or for a walk that doesn't descend, is no
+  // position in this walk's order.
+  const after = recursive && opts.resumeAfter !== undefined && (scope === '' || opts.resumeAfter.startsWith(scope + '/'))
+    ? opts.resumeAfter
+    : undefined;
 
-  const visit = async (dir: CheckedDir): Promise<void> => {
+  type Listing = { files: string[]; subdirs: string[] };
+  /** Each directory is listed once: a resumed walk visits the ones holding its position on both sides of it. */
+  const listings = new Map<string, Listing | null>();
+  const visited = new Set<string>();
+  /** Paths already reported as errors, so a second visit doesn't report them again. */
+  const failed = new Set<string>();
+  const fail = (path: string, reason: string): void => {
+    if (failed.has(path)) return;
+    failed.add(path);
+    walk.incomplete.push({ path, reason, kind: 'error' });
+  };
+  let left = cap;
+  let lastTaken: string | undefined;
+
+  const list = async (dir: CheckedDir): Promise<Listing | null> => {
     const rel = dir.rel;
-    if (capped) {
-      walk.incomplete.push({ path: rel, reason: `not visited: the file cap (${cap}) was reached`, kind: 'cap' });
-      return;
-    }
+    const known = listings.get(rel);
+    if (known !== undefined) return known;
+    listings.set(rel, null);
     let entries;
     try {
       entries = await readdir(dir.real, { withFileTypes: true });
@@ -782,18 +875,18 @@ export async function walkScope(
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         // Gone since it was checked: absent beneath only if that can be shown.
         const proof = rel === '' ? ROOT_UNAVAILABLE : await confirmAbsent(view, rootReal, rel, 'beneath');
-        if (typeof proof === 'string') walk.incomplete.push({ path: rel, reason: proof, kind: 'error' });
+        if (typeof proof === 'string') fail(rel, proof);
         else walk.missing.add(rel);
-        return;
+        return null;
       }
-      walk.incomplete.push({ path: rel, reason: `cannot list (${code ?? String(err)})`, kind: 'error' });
-      return;
+      fail(rel, `cannot list (${code ?? String(err)})`);
+      return null;
     }
+    entries.sort((a, b) => compareNames(a.name, b.name));
     const files: string[] = [];
     const subdirs: string[] = [];
     const others: Array<[string, string]> = [];
     const regions: Walk['incomplete'] = [];
-    let reachedCap = false;
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (isIgnored(childRel, entry.name, ignore)) {
@@ -804,12 +897,6 @@ export async function walkScope(
       if (entry.isDirectory()) {
         subdirs.push(childRel);
       } else if (entry.isFile()) {
-        if (walk.files.size + files.length >= cap) {
-          capped = true;
-          reachedCap = true;
-          regions.push({ path: rel, reason: `the file cap (${cap}) was reached`, kind: 'cap' });
-          break;
-        }
         files.push(childRel);
       } else {
         const symlink = entry.isSymbolicLink();
@@ -820,25 +907,75 @@ export async function walkScope(
     // A listing of a directory that was moved or replaced meanwhile says
     // nothing about this path: neither its names nor its absences count.
     if (!(await dir.stillHere())) {
-      walk.incomplete.push({ path: rel, reason: CHANGED_WALK, kind: 'error' });
-      return;
+      fail(rel, CHANGED_WALK);
+      return null;
     }
-    for (const f of files) walk.files.add(f);
+    for (const f of files) walk.seen.add(f);
     for (const d of subdirs) walk.dirs.add(d);
     for (const [p, why] of others) walk.others.set(p, why);
     walk.incomplete.push(...regions);
-    if (reachedCap) return;
     walk.complete.add(rel);
+    const listing = { files, subdirs };
+    listings.set(rel, listing);
+    return listing;
+  };
+
+  type Stretch = 'all' | 'after' | 'upto';
+  const fileIn = (stretch: Stretch, file: string): boolean =>
+    stretch === 'all' || (compareInWalk(file, after!) > 0) === (stretch === 'after');
+  const dirIn = (stretch: Stretch, dir: string): boolean => {
+    if (stretch === 'all') return true;
+    const at = subtreeAgainst(dir, after!);
+    return at === 'holds' || at === (stretch === 'after' ? 'after' : 'before');
+  };
+
+  const visit = async (dir: CheckedDir, stretch: Stretch): Promise<void> => {
+    visited.add(dir.rel);
+    const listing = await list(dir);
+    if (!listing) return;
+    for (const f of listing.files) {
+      if (left === 0) break;
+      if (!fileIn(stretch, f)) continue;
+      left--;
+      walk.seen.delete(f);
+      walk.files.add(f);
+      lastTaken = f;
+    }
     if (!recursive) return;
-    for (const sub of subdirs) {
+    for (const sub of listing.subdirs) {
+      // Once the cap is reached, no further directory is listed.
+      if (left === 0) break;
+      if (!dirIn(stretch, sub)) continue;
       const child = await checkChild(view, rootReal, dir, sub);
-      if (child.kind === 'checked') await visit(child.dir);
+      if (child.kind === 'checked') await visit(child.dir, stretch);
       else if (child.kind === 'absent') walk.missing.add(sub);
-      else walk.incomplete.push({ path: sub, reason: child.reason, kind: 'error' });
+      else fail(sub, child.reason);
     }
   };
 
-  await visit(top.dir);
+  if (after === undefined) {
+    await visit(top.dir, 'all');
+  } else {
+    await visit(top.dir, 'after');
+    if (left > 0) await visit(top.dir, 'upto');
+  }
+  if (left === 0 && lastTaken !== undefined) walk.stoppedAfter = lastTaken;
+
+  // What the cap left: directories holding files not taken, and directories
+  // a listing showed that weren't listed. A walk that doesn't descend leaves
+  // its subdirectories by design.
+  const capped = `the file cap (${cap}) was reached`;
+  const holdingUntaken = new Set<string>();
+  for (const f of walk.seen) holdingUntaken.add(parentOf(f));
+  for (const d of holdingUntaken) {
+    walk.incomplete.push({ path: d, reason: `${capped} before every file here was taken`, kind: 'cap' });
+  }
+  if (recursive) {
+    for (const d of walk.dirs) {
+      if (visited.has(d) || walk.missing.has(d) || failed.has(d)) continue;
+      walk.incomplete.push({ path: d, reason: `not visited: ${capped}`, kind: 'cap' });
+    }
+  }
   return walk;
 }
 
@@ -855,7 +992,7 @@ export function provenAbsent(walk: Walk, path: string): boolean {
     if (walk.missing.has(dir)) return true;
     const child = dir ? `${dir}/${parts[i]}` : parts[i]!;
     if (walk.complete.has(dir)) {
-      if (walk.others.has(child)) return false; // present, but unproven
+      if (walk.others.has(child) || walk.seen.has(child)) return false; // present, but unproven
       if (i === parts.length - 1) return !walk.files.has(child) && !walk.dirs.has(child);
       if (!walk.dirs.has(child)) return true; // no directory there: nothing beneath can exist
     }

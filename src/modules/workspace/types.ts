@@ -43,6 +43,16 @@ export interface MountConfig {
   /** Maximum file size in bytes (default: 5MB) */
   maxFileSize?: number;
   /**
+   * The most files one walk of this mount takes (default: 5000), a positive
+   * integer. A sync or scan that reaches it reports the rest as incomplete,
+   * and the next sync or scan of the same scope resumes after the last file
+   * it took, wrapping to the start, so repeated ones cover a larger mount; a
+   * restart keeps the place. A listing (`ls`, `glob`, `grep`) takes up to it
+   * from its scope's start. Each directory's listing is read whole, so a
+   * deletion is seen wherever the walk lists, whatever files it took.
+   */
+  walkCap?: number;
+  /**
    * If set, filesystem changes on this mount request inference.
    * - `true` — wake on any op (created | modified | deleted)
    * - array — wake only for the listed ops

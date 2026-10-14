@@ -2032,7 +2032,7 @@ describe('incomplete walks', () => {
     assert.notEqual(env.store.treeGet(TREE, 'cache/x.txt'), null);
   });
 
-  test('a capped walk deletes nothing it did not reach', async (t) => {
+  test('a capped walk proves absent what a listing lacks, and leaves unverified what it did not take', async (t) => {
     const env = new Env(t);
     const m = await env.open();
     for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) await seedSynced(env, m, f, f);
@@ -2040,9 +2040,131 @@ describe('incomplete walks', () => {
     const mount = (m as any).mounts.get('work');
     const pass = await (m as any).withMount(mount, () =>
       (m as any).passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { cap: 2 }));
-    assert.equal(pass.reports.get('c.txt')?.state, 'unverified');
-    assert.ok(pass.incomplete.some((r: { reason: string }) => /file cap/.test(r.reason)));
-    assert.notEqual(env.store.treeGet(TREE, 'c.txt'), null);
+    // The root's listing, read whole, has no c.txt: a deletion is seen
+    // wherever the walk lists, whichever files it took.
+    assert.equal(env.store.treeGet(TREE, 'c.txt'), null);
+    // d.txt is there, past the cap: unverified by this pass, and kept.
+    assert.equal(pass.reports.get('d.txt')?.state, 'unverified');
+    assert.notEqual(env.store.treeGet(TREE, 'd.txt'), null);
+    assert.ok(pass.incomplete.some((r: { reason: string }) => /file cap \(2\) was reached/.test(r.reason)));
+  });
+});
+
+describe('a mount larger than its walk cap (agent-framework #272)', () => {
+  const syncedNames = (env: Env) => env.store.treeList(TREE).map((e) => e.path).sort();
+
+  test('repeated bare syncs resume where the last stopped, so together they take the whole mount', async (t) => {
+    const env = new Env(t);
+    // Written out of order: the walk takes each directory's files by name,
+    // then its subdirectories by name.
+    for (const f of ['b/y.txt', 'z.txt', 'a.txt', 'b/x.txt', 'm.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+
+    const first = await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'm.txt'], 'the first two in the walk order');
+    assert.ok(first.incomplete.some((r: { reason: string }) => /file cap \(2\) was reached.*resumes after work\/m\.txt/.test(r.reason)),
+      JSON.stringify(first.incomplete));
+
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b/x.txt', 'm.txt', 'z.txt'], 'the next two, after m.txt');
+
+    // The last one, then the walk wraps to the start for the second: the
+    // mount is covered, and a.txt is looked at again.
+    env.writeDisk('a.txt', 'edited before the wrap');
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b/x.txt', 'b/y.txt', 'm.txt', 'z.txt']);
+    assert.equal(await contentOf(m, 'a.txt'), 'edited before the wrap', 'the third sync wrapped to a.txt');
+  });
+
+  test('the walk takes files by name, whatever order they were written in', async (t) => {
+    const env = new Env(t);
+    // Neither the order written nor its reverse starts with the three
+    // smallest names, so a walk taking them in either order would differ.
+    for (const f of ['g.txt', 'c.txt', 'h.txt', 'a.txt', 'f.txt', 'b.txt', 'e.txt', 'd.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 3 });
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt']);
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt']);
+  });
+
+  test('names that sort apart by UTF-8 byte and by UTF-16 code unit are each taken once: the walk visits files in the order it resumes by', async (t) => {
+    const env = new Env(t);
+    // U+FF21 comes before U+1F600 by UTF-8 byte, the order Node's readdir
+    // returns on Linux, and after it by UTF-16 code unit, the walk's order.
+    for (const f of ['b.txt', '\uFF21.txt', '\u{1F600}.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 1 });
+    const taken: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const before = new Set(syncedNames(env));
+      await call(m, 'sync', {});
+      taken.push(...syncedNames(env).filter((n) => !before.has(n)));
+    }
+    assert.deepEqual(taken, ['b.txt', '\u{1F600}.txt', '\uFF21.txt']);
+  });
+
+  test('a disk edit past the cap reaches the workspace on a later bare sync', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['a.txt', 'b.txt', 'c.txt']) await seedSynced(env, m, f, f);
+    env.writeDisk('c.txt', 'edited past the cap');
+    await call(m, 'sync', {});
+    await call(m, 'sync', {});
+    assert.equal(await contentOf(m, 'c.txt'), 'edited past the cap');
+  });
+
+  test('a deletion in a directory larger than the cap is proven by a listing read whole', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['big/a.txt', 'big/b.txt', 'big/c.txt', 'big/d.txt', 'big/e.txt']) await seedSynced(env, m, f, f);
+    env.rmDisk('big/e.txt');
+    // The first bare sync takes a.txt and b.txt; big's listing lacks e.txt.
+    await call(m, 'sync', {});
+    assert.equal(env.store.treeGet(TREE, 'big/e.txt'), null);
+    assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null);
+  });
+
+  test('a listing starts at its scope every time, and leaves no place behind', async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+    const listed = async () => [...(await listing(m)).keys()].sort();
+    assert.deepEqual(await listed(), ['a.txt', 'b.txt']);
+    assert.deepEqual(await listed(), ['a.txt', 'b.txt'], 'the same files again');
+    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), undefined);
+  });
+
+  test('a directory sync resumes for its own scope', async (t) => {
+    const env = new Env(t);
+    for (const f of ['d/a.txt', 'd/b.txt', 'd/c.txt', 'top.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+    await call(m, 'sync', { path: 'work/d' });
+    assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt']);
+    await call(m, 'sync', { path: 'work/d' });
+    assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt', 'd/c.txt']);
+    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), undefined, 'the mount root keeps its own place');
+  });
+
+  test('the place survives a restart: the next bare sync resumes after it', async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
+    let m = await env.open({ walkCap: 2 });
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt']);
+    m = await env.restart(m, { walkCap: 2 });
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt'], 'c.txt and d.txt, not a.txt and b.txt again');
+  });
+
+  test('walkCap must be a positive integer', () => {
+    for (const walkCap of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN, '5000']) {
+      assert.throws(
+        () => new WorkspaceModule({ mounts: [{ name: 'work', path: '/tmp', mode: 'read-write', walkCap: walkCap as number }] }),
+        /Mount "work": walkCap must be a positive integer/,
+        `walkCap ${String(walkCap)}`,
+      );
+    }
+    assert.doesNotThrow(() => new WorkspaceModule({ mounts: [{ name: 'work', path: '/tmp', mode: 'read-write', walkCap: 12_000 }] }));
   });
 });
 
