@@ -11137,16 +11137,20 @@ export class AgentFramework {
    * emitted inference:started, and listeners that bracket a turn, such as a
    * typing loop or an activity indicator, end it on a terminal event, so it
    * gets inference:aborted with `reason`, and lastInference records its end
-   * as driveStream's would. Nothing of the kind when another turn of this
-   * agent's name holds the turn token (one begun after a stop and start, or
-   * by a replacement agent object): the event and the record carry only the
-   * name, so this frame's would end that newer turn instead.
+   * as driveStream's would, when the record is still this turn's. Nothing of
+   * the kind when another turn of this agent's name holds the turn token (one
+   * begun after a stop and start, or by a replacement agent object): the
+   * event and the record carry only the name, so this frame's would end that
+   * newer turn instead.
    */
   private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number): void {
     const owner = this.activeTurnTokens.get(agentName);
     if (owner !== undefined && owner !== turnToken) return;
     const now = Date.now();
-    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), endedAt: now });
+    // Only this turn's own record ends: a name whose run was disposed meanwhile
+    // (runEphemeralToCompletion deletes its record) gets none back.
+    const last = this.lastInferenceAt.get(agentName);
+    if (last?.startedAt === startedAt) this.lastInferenceAt.set(agentName, { ...last, endedAt: now });
     this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: now - startedAt });
   }
 

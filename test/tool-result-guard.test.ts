@@ -3262,8 +3262,9 @@ test('a framework compile from before stop cannot drive after restart', async ()
 // removed, the agent object is replaced under its name, or the replacement's
 // own turn already holds the name's turn token.
 for (const phase of ['before', 'after'] as const) {
-  for (const how of ['stopping', 'removed', 'replaced', 'superseded'] as const) {
-    const title = { stopping: 'the framework stopping', removed: 'its agent removed', replaced: 'its agent replaced',
+  for (const how of ['stopping', 'removed', 'disposed', 'replaced', 'superseded'] as const) {
+    const title = { stopping: 'the framework stopping', removed: 'its agent removed',
+      disposed: 'its run disposed with its record', replaced: 'its agent replaced',
       superseded: "a newer turn of its agent's name running" }[how];
     test(`a turn dropped ${phase} its compile, with ${title}, ${how === 'superseded' ? "leaves the newer turn's bracket alone" : 'ends with inference:aborted'}`, async () => {
       const dir = mkdtempSync(join(tmpdir(), `guard-drop-${phase}-compile-`)); dirs.push(dir);
@@ -3305,7 +3306,12 @@ for (const phase of ['before', 'after'] as const) {
         await entered.opened;
         if (how === 'stopping') await framework.stop();
         else if (how === 'removed') internal.agents.delete('assistant');
-        else {
+        else if (how === 'disposed') {
+          // As runEphemeralToCompletion's disposal does: the agent, its record and its token go.
+          internal.agents.delete('assistant');
+          internal.lastInferenceAt.delete('assistant');
+          internal.activeTurnTokens.delete('assistant');
+        } else {
           internal.agents.set('assistant', Object.create(agent));
           if (how === 'superseded') internal.activeTurnTokens.set('assistant', -1);
         }
@@ -3328,7 +3334,13 @@ for (const phase of ['before', 'after'] as const) {
           assert.equal(turnEvents[1]?.reason, reason);
           const durationMs = turnEvents[1]?.durationMs ?? NaN;
           assert.ok(Number.isFinite(durationMs) && durationMs >= heldMs - 5 && durationMs < 60_000, `durationMs ${durationMs}`);
-          assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+          if (how === 'disposed') {
+            // The terminal event still closes a listener's bracket, but the
+            // disposed name gets no record back.
+            assert.equal(internal.lastInferenceAt.has('assistant'), false, JSON.stringify(last));
+          } else {
+            assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+          }
         }
       } finally {
         if (how === 'superseded') internal.activeTurnTokens.delete('assistant');
