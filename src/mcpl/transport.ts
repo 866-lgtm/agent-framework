@@ -188,6 +188,12 @@ export class StdioTransport extends McplTransport {
     });
 
     this.child.on('error', (err) => this.emit('error', err));
+    // A write racing the child's exit fails with EPIPE on stdin. That is the
+    // exit's echo, which 'close' already reports, never a reason to crash: an
+    // unhandled stream 'error' would end the host.
+    this.child.stdin?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    });
     this.child.on('exit', (code, signal) =>
       this.markClosed({ code, signal, reason: 'child process exited' }),
     );
@@ -240,9 +246,11 @@ export class StdioTransport extends McplTransport {
       this.child.kill();
     }
     await new Promise<void>((resolve) => {
-      // A child that has exited has its exitCode set, or its signalCode when
-      // a signal ended it, and its 'exit' event has already fired. A signal
-      // this process didn't send (an OOM kill, a crash) leaves `killed` false.
+      // Once Node has seen a child exit, it has its exitCode set, or its
+      // signalCode when a signal ended it, and its 'exit' event has fired. A
+      // signal that didn't come through kill() (an OOM kill, a crash) leaves
+      // `killed` false. A child that has exited but isn't reaped yet still
+      // takes the kill() above, which sets `killed`.
       if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null || this.child.killed) {
         resolve();
       } else {
