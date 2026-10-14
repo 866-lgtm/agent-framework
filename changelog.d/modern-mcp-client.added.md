@@ -29,7 +29,10 @@
     changes go through ordinary admission, so they park under quiesce like
     any wake. `close()` and `stop()` end any connect in flight. A
     `ModernMcpConnection` starts once: a second `start()` returns the first
-    call's promise.
+    call's promise. When a stdio launch's first attempt fails and its cleanup
+    can't confirm the child exited, `ModernMcpConnection.connect()` throws
+    `McplUnreapedLaunchError`, whose `connection` owns the launch; its
+    `close()` retries the reap.
   - **Status:** `listMcplServers()` entries gain `family`, `protocolVersion`
     and `transport`.
 - A server lost for good (it closed and won't reconnect), MCPL or modern,

@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
+import { AgentFramework, ModernMcpConnection, McplUnreapedLaunchError, ShutdownTimeoutError } from '../src/index.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -266,6 +266,25 @@ test('modern: a failed connect whose cleanup cannot reap stays registered until 
     await framework.connectMcplServer(modern('m', '', log));
     assert.equal(status(framework, 'm')?.connected, true);
   });
+});
+
+test("modern: ModernMcpConnection.connect hands back the connection that owns a launch its cleanup couldn't reap", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const log = join(dir, 'raw.jsonl');
+  const reaping = unreapable();
+  const failed = await ModernMcpConnection.connect(modern('m', 'reject-discover', log)).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failed instanceof McplUnreapedLaunchError, String(failed));
+  assert.ok(failed.connection instanceof ModernMcpConnection, 'the owner of the launch');
+  assert.match(failed.message, /its cleanup also failed: .*could not be reaped/);
+  assert.equal(launches(log).length, 1);
+  await killAndWait(reaping.stuck[0]!);
+  reaping.active = false;
+  // Its close() retries the reap, and resolves once the exit is confirmed.
+  await failed.connection.close();
 });
 
 test('legacy: a failed connect whose cleanup cannot reap stays registered until a disconnect confirms the exit', async () => {

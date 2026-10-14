@@ -60,7 +60,7 @@ import {
 } from '@modelcontextprotocol/client';
 
 import { StdioTransport, type McplTransport } from './transport.js';
-import { McplProtocolVersionError, McplRequestError } from './server-connection.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError } from './server-connection.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, redactServerText, serverTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 
@@ -490,10 +490,21 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
-  /** {@link create} and {@link start} in one step. */
+  /**
+   * {@link create} and {@link start} in one step. A first connect that fails
+   * and whose cleanup couldn't confirm its child exited throws
+   * {@link McplUnreapedLaunchError}, whose connection owns that launch, as
+   * the legacy engine's connect does: its close() retries the reap.
+   */
   static async connect(config: McplServerConfig): Promise<ModernMcpConnection> {
     const connection = ModernMcpConnection.create(config);
-    await connection.start();
+    try {
+      await connection.start();
+    } catch (error) {
+      const held = connection.unreaped[0];
+      if (held) throw new McplUnreapedLaunchError(connection, error instanceof Error ? error : new Error(String(error)), held.failure);
+      throw error;
+    }
     return connection;
   }
 
