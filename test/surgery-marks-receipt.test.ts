@@ -596,7 +596,7 @@ describe('surgery and awareness marks', () => {
     try {
       await assert.rejects(
         framework.suppressMessages('resident', { messageIds: [removed[0]], marks: { scope: 'all' } }),
-        /could not be retired \(injected retire failure\); it stays prepared, and a start on main holds it: cancel it then, not release it, since its messages were never removed/,
+        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created \S+: injected fork failure$/,
       );
     } finally {
       live.fork = realFork;
@@ -614,6 +614,11 @@ describe('surgery and awareness marks', () => {
       live.fork = realFork;
     }
     assert.equal(outbox().batches().at(-1)!.status, 'discarded');
+    // The first surgery never created its branch either, so the next start
+    // retires the batch its failed retirement left prepared.
+    await framework.stop();
+    await start(false);
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['discarded', 'discarded']);
   });
 
   it('an interrupted suppression: held at startup, its marks released, then its body resumed on its branch', async () => {

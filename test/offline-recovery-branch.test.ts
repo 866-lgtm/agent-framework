@@ -432,7 +432,9 @@ test('a failed offline suppression retires its batch once the source is confirme
     {
       const store = JsStore.open({ path: storePath });
       try {
-        assert.equal(new DiscordAwarenessOutbox(store).recoverAtStartup('main').held.length, 1, 'a start on the source holds it');
+        const exists = (name: string) => store.listBranches().some((branch) => branch.name === name);
+        assert.equal(new DiscordAwarenessOutbox(store).recoverAtStartup('main', exists).held.length, 1,
+          'a start on the source holds it: its branch was created');
       } finally {
         store.close();
       }
@@ -500,6 +502,32 @@ test('an offline recovery onto an existing branch is refused before any intent, 
       ContextManager.prototype.branchAt = branchAt;
     }
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'] });
+
+    // The same failure with its retirement failing too: the batch stays
+    // prepared, and since the recovery never created its branch, the next
+    // start retires it rather than holding it for an operator.
+    const discard = DiscordAwarenessOutbox.prototype.discard;
+    ContextManager.prototype.branchAt = function () { throw new Error('injected branch failure'); };
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    try {
+      await assert.rejects(
+        createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
+        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created fresh2/,
+      );
+    } finally {
+      ContextManager.prototype.branchAt = branchAt;
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded', 'prepared'] });
+    const reopened = JsStore.open({ path: storePath });
+    try {
+      const exists = (name: string) => reopened.listBranches().some((branch) => branch.name === name);
+      const recovered = new DiscordAwarenessOutbox(reopened).recoverAtStartup('main', exists);
+      assert.equal(recovered.retired.length, 1);
+      assert.deepEqual(recovered.held, []);
+    } finally {
+      reopened.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

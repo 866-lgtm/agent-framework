@@ -7807,9 +7807,16 @@ export class AgentFramework {
     } catch (error) {
       const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       // Its surgery didn't happen, so its messages are still in context: a
-      // release would mark them. The operator's act is a cancel.
-      const what = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, and a start on ` +
-        `${sourceBranch} holds it: cancel it then, not release it, since its messages were never removed`;
+      // release would mark them. A start holds the batch, for the operator to
+      // cancel, when its branch exists, and retires it when its surgery never
+      // created that branch (recoverAtStartup).
+      let forked = true;
+      try {
+        forked = this.store.listBranches().some((branch) => branch.name === batch.targetBranch);
+      } catch { /* unknown: say what a start on an existing branch does, whose cancel is right either way */ }
+      const what = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, and ` + (forked
+        ? `a start on ${sourceBranch} holds it: cancel it then, not release it, since its messages were never removed`
+        : `the next start retires it, since its surgery never created ${batch.targetBranch}`);
       this.opsAlert('discord-awareness-unresolved', agentName, `A failed surgery's ${what}`, { data: { batchId: batch.id } });
       return `; ${what}`;
     }

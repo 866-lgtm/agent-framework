@@ -276,10 +276,18 @@ export async function createOfflineRecoveryBranch(
           try {
             outbox.discard(batch.id);
           } catch (discardError) {
+            // A start holds the batch when its branch exists, and retires it
+            // when this recovery never created that branch (recoverAtStartup).
+            let forked = true;
+            try {
+              forked = store.listBranches().some((branch) => branch.name === targetBranch);
+            } catch { /* unknown: say what a start on an existing branch does, whose cancel is right either way */ }
             retire = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
-            )}); it stays prepared, and a start on ${sourceBranch} holds it: cancel it then ` +
-              `(--awareness cancel ${batch.id}), not release it, since its messages were never removed`;
+            )}); it stays prepared, and ` + (forked
+              ? `a start on ${sourceBranch} holds it: cancel it then (--awareness cancel ${batch.id}), not release it, ` +
+                'since its messages were never removed'
+              : `the next start retires it, since its surgery never created ${targetBranch}`);
           }
         }
       }
