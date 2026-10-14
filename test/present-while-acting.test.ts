@@ -1402,12 +1402,11 @@ describe('present while acting', () => {
     }
   };
 
-  // stop() and an agent's disposal end every open turn, but a start can reach
-  // its routing after either, opening or reopening its turn, and then be
-  // dropped before its stream sends anything: before its compile, once stop()
-  // has closed admission, or after it, once a restart has begun a lifecycle
-  // of its own. Here the start waits for a deferred batch's assembly while
-  // the stop runs.
+  // stop() ends every open turn, but a fresh start that awaits a deferred
+  // batch's assembly while the stop runs reaches its routing after it, opens
+  // its turn, and is then dropped before its stream sends anything: before
+  // its compile, once stop() has closed admission, or after it, once a
+  // restart has begun a lifecycle of its own.
   for (const restartFirst of [false, true]) {
     const name = restartFirst
       ? "a start whose compile spans a stop() and restart is dropped and leaves no turn open, so the next start opens its own"

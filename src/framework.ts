@@ -5757,14 +5757,12 @@ export class AgentFramework {
   /**
    * A start dropped before its stream sends anything (its agent was replaced,
    * or stop() closed admission or ended the lifecycle the start began in)
-   * ends the logical turn it was running. stop() and an agent's disposal end
-   * every open turn (openLogical), but a start can reach its routing after
-   * either: one that awaited its batches' assembly across a stop(), or a
-   * start of an agent that takes no primary provider gate, which doesn't
-   * check admission before its turn begins, such as a retry after its delay.
-   * The turn it opened or reopened then would stay open, and the agent's next
-   * start, after a restart too, would continue the dropped turn's routing.
-   * The identity check leaves any other turn open.
+   * ends the logical turn it was running. stop() ends every open turn
+   * (openLogical), but a fresh start that awaited its batches' assembly
+   * across a stop() reaches its routing after it and opens its turn. That
+   * turn would then stay open, and the agent's first start after a restart
+   * would continue the dropped turn's routing. The identity check leaves any
+   * other turn open.
    */
   private endDroppedTurn(agentName: string, routing: TurnRouting): void {
     if (this.openLogical.get(agentName) === routing) this.openLogical.delete(agentName);
