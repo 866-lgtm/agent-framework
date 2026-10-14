@@ -3545,9 +3545,8 @@ export class AgentFramework {
    */
   async addModule(module: Module): Promise<void> {
     // A server's tool prefix and a module's name share one namespace, as
-    // create() enforces at startup (mcplPrefixCollision): a module isn't
-    // added under a prefix a server holds, or one a restart is moving its
-    // server to.
+    // create() checks at startup: a module isn't added under a prefix a
+    // server holds, or one a restart is moving its server to.
     const server = this.mcplPrefixMap.get(module.name);
     if (server !== undefined) {
       throw new Error(`Module "${module.name}" collides with MCPL server "${server}"'s toolPrefix "${module.name}"`);
@@ -16666,9 +16665,19 @@ export class AgentFramework {
    * unlike `reconnect: true`, which only retries after transport-level
    * failures. Throws if the server has no stored config and none is given.
    * What its connect would refuse is refused before the running server is
-   * torn down, and until the connect, a connect, a restart or a module added
-   * meanwhile is refused the id and tool prefix the restart moves the server
-   * to.
+   * torn down. Until the connect, a connect or a restart started meanwhile
+   * is refused the id and the tool prefix the restart moves the server to,
+   * and a module added meanwhile is refused that tool prefix. The id and
+   * prefix it moves the server from are free once its disconnect is done, as
+   * after any disconnect.
+   *
+   * A disconnect of either id, or a `stop()`, that begins during the restart
+   * ends it, as a disconnect ends a connect in flight: the restart rejects,
+   * saying the server is down, and its holds are released. A restart whose
+   * connect fails leaves the server down, configured under the new
+   * configuration and holding its tool prefix, as any failed connect does:
+   * `listMcplServers()` lists it as not connected, `restartMcplServer(id)`
+   * tries it again, and `disconnectMcplServer(id)` removes it.
    *
    * Treat a submitted configuration and its nested values as immutable for
    * as long as the server uses them. Apply changed settings with
@@ -16687,7 +16696,8 @@ export class AgentFramework {
     // checks through its connect, the restart holds the id and the tool
     // prefix it moves the server to (mcpRestartClaims), so no connect,
     // restart or module added meanwhile takes them while the old server is
-    // torn down.
+    // torn down. A stop() or a disconnect that begins after these checks
+    // isn't held off: it ends the restart, as it would end a connect.
     if (this.mcpServerAdmissionClosed) {
       throw new Error(`MCP server "${id}" was not restarted: the framework is stopping or stopped`);
     }
@@ -16713,7 +16723,7 @@ export class AgentFramework {
         : `MCP server "${id}" was not restarted: the restart of "${claimedBy.restarting}" holds its id; restart it once that has finished`);
     }
     if (config.id !== id) {
-      const taken = this.mcpServerIdTaken(config.id);
+      const taken = this.mcpServerIdTaken(config.id, undefined, id);
       if (taken) throw new Error(taken);
     }
     const collision = this.mcplPrefixCollision(config, id);
@@ -16732,7 +16742,15 @@ export class AgentFramework {
     this.restartClaims().prefixes.set(prefix, claim);
     try {
       await this.disconnectMcplServer(id);
-      await this.connectMcplServerClaimed(config, claim);
+      try {
+        await this.connectMcplServerClaimed(config, claim);
+      } catch (error) {
+        // The old server is gone, whatever ended the connect: a disconnect or
+        // a stop() that began during the restart, or the new server's own
+        // failure. The caller learns that first, then the connect's reason.
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`MCP server "${id}" is down: it was disconnected for its restart, and the restart's connect failed: ${reason}`, { cause: error });
+      }
     } finally {
       if (this.restartClaims().ids.get(config.id) === claim) this.restartClaims().ids.delete(config.id);
       if (this.restartClaims().prefixes.get(prefix) === claim) this.restartClaims().prefixes.delete(prefix);
@@ -16763,20 +16781,27 @@ export class AgentFramework {
    *  disconnect in flight holds it, and so does a registered connection,
    *  including one kept because its launch couldn't be confirmed exited, and
    *  a restart moving its server to the id (mcpRestartClaims), except to
-   *  that restart's own connect (`claim`). */
-  private mcpServerIdTaken(id: string, claim?: McpRestartClaim): string | null {
+   *  that restart's own connect (`claim`). That connect is still refused
+   *  while a disconnect of the id is in flight: the restart's own disconnect
+   *  has finished by then, so that one began during the restart, and it ends
+   *  the restart. `restarting` words the refusal for a restart of that
+   *  server checking the id it would move to. */
+  private mcpServerIdTaken(id: string, claim?: McpRestartClaim, restarting?: string): string | null {
+    const refused = restarting === undefined ? '' : `MCP server "${restarting}" was not restarted: `;
+    const retry = restarting === undefined ? 'connect it' : `restart "${restarting}"`;
     const claimedBy = this.restartClaims().ids.get(id);
     if (claimedBy && claimedBy !== claim) {
-      return `MCP server "${id}" is held by the restart of "${claimedBy.restarting}"; connect it once that has finished`;
+      return `${refused}MCP server "${id}" is held by the restart of "${claimedBy.restarting}"; ${retry} once that has finished`;
     }
     const op = this.mcpServerOps?.get(id);
     if (op?.kind === 'disconnect') {
-      return `MCP server "${id}" is still being disconnected; connect it once that has finished`;
+      if (claim) return `MCP server "${id}" is being disconnected, which ends the restart of "${claim.restarting}"`;
+      return `${refused}MCP server "${id}" is still being disconnected; ${retry} once that has finished`;
     }
     const registered = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
     if (op || registered) {
       const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
-      return `MCPL server "${id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`;
+      return `${refused}MCPL server "${id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`;
     }
     return null;
   }

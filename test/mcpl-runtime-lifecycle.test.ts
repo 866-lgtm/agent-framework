@@ -344,6 +344,86 @@ test('a restart that fails releases the id and the tool prefix it held', async (
   });
 });
 
+test('a restart moving to an id or a tool prefix another restart holds is refused before it tears anything down', async (t) => {
+  await withFramework(true, async (framework) => {
+    await framework.connectMcplServer(serverConfig('second') as never);
+    const disconnect = framework.disconnectMcplServer.bind(framework);
+    const refusals: string[] = [];
+    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+      await disconnect(id);
+      if (id !== 'first') return;
+      // Between first's disconnect and its connect, only its claims hold "moved" and "xx".
+      for (const attempt of [
+        () => framework.restartMcplServer('second', serverConfig('moved', { toolPrefix: 'other' }) as never),
+        () => framework.restartMcplServer('second', serverConfig('second', { toolPrefix: 'xx' }) as never),
+      ]) {
+        await attempt().then(() => refusals.push('restarted'), (error: unknown) => refusals.push((error as Error).message));
+      }
+    });
+    await framework.restartMcplServer('first', serverConfig('moved', { toolPrefix: 'xx' }) as never);
+    assert.deepEqual(refusals, [
+      'MCP server "second" was not restarted: MCP server "moved" is held by the restart of "first"; restart "second" once that has finished',
+      'MCPL server "second" toolPrefix "xx" is held by the restart of "first"',
+    ]);
+    assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]).sort(), [['moved', true], ['second', true]]);
+    const tools = framework.getAllTools().map(tool => tool.name);
+    assert.ok(tools.includes('xx--echo') && tools.includes('mcpl--second--echo'), 'each serves its own prefix');
+  });
+});
+
+test('a restart whose connect fails leaves the server down, configured and not connected, and releases its holds', async () => {
+  await withFramework(true, async (framework) => {
+    const exits = { id: 'renamed', command: process.execPath, args: ['-e', 'process.exit(3)'], toolPrefix: 'xx' };
+    await assert.rejects(
+      framework.restartMcplServer('first', exits as never),
+      /^MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: /,
+    );
+    // As any failed connect leaves its server: listed as not connected, holding its prefix.
+    assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]), [['renamed', false]]);
+    await assert.rejects(
+      framework.addModule(new NamedModule('xx')),
+      /Module "xx" collides with MCPL server "renamed"'s toolPrefix "xx"/,
+    );
+    // The restart's holds are released, so the id and the prefix take a working configuration.
+    await framework.restartMcplServer('renamed', serverConfig('renamed', { toolPrefix: 'xx' }) as never);
+    assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]), [['renamed', true]]);
+    assert.ok(framework.getAllTools().some(tool => tool.name === 'xx--echo'));
+  });
+});
+
+for (const when of ['teardown', 'gap', 'connect'] as const) {
+  test(`a disconnect that begins during a restart's ${when} ends it: the server stays disconnected and the holds are released`, async (t) => {
+    await withFramework(true, async (framework) => {
+      const disconnect = framework.disconnectMcplServer.bind(framework);
+      let host: Promise<unknown> | undefined;
+      const hostDisconnect = () => {
+        host = disconnect('first').then(() => 'disconnected', (error: unknown) => error);
+      };
+      t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+        // The restart's own disconnect.
+        const own = disconnect(id);
+        if (when === 'teardown') hostDisconnect();
+        await own;
+        if (when === 'gap') hostDisconnect();
+        // The restart's connect takes the id within this turn, before an immediate runs.
+        if (when === 'connect') setImmediate(hostDisconnect);
+      });
+      const refused = await framework.restartMcplServer('first').then(() => null, (error: unknown) => error as Error);
+      assert.match(refused?.message ?? 'restarted', /^MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: /);
+      if (when !== 'connect') {
+        // Its connect is refused at once, naming the disconnect.
+        assert.match(refused!.message, /: MCP server "first" is being disconnected, which ends the restart of "first"$/);
+      }
+      assert.equal(await host, 'disconnected', 'the disconnect completed');
+      assert.deepEqual(framework.listMcplServers(), [], 'nothing is left of the server');
+      t.mock.restoreAll();
+      // Nothing holds the id or its prefix now.
+      await framework.connectMcplServer(serverConfig('first') as never);
+      assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]), [['first', true]]);
+    });
+  });
+}
+
 test('connectMcplServer rejects a duplicate id and a colliding prefix', async () => {
   await withFramework(true, async (framework) => {
     await assert.rejects(

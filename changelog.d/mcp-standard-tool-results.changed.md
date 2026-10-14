@@ -112,9 +112,17 @@
   disconnect of the server in flight. Before, a restart disconnected first,
   so a refused connect left the server gone; now the server keeps running.
   From those checks through its connect, the restart holds the id and the
-  tool prefix it moves the server to, so a connect, a restart or a module
-  added meanwhile is refused them, naming the restart, rather than taking
-  them while the old server is torn down. `addModule` also refuses a name a
+  tool prefix it moves the server to: a connect or a restart started
+  meanwhile is refused them, and a module added meanwhile is refused that
+  prefix, each naming the restart, rather than taking them while the old
+  server is torn down. The id and prefix it moves the server from are free
+  once its disconnect is done. A disconnect of either id, or a `stop()`,
+  that begins during the restart ends it, as a disconnect ends a connect in
+  flight, and the restart's error says the server is down. A restart whose
+  connect fails leaves the server down, configured under the new
+  configuration and holding its tool prefix, as any failed connect does:
+  it's listed as not connected, `restartMcplServer(id)` tries it again, and
+  `disconnectMcplServer(id)` removes it. `addModule` also refuses a name a
   server's tool prefix holds, as `create()` does at startup. A disconnect
   releases the tool-prefix claims its own server holds. Treat a submitted
   configuration as immutable while the server uses it: change settings with
