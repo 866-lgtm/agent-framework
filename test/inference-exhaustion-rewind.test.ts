@@ -339,6 +339,18 @@ test("provider answers, as this package's membrane floor types them, shed only w
     ['a rate limit', 'anthropic', 429, anthropic('rate_limit_error', 'Number of request tokens has exceeded your per-minute rate limit'), 'rate_limit', false],
     ['an overloaded provider', 'anthropic', 529, anthropic('overloaded_error', 'Overloaded'), 'server', false],
   ];
+  // With no status, as Anthropic's mid-stream errors come: the table takes the
+  // status the provider's code implies.
+  const statusless: Array<[string, unknown, string, number, boolean]> = [
+    ['a model that does not exist, mid-stream', anthropic('not_found_error', 'model: claude-nonexistent-1'), 'invalid_request', 404, false],
+    ['a request body too large, mid-stream', anthropic('request_too_large', 'Request exceeds the maximum allowed number of bytes.'), 'context_length', 413, true],
+  ];
+  for (const [name, body, type, status, sheds] of statusless) {
+    const error = errorFromProviderStatus({ provider: 'anthropic', body });
+    assert.equal(error.type, type, `${name}: typed ${error.type}`);
+    assert.equal(error.httpStatus, status, `${name}: at ${String(error.httpStatus)}`);
+    assert.equal(shedMayHelp(error.type, error.httpStatus), sheds, `${name}: ${error.type} at ${String(error.httpStatus)}`);
+  }
   for (const [name, provider, status, body, type, sheds] of rows) {
     const error = errorFromProviderStatus({ provider, status, body });
     assert.equal(error.type, type, `${name}: typed ${error.type}`);

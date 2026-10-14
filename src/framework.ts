@@ -1454,8 +1454,10 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   included, while a context_length at 400 or 422, a token overflow, keeps
  *   the history, and so does an account refusal, which is auth. An adapter
  *   can type a failure before the table does, as Anthropic's does for a
- *   gateway's aggregate error (server), and a failure with no HTTP status is
- *   typed from its message, with no status. The 422 arm also covers an
+ *   gateway's aggregate error (server). A failure with no HTTP status takes
+ *   the status its provider code implies when the table knows the code, as
+ *   for Anthropic's mid-stream errors, and is otherwise typed from its
+ *   message, with no status. The 422 arm also covers an
  *   OpenAI-compatible server, such as a FastAPI one, that answers a
  *   validation failure with 422. The test of provider answers through the
  *   table, beside the table test, pins how the two meet at the floor.
