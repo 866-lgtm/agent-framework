@@ -62,7 +62,7 @@ import type {
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage } from './shutdown.js';
-import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
+import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -394,6 +394,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -5242,7 +5243,8 @@ export class AgentFramework {
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
-      const emoji = REFUSAL_REACTIONS[category] ?? REFUSAL_REACTION_FALLBACK;
+      // Own names only: an inherited one such as 'constructor' takes the fallback.
+      const emoji = Object.hasOwn(REFUSAL_REACTIONS, category) ? REFUSAL_REACTIONS[category] : REFUSAL_REACTION_FALLBACK;
       // Resolve the MCPL server that owns the locus channel and call
       // tools/call directly on its connection (bare tool name — no prefix
       // games), bypassing the agent event queue so no synthetic tool-result
@@ -10968,7 +10970,7 @@ export class AgentFramework {
               // border is close, rather than noise on every near-threshold
               // flip. (It must not re-enter any agent's context — the emoji
               // is suppressed at the surface via
-              // DISCORD_SUPPRESS_REACTION_EMOJIS; without that, marking a
+              // DISCORD_SUPPRESSED_REACTIONS_BASELINE; without that, marking a
               // refusal feeds the next one.)
               if (!handledByRewind) {
                 void this.reactToRefusal(agent.name, category);
@@ -14529,6 +14531,14 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
 
+    // Every connect needs a readable awareness ledger: a runtime connect's
+    // awareness barrier reconciles it, and a stdio child taking the
+    // protective default derives that from it. Read it first, so an
+    // unreadable ledger refuses the connect before anything is registered
+    // under its id or spawned (a reconnecting server would otherwise be left
+    // registered as a closed stub). With no outbox configured nothing is read.
+    this.getPlacedReactionBaseline();
+
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl).
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
@@ -14544,7 +14554,33 @@ export class AgentFramework {
       );
     }
 
-    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    // A stdio child's protective reaction default, DISCORD_SUPPRESSED_REACTIONS_BASELINE
+    // (WebSocket servers own their environment outside this process). The
+    // caller's config stays unchanged, so a runtime restart derives afresh.
+    // The default is derived at each spawn: the env below is a getter, which
+    // the transport reads at first connect, at every automatic reconnect and
+    // at a stub's retry, so retained markers added since the last spawn are
+    // covered.
+    let connectionConfig = config;
+    if (!isWebSocketTransport(config)) {
+      const declared = this.declaredReactionBaseline(config);
+      if (declared) {
+        console.error(
+          `[mcpl] ${config.id}: DISCORD_SUPPRESSED_REACTIONS_BASELINE ${declared.source === 'env' ? 'from its env' : 'inherited from the host'} ` +
+            `replaces the framework's protective default`,
+        );
+      }
+      connectionConfig = { ...config };
+      Object.defineProperty(connectionConfig, 'env', {
+        enumerable: true,
+        configurable: true,
+        get: () => ({
+          ...config.env,
+          DISCORD_SUPPRESSED_REACTIONS_BASELINE: declared?.value ?? this.getPlacedReactionBaseline().join(','),
+        }),
+      });
+    }
+    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -14911,6 +14947,92 @@ export class AgentFramework {
   // ==========================================================================
 
   /**
+   * Snapshot the protective Discord reaction default for this deployment, as
+   * suppression tokens: the forms the Discord adapter's suppression matcher
+   * reads, not marker payloads for an add, a remove or a replay. It covers
+   * the reactions the framework places: refusal markers, the adapter's own
+   * default awareness marker, the configured awareness marker, and retained
+   * outbox markers (including offline recovery choices and marks that can
+   * later be removed or replayed). A custom emoji appears as its bare ID,
+   * which suppression matches even after a rename; stored markers and the
+   * actual add/remove payloads stay unchanged. Explicit adapter or operator
+   * suppression settings still take precedence. Throws on an unreadable
+   * ledger rather than reporting a partial baseline.
+   */
+  getPlacedReactionBaseline(): readonly string[] {
+    let retained: string[];
+    try {
+      retained = this.discordAwarenessOutbox?.batches().map((batch) => batch.emoji) ?? [];
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
+    }
+    // Discord events carry the custom emoji's name and ID separately. Full
+    // marker forms belong in add/remove calls, but suppression matches their
+    // stable ID (including after a rename), rather than the composite token.
+    const suppressionToken = (emoji: string): string => {
+      const custom = /^(?:<a?:\w+:(\d{17,20})>|(?:a:)?\w+:(\d{17,20}))$/.exec(emoji.trim());
+      return custom?.[1] ?? custom?.[2] ?? emoji;
+    };
+    return [...new Set([
+      ...REFUSAL_REACTION_BASELINE,
+      DEFAULT_DISCORD_AWARENESS_EMOJI,
+      this.discordAwarenessEmoji,
+      ...retained,
+    ].map(suppressionToken))].filter((emoji) => emoji.length > 0);
+  }
+
+  /**
+   * The reaction baseline an operator chose for a stdio server, if any: a
+   * value declared in its env, or one inherited from the host with
+   * `inheritEnv`, the declared one first. A value with no tokens, as
+   * discord-mcpl's parser reads them, counts as unset: the adapter splits on
+   * commas and keeps a token only when its normalizer leaves something of it
+   * (blank, `:`, `::` and a lone U+FE0F leave nothing), so such a value (an
+   * empty systemd `Environment=`, say, or `${A},${B}` or `:${NAME}:` with the
+   * variables empty) would otherwise turn the protective default off without
+   * anyone choosing that.
+   *
+   * Windows names are matched in both sources: Workers expose a case-
+   * sensitive `process.env` copy. Within one source, Node's spawn keeps the
+   * first spelling in sorted order, so each source is resolved that way.
+   *
+   * A value is read as the child will see it. A config loaded from JSON can
+   * carry a non-string there despite the type, and spawn writes every
+   * defined value as its string form, so a number is a declared value, not a
+   * failed connect. A null counts as unset, like a blank: written in JSON it
+   * means no value, and read as spawn's "null" it would replace the
+   * protective default with a list that suppresses nothing.
+   */
+  private declaredReactionBaseline(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): { value: string; source: 'env' | 'inherited' } | undefined {
+    // A token as discord-mcpl's parser keeps one: `parseSuppressionEnvTokens`
+    // trims each comma-separated token and keeps it when
+    // `normalizeReactionEmoji` (discord-mcpl `src/filters.ts`) leaves
+    // something, after it strips U+FE0F, trims, and strips one leading and one
+    // trailing colon. The same steps in the same order, so the two can be
+    // compared when either changes.
+    const isToken = (token: string): boolean =>
+      token.trim().replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '') !== '';
+    const valueIn = (env: NodeJS.ProcessEnv | undefined): string | undefined => {
+      let raw: unknown;
+      if (process.platform !== 'win32') raw = env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+      else {
+        const key = Object.keys(env ?? {}).sort()
+          .find((name) => name.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE');
+        raw = key === undefined ? undefined : env?.[key];
+      }
+      if (raw === undefined || raw === null) return undefined;
+      const value = String(raw);
+      return value.split(',').some(isToken) ? value : undefined;
+    };
+    const declared = valueIn(config.env);
+    if (declared !== undefined) return { value: declared, source: 'env' };
+    const inherited = config.inheritEnv ? valueIn(process.env) : undefined;
+    return inherited !== undefined ? { value: inherited, source: 'inherited' } : undefined;
+  }
+
+  /**
    * Connect a new MCPL server at runtime. Refreshes the tool list and
    * notifies the agent of newly available tools. Throws if the MCPL
    * subsystem is not initialized, the id is already connected, or the
@@ -14992,6 +15114,12 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
+    // Every connect reads the awareness ledger: its awareness barrier
+    // reconciles it, and a stdio child taking the protective default derives
+    // that from it. Read it before disconnecting, so an unreadable ledger
+    // refuses the restart and leaves the running child up, whatever the
+    // server's baseline or transport. (No outbox configured: nothing to read.)
+    this.getPlacedReactionBaseline();
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
   }
