@@ -27,7 +27,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import { parse } from '@babel/parser';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
   Module,
@@ -308,8 +308,9 @@ describe('stop() with work still in flight', () => {
     // that names another call's tool misleads whoever reconciles it. Every
     // object literal in src whose `type` is the string 'tool-result' (in any
     // quoting) carries toolName, and where its callId and toolName both read
-    // a call (`X.id`, `Y.name`), they read the same one. Read as TypeScript's
-    // syntax tree, not as text, so no spelling of the literal escapes the check.
+    // a call (`X.id`, `Y.name`), they read the same one. Read as a syntax
+    // tree (Babel's TypeScript parser), not as text, so no spelling of the
+    // literal escapes the check.
     const src = fileURLToPath(new URL('../../src/', import.meta.url));
     const files: string[] = [];
     const walk = (dir: string): void => {
@@ -320,32 +321,56 @@ describe('stop() with work still in flight', () => {
       }
     };
     walk(src);
-    const nameOf = (n: ts.PropertyName): string | undefined =>
-      ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) ? n.text : undefined;
-    const isToolResult = (e: ts.Expression): boolean => {
-      while (ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
-      return (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) && e.text === 'tool-result';
+    // Babel's nodes, read structurally: each has a `type`, its children are
+    // its node-valued fields, and its source span is `start`..`end`.
+    type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
+    const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
+    const child = (n: Node, field: string): Node | undefined => (isNode(n[field]) ? n[field] as Node : undefined);
+    // A string literal's text, in any quoting: '…', "…" or a template with no substitutions.
+    const literalText = (e: Node | undefined): string | undefined => {
+      if (e?.type === 'StringLiteral') return e.value as string;
+      if (e?.type === 'TemplateLiteral' && (e.expressions as unknown[]).length === 0) {
+        return ((e.quasis as Node[])[0].value as { cooked?: string }).cooked;
+      }
+      return undefined;
     };
-    // The call an `X.id` or `X.name` reads, as source text (`call`, `tc`).
-    const callRead = (p: ts.ObjectLiteralElementLike | undefined, field: 'id' | 'name'): string | undefined => {
-      if (!p || !ts.isPropertyAssignment(p)) return undefined;
-      const e = p.initializer;
-      return ts.isPropertyAccessExpression(e) && e.name.text === field ? e.expression.getText() : undefined;
+    // A property's name when written out (`type`, 'type', "type"); a computed one has none.
+    const nameOf = (p: Node): string | undefined => {
+      if (p.computed) return undefined;
+      const key = child(p, 'key');
+      return key?.type === 'Identifier' ? key.name as string : literalText(key);
+    };
+    const isToolResult = (e: Node | undefined): boolean => {
+      while (e && (e.type === 'TSAsExpression' || e.type === 'TSSatisfiesExpression' || e.type === 'ParenthesizedExpression')) {
+        e = child(e, 'expression');
+      }
+      return literalText(e) === 'tool-result';
     };
     const missing: string[] = [];
     const mismatched: string[] = [];
     let literals = 0;
     let paired = 0;
     for (const file of files) {
-      const sf = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
-      const visit = (node: ts.Node): void => {
-        if (ts.isObjectLiteralExpression(node)) {
-          const type = node.properties.find((p) => ts.isPropertyAssignment(p) && nameOf(p.name) === 'type');
-          if (type && ts.isPropertyAssignment(type) && isToolResult(type.initializer)) {
+      const text = readFileSync(file, 'utf8');
+      const program = parse(text, {
+        sourceType: 'module', plugins: ['typescript'], createParenthesizedExpressions: true,
+      }).program as unknown as Node;
+      // The call an `X.id` or `X.name` reads, as source text (`call`, `tc`).
+      const callRead = (p: Node | undefined, field: 'id' | 'name'): string | undefined => {
+        if (!p || p.type !== 'ObjectProperty' || p.shorthand) return undefined;
+        const e = child(p, 'value');
+        if (!e || (e.type !== 'MemberExpression' && e.type !== 'OptionalMemberExpression') || e.computed) return undefined;
+        const object = child(e, 'object');
+        return child(e, 'property')?.name === field && object ? text.slice(object.start!, object.end!) : undefined;
+      };
+      const visit = (node: Node): void => {
+        if (node.type === 'ObjectExpression') {
+          const properties = (node.properties as Node[]).filter((p) => p.type === 'ObjectProperty');
+          const type = properties.find((p) => !p.shorthand && nameOf(p) === 'type');
+          if (type && isToolResult(child(type, 'value'))) {
             literals++;
-            const where = `${file.slice(src.length)}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`;
-            const property = (name: string) => node.properties.find((p) =>
-              (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && nameOf(p.name) === name);
+            const where = `${file.slice(src.length)}:${node.loc!.start.line}`;
+            const property = (name: string) => properties.find((p) => nameOf(p) === name);
             const toolName = property('toolName');
             if (!toolName) missing.push(where);
             const idOf = callRead(property('callId'), 'id');
@@ -356,9 +381,13 @@ describe('stop() with work still in flight', () => {
             }
           }
         }
-        ts.forEachChild(node, visit);
+        for (const [field, value] of Object.entries(node)) {
+          if (field === 'loc' || field.endsWith('Comments')) continue;
+          if (Array.isArray(value)) { for (const v of value) if (isNode(v)) visit(v); }
+          else if (isNode(value)) visit(value);
+        }
       };
-      visit(sf);
+      visit(program);
     }
     assert.ok(literals > 20, `found ${literals} tool-result literals; the scan has lost them`);
     assert.deepEqual(missing, [], 'tool-result events without toolName');

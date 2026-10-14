@@ -54,6 +54,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@babel/parser": "^7.29.9",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.13",
     "discord.js": "^14.25.1",
