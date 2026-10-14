@@ -64,7 +64,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry, isStateExistsError } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -89,7 +89,9 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
+import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
+  nonErrorResultText,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -880,6 +882,10 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
+/** Total time one withheld batch may spend awaiting workspace writes.
+ *  At the deadline its unfinished write is named as such, and later
+ *  originals stay in the audit. This bound applies to withheld spills. */
+const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 /** Poll pending context-strategy maintenance independently of user activity. */
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
@@ -1204,6 +1210,8 @@ export class AgentFramework {
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
+  /** Invalidates framework turns still assembling when stop begins. */
+  private lifecycleGeneration = 0;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -2124,6 +2132,10 @@ export class AgentFramework {
 
     this.running = true;
     this.providerAdmissionClosed = false;
+    // A new lifecycle: a turn compiled before an earlier stop() never drives,
+    // and withheld spills, closed for the generation a stop ended, are open
+    // for this one.
+    this.lifecycleGeneration++;
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -2186,6 +2198,10 @@ export class AgentFramework {
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
+    this.lifecycleGeneration++;
+    // The generation this stop ends; withheld spills close for it alone, so a
+    // start() made before this stop finishes reopens them for its own.
+    const stoppingGeneration = this.lifecycleGeneration;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
 
@@ -2256,6 +2272,18 @@ export class AgentFramework {
     this.eventGate?.dispose();
     this.livenessWatchdog?.stop();
 
+    // A stopping stream's batch settles as withheld, and its stub names where
+    // the original went: let those writes finish while the workspace is up.
+    // Tracked here rather than per agent, since an ephemeral run or a closed
+    // fork leaves the agent map while its annotation can still be running.
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+    // An annotation that starts after this point, such as one from a direct
+    // Agent API call stop doesn't cancel, starts no write to the stopping
+    // workspace: its stub names the audit record. A write that was past its
+    // deadline isn't waited for here, but the workspace's own stop waits for
+    // the mount turn it holds, bounded only by teardownTimeoutMs.
+    this.guardSpillsClosedFor = stoppingGeneration;
+
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
     if (this.mcplServerRegistry) {
@@ -2270,13 +2298,19 @@ export class AgentFramework {
 
     const teardownSucceeded = shutdownErrors.length === 0;
 
+    // Those later annotations write nothing, so they finish at once; let them
+    // record and edit their stubs before the store closes.
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+
     // Streams may queue storage repairs while being cancelled above. Retry
-    // after their teardown, while the store is still open, before final sync.
-    for (const agent of this.agents.values()) {
+    // after their teardown, while the store is still open, before final sync:
+    // every live agent's guard, and every other guard that isn't idle, whose
+    // ephemeral run or closed fork has left the agent map.
+    for (const [guard, name] of this.guardsWithStorageWork()) {
       try {
-        agent.toolResultGuard.flushUnrecorded();
+        guard.flushUnrecorded();
       } catch (error) {
-        console.error(`[tool-result-guard] agent=${agent.name} could not finish queued storage work at stop:`, error);
+        console.error(`[tool-result-guard] agent=${name} could not finish queued storage work at stop:`, error);
         shutdownErrors.push(error);
       }
     }
@@ -2556,6 +2590,17 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
+    // A guard whose agent has left the map gets no activation to retry its
+    // queue; retry it here. It leaves busyGuards once nothing of it is left.
+    const live = new Set([...this.agents.values()].map((agent) => agent.toolResultGuard));
+    for (const [guard, name] of this.busyGuards) {
+      if (live.has(guard)) continue;
+      try {
+        guard.flushUnrecorded();
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
+      }
+    }
     const queued = [...this.agents.values()].flatMap((agent) => {
       try {
         agent.toolResultGuard.flushUnrecorded();
@@ -2877,7 +2922,14 @@ export class AgentFramework {
           if (!mount) return null;
           const path = `${mount}/refs/${fileName}`;
           const res = await workspace.writeBinary(path, data, mimeType);
-          return res.success ? path : null;
+          if (res.success) return path;
+          // Stored, with its disk copy failed: the workspace's tools read it
+          // from the tree, so the reference is fetched to that path.
+          if ((res.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+            console.error(`[refs] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${res.error ?? 'unknown error'}`);
+            return path;
+          }
+          return null;
         },
       );
     }
@@ -3050,7 +3102,38 @@ export class AgentFramework {
     };
   }
 
-  private restoreToolResultGuardSetting(agent: Agent): void {
+  /** Every guard's annotation still running, for stop() (agent-framework #277). */
+  private readonly guardAnnotations = new Set<Promise<void>>();
+  /** Each guard that isn't idle, by agent name, as the guard reports it. An
+   *  ephemeral run or a closed fork leaves the agent map with an annotation
+   *  maybe still running, or a stub edit, acceptance edit or audit write
+   *  queued, which maintenance and stop then retry (agent-framework #277). A
+   *  guard is here from the moment it has work left until the moment it has
+   *  none, however that comes about. */
+  private readonly busyGuards = new Map<ToolResultGuard, string>();
+  /** Withheld originals' writes still under way past their deadline: while
+   *  any is, the workspace isn't answering and no other withheld original's
+   *  write is started. Several can be, when writes of different agents'
+   *  batches stalled together. */
+  private readonly stalledSpills = new Set<Promise<void>>();
+  /** Withheld spills skipped since the current stall began. */
+  private stallSkips = 0;
+  /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
+  private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
+  /** The lifecycle generation whose stop() has let the running annotations
+   *  finish: a withheld original is then no longer written to a workspace
+   *  that is stopping, and its stub names the audit record. A start() after
+   *  that stop() has finished has a generation of its own, so the spill gate
+   *  is open again for an instance kept with a store it doesn't own and that
+   *  is still open (start() doesn't restore stopped modules or MCPL
+   *  connections, and refuses an owned store that stop() closed). A start()
+   *  made while a stop() is still draining isn't a supported order. */
+  private guardSpillsClosedFor: number | null = null;
+
+  /** A new agent's guard: its persisted setting, the tool-results spill its
+   *  withheld originals are written to, and the set stop() waits on
+   *  (agent-framework #277). */
+  private adoptToolResultGuard(agent: Agent): void {
     const enabled = (this.store.getStateJson(FRAMEWORK_STATE_ID) as {
       toolResultGuards?: Record<string, unknown>;
     } | null)?.toolResultGuards?.[agent.name];
@@ -3058,6 +3141,28 @@ export class AgentFramework {
       throw new Error(`Invalid persisted tool_result_guard for ${agent.name}: expected a boolean`);
     }
     agent.toolResultGuard.setOverride(enabled);
+    const guard = agent.toolResultGuard;
+    guard.setHost({
+      spill: (label, text, branch, deadline) => this.spillWithheld(label, text, branch, deadline),
+      deadline: () => Date.now() + this.withheldSpillDeadlineMs,
+      track: (annotation) => {
+        this.guardAnnotations.add(annotation);
+        void annotation.finally(() => this.guardAnnotations.delete(annotation));
+      },
+      idle: (idle) => {
+        if (idle) this.busyGuards.delete(guard);
+        else this.busyGuards.set(guard, agent.name);
+      },
+    });
+  }
+
+  /** Each guard that may have queued storage work, once, by agent name: the
+   *  live agents' and every other that isn't idle. */
+  private guardsWithStorageWork(): Map<ToolResultGuard, string> {
+    const guards = new Map<ToolResultGuard, string>();
+    for (const agent of this.agents.values()) guards.set(agent.toolResultGuard, agent.name);
+    for (const [guard, name] of this.busyGuards) if (!guards.has(guard)) guards.set(guard, name);
+    return guards;
   }
 
   private buildThinkTool(
@@ -4514,7 +4619,7 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
-      this.restoreToolResultGuardSetting(agent);
+      this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
 
@@ -6840,7 +6945,7 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
+    this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
@@ -6917,7 +7022,7 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
+    this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
@@ -7820,7 +7925,11 @@ export class AgentFramework {
       // seeding again would stack another template copy on top of it.
       const { messages: existing } = await contextManager.compile();
       if (existing.length === 0) {
-        const { messages: compiled } = await template.getContextManager().compile();
+        // The copy is the fork's own, and the template's annotation edits only
+        // the template's message: seed only once each of the template's
+        // annotations has finished.
+        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+          () => template.getContextManager().compile());
         for (const msg of compiled) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -7829,7 +7938,7 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
-      this.restoreToolResultGuardSetting(agent);
+      this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
@@ -9623,6 +9732,7 @@ export class AgentFramework {
     turnToken: number,
     ownsProviderGate: boolean,
   ): Promise<boolean> {
+    const lifecycle = this.lifecycleGeneration;
     const continuingTurn = resumesLogicalTurn(trigger?.reason);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
@@ -9890,9 +10000,10 @@ export class AgentFramework {
         injections = injections ? [...injections, silentInjection] : [silentInjection];
       }
 
-      // An ephemeral watchdog may dispose this Agent while hooks/compile await.
-      // Do not create a provider stream after its generation lost ownership.
-      if (this.agents.get(agent.name) !== agent) {
+      // An ephemeral watchdog may dispose this Agent while hooks/compile await,
+      // and stop() may close provider admission. Do not create a provider
+      // stream after its generation lost ownership, or once admission closed.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -9917,13 +10028,29 @@ export class AgentFramework {
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
+      // The compile can wait for annotations (each batch has one spill
+      // deadline), so check ownership, admission, and the lifecycle again.
+      // A stop followed by start must not revive this earlier turn.
+      // Membrane's yielding stream starts its request when it is first
+      // iterated, so cancelling it here, before driveStream, sends nothing.
       // A turn that was mid-compile when stop() cancelled every stream would
-      // register after that pass and outlive stop(): refuse it here, as a
-      // replaced agent is. The caller's finally releases the turn token.
+      // otherwise register after that pass and outlive stop(). The caller's
+      // finally releases the turn token.
       const stopping = this.providerAdmissionClosed;
-      if (this.agents.get(agent.name) !== agent || stopping) {
+      if (this.agents.get(agent.name) !== agent || stopping || lifecycle !== this.lifecycleGeneration) {
+        console.error(`[turn] ${agent.name}: a turn compiled while ${
+          this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
+            : stopping ? 'the framework was stopping'
+              : 'the framework was stopped and started again'} is dropped before it sends anything`);
         stream.cancel();
         agent.cancelStream();
+        if (this.agents.get(agent.name) === agent) {
+          // The compile took the agent's stream id, so a frame that started
+          // this one (a guard or budget restart) no longer owns the entries
+          // it left, and its teardown leaves them to this frame.
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+        }
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         if (stopping) this.endEphemeralRunRefused(agent);
@@ -11691,13 +11818,15 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      const result = await this.executeToolCall({
-        id: toolUseId,
-        name: toolName,
-        input,
-        callerAgentName: agentName,
-      });
+      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName };
+      const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
+      // The pair is stored as a model's call would be, so the result stored,
+      // traced and logged is its checked form. The caller gets the tool's
+      // own result back, as an in-process caller does, unless nothing
+      // usable could be stored: then it gets the error result stored.
+      const checked = checkedToolResult(call, returned);
+      const result = checked.result;
 
       // Store the pair through the same shapes the ordinary path uses. Build
       // the result blocks BEFORE storing the tool_use: the spill path awaits.
@@ -11748,7 +11877,7 @@ export class AgentFramework {
         `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
         `in ${durationMs}ms (${toolUseId})${ownedToEnd ? '' : ' — deferred behind a live turn'}`,
       );
-      return { toolUseId, result };
+      return { toolUseId, result: checked.usable ? returned : result };
     } finally {
       if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
       // Messages deferred while we held the token land now, after the pair
@@ -11806,10 +11935,11 @@ export class AgentFramework {
     // ephemerals, ModuleContext.callTool) reach utilities the same way the
     // model does.
     if (call.name === 'utils') {
-      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call);
+      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true });
     }
 
-    // Module tools
+    // Module tools. The caller uses the result in process, so it gets the
+    // module's own result, as the module returned it.
     return this.moduleRegistry.handleToolCall(call);
   }
 
@@ -12312,7 +12442,7 @@ export class AgentFramework {
       // stays reachable by provenance after the bytes leave the wire.
       const raw = tc.result.isError
         ? tc.result.error ?? 'Unknown error'
-        : toolResultDataToHistoryString(tc.result.data, undefined, {
+        : nonErrorResultText(tc.result, undefined, {
           imageRef: (blockIndex, image) => ledger.retain({
             toolCallId: tc.id,
             toolName: tc.name,
@@ -12335,6 +12465,133 @@ export class AgentFramework {
     return { blocks, spilled };
   }
 
+  /** Where a tool result labelled `label` is written: `<first writable
+   *  mount>/tool-results/<label>.txt`, or null when there is no writable
+   *  workspace. */
+  private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
+    const workspace = this.getWorkspaceModule();
+    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
+    if (!workspace || !mountName) return null;
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+    return { workspace, path: `${mountName}/tool-results/${safeLabel}.txt`, safeLabel };
+  }
+
+  /**
+   * A withheld original uses the remaining time in its batch's deadline.
+   * A write still under way at that deadline is reported as unfinished and
+   * goes on; the guard stops waiting for it, though stop() still waits for
+   * the workspace's turn it holds (bounded only by a teardown timeout). From
+   * then until every
+   * overdue write settles, new withheld spills are workspace_unanswered.
+   * Writes from other batches can start before the first deadline fires.
+   * An exhausted batch starts no more writes even if none is overdue.
+   * The inline cap's spills use writeToolResultFile without this deadline.
+   */
+  private async spillWithheld(label: string, text: string, branch: string,
+    deadline = Date.now() + this.withheldSpillDeadlineMs): Promise<WithheldSpill> {
+    // A batch with no finite deadline (a host whose deadline() threw) gets
+    // this write's own, rather than a timer Node would cut to 1 ms.
+    if (!Number.isFinite(deadline)) deadline = Date.now() + this.withheldSpillDeadlineMs;
+    if (this.guardSpillsClosedFor === this.lifecycleGeneration) return null;
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    if (this.stalledSpills.size > 0) {
+      // Said once per stall, with the count when it clears, so a stalled
+      // workspace doesn't write a line for every result it can't take.
+      if (this.stallSkips++ === 0) {
+        console.error(`[spill] withheld originals are skipped as workspace_unanswered while ${this.stalledSpills.size} write(s) past their deadline are under way (first: ${place.path})`);
+      }
+      return { skipped: 'workspace_unanswered' };
+    }
+    const remaining = deadline - Date.now();
+    // The guard says once per batch that it used its deadline.
+    if (remaining <= 0) return { skipped: 'batch_deadline' };
+    const write = this.writeToolResultFile(label, text, branch);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => {
+        // Marked as the deadline passes, before anything else runs, so no
+        // spill that starts after it finds the workspace answering.
+        const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => {
+          this.stalledSpills.delete(stalled);
+          if (this.stalledSpills.size === 0 && this.stallSkips > 0) {
+            console.error(`[spill] the workspace answered again; ${this.stallSkips} withheld original(s) were skipped as workspace_unanswered meanwhile`);
+            this.stallSkips = 0;
+          }
+        });
+        this.stalledSpills.add(stalled);
+        console.error(`[spill] ${place.path} still being written at the withheld batch deadline`);
+        resolve('late');
+      }, remaining);
+      timer.unref?.();
+    });
+    try {
+      const written = await Promise.race([write, late]);
+      if (written !== 'late') {
+        if (!written) return null;
+        if (written.branchLeft) return { skipped: 'branch_changed' };
+        return { path: written.path, ...(written.error !== undefined ? { error: written.error } : {}) };
+      }
+      return { path: place.path, unfinished: true };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Write one tool result's text to its tool-results file (see
+   * toolResultFilePlace): the one place both the inline cap's spill and the
+   * guard's withheld originals go. null when there is no writable workspace.
+   * A failed write is reported, traced and logged here, never thrown. With a
+   * branch, the file lands on that branch or isn't written (see writeBinary).
+   */
+  private async writeToolResultFile(
+    label: string,
+    content: string,
+    branch?: string,
+  ): Promise<{ path: string; error?: string; branchLeft?: true } | null> {
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    const { workspace, path, safeLabel } = place;
+    let failure: string;
+    try {
+      const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain', { branch });
+      if (result.success) return { path };
+      // The file is in the workspace's Chronicle tree, where its tools read
+      // it, and the rest of the write failed (its copy on disk, or something
+      // after the entry was set): it is written for every reader the stub or
+      // the truncation note sends there. The workspace emits
+      // workspace:materialize-failed only for a refused push, so the failure
+      // is traced here too.
+      if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+        const error = (result.error ?? 'the rest of the write failed').slice(0, 200);
+        this.emitTrace({ type: 'tool:spill_failed', label: safeLabel, path, contentLength: content.length, error });
+        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${error}`);
+        return { path };
+      }
+      // Declined, not failed: the store left the branch the file is for, so
+      // it isn't written anywhere, as the caller asked.
+      if ((result.data as { branchLeft?: boolean } | undefined)?.branchLeft === true) {
+        return { path, error: result.error ?? 'the workspace had left the branch this file is for', branchLeft: true };
+      }
+      failure = result.error ?? 'write refused';
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    failure = failure.slice(0, 200);
+    this.emitTrace({
+      type: 'tool:spill_failed',
+      label: safeLabel,
+      path,
+      contentLength: content.length,
+      error: failure,
+    });
+    console.error(
+      `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
+    );
+    return { path, error: failure };
+  }
+
   private async spillOrTruncate(
     content: string,
     cap: number | undefined,
@@ -12349,52 +12606,32 @@ export class AgentFramework {
     const { head, tail } = splitPreservingImageSlots(content, cap);
     const kept = formatPreservedImageSlots(tail);
 
-    const workspace = this.getWorkspaceModule();
-    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
-    if (workspace && mountName) {
-      const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
-      const path = `${mountName}/tool-results/${safeLabel}.txt`;
-      let failure: string;
-      try {
-        const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
-        if (result.success) {
-          // JSON serialization can expand each read-back code unit to six
-          // chars (\\u0000). Leave room for the page's metadata and a possible
-          // extra code unit at a surrogate-pair boundary.
-          const pageOverhead = JSON.stringify(path).length + 256;
-          const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
-          return {
-            text: head
-              + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-              + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-              + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-              + 'agent_settings update tool_result_inline_max_chars.]'
-              + kept,
-            filePath: path,
-          };
-        }
-        failure = result.error ?? 'write refused';
-      } catch (err) {
-        failure = err instanceof Error ? err.message : String(err);
-      }
+    const written = await this.writeToolResultFile(label, content);
+    if (written && written.error === undefined) {
+      const path = written.path;
+      // JSON serialization can expand each read-back code unit to six
+      // chars (\\u0000). Leave room for the page's metadata and a possible
+      // extra code unit at a surrogate-pair boundary.
+      const pageOverhead = JSON.stringify(path).length + 256;
+      const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
+      return {
+        text: head
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
+          + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
+          + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
+          + 'agent_settings update tool_result_inline_max_chars.]'
+          + kept,
+        filePath: path,
+      };
+    }
+    if (written) {
       // A workspace was there and the write FAILED — say that, loudly and
       // distinctly. Telling the agent "no writable workspace" would teach
       // them their residence lacks a capability it actually has.
-      failure = failure.slice(0, 200);
-      this.emitTrace({
-        type: 'tool:spill_failed',
-        label: safeLabel,
-        path,
-        contentLength: content.length,
-        error: failure,
-      });
-      console.error(
-        `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
-      );
       return {
         text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${path} FAILED`
-          + ` (${failure}); content over the cap was not retained]`
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
+          + ` (${written.error}); content over the cap was not retained]`
           + kept,
         filePath: null,
       };
@@ -12460,7 +12697,7 @@ export class AgentFramework {
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
-    if (result.data === undefined) return '';
+    if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse) — materialize every referenced payload now, so the stub
@@ -13073,7 +13310,7 @@ export class AgentFramework {
     const startTime = Date.now();
 
     this.moduleRegistry
-      .handleToolCall({ ...call, callerAgentName: agentName })
+      .storableToolCall({ ...call, callerAgentName: agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -16241,7 +16478,11 @@ export class AgentFramework {
           typeof workspace.getTools === 'function' &&
           workspace.getTools().some((tool) => tool.name === 'read_image')
         ) {
-          const result = await workspace.handleToolCall({ ...call, name: 'read_image' });
+          // The workspace module's own handler, called directly: its result
+          // gets the same check a module's result gets in the registry. The
+          // agent's name is for the check's log line, not the handler.
+          const moduleCall = { ...call, name: 'read_image' };
+          const result = storableToolResult({ ...moduleCall, callerAgentName: agentName }, await workspace.handleToolCall(moduleCall));
           if (result.success && Array.isArray(result.data)) {
             const image = result.data.find(
               (block): block is { type: 'image'; data: string; mimeType: string } =>
@@ -16286,11 +16527,7 @@ export class AgentFramework {
           ],
         });
       } catch (error) {
-        finish({
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          isError: true,
-        });
+        finish(thrownResult(error));
       }
     })();
   }
@@ -16651,21 +16888,35 @@ export class AgentFramework {
         for (const image of found) {
           const destination = pathFor(image.rangeOffset);
           const bytes = Buffer.from(image.data, 'base64');
-          const result = await workspace.writeBinary(destination, bytes, image.mediaType);
-          if (!result.success) {
-            finish({
-              success: false,
-              error:
-                `save_recent_image: failed writing "${destination}": ${result.error}` +
-                (savedFiles.length > 0
-                  ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
-                  : ''),
-              isError: true,
-            });
+          const failed = (why: unknown): void => finish({
+            success: false,
+            error:
+              `save_recent_image: failed writing "${destination}": ${why instanceof Error ? why.message : String(why)}` +
+              (savedFiles.length > 0
+                ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
+                : ''),
+            isError: true,
+          });
+          let result: Awaited<ReturnType<typeof workspace.writeBinary>>;
+          try {
+            result = await workspace.writeBinary(destination, bytes, image.mediaType);
+          } catch (error) {
+            // Thrown before its tree entry was set; the images before it
+            // are saved, and the failure says so, as a returned one does.
+            failed(error);
+            return;
+          }
+          const inChronicle = (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
+          if (!result.success && !inChronicle) {
+            failed(result.error);
             return;
           }
           savedFiles.push({
             ...(result.data as Record<string, unknown>),
+            path: destination,
+            size: bytes.byteLength,
+            mimeType: image.mediaType,
+            ...(!result.success ? { diskCopyError: result.error ?? 'disk copy failed' } : {}),
             imageIndex: index + image.rangeOffset,
             ...image.receipt,
           });
@@ -16693,7 +16944,7 @@ export class AgentFramework {
    *  (Module.getUtilities). Shared by the model-facing dispatcher and the
    *  programmatic path (executeToolCall), so code_execution scripts and
    *  ephemerals reach utilities too. */
-  private async handleUtilsToolCall(agentName: string, call: ToolCall): Promise<ToolResult> {
+  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean } = {}): Promise<ToolResult> {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
     const utilities = this.moduleRegistry.getAllUtilities();
     const available = (): string =>
@@ -16728,13 +16979,12 @@ export class AgentFramework {
           };
         }
         // Same dispatch as a first-class tool call — the module cannot tell
-        // which surface the call came through.
-        return this.moduleRegistry.handleToolCall({
-          id: call.id,
-          name: def.name,
-          input: args,
-          callerAgentName: agentName,
-        });
+        // which surface the call came through. An in-process caller gets the
+        // module's own result; the model's path takes its checked form.
+        const utilityCall = { id: call.id, name: def.name, input: args, callerAgentName: agentName };
+        return options.inProcess
+          ? this.moduleRegistry.handleToolCall(utilityCall)
+          : this.moduleRegistry.storableToolCall(utilityCall);
       }
       default:
         return { success: false, isError: true, error: 'action must be "list", "describe", or "run"' };
