@@ -526,7 +526,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         maxRetries: 2,
         onInferenceError: (_error: Error, _agent: string, attempt: number) => {
           waiting();
-          return attempt < 2 ? { retry: true as const, delayMs: 50 } : { retry: false as const };
+          // Long enough that only stop() ends the wait.
+          return attempt < 2 ? { retry: true as const, delayMs: 60_000 } : { retry: false as const };
         },
       },
     });
@@ -537,9 +538,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       compiles++;
       throw new Error('boom');
     };
-    // The retry re-enters startAgentStream after its delay; count those
-    // re-entries, so a retry that was never granted can't pass for one that
-    // was refused.
+    // A retry re-enters startAgentStream after its wait. stop() ends the
+    // wait, and that cancels the retry before it re-enters: count re-entries,
+    // so a retry that went ahead can't pass for one that was cancelled.
     const retries: Array<{ attempt: number; stopping: boolean }> = [];
     const frames = framework as unknown as {
       providerAdmissionClosed: boolean;
@@ -557,8 +558,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const error = console.error;
     console.error = () => {};
     try { await framework.stop(); } finally { console.error = error; }
-    assert.deepEqual(retries, [{ attempt: 1, stopping: true }], 'the retry was granted, and re-entered once stop() had begun');
-    assert.equal(compiles, 1, 'the retry was refused, not compiled');
+    assert.deepEqual(retries, [], 'stop() ended the wait, and the retry was cancelled before it re-entered');
+    assert.equal(compiles, 1, 'the retry was not compiled');
 
     const reopened = await createFramework();
     assert.ok(windowOf(reopened).includes('Antra: while it waits'), 'what was deferred for it was stored');

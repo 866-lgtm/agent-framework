@@ -10903,21 +10903,15 @@ export class AgentFramework {
     attempt = 0,
     providerGateAlreadyHeld = false,
   ): Promise<void> {
-    // Once stop() has begun, no turn starts, for any agent: a fork's or a
-    // subagent's retry after its delay, or a wake the loop dequeued before it
-    // ended, would otherwise begin a turn stop() never cancels, and the
-    // deferred drain at stop's end would meet it live.
-    if (this.providerAdmissionClosed) {
-      if (providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
-      this.endEphemeralRunRefused(agent);
-      return;
-    }
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
     // A stopping framework starts no turn, whoever owns provider admission
-    // (conversation agents and ephemeral runs do not take the gate).
+    // (conversation agents and ephemeral runs do not take the gate). An
+    // ephemeral run waiting on the turn ends now, as at every refusal of
+    // stop()'s.
     if (this.providerAdmissionClosed) {
       if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      this.endEphemeralRunRefused(agent);
       return;
     }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
@@ -11446,11 +11440,13 @@ export class AgentFramework {
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it. Nothing is written (the store is closing); this frame still
-          // owns its token, since no retry frame replaced it.
+          // owns its token, since no retry frame replaced it. An ephemeral
+          // run waiting on the turn ends now, as at every refusal of stop()'s.
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
           }
+          this.endEphemeralRunRefused(agent);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's
@@ -12672,7 +12668,9 @@ export class AgentFramework {
               await this.waitForRetry(action.delayMs);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
+              // An ephemeral run waiting on the turn ends now.
               if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
+              else this.endEphemeralRunRefused(agent);
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',

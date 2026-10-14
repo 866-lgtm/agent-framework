@@ -17,6 +17,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { JsStore } from '@animalabs/chronicle';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 class EphemeralToolModule implements Module {
@@ -211,11 +212,9 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a run waiting to retry when stop() begins gives up before its turn starts again', { timeout: 60_000 }, async () => {
-    // An ephemeral run doesn't hold the primary's provider gate, so the
-    // refusal at the top of startAgentStream is the first check its retry
-    // meets. The refusal before the compile would stop it too, but only once
-    // the turn had started again: its context gathered, its hooks run.
+  it('a run waiting to retry when stop() begins gives up before its turn starts again, and ends at once', { timeout: 60_000 }, async () => {
+    // stop() ends the retry's wait, which cancels the retry before its turn
+    // starts again; the run ends then, not when its idle watchdog fires.
     const { tempDir, storePath } = tempStorePath('ephemeral-retry-stopping-');
     let waiting!: () => void;
     const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
@@ -235,7 +234,8 @@ describe('runEphemeralToCompletion settle signal', () => {
         maxRetries: 1,
         onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
           waiting();
-          return attempt < 1 ? { retry: true, delayMs: 50 } : { retry: false };
+          // Long enough that only stop() ends the wait.
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
         },
       },
     });
@@ -254,6 +254,82 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.equal(compiles, 1, 'the retry was refused, not compiled');
       assert.equal(gathered, 1, 'the retry was refused before its turn started');
     } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a run whose stream failed and waits to retry ends at once when stop() begins', { timeout: 60_000 }, async () => {
+    // The stream's own retry: stop() ends its wait and cancels it there.
+    const { tempDir, storePath } = tempStorePath('ephemeral-stream-retry-stopping-');
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      // A stream that fails once it has started.
+      const stream = new MockYieldingStream([]);
+      (stream as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error('overloaded') });
+      return stream;
+    };
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          // Long enough that only stop() ends the wait.
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      const run = runStartedEphemeral(framework, agent, contextManager, STOPPED_RUN_WATCHDOGS);
+      await inDelay;
+      const stopped = framework.stop();
+      await assert.rejects(run, /refused: the framework is stopping/);
+      await stopped;
+      assert.equal(membrane.calls.length, 1, 'the retry was not compiled');
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a turn asked for once stop() has begun does not start, and its run ends at once', { timeout: 60_000 }, async () => {
+    // As a wake the loop dequeued before stop() ended it would be: refused
+    // before the turn starts. The run, whose request never reached the loop,
+    // ends then, not when its startup watchdog fires.
+    const tempDir = mkdtempSync(join(tmpdir(), 'ephemeral-late-turn-'));
+    // A store the framework doesn't own stays open after stop(), as the run's
+    // own cleanup needs it to.
+    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
+    let gathered = 0;
+    const contextModule: Module = new EphemeralToolModule();
+    contextModule.gatherContext = async () => {
+      gathered++;
+      return [];
+    };
+    const framework = await AgentFramework.create({
+      store,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [],
+      modules: [contextModule],
+      syncIntervalMs: 0,
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      // Asked for, but the event loop never started, so its turn waits.
+      const run = framework.runEphemeralToCompletion(agent, contextManager, STOPPED_RUN_WATCHDOGS);
+      await framework.stop();
+      await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      await assert.rejects(run, /refused: the framework is stopping/);
+      assert.equal(gathered, 0, 'the turn did not start');
+    } finally {
+      store.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
