@@ -29,7 +29,7 @@ class HeldTransport extends McplTransport {
 }
 
 test('close() resolves for a child that a signal this process did not send has already ended', async () => {
-  const transport = StdioTransport.spawn({
+  const transport = await StdioTransport.spawn({
     id: 'signalled',
     command: process.execPath,
     args: ['-e', 'setInterval(() => {}, 1 << 30)'],

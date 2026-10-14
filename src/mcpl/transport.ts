@@ -194,10 +194,11 @@ export class StdioTransport extends McplTransport {
   }
 
   /**
-   * Spawn `config.command` and return a ready stdio transport. Rejects if the
-   * command is missing (a config bug) or the process fails to spawn.
+   * Spawn `config.command` and resolve with a ready stdio transport once the
+   * child has spawned. Rejects if the command is missing (a config bug) or the
+   * process fails to spawn.
    */
-  static spawn(config: McplServerConfig): StdioTransport {
+  static async spawn(config: McplServerConfig): Promise<StdioTransport> {
     if (!config.command) {
       throw new Error(
         `MCPL server "${config.id}": stdio transport requires "command" (none provided)`,
@@ -206,6 +207,22 @@ export class StdioTransport extends McplTransport {
     const child = spawn(config.command, config.args ?? [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildChildEnv(config),
+    });
+    // Node reports a failed spawn (a command that doesn't exist, say) as an
+    // 'error' on a tick after spawn() returns, and no 'exit' follows. It is
+    // settled here, where it is listened for. A caller that listens only once
+    // this resolves, as the handshake does, would be too late when reached
+    // from a timer callback, as a reconnect is: Node runs that tick before the
+    // caller's promise continuation, and throws an 'error' nothing listens for.
+    await new Promise<void>((resolve, reject) => {
+      const failed = (err: Error) => {
+        reject(new Error(`MCPL server "${config.id}" could not be started: ${err.message}`, { cause: err }));
+      };
+      child.once('error', failed);
+      child.once('spawn', () => {
+        child.off('error', failed);
+        resolve();
+      });
     });
     const rl = createInterface({ input: child.stdout! });
     return new StdioTransport(child, rl);
