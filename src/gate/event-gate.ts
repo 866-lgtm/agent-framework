@@ -1620,6 +1620,15 @@ export class EventGate {
     }
   }
 
+  /** A turn that continues another (a budget restart, a tool-result-guard
+   *  retry) holds the entry its predecessor kept for it. After a stop(), whose
+   *  dispose() cleared every entry, it takes the entry again. Unlike
+   *  onInferenceStarted it leaves a pending self-wake alone: the logical turn
+   *  that armed it is the one still running. */
+  onInferenceResumed(agentName: string): void {
+    this.inferring.add(agentName);
+  }
+
   onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
@@ -1983,5 +1992,13 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    // stop() disposes the gate once its streams and event loop have ended (a
+    // turn still compiling then is dropped at its next check, before it sends
+    // anything), and a start() goes on with this gate. An agent left here by
+    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
+    // stop() refused) would make every debounced batch buffer until that
+    // agent's next turn ended. A turn that continues after the start() takes
+    // its entry again (onInferenceResumed).
+    this.inferring.clear();
   }
 }

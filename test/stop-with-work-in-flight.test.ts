@@ -16,6 +16,10 @@
  *     stopping"), never "accepted", and never thrown out of the
  *     connection's listener; a handler's own fault is answered -32603.
  * Any other event pushed to a stopped framework still throws to its caller.
+ * A turn waiting to retry is work in flight too: stop() cancels the retry,
+ * and leaves no agent inferring at the event gate, which a start() after the
+ * stop goes on with (#334). A turn that continues after that start() is
+ * marked inferring again.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -28,8 +32,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ErrorAction,
   Module,
   ModuleContext,
   ProcessEvent,
@@ -40,7 +46,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
 async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
@@ -104,6 +110,19 @@ class SlowModule implements Module {
       };
     }
     return {};
+  }
+}
+
+/** A stream that yields nothing until the test releases it. */
+class HeldStream extends MockYieldingStream {
+  constructor(private readonly released: Promise<void>, responses: ConstructorParameters<typeof MockYieldingStream>[0]) {
+    super(responses);
+  }
+
+  override async *[Symbol.asyncIterator]() {
+    await this.released;
+    const inner = super[Symbol.asyncIterator]();
+    for (let next = await inner.next(); !next.done; next = await inner.next()) yield next.value;
   }
 }
 
@@ -249,6 +268,89 @@ describe('stop() with work still in flight', () => {
     module.finish('success');
     await droppedLine();
     assert.deepEqual(rejections, []);
+  });
+
+  it('a turn whose retry stop() cancels leaves no agent inferring at the event gate', async () => {
+    // The stream can't start, and its retry waits longer than the test, so
+    // only stop() ends the wait, which cancels the retry. While an agent is
+    // inferring at the gate, the gate buffers every batch it debounces
+    // instead of delivering it, and wakes no agent for it.
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      throw new Error('the stream could not start');
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { config: { policies: [], default: 'always' } },
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    await inDelay;
+    assert.deepEqual(gate.inferenceDiagnostics().inferring, ['assistant'], 'the turn is open at the gate while its retry waits');
+    await framework.stop();
+    assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'stop() leaves no agent inferring');
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    assert.deepEqual(rejections, []);
+  });
+
+  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', async () => {
+    // A restart left queued when stop() ends the loop continues its turn once
+    // a start() on the same framework takes it up. stop() cleared the gate's
+    // entries, and a turn that continues another doesn't start a new one, so
+    // it has to take its agent's again: while no agent is inferring, the gate
+    // delivers debounced batches, and residents share one message slot.
+    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let streaming!: () => void;
+    const inStream = new Promise<void>((resolve) => { streaming = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      streaming();
+      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[])]);
+    };
+    const framework = await AgentFramework.create({
+      store,
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { configPath: join(tempDir, 'gate.json'), config: { policies: [], default: 'always' } },
+    });
+    const internal = framework as unknown as {
+      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+    };
+    try {
+      framework.start();
+      await framework.stop();
+      framework.start();
+      internal.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+      await inStream;
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['assistant'], 'the continuing turn holds its entry');
+      release();
+      await until(() => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the turn to end');
+      assert.equal(membrane.calls.length, 1);
+      assert.deepEqual(rejections, []);
+    } finally {
+      release();
+      await framework.stop();
+      store.close();
+    }
   });
 
   describe("tune-out's subconscious tools", () => {

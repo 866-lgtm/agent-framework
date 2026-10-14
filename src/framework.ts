@@ -11637,9 +11637,13 @@ export class AgentFramework {
       ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
-    // predecessor keeps EventGate liveness until its successor terminates.
+    // predecessor keeps EventGate liveness until its successor terminates,
+    // and the successor takes it again if a stop() cleared it in between (a
+    // restart left queued, which a start() then takes up).
     if (!resumesTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
+    } else {
+      this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
