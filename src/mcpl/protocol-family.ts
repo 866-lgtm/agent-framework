@@ -113,19 +113,25 @@ export function redactUrl(url: string | undefined): string {
  * - from the url, as written and decoded: credential-like path segments and
  *   query names, credential-shaped or credential-named query values, every
  *   other non-empty parameter as its whole name=value, and a ws:// url's
- *   username and password;
- * - the static token, raw and percent- or form-encoded;
- * - a stdio server's environment values whose names say they're credentials.
+ *   username and password, its userinfo as one unit before its @, and the
+ *   Basic credential a WebSocket client sends for that userinfo;
+ * - the static token, raw, with its slashes escaped as some JSON encoders
+ *   write them, and percent- or form-encoded with either case of hex;
+ * - a stdio server's environment values whose names say they're
+ *   credentials, raw, with their slashes JSON-escaped, and percent-encoded
+ *   with either case of hex.
  * A string replaced on its own has at least 8 characters, since a shorter
  * one can't be told from ordinary text, and it is replaced wherever it
  * occurs, after an escape or inside a longer token too. A query parameter is
  * also replaced as its whole name=value, only where no letter or digit
  * adjoins the pair, so v=2 leaves dev=2 alone; a short value goes only that
- * way. One
- * longest-first pass never scans its own replacement. A credential the
+ * way. One longest-first pass never scans its own replacement, and text
+ * that may come from several servers takes one pass over all their
+ * configurations' strings (serverCredentialPatterns). A credential the
  * configuration doesn't hold, such as the token an access provider fetches
- * or another origin's, is outside it. JSON-RPC answers, and the error a
- * host's own connect raises, pass as they are.
+ * or another origin's, is outside it, and so are other encodings of the
+ * ones it holds. JSON-RPC answers, and the error a host's own connect
+ * raises, pass as they are.
  */
 export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
   return serverTextRedactor(config)(text);
@@ -136,28 +142,56 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * pattern built once: for a connection's records, such as each stderr line.
  */
 export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
+  return credentialRedactor(serverCredentialPatterns(config));
+}
+
+/** A string {@link redactServerText} replaces, and the pattern that finds it. */
+export interface CredentialPattern {
+  readonly value: string;
+  readonly source: string;
+}
+
+/**
+ * The strings {@link redactServerText} replaces for one configuration, as
+ * patterns for {@link credentialRedactor}. Text that may come from several
+ * servers goes through one redactor over all their patterns, so its one
+ * longest-first pass takes the longest match among them all: a secret that
+ * begins another configuration's longer one can't cut that one short.
+ */
+export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): CredentialPattern[] {
   // Strings replaced wherever they occur (after an escape or inside a longer
   // token too), and name=value pairs, replaced only where no letter or digit
   // adjoins them, so a pair such as v=2 leaves dev=2 alone. A pair's value is
   // also replaced on its own when it's a credential, wherever it occurs.
   const secrets = new Set<string>();
   const pairs = new Set<string>();
+  const userinfo = new Set<string>();
   const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
   const decode = (value: string, query = false): string => {
     try { return decodeURIComponent(query ? value.replace(/\+/g, ' ') : value); }
     catch { return value; }
   };
-  // A string as written and percent-encoded (a string encodeURIComponent
-  // refuses, such as one with an unpaired surrogate, has no encoded form).
+  // Percent-escapes in lowercase hex, as some encoders write them.
+  const lowerEscapes = (value: string): string => value.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase());
+  // A string as written, with its slashes escaped as some JSON encoders
+  // write them, and percent-encoded in either case of hex (a string
+  // encodeURIComponent refuses, such as one with an unpaired surrogate, has
+  // no encoded form).
   const withEncoded = (value: string): void => {
     standalone(value);
-    try { standalone(encodeURIComponent(value)); } catch { /* no percent-encoded form */ }
+    standalone(value.replace(/\//g, '\\/'));
+    let encoded: string;
+    try { encoded = encodeURIComponent(value); } catch { return; /* no percent-encoded form */ }
+    standalone(encoded);
+    standalone(lowerEscapes(encoded));
   };
   // The token as sent: raw in a header, and percent- or form-encoded where a
   // transport puts it in a url.
   const token = config.token ?? '';
   withEncoded(token);
-  standalone(new URLSearchParams({ t: token }).toString().slice(2));
+  const formEncoded = new URLSearchParams({ t: token }).toString().slice(2);
+  standalone(formEncoded);
+  standalone(lowerEscapes(formEncoded));
   // A stdio server's environment values whose names say they carry a
   // credential: a part of the name that ends with a credential word
   // (GITHUB_TOKEN, API_KEY, PGPASSWORD, ACCESSTOKEN), and not one where the
@@ -200,15 +234,35 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
         standalone(value);
         standalone(decode(value));
       }
+      if (url.username || url.password) {
+        // The userinfo as one unit before its @, so a password too short to
+        // replace on its own still goes with its username, and the Basic
+        // credential a WebSocket client sends for it, from the userinfo as
+        // written and as decoded.
+        for (const [username, password] of [[url.username, url.password], [decode(url.username), decode(url.password)]]) {
+          if (`${username}:${password}`.length >= 8) userinfo.add(`${username}:${password}`);
+          standalone(Buffer.from(`${username}:${password}`).toString('base64'));
+        }
+      }
     }
   }
-  if (secrets.size === 0 && pairs.size === 0) return asText;
   const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const alternatives = [
+  return [
     ...[...secrets].map(value => ({ value, source: escape(value) })),
     ...[...pairs].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
-  ].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
-  const pattern = new RegExp(alternatives.join('|'), 'g');
+    ...[...userinfo].map(value => ({ value, source: `${escape(value)}(?=@)` })),
+  ];
+}
+
+/**
+ * One longest-first pass over the given patterns that never scans its own
+ * replacement: at each place, the longest string that matches there becomes
+ * `redacted`.
+ */
+export function credentialRedactor(patterns: readonly CredentialPattern[]): (text: unknown) => string {
+  if (patterns.length === 0) return asText;
+  const sources = [...patterns].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
+  const pattern = new RegExp([...new Set(sources)].join('|'), 'g');
   return (text) => asText(text).replace(pattern, 'redacted');
 }
 

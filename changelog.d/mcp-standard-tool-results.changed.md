@@ -108,12 +108,16 @@
   server), a new id another server holds, a tool prefix another server or a
   module holds, a framework whose `stop()` has begun, and a connect or
   disconnect of the server in flight. Before, a restart disconnected first,
-  so a refused connect left the server gone; now the server keeps running. A
-  disconnect releases its tool-prefix claim only while its own server holds
-  it. Treat a submitted configuration as immutable while the server uses it:
-  change settings with `restartMcplServer(id, newConfig)`, and rotate a
-  network server's credentials through `accessProvider` (a stdio server's
-  changed `env` goes through a restart with the new configuration).
+  so a refused connect left the server gone; now the server keeps running.
+  From those checks through its connect, the restart holds the id and the
+  tool prefix it moves the server to, so a connect or restart started
+  meanwhile is refused them, naming the restart, rather than taking them
+  while the old server is torn down. A disconnect releases its tool-prefix
+  claim only while its own server holds it. Treat a submitted configuration
+  as immutable while the server uses it: change settings with
+  `restartMcplServer(id, newConfig)`, and rotate a network server's
+  credentials through `accessProvider` (a stdio server's changed `env` goes
+  through a restart with the new configuration).
 - A server configuration naming no usable transport is now an error before
   anything is spawned or dialed. That covers a `transport` that doesn't
   match the url's scheme, `transport: 'http'` without a url, and an

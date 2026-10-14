@@ -14,6 +14,8 @@ import {
   checkServerConfig,
   redactUrl,
   redactServerText,
+  credentialRedactor,
+  serverCredentialPatterns,
   describeCredentialError,
   MCPL_ONLY_POLICY_FIELDS,
   MAX_TIMER_MS,
@@ -374,6 +376,30 @@ test('the cleartext warning counts a credential-shaped value under a plain name,
   const warned = serverConfigWarnings(cfg({ url: 'http://remote.example/mcp?session=Zx81kQ0pL2mN7vB4tY6c' }));
   assert.equal(warned.length, 1);
   assert.match(warned[0], /its url's query parameter "session" goes to remote\.example unencrypted/);
+});
+
+test('recorded server text: a slash escaped as JSON may write it, and percent-escapes in lowercase hex', () => {
+  const config = cfg({ token: 'tok/en+x0123', env: { API_TOKEN: 'env/secret+0123' } } as Partial<McplServerConfig>);
+  for (const form of ['tok/en+x0123', 'tok\\/en+x0123', 'tok%2Fen%2Bx0123', 'tok%2fen%2bx0123', 'env\\/secret+0123', 'env%2fsecret%2b0123']) {
+    assert.equal(redactServerText(`refused: ${form}`, config), 'refused: redacted', form);
+  }
+});
+
+test("recorded server text: a ws:// url's userinfo as one unit before its @, and the Basic credential sent for it", () => {
+  // Neither part is long enough to replace on its own.
+  const config = cfg({ url: 'wss://alice:pw@h/mcp' });
+  assert.equal(redactServerText('dial wss://alice:pw@h/mcp failed', config), 'dial wss://redacted@h/mcp failed');
+  assert.equal(redactServerText('Authorization: Basic YWxpY2U6cHc=', config), 'Authorization: Basic redacted');
+  assert.equal(redactServerText('alice:pw is not followed by its @ here', config), 'alice:pw is not followed by its @ here');
+});
+
+test("one redactor over several configurations' strings takes the longest secret among them all", () => {
+  const short = cfg({ id: 'a', token: 'ghp_SHAREDPREFIX123' });
+  const long = cfg({ id: 'b', token: 'ghp_SHAREDPREFIX123_but_longer_TAIL9' });
+  const redact = credentialRedactor([...serverCredentialPatterns(short), ...serverCredentialPatterns(long)]);
+  assert.equal(redact('auth failed for ghp_SHAREDPREFIX123_but_longer_TAIL9'), 'auth failed for redacted');
+  assert.equal(redact('auth failed for ghp_SHAREDPREFIX123'), 'auth failed for redacted');
+  assert.equal(credentialRedactor([])('nothing to replace'), 'nothing to replace');
 });
 
 test('recorded server text uses longest-first, one-pass replacements and is idempotent', () => {

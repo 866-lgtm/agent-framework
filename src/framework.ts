@@ -394,7 +394,7 @@ import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { asText, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverTextRedactor } from './mcpl/protocol-family.js';
+import { asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import type {
   McplServerConfig,
@@ -1078,6 +1078,10 @@ type AnswerOnce = {
   answered: () => boolean;
 };
 
+/** A restart's hold on the id and tool prefix it is moving its server to;
+ *  `restarting` names the server it restarts. Compared by identity. */
+type McpRestartClaim = { readonly restarting: string };
+
 /**
  * Wrap a server request's responder so the request is answered at most once,
  * and a later failure can tell whether the handler already answered.
@@ -1566,6 +1570,14 @@ export class AgentFramework {
   /** Connects and disconnects in flight, by server id (holdMcpServerId);
    *  created on first use, like modernMcpConnections. */
   private mcpServerOps: Map<string, { kind: 'connect' | 'disconnect'; settled: Promise<void> }> | undefined;
+  /** The ids and tool prefixes restarts hold, each with the claim of the
+   *  restart holding it, from the restart's checks through its connect
+   *  (restartMcplServer): no other connect or restart takes them while the
+   *  old server is torn down. */
+  private readonly mcpRestartClaims = {
+    ids: new Map<string, McpRestartClaim>(),
+    prefixes: new Map<string, McpRestartClaim>(),
+  };
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -14336,6 +14348,7 @@ export class AgentFramework {
   private async connectMcplServerInternal(
     config: import('./mcpl/types.js').McplServerConfig,
     deferAwareness = false,
+    claim?: McpRestartClaim,
   ): Promise<void> {
     if (this.mcpServerAdmissionClosed) {
       throw new Error(`MCP server "${config.id}" was not connected: the framework is stopping or stopped`);
@@ -14350,7 +14363,7 @@ export class AgentFramework {
     // protocol on a URL, a modern deadline of 0, MCPL policy on a modern
     // server. Every valid legacy shape resolves exactly as before.
     const family = AgentFramework.usableConfigFamily(config);
-    const taken = this.mcpServerIdTaken(config.id);
+    const taken = this.mcpServerIdTaken(config.id, claim);
     if (taken) throw new Error(taken);
     const hold = this.holdMcpServerId(config.id, 'connect');
     try {
@@ -14844,6 +14857,15 @@ export class AgentFramework {
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    await this.connectMcplServerClaimed(config);
+  }
+
+  /** connectMcplServer, for a restart's connect too: the id and tool prefix
+   *  its `claim` holds are free to it, and refused to everyone else. */
+  private async connectMcplServerClaimed(
+    config: import('./mcpl/types.js').McplServerConfig,
+    claim?: McpRestartClaim,
+  ): Promise<void> {
     // Refused before anything initializes, spawns or dials.
     if (this.mcpServerAdmissionClosed) {
       throw new Error(`MCP server "${config.id}" was not connected: the framework is stopping or stopped`);
@@ -14854,11 +14876,11 @@ export class AgentFramework {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
     }
 
-    const collision = this.mcplPrefixCollision(config);
+    const collision = this.mcplPrefixCollision(config, undefined, claim);
     if (collision) throw new Error(collision);
 
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
-    await this.connectMcplServerInternal(config);
+    await this.connectMcplServerInternal(config, false, claim);
     await this.refreshMcplTools();
     this.emitMcplToolDiff(oldToolNames, config.id);
   }
@@ -14897,7 +14919,6 @@ export class AgentFramework {
       // What held the id before (a connect still running, an earlier
       // disconnect) settles first, so what it registered is removed whole.
       await hold.previous;
-      const config = this.mcplServerConfigs.get(id);
       const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
       try {
@@ -14922,10 +14943,13 @@ export class AgentFramework {
       this.featureSetManager?.removeServer(id);
       this.checkpointManager?.removeServer(id);
 
-      const prefix = config?.toolPrefix ?? `mcpl--${id}`;
-      // Only this server's own claim: a server connected since under the
-      // prefix it held keeps it.
-      if (this.mcplPrefixMap.get(prefix) === id) this.mcplPrefixMap.delete(prefix);
+      // Only this server's own claims, as the prefix map holds them rather
+      // than as its configuration reads now: a server connected since under
+      // a prefix it held keeps it, and a configuration changed after its
+      // connect leaves no claim behind.
+      for (const [prefix, owner] of this.mcplPrefixMap) {
+        if (owner === id) this.mcplPrefixMap.delete(prefix);
+      }
       this.mcplServerConfigs.delete(id);
 
       await this.refreshMcplTools();
@@ -14940,6 +14964,9 @@ export class AgentFramework {
    * same (or an updated) config. This actually respawns a stdio child —
    * unlike `reconnect: true`, which only retries after transport-level
    * failures. Throws if the server has no stored config and none is given.
+   * What its connect would refuse is refused before the running server is
+   * torn down, and until the connect, a connect or restart started meanwhile
+   * is refused the id and tool prefix the restart moves the server to.
    *
    * Treat a submitted configuration and its nested values as immutable for
    * as long as the server uses them. Apply changed settings with
@@ -14954,7 +14981,10 @@ export class AgentFramework {
     // What the connect would refuse is refused here, before the running
     // server is torn down for it: a framework whose stop() has begun, the
     // configuration's binding and settings, a new id another server holds,
-    // and a tool prefix another server or a module already holds.
+    // and a tool prefix another server or a module already holds. From these
+    // checks through its connect, the restart holds the id and the tool
+    // prefix it moves the server to (mcpRestartClaims), so no connect or
+    // restart started meanwhile takes them while the old server is torn down.
     if (this.mcpServerAdmissionClosed) {
       throw new Error(`MCP server "${id}" was not restarted: the framework is stopping or stopped`);
     }
@@ -14971,14 +15001,32 @@ export class AgentFramework {
       // operation left, after the server was torn down.
       throw new Error(`MCP server "${id}" was not restarted: it is being ${inFlight.kind === 'disconnect' ? 'disconnected' : 'connected'}; restart it once that has finished`);
     }
+    const claimedBy = this.mcpRestartClaims.ids.get(id);
+    if (claimedBy) {
+      // Another restart is moving its server to this id, or restarting this
+      // server already.
+      throw new Error(claimedBy.restarting === id
+        ? `MCP server "${id}" was not restarted: it is being restarted; restart it once that has finished`
+        : `MCP server "${id}" was not restarted: the restart of "${claimedBy.restarting}" holds its id; restart it once that has finished`);
+    }
     if (config.id !== id) {
       const taken = this.mcpServerIdTaken(config.id);
       if (taken) throw new Error(taken);
     }
     const collision = this.mcplPrefixCollision(config, id);
     if (collision) throw new Error(collision);
-    await this.disconnectMcplServer(id);
-    await this.connectMcplServer(config);
+
+    const claim: McpRestartClaim = { restarting: id };
+    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    this.mcpRestartClaims.ids.set(config.id, claim);
+    this.mcpRestartClaims.prefixes.set(prefix, claim);
+    try {
+      await this.disconnectMcplServer(id);
+      await this.connectMcplServerClaimed(config, claim);
+    } finally {
+      if (this.mcpRestartClaims.ids.get(config.id) === claim) this.mcpRestartClaims.ids.delete(config.id);
+      if (this.mcpRestartClaims.prefixes.get(prefix) === claim) this.mcpRestartClaims.prefixes.delete(prefix);
+    }
   }
 
   /**
@@ -14989,19 +15037,28 @@ export class AgentFramework {
    * meanwhile, both have their credentials replaced.
    */
   private everyServerRedactor(): (text: unknown) => string {
-    const snapshot = [...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config));
+    const snapshot = [...this.mcplServerConfigs.values()].flatMap(config => serverCredentialPatterns(config));
     // The configurations present when the operation began, then those present
     // now: a server removed meanwhile and one connected meanwhile are both
-    // covered.
-    return (text) => [...snapshot, ...[...this.mcplServerConfigs.values()].map(config => serverTextRedactor(config))]
-      .reduce<string>((recorded, redact) => redact(recorded), asText(text));
+    // covered. One pass over all their strings, so a secret that begins
+    // another server's longer one can't cut that one short.
+    return (text) => credentialRedactor([
+      ...snapshot,
+      ...[...this.mcplServerConfigs.values()].flatMap(config => serverCredentialPatterns(config)),
+    ])(text);
   }
 
   /** Why a connect for this id is refused, or null when the id is free. One
    *  owner per id, across both engines (holdMcpServerId): a connect or
    *  disconnect in flight holds it, and so does a registered connection,
-   *  including one kept because its launch couldn't be confirmed exited. */
-  private mcpServerIdTaken(id: string): string | null {
+   *  including one kept because its launch couldn't be confirmed exited, and
+   *  a restart moving its server to the id (mcpRestartClaims), except to
+   *  that restart's own connect (`claim`). */
+  private mcpServerIdTaken(id: string, claim?: McpRestartClaim): string | null {
+    const claimedBy = this.mcpRestartClaims.ids.get(id);
+    if (claimedBy && claimedBy !== claim) {
+      return `MCP server "${id}" is held by the restart of "${claimedBy.restarting}"; connect it once that has finished`;
+    }
     const op = this.mcpServerOps?.get(id);
     if (op?.kind === 'disconnect') {
       return `MCP server "${id}" is still being disconnected; connect it once that has finished`;
@@ -15016,13 +15073,23 @@ export class AgentFramework {
 
   /** The collision rules create() enforces at startup, as a runtime connect
    *  (or a restart, before its disconnect) meets them: the tool prefix must
-   *  not shadow a module name or another server's prefix. The server's own
-   *  prefix is free to keep, and so is that of the server a restart is
-   *  about to disconnect (`leaving`). */
-  private mcplPrefixCollision(config: import('./mcpl/types.js').McplServerConfig, leaving?: string): string | null {
+   *  not shadow a module name or another server's prefix, or be one a
+   *  restart is moving its server to (mcpRestartClaims). The server's own
+   *  prefix is free to keep, so is that of the server a restart is about to
+   *  disconnect (`leaving`), and so is the prefix a restart's own connect
+   *  holds (`claim`). */
+  private mcplPrefixCollision(
+    config: import('./mcpl/types.js').McplServerConfig,
+    leaving?: string,
+    claim?: McpRestartClaim,
+  ): string | null {
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
     if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
       return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`;
+    }
+    const claimedBy = this.mcpRestartClaims.prefixes.get(prefix);
+    if (claimedBy && claimedBy !== claim) {
+      return `MCPL server "${config.id}" toolPrefix "${prefix}" is held by the restart of "${claimedBy.restarting}"`;
     }
     const prefixOwner = this.mcplPrefixMap.get(prefix);
     if (prefixOwner && prefixOwner !== config.id && prefixOwner !== leaving) {

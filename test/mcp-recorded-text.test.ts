@@ -225,6 +225,13 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   assert.equal(everyServer('closed lateSecret0123456789'), 'closed redacted');
   // A value that can't be printed reads as a placeholder.
   assert.equal(everyServer(Object.create(null)), '[a value that cannot be printed]');
+  // One pass over every server's strings: a secret that begins another
+  // server's longer one doesn't cut that one short.
+  framework.mcplServerConfigs = new Map([
+    ['a', { id: 'a', token: 'ghp_SHAREDPREFIX123' }],
+    ['b', { id: 'b', token: 'ghp_SHAREDPREFIX123_but_longer_TAIL9' }],
+  ]);
+  assert.equal(framework.everyServerRedactor()('auth failed for ghp_SHAREDPREFIX123_but_longer_TAIL9'), 'auth failed for redacted');
   framework.mcplServerConfigs = new Map([[config.id, config]]);
 
   // The model's dispatch: the tool:failed trace (message and stack) and the
