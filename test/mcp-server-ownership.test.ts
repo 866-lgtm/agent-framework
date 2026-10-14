@@ -436,7 +436,7 @@ test("a refresh in flight when a server is disconnected doesn't bring its tools 
   });
 });
 
-test("a server connected while a refresh waits keeps its own tool prefix in that refresh's list", async () => {
+test("a server connected while a refresh waits keeps its own tool prefix, and the held refresh publishes nothing", async () => {
   await withFramework(async ({ framework, dir }) => {
     await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
     const internals = framework as unknown as {
@@ -454,12 +454,40 @@ test("a server connected while a refresh waits keeps its own tool prefix in that
     connection.listTools = realList;
     // Connected while the first refresh waits, under a prefix of its own.
     await framework.connectMcplServer({ ...modern('n', '', join(dir, 'raw-n.jsonl')), toolPrefix: 'custom' });
-    // The held refresh finishes last, so its list is the one that stands.
+    // The held refresh finishes last, and publishes nothing: the connect's
+    // own refresh, started after it, listed both servers.
     release();
     await refreshing;
     const names = framework.getAllTools().map((t) => t.name);
     assert.ok(names.some((n) => n.startsWith('custom--')), names.join(', '));
     assert.ok(!names.some((n) => n.startsWith('mcpl--n--')), names.join(', '));
+  });
+});
+
+test("a refresh in flight when a server restarts under the same id publishes none of the old connection's listing", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    assert.ok(toolsOf(framework, 'm').length > 0);
+    const internals = framework as unknown as {
+      modernServers(): Map<string, { listTools(): Promise<unknown[]> }>;
+      refreshMcplTools(): Promise<void>;
+    };
+    const connection = internals.modernServers().get('m')!;
+    const realList = connection.listTools.bind(connection);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let listed = false;
+    connection.listTools = async () => { const tools = await realList(); listed = true; await gate; return tools; };
+    const refreshing = internals.refreshMcplTools();
+    await until(() => listed, "the refresh holds the old connection's list");
+    // Restarted under the same id, its tools now under another prefix.
+    await framework.restartMcplServer('m', { ...modern('m', '', join(dir, 'raw-2.jsonl')), toolPrefix: 'second' });
+    assert.notEqual(internals.modernServers().get('m'), connection, 'a new connection');
+    release();
+    await refreshing;
+    const names = framework.getAllTools().map((t) => t.name);
+    assert.deepEqual(toolsOf(framework, 'm'), [], `the old connection's listing isn't published: ${names.join(', ')}`);
+    assert.ok(names.some((n) => n.startsWith('second--')), names.join(', '));
   });
 });
 

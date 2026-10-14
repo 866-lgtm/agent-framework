@@ -2013,6 +2013,11 @@ export class AgentFramework {
   private mcplToolServers: Map<string, string> = new Map();
   /** Servers whose tools/list answered in the latest refresh. */
   private mcplListedServers: Set<string> = new Set();
+  /** refreshMcplTools' starts, and the start whose result was published
+   *  last: a refresh that a later-started one has overtaken publishes
+   *  nothing, since that one listed every server after it. */
+  private mcplToolsRefreshStarted = 0;
+  private mcplToolsRefreshPublished = 0;
   /** Zero-match tool-pattern diagnostics (checkToolPatterns): set at the end
    *  of create(), when the tool universe is first complete. */
   private toolPatternChecksArmed = false;
@@ -18099,6 +18104,7 @@ export class AgentFramework {
    */
   private async refreshMcplTools(): Promise<void> {
     if (!this.mcplServerRegistry) return;
+    const generation = ++this.mcplToolsRefreshStarted;
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
@@ -18106,7 +18112,7 @@ export class AgentFramework {
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
 
-    for (const server of this.mcplServerRegistry.getAllServers()) {
+    for (const server of [...this.mcplServerRegistry.getAllServers()]) {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       try {
@@ -18153,7 +18159,9 @@ export class AgentFramework {
     // Modern servers: the same namespacing, tool policy and RFC-008 class
     // hints. Feature sets are MCPL and don't apply. A server whose listing
     // fails stays unlisted (unknown), never "listed nothing".
-    for (const server of this.modernServers().values()) {
+    // The servers there now: one connected while this refresh runs is
+    // listed by its own connect's refresh.
+    for (const server of [...this.modernServers().values()]) {
       if (!server.isConnected) continue;
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
@@ -18185,6 +18193,10 @@ export class AgentFramework {
       }
     }
 
+    // A refresh started after this one has published already: it listed
+    // every server after this one did, a server replaced by a restart under
+    // the same id included, so this one's listings are older.
+    if (generation < this.mcplToolsRefreshPublished) return;
     // A server removed while this refresh awaited its lists (a disconnect,
     // or a server lost for good) publishes nothing: whichever refresh
     // finishes last must not bring back a removed server's tools.
@@ -18203,6 +18215,7 @@ export class AgentFramework {
       }
       for (const serverId of gone) listedServers.delete(serverId);
     }
+    this.mcplToolsRefreshPublished = generation;
     this.mcplTools = gone.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
