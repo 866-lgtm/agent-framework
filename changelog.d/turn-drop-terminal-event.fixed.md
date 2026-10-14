@@ -1,0 +1,1 @@
+- A turn dropped after its compile, because its agent was replaced or removed, or the framework was stopping or had been stopped and started again, now ends with `inference:aborted`, whose `reason` says which. The turn had emitted `inference:started` and then no terminal event, so a module that brackets a turn between them, such as a typing indicator, kept that turn open.

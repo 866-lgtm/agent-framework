@@ -11341,6 +11341,7 @@ export class AgentFramework {
     const startLogical = this.turnRouting.get(agent.name)?.logical;
 
     this.touchEphemeralRun(agent.name, true);
+    const turnStartedAt = Date.now();
     this.emitTrace({
       type: 'inference:started',
       agentName: agent.name,
@@ -11354,7 +11355,7 @@ export class AgentFramework {
     if (!continuingTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
     }
-    this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
+    this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside
@@ -11459,10 +11460,10 @@ export class AgentFramework {
       // Membrane's yielding stream starts its request when it is first
       // iterated, so cancelling it here, before driveStream, sends nothing.
       if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
-        console.error(`[turn] ${agent.name}: a turn compiled while ${
-          this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-            : this.providerAdmissionClosed ? 'the framework was stopping'
-              : 'the framework was stopped and started again'} is dropped before it sends anything`);
+        const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
+          : this.providerAdmissionClosed ? 'the framework was stopping'
+            : 'the framework was stopped and started again';
+        console.error(`[turn] ${agent.name}: a turn compiled while ${why} is dropped before it sends anything`);
         stream.cancel();
         agent.cancelStream();
         if (this.agents.get(agent.name) === agent) {
@@ -11474,6 +11475,15 @@ export class AgentFramework {
         }
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
+        // The turn emitted inference:started before its compile, and every
+        // turn that does gets one terminal event, which listeners such as a
+        // typing loop rely on. Nothing was sent, so it ends as aborted.
+        this.emitTrace({
+          type: 'inference:aborted',
+          agentName: agent.name,
+          reason: `a turn compiled while ${why} is dropped before it sends anything`,
+          durationMs: Date.now() - turnStartedAt,
+        });
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression

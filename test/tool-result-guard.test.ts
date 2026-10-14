@@ -3224,6 +3224,13 @@ test('a framework compile from before stop cannot drive after restart', async ()
     return result;
   };
   let starting: Promise<void> | undefined;
+  // The dropped turn's inference:* events, as a module's trace listener sees them.
+  const turnEvents: Array<{ type: string; reason?: string }> = [];
+  const unsubscribe = framework.onTrace((event) => {
+    if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') {
+      turnEvents.push({ type: event.type, ...('reason' in event ? { reason: String(event.reason) } : {}) });
+    }
+  });
   try {
     const lines: string[] = [];
     const error = console.error;
@@ -3238,6 +3245,11 @@ test('a framework compile from before stop cannot drive after restart', async ()
     } finally { console.error = error; }
     assert.equal(driven, 0);
     assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
+    // The turn emitted inference:started before its compile, so it gets one
+    // terminal event: a listener's bracket (a typing loop) closes.
+    assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
+    assert.match(turnEvents[1]?.reason ?? '', /stopped and started again.*dropped before it sends anything/);
+    unsubscribe();
     // A turn begun after the restart is admitted and drives its stream.
     await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
     await until(() => driven === 1, 'the turn begun after the restart drives');
