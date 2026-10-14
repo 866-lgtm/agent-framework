@@ -842,7 +842,7 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
   }
 });
 
-test('boot recovery drops a recovered deferred write the store could never take, naming it, and restores the rest', { timeout: 60_000 }, async () => {
+test('boot recovery drops a malformed recovered deferred write, naming it, and restores the rest', { timeout: 60_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-malformed-'));
   const storePath = join(dir, 'store');
   const config = () => ({

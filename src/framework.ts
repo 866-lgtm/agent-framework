@@ -2826,6 +2826,9 @@ export class AgentFramework {
     // No stream is left: from the start of stop() none registers and no
     // agent turn starts (providerAdmissionClosed, checked for every agent),
     // and every stream registered before was cancelled and awaited above.
+    // (A start() made before this stop finishes reopens admission, so a turn
+    // it begins can be alive here and take one of these entries mid-stream;
+    // #315 asks how start() after stop() should behave.)
     // What is still deferred (a message held for a turn's end whose flush
     // found the target busy again, or one deferred behind its target's own
     // state) would wait for a flush that may never come. Land each at its
@@ -4945,10 +4948,13 @@ export class AgentFramework {
           if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
         }
       }
-      // An entry the store could never take has no place in the queue, whose
-      // readers trust each entry's shape: one whose participant isn't text,
-      // or whose content isn't an array of block objects, is dropped here
-      // with a line naming it, rather than held.
+      // An entry whose shape the queue's readers don't expect has no place in
+      // it: one whose participant isn't text, or whose content isn't an array
+      // of block objects, is dropped here with a line naming it, rather than
+      // held. Reading a null block's type throws, at the tool boundary and in
+      // the store. The store keeps a string or number block as given, but
+      // membrane's native formatter refuses any request that carries one (the
+      // other formatters leave such a block out).
       const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
         !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
           && Array.isArray((m as { content?: unknown }).content)

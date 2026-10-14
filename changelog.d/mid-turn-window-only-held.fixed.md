@@ -43,14 +43,15 @@
   an ephemeral run whose turn is refused because `stop()` has closed
   admission, or whose retry `stop()` cancels, ends at once rather than
   waiting for a watchdog. Since no turn starts or registers a stream once
-  `stop()` begins, no reply can then follow a stored entry in a stream, so
-  `stop()` stores each one even while a frame it doesn't wait for still
-  holds its target's turn, such as a turn started outside the event loop, or
-  a puppet call still running after `stop()`'s wait for operator operations
-  timed out; that call's pair then lands after them. A quiesced host keeps
-  what is deferred in its persisted queue for boot recovery. An entry for a
-  target no longer registered (a disposed fork) is dropped from a
-  memory-only queue at exit, as before.
+  `stop()` begins (unless `start()` is called before it finishes), no reply
+  can then follow a stored entry in a stream, so `stop()` stores each one
+  even while a frame it doesn't wait for still holds its target's turn, such
+  as a turn started outside the event loop, or a puppet call still running
+  after `stop()`'s wait for operator operations timed out; that call's pair
+  then lands after them. A quiesced host keeps what is deferred in its
+  persisted queue for boot recovery. An entry for a target no longer
+  registered (a disposed fork) is dropped from a memory-only queue at exit,
+  as before.
 - A deferred write whose store throws goes back into the queue under its id,
   and so does every entry queued behind it for that agent, so none of them
   lands ahead of an earlier one, and a queued `tool_use` that can't be
@@ -79,8 +80,10 @@
   warns, and what's deferred after that is kept in memory only. Only the
   host log names the held write.
 - Boot recovery drops a recovered deferred write whose participant isn't
-  text or whose content isn't an array of block objects, which the store
-  could never take, and logs it by id and participant, rather than holding
-  it in the queue. Before, such an entry was dropped without a line, except
-  one whose blocks weren't all objects, such as a null block, which was kept,
-  where it could never be stored.
+  text or whose content isn't an array of block objects, and logs it by id
+  and participant, rather than holding it in the queue. The store can't take
+  a null block, and while it keeps a string or number block as given,
+  membrane's native formatter refuses any request that carries one, and the
+  other formatters leave it out. Before, such an entry was dropped without a
+  line, except one whose blocks weren't all objects, which was kept: one
+  with a null block could never be stored.
