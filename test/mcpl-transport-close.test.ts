@@ -227,3 +227,37 @@ test("a failed write to a child's stdin with nothing listening is not thrown", {
     await transport.close();
   }
 });
+
+test("a read error on a child's stdout or stderr reaches the transport's 'error' listener once", { timeout: 10_000 }, async () => {
+  const transport = await spawnDeafChild('pipes-heard');
+  try {
+    const child = (transport as unknown as { child: ChildProcess }).child;
+    for (const [name, stream] of [['stdout', child.stdout!], ['stderr', child.stderr!]] as const) {
+      const heard: string[] = [];
+      const onError = (error: Error) => { heard.push(error.message); };
+      transport.on('error', onError);
+      stream.destroy(new Error(`injected ${name} read failure`));
+      // A destroyed stream emits its 'error' on the next tick.
+      await new Promise((resolve) => setImmediate(resolve));
+      transport.off('error', onError);
+      assert.deepEqual(heard, [`injected ${name} read failure`]);
+    }
+  } finally {
+    await transport.close();
+  }
+});
+
+test("a read error on a child's stdout or stderr with nothing listening is not thrown", { timeout: 10_000 }, async () => {
+  const transport = await spawnDeafChild('pipes-unheard');
+  try {
+    const child = (transport as unknown as { child: ChildProcess }).child;
+    child.stdout!.destroy(new Error('injected stdout read failure'));
+    child.stderr!.destroy(new Error('injected stderr read failure'));
+    // Both errors are emitted on the next tick; one nothing caught would have
+    // failed this test as an uncaught exception by then.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(transport.listenerCount('error'), 0);
+  } finally {
+    await transport.close();
+  }
+});

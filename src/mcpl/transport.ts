@@ -194,6 +194,13 @@ export class StdioTransport extends McplTransport {
     this.child.stdin?.on('error', (err) => {
       if (this.listenerCount('error') > 0) this.emit('error', err);
     });
+    // A read error on the child's stdout, which readline re-emits, or on its
+    // stderr is reported the same way, never thrown with nothing listening.
+    const reportReadError = (err: Error) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    };
+    this.rl.on('error', reportReadError);
+    this.child.stderr?.on('error', reportReadError);
     this.child.on('exit', (code, signal) =>
       this.markClosed({ code, signal, reason: 'child process exited' }),
     );

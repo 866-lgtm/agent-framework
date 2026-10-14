@@ -13,4 +13,5 @@
 - A failed write to a stdio child's stdin, such as EPIPE from a child that
   has gone, reaches the transport's `'error'` listener if it has one and is
   otherwise dropped, since the child's exit is reported anyway. It was thrown
-  as an uncaught exception.
+  as an uncaught exception. So was a read error on the child's stdout or
+  stderr, which is now handled the same way.
