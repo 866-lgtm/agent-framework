@@ -28,10 +28,11 @@ export function removeStoredInterval(cm: ContextManager, fromId: MessageId, toId
 }
 
 /**
- * The first position of the body that holds `messages[index]`, read the way
- * context-manager 0.14.0 reads bodies (`continuesBody`, pairwise in store
- * order). A message outside any body is a body of its own.
+ * The first and last positions (inclusive) of the body that holds
+ * `messages[index]`, read the way context-manager 0.14.0 reads bodies
+ * (`continuesBody`, pairwise in store order). A message outside any body is a
+ * body of its own.
  */
-export function bodyStartIn(messages: readonly unknown[], index: number): number {
-  return bodyBoundsIn(messages as readonly (BodyShard | null | undefined)[], index).from;
+export function bodyRangeIn(messages: readonly unknown[], index: number): { from: number; to: number } {
+  return bodyBoundsIn(messages as readonly (BodyShard | null | undefined)[], index);
 }

@@ -372,28 +372,40 @@ describe('live operator surgery', () => {
     void s0;
   });
 
-  it('hide removes a one-shard body, which removeMessage alone refuses', async () => {
-    const [lone] = (['lone'] as const).map((text) =>
-      (cm() as unknown as ShardStore).messageStore.append(
-        'user',
-        [{ type: 'text', text }],
-        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-lone' },
-        undefined,
-        { bodyGroupId: 'g-lone', shardIndex: 0 },
-      ).id,
-    );
+  it('hide removes a message stored as a body whole, a one-shard body included', async () => {
+    // Each shard of a long message carries its Discord message id.
+    const appendBody = (discordId: string, group: string, texts: string[]): string[] =>
+      texts.map((text, shardIndex) =>
+        (cm() as unknown as ShardStore).messageStore.append(
+          'user',
+          [{ type: 'text', text }],
+          { serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordId },
+          undefined,
+          { bodyGroupId: group, shardIndex },
+        ).id,
+      );
+    const [lone] = appendBody('d-lone', 'g-lone', ['lone']);
+    const long = appendBody('d-long', 'g-long', ['l0', 'l1', 'l2']);
     const internals = framework as unknown as {
       handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
     };
-    const r = await internals.handleHostCommand('discord', {
+    const hide = (fromMessageId: string) => internals.handleHostCommand('discord', {
       command: 'hide',
       agentName: 'scout',
-      fromMessageId: 'd-lone',
+      fromMessageId,
       requesterName: 'antra',
     });
-    assert.equal(r.ok, true, String(r.error));
-    assert.equal(r.hidden, 1);
+
+    const one = await hide('d-lone');
+    assert.equal(one.ok, true, String(one.error));
+    assert.equal(one.hidden, 1);
     assert.equal(cm().getMessage(lone as never), null);
+
+    const whole = await hide('d-long');
+    assert.equal(whole.ok, true, String(whole.error));
+    assert.equal(whole.hidden, 3);
+    assert.deepEqual((whole.hiddenRefs as Array<{ messageId: string }>).map((ref) => ref.messageId), ['d-long']);
+    for (const id of long) assert.equal(cm().getMessage(id as never), null);
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 

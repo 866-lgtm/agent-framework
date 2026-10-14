@@ -19,7 +19,7 @@ import type {
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
-import { bodyStartIn, removeStoredMessages } from './stored-removal.js';
+import { bodyRangeIn, removeStoredMessages } from './stored-removal.js';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -5691,7 +5691,7 @@ export class AgentFramework {
     // The newest message can be the last shard of a body (a document stored
     // in shards). context-manager removes a shard only with the rest of its
     // body, so the rewind takes the whole body.
-    const first = bodyStartIn(all, idx);
+    const first = bodyRangeIn(all, idx).from;
     const members = all.slice(first, idx + 1);
     const msg = all[idx];
     const md = (msg.metadata ?? {}) as {
@@ -6107,10 +6107,13 @@ export class AgentFramework {
           if (toIdx < 0) {
             return { ok: false, error: `Message ${params.toMessageId} is not an addressable message in context.` };
           }
-          const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+          const [first, last] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+          // A message stored as a body (a long one, in shards) is hidden whole.
+          const lo = bodyRangeIn(all, first).from;
+          const hi = bodyRangeIn(all, last).to;
           const refs = refsIn(lo, hi);
           const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
-          cm.removeMessages(all[lo].id, all[hi].id);
+          removeStoredMessages(cm, all[lo], all[hi]);
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -6135,11 +6138,14 @@ export class AgentFramework {
             lastVisible: await this.lastVisiblePreview(agentName),
           };
         }
-        const refs = refsIn(fromIdx, fromIdx);
-        const hiddenId = String(all[fromIdx].id);
-        removeStoredMessages(cm, all[fromIdx], all[fromIdx]);
+        // A message stored as a body (a long one, in shards) is hidden whole:
+        // each shard carries its Discord id, and the first is found.
+        const { from: lo, to: hi } = bodyRangeIn(all, fromIdx);
+        const refs = refsIn(lo, lo);
+        const hiddenIds = all.slice(lo, hi + 1).map((m) => String(m.id));
+        removeStoredMessages(cm, all[lo], all[hi]);
         console.error(
-          `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
+          `[host-command] hide agent=${agentName} removed=${hi - lo + 1} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
         this.recordOperatorAction({
@@ -6147,11 +6153,11 @@ export class AgentFramework {
           agent: agentName,
           requester: hostCommandRequester(serverId, params),
           params: { fromMessageId: params.fromMessageId },
-          result: { branch: this.store.currentBranch().name, hidden: 1, removedIds: [hiddenId] },
+          result: { branch: this.store.currentBranch().name, hidden: hi - lo + 1, removedIds: hiddenIds },
         });
         return {
           ok: true,
-          hidden: 1,
+          hidden: hi - lo + 1,
           hiddenRefs: refs,
           lastVisible: await this.lastVisiblePreview(agentName),
         };
