@@ -294,24 +294,27 @@ describe('stop() with an operator operation in flight', () => {
     const framework = await create();
     const cm = framework.getAgent('agent')!.getContextManager();
     const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: `m${n}` }]));
-    // The rollback syncs awareness markers while it holds the store; hold that.
+    // The rollback moves the branch while it holds the store; hold that.
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
-    let syncing = false;
-    internals(framework).beginDiscordAwarenessBarrier = () => {
-      syncing = true;
-      return { requiresBarrier: true, promise: held.then(() => {
-        order.push('markers synced');
-        return { status: 'delivered', delivered: 0, failed: 0 };
-      }) };
+    let switching = false;
+    const switchBranch = cm.switchBranch.bind(cm);
+    cm.switchBranch = async (...args: Parameters<typeof cm.switchBranch>) => {
+      switching = true;
+      await held;
+      const switched = await switchBranch(...args);
+      order.push('branch moved');
+      return switched;
     };
     const rolling = framework.rollbackToMessage('agent', { messageId: ids[0]! });
-    await until(() => syncing, 'the rollback to reach its marker sync');
+    await until(() => switching, 'the rollback to reach its branch move');
     const stopping = framework.stop();
     await releaseWhenStopWaits(release);
     await stopping;
-    assert.deepEqual(order, ['markers synced', 'modules stopped']);
+    assert.deepEqual(order, ['branch moved', 'modules stopped']);
     assert.equal((await rolling).messagesRemoved, 2);
+    // Its marks' delivery would race the teardown, so it's left to the next start.
+    assert.ok(logged.some((line) => line.includes('delivery after rollback agent=agent not started')), logged.join('\n'));
     assert.deepEqual(rejections, []);
   });
 
@@ -331,89 +334,6 @@ describe('stop() with an operator operation in flight', () => {
     await stopping;
     await syncing;
     assert.deepEqual(order, ['awareness synced', 'modules stopped']);
-    assert.deepEqual(rejections, []);
-  });
-
-  it('an awareness sync called while stop() waits is not refused, and stop() waits for it too', { timeout: 20_000 }, async () => {
-    // The API server's undo and redo change the store and then sync, so a
-    // sync that arrives during stop() finishes a change already made.
-    const framework = await create();
-    const fw = framework as unknown as Internals & { refreshMcplTools(): Promise<void>; emitMcplToolDiff(...args: unknown[]): void };
-    let releaseFirst!: () => void;
-    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    fw.refreshMcplTools = async () => {};
-    fw.emitMcplToolDiff = () => {};
-    fw.mcplServerRegistry = {
-      getAllServers: () => [],
-      removeServer: async () => { await first; order.push('server removed'); },
-      closeAll: async () => {},
-    };
-    const disconnecting = framework.disconnectMcplServer('srv');
-    let deliver: (() => void) | undefined;
-    fw.beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: new Promise((resolve) => {
-        deliver = () => resolve({ status: 'delivered', delivered: 1, failed: 0 });
-      }),
-    });
-    const stopping = framework.stop();
-    await until(() => waitReads > 0 || order.includes('modules stopped'), 'stop to wait on the disconnect', 10_000);
-    const syncing = framework.syncDiscordAwarenessMarkers().then(() => { order.push('awareness synced'); });
-    try {
-      await until(() => deliver !== undefined, 'the late sync to wait on its barrier');
-      releaseFirst();
-      await disconnecting;
-      // stop()'s next round reads the set with the late sync in it.
-      await until(() => waitReads >= 2 || order.includes('modules stopped'), 'stop to wait on the late sync', 10_000);
-    } finally {
-      releaseFirst();
-      deliver?.();
-    }
-    await syncing;
-    await stopping;
-    assert.deepEqual(order, ['server removed', 'awareness synced', 'modules stopped']);
-    assert.deepEqual(rejections, []);
-  });
-
-  it("a retried stop() admits an awareness sync during its own wait, and waits for it", { timeout: 20_000 }, async () => {
-    const framework = await create();
-    const fw = framework as unknown as Internals & {
-      getToolsForAgent(name: string): Array<{ name: string }>;
-      executeToolCall(call: unknown): Promise<ToolResult>;
-    };
-    // A puppet call held in its tool outlasts the first stop()'s budget.
-    let releaseTool!: () => void;
-    const toolHeld = new Promise<void>((resolve) => { releaseTool = resolve; });
-    let called = false;
-    fw.getToolsForAgent = () => [{ name: 'probe' }];
-    fw.executeToolCall = async () => { called = true; await toolHeld; return { success: true, data: 'done' }; };
-    const puppeting = framework.puppetToolCall('agent', 'probe', {});
-    void puppeting.catch(() => {});
-    await until(() => called, 'the puppet call to reach its tool');
-    let deliver: (() => void) | undefined;
-    fw.beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 1, failed: 0 }); }),
-    });
-    let syncSettled = false;
-    try {
-      await assert.rejects(framework.stop(100), (error: unknown) => error instanceof ShutdownTimeoutError);
-      const readsBefore = waitReads;
-      const retrying = framework.stop();
-      void retrying.catch(() => {});
-      await until(() => waitReads > readsBefore, 'the retry to wait on the puppet call');
-      const syncing = framework.syncDiscordAwarenessMarkers().then(() => { syncSettled = true; });
-      await until(() => deliver !== undefined, 'the sync to wait on its barrier');
-      releaseTool();
-      await puppeting;
-      await until(() => waitReads > readsBefore + 1, 'the retry to wait on the sync');
-      assert.equal(framework.getStore().isClosed(), false, 'the retry waits for the sync');
-      deliver!();
-      await syncing;
-      await retrying;
-    } finally { releaseTool(); deliver?.(); }
-    assert.equal(syncSettled, true);
-    assert.equal(framework.getStore().isClosed(), true);
     assert.deepEqual(rejections, []);
   });
 
@@ -464,7 +384,7 @@ describe('stop() with an operator operation in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
-  it('an awareness sync after a stop() that failed before its wait is refused', async () => {
+  it('an awareness sync after a stop() that failed is refused', async () => {
     const framework = await create();
     const fw = framework as unknown as Internals & { codeExecutionRunners: Map<string, { dispose(): void }> };
     // A runner whose dispose throws fails stop() after the queue has closed,
@@ -477,7 +397,7 @@ describe('stop() with an operator operation in flight', () => {
     assert.equal(framework.getStore().isClosed(), true);
   });
 
-  it('an awareness sync called once stop() has finished waiting is refused, and installs no barrier', async () => {
+  it('an awareness sync called once stop() has begun is refused, and installs no barrier', async () => {
     const framework = await create();
     let barriers = 0;
     internals(framework).beginDiscordAwarenessBarrier = () => {
@@ -500,10 +420,10 @@ describe('stop() with an operator operation in flight', () => {
     assert.equal(barriers, 0);
   });
 
-  for (const action of ['rollback', 'suppress'] as const) it('a ' + action + " whose branch move outlasts stop()'s budget still finishes, its awareness sync included", { timeout: 20_000 }, async () => {
-    // A stop() whose budget ran out has finished waiting, and a sync called
-    // from outside is refused from then on; one inside an operation already
-    // admitted isn't, since its branch has moved.
+  for (const action of ['rollback', 'suppress'] as const) it('a ' + action + " whose branch move outlasts stop()'s budget still finishes, and leaves its marks' delivery to the next start", { timeout: 20_000 }, async () => {
+    // The surgery was admitted before stop() began, so nothing refuses it
+    // partway. Its marks' delivery isn't started while the framework stops:
+    // the durable outbox keeps them for the next start.
     const framework = await create();
     const cm = framework.getAgent('agent')!.getContextManager();
     const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: 'm' + n }]));
@@ -531,7 +451,8 @@ describe('stop() with an operator operation in flight', () => {
     } finally { finishMove(); }
     const result = await surgery;
     assert.ok(result.messagesRemoved > 0, JSON.stringify(result));
-    assert.equal(barriers, 1, 'its awareness sync ran');
+    assert.equal(barriers, 0, 'no delivery started while the framework stops');
+    assert.ok(logged.some((line) => line.includes('delivery after ' + action + ' agent=agent not started')), logged.join('\n'));
     await framework.stop();
     assert.equal(framework.getStore().isClosed(), true);
     assert.deepEqual(rejections, []);
@@ -584,6 +505,7 @@ describe('stop() with an operator operation in flight', () => {
     ['connect MCPL server', (f) => f.connectMcplServer({ id: 'late', command: 'unused' })],
     ['disconnect MCPL server', (f) => f.disconnectMcplServer('late')],
     ['restart MCPL server', (f) => f.restartMcplServer('late')],
+    ['awareness sync', (f) => f.syncDiscordAwarenessMarkers()],
   ];
   for (const [verb, call] of lateCalls) {
     it(verb + ' is refused during teardown and after stop(), with no writes and no operator log', async () => {
@@ -844,7 +766,7 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
-  it('switchBranch() reconciles the awareness markers on the branch it moved to', async () => {
+  it("switchBranch() starts the marks' delivery on the branch it moved to", async () => {
     const framework = await create();
     try {
       const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
@@ -857,6 +779,24 @@ describe('stop() with an operator operation in flight', () => {
       await framework.switchBranch('side');
       assert.deepEqual(reconciledOn, ['side']);
     } finally { await framework.stop(); }
+  });
+
+  it("stop() doesn't wait for the marks' delivery a branch switch started", async () => {
+    const framework = await create();
+    const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
+    await api.cmdBranchCreate({ name: 'side' });
+    let delivering = false;
+    internals(framework).beginDiscordAwarenessBarrier = () => {
+      delivering = true;
+      // A delivery that never ends, as a drain to an unreachable server might.
+      return { requiresBarrier: true, promise: new Promise(() => {}) };
+    };
+    await framework.switchBranch('side');
+    assert.equal(delivering, true, 'the switch started the delivery and answered without it');
+    await framework.stop();
+    assert.ok(order.includes('modules stopped'));
+    assert.equal(framework.getStore().isClosed(), true);
+    assert.deepEqual(rejections, []);
   });
 
   it('a branch switch during a live turn is refused, and the branch stays', async () => {
@@ -1046,11 +986,15 @@ describe('stop() with an operator operation in flight', () => {
     const sequenceBefore = framework.getStore().currentSequence();
     cm.addMessage('user', [{ type: 'text', text: 'a turn' }]);
     fw.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-    let deliver!: () => void;
-    fw.beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: new Promise((resolve) => { deliver = () => resolve({ status: 'delivered', delivered: 0, failed: 0 }); }),
-    });
+    // Hold the undo's preview, the last thing it does before it answers.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let previewing = false;
+    (fw as unknown as { lastVisiblePreview(name: string): Promise<unknown> }).lastVisiblePreview = async () => {
+      previewing = true;
+      await held;
+      return null;
+    };
     let stopping: Promise<void> | undefined;
     framework.onTrace((event) => {
       if (event.type === 'undo:completed') stopping = framework.stop();
@@ -1062,29 +1006,26 @@ describe('stop() with an operator operation in flight', () => {
       respond: () => { order.push('undo answered'); },
       respondError: () => { order.push('undo failed'); },
     });
-    await until(() => stopping !== undefined && (deliver !== undefined || order.includes('undo failed')), 'reentrant stop and awareness sync');
-    assert.ok(deliver, 'the admitted undo must finish its awareness sync');
-    await releaseWhenStopWaits(deliver);
+    await until(() => stopping !== undefined && (previewing || order.includes('undo failed')), 'reentrant stop and the undo\'s preview');
+    await releaseWhenStopWaits(release);
     await stopping;
     await until(() => order.includes('undo answered') || order.includes('undo failed'), 'undo answer');
     assert.ok(order.indexOf('undo answered') >= 0 && order.indexOf('undo answered') < order.indexOf('modules stopped'), order.join(', '));
     assert.deepEqual(rejections, []);
   });
 
-  it("the API server's undo whose trace starts stop() still syncs the markers, and stop() waits for that sync", async () => {
+  it("the API server's undo whose trace starts stop() answers, and leaves its marks' delivery to the next start", async () => {
     const framework = await create();
     const fw = internals(framework);
     const cm = framework.getAgent('agent')!.getContextManager();
     const record = (fw as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(fw);
     record('agent');
     cm.addMessage('user', [{ type: 'text', text: 'a turn' }]);
-    let deliver: (() => void) | undefined;
-    fw.beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: new Promise((resolve) => {
-        deliver = () => { order.push('sync delivered'); resolve({ status: 'delivered', delivered: 0, failed: 0 }); };
-      }),
-    });
+    let barriers = 0;
+    fw.beginDiscordAwarenessBarrier = () => {
+      barriers++;
+      return { requiresBarrier: false, promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }) };
+    };
     let stopping: Promise<void> | undefined;
     framework.onTrace((event) => {
       if (event.type === 'undo:completed' && !stopping) stopping = framework.stop();
@@ -1094,16 +1035,11 @@ describe('stop() with an operator operation in flight', () => {
       broadcast(event: string, data: unknown): void;
     };
     api.broadcast = () => {};
-    // Nothing in this framework's stop() awaits before its wait on the
-    // operator set, so only the wait's own yield keeps the sync admitted.
-    const undoing = api.cmdUndo({ agentName: 'agent' });
-    void undoing.catch(() => {});
-    await until(() => deliver !== undefined || order.includes('modules stopped'), 'the sync to reach its barrier');
-    assert.ok(deliver, "the undo's sync was admitted");
-    await releaseWhenStopWaits(deliver);
-    assert.equal((await undoing).undone, true);
+    assert.equal((await api.cmdUndo({ agentName: 'agent' })).undone, true);
+    assert.ok(stopping, "the undo's trace started stop()");
     await stopping;
-    assert.ok(order.indexOf('sync delivered') >= 0 && order.indexOf('sync delivered') < order.indexOf('modules stopped'), order.join(', '));
+    assert.equal(barriers, 0, 'no delivery started while the framework stops');
+    assert.ok(logged.some((line) => line.includes('delivery after undo agent=agent not started')), logged.join('\n'));
     assert.deepEqual(rejections, []);
   });
 

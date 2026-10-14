@@ -1,5 +1,5 @@
 - **`stop()` waits for an operator's operation that is already running, and
-  refuses new ones, with one exception given below.** A quiesce, a resume, a
+  refuses new ones.** A quiesce, a resume, a
   `host/command`, a store surgery, a branch switch, an undo or redo's config
   materialization, a puppet tool call, an awareness sync, or an MCPL
   connect, disconnect or restart admitted before `stop()` began now
@@ -15,23 +15,21 @@
   success; and a connect could leave a connection that nothing closed.
   - Once `stop()` has begun, `quiesce()`, `resume()`, `rollbackToMessage()`,
     `suppressMessages()`, `switchBranch()`, `undoLastTurn()`, `redo()`,
-    `maintenanceTick()`, `puppetToolCall()`, `connectMcplServer()`,
-    `disconnectMcplServer()` and `restartMcplServer()` refuse with "<verb>
-    refused: the framework is stopping" before they read or change
+    `maintenanceTick()`, `puppetToolCall()`, `syncDiscordAwarenessMarkers()`,
+    `connectMcplServer()`, `disconnectMcplServer()` and `restartMcplServer()`
+    refuse with "<verb> refused: the framework is stopping" before they
+    read or change
     anything, as a `host/command` already did. That includes a call made
     from a trace emitted inside `stop()`'s own start, before its queue has
     closed, and the MCPL listener now refuses a `host/command` from that
     moment too.
-  - The exception is `syncDiscordAwarenessMarkers()`, which each `stop()`
-    attempt admits until it has finished waiting, because its callers have
-    already changed the store when they call it: the API server's undo and
-    redo call it after `undoLastTurn()` or `redo()`, sometimes from inside a
-    trace listener that started `stop()`, so such a sync is admitted even
-    when nothing in `stop()` had awaited yet. `stop()` waits for a sync
-    admitted then, and refuses one that starts once it can no longer wait
-    for it. An operation already admitted runs its own sync without that
-    check, so a surgery whose branch move outlasted a budget still
-    finishes.
+  - The awareness delivery that a surgery, a branch switch, an undo or a
+    redo starts (`startDiscordAwarenessDelivery()`) runs like a server's
+    drain: `stop()` doesn't wait for it, and once `stop()` has begun none is
+    started, since its drain would race the teardown that closes its
+    connections. The durable outbox keeps the marks, and the next start
+    delivers them. A drain that `stop()` cuts off is logged without an ops
+    alert.
   - `stop()` also waits for what those operations start while it waits: the
     config materialization that undo, redo and the two surgeries start
     without waiting for it themselves. The framework now logs a failed

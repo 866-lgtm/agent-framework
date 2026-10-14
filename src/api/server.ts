@@ -539,9 +539,10 @@ export class ApiServer {
     const store = this.framework.getStore();
     const from = store.isClosed() ? this.currentBranch : store.currentBranch().name;
 
-    // The framework switches the store, reconciles the Discord awareness
-    // markers and re-materializes the config mount. It refuses during a live
-    // turn or once stop() has begun, and stop() waits for one already running.
+    // The framework switches the store, starts the delivery of its Discord
+    // awareness marks behind the data-plane gate, and re-materializes the
+    // config mount. It refuses during a live turn or once stop() has begun,
+    // and stop() waits for one already running.
     // The store has moved when the call returns, before its promise settles
     // (a refusal moves nothing), and the switch holds the store until it's
     // done, so the branch read here is current through the awaited steps.
@@ -611,7 +612,8 @@ export class ApiServer {
 
     if (result.undone) {
       this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
+      // Marks follow behind the data-plane gate; the undo doesn't wait for Discord.
+      this.framework.startDiscordAwarenessDelivery('undo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -631,7 +633,8 @@ export class ApiServer {
 
     if (result.redone) {
       this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
+      // Marks follow behind the data-plane gate; the redo doesn't wait for Discord.
+      this.framework.startDiscordAwarenessDelivery('redo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
