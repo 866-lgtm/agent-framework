@@ -852,7 +852,7 @@ export async function walkScope(
   /**
    * Each directory is listed once: a resumed walk visits the ones holding its
    * position on both sides of it, and the second visit reuses the listing
-   * while the directory is still the one it was read from.
+   * while the directory at its path is still the one it was read from.
    */
   const listings = new Map<string, Listing | null>();
   const visited = new Set<string>();
@@ -871,12 +871,27 @@ export async function walkScope(
     const known = listings.get(rel);
     if (known === null) return null;
     if (known !== undefined) {
+      // The scope's own directory comes back as the same CheckedDir, so its
+      // identity is checked against the path again, as a subdirectory's is
+      // by the fresh check that brought it here.
       const now = dir.identity();
-      if (known.dev === now.dev && known.ino === now.ino) return known;
-      // Replaced since its listing was read: that listing says nothing about
-      // the directory there now, so it proves nothing absent.
-      walk.complete.delete(rel);
-      listings.set(rel, null);
+      if (known.dev === now.dev && known.ino === now.ino && await dir.stillHere()) return known;
+      // Replaced since its listing was read: what the walk read of it and
+      // beneath it describes the directory that was there, so none of it
+      // proves anything absent, and neither its untaken files nor its
+      // unlisted subdirectories are the cap's to report. A subdirectory
+      // proven missing beneath it meanwhile proves nothing about what's
+      // there now either.
+      for (const [path, listing] of listings) {
+        if (rel !== '' && path !== rel && !path.startsWith(rel + '/')) continue;
+        if (listing) {
+          for (const f of listing.files) walk.seen.delete(f);
+          for (const sub of listing.subdirs) walk.dirs.delete(sub);
+        }
+        walk.complete.delete(path);
+        listings.set(path, null);
+      }
+      for (const path of walk.missing) if (rel === '' || path.startsWith(rel + '/')) walk.missing.delete(path);
       fail(rel, CHANGED_WALK);
       return null;
     }

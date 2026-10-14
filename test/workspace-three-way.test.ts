@@ -2327,9 +2327,111 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       const synced = await call(m, 'sync', {});
       assert.ok(synced.incomplete?.some((r: { mount: string; path: string; reason: string }) => r.mount === 'work' && r.path === 's' && /changed while the walk ran/.test(r.reason)),
         JSON.stringify(synced.incomplete));
+      // The pass took one file of its three, t/x.txt: nothing it left is the cap's.
+      assert.ok(!synced.incomplete.some((r: { reason: string }) => /file cap/.test(r.reason)), JSON.stringify(synced.incomplete));
     });
     assert.ok(swapped);
     assert.notEqual(env.store.treeGet(TREE, 's/z.txt'), null, 's/z.txt is on disk in the new s/: not proven absent');
+  });
+
+  test("a directory sync's scope replaced between the two stretches proves nothing absent from its old listing", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 3 });
+    for (const f of ['d/a.txt', 'd/b.txt', 'd/c.txt', 'd/z.txt', 'd/t/x.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', { path: 'work/d' }); // takes d/a, d/b, d/c: the place is d/c.txt
+    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', 'd'), 'd/c.txt');
+    env.rmDisk('d/z.txt');
+    // The scope's own directory is replaced while the after stretch lists
+    // d/t/, so the wrap comes back to another d/, which holds z.txt.
+    let swapped = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!swapped && String(path).endsWith(`${'/'}d${'/'}t`)) {
+        swapped = true;
+        renameSync(env.disk('d'), join(env.root, 'd-away'));
+        for (const f of ['a.txt', 'b.txt', 'c.txt', 'z.txt', 't/x.txt']) env.writeDisk(`d/${f}`, `d/${f}`);
+      }
+      return readdir(path, ...rest);
+    }, async () => {
+      const synced = await call(m, 'sync', { path: 'work/d' });
+      assert.ok(synced.incomplete?.some((r: { path: string; reason: string }) => /changed while the walk ran/.test(r.reason) && /(^|\/)d$/.test(r.path)),
+        JSON.stringify(synced.incomplete));
+    });
+    assert.ok(swapped);
+    assert.notEqual(env.store.treeGet(TREE, 'd/z.txt'), null, 'd/z.txt is on disk in the new d/: not proven absent');
+    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', 'd'), 'd/c.txt', 'a pass whose scope changed under it leaves the place');
+  });
+
+  test('when a directory is replaced, the listings read beneath it before stop proving anything too', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 3 });
+    for (const f of ['d/a.txt', 'd/b.txt', 'd/c.txt', 'd/t/k.txt', 'd/u/x.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', { path: 'work/d' }); // takes d/a, d/b, d/c: the place is d/c.txt
+    env.rmDisk('d/t/k.txt');
+    // The after stretch lists d/t/ (without k.txt), then d/ is replaced while
+    // d/u/ is listed; the new d/t/ holds k.txt.
+    let swapped = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!swapped && String(path).endsWith(`${'/'}d${'/'}u`)) {
+        swapped = true;
+        renameSync(env.disk('d'), join(env.root, 'd-away'));
+        for (const f of ['a.txt', 'b.txt', 'c.txt', 't/k.txt', 'u/x.txt']) env.writeDisk(`d/${f}`, `d/${f}`);
+      }
+      return readdir(path, ...rest);
+    }, () => call(m, 'sync', { path: 'work/d' }));
+    assert.ok(swapped);
+    assert.notEqual(env.store.treeGet(TREE, 'd/t/k.txt'), null, "d/t/'s listing came from the replaced d/: it proves nothing absent");
+  });
+
+  test("a replaced scope's subdirectory before the place isn't reported as the cap's", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 3 });
+    const files = ['d/a/f.txt', 'd/m/m1.txt', 'd/m/m2.txt', 'd/m/m3.txt', 'd/m/m4.txt', 'd/z/q.txt'];
+    for (const f of files) await seedSynced(env, m, f, f);
+    await call(m, 'sync', { path: 'work/d' }); // takes d/a/f, d/m/m1, d/m/m2: the place is d/m/m2.txt
+    // The after stretch takes d/m/m3 and d/m/m4 (two of three), then lists
+    // d/z/, while d/ is replaced; the wrap then meets another d/.
+    let swapped = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!swapped && String(path).endsWith(`${'/'}d${'/'}z`)) {
+        swapped = true;
+        renameSync(env.disk('d'), join(env.root, 'd-away'));
+        for (const f of files) env.writeDisk(f, f);
+      }
+      return readdir(path, ...rest);
+    }, async () => {
+      const synced = await call(m, 'sync', { path: 'work/d' });
+      assert.ok(synced.incomplete?.some((r: { path: string; reason: string }) => /changed while the walk ran/.test(r.reason) && /(^|\/)d$/.test(r.path)),
+        JSON.stringify(synced.incomplete));
+      assert.ok(!synced.incomplete.some((r: { reason: string }) => /file cap/.test(r.reason)), JSON.stringify(synced.incomplete));
+    });
+    assert.ok(swapped);
+  });
+
+  test('a subdirectory proven missing beneath a scope that is then replaced proves nothing absent', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 3 });
+    const files = ['d/a.txt', 'd/b.txt', 'd/c.txt', 'd/k/x.txt', 'd/u/q.txt', 'd/z/y.txt'];
+    for (const f of files) await seedSynced(env, m, f, f);
+    await call(m, 'sync', { path: 'work/d' }); // takes d/a, d/b, d/c: the place is d/c.txt
+    // While the after stretch lists d/k/, d/u/ is removed, so the walk proves
+    // it missing; while it lists d/z/, d/ is replaced by a directory holding
+    // every file again, u/q.txt included (as a delete-and-recreate would).
+    let removed = false;
+    let swapped = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!removed && String(path).endsWith(`${'/'}d${'/'}k`)) {
+        removed = true;
+        rmSync(env.disk('d/u'), { recursive: true, force: true });
+      }
+      if (!swapped && String(path).endsWith(`${'/'}d${'/'}z`)) {
+        swapped = true;
+        renameSync(env.disk('d'), join(env.root, 'd-away'));
+        for (const f of files) env.writeDisk(f, f);
+      }
+      return readdir(path, ...rest);
+    }, () => call(m, 'sync', { path: 'work/d' }));
+    assert.ok(removed && swapped);
+    assert.notEqual(env.store.treeGet(TREE, 'd/u/q.txt'), null, 'd/u/q.txt is on disk in the new d/: not proven absent');
   });
 
   test('an accepted new root starts with no place', async (t) => {
