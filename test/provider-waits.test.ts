@@ -181,11 +181,15 @@ describe('ProviderWaits', () => {
 
 /** The store's journal surface, with failures a test can arm. */
 function flaky(store: JsStore) {
-  const fail = { appendJson: 0, sync: 0, read: false };
+  const fail = { appendJson: 0, checkpoint: 0, sync: 0, read: false };
   const surface = {
     getRecordIdsByType: (type: string) => { if (fail.read) throw new Error('zz unreadable record'); return store.getRecordIdsByType(type); },
     getRecord: (id: string) => store.getRecord(id),
-    appendJson: (type: string, data: unknown) => { if (fail.appendJson > 0) { fail.appendJson--; throw new Error('zz append refused'); } return store.appendJson(type, data); },
+    appendJson: (type: string, data: unknown) => {
+      if (fail.appendJson > 0) { fail.appendJson--; throw new Error('zz append refused'); }
+      if (fail.checkpoint > 0 && type !== PROVIDER_WAIT_RECORD_TYPE) { fail.checkpoint--; throw new Error('zz checkpoint refused'); }
+      return store.appendJson(type, data);
+    },
     sync: () => { if (fail.sync > 0) { fail.sync--; throw new Error('zz disk full'); } store.sync(); },
   } as unknown as JsStore;
   return { surface, fail };
@@ -215,19 +219,20 @@ describe('ProviderWaits: durable and pending acts (room-225 #46276)', () => {
     } finally { if (!store.isClosed()) store.close(); }
   }));
 
-  it('an unrecorded binding wait is recorded at the next act, even one that leaves the binding unchanged', () => withStoreDir((path) => {
+  it('a binding wait not known to be recorded is recorded at the next act, even one that leaves the binding unchanged', () => withStoreDir((path) => {
     const time = clock();
     let store = JsStore.openOrCreate({ path });
     try {
       const { surface, fail } = flaky(store);
       const waits = new ProviderWaits(surface, { now: time.now, ...quiet });
-      fail.appendJson = 1; // refused before reaching the store
+      const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
+      fail.sync = 1; // the set reaches the store, its barrier fails: not known to be recorded
       assert.equal(waits.set('ada', 'zz-model', Number.POSITIVE_INFINITY, 'zz indefinite').wait.until, null);
-      assert.equal(store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length, 0, 'nothing recorded yet');
+      assert.equal(recorded(), 1, 'its record reached the store, unconfirmed');
       const shorter = waits.set('ada', 'zz-model', 1_000, 'zz shorter');
       assert.equal(shorter.changed, false);
       assert.equal(shorter.wait.until, null, 'the indefinite wait still binds');
-      assert.equal(store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length, 1, 'the pending set was recorded by the later act');
+      assert.equal(recorded(), 2, 'the later act offered the pending set again, and it was recorded');
       store.close();
 
       store = JsStore.openOrCreate({ path });
@@ -241,10 +246,13 @@ describe('ProviderWaits: durable and pending acts (room-225 #46276)', () => {
     try {
       const { surface, fail } = flaky(store);
       const waits = new ProviderWaits(surface, { now: time.now, ...quiet });
+      const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
       waits.set('ada', 'zz-model', 600_000, 'zz 429');
-      fail.appendJson = 1; // the release's record is refused
+      fail.sync = 1; // the release reaches the store, its barrier fails: not known to be recorded
       assert.deepEqual(waits.release('ada', 'zz-model', 'operator').map((r) => [r.wait.model, r.release]), [['zz-model', 'pending']]);
+      const before = recorded();
       assert.deepEqual(waits.release('ada', 'zz-model', 'operator'), [], 'nothing binds to lift');
+      assert.equal(recorded(), before + 1, 'the replay offered the pending release again at once');
       store.close();
 
       store = JsStore.openOrCreate({ path });
@@ -253,20 +261,78 @@ describe('ProviderWaits: durable and pending acts (room-225 #46276)', () => {
     } finally { if (!store.isClosed()) store.close(); }
   }));
 
-  it('absent any later act, an unrecorded wait is offered again from admission checks', () => withStoreDir((path) => {
+  it('absent any later act, a wait not known to be recorded is offered again from admission checks', () => withStoreDir((path) => {
     const time = clock();
     const store = JsStore.openOrCreate({ path });
     try {
       const { surface, fail } = flaky(store);
       const waits = new ProviderWaits(surface, { now: time.now, ...quiet });
-      fail.appendJson = 1;
+      const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
+      fail.sync = 1; // the set reaches the store, its barrier fails: not known to be recorded
       waits.set('ada', 'zz-model', 3_600_000, 'zz 429');
+      const before = recorded();
       waits.active('ada', 'zz-model');
-      assert.equal(store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length, 0, 'not retried at once');
+      assert.equal(recorded(), before, 'not retried at once');
       time.advance(30_000);
       waits.active('ada', 'zz-model');
-      assert.equal(store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length, 1, 'retried after the interval');
+      assert.equal(recorded(), before + 1, 'retried after the interval');
     } finally { store.close(); }
+  }));
+
+  it('after an append that throws inside the store, waits and releases hold in this process only, said once, and nothing more is written', () => withStoreDir((path) => {
+    const time = clock();
+    let store = JsStore.openOrCreate({ path });
+    try {
+      const lines: string[] = [];
+      const { surface, fail } = flaky(store);
+      const waits = new ProviderWaits(surface, { now: time.now, log: (line) => lines.push(line) });
+      const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
+      waits.set('ada', 'zz-recorded', 600_000, 'zz recorded first');
+      fail.appendJson = 1; // the store's append throws: the journal writes nothing until the store is reopened
+      waits.set('ada', 'zz-model', 600_000, 'zz 429');
+      assert.ok(waits.active('ada', 'zz-model'), 'the wait binds in this process');
+      waits.set('bob', 'zz-model', 600_000, 'zz later');
+      assert.deepEqual(waits.release('ada', 'zz-recorded', 'operator').map((r) => [r.wait.model, r.release]), [['zz-recorded', 'pending']]);
+      time.advance(30_000);
+      assert.ok(waits.active('bob', 'zz-model'), 'a later wait binds in this process too');
+      assert.equal(waits.active('ada', 'zz-recorded'), undefined, 'and the release lifts its wait here');
+      assert.equal(recorded(), 1, 'nothing is written after the failed append, not even from the 30 s re-offer');
+      assert.equal(lines.filter((line) => line.includes('until the store is reopened')).length, 1, 'said once');
+      assert.equal(lines.filter((line) => line.includes('could not record')).length, 0, 'not once per act');
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      const reopened = new ProviderWaits(store, { now: time.now, ...quiet });
+      assert.equal(reopened.active('ada', 'zz-model'), undefined, 'a reopened store has none of the acts that held in process only');
+      assert.equal(reopened.active('bob', 'zz-model'), undefined);
+      assert.ok(reopened.active('ada', 'zz-recorded'), 'and a release not recorded no longer lifts its wait');
+    } finally { if (!store.isClosed()) store.close(); }
+  }));
+
+  it('after a checkpoint that throws inside the store, nothing more is written, and that is said once', () => withStoreDir((path) => {
+    const time = clock();
+    let store = JsStore.openOrCreate({ path });
+    try {
+      const lines: string[] = [];
+      const { surface, fail } = flaky(store);
+      const waits = new ProviderWaits(surface, { now: time.now, log: (line) => lines.push(line) });
+      const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
+      fail.checkpoint = 1; // the 64th entry's flush checkpoints, and the store's append of it throws
+      for (let i = 0; i < 64; i++) waits.set(`zz-agent-${i}`, 'zz-model', 600_000, 'zz 429');
+      assert.deepEqual(waits.release('zz-nobody', 'zz-model', 'operator'), [], 'an act with nothing to record tries no checkpoint again');
+      waits.set('ada', 'zz-model', 600_000, 'zz after');
+      time.advance(30_000);
+      assert.ok(waits.active('ada', 'zz-model'), 'a later wait binds in this process');
+      assert.equal(recorded(), 64, 'the entries before the checkpoint are recorded, and nothing after it');
+      assert.equal(lines.filter((line) => line.includes('until the store is reopened')).length, 1, 'said once');
+      assert.equal(lines.filter((line) => line.includes('could not')).length, 0, 'not as a failed checkpoint or once per act');
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      const reopened = new ProviderWaits(store, { now: time.now, ...quiet });
+      assert.ok(reopened.active('zz-agent-63', 'zz-model'), 'a reopened store has the entries');
+      assert.equal(reopened.active('ada', 'zz-model'), undefined, 'and not the wait that held in process only');
+    } finally { if (!store.isClosed()) store.close(); }
   }));
 });
 

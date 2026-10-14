@@ -189,6 +189,8 @@ export class ProviderWaits {
    * Acts of this process not yet known to be durably recorded, in the order
    * they were made. They bind here from the moment they are made, and are
    * offered to the journal, in order, at every later act until one lands.
+   * Once the journal can't be written again (an append that threw inside the
+   * store: RecordJournal.needsReopen), they hold in this process only.
    */
   private readonly pending: ProviderWaitEntry[] = [];
   /** What binds in this process: `durable` with `pending` applied in order. */
@@ -420,10 +422,14 @@ export class ProviderWaits {
    * would admit an early call after a crash. The first that fails stays
    * pending with every act after it (they still bind in this process) and is
    * reported; an ambiguous one is reconciled before the next attempt, so an
-   * act may be recorded twice, which reduces the same. A checkpoint records
-   * the journal's own reduction, never this process's unrecorded acts, and
-   * never while the history is unreadable (it would cover entries that were
-   * never reduced).
+   * act may be recorded twice, which reduces the same. An append or
+   * checkpoint that throws inside the store leaves the journal unwritable
+   * until the store is reopened (RecordJournal.needsReopen), so nothing is
+   * written after it: that is said once, where it happens, and the acts stay
+   * pending, holding in this process only. A checkpoint records the
+   * journal's own reduction, never this process's unrecorded acts, and never
+   * while the history is unreadable (it would cover entries that were never
+   * reduced).
    */
   private flush(): void {
     if (!this.journal) {
@@ -434,10 +440,17 @@ export class ProviderWaits {
     while (this.pending.length > 0) {
       if (this.journal.needsReconcile && !this.load()) return;
       if (this.journal.needsReconcile) return;
+      // Offering again would only fail again; reportUnwritable said so when
+      // the write threw.
+      if (this.journal.needsReopen) return;
       const entry = this.pending[0]!;
       try {
         this.journal.append(entry, { durable: true });
       } catch (error) {
+        if (this.journal.needsReopen) {
+          this.reportUnwritable(error);
+          return;
+        }
         this.log(`[provider-wait] could not record ${entry.kind} for agent=${entry.agent} model=${entry.model ?? EVERY_MODEL} ` +
           `(${this.pending.length} act(s) pending); it holds in this process and is offered again at the next act: ${safeSlice(errorText(error), 0, 300)}`);
         return;
@@ -445,13 +458,34 @@ export class ProviderWaits {
       this.pending.shift();
       reduce(this.durable, entry);
     }
-    if (this.unreadable || this.journal.entriesSinceCheckpoint < CHECKPOINT_EVERY) return;
+    if (this.unreadable || this.journal.needsReopen || this.journal.entriesSinceCheckpoint < CHECKPOINT_EVERY) return;
     const now = this.now();
     try {
       this.journal.checkpoint({ waits: [...this.durable.values()].filter((wait) => live(wait, now)) }, { durable: true });
     } catch (error) {
+      if (this.journal.needsReopen) {
+        this.reportUnwritable(error);
+        return;
+      }
       this.log(`[provider-wait] could not checkpoint provider waits; the journal still replays in full: ${safeSlice(errorText(error), 0, 300)}`);
     }
+  }
+
+  /**
+   * Say that the journal can't be written again: the store's append threw
+   * inside the store, and only a reopen (as at the next start) reads its log
+   * back. Called where that first happens; flush() writes nothing after it,
+   * so it is said once for the journal's life. A stated wait still holds
+   * here, which is always safe; only its record is lost, so after a restart
+   * the agent's next call goes to the provider, and a wait it states again
+   * starts a new hold. No alert: a failed write is log-only.
+   */
+  private reportUnwritable(error: unknown): void {
+    this.log(`[provider-wait] nothing more is written to the provider-wait journal until the store is reopened, ` +
+      `as at the next start: an append failed inside the store (${safeSlice(errorText(error), 0, 300)}). ` +
+      `Until then every wait and release holds in this process only (${this.pending.length} pending now). ` +
+      'After a restart, a wait not recorded no longer binds: the agent\'s next call to that model goes to the provider, ' +
+      'and a wait the provider states again starts a new hold. A release not recorded no longer lifts its wait');
   }
 }
 
