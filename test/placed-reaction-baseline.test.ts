@@ -141,13 +141,23 @@ describe('placed-reaction baseline', () => {
     assert.deepEqual(config.env, { BASELINE_TEST_EXTRA: 'preserved' }, 'caller config stays unchanged');
   });
 
-  for (const transport of [undefined, 'stdio'] as const) {
-    it('injects the baseline with command + URL and ' + (transport ?? 'implicit') + ' transport', async () => {
-      const fw = await create('🔕', [server({ url: 'ws://127.0.0.1:1', transport })]);
-      const env = await childEnv(fw);
-      assert.deepEqual(new Set(env.baseline?.split(',')), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕']));
-    });
-  }
+  it('injects the baseline with command + URL and stdio transport', async () => {
+    const fw = await create('🔕', [server({ url: 'ws://127.0.0.1:1', transport: 'stdio' })]);
+    const env = await childEnv(fw);
+    assert.deepEqual(new Set(env.baseline?.split(',')), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕']));
+  });
+
+  it('refuses command + URL with no transport before spawning anything', async () => {
+    // Which of the two the configuration means is ambiguous, so its binding
+    // is refused: nothing is launched, and no baseline is derived for it.
+    const fw = await create('🔕');
+    await assert.rejects(
+      () => fw.connectMcplServer(server({ url: 'ws://127.0.0.1:1' })),
+      /"command" and "url" are both set, and no "transport" says which one to use/,
+    );
+    const registry = (fw as unknown as { mcplServerRegistry: { getServer(id: string): unknown } | null }).mcplServerRegistry;
+    assert.equal(registry?.getServer('probe') ?? null, null, 'nothing is registered or spawned');
+  });
 
   it('derives the default on runtime connect, including newly retained ledger markers', async () => {
     const fw = await create('🔕');
