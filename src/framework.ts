@@ -2818,7 +2818,7 @@ export class AgentFramework {
     }
     // The agent's context strategy may pace its own provider calls by the
     // same stated wait (context-manager's compression lane, from its
-    // corrective round #138 on; 0.13 has no releaseCompressionPause, so this
+    // corrective round #138 on; 0.14.0 has no releaseCompressionPause, so this
     // calls nothing there). The release is the operator's word on that wait
     // too, so it is offered to the lane with its scope even when no wait
     // binds here: the lane can hold a pause after
