@@ -29,8 +29,10 @@ and error flags remain intact; each entire payload becomes the guard's notice,
 > Tool result withheld by the guard. The tool has already executed.
 
 followed by where the original is (see "Where a withheld original goes"
-below). The same holds for every withheld settlement: a refusal, an aborted
-stream, a batch that was never submitted, and one whose audit sync failed.
+below), and, for the workspace's `materialize`, `sync` and `delete`, the fields
+of their results that say what they acted on. The same holds for every withheld
+settlement: a refusal, an aborted stream, a batch that was never submitted, and
+one whose audit sync failed.
 
 The refused attempt's partial assistant output is discarded. Inference is
 retried once on the same model, within the same logical turn; executed tools
@@ -174,6 +176,22 @@ A file whose tree entry was set is readable through the workspace's tools, on th
 When saving the staged audit record itself had failed as the result arrived,
 the stub says the result went to the audit record "though saving that record
 had failed when the result arrived", rather than that it is kept there.
+
+A tool can mark fields of its result's `data` to keep in the stub
+(`ToolResult.keepWhenWithheld`), and the workspace's `materialize`, `sync` and
+`delete` do: what `materialize` removed from disk and wrote to it, any root
+`sync` accepted and what it took from disk, gave up or holds as a conflict, and
+the path `delete` removed. They follow where the original is, in every form of
+the stub:
+
+> Tool result withheld by the guard. The tool has already executed. Its result
+> is in workspace file work/tool-results/2026-10-10-withheld-1a2b3c4d5e6f-0-toolu_01.txt.
+> Kept from its result: {"materialized":[{"mount":"work","path":"LOG.md"}]}
+
+They're serialized as a stored result is, in the order marked. Past the inline
+cap they're cut, with a note saying so and that the whole result is where the
+stub says, so a later field can be cut away entirely. A failed result keeps
+nothing, and no other tool marks any field.
 
 The file is an ordinary workspace file. The agent can read it back
 deliberately, and so can whoever else reads the mount: another agent sharing
