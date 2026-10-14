@@ -52,10 +52,44 @@ jobs:
       - name: Test
         run: npm test
 
+  # The tarball npm publish makes from this tree, installed alone into an
+  # empty directory with its dependencies from npm, and loaded: a file
+  # missing from `files`, a dependency only devDependencies supplied, or a
+  # bin npm's link can't run fails here, not for whoever installs the
+  # release. A job of its own, so the install scripts it runs never see the
+  # publish job's id-token; publish needs it, the GitHub release notes
+  # don't. It runs on a dispatch too, which publishes nothing.
+  pack-check:
+    name: Packed release installs on its own
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm install
+
+      # npm publish builds again first, through prepublishOnly, from the
+      # same sources.
+      - name: Build
+        run: npm run build
+
+      - name: Packed release installs on its own
+        run: node scripts/pack-installs-alone.mjs
+
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: [build-and-test, pack-check]
     if: startsWith(github.ref, 'refs/tags/v')
 
     # OIDC trusted publishing: GitHub mints a short-lived id-token, npm CLI
@@ -89,8 +123,11 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      # --ignore-scripts: this job holds the id-token, and neither the build
+      # nor npm publish needs a dependency's install script. The pack-check
+      # job runs them, as an install from npm does, without the id-token.
       - name: Install dependencies
-        run: npm install
+        run: npm install --ignore-scripts
 
       - name: Build
         run: npm run build
