@@ -121,9 +121,11 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
 /**
  * Facts every surgery marker receipt carries, whatever happened: the
  * publication scope chosen (`none` unless the operator chose marks), how many
- * removed addressable Discord messages the surgery left unmarked, and how
- * many authorized refs it did not remove (a delayed application whose anchor
- * no longer covered them; their marks are never widened to anything else).
+ * removed addressable Discord messages the choice leaves unmarked (outside its
+ * scope or its authorized refs; whether the chosen ones are scheduled is the
+ * receipt's `status`), and how many authorized refs it did not remove (a
+ * delayed application whose anchor no longer covered them; their marks are
+ * never widened to anything else).
  */
 export interface SurgeryMarkerFacts {
   scope: 'none' | 'addressed' | 'all';
@@ -139,15 +141,15 @@ export interface SurgeryMarkerFacts {
  * - `none` — no marks were requested (the default), or none of the removed
  *   messages fell within the chosen scope and authorized refs. It says
  *   nothing about whether Discord messages were removed: `unmarked` counts
- *   the addressable ones left unmarked, and the surgery's `removedRefs`
- *   (`discordRefs` in the operator log) list every one.
+ *   the addressable ones left unmarked, the surgery's `removedRefs` list
+ *   every one, and the operator log's `discordRefs` counts them.
  * - `queued` — one add request per mark is durably recorded and delivery has
  *   started. If a delivery pass fails, the requests stay recorded, the
  *   `discord-awareness-delivery` ops alert says so, and a later pass (a
  *   reconnect, a channel-list change or the next start) delivers them. The
- *   same alert names the requests a pass gave up on: refused by Discord for
- *   good, or after three attempts that reached the server unconfirmed. It is
- *   not a delivery claim: per-request outcomes stay in the awareness journal.
+ *   same alert names the requests a pass, or a start, gave up on: refused by
+ *   Discord for good, or after three unconfirmed attempts. It is not a
+ *   delivery claim: per-request outcomes stay in the awareness journal.
  * - `not-scheduled` — the body change landed, but the batch was never
  *   recorded, or recording it as active failed and it was retired from the
  *   journal: none of its marks will be delivered.

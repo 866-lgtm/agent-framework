@@ -1850,19 +1850,31 @@ export class AgentFramework {
     // switching to exactly the active branch completes its activation; any
     // other prepared batch is held for an operator; an attempt the previous
     // process left on the wire is recorded unknown. No content is read.
+    let recovered: ReturnType<DiscordAwarenessOutbox['recoverAtStartup']>;
     try {
-      const recovered = discordAwarenessOutbox.recoverAtStartup(store.currentBranch().name);
-      if (recovered.activated.length > 0 || recovered.held.length > 0 || recovered.unknownAttempts > 0) {
-        console.error(
-          `[discord-awareness] startup: activated ${recovered.activated.length} interrupted batch(es) ` +
-            `for ${store.currentBranch().name}, held ${recovered.held.length}, ` +
-            `recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
-        );
-      }
+      recovered = discordAwarenessOutbox.recoverAtStartup(store.currentBranch().name);
     } catch (error) {
       // The branch may be safe, but reporting the framework ready while its
       // durable awareness journal is unreadable creates a half-ready host.
       throw new DiscordAwarenessAccountingError('startup reconciliation', error);
+    }
+    if (recovered.activated.length > 0 || recovered.held.length > 0 || recovered.unknownAttempts > 0) {
+      console.error(
+        `[discord-awareness] startup: activated ${recovered.activated.length} interrupted batch(es) ` +
+          `for ${store.currentBranch().name}, held ${recovered.held.length}, ` +
+          `recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
+      );
+    }
+    if (recovered.givenUp > 0) {
+      // The alert a delivery pass raises when it gives up on operations:
+      // these reached the bound here, with no pass to report them.
+      framework.opsAlert(
+        'discord-awareness-delivery',
+        'host',
+        `${recovered.givenUp} awareness mark operation(s) won't be sent again: their third unconfirmed attempt ` +
+          'was still unanswered when the previous process ended',
+        { data: { givenUp: recovered.givenUp } },
+      );
     }
 
     // Restore persisted usage data (if any) from prior session
@@ -2353,11 +2365,12 @@ export class AgentFramework {
 
     const teardownSucceeded = shutdownErrors.length === 0;
 
-    // An awareness drain still recording the outcome of the request that was
-    // on the wire when its connection closed finishes before the store does;
-    // it claims nothing more once the route is gone. A failed teardown leaves
-    // the store open for a retry, so it isn't waited for then.
-    if (teardownSucceeded) await Promise.allSettled([...this.discordAwarenessDrains.values()]);
+    // An awareness drain finishes before the store closes. Whatever the
+    // teardown's result, it has nothing left to wait on: closing a connection
+    // rejects the request it had on the wire before awaiting its transport,
+    // and it claims nothing more once stop() has begun, so it records that
+    // outcome and ends.
+    await Promise.allSettled([...this.discordAwarenessDrains.values()]);
 
     // Those later annotations write nothing, so they finish at once; let them
     // record and edit their stubs before the store closes.
@@ -6630,7 +6643,8 @@ export class AgentFramework {
     if (!batch) return '';
     if (this.store.currentBranch().name !== sourceBranch) {
       return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: a start on ` +
-        `${batch.targetBranch} completes it, and a start on another branch holds it`;
+        `${batch.targetBranch} completes it${batch.suppressionIntervals?.length ? ' (its suppression first)' : ''}, ` +
+        'and a start on another branch holds it';
     }
     try {
       this.discordAwarenessOutbox.discard(batch.id);
@@ -14878,8 +14892,10 @@ export class AgentFramework {
       while (true) {
         // A route that went away (shutdown, or a disconnect that will
         // reconnect) leaves the rest queued: claiming would only write
-        // attempts that cannot be sent.
-        if (!connection.isConnected) break;
+        // attempts that cannot be sent. A host that is stopping starts
+        // nothing new either (providerAdmissionClosed is set from the moment
+        // stop() begins): its due marks wait for the next start.
+        if (!connection.isConnected || this.providerAdmissionClosed) break;
         // One dispatch at a time, chosen and written ahead in one step from
         // the journal as it is now: a cancel or retract made while the
         // previous request was on the wire takes effect here.
@@ -15491,7 +15507,7 @@ export class AgentFramework {
   getPlacedReactionBaseline(): readonly string[] {
     let retained: string[];
     try {
-      retained = this.discordAwarenessOutbox?.batches().map((batch) => batch.emoji) ?? [];
+      retained = this.discordAwarenessOutbox.batches().map((batch) => batch.emoji);
     } catch (error) {
       throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
     }

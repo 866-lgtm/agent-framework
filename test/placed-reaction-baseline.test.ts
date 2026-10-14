@@ -24,10 +24,12 @@ function baseline(framework: AgentFramework): readonly string[] {
 }
 
 // A refusal for an awareness journal that can't be read, met by the read a
-// connect or restart makes to derive the protective default. The assertions
-// after each refusal say what it left behind.
+// connect or restart makes to derive the protective default: the journal's
+// own refusal (as breakJournal leaves it) is the cause. The assertions after
+// each refusal say what it left behind.
 function accountingRefusal(error: unknown): boolean {
-  return error instanceof Error && error.name === 'DiscordAwarenessAccountingError';
+  return error instanceof Error && error.name === 'DiscordAwarenessAccountingError'
+    && /The Discord awareness journal can't be read in this process/.test(error.message);
 }
 
 async function childEnv(framework: AgentFramework) {
@@ -327,7 +329,49 @@ describe('placed-reaction baseline', () => {
     assert.equal((await childEnv(fw)).baseline, '🟪', 'connected with its own baseline');
     // A WebSocket server owns its environment, so its connect reads nothing
     // either: it gets as far as the transport.
-    await assert.rejects(() => fw.connectMcplServer({ id: 'remote', url: 'ws://127.0.0.1:1' }), (error: unknown) => !accountingRefusal(error));
+    await assert.rejects(
+      () => fw.connectMcplServer({ id: 'remote', url: 'ws://127.0.0.1:1' }),
+      /MCPL server "remote" WebSocket connect failed/,
+    );
+  });
+
+  it('a server that inherits its baseline from the host connects and restarts whatever the journal\'s state', async (t) => {
+    const previous = process.env[ENV_KEY];
+    process.env[ENV_KEY] = '🟦';
+    t.after(() => {
+      if (previous === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = previous;
+    });
+    const fw = await create(undefined, [server({ inheritEnv: true })]);
+    breakJournal(fw);
+    await fw.restartMcplServer('probe');
+    assert.equal((await childEnv(fw)).baseline, '🟦', 'restarted with the inherited baseline');
+    await fw.disconnectMcplServer('probe');
+    await fw.connectMcplServer(server({ inheritEnv: true }));
+    assert.equal((await childEnv(fw)).baseline, '🟦', 'connected with the inherited baseline');
+  });
+
+  it('a child that takes the default is not respawned while the journal is unreadable: each reconnect fails and is retried', async () => {
+    const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
+    const failures: string[] = [];
+    fw.onTrace((event) => {
+      if (event.type === 'mcpl:server-connect-failed') failures.push(String((event as { error?: unknown }).error));
+    });
+    breakJournal(fw);
+    const registry = (fw as unknown as {
+      mcplServerRegistry: {
+        getServer(id: string): { sendToolsCall(name: string, args: {}): Promise<unknown>; isConnected: boolean; willReconnect: boolean };
+      };
+    }).mcplServerRegistry;
+    await registry.getServer('probe').sendToolsCall('crash', {}).catch(() => {});
+    const deadline = Date.now() + 5_000;
+    while (failures.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(failures.length >= 2, `each attempt fails and the next is scheduled: ${failures.join(' | ')}`);
+    for (const failure of failures) {
+      assert.match(failure, /Discord awareness accounting failed during .*The Discord awareness journal can't be read in this process/);
+    }
+    assert.equal(registry.getServer('probe').isConnected, false, 'no child was spawned without the default');
+    assert.equal(registry.getServer('probe').willReconnect, true, 'and it keeps retrying');
   });
 
   it('passes a URL-only WebSocket config through unchanged', async () => {
@@ -364,19 +408,22 @@ describe('placed-reaction baseline', () => {
   it('fails explicitly on an unreadable journal rather than deriving an incomplete default', async () => {
     const fw = await create(undefined, [server()]);
     breakJournal(fw);
-    assert.throws(() => baseline(fw), /Discord awareness.*ledger/i);
+    assert.throws(() => baseline(fw), accountingRefusal);
+    const internals = fw as unknown as {
+      mcplServerRegistry: { getServer(id: string): unknown };
+      mcplServerConfigs: Map<string, unknown>;
+      mcplPrefixMap: Map<string, string>;
+    };
+    assert.equal(internals.mcplPrefixMap.get('mcpl--probe'), 'probe', 'a connected server has its tool routing');
     await fw.disconnectMcplServer('probe');
     // A connect that derives the default reads the journal before it
     // registers anything: a reconnecting server would otherwise be left
     // registered as a closed stub that blocks a retried connect.
-    const internals = fw as unknown as {
-      mcplServerRegistry: { getServer(id: string): unknown };
-      mcplServerConfigs: Map<string, unknown>;
-    };
     for (const config of [server(), server({ reconnect: true })]) {
       await assert.rejects(() => fw.connectMcplServer(config), accountingRefusal);
       assert.equal(internals.mcplServerRegistry.getServer('probe'), null, 'no connection is left registered');
       assert.equal(internals.mcplServerConfigs.has('probe'), false, 'no config is left registered');
+      assert.equal(internals.mcplPrefixMap.has('mcpl--probe'), false, 'no tool routing is left registered');
     }
   });
 });

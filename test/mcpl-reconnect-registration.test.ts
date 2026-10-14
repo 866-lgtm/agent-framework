@@ -98,7 +98,7 @@ describe('MCPL reconnect and channel registration', () => {
   });
 
   it('a first reconnect during staged startup keeps its registration held through startup\'s open of every plane', async () => {
-    // Mira-1605's reproduction (room-245): `retry` fails its first connect;
+    // The race as it was reproduced: `retry` fails its first connect;
     // its retry reconnects while `stager` is still staging, and holds its
     // policy answer; `stager` answers initialize only once that policy is
     // pending, so startup's final open of every connection's planes runs
@@ -182,8 +182,10 @@ describe('MCPL reconnect: a pending policy exchange holds its planes', () => {
     fw.mcplPolicyExchanges = new WeakMap();
     fw.mcplServerConfigs = new Map([['srv', { id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] }]]);
     // A runtime connect of this stdio server derives the protective reaction
-    // default; with no journal here, it covers the configured marker alone.
+    // default; with an empty journal here, it covers the configured marker
+    // alone.
     fw.discordAwarenessEmoji = '💤';
+    fw.discordAwarenessOutbox = { batches: () => [] };
     fw.featureSetManager = new FeatureSetManager();
     fw.checkpointManager = null;
     fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: () => connection };
@@ -248,8 +250,10 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
     fw.mcplPolicyExchanges = new WeakMap();
     fw.mcplServerConfigs = new Map([['srv', { id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] }]]);
     // A runtime connect of this stdio server derives the protective reaction
-    // default; with no journal here, it covers the configured marker alone.
+    // default; with an empty journal here, it covers the configured marker
+    // alone.
     fw.discordAwarenessEmoji = '💤';
+    fw.discordAwarenessOutbox = { batches: () => [] };
     fw.mcplPrefixMap = new Map();
     fw.featureSetManager = new FeatureSetManager();
     fw.checkpointManager = null;

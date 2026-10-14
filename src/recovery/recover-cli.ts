@@ -88,11 +88,12 @@ Awareness journal (host stopped):
 
 Queued work is delivered when the host next connects to the Discord server.
 Each recovery, and each cancel, retract or release, is recorded, best-effort,
-in <store>/operator-actions.jsonl, the host's operator log, with the OS
-account that ran it, whether it was carried out or refused: a log that can't
-be written says so on stderr, and the act stands. A dry run and a list write
-no entry. A list imports a pre-journal ledger if one is present, as the
-host's next start would. The store must exist: neither creates one.
+in <store>/operator-actions.jsonl (where the host keeps its operator log,
+unless its operatorLogPath puts it elsewhere), with the OS account that ran
+it, whether it was carried out or refused: a log that can't be written says
+so on stderr, and the act stands. A dry run and a list write no entry. A
+list imports a pre-journal ledger if one is present, as the host's next
+start would. The store must exist: neither creates one.
 The agent host must be stopped before running this command.`;
 }
 
@@ -175,8 +176,9 @@ function cliRequester(): OperatorRequester {
 
 /**
  * Record an act in the store's operator log (`<store>/operator-actions.jsonl`,
- * where the host records its own), whether it was done or refused, like the
- * live surfaces' acts. Best-effort: a logging failure never fails the act.
+ * where the host records its own unless its `operatorLogPath` moves it),
+ * whether it was done or refused, like the live surfaces' acts. Best-effort:
+ * a logging failure never fails the act.
  */
 function recordOperatorAction(storePath: string, entry: OperatorLogInput): void {
   new OperatorLog(defaultOperatorLogPath(storePath)).append(entry);

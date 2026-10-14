@@ -411,13 +411,14 @@ const result = await framework.rollbackToMessage('cairn', {
   Each reaction call has a mandatory deadline independent of
   `requestTimeoutMs` (including `0`): `discordAwarenessDeadlineMs` (default
   10000ms, clamped to 50..60000ms). The emoji is `discordAwarenessEmoji`
-  (offline: `--emoji`). An operation is not sent again after three attempts
-  that reached the server without a confirmation (refused, or never
-  answered), or after a refusal no retry can change (the message, channel
-  or emoji is gone, access is missing, or the message takes no more
-  reactions); a pass that gives up on operations raises one
-  `discord-awareness-delivery` ops alert. A JSON-RPC error answer, which
-  may come after the server acted, counts as unanswered.
+  (offline: `--emoji`). An operation is not sent again after three
+  unconfirmed attempts (refused, or never answered and so possibly landed,
+  one left on the wire when the host stopped included), or after a refusal
+  no retry can change (the message, channel or emoji is gone, access is
+  missing, or the message takes no more reactions); a pass that gives up on
+  operations raises one `discord-awareness-delivery` ops alert, and so does
+  a start whose reconciliation gives up on any. A JSON-RPC error answer,
+  which may come after the server acted, counts as unanswered.
 - **Marks are one-shot.** Switching branches, undo/redo and restarts never add
   or remove a mark. The journal is an append-only history of requests and
   their attempts, kept as typed records in the Chronicle store: it survives
@@ -455,9 +456,11 @@ const result = await framework.rollbackToMessage('cairn', {
     held or active, and every message an imported ledger recorded), whatever
     history says: removing an absent reaction does nothing. As the latest
     authorization for those messages, it stops adds that haven't ended and
-    any an earlier choice would request later; cancelling it never revives
-    them. Its receipt discloses earlier requests whose outcome is unknown and
-    imported history that leaves outcomes unrecorded;
+    any an earlier choice would request later (a prepared batch's
+    activation); cancelling it never revives them. A held batch released
+    after it is a new act, whose adds go out. Its receipt discloses earlier
+    requests whose outcome is unknown and imported history that leaves
+    outcomes unrecorded;
   - `releaseDiscordAwareness(batch)` queues a held batch. A held batch whose
     surgery never ran (its error said so) is cancelled instead: its messages
     were never removed.
@@ -476,7 +479,8 @@ const result = await framework.rollbackToMessage('cairn', {
 A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
 store, or `discordAwarenessOutboxPath`) is imported once on first use and the
 file renamed `.migrated-v2`; a copy put back at that path later imports only
-batches the journal doesn't already hold. What it recorded about each message
+batches the journal doesn't already hold, and is renamed beside the first
+(`.migrated-v2.<hash>`) rather than over it. What it recorded about each message
 is kept as evidence (attempt count; the last action and the outcome its error field
 establishes; the old writer's delivery status, labelled as the
 reconciliation state it was; and how many attempt outcomes it leaves

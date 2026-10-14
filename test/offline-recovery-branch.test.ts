@@ -449,7 +449,9 @@ test('a failed offline suppression retires its batch once the source is confirme
         storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
         marks: { scope: 'all' }, branchName: 'recovery/cairn/fail2',
       }),
-      /injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept for diagnosis: it may be partly suppressed, so don't start on it; awareness batch .* kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 completes it, and a start on another branch holds it/,
+      // One instruction for the kept branch: its batch completes the
+      // suppression at a start on it, so it isn't called unsafe to start.
+      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 completes it \(its suppression first\), and a start on another branch holds it$/,
     );
     assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
   } finally {

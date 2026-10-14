@@ -197,6 +197,85 @@ test('a corrupt journal stops startup, since it may hold a suppression the body 
   }
 });
 
+test('a start that gives up on operations raises the delivery alert a pass would', async () => {
+  const { dir, storePath, journal, queueMarks, config } = setup();
+  const proto = AgentFramework.prototype as unknown as { opsAlert(...args: unknown[]): void };
+  const opsAlert = proto.opsAlert;
+  const alerts: Array<{ kind: string; message: string }> = [];
+  let framework: AgentFramework | undefined;
+  try {
+    // An add that went unanswered twice, whose third request was on the
+    // wire when its host stopped.
+    queueMarks(['m1']);
+    const store = JsStore.openOrCreate({ path: storePath });
+    try {
+      const outbox = new DiscordAwarenessOutbox(store);
+      for (let i = 0; i < 2; i++) outbox.recordOutcome(outbox.claimDispatch('discord')!.attempts, 'unknown');
+      assert.ok(outbox.claimDispatch('discord'));
+    } finally {
+      store.close();
+    }
+    proto.opsAlert = function (this: unknown, ...args: unknown[]) {
+      alerts.push({ kind: String(args[0]), message: String(args[2]) });
+      return opsAlert.apply(this, args);
+    };
+    framework = await AgentFramework.create(config({ discord: false }));
+    assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-delivery']);
+    assert.match(alerts[0].message, /^1 awareness mark operation\(s\) won't be sent again/);
+    assert.deepEqual(journal(framework).pendingDispatches(), [], 'and it is not sent again');
+  } finally {
+    proto.opsAlert = opsAlert;
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a host that is stopping claims no more marks: those still due wait for the next start', async () => {
+  const { dir, storePath, journal, paths, queueMarks, config } = setup();
+  let framework: AgentFramework | undefined;
+  let release: (() => void) | undefined;
+  try {
+    queueMarks(['m1', 'm2']);
+    framework = await AgentFramework.create(config());
+    await waitFor('the first add on the wire', () => jsonl(paths.calls).length === 1);
+    // stop() begins, and waits before it closes any connection, as for a
+    // guard annotation still being written.
+    const annotations = (framework as unknown as { guardAnnotations: Set<Promise<void>> }).guardAnnotations;
+    const annotation = new Promise<void>((resolve) => { release = resolve; });
+    annotations.add(annotation);
+    void annotation.finally(() => annotations.delete(annotation));
+    const stopping = framework.stop();
+    // Discord answers the add on the wire while the host is stopping. The
+    // drain records that answer and, in the same step, claims the next add
+    // or stops.
+    writeFileSync(paths.hold, '1');
+    const first = String((jsonl(paths.calls)[0].args as { messageId: string }).messageId);
+    const second = first === 'm1' ? 'm2' : 'm1';
+    const op = (messageId: string) => journal(framework!).operations().find((o) => o.key.messageId === messageId)!;
+    await waitFor('the first add confirmed', () => op(first).attempts[0]?.outcome === 'confirmed');
+    assert.deepEqual(op(second).attempts, [], 'nothing more is claimed once stop() has begun');
+    release!();
+    await stopping;
+    framework = undefined;
+    assert.equal(jsonl(paths.calls).length, 1);
+    const store = JsStore.open({ path: storePath });
+    try {
+      assert.deepEqual(
+        new DiscordAwarenessOutbox(store).pendingDispatches().map((dispatch) => dispatch.key.messageId),
+        [second],
+        'the next start delivers it',
+      );
+    } finally {
+      store.close();
+    }
+  } finally {
+    release?.();
+    writeFileSync(paths.hold, '1');
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a branch switch neither adds nor removes marks', async () => {
   const { dir, journal, paths, config } = setup();
   let framework: AgentFramework | undefined;

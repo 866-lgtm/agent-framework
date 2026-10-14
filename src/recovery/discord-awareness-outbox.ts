@@ -27,9 +27,10 @@ import { RecordJournal, type AppendOptions } from '../record-journal.js';
  * opposite operation discloses it. An operation's status is its latest
  * answer, so an add whose retry Discord confirmed is confirmed, while its
  * first request is still counted as unresolved. An operation is not sent
- * again after three attempts that reached the server without a confirmation
- * (refused or unanswered); an attempt refused before it left the host
- * doesn't count, so a route that is down keeps its work queued.
+ * again after three unconfirmed attempts: refused, or unanswered and so
+ * possibly landed, one the previous process left on the wire included. An
+ * attempt refused before it left the host doesn't count, so a route that is
+ * down keeps its work queued.
  *
  * Operations are keyed by (MCPL server id, channel, message, emoji). The
  * server id is the configured route to a bot, not the bot's identity: if the
@@ -72,7 +73,7 @@ export function boundDiscordAwarenessText(text: string, max = 500): string {
  * takes no more reactions (or blocks this one). Retrying cannot help.
  */
 export function isPermanentDiscordReactionFailure(message: string): boolean {
-  return /unknown message|unknown channel|unknown emoji|missing access|missing permissions|missing permission|cannot access|maximum number of reactions|reaction was blocked|channel .* not found|message .* not found/i
+  return /unknown message|unknown channel|unknown emoji|missing access|missing permission|cannot access|maximum number of reactions|reaction was blocked|channel .* not found|message .* not found/i
     .test(message);
 }
 
@@ -132,10 +133,6 @@ export interface DiscordSuppressionInterval {
 
 export interface DiscordAwarenessReleaseAction extends DiscordAwarenessRef {
   action: DiscordAwarenessAction;
-  /** Earlier attempts recorded for this ref before it was held (legacy import). */
-  priorAttempts?: number;
-  /** The last error recorded for this ref before it was held, verbatim. */
-  priorError?: string;
 }
 
 /** One surgery's request, as recorded when the surgery prepared it. */
@@ -195,6 +192,20 @@ export type DiscordAwarenessSettlement =
   | { status: 'not-scheduled'; error: string }
   | { status: 'unresolved'; error: string };
 
+/**
+ * Where a batch is in its life, as the journal records it:
+ * - `prepared`: recorded before its surgery's body change, which settles it
+ *   (or startup does: see recoverAtStartup). One an operator cancelled stays
+ *   prepared, with `cancelled` set, and is never activated;
+ * - `held`: held at startup (an interrupted surgery, or an imported ledger's
+ *   undelivered work); it waits for an operator to release or cancel it;
+ * - `active`: settled, and nothing waits on an operator: activated by its
+ *   surgery (or imported so), or released, its requests in its operations.
+ *   A held batch an operator cancels becomes active too, with `cancelled`
+ *   set and nothing requested;
+ * - `discarded`: retired by its surgery, none of its marks to be sent: the
+ *   surgery never happened, or its activation could not be recorded.
+ */
 export type DiscordAwarenessBatchStatus = 'prepared' | 'active' | 'held' | 'discarded';
 
 export interface DiscordAwarenessBatch extends DiscordAwarenessBatchRecord {
@@ -800,21 +811,27 @@ export class DiscordAwarenessOutbox {
    * Startup reconciliation, run once before any delivery. It derives nothing
    * from branch ancestry:
    * - an attempt left `dispatching` by a previous process is recorded
-   *   `unknown` (it may have reached Discord);
+   *   `unknown` (it may have reached Discord). Like any unanswered attempt,
+   *   it counts toward the bound: `givenUp` is how many operations it
+   *   brought there, which won't be sent again;
    * - a prepared batch whose target is exactly the active branch completes
    *   its crash window (activated), except a suppression, whose resume
    *   completes its body first;
    * - any other prepared batch is held for an operator;
    * - a batch an operator cancelled while it was prepared stays as it is.
    */
-  recoverAtStartup(activeBranchName: string): { activated: string[]; held: string[]; unknownAttempts: number } {
+  recoverAtStartup(
+    activeBranchName: string,
+  ): { activated: string[]; held: string[]; unknownAttempts: number; givenUp: number } {
     const state = this.load();
     const at = Date.now();
     const records: JournalRecord[] = [];
     let unknownAttempts = 0;
+    const orphaned = new Set<string>();
     for (const op of state.ops.values()) {
       for (const attempt of op.attempts) {
         if (attempt.outcome !== undefined) continue;
+        orphaned.add(op.opId);
         records.push({
           t: 'outcome',
           at,
@@ -863,7 +880,12 @@ export class DiscordAwarenessOutbox {
     // (the store may be caller-supplied and already open), and a failed sync
     // records nothing.
     if (records.length > 0) this.append(records, { afterCommittedState: activated.length > 0, durable: true });
-    return { activated, held, unknownAttempts };
+    const after = this.load();
+    const givenUp = [...orphaned].filter((opId) => {
+      const op = after.ops.get(opId);
+      return !!op && !op.cancelled && unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS;
+    }).length;
+    return { activated, held, unknownAttempts, givenUp };
   }
 
   // -- operator controls ------------------------------------------------------
@@ -1037,7 +1059,16 @@ export class DiscordAwarenessOutbox {
     const batch = state.batches.get(batchId);
     if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch not found: ${batchId}`);
     if (batch.status !== 'held' || !batch.held) {
-      throw new DiscordAwarenessRefusal(`Discord awareness batch ${batchId} is ${batch.status}, not held`);
+      // A repeated release changes nothing; the refusal names the acts that
+      // settled the batch (a release can only precede a cancel), so a replay
+      // reads as one.
+      const act = (name: string, record?: { at: number; by?: string }) => record
+        ? `; it was ${name} at ${new Date(record.at).toISOString()}${record.by ? ` by ${record.by}` : ''}`
+        : '';
+      throw new DiscordAwarenessRefusal(
+        `Discord awareness batch ${batchId} is ${batch.status}, not held` +
+          `${act('released', batch.released)}${act('cancelled', batch.cancelled)}`,
+      );
     }
     const at = Date.now();
     const actions = batch.held.releaseActions;
@@ -1062,7 +1093,7 @@ export class DiscordAwarenessOutbox {
    * operations with the same action share one dispatch. An `unknown`
    * operation is retried only while it is still the newest live operation
    * for its key. No operation is sent again once three of its attempts
-   * reached the server without a confirmation.
+   * went unconfirmed (refused, or unanswered).
    */
   pendingDispatches(serverId?: string): DiscordAwarenessDispatch[] {
     const state = this.load();
@@ -1157,7 +1188,7 @@ export class DiscordAwarenessOutbox {
   /**
    * Record the outcome of a dispatch's attempts. Returns how many of its
    * operations this outcome ended without a confirmation: refused for good,
-   * or at their third attempt that reached the server unconfirmed, so they
+   * or at their third unconfirmed attempt (refused, or unanswered), so they
    * will not be sent again.
    */
   recordOutcome(
@@ -1389,8 +1420,16 @@ export class DiscordAwarenessOutbox {
       }
       applyRecords(state, entry.records);
     }
+    // The import appends through this state, so it is cached first. An
+    // import that fails takes it back: every later read rebuilds and tries
+    // the import again, rather than answering without it.
     this.state = state;
-    this.importLegacyLedger(state);
+    try {
+      this.importLegacyLedger(state);
+    } catch (error) {
+      this.state = null;
+      throw error;
+    }
     return state;
   }
 
@@ -1422,10 +1461,12 @@ export class DiscordAwarenessOutbox {
       this.append(importLegacy(parsed, this.legacyPath, sha256, state.batches), { durable: true });
     }
     // Imported (now or by an earlier process that stopped before renaming):
-    // the file is inert; move it out of the way.
+    // the file is inert; move it out of the way. A copy retired earlier stays
+    // as it is: a later one is kept beside it under its own hash.
     if (!existsSync(this.legacyPath)) return;
+    const retired = `${this.legacyPath}.migrated-v2`;
     try {
-      renameSync(this.legacyPath, `${this.legacyPath}.migrated-v2`);
+      renameSync(this.legacyPath, existsSync(retired) ? `${retired}.${sha256.slice(0, 12)}` : retired);
     } catch (error) {
       console.error(
         `[discord-awareness] imported ${basename(this.legacyPath)} but could not rename it: ` +
@@ -1740,12 +1781,9 @@ function importLegacy(
       const desired = entry.desired ?? raw.status === 'pending';
       if (!legacyActive || status === 'pending') {
         if (!legacyActive || desired || entry.markerPresent) {
-          releaseActions.push({
-            ...key,
-            action: desired || !legacyActive ? 'add' : 'remove',
-            ...(entry.attempts ? { priorAttempts: entry.attempts } : {}),
-            ...(entry.lastError ? { priorError: boundDiscordAwarenessText(entry.lastError) } : {}),
-          });
+          // What the old ledger recorded about earlier attempts is kept once,
+          // as the ref's legacy evidence (below), not on the held action.
+          releaseActions.push({ ...key, action: desired || !legacyActive ? 'add' : 'remove' });
         }
       }
       if (entry.attempts && entry.attempts > 0 && entry.lastAction) {
@@ -1859,8 +1897,8 @@ function markKey(key: DiscordAwarenessRef & { emoji: string }): string {
 }
 
 /**
- * Attempts that reached the server without a confirmation (refused, or never
- * answered) after which an operation is not sent again. Without a bound, a
+ * Unconfirmed attempts (refused, or never answered, so possibly landed)
+ * after which an operation is not sent again. Without a bound, a
  * refusal Discord repeats, or a server that never answers, would be sent
  * again at every drain, two journal records each time.
  */

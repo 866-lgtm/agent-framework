@@ -12,10 +12,11 @@
     `--marks addressed|all` on the CLI. `addressed` covers messages tagged
     `chat:addressed` (mentions, replies to the bot, DMs). Show
     `previewSurgeryMarks()` before the choice, and pass a scope's `refs` back
-    to bind the choice to exactly the previewed messages. Any other
-    `host/command` `marks` value is refused rather than guessed. A surface
-    that reacted to `hide`'s `hiddenRefs` itself should stop when the result
-    carries `markers`: the framework marked through its journal.
+    to bind the choice to exactly the previewed messages. A `host/command`
+    `marks` value other than these and `'none'` is refused rather than
+    guessed. A surface that reacted to `hide`'s `hiddenRefs` itself should
+    stop when the result carries `markers`: the framework marked through its
+    journal.
   - **Unchanged:** the body change itself (fork, switch, redaction), the
     receipt's `status` values, the emoji (`discordAwarenessEmoji`) and the
     reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord
@@ -42,8 +43,9 @@
   `discordAwarenessOutboxPath` now only names a previous JSON ledger to
   import. Such a file (by default `<store>/recovery/discord-awareness-outbox.json`)
   is imported once on first use and renamed `.migrated-v2`; a copy put back
-  there later imports only batches the journal doesn't already hold. What it
-  recorded is kept as evidence, never as synthesized attempts or as proof that
+  there later imports only batches the journal doesn't already hold, and is
+  renamed beside the first (`.migrated-v2.<hash>`). What it recorded is kept
+  as evidence, never as synthesized attempts or as proof that
   a suppression's body completed, and its undelivered work is held for an
   explicit release. A release before this one doesn't read the journal, so a
   host downgraded after the import starts without that work, or anything

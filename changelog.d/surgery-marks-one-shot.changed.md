@@ -6,18 +6,19 @@
   and got no answer stays `unknown` in its operation's history and in every
   receipt's unresolved count, even after a later attempt is confirmed; an
   operation's status is its latest answer. An operation is not sent again
-  after three attempts that reached the server without a confirmation
-  (refused, or never answered), or after a refusal no retry can change (a
-  message, channel or emoji that is gone, missing access, a message that
-  takes no more reactions), and a delivery pass that gives up on operations
-  raises one `discord-awareness-delivery` ops alert. A JSON-RPC error answer,
-  which may come after the server acted, is recorded `unknown`. Between
-  opposite requests for one
-  reaction, the later authorization wins, whenever each was created. A batch
-  whose surgery was interrupted before its branch switch was recorded is held
-  at startup until an operator releases it. An interrupted suppression's
-  redactions are resumed whenever its branch is active at startup,
-  independent of what happened to its marks.
+  after three unconfirmed attempts (refused, or never answered and so
+  possibly landed, one left on the wire when the host stopped included), or
+  after a refusal no retry can change (a message, channel or emoji that is
+  gone, missing access, a message that takes no more reactions), and a
+  delivery pass that gives up on operations raises one
+  `discord-awareness-delivery` ops alert, as does a start whose
+  reconciliation gives up on any. A JSON-RPC error answer, which may come
+  after the server acted, is recorded `unknown`. Between opposite requests
+  for one reaction, the later authorization wins, whenever each was
+  created. A batch whose surgery was interrupted before its branch switch
+  was recorded is held at startup until an operator releases it. An
+  interrupted suppression's redactions are resumed whenever its branch is
+  active at startup, independent of what happened to its marks.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch, or the batch a `hide` or turn
   `undo` records after its change) is now written only after that change is

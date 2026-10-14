@@ -3,8 +3,8 @@
  * asked and what was answered, kept as typed records in the Chronicle store
  * (RecordJournal), never a model of what is on Discord.
  *
- * Contract (room-225's proposed upstream change, after a field incident in
- * which a web-UI rollback queued 918 💤 reactions on other people's messages):
+ * Contract (since a field incident in which a web-UI rollback queued 918 💤
+ * reactions on other people's messages):
  * marks are an explicit publication choice (default none); one-shot, so
  * branch moves and restarts never derive operations from branch state; and
  * cancel / retract / release are explicit operator acts whose receipts say
@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { JsStore } from '@animalabs/chronicle';
@@ -166,7 +166,7 @@ test('startup derives nothing from ancestry: exact-target crash completion, ever
   // The unanswered add is unknown and, still the newest for its key, retried.
   assert.deepEqual(restarted.pendingDispatches('discord').map((d) => d.key.messageId).sort(), ['m1', 'm4']);
   // A later restart on another branch changes nothing.
-  assert.deepEqual(h.reopen().recoverAtStartup('main'), { activated: [], held: [suppression.id], unknownAttempts: 0 });
+  assert.deepEqual(h.reopen().recoverAtStartup('main'), { activated: [], held: [suppression.id], unknownAttempts: 0, givenUp: 0 });
 }));
 
 test('a dispatch is admitted from the journal as it is now: a cancel during an in-flight request stops the rest', withJournal((outbox) => {
@@ -252,7 +252,7 @@ test('cancelling a batch its surgery has not activated stops every mark; its bod
   const rollback = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1'), ref('m2')], scope: 'all' })!;
   assert.equal(outbox.cancel(rollback.id, 'operator').cancelled, 2);
   assert.throws(() => outbox.activate(rollback.id), /cancelled before activation/);
-  assert.deepEqual(outbox.recoverAtStartup('rollback/cairn/1'), { activated: [], held: [], unknownAttempts: 0 });
+  assert.deepEqual(outbox.recoverAtStartup('rollback/cairn/1'), { activated: [], held: [], unknownAttempts: 0, givenUp: 0 });
 
   const suppression = outbox.prepare({
     agentName: 'cairn', sourceBranch: 'main', targetBranch: 'suppress/cairn/1', refs: [ref('m3')], scope: 'all',
@@ -491,7 +491,26 @@ test('release queues a held batch\'s recorded operations, explicitly', withJourn
   const receipt = outbox.release(batch.id, 'operator');
   assert.deepEqual({ adds: receipt.addsQueued, removals: receipt.removalsQueued }, { adds: 2, removals: 0 });
   assert.equal(outbox.pendingDispatches('discord').length, 2);
-  assert.throws(() => outbox.release(batch.id), /not held/);
+  // A repeated release changes nothing, and its refusal says what settled
+  // the batch, so a replay reads as one.
+  assert.throws(
+    () => outbox.release(batch.id),
+    (error) => error instanceof DiscordAwarenessRefusal
+      && /^Discord awareness batch \S+ is active, not held; it was released at \S+Z by operator$/.test(error.message),
+  );
+  assert.equal(outbox.pendingDispatches('discord').length, 2);
+  // A held batch an operator cancels is settled too: nothing waits for a
+  // release, and it requested nothing.
+  const other = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/10', refs: [ref('m3')], scope: 'all' })!;
+  outbox.recoverAtStartup('main');
+  outbox.cancel(other.id, 'operator');
+  assert.equal(outbox.batches().find((b) => b.id === other.id)?.status, 'active');
+  assert.throws(
+    () => outbox.release(other.id),
+    (error) => error instanceof DiscordAwarenessRefusal
+      && /^Discord awareness batch \S+ is active, not held; it was cancelled at \S+Z by operator$/.test(error.message),
+  );
+  assert.ok(!outbox.operations().some((op) => op.key.messageId === 'm3'));
 }));
 
 test('settleActivation says what the journal will do when activation cannot be recorded', withJournal((outbox) => {
@@ -666,6 +685,12 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
   assert.deepEqual(restored.operations(), operations);
   assert.throws(() => restored.release('restored'), /is active, not held/);
   assert.equal(existsSync(h.legacyPath), false);
+  // Each copy is retired where it can be read again: the first keeps its
+  // name, and the later one is kept beside it rather than over it.
+  const retired = () => readdirSync(join(h.dir, 'recovery')).filter((name) => name.includes('.migrated-v2')).sort();
+  assert.equal(readFileSync(`${h.legacyPath}.migrated-v2`, 'utf8'), JSON.stringify(legacy));
+  assert.equal(retired().length, 2);
+  assert.equal(readFileSync(join(h.dir, 'recovery', retired()[1]), 'utf8'), JSON.stringify(legacy, null, 2));
 
   // A file that also holds a batch the journal has never seen imports that
   // batch alone, once even if the file lists it twice, held like any import.
@@ -680,6 +705,23 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
   assert.deepEqual(later.legacy, { entries: 1, lastAddConfirmed: 0, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
   assert.deepEqual(widened.view().filter((v) => v.id !== 'later'), view);
   assert.deepEqual(widened.operations(), operations);
+  assert.equal(existsSync(h.legacyPath), false);
+}));
+
+test('a legacy ledger that cannot be imported refuses every read until it can be, rather than answering without it', withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, '{ "version": 2, "batches": [');
+  const outbox = h.reopen();
+  assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/);
+  assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/, 'a later read tries the import again');
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 2,
+    batches: [{
+      id: 'late', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/late',
+      emoji: '💤', createdAt: 1, refs: [{ ...ref('m1'), desired: true, markerPresent: false, deliveryStatus: 'pending' }],
+    }],
+  }));
+  assert.deepEqual(outbox.batches().map((batch) => batch.id), ['late'], 'imported once it can be read');
   assert.equal(existsSync(h.legacyPath), false);
 }));
 
@@ -1176,7 +1218,7 @@ test('host/command hide takes the store reservation and marks only on request, t
       assert.equal(marked.markers.queued, 1);
       const [dispatch] = h.outbox.pendingDispatches('discord');
       assert.deepEqual(dispatch.key, { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1', emoji: '🫥' });
-      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0 });
+      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0, givenUp: 0 });
     });
   } finally {
     h.cleanup();
@@ -1297,7 +1339,7 @@ test('an applied change\'s batch that failed before reaching the store is not sc
     assert.equal(result.markers.status, 'not-scheduled');
     const fresh = new DiscordAwarenessOutbox(h.store);
     assert.equal(fresh.batches().length, 0, 'nothing was recorded');
-    assert.deepEqual(fresh.recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0 });
+    assert.deepEqual(fresh.recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0, givenUp: 0 });
     assert.equal(fresh.pendingDispatches('discord').length, 0);
     assert.match(result.markers.error, /recording the batch failed: injected sync failure/);
     assert.deepEqual(alerts, ['discord-awareness-not-scheduled']);
@@ -1321,7 +1363,7 @@ test('an applied change\'s batch that reached the store before its barrier faile
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-    assert.deepEqual(fresh.recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0 });
+    assert.deepEqual(fresh.recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0, givenUp: 0 });
     assert.deepEqual(alerts, []);
   } finally {
     h.cleanup();
@@ -1501,9 +1543,24 @@ test('an operation is not sent again after three attempts that reached the serve
   assert.equal(op('m2').attempts.length, 5);
 }));
 
+test('an attempt the previous process left on the wire counts toward the bound, and the start that reaches it says so', withJournal((outbox, h) => {
+  activeBatch(outbox, [ref('m1')]);
+  assert.equal(answer(outbox, 'm1', 'unknown').ended, 0);
+  assert.equal(answer(outbox, 'm1', 'unknown').ended, 0);
+  // The third request goes out, and the process ends before its answer.
+  assert.ok(outbox.claimDispatch('discord'));
+  const recovered = h.reopen().recoverAtStartup('main');
+  assert.equal(recovered.unknownAttempts, 1);
+  assert.equal(recovered.givenUp, 1, 'its third unconfirmed attempt ends it');
+  const restarted = h.reopen();
+  assert.deepEqual(restarted.pendingDispatches('discord'), [], 'it is not sent again');
+  assert.equal(restarted.recoverAtStartup('main').givenUp, 0, 'a later start reports nothing more');
+}));
+
 test('Discord refusals that no retry can change are permanent', () => {
   for (const text of ['Unknown Message', 'Unknown Channel', 'Unknown Emoji', 'Missing Access', 'Missing Permissions',
-    'Maximum number of reactions reached (20)', 'Reaction was blocked']) {
+    'Missing Permission', 'Cannot access this channel', 'Channel 123456789012345678 not found',
+    'Message 123456789012345678 not found', 'Maximum number of reactions reached (20)', 'Reaction was blocked']) {
     assert.equal(isPermanentDiscordReactionFailure(text), true, text);
   }
   for (const text of ['Internal Server Error', 'You are being rate limited.', 'did not respond within 10000ms']) {

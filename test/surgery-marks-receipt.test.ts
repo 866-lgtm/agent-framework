@@ -153,8 +153,9 @@ describe('surgery and awareness marks', () => {
 
   it('a surgery whose marker batch cannot be recorded does not start, and says so', async () => {
     await start(false);
-    const { tail } = seed(2);
+    const { tail, removed } = seed(2);
     const branch = cm().currentBranch().name;
+    const branchesBefore = cm().listBranches().length;
     const original = DiscordAwarenessOutbox.prototype.prepare;
     DiscordAwarenessOutbox.prototype.prepare = function () {
       throw new Error('recording awareness batch b1 failed: disk full');
@@ -165,11 +166,19 @@ describe('surgery and awareness marks', () => {
         (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
           && /^Rollback not started, nothing changed: recording awareness batch b1 failed: disk full/.test(error.message),
       );
+      // A suppression records its batch (its resume journal, with or without
+      // marks) before it changes anything, the same way.
+      await assert.rejects(
+        framework.suppressMessages('resident', { messageIds: [removed[0]] }),
+        (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
+          && /^Suppression not started, nothing changed: recording awareness batch b1 failed: disk full/.test(error.message),
+      );
     } finally {
       DiscordAwarenessOutbox.prototype.prepare = original;
     }
     assert.equal(cm().currentBranch().name, branch);
     assert.equal(cm().getAllMessages().length, 4);
+    assert.equal(cm().listBranches().length, branchesBefore, 'no fork was made');
   });
 
   it('an operator control the journal refuses is invalid; one it fails to record is failed', async () => {
@@ -343,6 +352,9 @@ describe('surgery and awareness marks', () => {
     assert.equal(result.messagesRemoved, 4, 'the rollback still removes everything after its anchor');
     assert.equal(result.markers.queued, 2);
     assert.equal(result.markers.unmarked, 2, 'the late arrival is removed locally, unmarked');
+    // What was requested, not what has gone out by now: a request for the
+    // late arrival would be in the journal however the drain is paced.
+    assert.deepEqual(outbox().operations().map((op) => op.key.messageId).sort(), authorized.map((r) => r.messageId).sort());
     await waitFor('two reactions answered', () => answered() === 2);
     assert.ok(!calls().some((c) => c.args.messageId === 'late-1'));
   });
@@ -351,8 +363,9 @@ describe('surgery and awareness marks', () => {
     await start(true);
     const { tail, removed } = seed(4);
 
-    // A hang detector, not a latency verdict: answered() === 0 below is what
-    // shows the rollback didn't wait on Discord.
+    // Every reaction is held, so a rollback that waited on Discord would
+    // never return: settlesWithin is the hang detector that shows it didn't
+    // (not a latency verdict), and answered() === 0 follows from the hold.
     const result = await settlesWithin(
       framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
       20_000,
@@ -495,12 +508,17 @@ describe('surgery and awareness marks', () => {
     await waitFor('the withheld add to be answered', () => answered() >= 1);
     const sentBeforeRetract = calls().length;
     assert.ok(calls().every((c) => c.name === 'add_reaction'));
+    // The cancel stopped every add that hadn't gone out: what went out is
+    // what it counted as on the wire or unknown.
+    assert.equal(sentBeforeRetract, cancelled.unknown + cancelled.inFlight);
 
     const retracted = framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
     assert.equal(retracted.removalsQueued, 3, 'one removal per selected message, whatever history says');
     assert.ok(retracted.keysWithUnresolvedAdds >= 1, 'the unknown add is disclosed, not assumed absent');
     await waitFor('the removals to be sent', () =>
       calls().slice(sentBeforeRetract).filter((c) => c.name === 'remove_reaction').length === retracted.removalsQueued);
+    await waitFor('nothing left to send', () => outbox().pendingDispatches().length === 0);
+    assert.ok(calls().slice(sentBeforeRetract).every((c) => c.name === 'remove_reaction'), 'the retract revived no add');
     const kinds = framework.getOperatorLog({ limit: 10 }).map((e) => e.kind);
     assert.ok(kinds.includes('awareness-cancel') && kinds.includes('awareness-retract'));
   });

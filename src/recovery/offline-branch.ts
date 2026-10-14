@@ -59,7 +59,8 @@ export interface OfflineRecoveryBranchResult {
   markers?: SurgeryMarkerReceipt;
   /** The refs that will be marked (empty unless marks were chosen). */
   refs: DiscordAwarenessRef[];
-  /** Removed addressable messages left unmarked. */
+  /** Removed addressable messages the marks choice leaves unmarked (outside
+   *  its scope); `markers` says whether the chosen ones are scheduled. */
   unmarked: number;
   /** Authorized refs (marks.refs) this recovery does not remove. */
   notRemoved: number;
@@ -264,11 +265,13 @@ export async function createOfflineRecoveryBranch(
           restoreError instanceof Error ? restoreError.message : String(restoreError),
         )}`;
       }
+      const sourceConfirmed = store.currentBranch().name === sourceBranch;
       let retire = '';
       if (batch) {
-        if (store.currentBranch().name !== sourceBranch) {
+        if (!sourceConfirmed) {
           retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: a start on ` +
-            `${targetBranch} completes it, and a start on another branch holds it`;
+            `${targetBranch} completes it${suppression.intervals.length > 0 ? ' (its suppression first)' : ''}, ` +
+            'and a start on another branch holds it';
         } else {
           try {
             outbox.discard(batch.id);
@@ -280,10 +283,13 @@ export async function createOfflineRecoveryBranch(
           }
         }
       }
+      // A partly suppressed branch is unsafe to start on, unless its batch was
+      // kept because the source couldn't be confirmed: a start on it then
+      // completes the suppression, as the batch's note says.
       const kept = createdBranch === undefined ? ''
-        : suppression.intervals.length > 0
-          ? `; branch ${createdBranch} is kept for diagnosis: it may be partly suppressed, so don't start on it`
-          : `; branch ${createdBranch} is kept for diagnosis`;
+        : suppression.intervals.length === 0 ? `; branch ${createdBranch} is kept for diagnosis`
+        : batch && !sourceConfirmed ? `; branch ${createdBranch} is kept: it may be partly suppressed`
+        : `; branch ${createdBranch} is kept for diagnosis: it may be partly suppressed, so don't start on it`;
       if (!restore && !retire && !kept) throw error;
       throw new Error(`${failure}${restore}${kept}${retire}`, { cause: error });
     }
