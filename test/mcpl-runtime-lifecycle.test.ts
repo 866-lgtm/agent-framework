@@ -424,6 +424,22 @@ for (const when of ['teardown', 'gap', 'connect'] as const) {
   });
 }
 
+test("a stop() that begins in a restart's gap ends it, and the restart says the server is down", async (t) => {
+  await withFramework(true, async (framework) => {
+    const disconnect = framework.disconnectMcplServer.bind(framework);
+    let stopping: Promise<void> | undefined;
+    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+      await disconnect(id);
+      stopping = framework.stop();
+    });
+    await assert.rejects(
+      framework.restartMcplServer('first'),
+      /^MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "first" was not connected: the framework is stopping or stopped$/,
+    );
+    await stopping;
+  });
+});
+
 test('connectMcplServer rejects a duplicate id and a colliding prefix', async () => {
   await withFramework(true, async (framework) => {
     await assert.rejects(
