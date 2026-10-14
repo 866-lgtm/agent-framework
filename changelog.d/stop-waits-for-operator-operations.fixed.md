@@ -23,13 +23,12 @@
     from a trace emitted inside `stop()`'s own start, before its queue has
     closed, and the MCPL listener now refuses a `host/command` from that
     moment too.
-  - The awareness delivery that a surgery, a branch switch, an undo or a
-    redo starts (`startDiscordAwarenessDelivery()`) runs like a server's
-    drain: `stop()` doesn't wait for it, and once `stop()` has begun none is
-    started, since its drain would race the teardown that closes its
-    connections. The durable outbox keeps the marks, and the next start
-    delivers them. A drain that `stop()` cuts off is logged without an ops
-    alert.
+  - The awareness delivery that a surgery, a branch switch, a `host/command`
+    undo, or the API server's undo or redo starts
+    (`startDiscordAwarenessDelivery()`) runs like a server's drain: `stop()`
+    doesn't wait for it, and once `stop()` has begun none is started, since
+    the teardown would cut it off. The durable outbox keeps the marks, and
+    the next start delivers them.
   - `stop()` also waits for what those operations start while it waits: the
     config materialization that undo, redo and the two surgeries start
     without waiting for it themselves. The framework now logs a failed

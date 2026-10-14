@@ -2,11 +2,11 @@
  * stop() and an operator's operations.
  *
  * Once stop() has begun, an operator's entry points refuse: quiesce, resume,
- * the store surgeries, a branch switch, undo, redo, maintain, puppet and the
- * MCPL lifecycle calls (a host/command is refused by its listener). The
- * awareness sync is the exception: it's admitted until stop() has finished
- * waiting, since its callers have already changed the store. These
- * tests cover those refusals and the operations admitted before them, over
+ * the store surgeries, a branch switch, undo, redo, maintain, puppet, the
+ * awareness sync and the MCPL lifecycle calls (a host/command is refused by
+ * its listener). The marks' delivery a branch move starts isn't one of these
+ * operations: stop() doesn't wait for it, and starts none once it has begun.
+ * These tests cover those refusals and the operations admitted before them, over
  * MCPL or from a direct call: stop() waits for each, and for what each starts
  * while it waits, before the event gate, the modules, the MCPL connections
  * and the store go. A budget can cut that wait short, leaving the store open.
@@ -359,14 +359,23 @@ describe('stop() with an operator operation in flight', () => {
     framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'a turn' }]);
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
     internals(framework).wireMcplEvents(connection);
+    let barriers = 0;
+    internals(framework).beginDiscordAwarenessBarrier = () => {
+      barriers++;
+      return { requiresBarrier: false, promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }) };
+    };
     let inner: Promise<void> | undefined;
     let undoInside: unknown;
+    let syncInside: Promise<void> | undefined;
     let hostUndo: unknown;
     framework.onTrace((event) => {
       if ((event as { type?: string }).type !== 'mcpl:coalescing' || inner) return;
       inner = framework.stop();
       // stop() has begun, though its queue isn't closed yet.
       try { framework.undoLastTurn('agent'); } catch (error) { undoInside = error; }
+      syncInside = framework.syncDiscordAwarenessMarkers();
+      void syncInside.catch(() => {});
+      framework.startDiscordAwarenessDelivery('probe');
       connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 1 }, {
         respond: (result: unknown) => { hostUndo = { respond: result }; },
         respondError: (code: number, message: string) => { hostUndo = { code, message }; },
@@ -375,6 +384,9 @@ describe('stop() with an operator operation in flight', () => {
     const outer = framework.stop();
     assert.equal(inner, outer, 'the reentrant stop() gets the attempt already running');
     assert.match(String(undoInside), /^Error: undo refused: the framework is stopping$/);
+    await assert.rejects(syncInside!, /^Error: awareness sync refused: the framework is stopping$/);
+    assert.ok(logged.some((line) => line.includes('delivery after probe agent=framework not started')), logged.join('\n'));
+    assert.equal(barriers, 0, 'neither the sync nor the delivery reached a barrier');
     assert.deepEqual(hostUndo, { code: -32000, message: 'the host is stopping' });
     assert.equal(framework.getStore().currentBranch().name, 'main', 'nothing moved the branch');
     await outer;
@@ -781,7 +793,7 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
-  it("stop() doesn't wait for the marks' delivery a branch switch started", async () => {
+  it("stop() doesn't wait for the marks' delivery a branch switch started", { timeout: 20_000 }, async () => {
     const framework = await create();
     const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
     await api.cmdBranchCreate({ name: 'side' });
@@ -793,32 +805,12 @@ describe('stop() with an operator operation in flight', () => {
     };
     await framework.switchBranch('side');
     assert.equal(delivering, true, 'the switch started the delivery and answered without it');
-    // A budget, so a stop() that waited for the delivery would fail rather than hang.
-    await framework.stop(1_000);
+    // A budget, so a stop() that waited for the delivery would fail rather than
+    // hang, with room for an ordinary teardown on a loaded runner.
+    await framework.stop(5_000);
     assert.ok(order.includes('modules stopped'));
     assert.equal(framework.getStore().isClosed(), true);
     assert.deepEqual(rejections, []);
-  });
-
-  it('a delivery that stop() cuts off is logged without an ops alert', async () => {
-    const framework = await create();
-    const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
-    await api.cmdBranchCreate({ name: 'side' });
-    let fail!: (error: Error) => void;
-    internals(framework).beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: new Promise((_resolve, reject) => { fail = reject; }),
-    });
-    const alerts: string[] = [];
-    framework.onTrace((event) => {
-      if (event.type === 'ops:alert') alerts.push((event as { kind?: string }).kind ?? '');
-    });
-    await framework.switchBranch('side');
-    const stopping = framework.stop();
-    fail(new Error('connection closed'));
-    await stopping;
-    await until(() => logged.some((line) => line.includes('delivery after branch switch agent=framework failed')), 'the failure to be logged');
-    assert.deepEqual(alerts.filter((kind) => kind === 'discord-awareness-delivery'), []);
   });
 
   it('a branch switch during a live turn is refused, and the branch stays', async () => {

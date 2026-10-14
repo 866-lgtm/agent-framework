@@ -7057,17 +7057,20 @@ export class AgentFramework {
    * (queued when a surgery began, or arriving during its switch or fork): the
    * surgery's store reservation, which used to hold such a turn through the
    * drain, now ends once the gate is up. A failure is accounted by the gate
-   * itself: the current generation's failure recycles the connections, and a
-   * superseded one leaves that to the newer generation, whose own pass meets
-   * the same ledger. Here it is logged and raised as an ops alert, and the
-   * next sync, reconnect or start delivers what is still pending.
+   * itself: the current generation's failure recycles the connections (or,
+   * once the host is stopping, releases the gate instead), and a superseded
+   * one leaves that to the newer generation, whose own pass meets the same
+   * ledger. Here it is logged and raised as an ops alert, and the next sync,
+   * reconnect or start delivers what is still pending.
    *
    * Like a server's drain, the delivery runs apart from the operation that
    * started it: it isn't an operator's operation, so stop() doesn't wait for
-   * it, and the durable outbox keeps what fails. Once stop() has begun, none
-   * is started, since its drain would race the teardown that closes its
-   * connections: the marks stay pending, and the next start's barrier
-   * reconciles the outbox with the branch and delivers them.
+   * it. A drain already running when stop() begins runs on while the
+   * connections close, and what it can't deliver stays pending in the
+   * durable outbox. Once stop() has begun, none is started, since there's
+   * no point opening a drain that the teardown is about to cut off: the
+   * marks stay pending, and the next start's barrier reconciles the outbox
+   * with the branch and delivers them.
    *
    * @param after What moved the branch, for the log and the alert
    *   ("rollback", "branch switch", "undo" …).
@@ -7086,8 +7089,6 @@ export class AgentFramework {
     this.runDiscordAwarenessSync().catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
       console.error(`[discord-awareness] delivery after ${after} agent=${agentName} failed: ${detail}`);
-      // A drain cut off by stop() isn't an incident: the outbox keeps its marks.
-      if (this.stopHasBegun()) return;
       this.opsAlert(
         'discord-awareness-delivery',
         agentName,
