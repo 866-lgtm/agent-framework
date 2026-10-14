@@ -147,6 +147,26 @@ class StaleStrategy implements ContextStrategy {
   }
 }
 
+/** A strategy whose readiness query refuses with whatever text it's given. */
+class SayingStrategy implements ContextStrategy {
+  readonly name = 'saying-test';
+  says = 'the first refusal';
+
+  checkReadiness(): ReadinessState {
+    throw new Error(this.says);
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {}
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 /** A strategy with work pending that no tick finishes. */
 class NeverReadyStrategy implements ContextStrategy {
   readonly name = 'never-ready-test';
@@ -759,6 +779,53 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it('a failure that lasts is alerted again when its whole text changes, and again once the alert cooldown has passed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-lasting-text-'));
+    const strategy = new SayingStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'saying', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (_kind: string, _agentName: string, text: string) => alerts.push(text);
+    const internals = framework as unknown as { runQueuedMaintenance: () => Promise<void>; opsAlertCooldownMs: number };
+    let passes = 0;
+    const runPass = internals.runQueuedMaintenance.bind(framework);
+    internals.runQueuedMaintenance = () => { passes++; return runPass(); };
+    const passed = async (n: number) => { const after = passes; await waitFor(() => passes >= after + n); };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      framework.start();
+      await waitFor(() => alerts.length === 1);
+      await passed(3);
+      assert.deepEqual(alerts, ['the first refusal']);
+
+      // Two long texts that differ only in their middle, which the bounded
+      // text a run records leaves out: the alert follows the whole text.
+      const long = (middle: string) => `${'a'.repeat(3_000)} ${middle} ${'z'.repeat(3_000)}`;
+      strategy.says = long('one');
+      await waitFor(() => alerts.length === 2);
+      strategy.says = long('two');
+      await waitFor(() => alerts.length === 3);
+      await passed(3);
+      assert.equal(alerts.length, 3);
+
+      // Unchanged, it is alerted again once the cooldown has passed.
+      internals.opsAlertCooldownMs = 0;
+      await waitFor(() => alerts.length >= 5);
+      assert.ok(alerts.slice(3).every((text) => text === long('two')));
+    } finally {
+      console.error = quiet;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a readiness refusal read after an agent\'s last tick is that agent\'s failure, alerted once', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-after-ticks-'));
     const strategy = new RefusesAfterTicksStrategy();
@@ -868,6 +935,47 @@ describe('queued context maintenance timer', () => {
       }
     });
   }
+
+  it('a surgery that takes the store while resume waits for a tick is refused by resume after the wait', { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-resume-rechecks-'));
+    const strategy = new GatedTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    strategy.framework = framework;
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const first = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
+    cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+    const internals = framework as unknown as { surgeryHold: unknown };
+    try {
+      await framework.quiesce();
+      framework.start();
+      await waitFor(() => strategy.ticks === 1);
+      // resume() finds no surgery and waits for the running tick; the
+      // rollback takes the store meanwhile.
+      const resuming = framework.resume();
+      void resuming.catch(() => {});
+      const moved = framework.rollbackToMessage('agent', { messageId: first });
+      await waitFor(() => internals.surgeryHold !== null);
+      strategy.release();
+      await assert.rejects(
+        resuming,
+        (error: unknown) => error instanceof OperatorActionError && error.code === 'agent-busy'
+          && error.message.includes('a live roll back for agent holds the store'),
+      );
+      assert.equal(framework.getHostModeStatus().quiesced, true, 'the host stays quiesced');
+      await moved;
+    } finally {
+      strategy.release();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('no pass starts while a surgery holds the store', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-hold-'));
