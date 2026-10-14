@@ -85,7 +85,13 @@ describe('compiles that are never sent', () => {
       maxTokens: 10_000,
     });
     try {
+      // A sent compile first, so the frontier it records already fits the
+      // window the lowered budget prepares: the descent is prepared before
+      // the preview runs, and only the dry run keeps the preview from
+      // settling it.
+      await x.framework.getAgent('agent')!.buildActivationRequest([]);
       assert.equal(x.framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }).transition, 'converging');
+      assert.equal(x.framework.getAgent('agent')!.getContextManager().getHotContextSettings()?.prepared, true);
       await x.framework.previewActivation('agent');
       assert.equal(x.framework.getAgentRuntimeSettings('agent').transition, 'converging', 'a preview settles nothing');
       // The control: the assembly a sent request goes through settles it.
