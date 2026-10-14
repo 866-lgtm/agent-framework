@@ -88,6 +88,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
@@ -844,6 +845,23 @@ function describeRequester(r: OperatorRequester | undefined): string {
   return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
 }
 
+/** What a held call or turn says of the wait that holds it: no call was
+ *  made. The refusal of an auxiliary call and the trace of a turn held once
+ *  compiled say it the same way. */
+function providerWaitText(agentName: string, model: string, wait: ProviderWait): string {
+  return `Provider wait: ${model} is held for ${agentName} ` +
+    `${wait.until === null ? 'until an operator releases it' : `until ${new Date(wait.until).toISOString()}`} ` +
+    `(recorded ${new Date(wait.setAt).toISOString()}: ${wait.reason}); no call was made`;
+}
+
+/** Who asked for an operator act, as a durable record and a log line carry
+ *  it. The name comes from a caller, so a control character (a forged log
+ *  line) becomes a space, and it is bounded. */
+function operatorLabel(by: string): string {
+  const label = safeSlice(withoutControls(by).trim(), 0, 120);
+  return label === '' ? 'operator' : label;
+}
+
 function hostCommandRequester(serverId: string, params: HostCommandParams): OperatorRequester {
   return {
     via: `host-command:${serverId}`,
@@ -919,6 +937,17 @@ interface ProviderAccelerationCooldown {
   /** Armed by an auxiliary (compression) failure with no primary involved:
    *  release reopens auxiliary admission without synthesising an inference. */
   auxiliaryOrigin?: boolean;
+  /** Set when this hold is a provider wait (a stated retry-after) for the
+   *  agent's primary model: it holds primary turns only. Auxiliary calls are
+   *  admitted per model by the provider waits themselves, so a compression
+   *  model the provider did not limit keeps working. */
+  waitModel?: string;
+  /** Set on an acceleration hold whose length is the provider's stated wait
+   *  (recorded for `model`), which replaced AF's own pacing for the failure.
+   *  `ownUntil` is when that pacing alone would have ended the hold: a
+   *  release of the stated wait shortens the hold to it, never past it. A
+   *  host hold never carries this: its length is the host's. */
+  statedWait?: { model: string; ownUntil: number };
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -940,8 +969,20 @@ interface ProviderAccelerationReceipt {
   stopReason: string;
 }
 const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
+/** Cap on waits the framework chooses itself. A provider's stated wait is
+ *  never capped: it is a lower bound (see ProviderWaits). It is also the
+ *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
+ *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
+/** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
+ *  a longer timer fires almost at once, so longer waits re-arm in steps. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** A stated wait recorded to hold a model longer than this, or until
+ *  released, raises an ops alert. It is honoured in full either way: a hold
+ *  that long is a quota-scale event or a provider's mistake, and a person
+ *  decides which (release-provider-wait). Shorter waits are pacing. */
+const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
 /**
  * A MembraneError, from this framework's copy of membrane or from another: the
  * host supplies the Membrane instance (config.membrane), so with two copies
@@ -1029,6 +1070,9 @@ interface HostCommandParams {
   abandon?: boolean;
   /** For the `resume` command: override a failing feasibility verdict. */
   force?: boolean;
+  /** For the `release-provider-wait` command: the model whose wait to release
+   *  (every model's when omitted). */
+  model?: string;
   requesterId?: string;
   requesterName?: string;
 }
@@ -1479,6 +1523,10 @@ export class AgentFramework {
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
+  /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
+  private providerWaits: ProviderWaits | undefined;
+  /** Wakers for error-policy retry waits in progress: stop() ends them. */
+  private retryWaitWakers = new Set<() => void>();
   private providerAdmissionClosed = false;
   /** Invalidates framework turns still assembling when stop begins. */
   private lifecycleGeneration = 0;
@@ -1910,6 +1958,15 @@ export class AgentFramework {
     this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
+    // Unreadable recorded waits hold every agent's provider calls, and a
+    // persistent cause never reads again: a person has to hear of it.
+    this.providerWaits = new ProviderWaits(store, {
+      onUnreadable: (error) => this.opsAlert('provider-wait', 'framework',
+        `recorded provider waits could not be read (${error}): no provider call is admitted for any agent ` +
+        'until they read again (re-read every 30 s) or an operator releases an agent\'s waits with ' +
+        'release-provider-wait; such a release lasts for this process only',
+        { data: { model: EVERY_MODEL, until: null } }),
+    });
     this.membrane = membrane;
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
@@ -2470,6 +2527,7 @@ export class AgentFramework {
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
+    for (const wake of [...this.retryWaitWakers]) wake();
     this.lifecycleGeneration++;
     // The generation this stop ends; withheld spills close for it alone, so a
     // start() made before this stop finishes reopens them for its own.
@@ -2631,7 +2689,13 @@ export class AgentFramework {
   private providerGateBlocked(agentName: string): boolean {
     const gate = this.providerGates.get(agentName);
     return (gate?.primaryDepth ?? 0) > 0 || (gate?.primaryPending ?? false) ||
-      this.providerAccelerationCooldowns.has(agentName);
+      this.cooldownBlocksAuxiliary(agentName);
+  }
+  /** Acceleration and host holds park the whole agent; a provider wait holds
+   *  only its own model, which auxiliary admission checks per call. */
+  private cooldownBlocksAuxiliary(agentName: string): boolean {
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    return cooldown !== undefined && cooldown.waitModel === undefined;
   }
   private acquirePrimaryProviderGate(agentName: string): void {
     const gate = this.providerGate(agentName); gate.primaryPending = false; gate.primaryDepth++;
@@ -2642,7 +2706,7 @@ export class AgentFramework {
   }
   private flushAuxiliaryAdmission(agentName: string): void {
     const gate = this.providerGate(agentName);
-    if (gate.primaryDepth > 0 || gate.primaryPending || this.providerAccelerationCooldowns.has(agentName)) return;
+    if (gate.primaryDepth > 0 || gate.primaryPending || this.cooldownBlocksAuxiliary(agentName)) return;
     for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
   }
   private async waitForAuxiliaryIdle(agentName: string): Promise<void> {
@@ -2650,8 +2714,9 @@ export class AgentFramework {
     if (gate.auxiliaryInFlight === 0) return;
     await new Promise<void>((resolve) => gate.idleWaiters.push(resolve));
   }
-  private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T> {
+  private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T> {
     const gate = this.providerGate(agentName);
+    this.refuseHeldProviderModel(agentName, model);
     if (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
       try {
@@ -2663,14 +2728,20 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
     }
+    // A wait recorded while this call was parked binds it too.
+    this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
     try { return await run(); }
     catch (error) {
       // Compression can be the first call to find a spent quota (idle agent,
-      // scheduled maintenance). Arm the host hold so later passes wait at the
-      // gate instead of retrying into it; this pass still fails to its caller.
+      // scheduled maintenance). Record a stated wait for this call's model,
+      // and arm the host hold so later passes wait at the gate instead of
+      // retrying into it; this pass still fails to its caller.
       const agent = this.agents.get(agentName);
-      if (agent && error instanceof Error) this.holdProviderAcceleration(agent, error, undefined, true);
+      if (agent && error instanceof Error) {
+        if (model !== undefined) this.recordProviderWait(agentName, model, error);
+        this.holdProviderAcceleration(agent, error, undefined, true);
+      }
       throw error;
     }
     finally {
@@ -2679,21 +2750,58 @@ export class AgentFramework {
     }
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
+  }
+  /**
+   * A conversation agent's auxiliary calls (its context manager's
+   * compression). A conversation agent takes no provider gate: admission
+   * belongs to the persistent resident, and a generation-unique fork must not
+   * leave a gate behind. But its stated waits are recorded for (agent, model)
+   * as a resident's are, so they bind its auxiliary calls too: a held model
+   * is refused without a call, and an auxiliary call's own stated wait is
+   * recorded for it. (An ephemeral run records nothing, its name being
+   * single-use, so its context manager keeps the plain membrane.)
+   */
+  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting(async (run, model) => {
+      this.refuseHeldProviderModel(agentName, model);
+      try { return await run(); }
+      catch (error) {
+        if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
+        throw error;
+      }
+    });
+  }
+  /** The framework's membrane, with each complete() call passed through
+   *  `admit` along with the model it names. */
+  private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
       const value = Reflect.get(obj, prop, receiver);
       if (prop === 'complete' && typeof value === 'function') {
-        return (...args: unknown[]) => this.withAuxiliaryAdmission(
-          agentName, () => Reflect.apply(value, this.membrane, args) as Promise<unknown>);
+        return (...args: unknown[]) => {
+          const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
+          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+            typeof model === 'string' ? model : undefined);
+        };
       }
       return typeof value === 'function' ? value.bind(this.membrane) : value;
     }}) as unknown as Membrane;
   }
-  private accelerationCooldownMs(agentName: string, error: MembraneError): number {
-    const base = error.retryAfterMs ?? this.providerAccelerationDefaultCooldownMs;
+  /** An acceleration hold's length: AF's own pacing (`ownMs`: its default
+   *  plus jitter, capped), or the provider's stated wait in its place
+   *  (`stated`). The stated wait is a lower bound: jitter only adds to it,
+   *  and the cap applies only to AF's own default. A negative stated wait is
+   *  a stated 0, as in ProviderWaits: the 1 s floor, plus jitter. */
+  private accelerationCooldownMs(agentName: string, error: MembraneError): { delayMs: number; ownMs: number; stated: boolean } {
     let hash = 0; for (const ch of agentName) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
     const jitter = this.providerAccelerationJitterMs > 0 ? hash % (this.providerAccelerationJitterMs + 1) : 0;
-    return Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, base) + jitter);
+    const ownMs = Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, this.providerAccelerationDefaultCooldownMs) + jitter);
+    const stated = error.retryAfterMs;
+    if (typeof stated === 'number' && Number.isFinite(stated)) {
+      return { delayMs: Math.max(1_000, stated) + jitter, ownMs, stated: true };
+    }
+    return { delayMs: ownMs, ownMs, stated: false };
   }
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
@@ -2723,7 +2831,7 @@ export class AgentFramework {
     if (!hold) return false;
     clearTimeout(cooldown.timer);
     cooldown.until = Date.now() + hold.holdMs;
-    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), hold.holdMs);
+    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), Math.min(hold.holdMs, MAX_TIMER_DELAY_MS));
     cooldown.timer.unref?.();
     if (hold.reason !== cooldown.reason) {
       cooldown.reason = hold.reason;
@@ -2733,21 +2841,39 @@ export class AgentFramework {
   }
   private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest, auxiliary = false): boolean {
     if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
+    // A provider's stated wait binds later calls to the primary model, across
+    // restarts. (An auxiliary call records its own model's wait at the gate.)
+    const wait = auxiliary ? undefined : this.recordProviderWait(agent.name, agent.model, error);
     // The host knows more than the message wording does: ask it first. An
     // auxiliary failure arms host holds only — the built-in acceleration
     // cooldown stays a primary-path mechanism.
     const hostHold = this.consultProviderHold(error, agent.name);
-    const acceleration = !hostHold && !auxiliary && isOrganizationAccelerationRateLimit(error);
-    if (!acceleration && !hostHold) return false;
-    const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
+    // A failure the provider says may not be retried keeps its terminal
+    // disposition, whatever its wording (a stated wait still binds after it).
+    const acceleration = !hostHold && !auxiliary && (error as MembraneError).retryable !== false
+      && isOrganizationAccelerationRateLimit(error);
+    // The stated wait binds later calls whatever the failure was. Retaining
+    // and retrying THIS request is for a failure the provider says may be
+    // retried: a non-retryable one keeps its terminal disposition (marker,
+    // failure streak), and the wait applies to the calls that follow it.
+    if (!acceleration && !hostHold) {
+      return wait !== undefined && isMembraneError(error) && error.retryable === true
+        && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true);
+    }
+    const now = Date.now();
+    const pacing = hostHold ? undefined : this.accelerationCooldownMs(agent.name, error as MembraneError);
+    const delayMs = hostHold ? hostHold.holdMs : pacing!.delayMs;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
     if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
     if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
+    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
       until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? boundFailureText(String(error.message)),
       failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
+      // The stated wait (recorded above for agent.model) set this hold's
+      // length: an operator release of it returns the hold to AF's own pacing.
+      ...(pacing?.stated ? { statedWait: { model: agent.model, ownUntil: now + pacing.ownMs } } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
     if (auxiliary && !existing) {
       console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
@@ -2762,10 +2888,90 @@ export class AgentFramework {
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
   }
+  /**
+   * A provider's stated wait on a turn that doesn't own provider admission:
+   * a conversation agent's or an ephemeral run's. Left to the error policy,
+   * which returns a stated wait as it is, a 429 stating two hours would hold
+   * the turn asleep two hours, up to three times, with nothing recorded and
+   * nothing raised (membrane #56 review, M3). So:
+   * - A conversation agent's turns come through the scheduler as a resident's
+   *   do, so it treats the wait as a resident does: recorded for (agent,
+   *   model), alerted past PROVIDER_WAIT_ALERT_MS, and the turn held until the
+   *   wait passes or an operator releases it ('held'). A non-retryable failure
+   *   records the wait for the calls after it and keeps its own disposition.
+   * - An ephemeral run's name is single-use, so a wait recorded for it would
+   *   bind nothing, and its caller is waiting on it. A retryable stated wait
+   *   up to PROVIDER_ACCELERATION_MAX_COOLDOWN_MS is left to the error policy,
+   *   slept and retried. A longer one, or one that can't be represented, ends
+   *   the run now ('fail'): it is never retried before the provider's time,
+   *   and the caller hears why at once.
+   * Anything else is the error policy's.
+   */
+  private nonOwningProviderWait(agent: Agent, error: Error, trigger?: InferenceRequest): 'held' | 'fail' | undefined {
+    // From either copy of membrane (isMembraneError), a wait is stated only
+    // as a number, as the default error policy reads it.
+    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
+    if (this.conversationAgentHomes.has(agent.name)) {
+      const wait = this.recordProviderWait(agent.name, agent.model, error);
+      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true)
+        ? 'held'
+        : undefined;
+    }
+    if (this.ephemeralRuns.has(agent.name) && error.retryable === true
+      && !(error.retryAfterMs <= PROVIDER_ACCELERATION_MAX_COOLDOWN_MS)) {
+      return 'fail';
+    }
+    return undefined;
+  }
+  /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
+   *  for its caller. */
+  private statedWaitNotSlept(error: Error): string {
+    const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
+    const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
+    if (typeof stated !== 'number' || Number.isNaN(stated)) {
+      return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+        `stated wait of ${cap} or less, so it ends now)`;
+    }
+    const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
+    return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+      `longer than ${cap}, so it ends now)`;
+  }
+  /** When a hold's timer next fires: at its deadline, stepped past what one
+   *  timer can hold. A hold with no deadline (a wait held until released, or
+   *  the stand-in for unreadable records) asks again as often as unreadable
+   *  records are read again: records that read again end it, and nothing
+   *  announces that. */
+  private providerHoldTimerMs(remaining: number): number {
+    return Number.isFinite(remaining)
+      ? Math.min(remaining, MAX_TIMER_DELAY_MS)
+      : this.providerWaits?.retryReadMs ?? MAX_TIMER_DELAY_MS;
+  }
   private releaseProviderAccelerationCooldown(agentName: string): void {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
+    // A wait hold lasts exactly as long as its wait binds: longer once the
+    // wait is extended, while it is indefinite, and over once no wait binds
+    // (passed, released, or the stand-in for unreadable records lifted because
+    // they read again). A different primary model now is not bound by it.
+    if (cooldown.waitModel !== undefined && this.agents.get(agentName)?.model === cooldown.waitModel) {
+      const wait = this.providerWaits?.active(agentName, cooldown.waitModel);
+      cooldown.until = wait ? (wait.until ?? Number.POSITIVE_INFINITY) : Date.now();
+    }
+    const remaining = cooldown.until - Date.now();
+    if (remaining > 0 && (cooldown.waitModel === undefined || this.agents.get(agentName)?.model === cooldown.waitModel)) {
+      clearTimeout(cooldown.timer);
+      cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), this.providerHoldTimerMs(remaining));
+      cooldown.timer.unref?.();
+      return;
+    }
     if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    if (cooldown.waitModel !== undefined) {
+      const model = this.agents.get(agentName)?.model;
+      console.error(`[provider-wait] agent=${agentName} model=${cooldown.waitModel} ` +
+        (model !== undefined && model !== cooldown.waitModel
+          ? `no longer holds primary turns: the primary model is now ${model} (the wait stays recorded)`
+          : `primary hold ended after ${Date.now() - cooldown.startedAt}ms`));
+    }
     if (cooldown.auxiliaryOrigin && cooldown.heldRequests.length === 0) {
       // Nobody asked for an inference while parked: just reopen the gate.
       console.error(`[provider-cooldown] agent=${agentName} auxiliary hold released after ${Date.now() - cooldown.startedAt}ms`);
@@ -2780,6 +2986,201 @@ export class AgentFramework {
     console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
       `fresh compile queued with ${requests.length} retained request(s)`);
   }
+  /**
+   * Wait an error policy's retry delay, all of it: the delay can be a
+   * provider's retry-after, and a single timer past 2^31-1 ms fires almost at
+   * once. Steps through longer waits; stop() wakes it so a shutting-down
+   * framework is never left with a wait parked for days.
+   */
+  private async waitForRetry(ms: number): Promise<void> {
+    // An infinite delay waits until stop(), like any wait too long to end; a
+    // delay that isn't a number, or is 0 or less, waits none.
+    let remaining = ms > 0 ? ms : 0;
+    while (remaining > 0 && !this.providerAdmissionClosed) {
+      const step = Math.min(remaining, MAX_TIMER_DELAY_MS);
+      remaining -= step;
+      await new Promise<void>((resolve) => {
+        const wakers = this.retryWaitWakers;
+        const done = (): void => { clearTimeout(timer); wakers.delete(done); resolve(); };
+        const timer = setTimeout(done, step);
+        wakers.add(done);
+      });
+    }
+  }
+
+  /**
+   * Record a provider's stated wait (a classified error carrying
+   * `retryAfterMs`) for (agent, model). Returns the wait that binds now,
+   * which is the longer of this one and any outstanding one. A wait that
+   * newly binds past PROVIDER_WAIT_ALERT_MS, or until released, raises an
+   * ops alert.
+   */
+  private recordProviderWait(agentName: string, model: string, error: Error): ProviderWait | undefined {
+    // From either copy of membrane: the host supplies the Membrane instance,
+    // and a wait is stated only as a number, as the default policy reads it.
+    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number' || !this.providerWaits) return undefined;
+    // The provider's words, bounded; a line break in them must not start a
+    // line that reads as the framework's own where the reason is logged.
+    const reason = safeSlice(withoutControls(error.message), 0, 300);
+    const { wait, changed } = this.providerWaits.set(agentName, model, error.retryAfterMs, reason);
+    // A wait already over (0, or a negative "retry now") holds nothing to report.
+    const remaining = wait.until === null ? Number.POSITIVE_INFINITY : wait.until - Date.now();
+    if (changed && remaining > 0) {
+      const until = wait.until === null
+        ? 'until an operator releases it (the stated wait cannot be represented as an instant)'
+        : `until ${new Date(wait.until).toISOString()}`;
+      const stated = `${error.type}${error.httpStatus !== undefined ? ` HTTP ${error.httpStatus}` : ''}, retry-after ${String(error.retryAfterMs)}ms`;
+      console.error(`[provider-wait] agent=${agentName} model=${model} holds ${until}: ${stated}`);
+      if (remaining > PROVIDER_WAIT_ALERT_MS) {
+        this.opsAlert('provider-wait', agentName,
+          `provider wait on ${model} holds ${until} (${stated}: ${reason}); ` +
+          'if the provider did not mean that, release it with release-provider-wait',
+          { data: { model, until: wait.until === null ? null : new Date(wait.until).toISOString() } });
+      }
+    }
+    return wait;
+  }
+
+  /**
+   * Hold this agent's primary turns for a provider wait on its model. The
+   * requests are kept and released together, into one fresh compile, when
+   * the wait ends: the same path an acceleration cooldown takes, without
+   * parking auxiliary calls to other models.
+   */
+  private holdForProviderWait(agent: Agent, wait: ProviderWait, requests: InferenceRequest[], failed = false): boolean {
+    const now = Date.now();
+    const until = wait.until ?? Number.POSITIVE_INFINITY;
+    if (until <= now) return false;
+    const existing = this.providerAccelerationCooldowns.get(agent.name);
+    const held = existing?.heldRequests ?? [];
+    for (const request of requests) {
+      if (!held.some((r) => this.sameInferenceRequest(r, request))) held.push(request);
+    }
+    // An acceleration or host hold already parks the whole agent; its release
+    // re-checks this wait at admission.
+    if (existing && existing.waitModel === undefined) return true;
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), this.providerHoldTimerMs(until - now));
+    timer.unref?.();
+    this.providerAccelerationCooldowns.set(agent.name, {
+      startedAt: existing?.startedAt ?? now, until, timer, heldRequests: held,
+      // A failed call counts; a turn arriving at a wait recorded earlier doesn't.
+      reason: wait.reason, failures: (existing?.failures ?? 0) + (failed ? 1 : 0), waitModel: wait.model,
+    });
+    if (!existing) {
+      console.error(`[provider-wait] agent=${agent.name} model=${wait.model} holding primary turns ` +
+        `${wait.until === null ? 'until released' : `until ${new Date(wait.until).toISOString()}`}; ${held.length} request(s) retained`);
+    }
+    return true;
+  }
+
+  /**
+   * Refuse an auxiliary call to a model the provider asked this agent to wait
+   * on, without calling it. The refusal is a retryable rate limit carrying
+   * the remaining wait, so a caller that paces (context-manager's compression
+   * lane, from its corrective round #138 on) waits it out instead of spending
+   * a call. It is marked
+   * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
+   * the wait without counting a failed call (room-225 #47927).
+   */
+  private refuseHeldProviderModel(agentName: string, model: string | undefined): void {
+    // A call that names no model can't be matched to a model's wait, but the
+    // hold that stands for unreadable records binds every model, so it binds
+    // that call too (EVERY_MODEL: only that hold, or a release of it, says so).
+    const wait = this.providerWaits?.active(agentName, model ?? EVERY_MODEL);
+    if (!wait) return;
+    const now = Date.now();
+    throw Object.assign(new MembraneError({
+      type: 'rate_limit',
+      retryable: true,
+      ...(wait.until !== null ? { retryAfterMs: Math.max(0, wait.until - now) } : {}),
+      message: providerWaitText(agentName, model ?? EVERY_MODEL, wait),
+      rawError: undefined,
+    }), { providerAdmission: 'deferred' as const });
+  }
+
+  /**
+   * Release provider waits: one model's for an agent, or every model's. The
+   * explicit operator override for a wait that should not be honoured (the
+   * passing of time needs no call). Recorded, so a restart does not bring the
+   * wait back; held primary turns are released into one fresh compile. An
+   * acceleration hold the released wait lengthened keeps only AF's own pacing
+   * for its failure; a host hold stays the host's.
+   */
+  releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
+    model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
+  }> {
+    // A release names one of this framework's agents, or the agent of a wait
+    // the listing shows (a disposed conversation fork's wait stays recorded):
+    // an operator can release anything the listing shows. Any other name (a
+    // typo, or '*' and 'framework', which stand for the hold on unreadable
+    // records in its listing and its alert) is refused before anything is
+    // recorded: it would lift nothing and still read as a success. That hold
+    // is lifted one agent at a time.
+    if (!this.agents.has(agentName) && !this.providerWaits?.recorded(agentName)) {
+      throw new Error(`Unknown agent: ${safeSlice(JSON.stringify(agentName), 0, 120)}. A release names one of this ` +
+        "framework's agents or an agent with a recorded wait, and the hold on unreadable provider waits is lifted " +
+        'one agent at a time');
+    }
+    by = operatorLabel(String(by));
+    // '*' (EVERY_MODEL, as providerWaits lists the unreadable-records hold)
+    // names every model, the same as omitting it, everywhere below.
+    if (model === EVERY_MODEL) model = undefined;
+    const released = this.providerWaits?.release(agentName, model, by) ?? [];
+    for (const { wait, release } of released) {
+      console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
+    }
+    // The agent's context strategy may pace its own provider calls by the
+    // same stated wait (context-manager's compression lane, from its
+    // corrective round #138 on; 0.14.0 has no releaseCompressionPause, so this
+    // calls nothing there). The release is the operator's word on that wait
+    // too, so it is offered to the lane with its scope even when no wait
+    // binds here: the lane can hold a pause after
+    // this framework's own wait is gone (the records read again, the wait
+    // passed, or it was released in another process). The strategy's own
+    // backoff stays, and the receipt still lists only waits released here.
+    // Read inside the try: the release is already recorded, so a strategy
+    // that throws must not keep the hold below from being released.
+    try {
+      const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
+        { releaseCompressionPause?: (model?: string) => boolean } | undefined;
+      if (strategy?.releaseCompressionPause?.(model)) {
+        console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
+      }
+    } catch (error) {
+      console.error(`[provider-wait] agent=${agentName} could not offer the release to the compression lane: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
+    }
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    const covers = (held: string | undefined): boolean => held !== undefined && (model === undefined || held === model);
+    if (cooldown && covers(cooldown.waitModel)) {
+      // A wait hold asks its wait again: released, the hold ends.
+      this.releaseProviderAccelerationCooldown(agentName);
+    } else if (cooldown?.statedWait && covers(cooldown.statedWait.model)) {
+      // An acceleration hold the stated wait lengthened keeps only AF's own
+      // pacing for that failure, and is never lengthened by a release. A host
+      // hold carries no stated wait: its length stays the host's.
+      cooldown.until = Math.min(cooldown.until, cooldown.statedWait.ownUntil);
+      console.error(`[provider-wait] agent=${agentName} model=${cooldown.statedWait.model} acceleration hold keeps AF's own pacing only, ` +
+        (cooldown.until > Date.now() ? `until ${new Date(cooldown.until).toISOString()}` : 'which has passed'));
+      delete cooldown.statedWait;
+      this.releaseProviderAccelerationCooldown(agentName);
+    }
+    return released.map(({ wait, release }) => ({
+      model: wait.model, until: wait.until === null ? null : new Date(wait.until).toISOString(), release,
+    }));
+  }
+
+  /** Provider waits binding now, for health and doctor tooling. */
+  providerWaitSnapshot(agentName?: string): Array<{ agent: string; model: string; until: string | null; reason: string; setAt: string }> {
+    return (this.providerWaits?.list(agentName) ?? []).map((wait) => ({
+      agent: wait.agent,
+      model: wait.model,
+      until: wait.until === null ? null : new Date(wait.until).toISOString(),
+      reason: wait.reason,
+      setAt: new Date(wait.setAt).toISOString(),
+    }));
+  }
+
   private recordProviderAccelerationRecovery(agent: Agent, request: NormalizedRequest | undefined, stopReason: string): void {
     const recovery = this.providerAccelerationRecoveries.get(agent.name); if (!recovery?.releasedAt) return;
     this.providerAccelerationRecoveries.delete(agent.name);
@@ -5837,6 +6238,10 @@ export class AgentFramework {
    *
    *   host-status — report the quiesce state (drained / parked wakes /
    *   running background scripts).
+   *
+   *   release-provider-wait — end an agent's provider wait (a provider's
+   *   stated retry-after, kept across restarts) for one `model` or all, as an
+   *   explicit, recorded operator override.
    */
   private async handleHostCommand(
     serverId: string,
@@ -5874,6 +6279,8 @@ export class AgentFramework {
     /** For `nudge`: agent state at queue time ('idle' = runs immediately,
      *  else it runs once the current turn settles). */
     agentStatus?: string;
+    /** For `release-provider-wait`: the waits released. */
+    released?: Array<{ model: string; until: string | null }>;
   }> {
     if (
       params.command !== 'undo' &&
@@ -5883,7 +6290,8 @@ export class AgentFramework {
       params.command !== 'quiesce' &&
       params.command !== 'resume' &&
       params.command !== 'maintain' &&
-      params.command !== 'host-status'
+      params.command !== 'host-status' &&
+      params.command !== 'release-provider-wait'
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
@@ -5919,6 +6327,30 @@ export class AgentFramework {
     }
     if (params.command === 'host-status') {
       return { ok: true, hostMode: this.getHostModeStatus() };
+    }
+    // A release names its agent, as host.releaseProviderWait does: the first
+    // agent by default could lift the wrong agent's waits. The name may be an
+    // agent the framework no longer has whose wait the listing still shows
+    // (a disposed conversation fork); releaseProviderWait decides that.
+    if (params.command === 'release-provider-wait') {
+      if (typeof params.agentName !== 'string' || params.agentName === '') {
+        return { ok: false, error: 'release-provider-wait: agentName must name the agent whose waits to release' };
+      }
+      // Only an omitted model, or '*', releases every model: a malformed one
+      // is refused here, before anything changes, never widened.
+      if (!isReleaseModel(params.model)) {
+        return { ok: false, error: "release-provider-wait: model must be a model name, or '*' (or omitted) for every model" };
+      }
+      const by = operatorLabel(String(requester));
+      let released: ReturnType<AgentFramework['releaseProviderWait']>;
+      try {
+        released = this.releaseProviderWait(params.agentName, params.model, by);
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      console.error(`[host-command] release-provider-wait agent=${params.agentName} model=${params.model ?? '*'} by=${by} ` +
+        `(server=${serverId}): ${released.length} wait(s) lifted`);
+      return { ok: true, released };
     }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
@@ -8313,10 +8745,10 @@ export class AgentFramework {
         isolate: true,
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
-        // Dynamic conversation forks retain the established provider policy in
-        // this bounded first slice. Provider cooldown ownership belongs to the
-        // persistent resident only; generation-unique forks must not leak gates.
-        membrane: this.membrane,
+        // Provider cooldown ownership belongs to the persistent resident only;
+        // generation-unique forks must not leak gates. A fork's own recorded
+        // provider waits still bind its compression calls.
+        membrane: this.conversationAuxiliaryMembraneFor(name),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -8384,6 +8816,18 @@ export class AgentFramework {
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
+    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
+    // its timer would requeue held wakes for an agent that is gone, and a wait
+    // held until released would re-arm for the name indefinitely. The recorded
+    // wait stays, and binds the name if its channel binds again.
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown) {
+      clearTimeout(cooldown.timer);
+      this.providerAccelerationCooldowns.delete(agentName);
+      console.error(`[provider-wait] agent=${agentName} disposed while held` +
+        `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
+        `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
+    }
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -9242,7 +9686,10 @@ export class AgentFramework {
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
       if (providerCooldown) {
-        if (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown)) {
+        // A provider wait binds its own model; with a different primary model
+        // selected now, the turn proceeds (the wait stays recorded).
+        const otherModel = providerCooldown.waitModel !== undefined && providerCooldown.waitModel !== agent.model;
+        if (!otherModel && (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown))) {
           for (const req of requests) {
             if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
               providerCooldown.heldRequests.push(req);
@@ -9261,6 +9708,12 @@ export class AgentFramework {
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
       }
+      // A provider's stated wait on this agent's primary model, including one
+      // recorded before a restart, holds the turn until it passes. An
+      // ephemeral run records nothing, its name being single-use, so no wait,
+      // known or unreadable, binds it (as at the last boundary).
+      const providerWait = this.providerWaits?.active(agentName, agent.model);
+      if (providerWait && !this.ephemeralRuns.has(agentName) && this.holdForProviderWait(agent, providerWait, requests)) continue;
 
       // Skip if agent is busy (inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
@@ -10028,6 +10481,12 @@ export class AgentFramework {
   ): Promise<void> {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
+    // A stopping framework starts no turn, whoever owns provider admission
+    // (conversation agents and ephemeral runs do not take the gate).
+    if (this.providerAdmissionClosed) {
+      if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      return;
+    }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
@@ -10080,6 +10539,35 @@ export class AgentFramework {
       }
       if (this.providerAdmissionClosed) {
         this.releasePrimaryProviderGate(agent.name);
+        return;
+      }
+    }
+    // The last admission boundary before this primary call. With the gate
+    // held and no auxiliary call in flight, no new provider wait can be
+    // recorded for this agent before the call (auxiliary admission waits on
+    // the gate). But one may have been recorded since the scheduler's check:
+    // an auxiliary call this wake parked behind can fail with a stated wait
+    // on the primary model. That wait binds this wake too: hold it, don't call.
+    // A conversation agent's waits are recorded and held as a resident's are
+    // (nonOwningProviderWait), and its retries and in-turn restarts reach this
+    // boundary without the scheduler: a wait recorded meanwhile, by its own
+    // auxiliary call or a non-retryable failure, binds them here too. An
+    // ephemeral run records nothing, so nothing binds it here. A frame whose
+    // agent was replaced or removed (a fork disposed while its retry slept)
+    // installs no hold: its turn is dropped after the compile, as main drops
+    // any such turn.
+    if (!this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent) {
+      const wait = this.providerWaits?.active(agent.name, agent.model);
+      if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+        if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+        // A retry or an in-turn restart arrives with its turn still open at
+        // the event gate: the failed attempt, or the predecessor that kept
+        // liveness for it, leaves closing it to this frame. Held here, no
+        // frame would close it, and while it is open every gate event
+        // buffers, for every agent, until the wait ends.
+        this.eventGate?.onInferenceEnded(agent.name);
+        console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds at admission ` +
+          `(recorded after the wake was scheduled); wake held, not started`);
         return;
       }
     }
@@ -10458,6 +10946,28 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
       }
+      // A conversation agent takes no provider gate, so its own compression
+      // can record a wait while this turn compiles, after the last boundary
+      // checked. Check its waits again here, where nothing has been sent, and
+      // hold the turn as the boundary would rather than send it into the wait.
+      if (this.conversationAgentHomes.has(agent.name)) {
+        const wait = this.providerWaits?.active(agent.name, agent.model);
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+          console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
+            `(recorded while the turn compiled); turn held, nothing sent`);
+          // The turn emitted inference:started before its compile; every turn
+          // that does gets one terminal event, which listeners (a typing loop)
+          // rely on, as the failure sites' holds emit inference:failed.
+          this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: providerWaitText(agent.name, agent.model, wait) });
+          stream.cancel();
+          agent.cancelStream();
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+          this.channelRegistry?.stopTyping();
+          this.eventGate?.onInferenceEnded(agent.name);
+          return false;
+        }
+      }
 
       const handle = this.driveStream(
         agent,
@@ -10495,10 +11005,28 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
       }
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (statedWait === 'held') {
+        // A conversation agent held by the provider's stated wait, as a
+        // resident is: the hold's release owns the later compile.
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
 
-      const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+      const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
-        await new Promise((resolve) => setTimeout(resolve, action.delayMs));
+        // A policy's delay can be a provider's retry-after: wait all of it.
+        await this.waitForRetry(action.delayMs);
+        if (this.providerAdmissionClosed) {
+          // stop() ended the wait: that cancels the retry, it does not hasten
+          // it. Nothing is written (the store is closing); this frame still
+          // owns its token, since no retry frame replaced it.
+          if (this.activeTurnTokens.get(agent.name) === turnToken) {
+            this.activeTurnTokens.delete(agent.name);
+            this.activeTurnTriggers.delete(agent.name);
+          }
+          return false;
+        }
         // The retry re-enters startAgentStream, which replaces this frame's
         // turn token with its own; cleanup belongs to the innermost frame.
         await this.startAgentStream(agent, trigger, attempt + 1);
@@ -10515,7 +11043,7 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          error: err.message,
+          error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
         }, startLogical);
         this.emitTrace({
           type: 'inference:exhausted',
@@ -11705,16 +12233,25 @@ export class AgentFramework {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
+            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            if (statedWait === 'held') {
+              lifecyclePhase = 'failed';
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+              break;
+            }
 
-            const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
-              await new Promise((resolve) => setTimeout(resolve, action.delayMs));
-              await this.startAgentStream(agent, trigger, attempt + 1);
+              // A policy's delay can be a provider's retry-after: wait all of it.
+              await this.waitForRetry(action.delayMs);
+              // stop() ending the wait cancels the retry (this frame's finally
+              // clears the token); it is never permission to retry at once.
+              if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: err.message,
+                error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
@@ -11952,6 +12489,20 @@ export class AgentFramework {
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
+      // The same rule for a turn that doesn't own provider admission as at
+      // the other two failure sites: a conversation agent's stated wait is
+      // recorded and its turn held; an ephemeral run whose wait it won't sleep
+      // says why it ends.
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (statedWait === 'held') {
+        this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+          error: `Provider wait: ${err.message}`,
+          request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
+        this.abortAgentScript(agent.name, 'provider wait');
+        lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+        return;
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -11961,7 +12512,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        error: err.message,
+        error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
       }, streamRouting.logical);
       this.emitTrace({
         type: 'inference:exhausted',
@@ -14080,11 +14631,14 @@ export class AgentFramework {
             primaryPending: gate?.primaryPending ?? false,
             auxiliaryInFlight: gate?.auxiliaryInFlight ?? 0,
             auxiliaryDeferred: gate?.deferredAuxiliary ?? 0,
-            cooldownUntil: cooldown?.until ?? null,
+            // Null while none, and while a provider wait holds until released.
+            cooldownUntil: cooldown !== undefined && Number.isFinite(cooldown.until) ? cooldown.until : null,
             cooldownReason: cooldown?.reason ?? null,
             hostHold: cooldown?.hostHoldError !== undefined,
             heldRequests: cooldown?.heldRequests.length ?? 0,
             lastRecovery: this.providerAccelerationLastRecovery?.get(name) ?? null,
+            /** Provider waits (stated retry-after) binding this agent now, per model. */
+            providerWaits: this.providerWaitSnapshot(name).map(({ agent: _agent, ...wait }) => wait),
           };
         })(),
         lastInference: this.lastInferenceAt.get(name) ?? null,

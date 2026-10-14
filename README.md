@@ -342,7 +342,7 @@ const server = new ApiServer(framework, { port: 8765 });
 await server.start();
 ```
 
-**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`
+**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`, `host.providerWaits/releaseProviderWait`
 
 Also available as an MCP server via the `agent-framework-mcp` binary.
 
@@ -363,9 +363,12 @@ await framework.resume();            // throws ResumeBlockedError if the layout 
 Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
 `POST /maintenance/tick`, `GET /hostmode`; options via query string) and as
 `host/command` verbs (`quiesce`, `resume`, `maintain`, `host-status`) from MCPL
-servers granted `allowHostCommands`. The HTTP host verbs accept an optional
-shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`) for
-deployments that front the port with a proxy.
+servers granted `allowHostCommands`. The same servers can lift a provider's
+stated wait with `release-provider-wait` (`agentName`, optional `model`), as
+`host.releaseProviderWait` does over the WebSocket API, and
+`host.providerWaits` lists the waits that bind. The HTTP host verbs accept an
+optional shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`)
+for deployments that front the port with a proxy.
 
 ## Observability
 

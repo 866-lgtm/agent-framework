@@ -12,6 +12,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
 import { ResumeBlockedError } from '../framework.js';
+import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
   ApiServerConfig,
@@ -420,6 +421,37 @@ export class ApiServer {
       case 'host.maintenanceTick':
         this.requireAdminToken(params);
         return this.framework.maintenanceTick();
+      // A provider's stated retry-after is honoured across restarts; this is
+      // the explicit operator override (recorded, so a restart keeps it).
+      case 'host.releaseProviderWait': {
+        this.requireAdminToken(params);
+        const p = (params ?? {}) as { agentName?: unknown; model?: unknown; requester?: unknown };
+        if (typeof p.agentName !== 'string' || p.agentName === '') throw new Error('agentName is required');
+        // Only an omitted model, or '*', releases every model: a malformed one
+        // is refused before anything changes, never widened.
+        const model = p.model;
+        if (!isReleaseModel(model)) throw new Error("model must be a model name, or '*' (or omitted) for every model");
+        // A requester over this surface names itself, so the record says
+        // where the name came from ('api:<name>'), and it can't pass for a
+        // host command's requester.
+        return {
+          released: this.framework.releaseProviderWait(
+            p.agentName,
+            model,
+            typeof p.requester === 'string' && p.requester !== '' ? `api:${p.requester}` : 'api',
+          ),
+        };
+      }
+      // A read, like host.status: the admin token gates the verbs that change
+      // something. (The HTTP /hostmode read takes it because that response is
+      // readable cross-origin; this surface checks the origin.)
+      case 'host.providerWaits': {
+        const agentName = params?.agentName;
+        if (agentName !== undefined && typeof agentName !== 'string') {
+          throw new Error('agentName must be an agent name, or omitted for every agent');
+        }
+        return { waits: this.framework.providerWaitSnapshot(agentName) };
+      }
 
       default:
         throw new Error(`Unknown command: ${command}`);
