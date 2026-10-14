@@ -1,14 +1,16 @@
 // Runs as npm's `preversion` lifecycle hook (see package.json), before
-// `npm version` bumps anything, and again in the publish workflow for the
-// pushed tag. Stops the release while the repository has an open issue
-// labelled `release-hold`: someone found that releasing `main` as it stands
-// would harm whoever runs it, and the issue says what has to happen first.
+// `npm version` bumps anything; as `prepublishOnly`, before `npm publish`;
+// and in the publish workflow for the pushed tag. Stops the release while the
+// repository has an open issue labelled `release-hold`: someone found that
+// releasing `main` as it stands would harm whoever runs it, and the issue
+// says what has to happen first.
 //
-// The repository is GITHUB_REPOSITORY when set (as in GitHub Actions), and
-// otherwise the GitHub repository package.json names. A token in GH_TOKEN or
-// GITHUB_TOKEN is sent when present; the issues of a public repository read
-// without one. If the holds can't be read, the release stops too: publishing
-// needs GitHub anyway.
+// The repository is the GitHub repository package.json names, so a fork or a
+// copy asks the package's home; GITHUB_REPOSITORY (as in GitHub Actions) is
+// used only when package.json names none. A token in GH_TOKEN or GITHUB_TOKEN
+// is sent when present; the issues of a public repository read without one.
+// If the holds can't be read, the release stops too: publishing needs GitHub
+// anyway.
 import { readFileSync } from "node:fs";
 
 const LABEL = "release-hold";
@@ -19,19 +21,38 @@ function fail(message) {
 }
 
 function repository() {
-  if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
-  let pkg;
+  let named;
+  let unreadable;
   try {
-    pkg = JSON.parse(readFileSync("package.json", "utf8"));
+    const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+    const url = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
+    named = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(url ?? "")?.[1];
   } catch (error) {
-    fail(`release-holds: can't read package.json: ${error.message}`);
+    unreadable = error.message;
   }
-  const url = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
-  const match = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(url ?? "");
-  if (!match) {
-    fail("release-holds: package.json names no GitHub repository, and GITHUB_REPOSITORY is unset");
+  const repo = named ?? process.env.GITHUB_REPOSITORY;
+  if (!repo) {
+    fail(
+      unreadable
+        ? `release-holds: can't read package.json (${unreadable}), and GITHUB_REPOSITORY is unset`
+        : "release-holds: package.json names no GitHub repository, and GITHUB_REPOSITORY is unset",
+    );
   }
-  return match[1];
+  return repo;
+}
+
+/** What a maintainer can do about an answer other than the list. */
+function refusal(status) {
+  if (status === 401) {
+    return "GitHub doesn't accept the token in GH_TOKEN or GITHUB_TOKEN; replace it, or unset it for a public repository";
+  }
+  if (status === 403 || status === 429) {
+    return "the token can't read this repository's issues, or this address has used up GitHub's rate limit; give a token that can, or try again later";
+  }
+  if (status === 404) {
+    return `no repository ${repo} is visible to this request; check package.json's repository field, or give a token if the repository is private`;
+  }
+  return "run this again once GitHub answers normally";
 }
 
 const repo = repository();
@@ -39,9 +60,9 @@ const api = (process.env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/
 const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
 const where = `https://github.com/${repo}/issues?q=is%3Aissue+is%3Aopen+label%3A${LABEL}`;
 
-let items;
+let response;
 try {
-  const response = await fetch(
+  response = await fetch(
     `${api}/repos/${repo}/issues?labels=${LABEL}&state=open&per_page=100`,
     {
       headers: {
@@ -51,11 +72,23 @@ try {
       signal: AbortSignal.timeout(30_000),
     },
   );
-  if (!response.ok) throw new Error(`GitHub answered ${response.status} ${response.statusText}`);
-  items = await response.json();
-  if (!Array.isArray(items)) throw new Error("GitHub's answer wasn't a list of issues");
 } catch (error) {
-  fail(`release-holds: couldn't read the release holds (${error.message}). Check ${where}, and run this again once GitHub can be reached.`);
+  const why = error.name === "TimeoutError"
+    ? "no answer within 30 s"
+    : error.cause?.code ?? error.cause?.message ?? error.message;
+  fail(`release-holds: couldn't reach GitHub to read the release holds (${why}). Check ${where}, and run this again once GitHub can be reached.`);
+}
+if (!response.ok) {
+  fail(`release-holds: GitHub answered ${`${response.status} ${response.statusText}`.trim()} when asked for the release holds: ${refusal(response.status)}. ${where}`);
+}
+let items;
+try {
+  items = await response.json();
+} catch (error) {
+  items = undefined;
+}
+if (!Array.isArray(items)) {
+  fail(`release-holds: GitHub's answer wasn't a list of issues. Check ${where}, and run this again.`);
 }
 
 // The issues endpoint lists pull requests too. A hold is an issue: a pull

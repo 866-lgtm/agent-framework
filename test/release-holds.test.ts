@@ -130,35 +130,70 @@ test("several holds are each named", async () => {
   }
 });
 
-test("GITHUB_REPOSITORY names the repository over package.json, and a token is sent", async () => {
+test("package.json names the repository, though GITHUB_REPOSITORY names another, and a token is sent", async () => {
   const gh = await github(200, []);
   try {
-    const result = await run(project({ name: "fixture" }), {
+    const result = await run(project(PKG), {
       GITHUB_API_URL: gh.url,
-      GITHUB_REPOSITORY: "other/place",
+      GITHUB_REPOSITORY: "fork/repo",
       GH_TOKEN: "t0ken",
     });
     assert.equal(result.code, 0, result.stderr);
-    assert.match(gh.seen[0]!.url, /^\/repos\/other\/place\/issues\?/);
+    assert.match(gh.seen[0]!.url, /^\/repos\/owner\/repo\/issues\?/);
     assert.equal(gh.seen[0]!.headers.authorization, "Bearer t0ken");
   } finally {
     await gh.close();
   }
 });
 
-test("holds that can't be read stop the release", async () => {
-  const gh = await github(500, { message: "unavailable" });
+test("GITHUB_REPOSITORY names the repository when package.json names none", async () => {
+  const gh = await github(200, []);
   try {
-    const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
-    assert.equal(result.code, 1);
-    assert.match(result.stderr, /^release-holds: couldn't read the release holds \(GitHub answered 500/);
+    const result = await run(project({ name: "fixture" }), {
+      GITHUB_API_URL: gh.url,
+      GITHUB_REPOSITORY: "other/place",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(gh.seen[0]!.url, /^\/repos\/other\/place\/issues\?/);
   } finally {
     await gh.close();
   }
 });
 
+test("an error answer stops the release", async () => {
+  const gh = await github(500, { message: "unavailable" });
+  try {
+    const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /^release-holds: GitHub answered 500 Internal Server Error when asked for the release holds: run this again once GitHub answers normally\./);
+  } finally {
+    await gh.close();
+  }
+});
+
+test("a repository GitHub won't show stops the release and points at package.json", async () => {
+  const gh = await github(404, { message: "Not Found" });
+  try {
+    const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /answered 404 Not Found .*no repository owner\/repo is visible to this request; check package\.json's repository field/);
+  } finally {
+    await gh.close();
+  }
+});
+
+test("GitHub out of reach stops the release, naming why", async () => {
+  // A port that was just free: nothing listens there now. (fetch refuses
+  // the discard port and others as "bad port" without connecting.)
+  const gh = await github(200, []);
+  await gh.close();
+  const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /^release-holds: couldn't reach GitHub to read the release holds \(E[A-Z]+\)\./);
+});
+
 test("no repository to ask stops the release", async () => {
-  const result = await run(project({ name: "fixture" }), { GITHUB_API_URL: "http://127.0.0.1:9" });
+  const result = await run(project({ name: "fixture" }), { GITHUB_API_URL: "http://127.0.0.1:1" });
   assert.equal(result.code, 1);
   assert.match(result.stderr, /names no GitHub repository/);
 });

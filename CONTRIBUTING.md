@@ -143,8 +143,8 @@ never do.
 - **Release holds.** When releasing `main` as it stands would harm
   someone running it, open an issue that says what has to happen first,
   label it `release-hold`, and close it once that's happened. While one is
-  open, `npm version` stops before it bumps anything, and the publish
-  workflow refuses the tag.
+  open, `npm version` stops before it bumps anything, and `npm publish`
+  and the publish workflow refuse the release.
 
 ## Building and testing
 
