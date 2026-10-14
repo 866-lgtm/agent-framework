@@ -2200,9 +2200,12 @@ export class AgentFramework {
     }
   }
 
-  /** Register before invoking the body: its synchronous trace callbacks can
-   * reenter stop(). Invocation stays in this stack, preserving immediate
-   * mode changes; the returned promise carries its result to the caller. */
+  /** Register before invoking the body, so the set holds the operation for
+   * its whole life: its synchronous trace callbacks can reenter stop(), and
+   * whether that stop() finds it then doesn't rest on when the wait first
+   * looks (it yields once first, too). Invocation stays in this stack,
+   * preserving immediate mode changes; the returned promise carries its
+   * result to the caller. */
   private trackOperatorOperation<T>(label: string, run: () => Promise<T>): Promise<T> {
     let resolve!: (value: T | PromiseLike<T>) => void;
     let reject!: (error: unknown) => void;
