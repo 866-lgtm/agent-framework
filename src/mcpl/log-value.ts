@@ -25,13 +25,13 @@
  * identifiers still can.
  *
  * A value longer than 256 UTF-16 units is cut, so one value can't make a line
- * long: it prints quoted, as its first 256 units (255 when the 256th would
- * split a surrogate pair), each at most six characters once escaped, followed
- * by `…(N)`, N being its full length. `JSON.parse` of the quoted part gives
- * back those first units. A cut value always opens with a quote, and its
- * marker follows the closing quote. A plain token never holds a quote, and a
- * quoted value that isn't cut ends at its closing quote, so only a value
- * that was cut prints as one.
+ * long: it prints quoted, as its first 256 units (255 when the 256th is a
+ * high surrogate, so a pair is never split), each at most six characters once
+ * escaped, followed by `…(N)`, N being its full length. `JSON.parse` of the
+ * quoted part gives back those first units. A cut value always opens with a
+ * quote, and its marker follows the closing quote. A plain token never holds
+ * a quote, and a quoted value that isn't cut ends at its closing quote, so
+ * only a value that was cut prints as one.
  *
  * A value that isn't a string prints as its JSON text, quoted as any text is
  * that isn't a plain token: the number 5 prints as `5`, and `{"toString":1}`
