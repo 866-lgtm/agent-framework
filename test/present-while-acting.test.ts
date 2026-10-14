@@ -36,6 +36,7 @@ import type { ContextInjection } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { MembraneError } from '@animalabs/membrane';
+import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1247,90 @@ describe('present while acting', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   };
+
+  // stop() and an agent's disposal end every open turn, but a start can reach
+  // its routing after either, opening or reopening its turn, and then be
+  // dropped before its stream sends anything: before its compile, once stop()
+  // has closed admission, or after it, once a restart has begun a lifecycle
+  // of its own. Here the start waits for a deferred batch's assembly while
+  // the stop runs.
+  for (const restartFirst of [false, true]) {
+    const name = restartFirst
+      ? "a start whose compile spans a stop() and restart is dropped and leaves no turn open, so the next start opens its own"
+      : "a start that stop() drops before its compile leaves no turn open, so the first start after a restart opens its own";
+    it(name, async () => {
+      // A store the framework doesn't own, so the same instance can start again.
+      const store = JsStore.openOrCreate({ path: join(tempDir, 'restart.chronicle') });
+      const framework = await AgentFramework.create({
+        store,
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' }],
+        modules: [module],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 0,
+      });
+      module.framework = framework;
+      const routed = stubChannelRegistry(framework);
+      const internals = framework as unknown as {
+        pushCoalescer: unknown;
+        openLogical: Map<string, unknown>;
+        startAgentStream(agent: unknown, trigger?: InferenceRequest): Promise<void>;
+      };
+      const agent = framework.getAgent('assistant')!;
+      const wake = (): InferenceRequest => ({
+        agentName: 'assistant', reason: 'external-message', source: 'test', timestamp: Date.now(),
+      } as InferenceRequest);
+      let entered!: () => void;
+      const assembling = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      internals.pushCoalescer = {
+        pendingBatches: () => true,
+        assemble: async () => {
+          entered();
+          await released;
+          return { settled: new Set<string>(), materialized: new Set<string>() };
+        },
+        suspend: () => {},
+        isRendering: () => false,
+      };
+      const lines: string[] = [];
+      const error = console.error;
+      try {
+        console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+        try {
+          const dropped = internals.startAgentStream(agent, wake());
+          await assembling;
+          await framework.stop();
+          if (restartFirst) framework.start();
+          release();
+          await dropped;
+        } finally { console.error = error; }
+        if (restartFirst) {
+          assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)),
+            lines.join('\n'));
+        } else {
+          assert.equal(membrane.calls.length, 0, 'the start was dropped before its compile');
+        }
+        assert.deepEqual(routed, [], 'the dropped start routed nothing');
+        assert.equal(internals.openLogical.has('assistant'), false, 'the dropped start left no turn open');
+
+        if (!restartFirst) framework.start();
+        internals.pushCoalescer = undefined;
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'After the restart.' }] as ContentBlock[]));
+        await internals.startAgentStream(agent, wake());
+        await until(() => routed.length > 0, "the next turn's speech");
+        // The dropped start resolved chan-live-1. Continuing its turn would
+        // have kept that locus, without resolving one.
+        assert.deepEqual(routed, [{ text: 'After the restart.', locus: 'chan-live-2' }],
+          'the next start resolved a locus of its own');
+      } finally {
+        release();
+        await framework.stop();
+        store.close();
+      }
+    });
+  }
 
   it("a send's engaged channel is recorded on the turn that sent, however late its open resolves", async () => {
     const sending = { engaged: new Set<string>() };

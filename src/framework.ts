@@ -4660,6 +4660,22 @@ export class AgentFramework {
     run.lastActivity = Date.now();
   }
 
+  /**
+   * A start dropped before its stream sends anything (its agent was replaced,
+   * or stop() closed admission or ended the lifecycle the start began in)
+   * ends the logical turn it was running. stop() and an agent's disposal end
+   * every open turn (openLogical), but a start can reach its routing after
+   * either: one that awaited its batches' assembly across a stop(), or a
+   * start of an agent that takes no primary provider gate, which doesn't
+   * check admission before its turn begins, such as a retry after its delay.
+   * The turn it opened or reopened then would stay open, and the agent's next
+   * start, after a restart too, would continue the dropped turn's routing.
+   * The identity check leaves any other turn open.
+   */
+  private endDroppedTurn(agentName: string, routing: TurnRouting): void {
+    if (this.openLogical.get(agentName) === routing) this.openLogical.delete(agentName);
+  }
+
   /** A logical turn's end, for every agent: it closes the agent's open
    *  logical turn when it is the settling stream's own (openLogical), and
    *  settles an active ephemeral run. The run's tool-call count comes from
@@ -10061,6 +10077,7 @@ export class AgentFramework {
       // and stop() may close provider admission. Do not create a provider
       // stream after its generation lost ownership, or once admission closed.
       if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
+        this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -10104,6 +10121,7 @@ export class AgentFramework {
           this.activeStreams.delete(agent.name);
           this.pendingAssistantBlocks.delete(agent.name);
         }
+        this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
