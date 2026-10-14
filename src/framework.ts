@@ -19,7 +19,14 @@ import type {
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
-import { bodyRangeIn, removeStoredMessage, removeStoredMessages } from './stored-removal.js';
+import {
+  bodyGroupRun,
+  bodyRangeIn,
+  locateMessageIndex,
+  locateMessageIndices,
+  removeStoredMessage,
+  removeStoredMessages,
+} from './stored-removal.js';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -854,72 +861,6 @@ class DefaultInferencePolicy implements InferencePolicy {
   ): boolean {
     return requests.some((r) => r.agentName === agentName);
   }
-}
-
-/** Minimal read surface the live-surgery helpers need from a ContextManager. */
-interface SurgeryReadableCm {
-  getMessageCount(): number;
-  getMessageWindow(
-    offset: number,
-    limit: number,
-    opts?: { resolveBlobs?: boolean; alignToBodyGroups?: boolean },
-  ): { messages: Array<{ id: unknown; bodyGroupId?: string }>; startIndex: number };
-}
-
-const SURGERY_SCAN_WINDOW = 500;
-
-/**
- * Slot index of `messageId` on the active branch, or -1. Scans from the tail
- * in blob-free windows: operator targets are almost always recent, and a
- * full `getAllMessages()` re-inflates every attachment on the branch.
- */
-function locateMessageIndex(cm: SurgeryReadableCm, messageId: string): number {
-  const hit = locateMessageIndices(cm, new Set([messageId])).get(messageId);
-  return hit ? hit.index : -1;
-}
-
-/** Tail-first scan resolving many ids at once; stops as soon as all are found. */
-function locateMessageIndices(
-  cm: SurgeryReadableCm,
-  ids: Set<string>,
-): Map<string, { index: number; bodyGroupId?: string }> {
-  const found = new Map<string, { index: number; bodyGroupId?: string }>();
-  const total = cm.getMessageCount();
-  for (let end = total; end > 0 && found.size < ids.size; end -= SURGERY_SCAN_WINDOW) {
-    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
-    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const id = String(messages[i].id);
-      if (ids.has(id) && !found.has(id)) {
-        found.set(id, {
-          index: startIndex + i,
-          ...(messages[i].bodyGroupId ? { bodyGroupId: messages[i].bodyGroupId } : {}),
-        });
-      }
-    }
-  }
-  return found;
-}
-
-/**
- * Inclusive slot range of the body-group run containing `index` (the slot
- * itself when it is not sharded). Delegates to the store's own
- * `alignToBodyGroups` edge walk — one contiguity assumption, not two.
- */
-function bodyGroupRun(
-  cm: SurgeryReadableCm,
-  index: number,
-): { from: number; to: number; fromId: string; toId: string; group: boolean } {
-  const win = cm.getMessageWindow(index, 1, { alignToBodyGroups: true, resolveBlobs: false });
-  const from = win.startIndex;
-  const to = win.startIndex + win.messages.length - 1;
-  return {
-    from,
-    to,
-    fromId: String(win.messages[0].id),
-    toId: String(win.messages[win.messages.length - 1].id),
-    group: win.messages[0].bodyGroupId !== undefined,
-  };
 }
 
 function describeMarkers(m: SurgeryMarkerReceipt): string {

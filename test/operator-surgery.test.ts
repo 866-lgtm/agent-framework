@@ -482,14 +482,23 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
-  it("a module's removal of a message in a body takes the whole body, and a plain message alone", async () => {
+  it("a module's removal of a message in a body takes the whole body, and a plain message alone, with no full read of the branch", async () => {
     const [b0, b1, b2] = appendShards('g-mod', ['b0', 'b1', 'b2']);
     const plain = String(cm().addMessage('user', [{ type: 'text', text: 'plain' }]));
     const internals = framework as unknown as { removeMessage(id: string): void };
-    internals.removeMessage(b1);
-    for (const id of [b0, b1, b2]) assert.equal(cm().getMessage(id as never), null);
-    internals.removeMessage(plain);
-    assert.equal(cm().getMessage(plain as never), null);
+    // A full read inflates every attachment on the branch: the body is found
+    // in blob-free windows instead.
+    const reads = cm() as unknown as { getAllMessages(): unknown };
+    const getAllMessages = reads.getAllMessages;
+    reads.getAllMessages = () => { throw new Error('read the whole branch'); };
+    try {
+      internals.removeMessage(b1);
+      for (const id of [b0, b1, b2]) assert.equal(cm().getMessage(id as never), null);
+      internals.removeMessage(plain);
+      assert.equal(cm().getMessage(plain as never), null);
+    } finally {
+      reads.getAllMessages = getAllMessages;
+    }
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
