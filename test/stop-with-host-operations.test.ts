@@ -537,7 +537,11 @@ describe('stop() with an operator operation in flight', () => {
     );
     assert.equal(framework.getStore().isClosed(), false, 'the operation may still write');
     assert.ok(order.includes('modules stopped'), 'timeout still proceeds with teardown');
-    await assert.rejects(framework.syncDiscordAwarenessMarkers(), /^Error: awareness sync refused: the framework is stopping$/,
+    // Bounded: a sync admitted here would wait on a barrier of its own, so it
+    // fails the test rather than hanging it.
+    const late = framework.syncDiscordAwarenessMarkers().then(() => 'admitted', (error: unknown) => String(error));
+    const stillRunning = new Promise<string>((resolve) => { setTimeout(() => resolve('still running'), 1_000).unref(); });
+    assert.equal(await Promise.race([late, stillRunning]), 'Error: awareness sync refused: the framework is stopping',
       'no stop() is waiting now, so a new sync is refused');
     await assert.rejects(framework.stop(100), (error: unknown) =>
       error instanceof ShutdownTimeoutError && error.pending.includes('awareness:sync'));
