@@ -2047,7 +2047,7 @@ describe('incomplete walks', () => {
     // d.txt is there, past the cap: unverified by this pass, and kept.
     assert.equal(pass.reports.get('d.txt')?.state, 'unverified');
     assert.notEqual(env.store.treeGet(TREE, 'd.txt'), null);
-    assert.ok(pass.incomplete.some((r: { reason: string }) => /file cap \(2\) was reached/.test(r.reason)));
+    assert.ok(pass.incomplete.some((r: { reason: string }) => /walk cap \(2\) was reached/.test(r.reason)));
   });
 });
 
@@ -2063,7 +2063,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
 
     const first = await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'm.txt'], 'the first two in the walk order');
-    assert.ok(first.incomplete.some((r: { reason: string }) => /file cap \(2\) was reached.*resumes after work\/m\.txt/.test(r.reason)),
+    assert.ok(first.incomplete.some((r: { reason: string }) => /walk cap \(2\) was reached.*resumes after work\/m\.txt/.test(r.reason)),
       JSON.stringify(first.incomplete));
 
     await call(m, 'sync', {});
@@ -2234,11 +2234,11 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const synced = await call(m, 'sync', {});
     const resumes = synced.incomplete.filter((r: { reason: string }) => /resumes after/.test(r.reason));
     assert.deepEqual(resumes.map((r: { mount: string; path: string; reason: string }) => [r.mount, r.path, r.reason]),
-      [['work', '', 'the file cap (1) was reached: the next sync or scan of this scope resumes after work/a.txt']]);
+      [['work', '', 'the walk cap (1) was reached: the next sync or scan of this scope resumes after work/a.txt']]);
     // z/q.txt sits beneath z/, which wasn't listed: its reason is z/'s, not
     // that of the root, which holds an untaken b.txt.
     const skipped = synced.skipped?.find((x: { path: string }) => x.path === 'z/q.txt');
-    assert.match(skipped?.reason ?? '', /not visited: the file cap \(1\) was reached/, JSON.stringify(synced.skipped));
+    assert.match(skipped?.reason ?? '', /not visited: the walk cap \(1\) was reached/, JSON.stringify(synced.skipped));
   });
 
   test('agent-action scans resume where the last stopped', async (t) => {
@@ -2328,7 +2328,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       assert.ok(synced.incomplete?.some((r: { mount: string; path: string; reason: string }) => r.mount === 'work' && r.path === 's' && /changed while the walk ran/.test(r.reason)),
         JSON.stringify(synced.incomplete));
       // The pass took one file of its three, t/x.txt: nothing it left is the cap's.
-      assert.ok(!synced.incomplete.some((r: { reason: string }) => /file cap/.test(r.reason)), JSON.stringify(synced.incomplete));
+      assert.ok(!synced.incomplete.some((r: { reason: string }) => /walk cap/.test(r.reason)), JSON.stringify(synced.incomplete));
     });
     assert.ok(swapped);
     assert.notEqual(env.store.treeGet(TREE, 's/z.txt'), null, 's/z.txt is on disk in the new s/: not proven absent');
@@ -2402,7 +2402,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       const synced = await call(m, 'sync', { path: 'work/d' });
       assert.ok(synced.incomplete?.some((r: { path: string; reason: string }) => /changed while the walk ran/.test(r.reason) && /(^|\/)d$/.test(r.path)),
         JSON.stringify(synced.incomplete));
-      assert.ok(!synced.incomplete.some((r: { reason: string }) => /file cap/.test(r.reason)), JSON.stringify(synced.incomplete));
+      assert.ok(!synced.incomplete.some((r: { reason: string }) => /walk cap/.test(r.reason)), JSON.stringify(synced.incomplete));
     });
     assert.ok(swapped);
   });
@@ -2432,6 +2432,79 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     }, () => call(m, 'sync', { path: 'work/d' }));
     assert.ok(removed && swapped);
     assert.notEqual(env.store.treeGet(TREE, 'd/u/q.txt'), null, 'd/u/q.txt is on disk in the new d/: not proven absent');
+  });
+
+  test('a directory listed on the after stretch that is a symlink on the wrap proves nothing absent from its old listing', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 3 });
+    for (const f of ['s/a.txt', 's/b.txt', 's/c.txt', 's/z.txt', 't/x.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', {}); // takes s/a, s/b, s/c: the place is s/c.txt
+    env.rmDisk('s/z.txt');
+    // While t/ is listed, s/ becomes a link to a directory that holds z.txt.
+    // The wrap's check of s/ fails, so its listing from the after stretch
+    // describes a directory that isn't there.
+    let swapped = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!swapped && String(path).endsWith(`${'/'}t`)) {
+        swapped = true;
+        renameSync(env.disk('s'), join(env.root, 's-away'));
+        writeFileSync(join(env.root, 's-away', 'z.txt'), 's/z.txt');
+        symlinkSync(join(env.root, 's-away'), env.disk('s'));
+      }
+      return readdir(path, ...rest);
+    }, () => call(m, 'sync', {}));
+    assert.ok(swapped);
+    assert.notEqual(env.store.treeGet(TREE, 's/z.txt'), null, "s/'s old listing proves nothing once s/ isn't that directory");
+  });
+
+  test('a directory proven missing on the after stretch and back by the wrap proves nothing absent', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['m/1.txt', 'm/2.txt', 'm/3.txt', 'z/q.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', {}); // takes m/1, m/2: the place is m/2.txt
+    // The root's listing shows m/, which is gone by the time the after
+    // stretch checks it, so the walk proves m/ missing; while it lists z/,
+    // m/ comes back.
+    let removed = false;
+    let restored = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!removed && String(path) === realpathSync(env.dir)) {
+        const listed = await readdir(path, ...rest);
+        removed = true;
+        rmSync(env.disk('m'), { recursive: true });
+        return listed;
+      }
+      if (!restored && String(path).endsWith(`${'/'}z`)) {
+        restored = true;
+        for (const f of ['m/1.txt', 'm/2.txt', 'm/3.txt']) env.writeDisk(f, f);
+      }
+      return readdir(path, ...rest);
+    }, () => call(m, 'sync', {}));
+    assert.ok(removed && restored);
+    // The wrap lists the m/ there now and takes m/1.txt from it.
+    for (const f of ['m/1.txt', 'm/2.txt', 'm/3.txt']) assert.notEqual(env.store.treeGet(TREE, f), null, `${f} is on disk`);
+  });
+
+  test('a link takes a place under the cap as a file does, so a followed link past the cap is read on a later pass', async (t) => {
+    const env = new Env(t);
+    for (const f of ['zz/t1.txt', 'zz/t2.txt', 'zz/t3.txt']) env.writeDisk(f, `target ${f}`);
+    env.writeDisk('a.txt', 'a');
+    for (const n of ['1', '2', '3']) symlinkSync(env.disk(`zz/t${n}.txt`), env.disk(`l${n}`));
+    const m = await env.open({ walkCap: 2, followSymlinks: true });
+    // The root's entries in order: a.txt, l1, l2, l3; the cap takes a.txt and l1.
+    const first = await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'l1'], JSON.stringify(first));
+    assert.ok(first.incomplete.some((r: { path: string; reason: string }) => r.path === '' && /before everything here was taken/.test(r.reason)),
+      JSON.stringify(first.incomplete));
+    // Like a file past the cap, an untracked link the pass didn't take isn't reported by path.
+    assert.ok(!(first.skipped ?? []).some((x: { path: string }) => x.path === 'l2' || x.path === 'l3'), JSON.stringify(first.skipped));
+    await call(m, 'sync', {}); // l2 and l3: the place is l3
+    assert.deepEqual(syncedNames(env), ['a.txt', 'l1', 'l2', 'l3']);
+    // A tracked link the next pass doesn't take isn't read through either:
+    // the third pass takes zz/t1.txt and zz/t2.txt, not l3.
+    env.writeDisk('zz/t3.txt', 'changed behind l3');
+    await call(m, 'sync', {});
+    assert.equal(await contentOf(m, 'l3'), 'target zz/t3.txt');
   });
 
   test('an accepted new root starts with no place', async (t) => {

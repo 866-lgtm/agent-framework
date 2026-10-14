@@ -43,13 +43,15 @@ export interface MountConfig {
   /** Maximum file size in bytes (default: 5MB) */
   maxFileSize?: number;
   /**
-   * The most files one walk of this mount takes (default: 5000), a positive
-   * integer. A sync or scan that reaches it reports the rest as incomplete,
-   * and the next sync or scan of the same scope resumes after the last file
-   * it took, wrapping to the start, so repeated ones cover a larger mount; a
-   * restart keeps the place. A listing (`ls`, `glob`, `grep`) takes up to it
-   * from its scope's start. Each directory's listing is read whole, so a
-   * deletion is seen wherever the walk lists, whatever files it took.
+   * The most entries one walk of this mount takes (default: 5000), a
+   * positive integer: files, and links or other entries that aren't
+   * directories, each of which the pass observes. A sync or scan that
+   * reaches it reports the rest as incomplete, and the next sync or scan of
+   * the same scope resumes after the last entry it took, wrapping to the
+   * start, so repeated ones cover a larger mount; a restart keeps the place.
+   * A listing (`ls`, `glob`, `grep`) takes up to it from its scope's start.
+   * Each directory's listing is read whole, so a deletion is seen wherever
+   * the walk lists, whatever it took.
    */
   walkCap?: number;
   /**

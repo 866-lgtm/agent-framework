@@ -152,7 +152,7 @@ export interface MountRuntime {
   treeStateId: string;
   intents: BranchIntents;
   readOnly: boolean;
-  /** The most files one walk of the mount takes (`MountConfig.walkCap`). */
+  /** The most entries one walk of the mount takes, files and the other entries that aren't directories (`MountConfig.walkCap`). */
   walkCap: number;
 }
 
@@ -634,7 +634,9 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       });
       for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
       // Ignored names are listed only when something tracks them (above).
-      for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && inScope(p, scope)) candidates.add(p);
+      // The other entries it took (a link, a socket…): ignored names are
+      // listed only when something tracks them (above).
+      for (const p of walk.othersTaken) if (inScope(p, scope)) candidates.add(p);
       for (const d of walk.dirs) if (inScope(d, { kind: 'dir', dir: scope.dir, recursive: false })) gathered.dirs.push(d);
     }
   }
@@ -650,19 +652,19 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       gathered.facts.set(path, { kind: 'absent' });
       continue;
     }
-    if (walk && !walk.files.has(path) && !walk.others.has(path)) {
-      // Beneath a region the walk didn't reach: unproven either way. The
-      // nearest region holding it says why.
+    if (walk?.others.get(path) === 'ignored by the mount') {
+      gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
+      continue;
+    }
+    if (walk && !walk.files.has(path) && !walk.othersTaken.has(path)) {
+      // Not taken by the walk, or beneath a region it didn't reach: unproven
+      // either way. The nearest region holding it says why.
       let region: Walk['incomplete'][number] | undefined;
       for (const r of walk.incomplete) {
         if (r.path !== '' && path !== r.path && !path.startsWith(r.path + '/')) continue;
         if (region === undefined || r.path.length > region.path.length) region = r;
       }
       gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
-      continue;
-    }
-    if (walk?.others.get(path) === 'ignored by the mount') {
-      gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
       continue;
     }
     const p = agreement.get(mount.name, path);
@@ -849,7 +851,7 @@ export async function reconcilePass(
     if (typeof resumeAfter === 'string' && scope.kind === 'dir') {
       result.incomplete.push({
         path: scope.dir,
-        reason: `the file cap (${opts.cap ?? mount.walkCap}) was reached: the next sync or scan of this scope resumes after ${mount.name}/${resumeAfter}`,
+        reason: `the walk cap (${opts.cap ?? mount.walkCap}) was reached: the next sync or scan of this scope resumes after ${mount.name}/${resumeAfter}`,
       });
     }
     for (const region of walk.incomplete) {

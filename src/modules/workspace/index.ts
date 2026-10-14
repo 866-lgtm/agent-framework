@@ -1224,7 +1224,7 @@ export class WorkspaceModule implements Module {
         name: 'sync',
         description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
           + 'rechecked and nothing pending in the workspace is discarded. A sync takes up to the mount\'s walk '
-          + 'cap of files (5000 unless configured); past it, what this one didn\'t reach is listed under '
+          + 'cap of files and links (5000 unless configured); past it, what this one didn\'t reach is listed under '
           + '`incomplete`, and the next sync of the same mount or directory resumes where it stopped. With a '
           + 'path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '

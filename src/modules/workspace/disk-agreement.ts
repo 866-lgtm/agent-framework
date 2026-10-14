@@ -266,7 +266,7 @@ export class DiskAgreement {
 
   /**
    * Where the next walk of `scope` ('' for the mount root) resumes: the last
-   * file a walk of it took before its file cap stopped it, if one did.
+   * entry a walk of it took before its cap stopped it, if one did.
    */
   walkResumesAfter(mount: string, scope: string): string | undefined {
     this.ensureReconciled();
