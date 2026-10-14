@@ -1865,7 +1865,10 @@ for (const [stated, says] of [
         const outcome = await ephemeralRun(fw, `zz-ephemeral-${stated}`);
         assert.ok('error' in outcome, 'the run ends with an error');
         assert.match(outcome.error.message, says);
+        // The words a host matched before the error was marked.
+        assert.match(outcome.error.message, /an ephemeral run doesn't sleep a stated wait/);
         assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
+        assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
         assert.ok(Object.is(outcome.error.retryAfterMs, stated), `it carries ${stated}, not ${outcome.error.retryAfterMs}`);
         assert.equal(membrane.primary, 1);
       } finally { await fw.stop(); log.restore(); }
@@ -1873,21 +1876,46 @@ for (const [stated, says] of [
   });
 }
 
-test("an ephemeral run that fails for another reason isn't marked as a stated wait", async () => {
+for (const [label, failure] of [
+  ['refused', () => new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400,
+    message: 'zz the request was refused', rawError: { status: 400 },
+  })],
+  // Not retryable, so its stated wait is no reason to wait: it ends as any failure does.
+  ['not retryable, with a long stated wait', () => new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400, retryAfterMs: 20 * 60_000,
+    message: 'zz the request was refused', rawError: { status: 400 },
+  })],
+] as const) {
+  for (const site of ['stream', 'setup', 'throw'] as const) {
+    test(`an ephemeral run that fails for another reason isn't marked as a stated wait (${label}, ${site})`, async () => {
+      await withStoreDir(async (path) => {
+        const log = silence();
+        const membrane = new FailingAt(1, site, failure);
+        const { fw } = await framework(path, membrane);
+        try {
+          const outcome = await ephemeralRun(fw, `zz-ephemeral-refused-${site}`);
+          assert.ok('error' in outcome, 'the run ends with an error');
+          assert.match(outcome.error.message, /zz the request was refused/);
+          assert.doesNotMatch(outcome.error.message, /stated wait/);
+          assert.ok(!(outcome.error instanceof ProviderWaitNotSleptError), 'a plain error');
+          assert.equal(outcome.error.name, 'Error');
+        } finally { await fw.stop(); log.restore(); }
+      });
+    });
+  }
+}
+
+test('a stated wait just past the cap is named in whole seconds rounded up, past the cap', async () => {
   await withStoreDir(async (path) => {
     const log = silence();
-    const refused = () => new MembraneError({
-      type: 'invalid_request', retryable: false, httpStatus: 400,
-      message: 'zz the request was refused', rawError: { status: 400 },
-    });
-    const membrane = new FailingAt(1, 'stream', refused);
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(600_001));
     const { fw } = await framework(path, membrane);
     try {
-      const outcome = await ephemeralRun(fw, 'zz-ephemeral-refused');
+      const outcome = await ephemeralRun(fw, 'zz-ephemeral-just-past');
       assert.ok('error' in outcome, 'the run ends with an error');
-      assert.match(outcome.error.message, /zz the request was refused/);
-      assert.ok(!(outcome.error instanceof ProviderWaitNotSleptError), 'a plain error');
-      assert.equal(outcome.error.name, 'Error');
+      assert.match(outcome.error.message, /the provider asked to wait 601 s; an ephemeral run doesn't sleep a stated wait longer than 600 s/);
+      assert.equal((outcome.error as ProviderWaitNotSleptError).retryAfterMs, 600_001);
     } finally { await fw.stop(); log.restore(); }
   });
 });
@@ -2039,7 +2067,8 @@ const foreignRateLimit = (retryAfterMs: unknown) => Object.assign(new Error('zz 
 });
 
 for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) {
-  test(`a 429 from another copy of membrane that states a wait is recorded, not slept in the turn (${who})`, async () => {
+  const outcome = who === 'ephemeral run' ? 'ends the run at once, marked' : 'is recorded, not slept in the turn';
+  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async () => {
     await withStoreDir(async (path) => {
       const log = silence();
       // An ephemeral run doesn't record: a wait past its cap ends it at once.
@@ -2053,6 +2082,7 @@ for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) 
           assert.ok('error' in outcome, 'the run ends with an error');
           assert.match(outcome.error.message, /the provider asked to wait 1200 s/);
           assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
+          assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
           assert.equal(outcome.error.retryAfterMs, 1_200_000);
           assert.equal(membrane.primary, 1, 'never retried inside the stated wait');
           return;

@@ -821,13 +821,16 @@ export class ResumeBlockedError extends Error {
 }
 
 /**
- * How `runEphemeralToCompletion` rejects when the provider states a wait
- * longer than an ephemeral run sleeps in its turn (600 s): the run ends at
- * once, without retrying inside the wait. `retryAfterMs` is the wait the
- * provider stated, in milliseconds: `Infinity` when it is longer than can be
- * represented, and `NaN` when it isn't a number. The message says the same in
- * words. A host can test `instanceof` or the `name`, which also holds for an
- * error from another copy of this package.
+ * How `runEphemeralToCompletion` rejects when a retryable provider failure
+ * states a wait the run won't sleep: one longer than an ephemeral run sleeps
+ * in its turn (600 s), an infinite one, or one that is `NaN`. The run ends at
+ * once, without retrying inside the wait, and every other ending of the run
+ * rejects with a plain `Error`. `retryAfterMs` is the wait as the provider
+ * stated it, in milliseconds, so `Infinity` or `NaN` in those two cases: a
+ * host that schedules a rerun from it handles a value that isn't finite, and
+ * one past the 2,147,483,647 ms a timer can hold. The message says the same
+ * in words. A host can test `instanceof` or the `name`, which also holds for
+ * an error from another copy of this package.
  */
 export class ProviderWaitNotSleptError extends Error {
   constructor(
@@ -3100,12 +3103,14 @@ export class AgentFramework {
    *  for its caller: the text, and the wait itself, which its rejection
    *  carries (ProviderWaitNotSleptError). */
   private statedWaitNotSlept(error: Error): { error: string; statedWaitMs: number } {
-    const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
+    // Called only after nonOwningProviderWait answered 'fail', which takes a
+    // numeric stated wait.
+    const stated = isMembraneError(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : Number.NaN;
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
-    if (typeof stated !== 'number' || Number.isNaN(stated)) {
+    if (Number.isNaN(stated)) {
       return {
-        error: `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
-          `stated wait of ${cap} or less, so it ends now)`,
+        error: `${error.message} (the provider's stated wait is not a number; an ephemeral run doesn't sleep a ` +
+          `stated wait it can't read, and sleeps only one of ${cap} or less, so it ends now)`,
         statedWaitMs: Number.NaN,
       };
     }
@@ -5806,6 +5811,9 @@ export class AgentFramework {
    * The agent is temporarily registered, inference is triggered, and the
    * framework drives the stream (emitting traces, logging, dispatching tools).
    * Returns the agent's speech output when it finishes (no more tool calls).
+   * Rejects with ProviderWaitNotSleptError when the run ends rather than sleep
+   * a retryable failure's stated wait, and with a plain Error for any other
+   * ending.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
