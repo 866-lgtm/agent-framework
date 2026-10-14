@@ -46,7 +46,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
 async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
@@ -110,19 +110,6 @@ class SlowModule implements Module {
       };
     }
     return {};
-  }
-}
-
-/** A stream that yields nothing until the test releases it. */
-class HeldStream extends MockYieldingStream {
-  constructor(private readonly released: Promise<void>, responses: ConstructorParameters<typeof MockYieldingStream>[0]) {
-    super(responses);
-  }
-
-  override async *[Symbol.asyncIterator]() {
-    await this.released;
-    const inner = super[Symbol.asyncIterator]();
-    for (let next = await inner.next(); !next.done; next = await inner.next()) yield next.value;
   }
 }
 
