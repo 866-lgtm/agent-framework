@@ -1852,9 +1852,11 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
   });
 }
 
+// Each ending's words as published: a host may match them (connectome-host
+// 0.10.2 does, one pattern per ending), so they don't change.
 for (const [stated, says] of [
-  [Number.NaN, /the provider's stated wait is not a number/],
-  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented/],
+  [Number.NaN, /the provider's stated wait is not a number, and an ephemeral run sleeps only a stated wait of 600 s or less, so it ends now\)$/],
+  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now\)$/],
 ] as const) {
   test(`an ephemeral run whose stated wait can't be represented (${stated}) ends at once too`, async () => {
     await withStoreDir(async (path) => {
@@ -1865,8 +1867,6 @@ for (const [stated, says] of [
         const outcome = await ephemeralRun(fw, `zz-ephemeral-${stated}`);
         assert.ok('error' in outcome, 'the run ends with an error');
         assert.match(outcome.error.message, says);
-        // The words a host matched before the error was marked.
-        assert.match(outcome.error.message, /an ephemeral run doesn't sleep a stated wait/);
         assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
         assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
         assert.ok(Object.is(outcome.error.retryAfterMs, stated), `it carries ${stated}, not ${outcome.error.retryAfterMs}`);

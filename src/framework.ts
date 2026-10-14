@@ -3109,8 +3109,8 @@ export class AgentFramework {
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
     if (Number.isNaN(stated)) {
       return {
-        error: `${error.message} (the provider's stated wait is not a number; an ephemeral run doesn't sleep a ` +
-          `stated wait it can't read, and sleeps only one of ${cap} or less, so it ends now)`,
+        error: `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+          `stated wait of ${cap} or less, so it ends now)`,
         statedWaitMs: Number.NaN,
       };
     }
