@@ -383,14 +383,22 @@ test('recorded server text: a slash escaped as JSON may write it, and percent-es
   for (const form of ['tok/en+x0123', 'tok\\/en+x0123', 'tok%2Fen%2Bx0123', 'tok%2fen%2bx0123', 'env\\/secret+0123', 'env%2fsecret%2b0123']) {
     assert.equal(redactServerText(`refused: ${form}`, config), 'refused: redacted', form);
   }
+  // A token whose form encoding differs from its percent encoding: a space is + there, %20 here.
+  const spaced = cfg({ token: 'tok en/x0123' });
+  for (const form of ['tok+en%2Fx0123', 'tok+en%2fx0123', 'tok%20en%2Fx0123', 'tok%20en%2fx0123']) {
+    assert.equal(redactServerText(`refused: ${form}`, spaced), 'refused: redacted', form);
+  }
 });
 
 test("recorded server text: a ws:// url's userinfo as one unit before its @, and the Basic credential sent for it", () => {
-  // Neither part is long enough to replace on its own.
-  const config = cfg({ url: 'wss://alice:pw@h/mcp' });
-  assert.equal(redactServerText('dial wss://alice:pw@h/mcp failed', config), 'dial wss://redacted@h/mcp failed');
-  assert.equal(redactServerText('Authorization: Basic YWxpY2U6cHc=', config), 'Authorization: Basic redacted');
-  assert.equal(redactServerText('alice:pw is not followed by its @ here', config), 'alice:pw is not followed by its @ here');
+  // Neither part is long enough to replace on its own, nor is the unit.
+  const config = cfg({ url: 'wss://bot:pw@h/mcp' });
+  assert.equal(redactServerText('dial wss://bot:pw@h/mcp failed', config), 'dial wss://redacted@h/mcp failed');
+  assert.equal(redactServerText('Authorization: Basic Ym90OnB3', config), 'Authorization: Basic redacted');
+  // The @ and a boundary before it anchor the unit.
+  assert.equal(redactServerText('bot:pw is not followed by its @ here', config), 'bot:pw is not followed by its @ here');
+  assert.equal(redactServerText('robot:pw@h', config), 'robot:pw@h');
+  assert.equal(redactServerText('dial wss://alice:pw@h/mcp failed', cfg({ url: 'wss://alice:pw@h/mcp' })), 'dial wss://redacted@h/mcp failed');
 });
 
 test("one redactor over several configurations' strings takes the longest secret among them all", () => {

@@ -309,6 +309,23 @@ test('a restart of an id another restart holds is refused before it tears anythi
   });
 });
 
+test('a module is refused a name a server holds as its tool prefix, or a restart is moving its server to', async () => {
+  await withFramework(true, async (framework) => {
+    await assert.rejects(
+      framework.addModule(new NamedModule('mcpl--first')),
+      /Module "mcpl--first" collides with MCPL server "first"'s toolPrefix "mcpl--first"/,
+    );
+    const restarting = framework.restartMcplServer('first', serverConfig('first', { toolPrefix: 'xx' }) as never);
+    await assert.rejects(
+      framework.addModule(new NamedModule('xx')),
+      /Module "xx" collides with the toolPrefix "xx" the restart of "first" holds/,
+    );
+    await restarting;
+    assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]), [['first', true]]);
+    assert.ok(framework.getAllTools().some(t => t.name === 'xx--echo'), 'the restarted server serves the prefix');
+  });
+});
+
 test('a restart that fails releases the id and the tool prefix it held', async (t) => {
   await withFramework(true, async (framework) => {
     t.mock.method(framework, 'disconnectMcplServer', async () => {

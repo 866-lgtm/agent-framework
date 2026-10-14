@@ -121,22 +121,21 @@ test("a script reads a structured result whole, the model's calls and history ke
       'large = json.loads(await fixture__inspect({"variant": "large"}))',
       'assert large["isError"] is True and large["oversized"]["savedTo"] is None and large["oversized"]["chars"] > 5000000, large',
       'assert "could not be delivered" in large["error"], large',
-      // Results JSON can't hold: an error naming the tool, in each path's form.
-      // A structured result's error keeps the documented shape, so a script reading "content" first still works.
-      'cyclic = json.loads(await loop__cyclic({}))',
-      'assert cyclic["content"] == [] and cyclic["structuredContent"] is None and cyclic["isError"] is True, cyclic',
-      'assert "loop--cyclic" in cyclic["error"] and "circular" in cyclic["error"], cyclic',
-      'bigint = json.loads(await loop__bigint({}))',
-      'assert bigint["content"] == [] and bigint["structuredContent"] is None and bigint["isError"] is True, bigint',
-      'assert "loop--bigint" in bigint["error"] and "BigInt" in bigint["error"], bigint',
+      // Results JSON can't hold: the dispatch makes each an error naming the
+      // tool (a module's result has to be stored), which a script reads as
+      // its error text, structured or not.
+      'cyclic = await loop__cyclic({})',
+      'assert cyclic.startswith("Error: Tool \'loop--cyclic\' ") and "circular" in cyclic, cyclic',
+      'bigint = await loop__bigint({})',
+      'assert bigint.startswith("Error: Tool \'loop--bigint\' ") and "BigInt" in bigint, bigint',
       'cyclic_data = await loop__cyclic_data({})',
-      'assert cyclic_data.startswith("Error: tool ") and "loop--cyclic_data" in cyclic_data and "circular" in cyclic_data, cyclic_data',
-      'assert all("The call itself completed." in e for e in [cyclic["error"], bigint["error"], cyclic_data]), "completed"',
+      'assert cyclic_data.startswith("Error: Tool \'loop--cyclic_data\' ") and "circular" in cyclic_data, cyclic_data',
+      'assert all(e.endswith("The call itself completed.") for e in [cyclic, bigint, cyclic_data]), "completed"',
       // An error result that can't be converted keeps the tool's own error.
-      'cyclic_error = json.loads(await loop__cyclic_error({}))',
-      'assert cyclic_error["isError"] is True and cyclic_error["error"].endswith("The call itself completed, with this error: db timeout"), cyclic_error',
-      'bare_throw = json.loads(await loop__bare_throw({}))',
-      'assert bare_throw["isError"] is True and "(a value with no text form)" in bare_throw["error"], bare_throw',
+      'cyclic_error = await loop__cyclic_error({})',
+      'assert cyclic_error.endswith("The call itself completed, with this error: db timeout"), cyclic_error',
+      'bare_throw = await loop__bare_throw({})',
+      'assert "(a value with no text form)" in bare_throw, bare_throw',
       'print(r["structuredContent"]["runId"], r["structuredContent"]["state"], r["structuredContent"]["output"])',
     ].join('\n');
     membrane.pushResponse(createMockResponse([

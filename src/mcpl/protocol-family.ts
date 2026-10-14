@@ -113,7 +113,8 @@ export function redactUrl(url: string | undefined): string {
  * - from the url, as written and decoded: credential-like path segments and
  *   query names, credential-shaped or credential-named query values, every
  *   other non-empty parameter as its whole name=value, and a ws:// url's
- *   username and password, its userinfo as one unit before its @, and the
+ *   username and password, its userinfo as one unit before its @ (with no
+ *   length floor, so a short password goes with its username), and the
  *   Basic credential a WebSocket client sends for that userinfo;
  * - the static token, raw, with its slashes escaped as some JSON encoders
  *   write them, and percent- or form-encoded with either case of hex;
@@ -235,12 +236,14 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
         standalone(decode(value));
       }
       if (url.username || url.password) {
-        // The userinfo as one unit before its @, so a password too short to
-        // replace on its own still goes with its username, and the Basic
-        // credential a WebSocket client sends for it, from the userinfo as
-        // written and as decoded.
+        // The Basic credential a WebSocket client sends for the userinfo, and
+        // the userinfo itself as one unit wherever it stands before an @ with
+        // no letter or digit just before it, so a password too short to
+        // replace on its own still goes with its username. The @ and that
+        // boundary anchor the unit as a pair's boundaries do, so it has no
+        // length floor. Each from the userinfo as written and as decoded.
         for (const [username, password] of [[url.username, url.password], [decode(url.username), decode(url.password)]]) {
-          if (`${username}:${password}`.length >= 8) userinfo.add(`${username}:${password}`);
+          if (password) userinfo.add(`${username}:${password}`);
           standalone(Buffer.from(`${username}:${password}`).toString('base64'));
         }
       }
@@ -250,7 +253,7 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   return [
     ...[...secrets].map(value => ({ value, source: escape(value) })),
     ...[...pairs].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
-    ...[...userinfo].map(value => ({ value, source: `${escape(value)}(?=@)` })),
+    ...[...userinfo].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?=@)` })),
   ];
 }
 

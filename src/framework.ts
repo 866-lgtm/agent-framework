@@ -1960,11 +1960,9 @@ export class AgentFramework {
   /** The ids and tool prefixes restarts hold, each with the claim of the
    *  restart holding it, from the restart's checks through its connect
    *  (restartMcplServer): no other connect or restart takes them while the
-   *  old server is torn down. */
-  private readonly mcpRestartClaims = {
-    ids: new Map<string, McpRestartClaim>(),
-    prefixes: new Map<string, McpRestartClaim>(),
-  };
+   *  old server is torn down. Created on first use (restartClaims), like
+   *  mcpServerOps. */
+  private mcpRestartClaims: { ids: Map<string, McpRestartClaim>; prefixes: Map<string, McpRestartClaim> } | undefined;
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -3546,6 +3544,18 @@ export class AgentFramework {
    * Add a module at runtime.
    */
   async addModule(module: Module): Promise<void> {
+    // A server's tool prefix and a module's name share one namespace, as
+    // create() enforces at startup (mcplPrefixCollision): a module isn't
+    // added under a prefix a server holds, or one a restart is moving its
+    // server to.
+    const server = this.mcplPrefixMap.get(module.name);
+    if (server !== undefined) {
+      throw new Error(`Module "${module.name}" collides with MCPL server "${server}"'s toolPrefix "${module.name}"`);
+    }
+    const claimedBy = this.restartClaims().prefixes.get(module.name);
+    if (claimedBy) {
+      throw new Error(`Module "${module.name}" collides with the toolPrefix "${module.name}" the restart of "${claimedBy.restarting}" holds`);
+    }
     this.resetCompletedStop();
     await this.moduleRegistry.addModule(module);
     this.emitTrace({ type: 'module:added', moduleName: module.name });
@@ -13723,9 +13733,10 @@ export class AgentFramework {
    * megabytes of base64 helps nobody. A result with structured content is
    * one JSON object holding both of the server's views
    * (scriptStructuredResult), so its content blocks reach the script as the
-   * dispatch gave them, images and payloads included. A result that can't be
-   * converted to JSON, such as a cyclic object or a BigInt from an in-process
-   * module, becomes an error that names the tool, in each path's error form.
+   * dispatch gave them, images and payloads included. A module's result that
+   * can't be stored or sent, such as a cyclic object or a BigInt, is already
+   * an error naming the tool when the dispatch returns it (storableToolResult),
+   * so a script reads that error's text.
    */
   private async handleScriptToolCall(
     agentName: string,
@@ -13785,9 +13796,10 @@ export class AgentFramework {
    * `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
    * script gets a failure to materialize the result, saying the tool may
    * already have completed, never a success missing its result. A result
-   * that can't be converted to JSON (a cyclic object, a BigInt) gets the
-   * same object empty, `{ content: [], structuredContent: null, isError:
-   * true, error }`, the error naming the tool.
+   * that can't be converted to JSON (a cyclic object, a BigInt), which the
+   * dispatch's own check makes unlikely here, gets the same object empty,
+   * `{ content: [], structuredContent: null, isError: true, error }`, the
+   * error naming the tool.
    */
   private async scriptStructuredResult(result: ToolResult, toolName: string): Promise<string> {
     const object = {
@@ -15454,6 +15466,12 @@ export class AgentFramework {
     return (this.modernMcpConnections ??= new Map());
   }
 
+  /** The restarts' claims (mcpRestartClaims), created on first use, as the
+   *  modern connections are. */
+  private restartClaims(): { ids: Map<string, McpRestartClaim>; prefixes: Map<string, McpRestartClaim> } {
+    return (this.mcpRestartClaims ??= { ids: new Map(), prefixes: new Map() });
+  }
+
   /**
    * Hold a server id for one connect or disconnect, until `release()`.
    * Together with the live connections (the MCPL registry and the modern
@@ -16648,8 +16666,9 @@ export class AgentFramework {
    * unlike `reconnect: true`, which only retries after transport-level
    * failures. Throws if the server has no stored config and none is given.
    * What its connect would refuse is refused before the running server is
-   * torn down, and until the connect, a connect or restart started meanwhile
-   * is refused the id and tool prefix the restart moves the server to.
+   * torn down, and until the connect, a connect, a restart or a module added
+   * meanwhile is refused the id and tool prefix the restart moves the server
+   * to.
    *
    * Treat a submitted configuration and its nested values as immutable for
    * as long as the server uses them. Apply changed settings with
@@ -16666,8 +16685,9 @@ export class AgentFramework {
     // configuration's binding and settings, a new id another server holds,
     // and a tool prefix another server or a module already holds. From these
     // checks through its connect, the restart holds the id and the tool
-    // prefix it moves the server to (mcpRestartClaims), so no connect or
-    // restart started meanwhile takes them while the old server is torn down.
+    // prefix it moves the server to (mcpRestartClaims), so no connect,
+    // restart or module added meanwhile takes them while the old server is
+    // torn down.
     if (this.mcpServerAdmissionClosed) {
       throw new Error(`MCP server "${id}" was not restarted: the framework is stopping or stopped`);
     }
@@ -16684,7 +16704,7 @@ export class AgentFramework {
       // operation left, after the server was torn down.
       throw new Error(`MCP server "${id}" was not restarted: it is being ${inFlight.kind === 'disconnect' ? 'disconnected' : 'connected'}; restart it once that has finished`);
     }
-    const claimedBy = this.mcpRestartClaims.ids.get(id);
+    const claimedBy = this.restartClaims().ids.get(id);
     if (claimedBy) {
       // Another restart is moving its server to this id, or restarting this
       // server already.
@@ -16708,14 +16728,14 @@ export class AgentFramework {
 
     const claim: McpRestartClaim = { restarting: id };
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
-    this.mcpRestartClaims.ids.set(config.id, claim);
-    this.mcpRestartClaims.prefixes.set(prefix, claim);
+    this.restartClaims().ids.set(config.id, claim);
+    this.restartClaims().prefixes.set(prefix, claim);
     try {
       await this.disconnectMcplServer(id);
       await this.connectMcplServerClaimed(config, claim);
     } finally {
-      if (this.mcpRestartClaims.ids.get(config.id) === claim) this.mcpRestartClaims.ids.delete(config.id);
-      if (this.mcpRestartClaims.prefixes.get(prefix) === claim) this.mcpRestartClaims.prefixes.delete(prefix);
+      if (this.restartClaims().ids.get(config.id) === claim) this.restartClaims().ids.delete(config.id);
+      if (this.restartClaims().prefixes.get(prefix) === claim) this.restartClaims().prefixes.delete(prefix);
     }
   }
 
@@ -16745,7 +16765,7 @@ export class AgentFramework {
    *  a restart moving its server to the id (mcpRestartClaims), except to
    *  that restart's own connect (`claim`). */
   private mcpServerIdTaken(id: string, claim?: McpRestartClaim): string | null {
-    const claimedBy = this.mcpRestartClaims.ids.get(id);
+    const claimedBy = this.restartClaims().ids.get(id);
     if (claimedBy && claimedBy !== claim) {
       return `MCP server "${id}" is held by the restart of "${claimedBy.restarting}"; connect it once that has finished`;
     }
@@ -16777,7 +16797,7 @@ export class AgentFramework {
     if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
       return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`;
     }
-    const claimedBy = this.mcpRestartClaims.prefixes.get(prefix);
+    const claimedBy = this.restartClaims().prefixes.get(prefix);
     if (claimedBy && claimedBy !== claim) {
       return `MCPL server "${config.id}" toolPrefix "${prefix}" is held by the restart of "${claimedBy.restarting}"`;
     }
