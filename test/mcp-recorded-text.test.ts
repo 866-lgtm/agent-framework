@@ -232,6 +232,12 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
     ['b', { id: 'b', token: 'ghp_SHAREDPREFIX123_but_longer_TAIL9' }],
   ]);
   assert.equal(framework.everyServerRedactor()('auth failed for ghp_SHAREDPREFIX123_but_longer_TAIL9'), 'auth failed for redacted');
+  // The same across the two sets it reads: the secret of a server present
+  // when it was made begins the longer secret of a server connected since.
+  framework.mcplServerConfigs = new Map([['a', { id: 'a', token: 'ghp_SHAREDPREFIX123' }]]);
+  const across = framework.everyServerRedactor();
+  framework.mcplServerConfigs = new Map([['b', { id: 'b', token: 'ghp_SHAREDPREFIX123_but_longer_TAIL9' }]]);
+  assert.equal(across('auth failed for ghp_SHAREDPREFIX123_but_longer_TAIL9'), 'auth failed for redacted');
   framework.mcplServerConfigs = new Map([[config.id, config]]);
 
   // The model's dispatch: the tool:failed trace (message and stack) and the
