@@ -412,7 +412,14 @@ function wiredProject(): string {
 /** npm, kept to the throwaway directory: its own cache and user config,
  *  and the stand-in for its registry and GitHub's API. */
 function npm(dir: string, args: string[], api: string) {
-  return exec("npm", args, dir, {
+  // Under `npm test`, npm names its own CLI script in npm_execpath, and this
+  // Node runs it: a bare `npm` is npm.cmd on Windows, which execFile can't
+  // start without a shell. Another package manager names its own CLI there
+  // (bun its binary), so anything but npm's script falls back to the `npm`
+  // on PATH.
+  const cli = process.env.npm_execpath;
+  const [file, argv] = cli && /npm-cli\.c?js$/.test(cli) ? [process.execPath, [cli, ...args]] : ["npm", args];
+  return exec(file, argv, dir, {
     HOME: dir,
     npm_config_cache: join(dir, ".npm-cache"),
     npm_config_userconfig: join(dir, ".npmrc"),
