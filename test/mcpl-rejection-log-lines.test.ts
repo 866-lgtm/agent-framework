@@ -353,17 +353,19 @@ test('refusal lines cover at most 1,000 channels, evicting the least recently re
   assert.equal(lines.admit('editor', 'quiet'), 0, 'quiet, evicted, prints again as new');
 });
 
-test('a silent heartbeat names its eventId as one field', async (t) => {
-  const f = await fixture({
-    server: { id: 'heartbeat', enabledFeatureSets: ['heartbeat'] },
-    featureSets: { heartbeat: { description: 'heartbeat', uses: ['pushEvents'] } },
+for (const [name, eventId, shown] of [['its eventId', FORGED, SHOWN], ['a missing eventId as ""', undefined, '""']] as const) {
+  test(`a silent heartbeat names ${name} as one field`, async (t) => {
+    const f = await fixture({
+      server: { id: 'heartbeat', enabledFeatureSets: ['heartbeat'] },
+      featureSets: { heartbeat: { description: 'heartbeat', uses: ['pushEvents'] } },
+    });
+    t.after(f.close);
+    const lines = captureConsoleError(t);
+    const r = await f.send('push/event', {
+      featureSet: 'heartbeat', eventId, timestamp: TS, origin: { source: 'heartbeat', silent: true }, payload: { content: [] },
+    });
+    assert.equal(r.result?.accepted, true);
+    await f.framework.runUntilIdle();
+    assert.deepEqual(lines.filter((l) => l.startsWith('[heartbeat]')), [`[heartbeat] heartbeat: accepted silent scheduled wake ${shown}`]);
   });
-  t.after(f.close);
-  const lines = captureConsoleError(t);
-  const r = await f.send('push/event', {
-    featureSet: 'heartbeat', eventId: FORGED, timestamp: TS, origin: { source: 'heartbeat', silent: true }, payload: { content: [] },
-  });
-  assert.equal(r.result?.accepted, true);
-  await f.framework.runUntilIdle();
-  assert.deepEqual(lines.filter((l) => l.startsWith('[heartbeat]')), [`[heartbeat] heartbeat: accepted silent scheduled wake ${SHOWN}`]);
-});
+}

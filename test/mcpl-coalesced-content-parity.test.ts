@@ -361,6 +361,7 @@ test('a render result is delivered only when the converters show each block as i
     { block: { type: 'resource', uri: `https://example.invalid/${'x'.repeat(4096)}` }, delivered: false },
     { block: { type: 'audio', uri: `https://example.invalid/${'x'.repeat(4096)}`, disposition: 'ref' }, delivered: false },
     { block: { type: 'image', uri: '' }, delivered: false },
+    { block: { type: 'video', data: 'AAAA', mimeType: 'video/mp4' }, delivered: false },
   ];
   f.renderer(async (params) => {
     const i = Number(String(params.eventId).slice(1));
