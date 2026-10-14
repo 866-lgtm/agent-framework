@@ -41,7 +41,9 @@
   bidi characters stripped from the text fields, as in the model's stub),
   and `savedTo`, the workspace path the framework fetched its payload to for
   the script (`null` when it couldn't; `fetch_reference` takes the id as its
-  `ref_id` argument). A block the classifier rejects arrives as the model's
+  `ref_id` argument). An unsaved reference that counts as expired also
+  carries `expired`, the reason the model's stub gives, and isn't fetched.
+  A block the classifier rejects arrives as the model's
   `[unrecognized content block: …]` notice, and inline data that also claims
   a bulk disposition as the withheld notice. #181, by @Meganeuridae, first
   found scripts losing `structuredContent`, and it kept the saved paths of
