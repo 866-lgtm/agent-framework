@@ -235,6 +235,19 @@ function estimateAppendedRoundTokens(
 }
 
 /**
+ * What a notice says in place of "your plain speech lands there" when the
+ * channel's server declared it inbound-only (isInboundOnly in the channel
+ * registry, which posts nothing there). ChannelRegistry.inboundOnlyServer
+ * names the declaring server.
+ */
+function inboundOnlySpeechNote(serverId: string): string {
+  return (
+    `${serverId} declared this channel inbound-only, so plain speech there is refused ` +
+    `and stays in your archive. To speak there, use ${serverId}'s own tools.`
+  );
+}
+
+/**
  * Explicit delivery tools whose successful use into a closed channel OPENS
  * it (send implies engagement — see openIfClosedForSend). Bare tool names,
  * matched after stripping the MCPL server prefix.
@@ -284,11 +297,13 @@ const isAddressedMessage = (
 function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): string {
   if (mode === 'locus') {
     return '[prose-routing] Mode change: your plain text auto-routes to the ' +
-      'conversational locus again. `>>` destination prefixes are no longer needed.';
+      'conversational locus again, unless its server declared that channel inbound-only. ' +
+      '`>>` destination prefixes are no longer needed.';
   }
   if (mode === 'hybrid') {
     return '[prose-routing] Hybrid routing enabled: unprefixed text still lands in the ' +
-      'current conversational locus. A leading `>>>destination` envelope instead routes ' +
+      'current conversational locus, unless its server declared that channel inbound-only. ' +
+      'A leading `>>>destination` envelope instead routes ' +
       'that prose to one uniquely resolved authorized Discord or Eidoverse channel. The ' +
       'envelope remains in your memory but recipients see only its body; delivery or failure ' +
       'is reported back to you.';
@@ -8687,12 +8702,15 @@ export class AgentFramework {
               const shown = label && label !== newLocus
                 ? `${label.startsWith('#') ? label : `#${label}`} (${newLocus})`
                 : newLocus;
+              const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(newLocus);
               const noticeContent: ContentBlock[] = [{
                 type: 'text',
-                text:
-                  `[routing] The conversation moved to ${shown} — your plain ` +
-                  'speech now lands there for the rest of this turn. Other ' +
-                  'channels need an explicit send tool.',
+                text: inboundOnlyServer
+                  ? `[routing] The conversation moved to ${shown}. ${inboundOnlySpeechNote(inboundOnlyServer)} ` +
+                    'Other channels need an explicit send tool.'
+                  : `[routing] The conversation moved to ${shown} — your plain ` +
+                    'speech now lands there for the rest of this turn. Other ' +
+                    'channels need an explicit send tool.',
               }];
               const noticeMeta = { system: true, kind: 'routing-notice' } as MessageMetadata;
               try {
@@ -9493,10 +9511,14 @@ export class AgentFramework {
     const target = typeof namer.proseTargetFor === 'function'
       ? namer.proseTargetFor(opts.channelId, opts.serverId)
       : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
-    const replyOption = target
-      ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
-        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
-      : `1. Reply without joining isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
+    const inboundOnlyServer = this.channelRegistry.inboundOnlyServer(opts.channelId, opts.serverId);
+    const replyOption = inboundOnlyServer
+      ? `1. Replying there isn't available: ${inboundOnlyServer} declared this channel inbound-only, so nothing ` +
+        `you write is posted into it. To speak there, use ${inboundOnlyServer}'s own tools.\n`
+      : target
+        ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
+          `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
+        : `1. Reply without joining isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -10572,9 +10594,12 @@ export class AgentFramework {
         label && label !== locus
           ? `${label.startsWith('#') ? label : `#${label}`} (${locus})`
           : locus;
-      text =
-        `[routing] Your plain speech now lands in ${shown}. ` +
-        'Other channels need an explicit send tool.';
+      const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(locus);
+      text = inboundOnlyServer
+        ? `[routing] The conversation is now in ${shown}. ${inboundOnlySpeechNote(inboundOnlyServer)} ` +
+          'Other channels need an explicit send tool.'
+        : `[routing] Your plain speech now lands in ${shown}. ` +
+          'Other channels need an explicit send tool.';
     }
 
     try {
@@ -10700,7 +10725,7 @@ export class AgentFramework {
       const parsed = parseProsePrefix(text);
       if (parsed.kind !== 'target') return { text };
       try {
-        return { text, resolved: this.channelRegistry!.resolveProseTarget(parsed.target!) };
+        return { text, resolved: this.channelRegistry!.resolveProseTarget(parsed.target!, { forSpeech: true }) };
       } catch (err) {
         // Admission runs in the stream's event loop, so a resolver that
         // throws makes the envelope bounce rather than stop the round.
@@ -10769,7 +10794,7 @@ export class AgentFramework {
         continue;
       }
       if (parsed.kind === 'target') {
-        const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
+        const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!, { forSpeech: true });
         if ('error' in resolved) {
           delete routing.pin;
           routing.hybridHold = true;
@@ -17819,11 +17844,14 @@ export class AgentFramework {
             if (openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
               this.turnLocusPins.set(agentName, opened);
               this.lastAnnouncedLocus.set(agentName, opened);
+              const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(opened);
               result = {
                 ...result,
                 data: {
                   ...(result.data as Record<string, unknown> | undefined),
-                  routing: 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
+                  routing: inboundOnlyServer
+                    ? `${inboundOnlySpeechNote(inboundOnlyServer)} Other channels need an explicit send tool.`
+                    : 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
                 },
               };
               console.error(

@@ -29,6 +29,7 @@ function makeRegistry(
 
   const openCalls: Array<{ channelId?: string }> = [];
   const closeCalls: Array<{ channelId?: string }> = [];
+  const streamCalls: Array<{ kind: 'chunk' | 'complete'; channelId?: string }> = [];
   let failOpens = false;
 
   const mockServer = {
@@ -37,6 +38,12 @@ function makeRegistry(
     sendChannelsPublish: async (params: { channelId?: string; conversationId?: string }) => {
       publishCalls.push(params);
       return publishResult;
+    },
+    sendChannelsOutgoingChunk: (params: { channelId?: string }) => {
+      streamCalls.push({ kind: 'chunk', channelId: params.channelId });
+    },
+    sendChannelsOutgoingComplete: (params: { channelId?: string }) => {
+      streamCalls.push({ kind: 'complete', channelId: params.channelId });
     },
     sendChannelsOpen: async (params: { channelId?: string }) => {
       if (failOpens) throw new Error('open refused by server');
@@ -73,7 +80,7 @@ function makeRegistry(
     }).findChannelEntry(channelId);
 
   return {
-    registry, failures, traces, publishCalls, openCalls, closeCalls, lookup,
+    registry, failures, traces, publishCalls, openCalls, closeCalls, streamCalls, lookup,
     setFailOpens: (v: boolean) => { failOpens = v; },
   };
 }
@@ -589,4 +596,212 @@ test('proseTargetFor: no token when none is safe (shared id across servers, whit
   } as never);
   assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
   assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Inbound-only channels (SPEC §14.2 `direction: 'inbound'`): the host posts
+// nothing into them. pocket-body declares its live transcript this way and
+// refuses publishes there, and another agent speaking in the room arrives on
+// it addressed, so a resident's plain speech can be aimed at it.
+// ---------------------------------------------------------------------------
+
+async function registerInboundOnly(registry: ChannelRegistry): Promise<void> {
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
+  } as never);
+}
+
+test('plain speech into a channel its server declared inbound-only is refused before the channel is opened or published to', async () => {
+  const { registry, failures, traces, publishCalls, openCalls, lookup } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+  assert.equal(lookup('body:ears')?.open, false, 'precondition: registered closed');
+
+  const result = await registry.routeSpeech('linn', 'Hello, room.', 'body:ears');
+
+  assert.equal(result, null, 'nothing was delivered');
+  assert.deepEqual(publishCalls, [], 'nothing was published');
+  assert.deepEqual(openCalls, [], 'the delivery attempt did not open the channel');
+  assert.equal(lookup('body:ears')?.open, false);
+  assert.equal(failures.length, 1, 'the refusal reaches the resident as a send failure');
+  assert.equal(failures[0]!.channelId, 'body:ears');
+  assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.match(failures[0]!.reason, /use that server's own tools$/);
+  assert.ok(traces.some((t) => t.type === 'mcpl:speech-route-failed' && t.channelId === 'body:ears'));
+});
+
+test('channel_publish into an inbound-only channel is refused, naming the declaration, and publishes nothing', async () => {
+  const { registry, publishCalls } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+
+  const result = await registry.handleChannelToolCall('channel_publish', {
+    channelId: 'body:ears',
+    content: 'Hello, room.',
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.isError, true);
+  assert.match(String(result.error), /^Channel body:ears is inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.deepEqual(publishCalls, [], 'nothing was published');
+});
+
+test('an inbound-only channel gets no outgoing stream', async () => {
+  const { registry, streamCalls } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+
+  registry.sendOutgoingChunk('body:ears', 'linn', 'inf_1', 0, 'Hello');
+  registry.sendOutgoingComplete('body:ears', 'linn', 'inf_1', 'Hello, room.');
+
+  assert.deepEqual(streamCalls, []);
+});
+
+test('a channel declared outbound or bidirectional, or with no direction, still takes speech, channel_publish and the stream', async () => {
+  const { registry, failures, publishCalls, streamCalls } = makeRegistry({ delivered: true });
+  await registry.handleChanged('body', {
+    added: [
+      { id: 'body:out', type: 'chat', label: 'out', direction: 'outbound' },
+      { id: 'body:both', type: 'chat', label: 'both', direction: 'bidirectional' },
+      { id: 'body:unstated', type: 'chat', label: 'unstated' },
+    ],
+  } as never);
+
+  for (const id of ['body:out', 'body:both', 'body:unstated']) {
+    assert.ok(await registry.routeSpeech('linn', `speech to ${id}`, id), `speech delivered to ${id}`);
+    const published = await registry.handleChannelToolCall('channel_publish', { channelId: id, content: `publish to ${id}` });
+    assert.equal(published.success, true, `channel_publish delivered to ${id}`);
+    registry.sendOutgoingChunk(id, 'linn', 'inf_1', 0, 'x');
+  }
+
+  assert.deepEqual(failures, []);
+  assert.deepEqual(publishCalls.map((c) => c.channelId), [
+    'body:out', 'body:out', 'body:both', 'body:both', 'body:unstated', 'body:unstated',
+  ]);
+  assert.deepEqual(streamCalls.map((c) => c.channelId), ['body:out', 'body:both', 'body:unstated']);
+});
+
+test('inboundOnlyServer names the declaring server for an inbound-only channel, and nothing for any other', async () => {
+  // The routing notices ask the registry this, so they say what routeSpeech does.
+  const { registry } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+  await registry.handleChanged('body', {
+    added: [
+      { id: 'body:out', type: 'chat', label: 'out', direction: 'outbound' },
+      { id: 'body:both', type: 'chat', label: 'both', direction: 'bidirectional' },
+      { id: 'body:unstated', type: 'chat', label: 'unstated' },
+    ],
+  } as never);
+
+  assert.equal(registry.inboundOnlyServer('body:ears'), 'body');
+  for (const id of ['body:out', 'body:both', 'body:unstated', 'body:unregistered']) {
+    assert.equal(registry.inboundOnlyServer(id), undefined, id);
+  }
+});
+
+test('the refusal follows the descriptor its server declared last: channels/register, and channels/changed updates either way', async () => {
+  const { registry, failures, publishCalls } = makeRegistry({ delivered: true });
+
+  // channels/register declares it inbound-only.
+  await registry.handleRegister('body', {
+    channels: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
+  } as never);
+  assert.equal(await registry.routeSpeech('linn', 'one', 'body:ears'), null);
+  assert.equal(registry.inboundOnlyServer('body:ears'), 'body');
+
+  // An update declares it bidirectional: speech goes out.
+  await registry.handleChanged('body', {
+    updated: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' }],
+  } as never);
+  assert.ok(await registry.routeSpeech('linn', 'two', 'body:ears'));
+  assert.equal(registry.inboundOnlyServer('body:ears'), undefined);
+
+  // Another declares it inbound-only again: refused again.
+  await registry.handleChanged('body', {
+    updated: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
+  } as never);
+  assert.equal(await registry.routeSpeech('linn', 'three', 'body:ears'), null);
+
+  assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:ears'], 'only the bidirectional turn published');
+  assert.equal(failures.length, 2);
+  for (const f of failures) {
+    assert.match(f.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
+  }
+});
+
+test('publishForAgent into an inbound-only channel is refused and traced as failed; into any other channel it traces once as routed, after the publish', async () => {
+  const { registry, publishCalls, traces } = makeRegistry({ delivered: true, messageId: 'm-77' } as { delivered: boolean });
+  await registerInboundOnly(registry);
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+  const routed = () => traces.filter((t) => t.type === 'mcpl:speech-routed');
+
+  const refused = await registry.publishForAgent('body:ears', 'a thought', 'Subconscious');
+  assert.equal(refused.success, false);
+  assert.match(String(refused.error), /inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.equal(publishCalls.length, 0, 'nothing was published');
+  assert.equal(routed().length, 0, 'speech that was never posted is not traced as routed');
+  const failed = traces.filter((t) => t.type === 'mcpl:speech-route-failed');
+  assert.equal(failed.length, 1, 'the refusal is traced as a failure');
+  assert.equal(failed[0]!.conversationId, 'Subconscious');
+  assert.equal(failed[0]!.channelId, 'body:ears');
+  assert.match(String(failed[0]!.reason), /inbound-only: server "body" declared/);
+
+  const posted = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  assert.equal(posted.success, true);
+  assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
+  // Shaped as routeSpeech's trace is, with the surface's message id.
+  assert.deepEqual(routed(), [{
+    type: 'mcpl:speech-routed', conversationId: 'Subconscious', serverId: 'body', channelId: 'body:home',
+    delivered: true, textLen: 'a thought'.length, text: 'a thought', messageId: 'm-77',
+  }]);
+});
+
+test('publishForAgent traces a publish the server reports undelivered as failed, not routed', async () => {
+  const { registry, publishCalls, traces } = makeRegistry({ delivered: false });
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+
+  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+
+  assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
+  assert.deepEqual(traces.filter((t) => t.type === 'mcpl:speech-routed'), []);
+  assert.deepEqual(
+    traces.filter((t) => t.type === 'mcpl:speech-route-failed').map((t) => [t.conversationId, t.channelId, t.reason]),
+    [['Subconscious', 'body:home', 'the server reported delivered:false']],
+  );
+});
+
+test('buildChannelContext names no defaultOutgoing for a locus its server declared inbound-only', async () => {
+  const active: Record<string, string> = { linn: 'body:ears', nell: 'body:home' };
+  const { registry } = makeRegistry({ delivered: true }, () => undefined, (n) => active[n]);
+  await registerInboundOnly(registry);
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+
+  assert.equal(registry.buildChannelContext('linn')?.defaultOutgoing, undefined, 'speech goes nowhere, so no channel is named');
+  assert.equal(registry.buildChannelContext('nell')?.defaultOutgoing?.channelId, 'body:home');
+});
+
+test('an inbound-only channel resolves as a speech target to an error naming the declaration, and still resolves for reading', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+
+  const speech = registry.resolveProseTarget('body:ears', { forSpeech: true });
+  assert.ok('error' in speech, 'refused as a target for speech');
+  assert.match(
+    (speech as { error: string }).error,
+    /^body:ears is inbound-only: server "body" declared this channel's direction "inbound"/,
+  );
+  // Reading its history still finds it.
+  assert.deepEqual(registry.resolveProseTarget('body:ears'), { channelId: 'body:ears', label: 'Body · ears' });
+  assert.deepEqual(registry.resolveProseTargetDurable('body:ears'), { channelId: 'body:ears', label: 'Body · ears' });
+  // No reply token is offered for it; one is for the bidirectional channel.
+  assert.equal(registry.proseTargetFor('body:ears', 'body'), undefined);
+  assert.ok(registry.proseTargetFor('body:home', 'body'));
+  // A bidirectional channel resolves either way.
+  assert.deepEqual(registry.resolveProseTarget('body:home', { forSpeech: true }), { channelId: 'body:home', label: 'Body · home' });
 });

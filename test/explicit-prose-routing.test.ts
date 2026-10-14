@@ -79,8 +79,14 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     'discord:dm:99': { channelId: 'discord:dm:99', label: 'DM: laria' },
   };
   const explicit: Record<string, unknown> = {
-    resolveProseTarget: (spec: string) =>
-      known[spec] ?? { error: `no channel matches "${spec}"` },
+    // As the registry does, a channel its server declared inbound-only
+    // resolves for reading but not as a target for speech.
+    resolveProseTarget: (spec: string, opts?: { forSpeech?: boolean }) =>
+      spec === '#ears'
+        ? opts?.forSpeech
+          ? { error: 'body:ears is inbound-only: server "body" declared this channel\'s direction "inbound", so the host posts nothing into it; to speak there, use that server\'s own tools' }
+          : { channelId: 'body:ears', label: 'Body · ears' }
+        : known[spec] ?? { error: `no channel matches "${spec}"` },
     routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
       routed.push({ text, locus: locus ?? null });
       const behavior = plan.shift() ?? 'delivered';
@@ -1353,6 +1359,24 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  it('the hybrid and locus primers say plain text goes to the locus unless its server declared that channel inbound-only', async () => {
+    const framework = await createFramework('hybrid');
+    const agent = framework.getAgent('assistant')!;
+    const prime = (framework as unknown as { maybePrimeProseMode(agent: unknown): void }).maybePrimeProseMode.bind(framework);
+    prime(agent);
+    // The agent's mode is set from its config; a later config change is what
+    // brings the locus primer.
+    (agent as unknown as { proseRouting: string }).proseRouting = 'locus';
+    prime(agent);
+    const primers = agent.getContextManager().getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text)
+      .filter(t => t.startsWith('[prose-routing]'));
+    assert.equal(primers.length, 2, String(primers));
+    assert.match(primers[0]!, /^\[prose-routing\] Hybrid routing enabled: unprefixed text still lands in the current conversational locus, unless its server declared that channel inbound-only\. /);
+    assert.match(primers[1]!, /^\[prose-routing\] Mode change: your plain text auto-routes to the conversational locus again, unless its server declared that channel inbound-only\. /);
+    await framework.stop();
+  });
+
   it('prose_help tool returns the routing reference on demand', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'prose_help', input: {} },
@@ -1411,6 +1435,28 @@ describe('explicit prose routing', () => {
     assert.ok(texts.includes('[delivered] plain speech → discord:g:cafe'), 'canonical destination receipt enters context');
     await framework.stop();
   });
+
+  for (const [mode, authored] of [
+    ['hybrid', '>>>#ears\nHello, room.'],
+    ['explicit', '>>#ears Hello, room.'],
+  ] as const) {
+    it(`${mode}: a target its server declared inbound-only bounces with that reason and publishes nothing`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: authored }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: (mode === 'hybrid' ? '>>>' : '>>') + 'skip_reply {{unsent}}' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, [], 'nothing was published');
+      const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages().flatMap(m => m.content)
+        .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+      const bounce = texts.find(t => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+      assert.ok(bounce, 'the text bounced');
+      assert.ok(bounce!.includes('body:ears is inbound-only: server "body" declared'), `the bounce gives the declaration: ${bounce}`);
+      assert.ok(!bounce!.includes('was not confirmed'), `the bounce doesn't call it an unconfirmed delivery: ${bounce}`);
+      await framework.stop();
+    });
+  }
 
   it('hybrid leaves unprefixed prose on the frozen locus', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));

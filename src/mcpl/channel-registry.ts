@@ -213,6 +213,26 @@ interface ChannelEntry {
   open: boolean;
 }
 
+/**
+ * A channel its server declared inbound-only (SPEC §14.2 `direction`): its
+ * messages come in, and the host posts nothing into it. No publish, from
+ * plain speech, `channel_publish` or `publishForAgent`, and no outgoing
+ * stream. A channel declared `outbound` or `bidirectional`, or with no
+ * direction, isn't one.
+ */
+function isInboundOnly(entry: ChannelEntry): boolean {
+  return entry.descriptor.direction === 'inbound';
+}
+
+/** Why the host sends nothing into an inbound-only channel, as the resident
+ *  reads it in a send-failure marker or a tool error. */
+function inboundOnlyReason(entry: ChannelEntry): string {
+  return (
+    `inbound-only: server "${entry.serverId}" declared this channel's direction "inbound", ` +
+    'so the host posts nothing into it; to speak there, use that server\'s own tools'
+  );
+}
+
 /** Minimal responder interface for sending JSON-RPC results back. */
 interface Responder {
   respond(result: unknown): void;
@@ -1452,7 +1472,8 @@ export class ChannelRegistry {
     const openChannels = this.getOpenChannels();
 
     // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
-    // told the channel its speech will actually land in: a conversation fork's
+    // told the channel its speech will actually land in (none, when its server
+    // declared it inbound-only, since speech isn't posted there): a conversation fork's
     // home channel, else this turn's triggering channel (single trunk agent —
     // item-3 redux), else the global default (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
@@ -1478,8 +1499,10 @@ export class ChannelRegistry {
       };
     }
 
-    // Default outgoing: the resolved outbound locus (home channel for forks).
-    if (outgoing) {
+    // Default outgoing: the resolved outbound locus (home channel for forks),
+    // unless its server declared it inbound-only: routeSpeech posts nothing
+    // there, so it isn't where the agent's speech goes.
+    if (outgoing && !this.inboundOnlyServer(outgoing)) {
       context.defaultOutgoing = {
         channelId: outgoing,
       };
@@ -2082,16 +2105,39 @@ export class ChannelRegistry {
 
   /**
    * Publish into a channel on behalf of a named non-resident agent (the
-   * subconscious's speak_in_channel). Same delivery path as the
-   * channel_publish tool; the agent name rides the speech-routed trace.
+   * subconscious's speak_in_channel). Same delivery path, and the same result,
+   * as the channel_publish tool. Its traces carry the agent's name and follow
+   * the outcome as routeSpeech's do: speech-routed after a publish the server
+   * accepted and didn't report undelivered, and speech-route-failed otherwise.
    */
   async publishForAgent(
     channelId: string,
     text: string,
     agentName: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
-    this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text });
+    const result = await this.handleToolPublish({ channelId, content: text });
+    const reply = result.data as { delivered?: boolean; messageId?: string } | undefined;
+    if (result.success && reply?.delivered !== false) {
+      this.emitTraceFn({
+        type: 'mcpl:speech-routed',
+        conversationId: agentName,
+        serverId: this.findChannelEntry(channelId)?.serverId ?? '',
+        channelId,
+        delivered: true,
+        textLen: text.length,
+        text,
+        ...(reply?.messageId !== undefined ? { messageId: reply.messageId } : {}),
+      });
+    } else {
+      this.emitTraceFn({
+        type: 'mcpl:speech-route-failed',
+        conversationId: agentName,
+        channelId,
+        reason: result.success ? 'the server reported delivered:false' : (result.error ?? 'the publish failed'),
+        textLen: text.length,
+      });
+    }
+    return result;
   }
 
   /**
@@ -2303,6 +2349,17 @@ export class ChannelRegistry {
   }
 
   /**
+   * The server that declared this channel inbound-only (isInboundOnly), or
+   * undefined when it isn't one. The notices name that server. A caller that
+   * knows the channel's server passes it; otherwise the channel is found as
+   * routeSpeech finds it.
+   */
+  inboundOnlyServer(channelId: string, serverId?: string): string | undefined {
+    const entry = serverId ? this.channels.get(`${serverId}:${channelId}`) : this.findChannelEntry(channelId);
+    return entry && isInboundOnly(entry) ? entry.serverId : undefined;
+  }
+
+  /**
    * Find a channel entry by channelId (searches across all servers).
    * Returns the first match.
    */
@@ -2429,8 +2486,23 @@ export class ChannelRegistry {
    *
    * Ambiguity is an error carrying candidates — never a guess: this is the
    * mechanism that makes prose misdelivery structurally impossible.
+   *
+   * `forSpeech` is for a target the agent's speech will be posted to: a
+   * channel its server declared inbound-only (isInboundOnly) then resolves
+   * to an error that says so, since nothing is posted there. Without it, as
+   * for reading a channel's history, any registered channel resolves.
    */
   resolveProseTarget(
+    spec: string,
+    opts?: { forSpeech?: boolean },
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+    const resolved = this.resolveTargetByName(spec);
+    if (!opts?.forSpeech || 'error' in resolved) return resolved;
+    const entry = this.findChannelEntry(resolved.channelId);
+    return entry && isInboundOnly(entry) ? { error: `${resolved.channelId} is ${inboundOnlyReason(entry)}` } : resolved;
+  }
+
+  private resolveTargetByName(
     spec: string,
   ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
     const entries = [...this.channels.values()];
@@ -2590,7 +2662,7 @@ export class ChannelRegistry {
     ];
     for (const c of candidates) {
       if (/\s/.test(c) || c === '#') continue;
-      const r = this.resolveProseTarget(c);
+      const r = this.resolveProseTarget(c, { forSpeech: true });
       if ('channelId' in r && r.channelId === d.id) return c;
     }
     return undefined;
@@ -2979,18 +3051,6 @@ export class ChannelRegistry {
   }
 
   /**
-   * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
-   * Publish the agent's plain-text speech to the current conversational locus
-   * (the most recent incoming channel, tracked cross-surface here in the host).
-   * Called by the framework on a text-only turn — replaces the per-surface
-   * sticky auto-post that used to live in discord-mcpl. Returns null when there
-   * is no locus / the channel or its server can't be resolved (in which case
-   * the speech simply stays in chronicle + module surfaces).
-   */
-  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default). Public so a multi-segment caller can snapshot it
-   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
-  /**
    * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
    * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
    * server declared `channels.streaming` in its initialize capabilities —
@@ -3038,6 +3098,9 @@ export class ChannelRegistry {
     // never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
+    // A stream is a copy of speech the host would post, and nothing is
+    // posted into an inbound-only channel.
+    if (isInboundOnly(matches[0]!)) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
@@ -3048,11 +3111,25 @@ export class ChannelRegistry {
     return server;
   }
 
+  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
+   *  process-global default). Public so a multi-segment caller can snapshot it
+   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
     return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
   }
 
+  /**
+   * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
+   * Publish the agent's plain-text speech to the current conversational locus
+   * (the most recent incoming channel, tracked cross-surface here in the host).
+   * Called by the framework on a text-only turn — replaces the per-surface
+   * sticky auto-post that used to live in discord-mcpl. Returns null when there
+   * is no locus, the channel or its server can't be resolved, its server
+   * declared it inbound-only, or the open or publish fails. Each of these goes
+   * through fail(): a trace, and the host's send-failure marker. The speech
+   * stays in chronicle + module surfaces.
+   */
   async routeSpeech(
     conversationId: string,
     text: string,
@@ -3098,6 +3175,11 @@ export class ChannelRegistry {
     const entry = this.findChannelEntry(channelId);
     if (!entry) {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
+    }
+    // Before the open below: speech that can't be posted here mustn't open
+    // the channel either.
+    if (isInboundOnly(entry)) {
+      return fail(channelId, inboundOnlyReason(entry));
     }
 
     // INVARIANT: it is not possible to send into a closed channel. Speech
@@ -3204,6 +3286,13 @@ export class ChannelRegistry {
       return {
         success: false,
         error: `Channel not found: ${channelId}`,
+        isError: true,
+      };
+    }
+    if (isInboundOnly(entry)) {
+      return {
+        success: false,
+        error: `Channel ${channelId} is ${inboundOnlyReason(entry)}`,
         isError: true,
       };
     }

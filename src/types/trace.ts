@@ -412,7 +412,9 @@ export type TraceEvent =
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent, whose
+  // conversationId is the speaking agent's name). `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
   // for the posted message (when the MCPL server reports one). Together they
