@@ -189,75 +189,76 @@ async function within<T, F>(promise: Promise<T>, fallback: F): Promise<T | F> {
   }
 }
 
-/** A child that closes its end of stdin and stays alive, so a write fails with EPIPE before any 'exit'. */
-async function spawnDeafChild(id: string): Promise<StdioTransport> {
+/** A child that closes its end of stdin and stays alive, so a write fails with
+ *  EPIPE before any 'exit'. Its close is registered with the test as soon as it
+ *  spawns, so a wait that never ends can't leave the child running. */
+async function spawnDeafChild(t: TestContext, id: string): Promise<StdioTransport> {
   const transport = await StdioTransport.spawn({
     id,
     command: process.execPath,
     args: ['-e', "require('fs').closeSync(0); console.log('stdin closed'); setInterval(() => {}, 1 << 30)"],
   });
-  await new Promise<void>((resolve) => { transport.once('line', () => resolve()); });
+  t.after(() => transport.close());
+  const ready = await within(new Promise<boolean>((resolve) => { transport.once('line', () => resolve(true)); }), false);
+  assert.ok(ready, 'the child said it had closed its stdin within 5 s');
   return transport;
 }
 
-test("a failed write to a child's stdin reaches the transport's 'error' listener", { timeout: 10_000 }, async () => {
-  const transport = await spawnDeafChild('deaf-heard');
-  try {
-    const reported = new Promise<NodeJS.ErrnoException>((resolve) => { transport.once('error', resolve); });
-    transport.writeLine('{}');
-    const error = await within(reported, null);
-    assert.ok(error, "the write's failure reached the transport's 'error' listener within 5 s");
-    assert.equal(error.code, 'EPIPE');
-  } finally {
-    await transport.close();
-  }
+test("a failed write to a child's stdin reaches the transport's 'error' listener", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'deaf-heard');
+  const reported = new Promise<NodeJS.ErrnoException>((resolve) => { transport.once('error', resolve); });
+  transport.writeLine('{}');
+  const error = await within(reported, null);
+  assert.ok(error, "the write's failure reached the transport's 'error' listener within 5 s");
+  assert.equal(error.code, 'EPIPE');
 });
 
-test("a failed write to a child's stdin with nothing listening is not thrown", { timeout: 10_000 }, async () => {
-  const transport = await spawnDeafChild('deaf-unheard');
-  try {
-    const child = (transport as unknown as { child: ChildProcess }).child;
-    const failed = new Promise<void>((resolve) => { child.stdin!.once('close', () => resolve()); });
-    transport.writeLine('{}');
-    // The EPIPE destroys stdin; an 'error' nothing caught would have failed
-    // this test as an uncaught exception by the time its 'close' arrives.
-    assert.equal(await within(failed.then(() => 'closed'), 'still open after 5 s'), 'closed');
-    assert.equal(transport.listenerCount('error'), 0);
-  } finally {
-    await transport.close();
-  }
+test("a failed write to a child's stdin with nothing listening is not thrown", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'deaf-unheard');
+  const child = (transport as unknown as { child: ChildProcess }).child;
+  const failed = new Promise<void>((resolve) => { child.stdin!.once('close', () => resolve()); });
+  transport.writeLine('{}');
+  // The EPIPE destroys stdin; an 'error' nothing caught would have failed
+  // this test as an uncaught exception by the time its 'close' arrives.
+  assert.equal(await within(failed.then(() => 'closed'), 'still open after 5 s'), 'closed');
+  assert.equal(transport.listenerCount('error'), 0);
 });
 
-test("a read error on a child's stdout or stderr reaches the transport's 'error' listener once", { timeout: 10_000 }, async () => {
-  const transport = await spawnDeafChild('pipes-heard');
-  try {
-    const child = (transport as unknown as { child: ChildProcess }).child;
-    for (const [name, stream] of [['stdout', child.stdout!], ['stderr', child.stderr!]] as const) {
-      const heard: string[] = [];
-      const onError = (error: Error) => { heard.push(error.message); };
-      transport.on('error', onError);
-      stream.destroy(new Error(`injected ${name} read failure`));
-      // A destroyed stream emits its 'error' on the next tick.
-      await new Promise((resolve) => setImmediate(resolve));
-      transport.off('error', onError);
-      assert.deepEqual(heard, [`injected ${name} read failure`]);
-    }
-  } finally {
-    await transport.close();
-  }
-});
-
-test("a read error on a child's stdout or stderr with nothing listening is not thrown", { timeout: 10_000 }, async () => {
-  const transport = await spawnDeafChild('pipes-unheard');
-  try {
-    const child = (transport as unknown as { child: ChildProcess }).child;
-    child.stdout!.destroy(new Error('injected stdout read failure'));
-    child.stderr!.destroy(new Error('injected stderr read failure'));
-    // Both errors are emitted on the next tick; one nothing caught would have
-    // failed this test as an uncaught exception by then.
+test("a read error on a child's stdout or stderr reaches the transport's 'error' listener once", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'pipes-heard');
+  const child = (transport as unknown as { child: ChildProcess }).child;
+  for (const [name, stream] of [['stdout', child.stdout!], ['stderr', child.stderr!]] as const) {
+    const heard: string[] = [];
+    const onError = (error: Error) => { heard.push(error.message); };
+    transport.on('error', onError);
+    stream.destroy(new Error(`injected ${name} read failure`));
+    // A destroyed stream emits its 'error' on the next tick.
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(transport.listenerCount('error'), 0);
-  } finally {
-    await transport.close();
+    transport.off('error', onError);
+    assert.deepEqual(heard, [`injected ${name} read failure`]);
   }
+});
+
+test("a read error on a child's stdout or stderr with nothing listening is not thrown", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'pipes-unheard');
+  const child = (transport as unknown as { child: ChildProcess }).child;
+  child.stdout!.destroy(new Error('injected stdout read failure'));
+  child.stderr!.destroy(new Error('injected stderr read failure'));
+  // Both errors are emitted on the next tick; one nothing caught would have
+  // failed this test as an uncaught exception by then.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transport.listenerCount('error'), 0);
+});
+
+test("a read error on a child's stdout that arrives while close() runs reaches the listener, not thrown", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'pipes-closing');
+  const child = (transport as unknown as { child: ChildProcess }).child;
+  const heard: string[] = [];
+  transport.on('error', (error: Error) => { heard.push(error.message); });
+  // destroy() emits the error on the next tick, after close() has closed
+  // readline, which takes readline's own listener off the stream.
+  child.stdout!.destroy(new Error('injected stdout read failure'));
+  await transport.close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(heard, ['injected stdout read failure']);
 });
