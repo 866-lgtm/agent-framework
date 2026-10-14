@@ -315,6 +315,8 @@ test('message-granular undo prepares markers before switching branches', async (
     framework.nextTurnToken = 1;
     framework.deferredMessages = [];
     framework.pendingAssistantBlocks = new Map();
+    // A host/command and a store surgery are operations stop() waits for.
+    framework.operatorOperations = new Set();
     framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {

@@ -1025,6 +1025,44 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
   }
 });
 
+test('the breaker reads the status a real failure carries: a 404 never sheds; a 400, a 413 under either label and no status do', async () => {
+  // Through classifyInferenceError, the inference:exhausted trace and
+  // noteInferenceExhausted to the gate, three failed turns each: the
+  // escalation threshold. A shed is read from its own line, since the cap's
+  // and nothing-left-to-shed's lines share its prefix.
+  const legs = [
+    ['invalid_request', 404, false], ['invalid_request', 400, true], ['invalid_request', 413, true],
+    ['context_length', 413, true], ['invalid_request', undefined, true],
+  ] as const;
+  for (const [type, status, sheds] of legs) {
+    const label = `${type} ${status === undefined ? 'with no status' : `at ${status}`}`;
+    const { errs, traces, messages, markers, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
+      type, retryable: false, message: `zz-${label}`, rawError: { status },
+      ...(status === undefined ? {} : { httpStatus: status }),
+    }), { turns: 3 });
+    const exhausted = traces.filter((t) => t.type === 'inference:exhausted');
+    assert.ok(exhausted.length >= 3, `${label}: ${exhausted.length} exhausted traces`);
+    // The status as the failure carried it: none is invented for an error without one.
+    assert.ok(exhausted.every((t) => t.httpStatus === status), `${label} reached the trace as it was`);
+    assert.ok(errs.some((e) => e.startsWith('[inference-hard-down] agent=resident')), `${label} is reported hard-down`);
+    const shed = errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
+    const kept = messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
+      .map((m) => (m.content[0] as { text: string }).text);
+    if (sheds) {
+      assert.ok(shed.length > 0, `${label} sheds`);
+      assert.ok(!kept.includes('hello 2'), `${label}: the newest exchange is shed`);
+    } else {
+      assert.equal(shed.length, 0, `${label} sheds nothing`);
+      assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);
+      // Only the shed is gated: each failure is still marked and logged.
+      assert.equal(markers.length, 3, `${label}: an [inference-failed] marker per failure`);
+      const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+        .filter((record) => record.kind === 'inference-exhausted');
+      assert.deepEqual(records.map((record) => record.httpStatus), [404, 404, 404], `${label}: a failures.log record per failure`);
+    }
+  }
+});
+
 test('an ephemeral run rejects with the bounded failure text', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-failure-bounds-'));
   const cwd = process.cwd();
