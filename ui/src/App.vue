@@ -86,9 +86,9 @@ function handleEvent(data: { event: string; data: unknown }) {
     const { agentName } = data.data as { agentName: string };
     agentsStore.updateAgentStatus(agentName, 'inferring');
   } else if (
-    data.event === 'inference:completed' ||
-    // The turn's terminal events (onTrace's contract): a turn dropped
+    // The events that end a turn (onTrace's contract). A turn dropped
     // before it sends anything ends with inference:aborted alone.
+    data.event === 'inference:completed' ||
     data.event === 'inference:turn_ended' ||
     data.event === 'inference:aborted' ||
     data.event === 'inference:failed' ||
