@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -136,7 +136,10 @@ test('--dry-run with an awareness control is refused before the store opens: not
     assert.deepEqual(operatorLog(storePath), [], 'and nothing was recorded');
 
     const missing = join(dir, 'no-such-store');
-    assert.equal(recover(missing, '--awareness', 'cancel', active.id, '--dry-run').status, 1);
+    const refusedFirst = recover(missing, '--awareness', 'cancel', active.id, '--dry-run');
+    assert.equal(refusedFirst.status, 1);
+    assert.match(refusedFirst.stderr, /--dry-run previews a recovery; it does not apply to --awareness/,
+      'the dry-run refusal answers, not the missing store');
     assert.equal(existsSync(missing), false, 'refused before any store is opened or created');
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -158,6 +161,9 @@ test('an offline recovery records its marks choice and receipt in the operator l
     const dry = recover(storePath, '--agent', 'cairn', '--message-id', 'm-safe', '--marks', 'addressed', '--dry-run');
     assert.equal(dry.status, 0, dry.stderr);
     assert.deepEqual(operatorLog(storePath), [], 'a dry run changes nothing and records nothing');
+    const failedDry = recover(storePath, '--agent', 'cairn', '--message-id', 'no-such-message', '--marks', 'addressed', '--dry-run');
+    assert.equal(failedDry.status, 1, failedDry.stdout);
+    assert.deepEqual(operatorLog(storePath), [], 'nor does one that fails');
 
     const done = recover(storePath, '--agent', 'cairn', '--message-id', 'm-safe', '--marks', 'addressed', '--branch', 'recovery/cairn/1');
     assert.equal(done.status, 0, done.stderr);
@@ -227,6 +233,54 @@ test('a recovery\'s options with an awareness verb are refused, not ignored', ()
       reopened.close();
     }
     assert.deepEqual(operatorLog(storePath), [], 'and nothing was recorded');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a mistyped marks choice, an awareness verb it doesn\'t know, and --awareness without --store are refused, recording nothing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  try {
+    JsStore.openOrCreate({ path: storePath }).close();
+    const typo = recover(storePath, '--agent', 'cairn', '--message-id', 'm-1', '--marks', 'adressed');
+    assert.equal(typo.status, 1);
+    assert.match(typo.stderr, /--marks must be none, addressed or all/);
+    const unknownVerb = recover(storePath, '--awareness', 'purge');
+    assert.equal(unknownVerb.status, 1);
+    assert.match(unknownVerb.stderr, /--awareness must be list, cancel <ID>, retract <ID\|all> or release <ID>/);
+    const storeless = spawnSync(process.execPath, [CLI, '--awareness', 'list'], { encoding: 'utf8' });
+    assert.equal(storeless.status, 1);
+    assert.match(storeless.stderr, /--awareness needs --store/);
+    assert.deepEqual(operatorLog(storePath), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a control still acts when the operator log can\'t be written, and says the log failed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const outbox = new DiscordAwarenessOutbox(store);
+    const batch = outbox.prepare({
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1'), ref('m2')], scope: 'all',
+    })!;
+    outbox.activate(batch.id);
+    store.close();
+    // A directory where the log file goes: every append to it fails.
+    mkdirSync(join(storePath, 'operator-actions.jsonl'));
+    const cancelled = recover(storePath, '--awareness', 'cancel', batch.id);
+    assert.equal(cancelled.status, 0, cancelled.stderr);
+    assert.equal((JSON.parse(cancelled.stdout) as { cancelled: number }).cancelled, 2);
+    assert.match(cancelled.stderr, /\[operator-log\] failed to write \S*operator-actions\.jsonl/);
+    const reopened = JsStore.open({ path: storePath });
+    try {
+      assert.ok(new DiscordAwarenessOutbox(reopened).batches()[0].cancelled, 'the cancel is in the journal');
+    } finally {
+      reopened.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

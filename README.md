@@ -415,8 +415,9 @@ const result = await framework.rollbackToMessage('cairn', {
   `requestTimeoutMs` (including `0`): `discordAwarenessDeadlineMs` (default
   10000ms, clamped to 50..60000ms). The emoji is `discordAwarenessEmoji`
   (offline: `--emoji`). An operation is not sent again after three
-  unconfirmed attempts (refused, or never answered and so possibly landed,
-  one left on the wire when the host stopped included), or after a refusal
+  unconfirmed attempts (Discord refused it, or no answer came and so it may
+  have landed, one left on the wire when the host stopped included; an
+  attempt refused before it left the host doesn't count), or after a refusal
   no retry can change (the message, channel or emoji is gone, access is
   missing, or the message takes no more reactions); a pass that gives up on
   operations raises one `discord-awareness-delivery` ops alert, and so does
@@ -442,12 +443,16 @@ const result = await framework.rollbackToMessage('cairn', {
   failing inside an append) leaves the journal refusing every read and write
   until the store is reopened; the next start reads that record with the
   rest. A batch whose surgery crashed after its switch (its target branch
-  active at startup) is completed then; one whose surgery was interrupted
-  before its branch switch was recorded is held at startup until an operator
+  active at startup) is completed then; one whose surgery crashed before it
+  created its target branch is retired at startup, since none of its
+  messages were removed; one whose surgery was otherwise interrupted before
+  its branch switch was recorded is held at startup until an operator
   releases or cancels it; an interrupted suppression's redactions are
   resumed whenever its branch is active at startup, whatever its marks'
   state.
-- **Operator controls,** each recorded in the operator log:
+- **Operator controls,** each recorded in the operator log; once `stop()`
+  has begun, cancel, retract and release refuse, like every operator entry
+  point:
   - `listDiscordAwareness()` lists batches and retract requests;
   - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
     and retries of a batch's marks or a retract's removals, and never removes
@@ -462,11 +467,11 @@ const result = await framework.rollbackToMessage('cairn', {
     any an earlier choice would request later (a prepared batch's
     activation); cancelling it never revives them. A held batch released
     after it is a new act, whose adds go out. Its receipt discloses earlier
-    requests whose outcome is unknown and imported history that leaves
-    outcomes unrecorded;
-  - `releaseDiscordAwareness(batch)` queues a held batch. A held batch whose
-    surgery never ran (its error said so) is cancelled instead: its messages
-    were never removed.
+    add requests whose outcome is unknown (an unknown removal can't bring a
+    mark back) and imported history that leaves outcomes unrecorded;
+  - `releaseDiscordAwareness(batch)` queues a held batch. A batch whose
+    surgery never ran is never held: the next start retires it, since its
+    target branch was never created.
 
   A request the journal won't carry out (an unknown batch, or one in the
   wrong state) is refused as `invalid`; a failure to read or write the

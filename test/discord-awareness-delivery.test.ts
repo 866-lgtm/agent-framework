@@ -263,11 +263,14 @@ test('a host that is stopping claims no more marks: those still due wait for the
       assert.deepEqual(
         new DiscordAwarenessOutbox(store).pendingDispatches().map((dispatch) => dispatch.key.messageId),
         [second],
-        'the next start delivers it',
+        'it stays due after the stop',
       );
     } finally {
       store.close();
     }
+    framework = await AgentFramework.create(config());
+    await waitFor('the next start delivers it', () => jsonl(paths.calls).length === 2);
+    assert.equal(String((jsonl(paths.calls)[1].args as { messageId: string }).messageId), second);
   } finally {
     release?.();
     writeFileSync(paths.hold, '1');
@@ -293,10 +296,11 @@ test('a branch switch neither adds nor removes marks', async () => {
     const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
     await waitFor('the add confirmed', () =>
       journal(framework!).operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
-    // Switch back to the source and forward again: nothing is sent.
-    await cm.switchBranch(result.sourceBranch);
+    // Switch back to the source and forward again, through the operator's
+    // branch switch: nothing is sent.
+    await framework.switchBranch(result.sourceBranch);
     await framework.syncDiscordAwarenessMarkers();
-    await cm.switchBranch(result.targetBranch);
+    await framework.switchBranch(result.targetBranch);
     await framework.syncDiscordAwarenessMarkers();
     await framework.stop();
     framework = await AgentFramework.create(config());

@@ -13,14 +13,17 @@
     selected message, whatever history says. As the latest authorization
     for those messages, it stops adds that haven't ended and any an earlier
     choice would request later (a prepared surgery's activation), and
-    cancelling it never revives them. Its receipt discloses requests whose
-    outcome is unknown and imported history that leaves outcomes
-    unrecorded.
+    cancelling it never revives them. Its receipt discloses earlier add
+    requests whose outcome is unknown and imported history that leaves
+    outcomes unrecorded.
   - `releaseDiscordAwareness(batch)` queues a held batch.
 
   Each control is recorded in the operator log. A request the journal won't
   carry out (an unknown batch, or one in the wrong state) is refused as
-  `invalid`, and a failure to read or write the journal is `failed`. The same
+  `invalid`, and a failure to read or write the journal is `failed`. Once
+  `stop()` has begun, cancel, retract and release refuse with "awareness
+  <verb> refused: the framework is stopping", like every operator entry
+  point; the list still reads the journal. The same
   controls are available as the `host/command` `marks` verb (`action: list |
   cancel | retract | release`, `target`) and, with the host stopped, as
   `agent-framework-recover --awareness list|cancel|retract|release`, which

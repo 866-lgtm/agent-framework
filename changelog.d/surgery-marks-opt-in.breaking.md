@@ -15,8 +15,9 @@
     to bind the choice to exactly the previewed messages. A `host/command`
     `marks` value other than these and `'none'` is refused rather than
     guessed. A surface that reacted to `hide`'s `hiddenRefs` itself should
-    stop when the result carries `markers`: the framework marked through its
-    journal.
+    stop when the result carries `markers`: such a framework places marks
+    itself, through its journal, as the operator chose, and none unless
+    asked.
   - **Unchanged:** the body change itself (fork, switch, redaction), the
     receipt's `status` values, the emoji (`discordAwarenessEmoji`) and the
     reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord

@@ -2239,21 +2239,24 @@ export class AgentFramework {
 
     // Startup reconciliation of the awareness journal, before any delivery.
     // It derives nothing from branch ancestry: a surgery that crashed after
-    // switching to exactly the active branch completes its activation; any
-    // other prepared batch is held for an operator; an attempt the previous
+    // switching to exactly the active branch completes its activation; one
+    // that crashed before it created its branch is retired; any other
+    // prepared batch is held for an operator; an attempt the previous
     // process left on the wire is recorded unknown. No content is read.
     let recovered: ReturnType<DiscordAwarenessOutbox['recoverAtStartup']>;
     try {
-      recovered = discordAwarenessOutbox.recoverAtStartup(store.currentBranch().name);
+      const branches = new Set(store.listBranches().map((branch) => branch.name));
+      recovered = discordAwarenessOutbox.recoverAtStartup(store.currentBranch().name, (name) => branches.has(name));
     } catch (error) {
       // The branch may be safe, but reporting the framework ready while its
       // durable awareness journal is unreadable creates a half-ready host.
       throw new DiscordAwarenessAccountingError('startup reconciliation', error);
     }
-    if (recovered.activated.length > 0 || recovered.held.length > 0 || recovered.unknownAttempts > 0) {
+    if (recovered.activated.length > 0 || recovered.held.length > 0 || recovered.retired.length > 0 || recovered.unknownAttempts > 0) {
       console.error(
         `[discord-awareness] startup: activated ${recovered.activated.length} interrupted batch(es) ` +
           `for ${store.currentBranch().name}, held ${recovered.held.length}, ` +
+          `retired ${recovered.retired.length} whose surgery never created its branch, ` +
           `recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
       );
     }
@@ -2837,7 +2840,9 @@ export class AgentFramework {
     // teardown's result, it has nothing left to wait on: closing a connection
     // rejects the request it had on the wire before awaiting its transport,
     // and it claims nothing more once stop() has begun, so it records that
-    // outcome and ends.
+    // outcome and ends. A drain's own failure is reported where it was
+    // started (a background delivery's log and alert, a sync's caller), not
+    // here; the next start reopens a journal that refused a write.
     await Promise.allSettled([...this.discordAwarenessDrains.values()]);
 
     // Those later annotations write nothing, so they finish at once; let them
@@ -6733,9 +6738,13 @@ export class AgentFramework {
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
-    if (params.marks !== undefined && params.marks !== 'none' && params.marks !== 'addressed' && params.marks !== 'all') {
+    if (
+      (params.command === 'undo' || params.command === 'hide')
+      && params.marks !== undefined && params.marks !== 'none' && params.marks !== 'addressed' && params.marks !== 'all'
+    ) {
       // A publication choice is never guessed: a mistyped scope is refused
-      // rather than silently treated as none (or as anything else).
+      // rather than silently treated as none (or as anything else). The
+      // verbs that remove nothing take no choice and ignore the field.
       return { ok: false, error: `marks must be none, addressed or all (got ${JSON.stringify(params.marks)})` };
     }
 
@@ -8271,6 +8280,7 @@ export class AgentFramework {
     target: string,
     opts: { requester?: OperatorRequester; note?: string } = {},
   ): DiscordAwarenessCancelReceipt {
+    this.refuseOperatorAfterStop('awareness cancel');
     return this.awarenessOperatorAction('awareness-cancel', { target }, opts, () =>
       this.discordAwarenessOutbox.cancel(target, describeRequester(opts.requester)));
   }
@@ -8285,6 +8295,7 @@ export class AgentFramework {
     target: string | 'all',
     opts: { requester?: OperatorRequester; note?: string } = {},
   ): DiscordAwarenessRetractReceipt {
+    this.refuseOperatorAfterStop('awareness retract');
     const receipt = this.awarenessOperatorAction('awareness-retract', { target }, opts, () =>
       this.discordAwarenessOutbox.retract(target, describeRequester(opts.requester)));
     this.deliverDiscordAwarenessInBackground('retract', 'operator');
@@ -8296,6 +8307,7 @@ export class AgentFramework {
     batchId: string,
     opts: { requester?: OperatorRequester; note?: string } = {},
   ): DiscordAwarenessReleaseReceipt {
+    this.refuseOperatorAfterStop('awareness release');
     const receipt = this.awarenessOperatorAction('awareness-release', { batchId }, opts, () =>
       this.discordAwarenessOutbox.release(batchId, describeRequester(opts.requester)));
     this.deliverDiscordAwarenessInBackground('release', 'operator');

@@ -89,7 +89,9 @@ export class DiscordAwarenessRefusal extends Error {
   }
 }
 
-/** AF's own refusal to write a request on a closed connection. */
+/** AF's own refusal to write a request on a closed connection, as an
+ *  imported (pre-journal) ledger recorded it: as text, with no typed
+ *  outcome. Live attempts are classified by McplRequestError's outcome. */
 const PRE_WRITE_REFUSAL = /^Cannot send request:/;
 
 /** The pre-journal (version 1 and 2) ledger file name, imported once. */
@@ -283,9 +285,9 @@ export interface DiscordAwarenessCancelReceipt {
   /** The batch id or retract request id that was cancelled. */
   target: string;
   kind: 'batch' | 'retract';
-  /** Requests this call stopped before they were ever sent (for a batch not
-   *  yet activated, every mark it would have requested). A repeated cancel
-   *  stops none. */
+  /** Operations of this batch or retract that this call stopped before they
+   *  were ever sent (for a batch not yet activated, every mark it would have
+   *  requested). A repeated cancel stops none. */
   cancelled: number;
   /** Held release actions dropped (a held batch was cancelled). */
   heldDropped: number;
@@ -309,10 +311,11 @@ export interface DiscordAwarenessRetractReceipt {
   requestId: string;
   /** Removals queued: one per selected reaction key, whatever history says. */
   removalsQueued: number;
-  /** Add requests for those keys that had not ended (due, on the wire, or
-   *  unknown), whose later sends and retries are now retired. One on the
-   *  wire still settles before the removal is sent, and any unresolved one
-   *  may land or have landed (keysWithUnresolvedAdds). */
+  /** Add operations on those keys that had not ended (due, on the wire, or
+   *  unknown), one per batch that asked for the mark, whose later sends and
+   *  retries are now retired. One on the wire still settles before the
+   *  removal is sent, and any unresolved one may land or have landed
+   *  (keysWithUnresolvedAdds). */
   addsSuperseded: number;
   /** Keys whose earlier add attempts are unresolved (on the wire or unknown):
    *  such an add may land after this removal. */
@@ -629,23 +632,22 @@ export class DiscordAwarenessOutbox {
    * What a prepare whose write failed leaves, for the surgery's error (the
    * surgery then doesn't run): nothing; the batch, retired at once when it is
    * in this process's view; or, after a write that failed inside the store, a
-   * batch this process can't see, which the next start holds for an operator.
-   * A held batch of a surgery that never ran is to be cancelled, not
-   * released: its messages were never removed.
+   * batch this process can't see, which the next start retires: its surgery
+   * never created its target branch, so none of its messages were removed.
    */
   private failedPrepare(batchId: string, error: unknown): string {
     const detail = `recording awareness batch ${batchId} failed: ${errorText(error)}`;
-    const cancelIt = 'cancel it then, not release it, since its surgery didn\'t run';
+    const retired = 'the next start retires it, since its surgery never created its branch';
     if (this.journal.needsReopen) {
       return `${detail}; the batch may be in the store, unseen until the store is reopened, ` +
-        `and if so the next start holds it: ${cancelIt}`;
+        `and if so ${retired}`;
     }
     if (!this.journal.needsReconcile) return detail;
     try {
       return this.discard(batchId) ? `${detail}; it reached the journal and is retired` : detail;
     } catch (retireError) {
       return `${detail}; it reached the journal, and retiring it also failed (${errorText(retireError)}), ` +
-        `so the next start holds it: ${cancelIt}`;
+        `so ${retired}`;
     }
   }
 
@@ -735,12 +737,14 @@ export class DiscordAwarenessOutbox {
   /**
    * Activate a batch after its body change landed, and if that cannot be
    * recorded, retire it instead, so that what the caller reports is what
-   * the journal will do:
+   * the journal will do. After a failure the batch is read back:
    * - `queued`: the batch is active (including when the activation landed
    *   but its durability barrier failed: startup would crash-complete it);
-   * - `not-scheduled`: it was retired; none of its marks will be sent;
-   * - `unresolved`: neither could be recorded; a later startup that can read
-   *   the batch may activate it.
+   * - `not-scheduled`: it is retired, by this call or before it (including
+   *   when the retirement landed but its barrier failed); none of its marks
+   *   will be sent;
+   * - `unresolved`: the journal holds neither, as far as this process can
+   *   read it; a later startup that can read the batch may activate it.
    * Never throws.
    */
   settleActivation(batchId: string): DiscordAwarenessSettlement {
@@ -751,17 +755,24 @@ export class DiscordAwarenessOutbox {
       detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
     }
     try {
+      if (this.discard(batchId)) return { status: 'not-scheduled', error: detail };
+    } catch (error) {
+      detail += `; retiring it also failed: ${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}`;
+    }
+    // Neither call settled it as far as it knows: what the journal holds
+    // decides. An activation or a retirement can land before its barrier
+    // fails, and discard() declines a batch that is no longer prepared.
+    try {
       const state = this.load();
       const current = state.batches.get(batchId);
       if (current?.status === 'active') {
-        // The activation landed but its barrier failed: report what it queued.
         const queued = [...state.ops.values()]
           .filter((op) => op.cause.kind === 'batch' && op.cause.batchId === batchId && !op.cancelled).length;
         return { status: 'queued', queued };
       }
-      if (this.discard(batchId)) return { status: 'not-scheduled', error: detail };
+      if (current?.status === 'discarded') return { status: 'not-scheduled', error: detail };
     } catch (error) {
-      detail += `; retiring it also failed: ${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}`;
+      detail += `; reading the journal back also failed: ${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}`;
     }
     return { status: 'unresolved', error: detail };
   }
@@ -814,6 +825,10 @@ export class DiscordAwarenessOutbox {
    *   `unknown` (it may have reached Discord). Like any unanswered attempt,
    *   it counts toward the bound: `givenUp` is how many operations it
    *   brought there, which won't be sent again;
+   * - a prepared batch whose target branch doesn't exist (`branchExists`,
+   *   when given) is retired: its surgery ended before it created that
+   *   branch, which is its body change, so nothing it would mark was
+   *   removed;
    * - a prepared batch whose target is exactly the active branch completes
    *   its crash window (activated), except a suppression, whose resume
    *   completes its body first;
@@ -822,7 +837,8 @@ export class DiscordAwarenessOutbox {
    */
   recoverAtStartup(
     activeBranchName: string,
-  ): { activated: string[]; held: string[]; unknownAttempts: number; givenUp: number } {
+    branchExists?: (name: string) => boolean,
+  ): { activated: string[]; held: string[]; retired: string[]; unknownAttempts: number; givenUp: number } {
     const state = this.load();
     const at = Date.now();
     const records: JournalRecord[] = [];
@@ -845,8 +861,17 @@ export class DiscordAwarenessOutbox {
     }
     const activated: string[] = [];
     const held: string[] = [];
+    const retired: string[] = [];
     for (const batch of state.batches.values()) {
       if (batch.status !== 'prepared' || batch.cancelled) continue;
+      if (branchExists && !branchExists(batch.targetBranch)) {
+        // A rollback's or a suppression's target is the fork it creates, and
+        // an in-place batch's is the branch it changed: with no such branch,
+        // none of its marks apply. Held, an operator could release them.
+        records.push({ t: 'discarded', at, batchId: batch.id });
+        retired.push(batch.id);
+        continue;
+      }
       const suppression = (batch.activationPolicy ?? 'target-branch') === 'explicit'
         && !!batch.suppressionIntervals?.length;
       if (batch.targetBranch === activeBranchName) {
@@ -869,7 +894,9 @@ export class DiscordAwarenessOutbox {
           batchId: batch.id,
           reason: suppression
             ? `its suppression on ${batch.targetBranch} was interrupted; the body resumes when that branch is active at startup, the marks only on release`
-            : `its surgery was interrupted before the switch to ${batch.targetBranch} was confirmed`,
+            : batch.sourceBranch === batch.targetBranch
+              ? `its change on ${batch.targetBranch} landed, but the process ended before its marks were activated, and that branch isn't active now`
+              : `its surgery was interrupted before the switch to ${batch.targetBranch} was confirmed`,
           releaseActions: batch.refs.map((ref) => ({ ...ref, action: 'add' })),
         });
         held.push(batch.id);
@@ -885,7 +912,7 @@ export class DiscordAwarenessOutbox {
       const op = after.ops.get(opId);
       return !!op && !op.cancelled && unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS;
     }).length;
-    return { activated, held, unknownAttempts, givenUp };
+    return { activated, held, retired, unknownAttempts, givenUp };
   }
 
   // -- operator controls ------------------------------------------------------
@@ -1001,9 +1028,11 @@ export class DiscordAwarenessOutbox {
    * absent reaction does nothing. It is the latest authorization for those
    * keys: adds not yet ended are superseded, and adds an earlier choice
    * requests later (a prepared batch's activation) are recorded superseded.
-   * The receipt reports history only: requests whose outcome is unresolved,
-   * and imported history that leaves outcomes unrecorded, any of which may
-   * land or have landed.
+   * The receipt reports history only: earlier add requests whose outcome is
+   * unresolved, and imported history that leaves outcomes unrecorded, any
+   * of which may land or have landed. An earlier removal's unknown outcome
+   * isn't disclosed: it can't bring a mark back, and this removal goes out
+   * anyway.
    */
   retract(target: string | 'all', by?: string): DiscordAwarenessRetractReceipt {
     const state = this.load();
@@ -1059,9 +1088,9 @@ export class DiscordAwarenessOutbox {
     const batch = state.batches.get(batchId);
     if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch not found: ${batchId}`);
     if (batch.status !== 'held' || !batch.held) {
-      // A repeated release changes nothing; the refusal names the acts that
-      // settled the batch (a release can only precede a cancel), so a replay
-      // reads as one.
+      // A repeated release changes nothing. A release and a cancel each
+      // settle a held batch, and either can come first: the refusal names
+      // whichever did, so a replay reads as one.
       const act = (name: string, record?: { at: number; by?: string }) => record
         ? `; it was ${name} at ${new Date(record.at).toISOString()}${record.by ? ` by ${record.by}` : ''}`
         : '';
@@ -1093,7 +1122,8 @@ export class DiscordAwarenessOutbox {
    * operations with the same action share one dispatch. An `unknown`
    * operation is retried only while it is still the newest live operation
    * for its key. No operation is sent again once three of its attempts
-   * went unconfirmed (refused, or unanswered).
+   * went unconfirmed (Discord refused it, or no answer came); an attempt
+   * refused before it left the host doesn't count.
    */
   pendingDispatches(serverId?: string): DiscordAwarenessDispatch[] {
     const state = this.load();
@@ -1188,8 +1218,8 @@ export class DiscordAwarenessOutbox {
   /**
    * Record the outcome of a dispatch's attempts. Returns how many of its
    * operations this outcome ended without a confirmation: refused for good,
-   * or at their third unconfirmed attempt (refused, or unanswered), so they
-   * will not be sent again.
+   * or at their third unconfirmed attempt (Discord refused it, or no answer
+   * came), so they will not be sent again.
    */
   recordOutcome(
     attempts: Array<{ opId: string; attempt: number }>,
@@ -1519,7 +1549,11 @@ function restoreState(snapshot: JournalSnapshot): JournalState {
   const state: JournalState = {
     batches: new Map(snapshot.batches.map((batch) => [
       batch.id,
-      { ...structuredClone(batch), authorization: batch.authorization ?? 0 },
+      {
+        ...structuredClone(batch),
+        authorization: batch.authorization ?? 0,
+        ...(batch.released ? { releaseAuthorization: batch.releaseAuthorization ?? 0 } : {}),
+      },
     ])),
     ops: new Map(snapshot.ops.map((op) => [op.opId, { ...structuredClone(op), authorization: op.authorization ?? 0 }])),
     legacy: new Map(),
@@ -1897,10 +1931,11 @@ function markKey(key: DiscordAwarenessRef & { emoji: string }): string {
 }
 
 /**
- * Unconfirmed attempts (refused, or never answered, so possibly landed)
- * after which an operation is not sent again. Without a bound, a
- * refusal Discord repeats, or a server that never answers, would be sent
- * again at every drain, two journal records each time.
+ * Unconfirmed attempts (Discord refused them, or no answer came, so they may
+ * have landed) after which an operation is not sent again. An attempt
+ * refused before it left the host (`not-sent`) isn't counted. Without a
+ * bound, a refusal Discord repeats, or a server that never answers, would be
+ * sent again at every drain, two journal records each time.
  */
 const MAX_UNCONFIRMED_ATTEMPTS = 3;
 

@@ -329,6 +329,7 @@ describe('surgery and awareness marks', () => {
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
     assert.deepEqual(stuck.markers, none);
+    assert.ok(!cm().getAllMessages().some((m) => String(m.id) === other), 'the redaction stood');
     assert.equal(outbox().batches().filter((batch) => batch.status === 'prepared').length, 1, 'its journal is left prepared');
     const alert = alerts.find((candidate) => candidate.kind === 'discord-awareness-unresolved');
     assert.match(alert?.message ?? '', /suppress applied, but its resume journal \(awareness batch \S+, no marks\) could not be closed.*it stays prepared/);
@@ -646,6 +647,30 @@ describe('surgery and awareness marks', () => {
     assert.equal(after.suppressionComplete, true);
     assert.equal(after.status, 'active');
     assert.equal(outbox().operations().filter((op) => op.action === 'add').length, 1, 'only the release queued marks');
+  });
+
+  it('a suppression that crashed after recording its batch and before its fork is retired at startup, not held', async () => {
+    await start(false);
+    const { removed } = seed(3);
+    const live = cm();
+    const sourceBranch = live.currentBranch().name;
+    // suppressMessages records its batch, durably, before cm.fork: a crash
+    // between the two leaves a batch whose target branch doesn't exist.
+    const [target] = live.getAllMessages().filter((m) => String(m.id) === removed[1]);
+    const batch = outbox().prepare({
+      agentName: 'resident', sourceBranch, targetBranch: 'never-forked',
+      refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1' }], scope: 'all',
+      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
+    })!;
+    await framework.stop();
+
+    await start(false);
+    const [after] = outbox().batches();
+    assert.equal(after.id, batch.id);
+    assert.equal(after.status, 'discarded', 'retired: none of its messages were removed');
+    assert.ok(cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'its message is still there');
+    assert.throws(() => framework.releaseDiscordAwareness(batch.id), /is discarded, not held/);
+    assert.equal(outbox().operations().length, 0);
   });
 
   it('an imported active suppression is verified on its target at startup: the old ledger does not prove its body', async () => {

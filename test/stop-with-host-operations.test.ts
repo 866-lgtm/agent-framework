@@ -505,6 +505,9 @@ describe('stop() with an operator operation in flight', () => {
     ['disconnect MCPL server', (f) => f.disconnectMcplServer('late')],
     ['restart MCPL server', (f) => f.restartMcplServer('late')],
     ['awareness sync', (f) => f.syncDiscordAwarenessMarkers()],
+    ['awareness cancel', (f) => f.cancelDiscordAwareness('no-such-batch')],
+    ['awareness retract', (f) => f.retractDiscordAwareness('all')],
+    ['awareness release', (f) => f.releaseDiscordAwareness('no-such-batch')],
   ];
   for (const [verb, call] of lateCalls) {
     it(verb + ' is refused during teardown and after stop(), with no writes and no operator log', async () => {
@@ -769,10 +772,47 @@ describe('stop() with an operator operation in flight', () => {
       const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
       await api.cmdBranchCreate({ name: 'side' });
       const drains = holdDrains(framework);
+      const journal = framework.listDiscordAwareness();
       await framework.switchBranch('side');
       assert.equal(framework.getStore().currentBranch().name, 'side');
       assert.equal(drains.started(), 0);
+      assert.deepEqual(framework.listDiscordAwareness(), journal, 'the awareness journal is unchanged');
     } finally { await framework.stop(); }
+  });
+
+  it('stop() keeps the store open until an awareness drain already running has ended', async () => {
+    const framework = await create();
+    const fw = framework as unknown as {
+      runDiscordAwarenessDrain(serverId: string, pass: unknown): Promise<unknown>;
+      drainDiscordAwarenessOutbox(serverId: string): Promise<unknown>;
+      discordAwarenessDrains: Map<string, Promise<unknown>>;
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let storeOpenAtEnd: boolean | undefined;
+    // A pass with a request on the wire, as drainDiscordAwarenessOutbox
+    // registers it: it ends when the request is answered.
+    fw.runDiscordAwarenessDrain = async () => {
+      await held;
+      storeOpenAtEnd = !framework.getStore().isClosed();
+      return { status: 'delivered', delivered: 0, failed: 0 };
+    };
+    const drain = fw.drainDiscordAwarenessOutbox('srv');
+    assert.equal(fw.discordAwarenessDrains.size, 1, 'the pass is registered');
+    const stopping = framework.stop();
+    try {
+      await until(() => order.includes('modules stopped'), 'module teardown');
+      // Past the teardown, only the drain stands between stop() and the
+      // store's close, which would otherwise follow within a few turns.
+      for (let turn = 0; turn < 20; turn++) await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+      assert.equal(framework.getStore().isClosed(), false, 'the store waits for the drain');
+    } finally {
+      release();
+      await stopping;
+      await drain;
+    }
+    assert.equal(storeOpenAtEnd, true, 'the drain ended with the store still open');
+    assert.equal(framework.getStore().isClosed(), true);
   });
 
   it('a branch switch during a live turn is refused, and the branch stays', async () => {

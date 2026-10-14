@@ -79,10 +79,7 @@ Awareness journal (host stopped):
                               Queue removal of this bot's marks (through each
                               ref's configured MCPL route) on a batch's refs,
                               or on every ref an add was ever sent for
-  --awareness release <ID>    Queue a held batch's recorded operations. A held
-                              batch whose surgery never ran (its error said
-                              so) is to be cancelled, not released: its
-                              messages were never removed
+  --awareness release <ID>    Queue a held batch's recorded operations
   Each acts at once: inspect first with --awareness list. The awareness verbs
   take only --store and --outbox; anything else is refused.
 
