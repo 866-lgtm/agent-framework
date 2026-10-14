@@ -66,6 +66,7 @@ import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE
 import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
+import { logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -5956,7 +5957,7 @@ export class AgentFramework {
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) {
         console.error(
-          `[inference-refusal] reaction skipped: no MCPL server for locus "${incoming.channelId}" (agent=${agentName})`,
+          `[inference-refusal] reaction skipped: no MCPL server for locus ${logValue(incoming.channelId)} (agent=${agentName})`,
         );
         return;
       }
@@ -8483,7 +8484,7 @@ export class AgentFramework {
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
     if (isVisiblyEmptyContent(event.content)) {
-      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${event.channelId} messageId=${event.messageId} reason=empty-content`);
+      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${logValue(event.channelId)} messageId=${logValue(event.messageId)} reason=empty-content`);
       this.emitTrace({
         type: 'mcpl:empty-content-dropped', lane: 'channel', serverId: event.serverId,
         channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
@@ -8669,7 +8670,7 @@ export class AgentFramework {
         });
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Failed to spawn conversation agent for ${event.channelId}:`, err);
+        console.error(`Failed to spawn conversation agent for ${logValue(event.channelId)}:`, err);
         this.emitTrace({
           type: 'mcpl:conversation-spawn-failed',
           channelId: event.channelId,
@@ -9044,7 +9045,21 @@ export class AgentFramework {
         if (!server?.isConnected) throw new Error('server disconnected');
         return server.sendPushRender(params);
       },
-      audit: (record) => this.emitTrace({ type: 'mcpl:coalescing', ...record }),
+      audit: (record) => {
+        // A render result the host refused falls back to the occurrence's own
+        // content; say so on the host, with the server, the subject and the
+        // failing field, not only in the trace. The error is a field like the
+        // rest (logValue, spaces escaped), not a host-message tail: a server
+        // that answers push/render with an error chooses its message.
+        if (record.kind === 'render-failed') {
+          console.error(
+            `[push-render-failed] server=${logValue(record.serverId ?? '')} subject=${logValue(record.subject ?? '')} ` +
+            `eventId=${logValue(record.eventId ?? '')}${record.field !== undefined ? ` field=${logValue(record.field)}` : ''}: ` +
+            `${logValue(record.error ?? '')} (the occurrence's own content is delivered instead)`,
+          );
+        }
+        this.emitTrace({ type: 'mcpl:coalescing', ...record });
+      },
       save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
       recordReceipt: (record) => {
         // Written now, not at the throttled flush: an acknowledged acceptance
@@ -9151,7 +9166,7 @@ export class AgentFramework {
         throw new CoalesceError('eventId', 'eventId is required with coalesce');
       }
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(message.content, undefined, { allowEmpty: message.coalesce.retract === true });
+      validateCoalescedContent(message.content, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
       const result = await this.pushCoalescer.accept({
         serverId,
@@ -9178,7 +9193,7 @@ export class AgentFramework {
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
       if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(params.payload?.content, undefined, {
+      validateCoalescedContent(params.payload?.content, {
         allowEmpty: params.coalesce.retract === true || isSilentHeartbeatMarker({
           serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content,
         }),
@@ -9267,7 +9282,7 @@ export class AgentFramework {
         this.persistConversationRouterState();
         return [decision.agentName];
       } catch (err) {
-        console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
+        console.error(`[coalescing] could not spawn a conversation agent for ${logValue(occ.scope.id)}:`, err);
         return [];
       }
     }
@@ -9475,7 +9490,7 @@ export class AgentFramework {
     // model would wake to `[Continue]` or an older message re-presented as
     // the newest, a wake with no visible cause.
     if (isVisiblyEmptyContent(event.content) && !isSilentHeartbeatMarker(event)) {
-      console.error(`[push-event-dropped] server=${event.serverId} eventId=${event.eventId} reason=empty-content`);
+      console.error(`[push-event-dropped] server=${event.serverId} eventId=${logValue(event.eventId ?? '')} reason=empty-content`);
       this.emitTrace({ type: 'mcpl:empty-content-dropped', lane: 'push', serverId: event.serverId, eventId: event.eventId });
       return undefined;
     }
@@ -9540,7 +9555,7 @@ export class AgentFramework {
       const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
-      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
+      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
 
     if (event.triggerInference) {
