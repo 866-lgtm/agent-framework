@@ -15947,13 +15947,14 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
 
-    // Every connect needs a readable awareness ledger: a runtime connect's
-    // awareness barrier reconciles it, and a stdio child taking the
+    // Every legacy connect needs a readable awareness ledger: a runtime
+    // connect's awareness barrier reconciles it, and a stdio child taking the
     // protective default derives that from it. Read it first, so an
     // unreadable ledger refuses the connect before anything is registered
     // under its id or spawned (a reconnecting server would otherwise be left
     // registered as a closed stub). With no outbox configured nothing is read.
-    this.getPlacedReactionBaseline();
+    // A modern connection has no awareness barrier and no reaction default.
+    if (family === 'legacy') this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl).
@@ -16674,7 +16675,7 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
-    AgentFramework.usableConfigFamily(config);
+    const family = AgentFramework.usableConfigFamily(config);
     const inFlight = this.mcpServerOps?.get(id);
     if (inFlight) {
       // A connect or disconnect of the server being restarted, in flight,
@@ -16697,12 +16698,13 @@ export class AgentFramework {
     }
     const collision = this.mcplPrefixCollision(config, id);
     if (collision) throw new Error(collision);
-    // Every connect reads the awareness ledger: its awareness barrier
+    // A legacy connect reads the awareness ledger: its awareness barrier
     // reconciles it, and a stdio child taking the protective default derives
     // that from it. Read it before disconnecting, so an unreadable ledger
     // refuses the restart and leaves the running child up, whatever the
     // server's baseline or transport. (No outbox configured: nothing to read.)
-    this.getPlacedReactionBaseline();
+    // A modern connection reads neither.
+    if (family === 'legacy') this.getPlacedReactionBaseline();
 
     const claim: McpRestartClaim = { restarting: id };
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;

@@ -12,6 +12,7 @@ import { MockMembrane } from './helpers/mock-membrane.js';
 
 const ENV_KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
 const FIXTURE = fileURLToPath(new URL('./fixtures/reaction-baseline-mcpl-server.mjs', import.meta.url));
+const MODERN_FIXTURE = fileURLToPath(new URL('./fixtures/modern-mcp-server.mjs', import.meta.url));
 
 function server(overrides: Partial<McplServerConfig> = {}): McplServerConfig {
   return { id: 'probe', command: process.execPath, args: [FIXTURE], ...overrides };
@@ -289,6 +290,22 @@ describe('placed-reaction baseline', () => {
       assert.ok(await childEnv(fw).catch(() => undefined), 'the running child still answers');
     });
   }
+
+  it('a modern server connects and restarts on a corrupt ledger, which it never reads', async () => {
+    // A modern connection has no awareness barrier and no reaction default,
+    // so the ledger is no reason of its own to refuse it.
+    const fw = await create();
+    const modern = (id: string): McplServerConfig => ({
+      id, command: process.execPath, args: [MODERN_FIXTURE, join(dir, `${id}-starts.log`), join(dir, `${id}-events.log`)], protocol: 'modern',
+    });
+    await fw.connectMcplServer(modern('modern'));
+    writeFileSync(outboxPath, '{broken');
+    await fw.restartMcplServer('modern');
+    await fw.connectMcplServer(modern('second'));
+    assert.deepEqual(fw.listMcplServers().map((s) => [s.id, s.connected]).sort(), [['modern', true], ['second', true]]);
+    // A legacy connect still refuses on it.
+    await assert.rejects(() => fw.connectMcplServer(server()), accountingRefusal);
+  });
 
   it('passes a URL-only WebSocket config through unchanged', async () => {
     const fw = await create();

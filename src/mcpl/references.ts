@@ -356,7 +356,9 @@ function unrecognizedBlockNotice(reason: string): string {
  * without its URI: the host's reference id, what the server said about it in
  * this block (its labels stripped and bounded as in the stub), and `savedTo`,
  * the workspace path its payload was fetched to, or null when it wasn't
- * (`fetch_reference` takes the id as `ref_id`). A block the classifier
+ * (`fetch_reference` takes the id as `ref_id`). An unsaved reference that
+ * counts as expired also carries `expired`, the reason the stub gives in
+ * place of advising fetch_reference. A block the classifier
  * rejects becomes the notice the model's lanes show, and inline data that
  * also claims a bulk disposition the withheld notice, each as a text block.
  * A text block, or inline data that claims nothing, is returned as sent.
@@ -371,6 +373,8 @@ export function referenceBlockForScript(block: unknown): unknown {
     case 'reference': {
       const t = c.testimony;
       const record = referenceRegistry.register(t);
+      // As the stub judges it: a saved copy is still served.
+      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony);
       return {
         type: (block as { type: string }).type,
         refId: record.refId,
@@ -380,6 +384,7 @@ export function referenceBlockForScript(block: unknown): unknown {
         ...(t.digest !== undefined ? { digest: t.digest } : {}),
         ...(t.expiresAt !== undefined ? { expiresAt: sanitizeLabel(t.expiresAt, STUB_FIELD_CHARS) } : {}),
         savedTo: record.fetchedPath ?? null,
+        ...(expiry ? { expired: EXPIRY_REASON[expiry] } : {}),
       };
     }
   }
