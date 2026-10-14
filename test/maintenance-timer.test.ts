@@ -187,6 +187,30 @@ class FencingTickStrategy implements ContextStrategy {
   }
 }
 
+/** A strategy with work pending whose tick runs a hook: a surgery can begin inside a pass. */
+class HookedTickStrategy implements ContextStrategy {
+  readonly name = 'hooked-tick-test';
+  ticks = 0;
+  onTick?: () => void;
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'hooked tick queued' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    this.ticks++;
+    this.onTick?.();
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 class ToolModule implements Module {
   readonly name = 'maintenance-tools';
 
@@ -574,6 +598,80 @@ describe('queued context maintenance timer', () => {
       internals.surgeryHold = null;
       await waitFor(() => strategy.ticks >= 2);
     } finally {
+      internals.surgeryHold = null;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a pass starts no new tick once a surgery holds the store, and reads nothing after its ticks', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-mid-pass-'));
+    const strategy = new HookedTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (kind: string) => alerts.push(kind);
+    strategy.onTick = () => {
+      internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    };
+    try {
+      framework.start();
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      assert.equal(strategy.ticks, 1);
+      assert.equal(run.ticks, 1);
+      assert.equal(run.error, undefined);
+      assert.equal(run.readyAfter, undefined);
+      assert.equal(run.pendingAfter, undefined);
+      assert.deepEqual(alerts, []);
+    } finally {
+      internals.surgeryHold = null;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a failure met while a surgery holds the store is recorded and logged, without an alert', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-failure-'));
+    const strategy = new HookedTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (kind: string) => alerts.push(kind);
+    strategy.onTick = () => {
+      internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+      throw new Error('the store switched branches under the tick');
+    };
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      framework.start();
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
+      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      assert.equal(run.ticks, 0);
+      assert.equal(run.error, 'the store switched branches under the tick');
+      assert.equal(run.readyAfter, undefined);
+      assert.deepEqual(alerts, []);
+      assert.ok(logged.some((line) =>
+        line.includes('agent=agent stopped while a rollback holds the store')
+        && line.includes('the store switched branches under the tick')));
+    } finally {
+      console.error = consoleError;
       internals.surgeryHold = null;
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
