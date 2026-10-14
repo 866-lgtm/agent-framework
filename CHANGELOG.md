@@ -517,13 +517,26 @@ Releases up to and including 0.7.3 predate this file; for their contents see
     context-manager 0.13 or earlier** (added after the release): 0.14.0 stamps
     its persisted calibration multiplier with the pricing it was learned under.
     An unstamped multiplier is kept and re-stamped, unless the store holds
-    XML-history carriers, in which case it restarts from 1.0. Two kinds of
-    store can then refuse every compile with `OverBudgetError` before
-    inference: one whose multiplier was last learned before context-manager
-    0.11.0, and one that holds XML-history carriers and had learned a
-    multiplier below 1. With the host stopped, reset the first kind's
-    multiplier once, and re-stamp the second kind's checked value, as the
-    **Operators** entry of context-manager 0.14.0's changelog describes.
+    XML-history carriers, in which case it restarts from 1.0 and the value it
+    discarded is kept as `reset.discardedMultiplier` in the calibration state
+    (shown in `RenderStats.calibration`). Two kinds of store can then refuse
+    every compile with `OverBudgetError` before inference. One holds no
+    carriers and kept a multiplier last learned before its host moved to
+    context-manager 0.11.0; its record can't show that, so tell it by when
+    the host moved. The other holds carriers and had learned a multiplier
+    below 1, which its `reset.discardedMultiplier` shows. With the host
+    stopped, reset the first kind's multiplier once, and re-stamp the second
+    kind's checked value, as the **Operators** entry of context-manager
+    0.14.0's changelog describes.
+  - **What else hosts meet with context-manager 0.14.0** (added after the
+    release): a preview, or any compile made with `dryRun`, leaves the context
+    manager's estimate, its calibration and a pending kv-unified draft's marker
+    indices as it found them. The context manager's state queries (`isReady`,
+    `getPendingWork`, `getHotContextSettings`, `previewContext` and others)
+    throw while its strategy's initialization is pending or has failed, where
+    they used to answer. A reposted sharded document renders as two bodies, so
+    a stored conversation holding one misses the prompt cache once after the
+    upgrade.
 
 ## 0.21.0 — 2026-10-03
 
