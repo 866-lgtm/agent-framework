@@ -133,15 +133,15 @@ never do.
   (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
-  release; npm then commits and tags. `git push --follow-tags` triggers CI,
-  which refuses a tag with no matching changelog section, publishes
+  release; npm then commits and tags. `git push --follow-tags` triggers
+  CI, which refuses a tag with no matching changelog section, publishes
   `@animalabs/agent-framework` to npm, and creates the GitHub release with
   that section as its notes. The two release jobs are independent: some
   consumers run github-clone checkouts, so release notes must exist even
   when npm publish fails. Both need the build job, so a failed build stops
   both; past it, so do a tag with no changelog section, which neither can
-  release, and an open release hold (below), which each checks. Version bumps are a maintainer release-time action, not
-  part of feature PRs.
+  release, and an open release hold (below), which each checks. Version
+  bumps are a maintainer release-time action, not part of feature PRs.
 - **Release holds.** When releasing `main` as it stands would harm
   someone running it, open an issue that says what has to happen first
   and label it `release-hold`, or ask a maintainer to label it. Close it
