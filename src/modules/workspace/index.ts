@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { filesystemTrustsCtime, locateRoot } from './observe.js';
+import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1220,7 +1220,14 @@ export class WorkspaceModule implements Module {
           + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
           + 'directory) is unavailable and listed under `incomplete`. Reconnect the drive; acceptRoot is for a '
           + 'directory replaced on purpose, or a drive back under a new device number, never for one still '
-          + 'unplugged, whose empty mountpoint would become the root.',
+          + 'unplugged, whose empty mountpoint would become the root. What the scan passed over by design and '
+          + 'reported nowhere else is counted under `passedOver`, by mount and reason: entries the mount\'s '
+          + 'ignore list covers that hold nothing the workspace tracks (an ignored directory counts once). So a '
+          + 'total of 0, with no conflicts and nothing under `passedOver`, `incomplete` or `skipped`, means the '
+          + 'sync looked everywhere and nothing had changed. A path the mount ignores is synced when you name '
+          + 'it, and listed under `ignored`: a sync without a path passes over it. Naming an ignored directory '
+          + 'sets aside the patterns that cover it or a directory above it; one that covers only something '
+          + 'inside it still applies, and what it covers is passed over.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1407,11 +1414,27 @@ export class WorkspaceModule implements Module {
    * mount, through the same Chronicle-tree + auto-materialize path as the
    * `write` tool. Public API for the framework's synthesized `save_image`
    * tool and other peer callers that hold bytes rather than text.
+   *
+   * `branch`, when given, ties the write to that branch: the store's current
+   * branch is checked where the tree entry is set, nothing yielding between
+   * the check and the entry, so the file's tree entry lands on that branch or
+   * the write is refused, with `data: { branchLeft: true }`. A mount has one
+   * directory on disk, so with autoMaterialize the file's copy there is
+   * written like any other write's. The tool-result guard writes a
+   * withheld original this way, for the branch its stub is on
+   * (agent-framework #277).
+   *
+   * A write whose tree entry is set but that then fails returns success
+   * false with `data: { inChronicle: true }`: its copy on disk was refused, or
+   * something after the entry (recording its intent, the event, the push)
+   * threw. The workspace's tools read the file from the tree, so it is there
+   * for them, on the branch that was current when the entry was set.
    */
   async writeBinary(
     mountPrefixedPath: string,
     data: Buffer,
     mimeType: string,
+    options: { branch?: string } = {},
   ): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     let mount: MountState;
@@ -1435,14 +1458,28 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     return this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
+      // Checked inside the mount's turn, after anything the write waited on:
+      // commitToolChange sets the tree entry before it first yields.
+      if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
+        return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
+      }
       const blobHash = store.storeBlob(data, mimeType);
-      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
-      if (materializeError) {
-        return {
-          success: false,
-          error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
-          isError: true,
-        };
+      let committed = false;
+      let failure: string | null;
+      try {
+        const materializeError = await this.commitToolChange(mount, relativePath,
+          { kind: 'set', blobHash, size: data.byteLength }, () => { committed = true; });
+        failure = materializeError === null ? null
+          : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`;
+      } catch (error) {
+        if (!committed) throw error;
+        failure = `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
+      }
+      if (failure !== null) {
+        // The file is in the Chronicle tree, where the workspace's tools read
+        // it. `inChronicle` lets a caller that needs the file readable tell
+        // this from a write that never happened (agent-framework #281).
+        return { success: false, error: failure, isError: true, data: { inChronicle: true } };
       }
       return {
         success: true,
@@ -1894,6 +1931,7 @@ export class WorkspaceModule implements Module {
     mount: MountState,
     relativePath: string,
     change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
+    onCommitted?: () => void,
   ): Promise<string | null> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
@@ -1903,6 +1941,11 @@ export class WorkspaceModule implements Module {
     const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
     if (change.kind === 'set') {
       store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+      // A later intent update or disk push can throw; the tree entry is
+      // already set, on the branch current now. If the active branch changes
+      // during the push, that branch's tree has the file and the new one may
+      // not.
+      onCommitted?.();
       intents.update(relativePath, (cur) => {
         const next = { ...cur };
         delete next.tombstone;
@@ -2277,7 +2320,9 @@ export class WorkspaceModule implements Module {
         };
       }
 
-      return { success: true, data: { path: input.path, deleted: true } };
+      // Its whole receipt is what it changed: kept in the stub if the guard
+      // withholds the result (agent-framework #277).
+      return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
     });
   }
 
@@ -2725,6 +2770,10 @@ export class WorkspaceModule implements Module {
           : {}),
         ...(blocked.length > 0 ? { skipped: blocked } : {}),
       },
+      // What disk lost, then what it was written: kept in the stub if the
+      // guard withholds the result (agent-framework #277). What was left or
+      // skipped, and why, is in the full result.
+      keepWhenWithheld: ['deleted', 'materialized'],
     };
   }
 
@@ -2775,6 +2824,8 @@ export class WorkspaceModule implements Module {
     }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
     const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
+    const allPassedOver: Array<{ mount: string; reason: string; count: number }> = [];
+    const allIgnored: Array<{ mount: string; path: string; note: string }> = [];
     const rootsAccepted: string[] = [];
     if (input.acceptRoot && input.path) {
       return { success: false, error: 'acceptRoot takes a whole mount\'s root: give mount, or nothing, not path', isError: true };
@@ -2809,7 +2860,9 @@ export class WorkspaceModule implements Module {
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
-        const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn };
+        // named: ignore patterns covering the path asked for don't apply
+        // beneath it (a directory scope's walk; a path scope doesn't walk).
+        const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
         if (!isDir) return this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
         const beneath = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }, opts);
         // Something at the path itself is no part of a directory scope: a file
@@ -2824,12 +2877,15 @@ export class WorkspaceModule implements Module {
           || this.intents.get(name)!.get(relativePath) !== null;
         if (!atPath) return beneath;
         const itself = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
+        const passedOver = new Map(beneath.passedOver);
+        for (const [reason, count] of itself.passedOver) passedOver.set(reason, (passedOver.get(reason) ?? 0) + count);
         return {
           ops: [...beneath.ops, ...itself.ops],
           discarded: [...beneath.discarded, ...itself.discarded],
           newConflicts: [...beneath.newConflicts, ...itself.newConflicts],
           reports: new Map([...beneath.reports, ...itself.reports]),
           incomplete: [...beneath.incomplete, ...itself.incomplete],
+          passedOver,
           dirs: beneath.dirs,
           branchId: itself.branchId ?? beneath.branchId,
         };
@@ -2856,6 +2912,17 @@ export class WorkspaceModule implements Module {
         }
       }
       for (const region of pass.incomplete) allIncomplete.push({ mount: name, ...region });
+      for (const [reason, count] of pass.passedOver) allPassedOver.push({ mount: name, reason, count });
+      // A path named explicitly is synced even where the mount's ignore list
+      // covers it, and the result says so: a sync without a path passes
+      // over it, so nothing else keeps it current (agent-framework #276).
+      if (coveredByIgnore(relativePath, mount.config.ignore ?? [])) {
+        allIgnored.push({
+          mount: name,
+          path: relativePath,
+          note: 'this mount\'s ignore list covers it, so a sync without a path won\'t maintain it',
+        });
+      }
     }
 
     return {
@@ -2866,8 +2933,17 @@ export class WorkspaceModule implements Module {
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
         ...(allIncomplete.length > 0 ? { incomplete: allIncomplete } : {}),
+        ...(allPassedOver.length > 0 ? { passedOver: allPassedOver } : {}),
+        ...(allIgnored.length > 0 ? { ignored: allIgnored } : {}),
         ...(rootsAccepted.length > 0 ? { rootsAccepted } : {}),
       },
+      // What the workspace took from disk, gave up, or now holds as a
+      // conflict, per mount, and any root it accepted: kept in the stub if
+      // the guard withholds the result (agent-framework #277). What the scan
+      // skipped or couldn't see is in the full result.
+      // A root it accepted is short and telling: first, so a long results
+      // list can't cut it away.
+      keepWhenWithheld: ['rootsAccepted', 'results'],
     };
   }
 

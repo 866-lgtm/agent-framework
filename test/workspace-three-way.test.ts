@@ -570,6 +570,147 @@ describe('a path sync', () => {
   });
 });
 
+describe('a sync says what it passed over (agent-framework #276)', () => {
+  test('a sync without a path counts what the mount ignores, by mount and reason', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['*.md', 'node_modules'] });
+    env.writeDisk('LOG.md', 'an append-heavy log\n');
+    env.writeDisk('node_modules/a/index.js', 'one');
+    env.writeDisk('node_modules/b/index.js', 'two');
+    env.writeDisk('kept.txt', 'taken in');
+
+    const data = await call(m, 'sync', {});
+    assert.equal(data.totalSynced, 1, 'only kept.txt is looked at');
+    assert.deepEqual(data.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 2 }],
+      'LOG.md and node_modules, the directory counted once');
+    assert.equal(data.ignored, undefined, 'nothing was named, so nothing is listed as ignored');
+
+    const quiet = await call(m, 'sync', {});
+    assert.equal(quiet.totalSynced, 0);
+    assert.deepEqual(quiet.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 2 }],
+      'a 0 still says what it did not look at');
+  });
+
+  test('a symlink the mount follows was looked at, so it is not counted as passed over', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ followSymlinks: true });
+    env.writeDisk('real.txt', 'the target');
+    symlinkSync(env.disk('real.txt'), env.disk('link.txt'));
+
+    const data = await call(m, 'sync', {});
+    assert.equal(data.totalSynced, 2, 'the link is followed and taken in, beside its target');
+    assert.equal(data.passedOver, undefined);
+  });
+
+  test("a named directory the ignore list covers is synced, its contents included", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build/**'] });
+    env.writeDisk('build/out.txt', 'built');
+    env.writeDisk('build/sub/deep.txt', 'deeper');
+
+    const bare = await call(m, 'sync', {});
+    assert.equal(bare.totalSynced, 0);
+    assert.deepEqual(bare.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }]);
+
+    const named = await call(m, 'sync', { path: 'work/build' });
+    assert.equal(named.totalSynced, 2, 'both files beneath the named directory');
+    assert.equal(await contentOf(m, 'build/sub/deep.txt'), 'deeper');
+    assert.deepEqual(named.ignored, [{ mount: 'work', path: 'build',
+      note: "this mount's ignore list covers it, so a sync without a path won't maintain it" }]);
+    assert.equal(named.passedOver, undefined, 'nothing beneath the named directory was passed over');
+  });
+
+  test('naming an ignored directory sets aside only the patterns that cover it: one that covers something inside it still applies', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build/**', '*.md'] });
+    env.writeDisk('build/out.txt', 'built');
+    env.writeDisk('build/LOG.md', 'log');
+
+    const named = await call(m, 'sync', { path: 'work/build' });
+    assert.equal(named.totalSynced, 1, 'out.txt only');
+    assert.equal(await contentOf(m, 'build/out.txt'), 'built');
+    assert.equal(env.store.treeGet('workspace/work/tree', 'build/LOG.md'), null, 'LOG.md stays untracked');
+    assert.deepEqual(named.ignored.map(({ path }: { path: string }) => path), ['build']);
+    assert.deepEqual(named.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }], 'LOG.md was passed over');
+  });
+
+  test('a listing of a directory the ignore list covers keeps the ignore, and tracks nothing beneath it', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build/**'] });
+    env.writeDisk('build/sub/a.txt', 'ignored');
+    const listed = await call(m, 'ls', { path: 'work/build/sub', recursive: true });
+    assert.ok(!(listed.entries as Entry[]).some((e) => e.path === 'build/sub/a.txt' && e.state === 'synced'),
+      `the file isn't listed as tracked: ${JSON.stringify(listed.entries)}`);
+    assert.equal(env.store.treeGet(TREE, 'build/sub/a.txt'), null, 'nothing beneath the ignored directory is tracked');
+    const globbed = await call(m, 'glob', { pattern: 'work/build/**' });
+    assert.equal(env.store.treeGet(TREE, 'build/sub/a.txt'), null, `nor after a glob: ${JSON.stringify(globbed)}`);
+  });
+
+  test('a symlink is reported by path, not counted as passed over: not followed, or a link to a directory', async (t) => {
+    const env = new Env(t);
+    const plain = await env.open();
+    env.writeDisk('real.txt', 'the target');
+    symlinkSync(env.disk('real.txt'), env.disk('link.txt'));
+    const notFollowed = await call(plain, 'sync', {});
+    assert.equal(notFollowed.passedOver, undefined);
+    assert.ok((notFollowed.skipped as Array<{ path: string; reason: string }>).some((s) => s.path === 'link.txt'),
+      `the link is listed under skipped, got ${JSON.stringify(notFollowed.skipped)}`);
+
+    const env2 = new Env(t);
+    const following = await env2.open({ followSymlinks: true });
+    env2.writeDisk('dir/inside.txt', 'in a directory');
+    symlinkSync(env2.disk('dir'), env2.disk('dirlink'));
+    const followed = await call(following, 'sync', {});
+    assert.equal(followed.passedOver, undefined);
+    const skip = (followed.skipped as Array<{ path: string; reason: string }>).find((s) => s.path === 'dirlink');
+    assert.match(String(skip?.reason), /a symlink to a directory, not walked/);
+  });
+
+  test('an ignored region hides only what lies beneath it, not a sibling sharing its name prefix', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['build', 'build2'] });
+    env.writeDisk('build2/kept.txt', 'tracked, beneath the ignored build2');
+    env.writeDisk('build/out.txt', 'ignored, and never tracked');
+    await call(m, 'sync', { path: 'work/build2/kept.txt' }); // named, so tracked
+    const bare = await call(m, 'sync', {});
+    assert.deepEqual((bare.incomplete as Array<{ path: string }>).map((r) => r.path), ['build2'],
+      'build2 hides a tracked path');
+    assert.deepEqual(bare.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }],
+      'build hides nothing tracked: build2/kept.txt is not beneath it, though it shares the name prefix');
+  });
+
+  test('a path the mount ignores is taken when named, and the result says a bare sync will not maintain it', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['*.md', 'vendor'] });
+    env.writeDisk('LOG.md', 'an append-heavy log\n');
+    env.writeDisk('vendor/lib/notes.txt', 'beneath an ignored directory');
+
+    const named = await call(m, 'sync', { path: 'work/LOG.md' });
+    assert.equal(named.totalSynced, 1);
+    assert.deepEqual(named.ignored, [{ mount: 'work', path: 'LOG.md',
+      note: "this mount's ignore list covers it, so a sync without a path won't maintain it" }]);
+    assert.equal(await contentOf(m, 'LOG.md'), 'an append-heavy log\n');
+
+    const nested = await call(m, 'sync', { path: 'work/vendor/lib/notes.txt' });
+    assert.equal(nested.totalSynced, 1);
+    assert.deepEqual(nested.ignored?.map((i: { path: string }) => i.path), ['vendor/lib/notes.txt'],
+      'covered through the directory above it, which the list names');
+
+    env.writeDisk('plain.txt', 'not ignored');
+    const control = await call(m, 'sync', { path: 'work/plain.txt' });
+    assert.equal(control.totalSynced, 1);
+    assert.equal(control.ignored, undefined, 'a path the ignore list does not cover gets no note');
+
+    // Now tracked, both ignored regions hide something the workspace holds:
+    // a bare sync reports them under `incomplete`, and never counts them too.
+    const bare = await call(m, 'sync', {});
+    const regions = (bare.incomplete as Array<{ mount: string; path: string; reason: string }>)
+      .filter((r) => r.reason === 'ignored by the mount').map((r) => r.path).sort();
+    assert.deepEqual(regions, ['LOG.md', 'vendor']);
+    assert.equal(bare.passedOver, undefined, 'a region reported as incomplete is not also passed over');
+  });
+});
+
 describe('disk counterparts that are not stored', () => {
   test('a binary counterpart keeps the draft and a disk reference that reports a later change', async (t) => {
     const env = new Env(t);
