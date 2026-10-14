@@ -22,7 +22,9 @@
   arrives during a capacity hold or before a re-inference, and one drained
   at a budget restart's over-budget boundary, which before never moved the
   locus. Ambient traffic in a channel the turn hasn't sent into, reactions
-  and system markers don't move it.
+  and system markers don't move it, and neither does a message removed
+  before that start, such as an unread coalesced message its server
+  retracted: the newest qualifying message that remains decides.
 - A silent turn's tool boundary no longer re-pins its locus or adds a
   `[routing]` notice to its stream.
 - For a trunk agent, the channel context passed to `beforeInference` hooks

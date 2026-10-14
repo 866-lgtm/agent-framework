@@ -589,21 +589,31 @@ interface TurnRouting {
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
   /**
-   * Locus and hybrid mode: the channel the newest message that arrived
-   * between the turn's streams would re-pin the locus to (repinChannel),
-   * if one did. No tool boundary weighs such a message, since none of the
+   * Locus and hybrid mode: the messages that arrived between the turn's
+   * streams and would re-pin the locus (repinChannel), in the order they
+   * were stored. No tool boundary weighs such a message, since none of the
    * turn's streams was running: it was stored during a capacity hold or the
    * wait for a re-inference, or flushed at the end of a stream that didn't
    * settle the turn, or by the start that continues it (noteArrival). The
-   * turn's next start re-pins there and clears it, as a boundary would have.
+   * turn's next start re-pins to the newest one still in the agent's store
+   * and clears them all, as a boundary would have weighed its injections
+   * (remainingArrival). One removed meanwhile, such as an unread coalesced
+   * message its server retracted, isn't there for the agent to answer.
    */
-  arrival?: string;
+  arrivals: Arrival[];
+}
+
+/** A message that would re-pin its turn's locus (TurnRouting.arrivals). */
+interface Arrival {
+  messageId: MessageId;
+  /** The channel it re-pins the locus to. */
+  channelId: string;
 }
 
 function freshTurnRouting(): TurnRouting {
   return {
     engaged: new Set(), destination: null, hybridHold: false,
-    continuation: false, deliveries: [], suppressed: 0,
+    continuation: false, deliveries: [], suppressed: 0, arrivals: [],
   };
 }
 
@@ -7216,11 +7226,14 @@ export class AgentFramework {
           // queued, they flush at the target's own next boundary — with
           // injection — or in driveStream's finally when its turn ends.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+          // The injected messages' ids, for a boundary that leaves them to the
+          // turn's next start as arrivals.
+          const injectedIds = new Map<object, MessageId>();
           {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
               for (const msg of deferred) {
-                agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+                const id = agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -7230,11 +7243,13 @@ export class AgentFramework {
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
                 if (!hasToolBlocks && msg.participant !== agent.name) {
-                  midTurnInjections.push({
+                  const injection = {
                     participant: msg.participant,
                     content: msg.content,
                     ...(msg.metadata ? { metadata: msg.metadata } : {}),
-                  });
+                  };
+                  midTurnInjections.push(injection);
+                  injectedIds.set(injection, id);
                 }
               }
             }
@@ -7348,7 +7363,7 @@ export class AgentFramework {
             // stream to tell) leaves its injections to the turn's next start,
             // as arrivals: a budget restart, or a re-inference on these tool
             // results.
-            for (const inj of midTurnInjections) this.noteArrival(agent.name, inj.metadata);
+            for (const inj of midTurnInjections) this.noteArrival(agent.name, inj.metadata, injectedIds.get(inj)!);
           }
 
           if (shouldEndTurn) {
@@ -9180,14 +9195,33 @@ export class AgentFramework {
   /**
    * Weigh a message stored for an agent whose logical turn is open while
    * none of the turn's streams is running, so that no tool boundary will
-   * weigh it: one that would re-pin the locus becomes the turn's arrival,
-   * the newest replacing any before it (TurnRouting.arrival).
+   * weigh it: one that would re-pin the locus becomes one of the turn's
+   * arrivals (TurnRouting.arrivals).
    */
-  private noteArrival(agentName: string, metadata: MessageMetadata | undefined): void {
+  private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
     const channelId = this.repinChannel(metadata, open);
-    if (channelId) open.arrival = channelId;
+    if (channelId) open.arrivals.push({ messageId, channelId });
+  }
+
+  /**
+   * The channel of the turn's newest arrival whose message is still in the
+   * agent's store (TurnRouting.arrivals). A message removed since it was
+   * stored, such as an unread coalesced message its server retracted, moves
+   * nothing, and an earlier one that remains still does. Compression keeps a
+   * message in the store; the last compile can't be the test, since an
+   * arrival between the turn's streams isn't in it yet.
+   */
+  private remainingArrival(agent: Agent, routing: TurnRouting): string | undefined {
+    const cm = agent.getContextManager();
+    for (let i = routing.arrivals.length - 1; i >= 0; i--) {
+      const { messageId, channelId } = routing.arrivals[i]!;
+      let stored: StoredMessage | null;
+      try { stored = cm.getMessage(messageId); } catch { stored = null; }
+      if (stored) return channelId;
+    }
+    return undefined;
   }
 
   /**
@@ -9822,7 +9856,7 @@ export class AgentFramework {
             const id = agent.getContextManager().addMessage(
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
-            this.noteArrival(agent.name, msg.metadata);
+            this.noteArrival(agent.name, msg.metadata, id);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -9978,9 +10012,9 @@ export class AgentFramework {
       // Every other start of the turn keeps its locus: a resume, or a start
       // that continues the open turn. A message that arrived while none of
       // the turn's streams was running can still move it, as it would have
-      // at a tool boundary: no boundary drained it (TurnRouting.arrival).
-      const arrival = routing.arrival;
-      routing.arrival = undefined;
+      // at a tool boundary: no boundary drained it (TurnRouting.arrivals).
+      const arrival = this.remainingArrival(agent, routing);
+      routing.arrivals = [];
       if (arrival && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
         this.repinTurnLocus(agent, routing, arrival, 'arrival');
       }
@@ -13540,7 +13574,7 @@ export class AgentFramework {
     // Stored while none of the agent's turns is alive, or assembled for the
     // start now beginning: no tool boundary will weigh it.
     if (!this.activeTurnTokens.has(agent.name) || opts?.bypassDeferralFor === agent.name) {
-      this.noteArrival(agent.name, metadata);
+      this.noteArrival(agent.name, metadata, stored);
     }
     return stored;
   }
@@ -16098,8 +16132,11 @@ export class AgentFramework {
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
               callingTurn.locus = opened;
               // The announce baseline is the agent's, across turns: it takes
-              // only a move this result tells the agent, while its turn runs.
-              if (this.turnRouting.get(agentName) === callingTurn) this.lastAnnouncedLocus.set(agentName, opened);
+              // only a move this result tells the agent, which needs its turn
+              // still open. A result that lands after the turn settled is
+              // dropped, so the agent never reads it, whether or not a later
+              // start has replaced the turn's routing state yet.
+              if (this.openLogical.get(agentName) === callingTurn) this.lastAnnouncedLocus.set(agentName, opened);
               result = {
                 ...result,
                 data: {

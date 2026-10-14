@@ -998,11 +998,11 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
     const h = await harness([[answer()]], { proseRouting: mode });
     type Routing = { pin?: string; destination: string | null; hybridHold: boolean;
       continuation: boolean; deliveries: string[]; suppressed: number;
-      triggerChannel?: string; locus?: string; engaged: Set<string>; arrival?: string };
+      triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
     const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
       continuation: true, deliveries: ['chan-earlier'], suppressed: 2,
-      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrival: 'chan-earlier' });
+      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrivals: [{ messageId: 'earlier-message', channelId: 'chan-earlier' }] });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
     try {
@@ -1018,7 +1018,7 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
-      assert.equal(now?.arrival, undefined, `${mode}: no arrival carried into the new turn`);
+      assert.deepEqual(now?.arrivals, [], `${mode}: no arrival carried into the new turn`);
       assert.deepEqual(earlier, earlierFields(),
         `${mode}: all earlier-turn routing and receipt state stays with its queued prose`);
     } finally {

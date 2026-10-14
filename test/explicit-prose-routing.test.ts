@@ -357,12 +357,12 @@ describe('explicit prose routing', () => {
   type RoutingState = {
     pin?: string; destination: string | null; hybridHold: boolean;
     continuation: boolean; deliveries: string[]; suppressed: number;
-    triggerChannel?: string; locus?: string; engaged: Set<string>; arrival?: string;
+    triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
     destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
-    engaged: new Set(), ...fields,
+    engaged: new Set(), arrivals: [], ...fields,
   });
 
   async function within<T>(promise: Promise<T>, label: string, ms = 5000): Promise<T> {
@@ -944,7 +944,7 @@ describe('explicit prose routing', () => {
       // Everything the open turn has decided about where its speech goes.
       const decided = (): RoutingState => routingState({
         continuation: true, pin: 'chan-alpha', hybridHold: true, triggerChannel: 'chan-alpha',
-        locus: 'world:commons', engaged: new Set(['discord:g:cafe']), arrival: 'discord:g:cafe',
+        locus: 'world:commons', engaged: new Set(['discord:g:cafe']), arrivals: [{ messageId: 'cafe-message', channelId: 'discord:g:cafe' }],
       });
       const open = decided();
       internals.openLogical.set('assistant', open);
@@ -1777,13 +1777,13 @@ describe('explicit prose routing', () => {
       // Someone addresses the agent from another channel while the turn waits.
       internals.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[],
         { channelId: 'discord:g:cafe', tags: ['chat:addressed'] });
-      assert.equal(earlier.arrival, 'discord:g:cafe', 'it is the turn\'s arrival');
+      assert.deepEqual(earlier.arrivals.map((a) => a.channelId), ['discord:g:cafe'], 'it is the turn\'s arrival');
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
       await within(framework.runUntilIdle(), 'the re-inference', 10000);
 
       assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), [{ text: 'carrying on', locus: 'chan-alpha' }]);
       assert.equal(earlier.locus, undefined, 'no locus');
-      assert.equal(earlier.arrival, undefined, 'the arrival is used up');
+      assert.deepEqual(earlier.arrivals, [], 'the arrival is used up');
       assert.ok(!context(framework).texts.some((t) => t.includes('The conversation moved to')), 'and no routing notice');
     } finally {
       await framework.stop();
