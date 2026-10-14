@@ -461,6 +461,27 @@ test("a stop() that begins in a restart's gap ends it, and the restart says the 
   });
 });
 
+test("a disconnect of the id a restart moves to ends the restart, even one that finishes before the restart's connect", async (t) => {
+  await withFramework(true, async (framework) => {
+    const disconnect = (framework as unknown as Inner).runDisconnectMcplServer.bind(framework);
+    t.mock.method(framework as unknown as Inner, 'runDisconnectMcplServer', async (id: string) => {
+      await disconnect(id);
+      // In the restart's gap, the id it moves to is disconnected, and that
+      // disconnect is over before the restart's connect begins.
+      if (id === 'first') await framework.disconnectMcplServer('second');
+    });
+    await assert.rejects(
+      framework.restartMcplServer('first', serverConfig('second') as never),
+      /^Error: MCP server "first" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "second" was disconnected, which ends the restart of "first"$/,
+    );
+    assert.deepEqual(framework.listMcplServers(), [], 'nothing was connected under the new id');
+    assert.ok(!framework.getAllTools().some(tool => tool.name.startsWith('mcpl--second--')));
+    // The id and the prefix are free again.
+    await framework.connectMcplServer(serverConfig('second') as never);
+    assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]), [['second', true]]);
+  });
+});
+
 /** A stdio server that reads its input and never answers, so a connect waits in its handshake. */
 const SILENT = { id: 'silent', command: process.execPath, args: ['-e', 'process.stdin.resume()'] };
 

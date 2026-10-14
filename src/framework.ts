@@ -1539,9 +1539,10 @@ type AnswerOnce = {
   answered: () => boolean;
 };
 
-/** A restart's hold on the id and tool prefix it is moving its server to;
- *  `restarting` names the server it restarts. Compared by identity. */
-type McpRestartClaim = { readonly restarting: string };
+/** A restart's hold on the id and tool prefix it moves its server to;
+ *  `restarting` names the server it restarts. Compared by identity.
+ *  `endedBy` says what ended it before its connect: a disconnect of that id. */
+type McpRestartClaim = { readonly restarting: string; endedBy?: string };
 
 /**
  * Wrap a server request's responder so the request is answered at most once,
@@ -17235,6 +17236,10 @@ export class AgentFramework {
    */
   async disconnectMcplServer(id: string): Promise<void> {
     this.refuseOperatorAfterStop('disconnect MCPL server');
+    // A restart moving its server to this id is ended by this disconnect,
+    // even one that finishes before the restart's connect begins.
+    const claim = this.restartClaims().ids.get(id);
+    if (claim) claim.endedBy = `MCP server "${id}" was disconnected, which ends the restart of "${claim.restarting}"`;
     return this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(id));
   }
 
@@ -17446,6 +17451,8 @@ export class AgentFramework {
       if (claim) return `MCP server "${id}" is being disconnected, which ends the restart of "${claim.restarting}"`;
       return `${refused}MCP server "${id}" is still being disconnected; ${retry} once that has finished`;
     }
+    // A disconnect of the id began during the restart, and has finished.
+    if (claim?.endedBy) return claim.endedBy;
     const registered = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
     if (op || registered) {
       const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
