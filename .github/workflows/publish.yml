@@ -62,9 +62,11 @@ jobs:
     # exchanges it for a publish credential. No long-lived NPM_TOKEN secret.
     # npm-side config: npmjs.com -> package -> Settings -> Trusted Publishers
     # -> GitHub Actions, matching the repo + this workflow path.
+    # issues: read lets prepublishOnly's release-hold check list the holds.
     permissions:
       contents: read
       id-token: write
+      issues: read
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -95,6 +97,10 @@ jobs:
 
       - name: Publish
         run: npm publish --access public --provenance
+        env:
+          # prepublishOnly checks the release holds again, as the build job
+          # did, with the same token.
+          GH_TOKEN: ${{ github.token }}
 
   github-release:
     name: GitHub release notes
