@@ -713,6 +713,19 @@ function logSeedOmissions(
   );
 }
 
+/**
+ * A maintenance provider call withdrawn because a surgery holds the store. It
+ * sent nothing: it was refused at the provider gate, or woken there from its
+ * wait. context-manager keeps the work it was for queued, with no attempt
+ * counted, and the next pass after the hold does it again.
+ */
+class MaintenanceWithdrawnError extends Error {
+  constructor(hold: { verb: string; agentName: string }) {
+    super(`maintenance call withdrawn: a live ${hold.verb} for ${hold.agentName} holds the store`);
+    this.name = 'MaintenanceWithdrawnError';
+  }
+}
+
 class DiscordAwarenessAccountingError extends Error {
   constructor(operation: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
@@ -2878,6 +2891,7 @@ export class AgentFramework {
   private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T> {
     const gate = this.providerGate(agentName);
     this.refuseHeldProviderModel(agentName, model);
+    this.withdrawMaintenanceUnderSurgery();
     if (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
       try {
@@ -2889,6 +2903,8 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
     }
+    // A surgery that took the store while this call was parked withdraws it.
+    this.withdrawMaintenanceUnderSurgery();
     // A wait recorded while this call was parked binds it too.
     this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
@@ -2909,6 +2925,16 @@ export class AgentFramework {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
     }
+  }
+  /**
+   * Maintenance makes no provider call while a surgery holds the store. The
+   * surgery waits for the maintenance work that is running before it moves
+   * the branch, so a call that parked at the gate would make it wait on
+   * whatever reopens the gate: the end of a cooldown, or the retry turn a
+   * cooldown queues, which the hold itself keeps from starting.
+   */
+  private withdrawMaintenanceUnderSurgery(): void {
+    if (this.surgeryHold) throw new MaintenanceWithdrawnError(this.surgeryHold);
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
@@ -3508,6 +3534,10 @@ export class AgentFramework {
       const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
       // Settled, not all: the pass ends only when every agent's work has.
       const outcomes = await Promise.allSettled(running.map(async ({ agent, cm, record }) => {
+        // A tick whose provider call a surgery withdrew ends this agent's
+        // work for the pass, as the hold would have before its next tick: it
+        // is no failure, and what the failure reports remember stays as it is.
+        let withdrawn = false;
         try {
           for (
             let i = 0;
@@ -3518,22 +3548,27 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          this.reportMaintenanceFailure(
-            agent.name,
-            record,
-            error instanceof Error ? String(error.message) : failureDescription(error),
-          );
+          if (error instanceof MaintenanceWithdrawnError) {
+            withdrawn = true;
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+          } else {
+            this.reportMaintenanceFailure(
+              agent.name,
+              record,
+              error instanceof Error ? String(error.message) : failureDescription(error),
+            );
+          }
         } finally {
           record.finishedAt = Date.now();
           const state = this.contextReadiness(cm);
           if ('error' in state) {
             // A run records an agent's first failure: a readiness refusal
             // after a tick that failed is read again by the next pass.
-            if (record.error === undefined) this.reportMaintenanceFailure(agent.name, record, state.error);
+            if (record.error === undefined && !withdrawn) this.reportMaintenanceFailure(agent.name, record, state.error);
           } else {
             record.readyAfter = state.ready;
             if (state.pending) record.pendingAfter = state.pending;
-            if (record.error === undefined) this.maintenanceFailureReported.delete(agent.name);
+            if (record.error === undefined && !withdrawn) this.maintenanceFailureReported.delete(agent.name);
           }
           const progress = this.contextProgress(cm);
           if (progress) record.progressAfter = progress;
@@ -7760,6 +7795,9 @@ export class AgentFramework {
     // arrivals during the awaited switch (see surgeryHold).
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
+    // Maintenance calls parked at a provider gate wake, find the hold and are
+    // withdrawn, so the wait for running maintenance can't wait on them.
+    for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
     // stop() waits for the release (see stopOwned): a surgery admitted before
     // stop() began finishes, flush included, before the store closes.
     let settle!: () => void;
@@ -15740,7 +15778,11 @@ export class AgentFramework {
               `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
           );
         } catch (err) {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          if (err instanceof MaintenanceWithdrawnError) {
+            console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+          } else {
+            console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          }
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
