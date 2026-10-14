@@ -793,10 +793,32 @@ describe('stop() with an operator operation in flight', () => {
     };
     await framework.switchBranch('side');
     assert.equal(delivering, true, 'the switch started the delivery and answered without it');
-    await framework.stop();
+    // A budget, so a stop() that waited for the delivery would fail rather than hang.
+    await framework.stop(1_000);
     assert.ok(order.includes('modules stopped'));
     assert.equal(framework.getStore().isClosed(), true);
     assert.deepEqual(rejections, []);
+  });
+
+  it('a delivery that stop() cuts off is logged without an ops alert', async () => {
+    const framework = await create();
+    const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
+    await api.cmdBranchCreate({ name: 'side' });
+    let fail!: (error: Error) => void;
+    internals(framework).beginDiscordAwarenessBarrier = () => ({
+      requiresBarrier: true,
+      promise: new Promise((_resolve, reject) => { fail = reject; }),
+    });
+    const alerts: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push((event as { kind?: string }).kind ?? '');
+    });
+    await framework.switchBranch('side');
+    const stopping = framework.stop();
+    fail(new Error('connection closed'));
+    await stopping;
+    await until(() => logged.some((line) => line.includes('delivery after branch switch agent=framework failed')), 'the failure to be logged');
+    assert.deepEqual(alerts.filter((kind) => kind === 'discord-awareness-delivery'), []);
   });
 
   it('a branch switch during a live turn is refused, and the branch stays', async () => {
