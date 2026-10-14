@@ -977,6 +977,47 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it('a rollback waits for an over-budget drain kick\'s tick in flight, and the kick ticks no more under the hold', { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-drain-hold-'));
+    const strategy = new GatedTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    strategy.framework = framework;
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const first = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
+    cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+    const internals = framework as unknown as {
+      surgeryHold: unknown;
+      noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
+    };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      // A refused compile kicks the drain, whose first tick waits on the gate.
+      internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
+      await waitFor(() => strategy.ticks === 1);
+      const moved = framework.rollbackToMessage('agent', { messageId: first });
+      await waitFor(() => internals.surgeryHold !== null);
+      assert.equal(cm.currentBranch().name, 'main', 'the rollback waits for the drain kick\'s tick');
+      strategy.release();
+      await moved;
+      assert.equal(strategy.branchAtFirstTickEnd, 'main');
+      assert.equal(strategy.ticksUnderHold, 0, 'the kick starts no tick while the rollback holds the store');
+      assert.notEqual(cm.currentBranch().name, 'main');
+    } finally {
+      console.error = quiet;
+      strategy.release();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('no pass starts while a surgery holds the store', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-hold-'));
     const strategy = new QueuedStrategy();
