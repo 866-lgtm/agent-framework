@@ -280,6 +280,35 @@ test("a connect between a restart's disconnect and its connect is refused the id
   });
 });
 
+test('a restart of an id another restart holds is refused before it tears anything down', async (t) => {
+  await withFramework(true, async (framework) => {
+    await framework.connectMcplServer(serverConfig('second') as never);
+    const disconnect = framework.disconnectMcplServer.bind(framework);
+    let during: (() => Promise<void>) | undefined;
+    const refusals: string[] = [];
+    t.mock.method(framework, 'disconnectMcplServer', async (id: string) => {
+      await disconnect(id);
+      // Between the restart's disconnect and its connect, only its claims hold these ids.
+      const attempt = during;
+      during = undefined;
+      if (attempt) {
+        await attempt().then(() => refusals.push('restarted'), (error: unknown) => refusals.push((error as Error).message));
+      }
+    });
+    // A restart under the same id holds it.
+    during = () => framework.restartMcplServer('first', serverConfig('first') as never);
+    await framework.restartMcplServer('first');
+    // A restart under a new id holds the new one.
+    during = () => framework.restartMcplServer('renamed', serverConfig('renamed') as never);
+    await framework.restartMcplServer('second', serverConfig('renamed') as never);
+    assert.deepEqual(refusals, [
+      'MCP server "first" was not restarted: it is being restarted; restart it once that has finished',
+      'MCP server "renamed" was not restarted: the restart of "second" holds its id; restart it once that has finished',
+    ]);
+    assert.deepEqual(framework.listMcplServers().map(s => [s.id, s.connected]).sort(), [['first', true], ['renamed', true]]);
+  });
+});
+
 test('a restart that fails releases the id and the tool prefix it held', async (t) => {
   await withFramework(true, async (framework) => {
     t.mock.method(framework, 'disconnectMcplServer', async () => {
