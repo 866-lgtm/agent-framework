@@ -12,6 +12,20 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+**Operators upgrading from 0.22.0:** a provider's stated `retry-after` now
+holds the agent's turns, recorded in the store and kept across restarts,
+where 0.22.0 slept it inside the turn and `stop()` couldn't end the sleep. A
+hold longer than an hour raises a `provider-wait` ops alert, and the
+`release-provider-wait` host command lifts one. Discord reaction suppression
+now also covers 💤, the awareness emoji and retained recovery emoji by
+default; a host that injects the old refusal-only default should remove it.
+Going back to 0.22.0 is safe: it opens a store 0.22.1 wrote and ignores the
+recorded waits, so a long `retry-after` is slept inside the turn again, and a
+wait recorded before going back binds again if you return before it passes.
+Not tested: going back while the recorded waits can't be read (0.22.1 then
+holds every provider call), and going back under connectome-host rather than
+a bare framework.
+
 ## 0.22.0 — 2026-10-13
 
 ### Breaking
