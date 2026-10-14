@@ -4382,6 +4382,13 @@ export class AgentFramework {
       console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
       return { ...this.getContextMaintenanceSnapshot(), ran: false };
     }
+    if (this.surgeryHold) {
+      // No pass starts while a surgery holds the store (runQueuedMaintenance).
+      console.warn(
+        `[host-mode] maintenanceTick: a ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — no pass executed`,
+      );
+      return { ...this.getContextMaintenanceSnapshot(), ran: false };
+    }
     this.startQueuedMaintenance();
     await this.maintenancePass;
     return { ...this.getContextMaintenanceSnapshot(), ran: true };
