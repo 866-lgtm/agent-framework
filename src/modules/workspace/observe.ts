@@ -884,19 +884,24 @@ export async function walkScope(
    * now. What was taken stays taken: the pass observes it by path.
    */
   const dropBeneath = (rel: string): void => {
+    const beneath = (path: string): boolean => rel === '' || path.startsWith(rel + '/');
     for (const [path, listing] of listings) {
-      if (rel !== '' && path !== rel && !path.startsWith(rel + '/')) continue;
+      if (path !== rel && !beneath(path)) continue;
       if (listing) {
-        for (const [leaf, isFile] of listing.leaves) {
-          if (isFile) walk.seen.delete(leaf);
-          else if (!walk.othersTaken.has(leaf)) walk.others.delete(leaf);
-        }
+        for (const [leaf, isFile] of listing.leaves) if (isFile) walk.seen.delete(leaf);
         for (const sub of listing.subdirs) walk.dirs.delete(sub);
       }
       walk.complete.delete(path);
       listings.set(path, null);
     }
-    for (const path of walk.missing) if (rel === '' || path.startsWith(rel + '/')) walk.missing.delete(path);
+    // The links, ignored names and other entries those listings showed, and
+    // the regions they gave rise to, described the directory that was there.
+    for (const [path] of walk.others) if (beneath(path) && !walk.othersTaken.has(path)) walk.others.delete(path);
+    for (let i = walk.incomplete.length - 1; i >= 0; i--) {
+      const region = walk.incomplete[i]!;
+      if ((region.kind === 'symlink' || region.kind === 'ignored') && beneath(region.path)) walk.incomplete.splice(i, 1);
+    }
+    for (const path of walk.missing) if (beneath(path)) walk.missing.delete(path);
   };
 
   const list = async (dir: CheckedDir): Promise<Listing | null> => {
@@ -923,7 +928,12 @@ export async function walkScope(
         // Gone since it was checked: absent beneath only if that can be shown.
         const proof = rel === '' ? ROOT_UNAVAILABLE : await confirmAbsent(view, rootReal, rel, 'beneath');
         if (typeof proof === 'string') fail(rel, proof);
-        else walk.missing.add(rel);
+        else {
+          walk.missing.add(rel);
+          // Nothing was listed, so a later check that finds it again, on the
+          // wrap, lists it afresh.
+          listings.delete(rel);
+        }
         return null;
       }
       fail(rel, `cannot list (${code ?? String(err)})`);

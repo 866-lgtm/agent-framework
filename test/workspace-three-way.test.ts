@@ -2504,6 +2504,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     // the third pass takes zz/t1.txt and zz/t2.txt, not l3.
     env.writeDisk('zz/t3.txt', 'changed behind l3');
     await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'l1', 'l2', 'l3', 'zz/t1.txt', 'zz/t2.txt'], 'the third pass took zz/t1.txt and zz/t2.txt');
     assert.equal(await contentOf(m, 'l3'), 'target zz/t3.txt');
   });
 
@@ -2574,6 +2575,61 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       assert.match(reason ?? '', /walk cap \(2\) was reached/, `${p}: ${reason}`);
     }
     assert.ok(!(third.incomplete ?? []).some((r: { path: string }) => ['l1', 'l2', 'l3'].includes(r.path)), JSON.stringify(third.incomplete));
+  });
+
+  test("a replaced directory's untaken links and ignored names are no longer counted, as the cap's or as passed over", async (t) => {
+    const env = new Env(t);
+    for (const f of ['s/a.txt', 's/b.txt', 's/c.txt', 's/x.log', 't/x.txt']) env.writeDisk(f, f);
+    symlinkSync(env.disk('t/x.txt'), env.disk('s/aa-link'));
+    const m = await env.open({ walkCap: 3, ignore: ['*.log'] });
+    await call(m, 'sync', {}); // s/a.txt, s/aa-link, s/b.txt: the place is s/b.txt
+    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), 's/b.txt');
+    // The after stretch takes s/c.txt and lists t/, while s/ is replaced; the
+    // wrap then meets another s/, so the old listing's a.txt, aa-link and
+    // x.log (ignored) describe nothing there.
+    let swapped = false;
+    let synced: any;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!swapped && String(path).endsWith(`${'/'}t`)) {
+        swapped = true;
+        renameSync(env.disk('s'), join(env.root, 's-away'));
+        for (const f of ['s/a.txt', 's/b.txt', 's/c.txt']) env.writeDisk(f, f);
+      }
+      return readdir(path, ...rest);
+    }, async () => {
+      synced = await call(m, 'sync', {});
+    });
+    assert.ok(swapped);
+    assert.ok(synced.incomplete.some((r: { path: string; reason: string }) => r.path === 's' && /changed while the walk ran/.test(r.reason)), JSON.stringify(synced.incomplete));
+    // The pass took two entries of its three: nothing is the cap's.
+    assert.ok(!synced.incomplete.some((r: { reason: string }) => /walk cap/.test(r.reason)), JSON.stringify(synced.incomplete));
+    assert.equal(synced.passedOver, undefined, JSON.stringify(synced.passedOver));
+  });
+
+  test('a directory gone when the after stretch lists it, and back by the wrap, is listed afresh there', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ walkCap: 2 });
+    for (const f of ['m/1.txt', 'm/2.txt', 'm/3.txt', 'z/q.txt']) await seedSynced(env, m, f, f);
+    await call(m, 'sync', {}); // takes m/1, m/2: the place is m/2.txt
+    // m/ is there when it's checked and gone when it's listed, so the after
+    // stretch proves it missing; while z/ is listed, it comes back, with an
+    // edit to m/1.txt the wrap takes.
+    let removed = false;
+    let restored = false;
+    await withFsPromises('readdir', (readdir) => async (path: string, ...rest: unknown[]) => {
+      if (!removed && String(path).endsWith(`${'/'}m`)) {
+        removed = true;
+        rmSync(env.disk('m'), { recursive: true });
+      }
+      if (!restored && String(path).endsWith(`${'/'}z`)) {
+        restored = true;
+        env.writeDisk('m/1.txt', 'm/1.txt edited while it was gone');
+        for (const f of ['m/2.txt', 'm/3.txt']) env.writeDisk(f, f);
+      }
+      return readdir(path, ...rest);
+    }, () => call(m, 'sync', {}));
+    assert.ok(removed && restored);
+    assert.equal(await contentOf(m, 'm/1.txt'), 'm/1.txt edited while it was gone');
   });
 
   test('an accepted new root starts with no place', async (t) => {

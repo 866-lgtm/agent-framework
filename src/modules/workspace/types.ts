@@ -44,7 +44,8 @@ export interface MountConfig {
   maxFileSize?: number;
   /**
    * The most entries one walk of this mount takes (default: 5000), a
-   * positive integer: files, and links or other entries that aren't
+   * positive integer no larger than Number.MAX_SAFE_INTEGER: files, and
+   * links or other entries that aren't
    * directories, each of which the pass observes. A sync or scan that
    * reaches it reports the rest as incomplete, and the next sync or scan of
    * the same scope resumes after the last entry it took, wrapping to the
