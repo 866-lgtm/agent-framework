@@ -251,14 +251,7 @@ export class McplServerConnection extends EventEmitter {
     // written to the next transport (sameTransport). The host's own reports
     // about the transport stay too: its lifecycle (connect-failed,
     // reconnect-failed), the server's stderr, and orphaned-response audits.
-    const held = this.bufferedEvents.length;
-    const dropped = McplServerConnection.PROCESS_EVENTS;
-    this.bufferedEvents = this.bufferedEvents.filter((item) => !dropped.has(item.event));
-    if (this.bufferedEvents.length < held) {
-      console.error(
-        `[mcpl] ${this.id}: dropped ${held - this.bufferedEvents.length} held message(s) from a transport that closed`,
-      );
-    }
+    this.bufferedEvents = this.keepAcrossBoundary(this.bufferedEvents);
     // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
     // server sends it again, and until then receives metadata only.
     this.toolObserveFilter = null;
@@ -267,6 +260,20 @@ export class McplServerConnection extends EventEmitter {
     // transport, and a fresh initialize starts a fresh manifest history
     // (Sol, PR #84 review — they previously survived into the new epoch).
     this.manifestState = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
+  }
+
+  /** What of these held items a transport boundary keeps (see
+   *  resetPolicyForTransportBoundary), in order; the rest is logged and
+   *  dropped. */
+  private keepAcrossBoundary(held: Array<{ event: string; args: unknown[] }>): Array<{ event: string; args: unknown[] }> {
+    const dropped = McplServerConnection.PROCESS_EVENTS;
+    const kept = held.filter((item) => !dropped.has(item.event));
+    if (kept.length < held.length) {
+      console.error(
+        `[mcpl] ${this.id}: dropped ${held.length - kept.length} held message(s) from a transport that closed`,
+      );
+    }
+    return kept;
   }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
@@ -368,12 +375,29 @@ export class McplServerConnection extends EventEmitter {
         `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
       );
     }
+    // Re-enter the gate for every buffered item. A control handler (a
+    // host/command quiesce, say) may pause the data plane while this
+    // snapshot is being flushed; later data items must observe that pause.
+    this.flushHeld(pending);
+  }
+
+  /**
+   * Re-emit a held snapshot in order, through the admission gate (this.emit).
+   * A transport boundary crossed during the flush (a listener that closes
+   * the connection, say) leaves the rest of the snapshot to the boundary rule,
+   * as if it had still been held: what the server said about its own process
+   * is dropped, and the rest is held again, after whatever this flush held.
+   */
+  private flushHeld(pending: Array<{ event: string; args: unknown[] }>): void {
+    const epoch = this.transportEpoch;
     this.flushDepth++;
     try {
-      for (const { event, args } of pending) {
-        // Re-enter the gate for every buffered item. A control handler (a
-        // host/command quiesce, say) may pause the data plane while this
-        // snapshot is being flushed; later data items must observe that pause.
+      for (let index = 0; index < pending.length; index++) {
+        if (this.transportEpoch !== epoch) {
+          this.bufferedEvents.push(...this.keepAcrossBoundary(pending.slice(index)));
+          return;
+        }
+        const { event, args } = pending[index]!;
         this.emit(event, ...args);
       }
     } finally {
@@ -391,19 +415,12 @@ export class McplServerConnection extends EventEmitter {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
-    this.flushDepth++;
-    try {
-      for (const item of pending) {
-        // Re-enter the ADMISSION gate (this.emit), never super.emit: control
-        // events include channels-register/changed, which are grant-gated —
-        // the old direct flush bypassed positive-grant enforcement entirely
-        // (PR #79 review blocker 3). Data-plane items re-buffer in order via
-        // the same call, since dataPlaneReady is still false.
-        this.emit(item.event, ...item.args);
-      }
-    } finally {
-      this.flushDepth--;
-    }
+    // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+    // events include channels-register/changed, which are grant-gated —
+    // the old direct flush bypassed positive-grant enforcement entirely
+    // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+    // the same call, since dataPlaneReady is still false.
+    this.flushHeld(pending);
   }
 
   /**
@@ -981,7 +998,10 @@ export class McplServerConnection extends EventEmitter {
       await this.transport.close();
       return;
     }
+    // No transport to close, so no transport 'close' crosses the boundary:
+    // cross it here, as every teardown does.
     this.closed = true;
+    this.resetPolicyForTransportBoundary();
     this.emit('close', null, null, this.closeInfoByHost());
     this.scheduleReconnect();
   }
@@ -1378,9 +1398,11 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /** Whether a response to a request received on `epoch` may go out now. */
-  private sameTransport(id: string | number, epoch: number): boolean {
+  private sameTransport(id: string | number, epoch: number, answer?: string): boolean {
     if (epoch === this.transportEpoch) return true;
-    console.error(`[mcpl] ${this.id}: not answering request ${String(id)}: the transport it came on has closed`);
+    console.error(
+      `[mcpl] ${this.id}: not answering request ${String(id)}${answer ? ` with ${answer}` : ''}: the transport it came on has closed`,
+    );
     return false;
   }
 
@@ -1394,7 +1416,9 @@ export class McplServerConnection extends EventEmitter {
     data?: unknown,
     epoch = this.transportEpoch,
   ): void {
-    if (this.closed || !this.sameTransport(id, epoch)) return;
+    // A refusal that can't be answered still says what it refused: a held
+    // message admitted under the next transport's grant is refused here.
+    if (this.closed || !this.sameTransport(id, epoch, `error ${code} (${message})`)) return;
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',
       id,

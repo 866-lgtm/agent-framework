@@ -215,8 +215,9 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
     connection.establishGrant(new CapabilityGrant(new Set(['inferenceRequest']), []));
-    const requests: Array<{ id: unknown; respond: (result: unknown) => void }> = [];
-    connection.on('inference-request', (_params: unknown, responder: { id: unknown; respond: (result: unknown) => void }) => {
+    type Responder = { id: unknown; respond: (result: unknown) => void; respondError: (code: number, message: string) => void };
+    const requests: Responder[] = [];
+    connection.on('inference-request', (_params: unknown, responder: Responder) => {
       requests.push(responder);
     });
     let reconnected = 0;
@@ -225,13 +226,14 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const serverSends = (message: Record<string, unknown>) =>
       (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
         .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
-    // One request is admitted and its handler still holds the responder; a
-    // second is held while the data plane is paused (a quiesce).
+    // Two requests are admitted and their handlers still hold the responders;
+    // a third is held while the data plane is paused (a quiesce).
     serverSends({ id: 5, method: 'inference/request', params: { n: 5 } });
-    assert.equal(requests.length, 1);
+    serverSends({ id: 6, method: 'inference/request', params: { n: 6 } });
+    assert.equal(requests.length, 2);
     connection.pauseDataPlane();
     serverSends({ id: 7, method: 'inference/request', params: { n: 7 } });
-    assert.equal(requests.length, 1, 'held while paused');
+    assert.equal(requests.length, 2, 'held while paused');
 
     connection.sendToolsList().catch(() => {});
     await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
@@ -240,21 +242,25 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const writeLine = transport.writeLine.bind(transport);
     transport.writeLine = (line: string) => { written.push(line); writeLine(line); };
 
-    // The handler answers its request after the reconnect: not written.
+    // The handlers answer their requests after the reconnect, one with a
+    // result and one with an error: neither is written.
     requests[0]!.respond({ ok: true });
+    requests[1]!.respondError(-32000, 'answered too late');
     connection.establishGrant(new CapabilityGrant(new Set(['inferenceRequest']), []));
     connection.ready();
-    assert.equal(requests.length, 1, 'the held request from the closed transport is not admitted on the new one');
-    assert.deepStrictEqual(written.filter((line) => /"id":(5|7)\b/.test(line)), [], 'nothing answers the closed transport\'s requests');
+    assert.equal(requests.length, 2, 'the held request from the closed transport is not admitted on the new one');
+    assert.deepStrictEqual(written.filter((line) => /"id":(5|6|7)\b/.test(line)), [], 'nothing answers the closed transport\'s requests');
   });
 
   it('keeps an incoming message and a push held across a transport boundary, admits them under the next grant, and answers nothing there', async () => {
     // What a server reported about the world isn't sent again by the next
     // process: discord-mcpl advances its watermark as it forwards a message.
+    // The dead transport's grant has no pushEvents, so a push admitted under
+    // it would be refused: delivered, it was admitted under the next one.
     const grant = () => new CapabilityGrant(new Set(['channels.incoming', 'pushEvents']), []);
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
-    connection.establishGrant(grant());
+    connection.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
     const incoming: Array<{ params: unknown; respond: (result: unknown) => void }> = [];
     connection.on('channels-incoming', (params: unknown, responder: { respond: (result: unknown) => void }) => {
       incoming.push({ params, respond: responder.respond });
@@ -287,6 +293,74 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(pushes, [{ n: 1 }]);
     incoming[0]!.respond({ ok: true });
     assert.deepStrictEqual(written.filter((line) => /"id":9\b/.test(line)), [], 'its answer is not written to the next transport');
+  });
+
+  it('says what it refused when the next grant refuses a kept incoming message, whose refusal can\'t be answered', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.establishGrant(new CapabilityGrant(new Set(['channels.incoming', 'pushEvents']), []));
+    const incoming: unknown[] = [];
+    connection.on('channels-incoming', (params: unknown) => { incoming.push(params); });
+    const pushes: unknown[] = [];
+    connection.on('push-event', (params: unknown) => pushes.push(params));
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    connection.ready();
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    connection.pauseDataPlane();
+    serverSends({ id: 9, method: 'channels/incoming', params: { messages: [{ id: 'held-1' }] } });
+    serverSends({ method: 'push/event', params: { n: 1 } });
+
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      // The next process's policy grants pushes only.
+      connection.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
+      connection.ready();
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(incoming, [], 'refused under the next grant');
+    assert.deepStrictEqual(pushes, [{ n: 1 }]);
+    assert.ok(logged.some((line) => /not answering request 9 with error -32002 \(channels-incoming rejected: capability "channels\.incoming" not in the effective grant\): the transport it came on has closed/.test(line)),
+      logged.join('\n'));
+  });
+
+  it('a transport boundary crossed during a flush holds the rest of the snapshot to the boundary rule', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.establishGrant(new CapabilityGrant(new Set(['channels.incoming', 'inferenceRequest', 'pushEvents']), []));
+    const seen: string[] = [];
+    let closing: Promise<void> | undefined;
+    // A listener that closes the connection while the flush is still going.
+    connection.on('channels-incoming', () => { seen.push('incoming'); closing = connection!.close(); });
+    connection.on('inference-request', () => { seen.push('inference'); });
+    connection.on('push-event', () => { seen.push('push'); });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    serverSends({ id: 10, method: 'channels/incoming', params: { messages: [{ id: 'm' }] } });
+    serverSends({ id: 11, method: 'inference/request', params: { n: 11 } });
+    serverSends({ method: 'push/event', params: { n: 12 } });
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      connection.ready();
+    } finally {
+      console.error = consoleError;
+    }
+    await closing;
+    assert.deepStrictEqual(seen, ['incoming'], 'nothing after the boundary reached a listener');
+    const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
+    assert.deepStrictEqual(held, ['push-event'], 'the push is kept, the inference request dropped');
+    assert.ok(logged.some((line) => line.includes('dropped 1 held message(s) from a transport that closed')), logged.join('\n'));
+    connection = null;
   });
 
   it('drops what a transport that closed during its exchange sent, so the next transport\'s grant never admits it', async () => {

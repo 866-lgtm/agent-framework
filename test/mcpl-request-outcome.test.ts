@@ -13,7 +13,14 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { McplServerConnection, McplRequestError } from '../src/mcpl/server-connection.js';
+import { McplRequestError as FromMcplIndex } from '../src/mcpl/index.js';
+import { McplRequestError as FromPackageRoot } from '../src/index.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
+
+test('McplRequestError is exported from the mcpl index and the package root', () => {
+  assert.equal(FromMcplIndex, McplRequestError);
+  assert.equal(FromPackageRoot, McplRequestError);
+});
 
 // Stdio server: answers initialize; tools/call 'fail' gets a JSON-RPC error
 // with data, 'stuck' gets nothing, 'exit' kills the process mid-request.
