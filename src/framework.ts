@@ -873,11 +873,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
   maxRetries = 3;
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (error instanceof MembraneError && !error.retryable) {
+    if (isMembraneError(error) && error.retryable === false) {
       return { retry: false };
     }
     if (attempt < this.maxRetries) {
-      const delayMs = error instanceof MembraneError && error.retryAfterMs !== undefined
+      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
         ? error.retryAfterMs
         : Math.pow(2, attempt) * 1000;
       return { retry: true, delayMs };
@@ -942,8 +942,19 @@ interface ProviderAccelerationReceipt {
 const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
+/**
+ * A MembraneError, from this framework's copy of membrane or from another: the
+ * host supplies the Membrane instance (config.membrane), so with two copies
+ * installed its errors are instances of a class this framework's `instanceof`
+ * doesn't match. Recognised by name as well, as context-manager's errors are;
+ * its fields are the same, so callers still check each one's type.
+ */
+function isMembraneError(error: unknown): error is MembraneError {
+  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
+}
+
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
-  if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
+  if (!isMembraneError(error) || error.type !== 'rate_limit') return false;
   return (
     /organization(?:'s)?[^\n]{0,120}maximum(?:\s+usage)?\s+increase\s+rate/i.test(error.message) ||
     /organization(?:'s)?[^\n]{0,120}acceleration(?:\s+limit)?/i.test(error.message)
@@ -1076,11 +1087,206 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
-/** Cap an API error message for inline use in a rewind marker: keep enough to
- *  identify the failure class without pasting a wall of provider JSON into the
- *  agent's context. */
-function truncateReason(reason: string, max = 160): string {
-  return reason.length <= max ? reason : reason.slice(0, max) + '…';
+/**
+ * Longest failure text the inference-failure pipeline writes to one sink: the
+ * reason in the exhaustion stderr line, a field of a logs/failures.log record,
+ * an ops alert's message, the inference log's `error`, and a trace event's
+ * `error` and `stack`. A failure's text is whatever its source put in
+ * `Error.message`, and a provider can echo the entire rejected request there
+ * (one OpenAI-compatible 400 echoed ~1.7 MB). The sinks with shorter bounds
+ * name them below, and every cut goes through boundFailureText. This bound
+ * doesn't depend on membrane bounding its own errors.
+ */
+const FAILURE_TEXT_MAX_CHARS = 2_000;
+/** Longest failure reason written into an agent's own context (the
+ *  `[inference-failed]` marker): enough for a provider's explanation, not a
+ *  self-dump the agent then carries in every later request. */
+const FAILURE_MARKER_REASON_MAX_CHARS = 600;
+/** Longest failure reason in the rewind marker, also the agent's own context:
+ *  enough to identify the failure class without a wall of provider JSON. */
+const REWIND_MARKER_REASON_MAX_CHARS = 160;
+/** Longest failure reason in an agent's status (`lastInference.lastError`) and
+ *  in the compile-refused ops alert. */
+const FAILURE_SUMMARY_MAX_CHARS = 300;
+/** Longest alert message posted to the ops webhook. */
+const OPS_WEBHOOK_MESSAGE_MAX_CHARS = 500;
+/** Longest provider error code recorded verbatim; real codes are short tokens.
+ *  A failure's name and type are bounded the same way. */
+const PROVIDER_ERROR_CODE_MAX_CHARS = 128;
+
+const isHighSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xd800 && code <= 0xdbff;
+};
+const isLowSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xdc00 && code <= 0xdfff;
+};
+/** Whether a cut before `index` would separate the halves of a surrogate pair. */
+const splitsPair = (text: string, index: number): boolean =>
+  index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
+
+/**
+ * `text` when it fits within `max` characters; otherwise its head and tail
+ * around a marker stating how many of how many characters were omitted, the
+ * whole within `max`. A cut that would separate a surrogate pair moves toward
+ * omission, so the result never holds half of a pair the text held whole, and
+ * bounding bounded text returns it as is. Each sink cuts the whole text, so
+ * its marker states the whole length.
+ */
+function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const markerLength = ` …[${text.length} of ${text.length} characters omitted]… `.length;
+  const budget = Math.max(0, max - markerLength);
+  const tailLength = Math.floor(budget / 4);
+  let headEnd = budget - tailLength;
+  if (splitsPair(text, headEnd)) headEnd--;
+  let tailStart = text.length - tailLength;
+  if (splitsPair(text, tailStart)) tailStart++;
+  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+/** A provider error code, verbatim when token-sized; otherwise bounded. */
+function boundProviderErrorCode(code: unknown): string | undefined {
+  if (typeof code !== 'string') return undefined;
+  return boundFailureText(code, PROVIDER_ERROR_CODE_MAX_CHARS);
+}
+
+/**
+ * A value's JSON for a failure sink, with every Error inside it written as its
+ * whole projection (failureDescription): serialising an Error writes its own
+ * fields, a MembraneError's whole `rawRequest` among them. The projection is
+ * left uncut, as a nested string is, so the sink's one cut of the JSON states
+ * its whole length. An Error is recognised by instanceof, so one from another
+ * realm (a vm context) is written as its own JSON, as any object is. Throws,
+ * or returns undefined, as JSON.stringify does.
+ */
+function failureJson(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? failureDescription(nested) : nested));
+}
+
+/**
+ * The whole text describeFailure cuts. For an Error, its head (name,
+ * classification, status, provider code, each bounded) and its whole
+ * message. For a primitive, its String. For another object, its String when
+ * that's text of its own (a Buffer, an Error from another realm, a class
+ * with its own toString). An array, or an object whose String is empty or
+ * only its tag, such as `[object Object]`, is its JSON instead
+ * (failureJson), so its fields and elements are kept; its tag stands when
+ * JSON can't write it or finds nothing in it.
+ */
+function failureDescription(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) {
+      if (typeof error !== 'object' || error === null) return String(error);
+      if (!Array.isArray(error)) {
+        let text: string | undefined;
+        try { text = String(error); } catch { /* no String of its own: its JSON, below */ }
+        if (text && !/^\[object [^\]]*\]$/.test(text)) return text;
+      }
+      try {
+        const json = failureJson(error);
+        if (json !== undefined && json !== '{}') return json;
+      } catch { /* its tag, below */ }
+      return Object.prototype.toString.call(error);
+    }
+    const fields = error as Error & {
+      type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
+    };
+    // Every component is remote or caller-supplied text, the name included.
+    const classification = [
+      typeof fields.type === 'string' ? boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) : undefined,
+      typeof fields.httpStatus === 'number' ? `HTTP ${fields.httpStatus}` : undefined,
+      boundProviderErrorCode(fields.providerErrorCode),
+      typeof fields.retryable === 'boolean' ? `retryable=${fields.retryable}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
+    const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
+    return `${head}: ${String(error.message)}`;
+  } catch {
+    return '[failure could not be described]';
+  }
+}
+
+/**
+ * A bounded string describing a failure, for logs that would otherwise print
+ * the error object; it is one line unless one of its parts has newlines, as a
+ * message can. Printing the object prints its message whole, in the stack,
+ * and every own field: a MembraneError's `rawRequest` is the whole request
+ * that failed, and Node's console prints each of its strings, a long system
+ * prompt among them, up to 10,000 characters. The projection keeps what a
+ * reader needs (name, classification, status, provider code, message) and
+ * nothing else. The head's parts are bounded each, and the whole
+ * (failureDescription) is cut once, so its marker states the length of the
+ * head and the whole message.
+ */
+function describeFailure(error: unknown): string {
+  return boundFailureText(failureDescription(error));
+}
+
+/** A stack frame's line: an indent of spaces or tabs, then `at `. The indent
+ *  never crosses a line break, so a run of blank lines isn't rescanned from
+ *  each line's start. */
+const FRAME_LINE = /^[ \t]+at /m;
+
+/**
+ * describeFailure, then the error's stack frames, bounded, on the lines
+ * below: for a log of a failure the framework's own code may have thrown,
+ * where the frames say where. The stack opens with the message, and a
+ * message's own lines can look like frames (an echoed request quoting a stack
+ * trace), so when the message is the stack's header, before its first frame
+ * line, the frames are the stack from its first frame line after the
+ * message. Otherwise (a stack without its header, a message that isn't in
+ * the stack or is empty) they are the stack from its first frame line. The
+ * leak the projection closes was the object's own fields, not its stack.
+ */
+function describeFailureWithFrames(error: unknown): string {
+  let frames: string | undefined;
+  try {
+    const stack = error instanceof Error ? error.stack : undefined;
+    if (typeof stack === 'string') {
+      const message = String((error as Error).message);
+      // The message is the stack's header only before its first frame: a
+      // stack without its header (copied, or frames only) can hold the
+      // message's text inside a frame's name.
+      const firstFrame = stack.search(FRAME_LINE);
+      const at = message ? stack.indexOf(message) : -1;
+      const frameLine = new RegExp(FRAME_LINE.source, 'gm');
+      frameLine.lastIndex = at >= 0 && (firstFrame < 0 || at < firstFrame) ? at + message.length : 0;
+      const found = frameLine.exec(stack);
+      if (found) frames = boundFailureText(stack.slice(found.index));
+    }
+  } catch { /* the projection alone */ }
+  const described = describeFailure(error);
+  return frames === undefined ? described : `${described}\n${frames}`;
+}
+
+/**
+ * A failure record's fields, each bounded, for logs/failures.log and the
+ * ops:alert trace: a string to FAILURE_TEXT_MAX_CHARS; an Error to its
+ * projection, since serialising one writes its own fields, a MembraneError's
+ * whole `rawRequest` among them; any other value to its JSON, with each Error
+ * inside it as its projection (failureJson), as the plain data that JSON
+ * describes when it fits FAILURE_TEXT_MAX_CHARS and as the JSON text,
+ * bounded, when it doesn't. So the trace's data is what failures.log writes:
+ * a Map or an object with toJSON whose JSON is small never hands a listener
+ * the value itself.
+ */
+function boundFailureFields(record: Record<string, unknown>): Record<string, unknown> {
+  const bounded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === 'string') bounded[key] = boundFailureText(value);
+    else if (value instanceof Error) bounded[key] = describeFailure(value);
+    else {
+      let json: string | undefined;
+      try { json = failureJson(value); } catch { bounded[key] = describeFailure(value); continue; }
+      // A value JSON writes nothing for (a function, undefined) is left out,
+      // as the log's JSON leaves it out.
+      if (json === undefined) continue;
+      bounded[key] = json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
+    }
+  }
+  return bounded;
 }
 
 /** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
@@ -2448,10 +2654,14 @@ export class AgentFramework {
     try {
       const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
       if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      // The reason is printed, kept in the cooldown and shown in the status
+      // snapshot (cooldownReason); without the host's own, it is the error's
+      // message, which can echo the whole request.
       return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
-        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
+        reason: boundFailureText(typeof hold.reason === 'string' && hold.reason ? hold.reason : String(error.message)) };
     } catch (err) {
-      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      // The hook is handed the model's error, and may throw it back.
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold: ${describeFailureWithFrames(err)}`);
       return undefined;
     }
   }
@@ -2486,7 +2696,7 @@ export class AgentFramework {
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? boundFailureText(String(error.message)),
       failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
     if (auxiliary && !existing) {
@@ -2496,7 +2706,7 @@ export class AgentFramework {
     }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
+      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: boundFailureText(String(error.message)) });
     console.error(`[provider-cooldown] agent=${agent.name} ` +
       `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
@@ -2554,7 +2764,10 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
-      const reason = error instanceof Error ? error.message : String(error);
+      // The alert cuts its own copies from the whole message, so the
+      // webhook's states the whole length.
+      const wholeReason = error instanceof Error ? String(error.message) : failureDescription(error);
+      const reason = boundFailureText(wholeReason);
       console.error(
         '[context-maintenance] pass failed:',
         reason,
@@ -2562,7 +2775,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-maintenance-failed',
         'framework',
-        reason,
+        wholeReason,
         { data: { scope: 'pass' } },
       );
     });
@@ -2632,12 +2845,13 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          record.error = error instanceof Error ? error.message : String(error);
+          const wholeError = error instanceof Error ? String(error.message) : failureDescription(error);
+          record.error = boundFailureText(wholeError);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
             agent.name,
-            record.error,
+            wholeError,
             {
               data: {
                 scope: 'agent',
@@ -4709,7 +4923,8 @@ export class AgentFramework {
     if (!run) return;
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
-      run.settle.reject(new Error(outcome.error ?? 'Unknown error'));
+      // The caller may log or relay the message, which can echo the whole request.
+      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
       return;
     }
     run.settle.resolve({
@@ -9808,7 +10023,7 @@ export class AgentFramework {
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
-          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
+          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
         return;
       }
@@ -13122,6 +13337,9 @@ export class AgentFramework {
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
+    // The failure text is stored inline in every record; the request that
+    // produced it is already stored separately as a blob.
+    if (typeof entryToStore.error === 'string') entryToStore.error = boundFailureText(entryToStore.error);
 
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
@@ -13706,6 +13924,10 @@ export class AgentFramework {
         (event.error as string) ?? 'unknown error',
         event.retryable as boolean | undefined,
         event.errorType as string | undefined,
+        {
+          httpStatus: event.httpStatus as number | undefined,
+          providerErrorCode: event.providerErrorCode as string | undefined,
+        },
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
@@ -13724,6 +13946,13 @@ export class AgentFramework {
       ...event,
       timestamp: Date.now(),
     } as TraceEvent;
+    // Listeners (web UI, subagent observers, host loggers) receive bounded
+    // failure text. An event's `error` and `stack` strings are whatever its
+    // source's Error carried, which for a provider failure can be an echo of
+    // the whole request.
+    const bounded = traceEvent as unknown as Record<string, unknown>;
+    if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
+    if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
 
     // An event goes to the subscriptions present when its delivery starts,
     // each one only if it is still active when its turn comes, as the DOM's
@@ -13812,10 +14041,14 @@ export class AgentFramework {
    *  and kind-specific fields (additive only — doctor parses by regex). */
   private logFailure(record: Record<string, unknown>): void {
     try {
+      // Every field is bounded: `reason` is conventionally free text, and any
+      // caller's field may carry an error message, or an Error whose own
+      // fields include the whole request.
+      const bounded = boundFailureFields(record);
       mkdirSync('logs', { recursive: true });
       appendFileSync(
         'logs/failures.log',
-        JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n',
+        JSON.stringify({ at: new Date().toISOString(), ...bounded }) + '\n',
       );
     } catch { /* best-effort */ }
   }
@@ -13848,13 +14081,27 @@ export class AgentFramework {
   private opsAlert(
     kind: string,
     agentName: string,
-    message: string,
+    rawMessage: string,
     opts?: { data?: Record<string, unknown>; skipLog?: boolean },
   ): void {
+    // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
+    // that isn't a string; it's described as a thrown value is, rather than
+    // thrown on (a string is its own description).
+    const wholeMessage = failureDescription(rawMessage);
+    const message = boundFailureText(wholeMessage);
+    // The caller's data goes to failures.log and to trace listeners, bounded
+    // the same way for both. A JavaScript caller's null is no data, and data
+    // that isn't a plain object (a string, an array, a Buffer) is kept as one
+    // field, `data`, rather than spread into a field per character or element.
+    const rawData: unknown = opts?.data;
+    const plain = typeof rawData === 'object' && rawData !== null &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(rawData));
+    const data = rawData == null ? undefined
+      : boundFailureFields(plain ? rawData as Record<string, unknown> : { data: rawData });
     if (!opts?.skipLog) {
-      this.logFailure({ agent: agentName, kind, reason: message, ...opts?.data });
+      this.logFailure({ agent: agentName, kind, reason: message, ...data });
     }
-    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data: opts?.data });
+    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data });
 
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
@@ -13867,7 +14114,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${message.slice(0, 500)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
@@ -13933,9 +14180,23 @@ export class AgentFramework {
    * Deliberately NOT a message match: the message wording belongs to CM and
    * can be reworded without warning.
    */
-  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
-    if (err instanceof MembraneError) {
-      return { retryable: err.retryable, errorType: err.type };
+  private classifyInferenceError(err: Error): {
+    retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
+  } {
+    // From either copy of membrane (isMembraneError). The fields are read as
+    // data, and the type is bounded like describeFailure's, for every sink the
+    // classification reaches (the trace, the marker, the logs).
+    if (isMembraneError(err)) {
+      const fields = err as Error & {
+        retryable?: unknown; type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown;
+      };
+      const providerErrorCode = boundProviderErrorCode(fields.providerErrorCode);
+      return {
+        ...(typeof fields.retryable === 'boolean' ? { retryable: fields.retryable } : {}),
+        ...(typeof fields.type === 'string' ? { errorType: boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+        ...(typeof fields.httpStatus === 'number' ? { httpStatus: fields.httpStatus } : {}),
+        ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+      };
     }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
@@ -13963,25 +14224,70 @@ export class AgentFramework {
 
   private noteInferenceExhausted(
     agentName: string,
-    reason: string,
+    rawReason: string,
     retryable?: boolean,
-    errorType?: string,
+    rawErrorType?: string,
+    detail?: { httpStatus?: number; providerErrorCode?: string },
   ): void {
+    // The reason is the failure's own message, and a provider can echo the
+    // whole rejected request in it: one household's [inference-failed]
+    // marker carried ~1.7 MB of its own request back into its context. Every
+    // sink below gets an excerpt cut from the whole reason at its own bound
+    // (boundFailureText, so its marker states the whole length): the stderr
+    // line, failures.log and the hard-down alert FAILURE_TEXT_MAX_CHARS, the
+    // [inference-failed] marker FAILURE_MARKER_REASON_MAX_CHARS, the status's
+    // lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS, and
+    // the rewind marker REWIND_MARKER_REASON_MAX_CHARS. The classification
+    // travels as structured fields beside the text.
+    //
+    // A reason that isn't a string (the stream paths always pass a message)
+    // is described rather than allowed to throw before anything is recorded.
+    // Its whole description is the whole reason, cut once by each sink.
+    const wholeReason: string = typeof rawReason === 'string' ? rawReason : failureDescription(rawReason);
+    // The type is bounded wherever it's written, as classifyInferenceError
+    // bounds the types it reads, since a caller can pass one it didn't classify.
+    const errorType = typeof rawErrorType === 'string'
+      ? boundFailureText(rawErrorType, PROVIDER_ERROR_CODE_MAX_CHARS) : rawErrorType;
+    const reason = boundFailureText(wholeReason);
+    const markerReason = boundFailureText(wholeReason, FAILURE_MARKER_REASON_MAX_CHARS);
+    const httpStatus = typeof detail?.httpStatus === 'number' ? detail.httpStatus : undefined;
+    const providerErrorCode = boundProviderErrorCode(detail?.providerErrorCode);
+    const classification: Record<string, unknown> = {
+      ...(errorType !== undefined ? { errorType } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+    };
+    // Each excerpt says how long the whole was when it was cut.
+    const cutAt = (excerpt: string): Record<string, unknown> =>
+      excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
-    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
-    console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+    const labels = [
+      errorType !== undefined ? `type=${errorType}` : undefined,
+      httpStatus !== undefined ? `status=${httpStatus}` : undefined,
+      providerErrorCode !== undefined ? `code=${providerErrorCode}` : undefined,
+    ].filter((label): label is string => label !== undefined);
+    console.error(
+      `[inference-failed] agent=${agentName} consecutive=${streak}` +
+      `${labels.length > 0 ? ` ${labels.join(' ')}` : ''}: ${reason}`,
+    );
 
     // (1b) Machine-greppable durable record, independent of journald/unit log
     // redirects: logs/failures.log under the host's working directory. This is
-    // what connectome-doctor reads. Legacy fields kept; `kind` is additive.
-    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted' });
+    // what connectome-doctor reads. Legacy fields kept; `kind` and the
+    // classification fields are additive.
+    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+      const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+        .filter((part): part is string => part !== undefined)
+        .join(', ');
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -13989,15 +14295,15 @@ export class AgentFramework {
             type: 'text',
             text:
               `[inference-failed] Your previous turn did not complete: the model ` +
-              `call failed and produced no response, so nothing was sent. Reason: ` +
-              `${reason}. If this recurs with the same cause, change approach ` +
+              `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
+              `${markerReason}. If this recurs with the same cause, change approach ` +
               `rather than retrying identically (e.g. drop an oversized attachment ` +
               `or an unsupported setting).`,
           }],
-          { system: true, kind: 'inference-failed', reason, consecutive: streak },
+          { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
       } catch (err) {
-        console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
+        console.error(`[inference-failed] could not record chronicle marker for ${agentName}: ${describeFailureWithFrames(err)}`);
       }
     }
 
@@ -14016,10 +14322,16 @@ export class AgentFramework {
     // (e.g. a reason string that crossed a serialization boundary). It matches
     // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
     // errorType gate is the one that's load-bearing.
+    //
+    // The fallback applies only to an unclassified reason. A classified
+    // failure (a provider's 400, say) already says what it is, and its
+    // message is the provider's text, which can quote anything, including
+    // these phrases from the agent's own context.
     const overBudget =
       errorType === 'over_budget' ||
       errorType === 'context_refusal' ||
-      /exceed hard budget|no summary covers/i.test(reason);
+      // Decided on the whole reason: presentation bounds never change it.
+      (errorType === undefined && /exceed hard budget|no summary covers/i.test(wholeReason));
     // Observability: a refused compile means the agent cannot think AT ALL
     // this turn — surface it on the ops-alert pipeline (ops:alert trace +
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
@@ -14029,7 +14341,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (${errorType ?? 'unclassified'}): ${reason.slice(0, 300)} — ` +
+        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${agent ? 'kicking' : 'unavailable (no agent handle)'}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
         { skipLog: true },
@@ -14047,7 +14359,7 @@ export class AgentFramework {
           }
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
         } catch (err) {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks:`, err);
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
@@ -14064,10 +14376,13 @@ export class AgentFramework {
       // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
       // a hard-down agent re-posts every ~15 min, not on every failed retry.
       // failures.log already got the per-exhaustion record above.
+      // The excerpt leaves room for the prefix, so the alert's own bound
+      // never cuts it a second time.
+      const hardDown = `${streak} consecutive inference failures. Last reason: `;
       this.opsAlert(
         'hard-down',
         agentName,
-        `${streak} consecutive inference failures. Last reason: ${reason}`,
+        hardDown + boundFailureText(wholeReason, FAILURE_TEXT_MAX_CHARS - hardDown.length),
         { skipLog: true },
       );
 
@@ -14081,7 +14396,7 @@ export class AgentFramework {
       // rejecting your history" marker. `retryable` is kept only for the trace.
       void retryable;
       if (errorType === 'invalid_request' && agent) {
-        this.quarantinePoisonedHistory(agent, reason);
+        this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
   }
@@ -14099,7 +14414,7 @@ export class AgentFramework {
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
-  private quarantinePoisonedHistory(agent: Agent, reason: string): void {
+  private quarantinePoisonedHistory(agent: Agent, wholeReason: string): void {
     const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
     const used = this.exhaustionRewinds.get(agent.name) ?? 0;
     if (used >= cap) {
@@ -14120,7 +14435,8 @@ export class AgentFramework {
     }
 
     this.exhaustionRewinds.set(agent.name, used + 1);
-    const count = this.updateRewindMarker(agent, truncateReason(reason), 'inference-failure');
+    const count = this.updateRewindMarker(
+      agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
       `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
