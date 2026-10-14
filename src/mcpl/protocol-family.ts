@@ -113,22 +113,26 @@ export function redactUrl(url: string | undefined): string {
  * - from the url, as written and decoded: credential-like path segments and
  *   query names, credential-shaped or credential-named query values, every
  *   other non-empty parameter as its whole name=value, and a ws:// url's
- *   username and password, its userinfo as one unit before its @ (with no
- *   length floor, so a short password goes with its username), and the
- *   Basic credential a WebSocket client sends for that userinfo;
- * - the static token, raw, with its slashes escaped as some JSON encoders
- *   write them, and percent- or form-encoded with either case of hex;
+ *   username and password, its userinfo as one unit before its @ (the
+ *   username alone when there's no password), with no length floor, so a
+ *   short password goes with its username and a short username alone goes
+ *   too, and the Basic credential a WebSocket client sends for that userinfo;
+ * - the static token, raw, as JSON encoders write it (JSON.stringify's
+ *   escapes, and with its slashes escaped too, as some encoders write them),
+ *   and percent- or form-encoded with either case of hex;
  * - a stdio server's environment values whose names say they're
- *   credentials, raw, with their slashes JSON-escaped, and percent-encoded
- *   with either case of hex.
+ *   credentials, raw, as JSON encoders write them, and percent-encoded with
+ *   either case of hex.
  * A string replaced on its own has at least 8 characters, since a shorter
  * one can't be told from ordinary text, and it is replaced wherever it
  * occurs, after an escape or inside a longer token too. A query parameter is
  * also replaced as its whole name=value, only where no letter or digit
  * adjoins the pair, so v=2 leaves dev=2 alone; a short value goes only that
- * way. One longest-first pass never scans its own replacement, and text
- * that may come from several servers takes one pass over all their
- * configurations' strings (serverCredentialPatterns). A credential the
+ * way. Every place one of these matches is replaced, overlapping places
+ * included, and the replacement is never scanned again; text that may come
+ * from several servers takes one pass over all their configurations'
+ * strings (serverCredentialPatterns), so strings of different servers that
+ * overlap are both replaced whole. A credential the
  * configuration doesn't hold, such as the token an access provider fetches
  * or another origin's, is outside it, and so are other encodings of the
  * ones it holds. JSON-RPC answers, and the error a host's own connect
@@ -155,9 +159,9 @@ export interface CredentialPattern {
 /**
  * The strings {@link redactServerText} replaces for one configuration, as
  * patterns for {@link credentialRedactor}. Text that may come from several
- * servers goes through one redactor over all their patterns, so its one
- * longest-first pass takes the longest match among them all: a secret that
- * begins another configuration's longer one can't cut that one short.
+ * servers goes through one redactor over all their patterns, so a secret
+ * that begins inside another configuration's, or shares its start, can't
+ * leave any of that one in place.
  */
 export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): CredentialPattern[] {
   // Strings replaced wherever they occur (after an escape or inside a longer
@@ -174,13 +178,17 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   };
   // Percent-escapes in lowercase hex, as some encoders write them.
   const lowerEscapes = (value: string): string => value.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase());
-  // A string as written, with its slashes escaped as some JSON encoders
-  // write them, and percent-encoded in either case of hex (a string
-  // encodeURIComponent refuses, such as one with an unpaired surrogate, has
-  // no encoded form).
+  // A string as written; as JSON encoders write it, with JSON.stringify's
+  // escapes (a quote, a backslash, a control character) and with its
+  // slashes escaped too, as some encoders write them; and percent-encoded in
+  // either case of hex (a string encodeURIComponent refuses, such as one
+  // with an unpaired surrogate, has no encoded form).
   const withEncoded = (value: string): void => {
-    standalone(value);
-    standalone(value.replace(/\//g, '\\/'));
+    const json = JSON.stringify(value).slice(1, -1);
+    for (const written of [value, json]) {
+      standalone(written);
+      standalone(written.replace(/\//g, '\\/'));
+    }
     let encoded: string;
     try { encoded = encodeURIComponent(value); } catch { return; /* no percent-encoded form */ }
     standalone(encoded);
@@ -235,17 +243,18 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
         standalone(value);
         standalone(decode(value));
       }
-      if (url.username || url.password) {
-        // The Basic credential a WebSocket client sends for the userinfo, and
-        // the userinfo itself as one unit wherever it stands before an @ with
-        // no letter or digit just before it, so a password too short to
-        // replace on its own still goes with its username. The @ and that
-        // boundary anchor the unit as a pair's boundaries do, so it has no
-        // length floor. Each from the userinfo as written and as decoded.
-        for (const [username, password] of [[url.username, url.password], [decode(url.username), decode(url.password)]]) {
-          if (password) userinfo.add(`${username}:${password}`);
-          standalone(Buffer.from(`${username}:${password}`).toString('base64'));
-        }
+      // The userinfo itself as one unit wherever it stands before an @ with
+      // no letter or digit just before it: username:password, or the
+      // username alone when there's no password, as a token written as the
+      // username is. So a password too short to replace on its own still
+      // goes with its username, and a short username alone goes too. The @
+      // and that boundary anchor the unit as a pair's boundaries do, so it
+      // has no length floor. And the Basic credential a WebSocket client
+      // sends for it. Each from the userinfo as written and as decoded.
+      for (const [username, password] of [[url.username, url.password], [decode(url.username), decode(url.password)]]) {
+        if (!username && !password) continue;
+        userinfo.add(password ? `${username}:${password}` : username);
+        standalone(Buffer.from(`${username}:${password}`).toString('base64'));
       }
     }
   }
@@ -258,15 +267,40 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
 }
 
 /**
- * One longest-first pass over the given patterns that never scans its own
- * replacement: at each place, the longest string that matches there becomes
- * `redacted`.
+ * Every place one of the given patterns matches becomes `redacted`,
+ * overlapping places included: the matches are found in the text as given,
+ * a match may begin inside another, and each run of overlapping matches is
+ * replaced as one. So two strings that overlap, one's end being the other's
+ * start, are both replaced whole, and the replacement is never scanned.
  */
 export function credentialRedactor(patterns: readonly CredentialPattern[]): (text: unknown) => string {
   if (patterns.length === 0) return asText;
+  // Longest first, so at each place the longest string that matches there is
+  // the match.
   const sources = [...patterns].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
   const pattern = new RegExp([...new Set(sources)].join('|'), 'g');
-  return (text) => asText(text).replace(pattern, 'redacted');
+  return (text) => {
+    const input = asText(text);
+    const spans: Array<[start: number, end: number]> = [];
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(input); match; match = pattern.exec(input)) {
+      const start = match.index;
+      const end = start + match[0].length;
+      const last = spans[spans.length - 1];
+      if (last && start < last[1]) last[1] = Math.max(last[1], end);
+      else spans.push([start, end]);
+      // The next search starts one place on, not after this match, so a
+      // match that begins inside this one is found too.
+      pattern.lastIndex = start + 1;
+    }
+    let redacted = '';
+    let from = 0;
+    for (const [start, end] of spans) {
+      redacted += `${input.slice(from, start)}redacted`;
+      from = end;
+    }
+    return redacted + input.slice(from);
+  };
 }
 
 /** Any value as text: a value that can't be printed reads as a placeholder. */

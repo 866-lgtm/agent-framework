@@ -399,6 +399,37 @@ test("recorded server text: a ws:// url's userinfo as one unit before its @, and
   assert.equal(redactServerText('bot:pw is not followed by its @ here', config), 'bot:pw is not followed by its @ here');
   assert.equal(redactServerText('robot:pw@h', config), 'robot:pw@h');
   assert.equal(redactServerText('dial wss://alice:pw@h/mcp failed', cfg({ url: 'wss://alice:pw@h/mcp' })), 'dial wss://redacted@h/mcp failed');
+  // ws:// as wss://.
+  const plain = cfg({ url: 'ws://bot:pw@h/mcp' });
+  assert.equal(redactServerText('dial ws://bot:pw@h/mcp failed', plain), 'dial ws://redacted@h/mcp failed');
+  assert.equal(redactServerText('Authorization: Basic Ym90OnB3', plain), 'Authorization: Basic redacted');
+  // A username alone, as a token written as the username is: the unit is the
+  // username, and the Basic credential is that of "name:".
+  for (const url of ['ws://k3y@h/mcp', 'wss://k3y@h/mcp']) {
+    const tokenOnly = cfg({ url });
+    assert.equal(redactServerText(`dial ${url} failed`, tokenOnly), `dial ${url.replace('k3y', 'redacted')} failed`, url);
+    assert.equal(redactServerText(`Authorization: Basic ${Buffer.from('k3y:').toString('base64')}`, tokenOnly), 'Authorization: Basic redacted', url);
+    assert.equal(redactServerText('monk3y@h', tokenOnly), 'monk3y@h', url);
+  }
+  // Percent-encoded, with every part too short to replace on its own: the
+  // unit as written and as decoded, and the Basic credential sent for each.
+  const encoded = cfg({ url: 'wss://b%40t:p%40ss@h/mcp' });
+  assert.equal(redactServerText('dial wss://b%40t:p%40ss@h/mcp failed', encoded), 'dial wss://redacted@h/mcp failed');
+  assert.equal(redactServerText('as user b@t:p@ss@h', encoded), 'as user redacted@h');
+  for (const userinfo of ['b%40t:p%40ss', 'b@t:p@ss']) {
+    assert.equal(redactServerText(`Authorization: Basic ${Buffer.from(userinfo).toString('base64')}`, encoded), 'Authorization: Basic redacted', userinfo);
+  }
+});
+
+test('recorded server text: a credential as JSON.stringify writes it, its quotes and backslashes escaped', () => {
+  const password = 'pa"ss\\w0rd/x1';
+  const config = cfg({ command: 'srv', token: 'to"ken\\0123', env: { DB_PASSWORD: password } } as Partial<McplServerConfig>);
+  for (const secret of [password, config.token!]) {
+    const json = JSON.stringify(secret).slice(1, -1);
+    for (const form of [secret, json, json.replace(/\//g, '\\/')]) {
+      assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
+    }
+  }
 });
 
 test("one redactor over several configurations' strings takes the longest secret among them all", () => {
@@ -408,6 +439,17 @@ test("one redactor over several configurations' strings takes the longest secret
   assert.equal(redact('auth failed for ghp_SHAREDPREFIX123_but_longer_TAIL9'), 'auth failed for redacted');
   assert.equal(redact('auth failed for ghp_SHAREDPREFIX123'), 'auth failed for redacted');
   assert.equal(credentialRedactor([])('nothing to replace'), 'nothing to replace');
+});
+
+test("one redactor over several configurations' strings replaces strings that overlap, both whole", () => {
+  // The first's end is the second's start.
+  const head = cfg({ id: 'a', token: 'XXXXXXXXYYYY' });
+  const tail = cfg({ id: 'b', token: 'YYYYZZZZZZZZ' });
+  const redact = credentialRedactor([...serverCredentialPatterns(head), ...serverCredentialPatterns(tail)]);
+  assert.equal(redact('auth failed for XXXXXXXXYYYYZZZZZZZZ.'), 'auth failed for redacted.');
+  assert.equal(redact('XXXXXXXXYYYY and YYYYZZZZZZZZ'), 'redacted and redacted');
+  // Strings next to each other, not overlapping, are each replaced, as before.
+  assert.equal(redact('XXXXXXXXYYYYYYYYZZZZZZZZ'), 'redactedredacted');
 });
 
 test('recorded server text uses longest-first, one-pass replacements and is idempotent', () => {
