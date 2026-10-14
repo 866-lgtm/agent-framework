@@ -54,6 +54,98 @@ async function until(cond: () => boolean, what: string, ms = 5000): Promise<void
 /** One more turn of the event loop: an unhandled rejection is reported by then. */
 const turn = (): Promise<void> => new Promise((r) => setImmediate(() => setImmediate(r)));
 
+/**
+ * The tool-result scan: in each source, every object literal whose `type`
+ * is the string 'tool-result', read as a syntax tree (Babel's TypeScript
+ * parser) rather than as text. A key is read however it's written (an
+ * identifier, or a string in any quoting, computed or not), and a value
+ * through `as`, `satisfies`, `<T>`, `!` and parentheses, so no way of writing
+ * the literal itself escapes; a value held elsewhere, such as in a const,
+ * isn't the literal and isn't read. Each literal must carry toolName, and
+ * where its callId and toolName both read a call's id and name (`X.id`,
+ * `X?.name`, `X['id']`), they must read the same X.
+ */
+function scanToolResults(sources: Array<{ name: string; text: string }>): {
+  literals: string[];
+  paired: number;
+  missing: string[];
+  mismatched: string[];
+} {
+  // Babel's nodes, read structurally: each has a `type`, its children are
+  // its node-valued fields, and its source span is `start`..`end`.
+  type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
+  const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
+  const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
+  const unwrap = (e: Node | undefined): Node | undefined => {
+    while (e && ['TSAsExpression', 'TSSatisfiesExpression', 'TSTypeAssertion', 'TSNonNullExpression', 'ParenthesizedExpression'].includes(e.type)) {
+      e = child(e, 'expression');
+    }
+    return e;
+  };
+  // A string's text, in any quoting: '…', "…" or a template with no substitutions.
+  const stringOf = (e: Node | undefined): string | undefined => {
+    e = unwrap(e);
+    if (e?.type === 'StringLiteral') return e.value as string;
+    if (e?.type === 'TemplateLiteral' && (e.expressions as unknown[]).length === 0) {
+      return ((e.quasis as Node[])[0].value as { cooked?: string }).cooked;
+    }
+    return undefined;
+  };
+  // A property's name, however its key is written; a computed key that isn't a string has none.
+  const nameOf = (p: Node): string | undefined => {
+    const key = child(p, 'key');
+    return !p.computed && key?.type === 'Identifier' ? key.name as string : stringOf(key);
+  };
+  const literals: string[] = [];
+  const missing: string[] = [];
+  const mismatched: string[] = [];
+  let paired = 0;
+  for (const { name, text } of sources) {
+    let program: Node;
+    try {
+      program = parse(text, {
+        sourceType: 'module', plugins: ['typescript'], createParenthesizedExpressions: true,
+      }).program as unknown as Node;
+    } catch (error) {
+      throw new Error(`${name}: ${(error as Error).message}`);
+    }
+    // The call an `X.id` or `X.name` reads, as X's source text (`call`, `tc`).
+    const callRead = (p: Node | undefined, field: 'id' | 'name'): string | undefined => {
+      const e = unwrap(child(p, 'value'));
+      if (e?.type !== 'MemberExpression' && e?.type !== 'OptionalMemberExpression') return undefined;
+      const property = child(e, 'property');
+      const read = e.computed ? stringOf(property) : property?.type === 'Identifier' ? property.name as string : undefined;
+      const object = unwrap(child(e, 'object'));
+      return read === field && object ? text.slice(object.start!, object.end!) : undefined;
+    };
+    const visit = (node: Node): void => {
+      if (node.type === 'ObjectExpression') {
+        const properties = (node.properties as Node[]).filter((p) => p.type === 'ObjectProperty');
+        const type = properties.find((p) => nameOf(p) === 'type');
+        if (type && stringOf(child(type, 'value')) === 'tool-result') {
+          const where = `${name}:${node.loc!.start.line}`;
+          literals.push(where);
+          const property = (field: string) => properties.find((p) => nameOf(p) === field);
+          const toolName = property('toolName');
+          if (!toolName) missing.push(where);
+          const idOf = callRead(property('callId'), 'id');
+          const nameFrom = callRead(toolName, 'name');
+          if (idOf !== undefined && nameFrom !== undefined) {
+            paired++;
+            if (idOf !== nameFrom) mismatched.push(`${where}: callId reads ${idOf}, toolName reads ${nameFrom}`);
+          }
+        }
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) { for (const v of value) if (isNode(v)) visit(v); }
+        else if (isNode(value)) visit(value);
+      }
+    };
+    visit(program);
+  }
+  return { literals, paired, missing, mismatched };
+}
+
 /** A tool that settles only when the test says so, so the test owns the work it started. */
 class SlowModule implements Module {
   readonly name = 'slow';
@@ -306,93 +398,60 @@ describe('stop() with work still in flight', () => {
     // The drop's log line names the tool from the event's toolName, so a
     // producer that leaves it out logs a drop nobody can reconcile, and one
     // that names another call's tool misleads whoever reconciles it. Every
-    // object literal in src whose `type` is the string 'tool-result' (in any
-    // quoting) carries toolName, and where its callId and toolName both read
-    // a call (`X.id`, `Y.name`), they read the same one. Read as a syntax
-    // tree (Babel's TypeScript parser), not as text, so no spelling of the
-    // literal escapes the check.
+    // tool-result object literal in src carries toolName, and where its
+    // callId and toolName both read a call, they read the same one
+    // (scanToolResults, which the next test checks).
     const src = fileURLToPath(new URL('../../src/', import.meta.url));
-    const files: string[] = [];
+    const sources: Array<{ name: string; text: string }> = [];
     const walk = (dir: string): void => {
       for (const name of readdirSync(dir)) {
         const full = join(dir, name);
         if (statSync(full).isDirectory()) walk(full);
-        else if (name.endsWith('.ts')) files.push(full);
+        else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
       }
     };
     walk(src);
-    // Babel's nodes, read structurally: each has a `type`, its children are
-    // its node-valued fields, and its source span is `start`..`end`.
-    type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
-    const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
-    const child = (n: Node, field: string): Node | undefined => (isNode(n[field]) ? n[field] as Node : undefined);
-    // A string literal's text, in any quoting: '…', "…" or a template with no substitutions.
-    const literalText = (e: Node | undefined): string | undefined => {
-      if (e?.type === 'StringLiteral') return e.value as string;
-      if (e?.type === 'TemplateLiteral' && (e.expressions as unknown[]).length === 0) {
-        return ((e.quasis as Node[])[0].value as { cooked?: string }).cooked;
-      }
-      return undefined;
-    };
-    // A property's name when written out (`type`, 'type', "type"); a computed one has none.
-    const nameOf = (p: Node): string | undefined => {
-      if (p.computed) return undefined;
-      const key = child(p, 'key');
-      return key?.type === 'Identifier' ? key.name as string : literalText(key);
-    };
-    const isToolResult = (e: Node | undefined): boolean => {
-      while (e && (e.type === 'TSAsExpression' || e.type === 'TSSatisfiesExpression' || e.type === 'ParenthesizedExpression')) {
-        e = child(e, 'expression');
-      }
-      return literalText(e) === 'tool-result';
-    };
-    const missing: string[] = [];
-    const mismatched: string[] = [];
-    let literals = 0;
-    let paired = 0;
-    for (const file of files) {
-      const text = readFileSync(file, 'utf8');
-      const program = parse(text, {
-        sourceType: 'module', plugins: ['typescript'], createParenthesizedExpressions: true,
-      }).program as unknown as Node;
-      // The call an `X.id` or `X.name` reads, as source text (`call`, `tc`).
-      const callRead = (p: Node | undefined, field: 'id' | 'name'): string | undefined => {
-        if (!p || p.type !== 'ObjectProperty' || p.shorthand) return undefined;
-        const e = child(p, 'value');
-        if (!e || (e.type !== 'MemberExpression' && e.type !== 'OptionalMemberExpression') || e.computed) return undefined;
-        const object = child(e, 'object');
-        return child(e, 'property')?.name === field && object ? text.slice(object.start!, object.end!) : undefined;
-      };
-      const visit = (node: Node): void => {
-        if (node.type === 'ObjectExpression') {
-          const properties = (node.properties as Node[]).filter((p) => p.type === 'ObjectProperty');
-          const type = properties.find((p) => !p.shorthand && nameOf(p) === 'type');
-          if (type && isToolResult(child(type, 'value'))) {
-            literals++;
-            const where = `${file.slice(src.length)}:${node.loc!.start.line}`;
-            const property = (name: string) => properties.find((p) => nameOf(p) === name);
-            const toolName = property('toolName');
-            if (!toolName) missing.push(where);
-            const idOf = callRead(property('callId'), 'id');
-            const nameFrom = callRead(toolName, 'name');
-            if (idOf !== undefined && nameFrom !== undefined) {
-              paired++;
-              if (idOf !== nameFrom) mismatched.push(`${where}: callId reads ${idOf}, toolName reads ${nameFrom}`);
-            }
-          }
-        }
-        for (const [field, value] of Object.entries(node)) {
-          if (field === 'loc' || field.endsWith('Comments')) continue;
-          if (Array.isArray(value)) { for (const v of value) if (isNode(v)) visit(v); }
-          else if (isNode(value)) visit(value);
-        }
-      };
-      visit(program);
-    }
-    assert.ok(literals > 20, `found ${literals} tool-result literals; the scan has lost them`);
+    const { literals, paired, missing, mismatched } = scanToolResults(sources);
+    assert.ok(literals.length > 20, `found ${literals.length} tool-result literals; the scan has lost them`);
     assert.deepEqual(missing, [], 'tool-result events without toolName');
     assert.ok(paired > 20, `paired ${paired} callId/toolName reads; the pairing has lost them`);
     assert.deepEqual(mismatched, [], "tool-result events naming another call's tool");
+  });
+
+  it('the tool-result scan reads every way the literal can be written, and reports what it should', () => {
+    const text = [
+      'declare const call: { id: string; name: string };',
+      'declare const other: { id: string; name: string };',
+      'declare const maybe: { id: string; name: string } | undefined;',
+      'export const events = [',
+      "  { type: 'tool-result', callId: call.id, toolName: call.name },",
+      '  { type: "tool-result", callId: call.id, toolName: call.name },',
+      '  { type: `tool-result`, callId: call.id, toolName: call.name },',
+      "  { 'type': 'tool-result' as const, callId: call.id, toolName: call.name },",
+      "  { type: ('tool-result') satisfies string, callId: call.id, toolName: call.name },",
+      "  { ['type']: <const>'tool-result', callId: call.id, toolName: call.name },",
+      "  { type: 'tool-result'!, callId: (call as typeof call).id as string, toolName: call!.name! },",
+      "  { type: 'tool-result', callId: maybe?.id, toolName: maybe?.name },",
+      "  { type: 'tool-result', callId: call['id'], toolName: call[`name`] },",
+      "  { type: 'tool-result', callId: call.id },",
+      "  { type: 'tool-result', callId: call.id, toolName: other.name },",
+      "  { type: 'tool-result', callId: (call).id, toolName: (other as typeof other).name },",
+      "  { type: 'tool-result', callId: 'c1', toolName: 'read' },",
+      "  { type: 'tool-results', callId: call.id },",
+      "  { kind: 'tool-result', callId: call.id },",
+      '];',
+    ].join('\n');
+    const result = scanToolResults([{ name: 'events.ts', text }]);
+    const lines = (...ns: number[]) => ns.map((n) => `events.ts:${n}`);
+    assert.deepEqual(result.literals, lines(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17), 'each spelling is a tool-result literal, and only those');
+    assert.deepEqual(result.missing, lines(14));
+    assert.equal(result.paired, 11, 'every pair of call reads, through wrappers and optional or computed members');
+    assert.deepEqual(result.mismatched, [
+      'events.ts:15: callId reads call, toolName reads other',
+      'events.ts:16: callId reads call, toolName reads other',
+    ]);
+    // A source Babel can't parse fails the scan by name.
+    assert.throws(() => scanToolResults([{ name: 'broken.ts', text: 'const = ;' }]), /^Error: broken\.ts: /);
   });
 
   describe('a server sending while the host stops', () => {
