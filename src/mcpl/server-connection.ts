@@ -990,6 +990,13 @@ export class McplServerConnection extends EventEmitter {
         // The prior transport was disconnected before this retry began. Keep
         // the fresh, unadmitted transport owned by close(), including on a
         // failed transport cleanup, instead of reviving a stopped connection.
+        // It isn't wired, and the handshake has removed its own listener, so
+        // an error it reports before close() has closed it (a socket reset
+        // during the close handshake) is logged here rather than thrown where
+        // nothing catches it.
+        transport.on('error', (err: Error) => {
+          console.error(`[mcpl] ${this.id}: a transport kept for close() reported an error: ${err.message}`);
+        });
         this.transport = transport;
         return;
       }

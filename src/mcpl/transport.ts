@@ -223,7 +223,10 @@ export class StdioTransport extends McplTransport {
       this.child.kill();
     }
     await new Promise<void>((resolve) => {
-      if (!this.child || this.child.exitCode !== null || this.child.killed) {
+      // A child that has exited has its exitCode set, or its signalCode when
+      // a signal ended it, and its 'exit' event has already fired. A signal
+      // this process didn't send (an OOM kill, a crash) leaves `killed` false.
+      if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null || this.child.killed) {
         resolve();
       } else {
         this.child.once('exit', () => resolve());
