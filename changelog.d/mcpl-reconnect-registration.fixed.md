@@ -13,10 +13,12 @@
   planes opened or is announced as reconnected (`mcpl:server-reconnected`,
   `module:added`): its planes stay closed until the next transport's
   exchange settles, and an answer that arrives after its transport closed
-  grants nothing. What a server sent that is still held when its transport
-  closes, requests and notifications alike (a `tools/observe` filter, a
-  channel registration), is dropped rather than admitted under the next
-  transport's grant: the next process announces its own. An answer to a
+  grants nothing. What a server sent about its own process that is still
+  held when its transport closes (a request, a `tools/observe` filter, a
+  channel registration) is dropped rather than admitted under the next
+  transport's grant: the next process announces its own. Incoming channel
+  messages and pushes still held are kept and admitted under the next
+  grant, since the next process won't send them again. An answer to a
   request from a closed transport is never written to the next one. A
   `close()` during a reconnect's handshake now closes the new transport
   instead of adopting it.

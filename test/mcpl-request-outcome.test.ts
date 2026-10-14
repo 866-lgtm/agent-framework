@@ -73,7 +73,18 @@ test('a request nobody answers is no-response, and the message is unchanged', as
 
 test('a connection lost while awaiting is no-response', async () => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 10_000 }), HOST_CAPS);
-  await rejectsWith(connection.sendToolsCall('exit', {}), 'no-response');
+  const err = await rejectsWith(connection.sendToolsCall('exit', {}), 'no-response');
+  // The loss itself rejects it, not the request's own deadline.
+  assert.match(err.message, /disconnected unexpectedly .* while awaiting tools\/call/);
+});
+
+test('a connection the host closes while a request awaits its answer is no-response', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 10_000 }), HOST_CAPS);
+  const rejected = rejectsWith(connection.sendToolsCall('stuck', {}), 'no-response');
+  await connection.close();
+  const err = await rejected;
+  assert.match(err.message, /closed while awaiting response for tools\/call/);
+  connection = null;
 });
 
 test('a request on a closed connection is not-sent', async () => {

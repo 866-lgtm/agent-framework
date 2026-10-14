@@ -248,6 +248,47 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(written.filter((line) => /"id":(5|7)\b/.test(line)), [], 'nothing answers the closed transport\'s requests');
   });
 
+  it('keeps an incoming message and a push held across a transport boundary, admits them under the next grant, and answers nothing there', async () => {
+    // What a server reported about the world isn't sent again by the next
+    // process: discord-mcpl advances its watermark as it forwards a message.
+    const grant = () => new CapabilityGrant(new Set(['channels.incoming', 'pushEvents']), []);
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.establishGrant(grant());
+    const incoming: Array<{ params: unknown; respond: (result: unknown) => void }> = [];
+    connection.on('channels-incoming', (params: unknown, responder: { respond: (result: unknown) => void }) => {
+      incoming.push({ params, respond: responder.respond });
+    });
+    const pushes: unknown[] = [];
+    connection.on('push-event', (params: unknown) => pushes.push(params));
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    connection.ready();
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    // A quiesce holds the data plane while a member's message and a push arrive.
+    connection.pauseDataPlane();
+    serverSends({ id: 9, method: 'channels/incoming', params: { messages: [{ id: 'held-1' }] } });
+    serverSends({ method: 'push/event', params: { n: 1 } });
+    assert.equal(incoming.length + pushes.length, 0, 'held while paused');
+
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    const written: string[] = [];
+    const transport = (connection as unknown as { transport: { writeLine(line: string): void } }).transport;
+    const writeLine = transport.writeLine.bind(transport);
+    transport.writeLine = (line: string) => { written.push(line); writeLine(line); };
+    assert.equal(incoming.length + pushes.length, 0, 'still held until the planes open');
+
+    connection.establishGrant(grant());
+    connection.ready();
+    assert.deepStrictEqual(incoming.map((message) => message.params), [{ messages: [{ id: 'held-1' }] }], 'delivered under the new grant');
+    assert.deepStrictEqual(pushes, [{ n: 1 }]);
+    incoming[0]!.respond({ ok: true });
+    assert.deepStrictEqual(written.filter((line) => /"id":9\b/.test(line)), [], 'its answer is not written to the next transport');
+  });
+
   it('drops what a transport that closed during its exchange sent, so the next transport\'s grant never admits it', async () => {
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);

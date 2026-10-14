@@ -146,7 +146,11 @@ interface RequestOptions {
  * - `'close'`              — Connection closed: `(code, signal, info: McplConnectionCloseInfo)`
  * - `'connect-failed'`     — Initial connect failed; background retry scheduled
  * - `'reconnect-failed'`   — A background reconnect attempt failed; next retry scheduled
- * - `'reconnect'`          — Background reconnect succeeded
+ * - `'reconnect'`          — Background reconnect succeeded. The new transport
+ *                            starts with an empty grant and both planes
+ *                            closed, as at initial connect: whoever owns the
+ *                            connection runs the §5.3 policy exchange again,
+ *                            then calls ready() (the framework's listener does).
  */
 export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
@@ -233,16 +237,22 @@ export class McplServerConnection extends EventEmitter {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
-    // Everything the server sent that is still held in the buffer came on the
-    // transport that is now gone. Its requests can't be answered, and
-    // admitting one against the next transport's grant, or answering its id
-    // there, would act for a request the next server never made. Its
-    // notifications describe a process that is gone (a tools/observe filter,
-    // a channel registration): the next one announces its own. The host's
-    // own reports about the transport stay: its lifecycle (connect-failed,
+    // What the server sent that is still held came on the transport that is
+    // now gone. What it said about its own process is dropped: its requests
+    // wait on answers that can no longer reach whoever asked (an inference
+    // request, a host/command), and its announcements describe a process
+    // that is gone (a tools/observe filter, a channel registration), so the
+    // next one announces its own. What it reported about the world is kept: a
+    // channel's incoming messages and its pushes, which the next process
+    // won't send again (a bridge such as discord-mcpl advances its watermark
+    // as it forwards). They are admitted at the flush against the next
+    // transport's grant, like anything held, and an answer to one is never
+    // written to the next transport (sameTransport). The host's own reports
+    // about the transport stay too: its lifecycle (connect-failed,
     // reconnect-failed), the server's stderr, and orphaned-response audits.
     const held = this.bufferedEvents.length;
-    this.bufferedEvents = this.bufferedEvents.filter((item) => !McplServerConnection.SERVER_EVENTS.has(item.event));
+    const dropped = McplServerConnection.PROCESS_EVENTS;
+    this.bufferedEvents = this.bufferedEvents.filter((item) => !dropped.has(item.event));
     if (this.bufferedEvents.length < held) {
       console.error(
         `[mcpl] ${this.id}: dropped ${held - this.bufferedEvents.length} held message(s) from a transport that closed`,
@@ -487,9 +497,11 @@ export class McplServerConnection extends EventEmitter {
     return typeof responder?.respond === 'function';
   }
 
-  /** Events that carry a server's own messages, as routed from its transport. */
-  private static get SERVER_EVENTS(): ReadonlySet<string> {
-    return new Set(Object.values(McplServerConnection.METHOD_TO_EVENT));
+  /** Events routed from a server's transport that speak for its process, not
+   *  the world: dropped at a transport boundary while held. */
+  private static get PROCESS_EVENTS(): ReadonlySet<string> {
+    const world = new Set(['channels-incoming', 'push-event']);
+    return new Set(Object.values(McplServerConnection.METHOD_TO_EVENT).filter((event) => !world.has(event)));
   }
 
   /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time

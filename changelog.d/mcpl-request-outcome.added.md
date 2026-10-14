@@ -7,4 +7,6 @@
   transport and no answer came back: a timeout, or the connection closed
   while awaiting; it may or may not have reached the server). Only
   `not-sent` proves the server never saw the request. Messages are unchanged,
-  and it is still an `Error`, so existing handling keeps working.
+  and it is still an `Error`, so existing handling keeps working; its `name`
+  is `McplRequestError`, which is what `String(error)` and a stack trace now
+  begin with.
