@@ -1416,18 +1416,19 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *
  * 400 and 422 are how a provider answers a request that fails its
  * validation, as a history it can't accept does, but other refusals come
- * back the same way, such as Anthropic's 400 for a credit balance that's too
- * low. A 413 is the request's size. When the newest exchange made it too
- * large, as an oversized attachment does, shedding that exchange may bring
- * the request back under the limit, and nothing else in the framework
- * recovers a 413; when the history as a whole is too large, the shed doesn't
- * help, and the breaker stops at its rewind cap. The 413 arm takes both
- * labels a 413 arrives under, invalid_request and context_length, because
- * membrane's label for a 413 differs by version and adapter. Other statuses
- * keep the history, since shed history can't be got back and the status
- * gives no sign that a shed would help: a 404 is a model or an endpoint that
- * doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the
- * resource, as a rule, rather than the conversation.
+ * back the same way, such as a refusal of the account that membrane doesn't
+ * recognize by its text. A 413 is the request's size. When the newest
+ * exchange made it too large, as an oversized attachment does, shedding that
+ * exchange may bring the request back under the limit, and nothing else in
+ * the framework recovers a 413; when the history as a whole is too large,
+ * the shed doesn't help, and the breaker stops at its rewind cap. The 413 arm
+ * takes both labels membranes have given a 413, invalid_request and
+ * context_length (see the notes below). Other statuses keep the history,
+ * since a shed takes the exchange out of the agent's context, which only an
+ * operator's undo brings back, and the status gives no sign that a shed
+ * would help: a 404 is a model or an endpoint that doesn't exist, and 405,
+ * 409, 410 and 415 are about the HTTP request or the resource, as a rule,
+ * rather than the conversation.
  *
  * The table test in test/inference-exhaustion-rewind.test.ts is this
  * predicate's contract. The notes below on which membrane version gives which
@@ -1442,17 +1443,22 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
  *   415, 422 …) as invalid_request, so it alone produces an invalid_request
  *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
- * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, one
- *   table serves every adapter. Auth codes, account refusals (a balance too
- *   low, usage limits reached) and context overflow are checked on a 400 or
- *   422 first, a 404 is invalid_request, a 413 is context_length, and other
- *   4xx are invalid_request. So a 413 still sheds, an Anthropic one
+ * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, every
+ *   adapter sends an HTTP failure through one status table
+ *   (errorFromProviderStatus). On a 400 or 422, auth codes and reasons and
+ *   the two account refusals it recognizes by their text (a balance too low,
+ *   usage limits reached) are auth, and a context overflow, by its code or
+ *   text, is context_length. A 401, 402 or 403 is auth, a 408 timeout, a 429
+ *   rate_limit, a 404 invalid_request and a 413 context_length; other 4xx
+ *   are invalid_request. So a 413 the table types sheds, an Anthropic one
  *   included, while a context_length at 400 or 422, a token overflow, keeps
- *   the history, and so does an account refusal, which is auth. The 422 arm
- *   then also covers an OpenAI-compatible server, such as a FastAPI one,
- *   that answers a validation failure with 422. The test of real provider
- *   answers through membrane's classifier, beside the table test, pins how
- *   the two meet at the floor.
+ *   the history, and so does an account refusal, which is auth. An adapter
+ *   can type a failure before the table does, as Anthropic's does for a
+ *   gateway's aggregate error (server), and a failure with no HTTP status is
+ *   typed from its message, with no status. The 422 arm also covers an
+ *   OpenAI-compatible server, such as a FastAPI one, that answers a
+ *   validation failure with 422. The test of provider answers through the
+ *   table, beside the table test, pins how the two meet at the floor.
  *
  * An error with no status, from a membrane that reports none, keeps the rule
  * the breaker had before: the type alone.
