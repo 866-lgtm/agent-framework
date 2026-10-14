@@ -2115,13 +2115,16 @@ export class ChannelRegistry {
     text: string,
     agentName: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
+    // The server the publish goes to, as handleToolPublish finds it before
+    // it awaits: the channel may be removed while the reply is pending.
+    const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
     const result = await this.handleToolPublish({ channelId, content: text });
     const reply = result.data as { delivered?: boolean; messageId?: string } | undefined;
     if (result.success && reply?.delivered !== false) {
       this.emitTraceFn({
         type: 'mcpl:speech-routed',
         conversationId: agentName,
-        serverId: this.findChannelEntry(channelId)?.serverId ?? '',
+        serverId,
         channelId,
         delivered: true,
         textLen: text.length,
@@ -3212,6 +3215,12 @@ export class ChannelRegistry {
       } catch (err) {
         return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
       }
+    }
+    // The open awaited the server, and a channels/changed update or a
+    // re-register may have declared the channel inbound-only meanwhile.
+    const declared = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`) ?? entry;
+    if (isInboundOnly(declared)) {
+      return fail(channelId, inboundOnlyReason(declared));
     }
 
     const server = this.serverRegistry.getServer(entry.serverId);

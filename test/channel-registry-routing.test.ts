@@ -31,12 +31,15 @@ function makeRegistry(
   const closeCalls: Array<{ channelId?: string }> = [];
   const streamCalls: Array<{ kind: 'chunk' | 'complete'; channelId?: string }> = [];
   let failOpens = false;
+  let onOpen: (() => Promise<void>) | undefined;
+  let onPublish: (() => Promise<void>) | undefined;
 
   const mockServer = {
     // Post-policy state: full grant, so tests exercise delivery, not §5.3 denial.
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsPublish: async (params: { channelId?: string; conversationId?: string }) => {
       publishCalls.push(params);
+      await onPublish?.();
       return publishResult;
     },
     sendChannelsOutgoingChunk: (params: { channelId?: string }) => {
@@ -48,6 +51,7 @@ function makeRegistry(
     sendChannelsOpen: async (params: { channelId?: string }) => {
       if (failOpens) throw new Error('open refused by server');
       openCalls.push(params);
+      await onOpen?.();
       return {};
     },
     sendChannelsClose: async (params: { channelId?: string }) => {
@@ -82,6 +86,10 @@ function makeRegistry(
   return {
     registry, failures, traces, publishCalls, openCalls, closeCalls, streamCalls, lookup,
     setFailOpens: (v: boolean) => { failOpens = v; },
+    /** Runs while the server is answering an open, before it returns. */
+    setOnOpen: (fn: (() => Promise<void>) | undefined) => { onOpen = fn; },
+    /** Runs while the server is answering a publish, before it returns. */
+    setOnPublish: (fn: (() => Promise<void>) | undefined) => { onPublish = fn; },
   };
 }
 
@@ -804,4 +812,38 @@ test('an inbound-only channel resolves as a speech target to an error naming the
   assert.ok(registry.proseTargetFor('body:home', 'body'));
   // A bidirectional channel resolves either way.
   assert.deepEqual(registry.resolveProseTarget('body:home', { forSpeech: true }), { channelId: 'body:home', label: 'Body · home' });
+});
+
+test('a channel declared inbound-only while the host opens it for speech is refused before the publish', async () => {
+  const { registry, publishCalls, openCalls, failures, setOnOpen } = makeRegistry({ delivered: true });
+  await registry.handleRegister('body', {
+    channels: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' }],
+  } as never);
+  setOnOpen(async () => {
+    await registry.handleChanged('body', {
+      updated: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
+    } as never);
+  });
+
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:ears'), null);
+  assert.deepEqual(openCalls.map((c) => c.channelId), ['body:ears'], 'the closed channel was opened');
+  assert.equal(publishCalls.length, 0, 'nothing was published after the declaration');
+  assert.equal(failures.length, 1);
+  assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
+});
+
+test("publishForAgent's routed trace names the server it published through, though the channel is removed while the reply is pending", async () => {
+  const { registry, traces, setOnPublish } = makeRegistry({ delivered: true });
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+  setOnPublish(async () => {
+    await registry.handleChanged('body', { removed: ['body:home'] } as never);
+  });
+
+  const posted = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  assert.equal(posted.success, true);
+  const routed = traces.filter((t) => t.type === 'mcpl:speech-routed');
+  assert.equal(routed.length, 1);
+  assert.equal(routed[0]!.serverId, 'body');
 });
