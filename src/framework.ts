@@ -17968,9 +17968,9 @@ export class AgentFramework {
     // The turn that called: a channel_open's result records its trigger
     // channel there, however late it arrives, and moves its locus while the
     // turn is still open, even once another start's routing is the agent's
-    // live one. A silent turn routes no prose, so its open moves no locus.
+    // live one. A silent turn routes no prose, and its routing state is never
+    // the open turn's (openLogical), so its open moves no locus.
     const callingTurn = this.routingOf(agentName);
-    const callingSilent = this.activeTurnTriggers.get(agentName)?.suppressProse === true;
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
@@ -18003,7 +18003,7 @@ export class AgentFramework {
             // turn's locus stays where the agent was last told, for a resume
             // that opens the turn again, and so does the announce baseline,
             // which is the agent's across turns.
-            if (openerAgent && !callingSilent
+            if (openerAgent
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
               && this.openLogical.get(agentName) === callingTurn) {
               callingTurn.locus = opened;
