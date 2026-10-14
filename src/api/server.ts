@@ -497,7 +497,11 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    const { messages } = await contextManager.compile();
+    // A dry run: listed, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for (see
+    // Agent.compileWithInjections for what a dry run still leaves, and for
+    // context-manager#160's thinking binding).
+    const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
     const offset = params?.offset ?? 0;
@@ -705,10 +709,21 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
+    // A dry run: shown, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for, at a
+    // hypothetical budget least of all (see Agent.compileWithInjections for
+    // what a dry run still leaves). Under the autobiographical strategy, a
+    // budget the context can't fit still throws: a dry run skips only
+    // context-manager's post-pick check, and an adaptive fold plan that
+    // doesn't fit then overruns at the middle's emission. Windowed
+    // passthrough's newest message alone is the one window that comes back
+    // larger than the budget.
     const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }
-        : undefined
+        : undefined,
+      undefined,
+      { dryRun: true },
     );
 
     return { context: messages };

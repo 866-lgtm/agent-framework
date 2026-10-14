@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -635,6 +635,80 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   return Math.max(
     MIN_DISCORD_AWARENESS_DEADLINE_MS,
     Math.min(MAX_DISCORD_AWARENESS_DEADLINE_MS, Math.floor(value)),
+  );
+}
+
+/** Messages copied into another conversation (a fork's seed) without their
+ *  `thinking` and `redacted_thinking` blocks: a fork inherits the template's
+ *  conversation, not its reasoning. A signed block was minted under the
+ *  template's prefix, which the fork's doesn't promise to match; unsigned
+ *  reasoning (text-only providers, XML mode) goes by the same rule. On the
+ *  OpenAI Responses path a removed block also carried the reasoning item
+ *  (`rawItem`) the message's other items were paired with by id, so in a
+ *  message that lost its thinking those items lose their `rawItem` and render
+ *  from their fields, without ids; an opaque carrier (a text block whose raw
+ *  item isn't a `message`, such as a compaction) keeps it, since the raw item
+ *  is its whole content. An Anthropic or XML-mode message's thinking carries
+ *  no raw item, and its only raw items are such carriers (membrane keeps a
+ *  block it has no type for, such as a `server_tool_use`, that way), so it
+ *  loses only its thinking. A message with no content left, whether
+ *  the filter emptied it or it was already empty, is left out, since a
+ *  request can't carry an empty message; any other message without thinking
+ *  is kept as it was. */
+function withoutThinking<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
+  const out: M[] = [];
+  for (const message of messages) {
+    const content = message.content.filter((b) => !isThinkingBlock(b));
+    if (content.length === 0) continue;
+    out.push(content.length === message.content.length
+      ? message
+      : { ...message, content: content.map(releasePairedRawItem) });
+  }
+  return out;
+}
+
+function isThinkingBlock(block: ContentBlock): boolean {
+  return block.type === 'thinking' || block.type === 'redacted_thinking';
+}
+
+function rawItemOf(block: ContentBlock): unknown {
+  return (block as { rawItem?: unknown }).rawItem;
+}
+
+/** A block without the provider-native item it was parsed from, unless that
+ *  item is the block's whole content: an opaque carrier, a text block whose
+ *  raw item isn't a `message` item (membrane keeps compaction and other items
+ *  it has no block for that way). */
+function releasePairedRawItem(block: ContentBlock): ContentBlock {
+  const raw = rawItemOf(block);
+  if (raw === undefined) return block;
+  const rawType = typeof raw === 'object' && raw !== null ? (raw as { type?: unknown }).type : undefined;
+  if (block.type === 'text' && rawType !== 'message') return block;
+  const { rawItem: _released, ...rest } = block as ContentBlock & { rawItem?: unknown };
+  return rest as ContentBlock;
+}
+
+/** One log line for a fork's seed that left something out, so an operator who
+ *  sees a fork answer differently from its template has something to check:
+ *  the template's thinking blocks, and the tool blocks the pairing pass
+ *  dropped (calls with no result in the seed, results whose call isn't in
+ *  it). `withoutReasoning` is the seed before that pass, `seed` after it. */
+function logSeedOmissions(
+  fork: string,
+  template: string,
+  compiled: readonly { content: ContentBlock[] }[],
+  withoutReasoning: readonly { content: ContentBlock[] }[],
+  seed: readonly { content: ContentBlock[] }[],
+): void {
+  const count = (messages: readonly { content: ContentBlock[] }[], test: (b: ContentBlock) => boolean) =>
+    messages.reduce((n, m) => n + m.content.filter(test).length, 0);
+  const thinking = count(compiled, isThinkingBlock);
+  const calls = count(withoutReasoning, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
+  const results = count(withoutReasoning, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
+  if (thinking + calls + results === 0) return;
+  console.log(
+    `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
+    `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
 }
 
@@ -4796,13 +4870,28 @@ export class AgentFramework {
    * were activated right now — WITHOUT running inference, opening a stream, or
    * mutating agent state. Intended for debug/preview tooling.
    *
-   * Transparency contract (default): the preview is side-effect-free and
-   * leaves no trace on the system. It does only read-only work —
-   * `ContextManager.compile` (which never triggers compression itself;
-   * compression runs in the background out-of-band), tool filtering, and
-   * system-prompt assembly — then delegates to `Agent.buildActivationRequest`.
-   * No tokens are spent, nothing is written to Chronicle, and no external
-   * MCPL server is contacted.
+   * What a preview commits (default): nothing of its own. It compiles as a
+   * dry run (`dryRun`), filters tools and assembles the system prompt, then
+   * delegates to `Agent.buildActivationRequest`. No tokens are spent, no
+   * external MCPL server is contacted, no fold resolution is persisted and
+   * none of the compression its fold plan calls for is queued; the consumed
+   * watermark and any prepared budget change are left alone; and once
+   * context-manager's thinking binding (context-manager#160, not yet
+   * released) ships, no stamps are committed and no compile awaits
+   * acceptance. In context-manager 0.14 its dry run leaves nothing else
+   * behind but the release of an expired compression hold, as any compile
+   * does (see `Agent.compileWithInjections`). The preview keeps in-memory
+   * bookkeeping of its own, such as handing the context manager the
+   * compression tool definitions, as every activation request does.
+   * Under the autobiographical strategy, a budget the context can't fit
+   * still throws, as for a committing compile: a dry run skips only
+   * context-manager's post-pick check, and an adaptive fold plan that
+   * doesn't fit then overruns at the middle's emission, with a refusal that
+   * names the tokens and the limit. Windowed passthrough's newest message
+   * alone is the one window that comes back larger than the budget. For a
+   * verdict instead of the refusal, `previewContextSettings` returns
+   * context-manager's own at a budget, with the agent's `maxTokens` reserved
+   * for the response.
    *
    * The trade-off is fidelity: the dynamically-gathered ContextInjection[]
    * (module `gatherContext` + MCPL `beforeInference` hooks) are NOT included
@@ -4833,13 +4922,15 @@ export class AgentFramework {
     };
 
     // An explicit budget compiles against a HYPOTHETICAL window instead of the
-    // agent's live one. That also suppresses transition-settling in
-    // compileWithInjections (which only settles when no budget is passed), so
-    // previewing a smaller window cannot advance a converging descent.
-    // Default: no dynamic injection gathering → fully transparent (no
-    // inference, no Chronicle writes, no external RPC). Opt in explicitly.
+    // agent's live one. Every preview is a dry run, so none of them settles
+    // a converging descent or commits what a sent compile commits (see the
+    // doc comment above).
+    // Default: no dynamic injection gathering → no inference, no Chronicle
+    // writes of its own, no external RPC. Opt in explicitly.
     if (!opts?.injections) {
-      return capture(await agent.buildActivationRequest(tools, undefined, opts?.budget, presentation?.available ?? tools));
+      return capture(await agent.buildActivationRequest(
+        tools, undefined, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+      ));
     }
 
     // Full-fidelity path: mirrors startAgentStream's injection gathering.
@@ -4874,7 +4965,9 @@ export class AgentFramework {
       }
     }
 
-    return capture(await agent.buildActivationRequest(tools, injections, opts?.budget, presentation?.available ?? tools));
+    return capture(await agent.buildActivationRequest(
+      tools, injections, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+    ));
   }
 
   /**
@@ -4884,9 +4977,11 @@ export class AgentFramework {
    *
    * Unlike `previewActivation` (which renders a request), this returns the
    * picker's plan: resulting tokens, whether it fits, how many summaries would
-   * have to be produced first, and the per-chunk fold levels. Commits nothing:
-   * no resolution persistence, no compression enqueue, no transition
-   * bookkeeping — see `AutobiographicalStrategy.previewContext`.
+   * have to be produced first, and the per-chunk fold levels. It commits
+   * nothing: its select is a dry run, which in context-manager 0.14 leaves
+   * what a select leaves behind as the last committing compile left it —
+   * see `AutobiographicalStrategy.previewContext` and
+   * `Agent.compileWithInjections`.
    *
    * Returns null when the agent's strategy has no fold plan (non-adaptive).
    */
@@ -8902,9 +8997,10 @@ export class AgentFramework {
   /**
    * Spawn a persistent per-channel conversation agent ("fork") from the
    * template agent: own ContextManager under `conversations/{name}`, seeded
-   * with a copy of the template's compiled context (the SubagentModule
-   * wholesale-copy pattern), registered in the event loop like any agent —
-   * but never primary.
+   * with the template's compiled context without its thinking or its unpaired
+   * tool blocks (the SubagentModule wholesale-copy pattern; see the seeding
+   * comment below), registered in the event loop like any agent — but never
+   * primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
     const router = this.conversationRouter!;
@@ -8938,14 +9034,54 @@ export class AgentFramework {
       // persisted precisely so names aren't reused, but if this namespace has
       // history anyway (counter state lost, crash between spawn and persist),
       // seeding again would stack another template copy on top of it.
-      const { messages: existing } = await contextManager.compile();
+      //
+      // Both compiles are dry runs: neither is sent, and the template's runs
+      // while the template may be mid-stream, where a committing compile
+      // would commit fold resolutions and queue the compression its fold plan
+      // calls for (and, once context-manager's thinking binding ships, fence
+      // its stream's replies). In context-manager 0.14 a dry run leaves
+      // nothing else behind but the release of an expired compression hold
+      // (see Agent.compileWithInjections), so the template's request in
+      // flight keeps its calibration estimate.
+      // The template's compile runs at context-manager's default budget (none
+      // is passed), and a dry run still refuses a budget it can't fit: it
+      // skips only the post-pick check, and an adaptive fold plan that
+      // doesn't fit then overruns at the middle's emission. So a template
+      // whose fold plan doesn't fit that budget fails the spawn with
+      // context-manager's refusal, which names the tokens and the limit, as
+      // a committing compile failed it. Only a windowed-passthrough template
+      // whose newest message alone exceeds it seeds that message, larger than
+      // the budget. The fork's own compiles meet its window by its strategy's
+      // rule: passthrough, the fork's default, keeps the newest messages that
+      // fit; an adaptive strategy folds to fit or throws over_budget for the
+      // drain breaker.
+      // The seed leaves out the template's thinking (withoutThinking): a
+      // signed block verifies only while everything before it is what it was
+      // minted under, and a fork's system, tools and scoped injections don't
+      // promise that, while its own namespace holds no stamps that could
+      // vouch for the copies. On models that don't bind thinking to its
+      // prefix a copy would have been kept, so there the fork loses the
+      // template's reasoning.
+      // Then context-manager's stripUnpairedToolBlocks drops each call whose
+      // result isn't in the seed and each result whose call isn't, keeping
+      // the rest of their messages (a message left with nothing becomes its
+      // "[tool call omitted]" placeholder). A fork spawned while the template
+      // is between a round's call and its results (the coalescer can spawn
+      // one outside the event loop) would otherwise give the fork's first
+      // request an unanswered call: the passthrough strategies have no
+      // pairing pass, and an adaptive template's compile has been through its
+      // own.
+      const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
       if (existing.length === 0) {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
         const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
-          () => template.getContextManager().compile());
-        for (const msg of compiled) {
+          () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const withoutReasoning = withoutThinking(compiled);
+        const seed = stripUnpairedToolBlocks(withoutReasoning);
+        logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
+        for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
         }

@@ -956,6 +956,34 @@ describe('a reached budget across a restart', () => {
     });
   });
 
+  it('a dry run under a budget the boot applied at once proves nothing: the fallback stays armed, whether the preview fits or is refused', async () => {
+    await run(async (h) => {
+      const restarted = await provenAtBoot(h, 60_000);
+      const recorded = persisted(restarted);
+      // A preview that fits notes nothing and keeps the fallback.
+      await restarted.previewActivation('agent');
+      // A preview refused at the boot budget restores nothing from a preview.
+      const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      const log = quietErrors();
+      try {
+        await withPatched('compile', async () => { throw refusal; }, async () => {
+          await assert.rejects(restarted.previewActivation('agent'), /over budget/);
+        });
+      } finally {
+        log.restore();
+      }
+      assert.ok(!log.lines.some((l) => l.includes('the context manager refused')), log.lines.join('\n'));
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 60_000, transition: 'stable' }, 'still the boot budget, applied at once');
+      assert.deepEqual(persisted(restarted), recorded, 'neither preview wrote the record');
+      // The fallback is still armed: the first sent compile refused at the
+      // boot budget restores it paced, and goes on.
+      const { planned, lines, thrown } = await refusedFirst(restarted);
+      assert.equal(thrown, undefined);
+      assert.deepEqual(planned, [60_000, 100_000]);
+      assert.ok(lines.some((l) => l.includes('restored it as a paced descent from the recipe\'s budget')), lines.join('\n'));
+    });
+  });
+
   it("the fallback runs once: if the recipe's budget is refused too, its compile reports that refusal", { timeout: 20_000 }, async () => {
     // Restored paced, and kept set where the strategy can't prepare a smaller window.
     for (const canPace of [true, false]) {
