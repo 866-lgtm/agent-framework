@@ -22,8 +22,12 @@ A prose segment's FIRST line may carry a routing prefix:
 ```
 
 - Body may start on the same line (`>>#ops deploy done`) or the next.
-- **Sticky within the turn:** the first resolved target applies to later
-  unprefixed segments of the SAME turn. Cross-turn, nothing is implicit.
+- **Sticky within the turn:** the latest resolved target applies to later
+  unprefixed segments of the SAME turn, including those a later stream of it
+  writes, such as a framework retry's, a budget restart's or the compile a
+  provider-capacity hold defers the turn to. A round kept private (one that
+  calls `skip_reply`, or has a same-round private think) sets no target.
+  Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
   ends, instead of the default pause-until-next-event. Gives prose the same
@@ -58,8 +62,8 @@ The grammar is never injected into context. The mode switch appends one short
 durable notice (persisted per agent, so reboots never re-notice); the first
 undelivered text produces a bounce notice carrying the exact resend syntax —
 the model learns by doing, and the knowledge accretes into its own history.
-The full reference is available on demand via the **`prose_help` tool**, whose
-result is model-requested content. The system prompt is never touched: those
+When the agent's `allowedTools` permits `prose_help`, the full reference is
+available on demand through that tool. Its result is model-requested content. The system prompt is never touched: those
 bytes belong to the recipe, and the deepest KV prefix must not vary with
 framework code.
 

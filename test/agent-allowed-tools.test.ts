@@ -9,7 +9,7 @@ import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
-async function harness(config: Partial<AgentConfig>) {
+async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolCall) => Promise<ToolResult>) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-allowed-tools-'));
   const membrane = new MockMembrane();
   const effects: ToolCall[] = [];
@@ -26,7 +26,7 @@ async function harness(config: Partial<AgentConfig>) {
     })),
     async handleToolCall(call) {
       effects.push(call);
-      return { success: true, data: 'executed' };
+      return probeHandler ? await probeHandler(call) : { success: true, data: 'executed' };
     },
     async onProcess(event) {
       return event.type === 'external-message'
@@ -38,6 +38,7 @@ async function harness(config: Partial<AgentConfig>) {
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'Test', ...config }],
     modules: [module], syncIntervalMs: 0, codeExecution: { enabled: true },
+    conversations: { templateAgent: 'assistant', bind: { channel: 'mention' } },
   });
   const traces: Array<Record<string, unknown>> = [];
   framework.onTrace((event) => traces.push(event as unknown as Record<string, unknown>));
@@ -422,24 +423,83 @@ for (const permitted of [false, true]) {
 }
 
 test('script in flight cannot gain legacy permissions when its ephemeral run disposes', async () => {
-  const h = await harness({ allowedTools: [] });
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const h = await harness({ allowedTools: [] }, async call => {
+    if ((call.input as {phase: string}).phase === 'barrier') { enter(); await released; }
+    return { success: true, data: 'released' };
+  });
+  let streamEntered!: () => void;
+  const streamCreated = new Promise<void>(resolve => { streamEntered = resolve; });
+  const originalStream = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (...args: Parameters<typeof originalStream>) => {
+    const stream = originalStream(...args);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      await entered;
+      const iterator = iterate();
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) return;
+        yield next.value;
+      }
+    };
+    streamEntered(); return stream;
+  };
   try {
     const created = await h.framework.createEphemeralAgent({ name: 'retiring-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['code_execution', 'probe--allowed'] });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete once.' }]);
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
     const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    h.framework.start(); await streamCreated;
     const script = h.framework.executeToolCall({ id: 'in-flight', name: 'code_execution', callerAgentName: created.agent.name, input: { code: [
-      'import asyncio', 'await asyncio.sleep(0.25)',
-      'make = probe__allowed.__globals__["_make_tool_fn"]',
-      'try:', '    print(await make("probe--denied", "late")({}))',
+      'await probe__allowed({"phase": "barrier"})',
+      'try:', '    print(await probe__allowed({"phase": "late"}))',
       'except Exception as error:', '    print(str(error))',
     ].join('\n') } });
-    h.framework.start(); await run;
+    await entered;
+    assert.equal(h.framework.getAgent(created.agent.name), created.agent);
+    await run;
     assert.equal(h.framework.getAgent(created.agent.name), null);
+    release();
     const result = await script; assert.equal(result.success, true);
     assert.match((result.data as { stdout: string }).stdout, /not permitted.*allowedTools/);
-    assert.deepEqual(h.effects, []);
+    assert.deepEqual(h.effects.map(call => call.input), [{phase: 'barrier'}]);
     assert.equal(h.emitter.openCount, 0);
     assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
+  } finally { release(); await h.close(); }
+});
+
+test('disposed conversation fork cannot regain legacy tool permissions', async () => {
+  const h = await harness({ allowedTools: ['probe--allowed'] });
+  try {
+    const internals = h.framework as unknown as {
+      createConversationAgent(name: string, channel: string): Promise<{name: string}>;
+      disposeConversationAgent(name: string): void;
+    };
+    const fork = await internals.createConversationAgent('conversation-probe-g1', 'world:probe');
+    assert.ok(h.framework.getAgent(fork.name));
+    const call = {id: 'fork-permitted', name: 'probe--allowed', input: {}, callerAgentName: fork.name};
+    assert.equal((await h.framework.executeToolCall(call)).success, true);
+    internals.disposeConversationAgent(fork.name);
+    assert.equal(h.framework.getAgent(fork.name), null);
+    const before = h.effects.length;
+    assert.equal((await h.framework.executeToolCall({...call,id:'fork-late'})).success, false);
+    assert.equal(h.effects.length, before);
+    assert.equal(h.emitter.openCount, 0);
+  } finally { await h.close(); }
+});
+
+test('public utility catalogue preserves names and the collapsed model surface', async () => {
+  const h = await harness({ allowedTools: 'all' });
+  try {
+    const framework = h.framework as typeof h.framework & {getAllUtilities(): ReturnType<typeof h.framework.getAllTools>};
+    const utilities = framework.getAllUtilities();
+    assert.deepEqual(utilities.map(tool => tool.name), ['probe--allowed_util', 'probe--denied_util']);
+    assert.ok(h.framework.getAllTools().some(tool => tool.name === 'utils'));
+    assert.ok(!h.framework.getAllTools().some(tool => tool.name === 'probe--allowed_util'));
+    utilities.pop();
+    assert.equal(framework.getAllUtilities().length, 2);
   } finally { await h.close(); }
 });

@@ -4,6 +4,8 @@ import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/cont
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { isStateExistsError } from './module-registry.js';
+import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
 export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
@@ -52,31 +54,60 @@ export interface WithheldHost {
 
 /**
  * The stub a withheld result settles to: #159's neutral notice, then where
- * the original is. It names no refusal and no category (#159 keeps those in
- * operational logs), only the place, so reading it back is the agent's
- * deliberate choice (agent-framework #277). The place holds the result as
- * stored, which for one over the inline cap is its capped text, whose own
- * note names the file with the whole output; so the stub says "its result",
- * not its full result. A failed write's own error text
- * stays in the audit record and the logs, not here. The audit
- * record is said to keep the original only when it was saved: a staged
- * record whose save failed is still queued in memory, and a restart before
- * its retry loses it.
+ * the original is, then, when its tool marked any, the fields kept from its
+ * result (`kept`, from keptWhenWithheld). It names no refusal and no
+ * category (#159 keeps those in operational logs), so reading the rest back
+ * is the agent's deliberate choice (agent-framework #277). The place holds
+ * the result as stored, which for one over the inline cap is its capped
+ * text, whose own note names the file with the whole output; so the stub
+ * says "its result", not its full result. A failed write's own error text
+ * stays in the audit record and the logs, not here. The audit record is
+ * said to keep the original only when it was saved: a staged record whose
+ * save failed is still queued in memory, and a restart before its retry
+ * loses it.
  */
-export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean): string {
+export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean, kept?: string): string {
   const audit = `the guard's audit record (${TOOL_RESULT_GUARD_AUDIT_STATE}), for an operator`;
-  const kept = (only: string) => auditDurable
+  const keptIn = (only: string) => auditDurable
     ? `is kept ${only}in ${audit}`
     : `went ${only}to ${audit}, though saving that record had failed when the result arrived`;
-  if (!spill || 'skipped' in spill) return `${TOOL_RESULT_GUARD_NOTICE} Its result ${kept('')}.`;
-  if (spill.unfinished) {
-    return `${TOOL_RESULT_GUARD_NOTICE} Its result was still being written to workspace file ${spill.path} ` +
-      `when this note was made; if that file is missing, it ${kept('')}.`;
+  const place = !spill || 'skipped' in spill
+    ? `Its result ${keptIn('')}.`
+    : spill.unfinished
+      ? `Its result was still being written to workspace file ${spill.path} when this note was made; ` +
+        `if that file is missing, it ${keptIn('')}.`
+      : spill.error === undefined
+        ? `Its result is in workspace file ${spill.path}.`
+        : `Writing its result to workspace file ${spill.path} failed, so it ${keptIn('only ')}.`;
+  const fields = kept === undefined ? '' : ` Kept from its result: ${kept}`;
+  return `${TOOL_RESULT_GUARD_NOTICE} ${place}${fields}`;
+}
+
+/**
+ * What a withheld result's stub keeps of it: the fields of its data that its
+ * tool marked as saying what it acted on (ToolResult.keepWhenWithheld), in
+ * the order marked, serialized as a stored result is. Past the inline cap
+ * they're cut, with a note that says so and where the whole result is, since
+ * a later field can then be cut away entirely. Undefined when it keeps
+ * nothing, as for a failed result (agent-framework #277). A write's file
+ * list is evidence of what it did, rarely what drew a refusal, and keeping it
+ * is what shows a clobbered file when the receipt is withheld.
+ */
+export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: number | undefined): string | undefined {
+  const { data, keepWhenWithheld: keys } = result;
+  if (!result.success || result.isError || !keys?.length || !data || typeof data !== 'object' || Array.isArray(data)) {
+    return undefined;
   }
-  if (spill.error === undefined) {
-    return `${TOOL_RESULT_GUARD_NOTICE} Its result is in workspace file ${spill.path}.`;
-  }
-  return `${TOOL_RESULT_GUARD_NOTICE} Writing its result to workspace file ${spill.path} failed, so it ${kept('only ')}.`;
+  const fields = data as Record<string, unknown>;
+  const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
+  if (Object.keys(kept).length === 0) return undefined;
+  const whole = toolResultDataToHistoryString(kept);
+  if (!maxChars || whole.length <= maxChars) return whole;
+  // Never half a surrogate pair: the stub goes to the provider as text, so
+  // the cut can be one character short of the cap.
+  const head = safeSlice(whole, 0, maxChars);
+  return `${head} [cut at the inline cap: ${head.length} of these fields' ${whole.length} ` +
+    'characters; the whole result is where this note says]';
 }
 
 interface PendingBatch {
@@ -89,6 +120,9 @@ interface PendingBatch {
   submitted: boolean;
   /** False when the audit sync failed: originals then never go on the wire. */
   durable: boolean;
+  /** What each result's stub keeps if the batch is withheld, by its index in
+   *  content: the fields its tool marked (keptWhenWithheld). */
+  kept: Map<number, string>;
 }
 
 interface AuditOperation {
@@ -280,11 +314,15 @@ export class ToolResultGuard {
       : JSON.parse(json);
   }
 
+  /** `inlineCap` is the cap the caller stored `content` under; what a stub
+   *  keeps of a withheld result is cut at it too. */
   storeResults(
     content: ContentBlock[],
     wireResults: ToolResult[],
     originals: CompletedToolCall[],
-    metadata?: MessageMetadata,
+    metadata: MessageMetadata | undefined,
+    /** The cap the results were stored under: what a stub keeps is cut there too. */
+    inlineCap: number | undefined,
   ): MessageId {
     if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {
@@ -312,13 +350,22 @@ export class ToolResultGuard {
     const withheld: ContentBlock[] = content.map((block) => block.type === 'tool_result'
       ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError }
       : block);
+    // What each stub keeps if the batch is withheld, matched to its tool's
+    // result by tool use id, keyed by index as the stubs and files are.
+    const results = new Map(originals.map((call) => [call.id, call.result]));
+    const kept = new Map<number, string>();
+    for (const [index, block] of content.entries()) {
+      const result = block.type === 'tool_result' ? results.get(block.toolUseId) : undefined;
+      const text = result ? keptWhenWithheld(result, inlineCap) : undefined;
+      if (text !== undefined) kept.set(index, text);
+    }
     // Compression hold (CM >= 0.12): placed BEFORE onNewMessage fires, so no
     // chunk is ever summarized from the placeholder; released after the
     // settlement edit. Holds are in-memory only — a reopened manager has none,
     // which is correct since a reopened guard has no pending batch.
     const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
     this.pending = { id, messageId, content, withheld, wireResults,
-      branch: this.cm.currentBranch().name, submitted: false, durable: false };
+      branch: this.cm.currentBranch().name, submitted: false, durable: false, kept };
     // Durability barrier: the audit must reach Chronicle's chain heads before
     // the originals can go to a provider. On a failed sync the batch fails
     // CLOSED: the placeholders go on the wire instead (the turn continues,
@@ -452,7 +499,8 @@ export class ToolResultGuard {
   /**
    * Turn a withheld batch's notices into stubs that say where each original
    * is (agent-framework #277): written to the workspace when a writable mount
-   * takes it, else kept in the audit record. Its own unedited placeholder is
+   * takes it, else kept in the audit record. A stub also keeps the file
+   * lists its tool marked. Its own unedited placeholder is
    * the only thing it edits: an operator's later edit, removal or rollback
    * stands.
    *
@@ -540,7 +588,7 @@ export class ToolResultGuard {
           spills.set(index, spill);
         }
         const annotated: ContentBlock[] = pending.withheld.map((block, index) => block.type === 'tool_result'
-          ? { ...block, content: withheldResultNotice(spills.get(index) ?? null, pending.durable) }
+          ? { ...block, content: withheldResultNotice(spills.get(index) ?? null, pending.durable, pending.kept.get(index)) }
           : block);
         try {
           this.append({

@@ -9,9 +9,10 @@ import { Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type P
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
-import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, withheldResultNotice } from '../src/tool-result-guard.js';
+import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { JsStore } from '@animalabs/chronicle';
 
 // What a withheld result settles to with no writable workspace (#277): the
@@ -913,12 +914,12 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
     getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const internals = h.framework as unknown as {
-    requestProseContinuation(agent: unknown, routing: { logical: { continuation: boolean } }): void;
+    requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void;
   };
   const check = internals.requestProseContinuation.bind(h.framework);
   const seen: boolean[] = [];
   internals.requestProseContinuation = (agent, routing) => {
-    seen.push(routing.logical.continuation);
+    seen.push(routing.continuation);
     check(agent, routing);
   };
   try {
@@ -996,10 +997,13 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
     type Routing = { pin?: string; destination: string | null; hybridHold: boolean;
-      logical: { continuation: boolean; deliveries: string[]; suppressed: number } };
+      continuation: boolean; deliveries: string[]; suppressed: number;
+      triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlier: Routing = { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
-      logical: { continuation: true, deliveries: ['chan-earlier'], suppressed: 2 } };
+    const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
+      continuation: true, deliveries: ['chan-earlier'], suppressed: 2,
+      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrivals: [{ messageId: 'earlier-message', channelId: 'chan-earlier' }] });
+    const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
     try {
       await h.run();
@@ -1008,12 +1012,14 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.pin, undefined, `${mode}: no sticky destination`);
       assert.equal(now?.destination, null, `${mode}: no turn destination`);
       assert.equal(now?.hybridHold, false, `${mode}: no hybrid hold`);
-      assert.equal(now?.logical.continuation, false, `${mode}: no continuation`);
-      assert.notEqual(now?.logical, earlier.logical, `${mode}: a fresh turn's logical state isn't shared with the earlier turn's`);
-      assert.deepEqual(now?.logical.deliveries, [], `${mode}: no deliveries carried into the new turn`);
-      assert.equal(now?.logical.suppressed, 0, `${mode}: no suppression carried into the new turn`);
-      assert.deepEqual(earlier, { pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
-        logical: { continuation: true, deliveries: ['chan-earlier'], suppressed: 2 } },
+      assert.equal(now?.continuation, false, `${mode}: no continuation`);
+      assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
+      assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
+      assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
+      assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
+      assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
+      assert.deepEqual(now?.arrivals, [], `${mode}: no arrival carried into the new turn`);
+      assert.deepEqual(earlier, earlierFields(),
         `${mode}: all earlier-turn routing and receipt state stays with its queued prose`);
     } finally {
       await h.framework.stop();
@@ -1427,7 +1433,7 @@ async function compressionRig() {
   const guard = new ToolResultGuard('Claude', cm, true);
   const REAL = 'REAL-ACCEPTED-TOOL-OUTPUT';
   const content: ContentBlock[] = [{ type: 'tool_result', toolUseId: 'tu-1', content: REAL }];
-  const messageId = guard.storeResults(content, [{ toolUseId: 'tu-1', content: REAL }], []);
+  const messageId = guard.storeResults(content, [{ toolUseId: 'tu-1', content: REAL }], [], undefined, undefined);
   // Deferred messages flushed right behind the staged batch push it out of
   // the protected tail.
   for (let i = 0; i < 6; i++) cm.addMessage(i % 2 === 0 ? 'Claude' : 'User', [{ type: 'text', text: filler(30) }]);
@@ -2396,7 +2402,7 @@ test('#281: a compile waits for an annotation that began while it waited for ano
     // A second batch settles while the compile waits for the first annotation.
     r.cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-2', name: 'search', input: {} }]);
     secondId = r.guard.storeResults([{ type: 'tool_result', toolUseId: 'tu-2', content: 'SECOND' }],
-      [{ toolUseId: 'tu-2', content: 'SECOND' }], []);
+      [{ toolUseId: 'tu-2', content: 'SECOND' }], [], undefined, undefined);
     r.guard.submissionResults([{ toolUseId: 'tu-2', content: 'SECOND' }]);
     assert.ok(r.guard.withhold('test-category'));
     first.open();
@@ -2756,7 +2762,7 @@ test('#281: an annotation that starts while modules stop writes no file, and is 
   h.module.stop = async () => {
     // A settlement during shutdown, as a direct-API call that stop doesn't cancel can make.
     agent.toolResultGuard.storeResults([{ type: 'tool_result', toolUseId: 'late', content: 'late-original' }],
-      [{ toolUseId: 'late', content: 'late-original' }], []);
+      [{ toolUseId: 'late', content: 'late-original' }], [], undefined, undefined);
     agent.toolResultGuard.abandon('stopping');
     await stopModule();
   };
@@ -2770,6 +2776,220 @@ test('#281: an annotation that starts while modules stop writes no file, and is 
     assert.deepEqual(audit.slice(-3).map((record) => record.type), ['withheld', 'annotated', 'stub_updated']);
     assert.deepEqual(audit.at(-2)?.results, [{ toolUseId: 'late', skipped: 'no_workspace_file' }]);
   } finally { await restarted.stop(); }
+});
+
+test('#277: a write for a branch that waits for its mount while the branch changes is refused, and neither branch gets it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-guard-write-binary-')); dirs.push(dir);
+  mkdirSync(join(dir, 'mount'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: join(dir, 'mount'), mode: 'read-write', watch: 'never' }] });
+  workspace.initStore(store);
+  try {
+    const tree = 'workspace/work/tree';
+    const source = store.currentBranch().name;
+    const before = store.currentSequence();
+    // Hold the mount's turn, as a pass on it would: the write queues behind it.
+    const internals = workspace as unknown as {
+      mounts: Map<string, unknown>;
+      withMount: (mount: unknown, fn: () => Promise<void>) => Promise<void>;
+    };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const held = internals.withMount(internals.mounts.get('work'), () => gate);
+    const writing = workspace.writeBinary('work/tool-results/late.txt', Buffer.from('late'), 'text/plain', { branch: source });
+    store.createBranchAt('elsewhere', source, before);
+    store.switchBranch('elsewhere');
+    release();
+    await held;
+    assert.deepEqual(await writing, { success: false, error: 'the workspace had left the branch this file is for', isError: true,
+      data: { branchLeft: true } });
+    assert.equal(store.treeGet(tree, 'tool-results/late.txt'), null, 'nothing lands on the branch switched to');
+    store.switchBranch(source);
+    assert.equal(store.treeGet(tree, 'tool-results/late.txt'), null, 'nor on the branch the write named');
+  } finally { store.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// #277's second half: a withheld result keeps the file lists its tool marked
+// (ToolResult.keepWhenWithheld) inline in its stub. materialize, sync and
+// delete mark theirs; nothing else does.
+// ---------------------------------------------------------------------------
+
+const LISTS = ' Kept from its result: ';
+/** The file lists a stub kept, parsed; undefined when it kept none. */
+const keptLists = (stub: string) => stub.includes(LISTS) ? JSON.parse(stub.slice(stub.indexOf(LISTS) + LISTS.length)) : undefined;
+const toolUse = (id: string, name: string, input: Record<string, unknown> = {}) =>
+  createMockResponse([{ type: 'tool_use', id, name, input }], 'tool_use');
+
+test('#277: a stub keeps the file lists after where the original is, for each place it can be', () => {
+  const notice = 'Tool result withheld by the guard. The tool has already executed.';
+  const lists = '{"materialized":[{"mount":"work","path":"LOG.md"}]}';
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt' }, true, lists),
+    `${notice} Its result is in workspace file work/tool-results/x.txt. Kept from its result: ${lists}`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, true, lists),
+    `${notice} Writing its result to workspace file work/tool-results/x.txt failed, ` +
+    `so it is kept only in the guard's audit record (framework/tool-result-guard), for an operator. Kept from its result: ${lists}`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/y.txt', unfinished: true }, true, lists),
+    `${notice} Its result was still being written to workspace file work/tool-results/y.txt when this note was made; ` +
+    `if that file is missing, it is kept in the guard's audit record (framework/tool-result-guard), for an operator. ` +
+    `Kept from its result: ${lists}`);
+  assert.equal(withheldResultNotice(null, false, lists),
+    `${notice} Its result went to the guard's audit record (framework/tool-result-guard), for an operator, ` +
+    `though saving that record had failed when the result arrived. Kept from its result: ${lists}`);
+  assert.equal(withheldResultNotice(null, true, undefined), AUDIT_STUB, 'nothing kept: the stub is as before');
+});
+
+test('#277: a result keeps the fields its tool marked, in the order marked, cut at the inline cap', () => {
+  const data = { materialized: [{ mount: 'work', path: 'LOG.md' }], count: 1, deleted: [{ mount: 'work', path: 'old.txt' }],
+    skipped: [{ mount: 'work', reason: 'a.txt: divergent' }] };
+  assert.equal(keptWhenWithheld({ success: true, data, keepWhenWithheld: ['deleted', 'materialized'] }, undefined),
+    '{"deleted":[{"mount":"work","path":"old.txt"}],"materialized":[{"mount":"work","path":"LOG.md"}]}');
+  assert.equal(keptWhenWithheld({ success: true, data: { materialized: [], count: 0 }, keepWhenWithheld: ['deleted', 'materialized'] }, undefined),
+    '{"materialized":[]}', 'a marked field the result lacks is left out; an empty list is kept');
+  for (const result of [
+    { success: true, data },
+    { success: true, data, keepWhenWithheld: [] },
+    { success: true, data, keepWhenWithheld: ['absent'] },
+    { success: true, data: 'text', keepWhenWithheld: ['length'] },
+    { success: true, data: [{ path: 'a' }], keepWhenWithheld: ['0'] },
+    { success: false, isError: true, error: 'failed', data: { path: 'work/a.txt' }, keepWhenWithheld: ['path'] },
+    // A failure is success false, whatever isError says.
+    { success: false, isError: false, error: 'failed', data: { path: 'work/a.txt' }, keepWhenWithheld: ['path'] },
+    // No data at all, with marks.
+    { success: true, data: null, keepWhenWithheld: ['path'] },
+    { success: true, keepWhenWithheld: ['path'] },
+  ]) assert.equal(keptWhenWithheld(result as never, undefined), undefined, `keeps nothing: ${JSON.stringify(result)}`);
+  const long = { written: Array.from({ length: 200 }, (_, i) => `file-${i}.txt`) };
+  const cut = keptWhenWithheld({ success: true, data: long, keepWhenWithheld: ['written'] }, 1000)!;
+  const whole = JSON.stringify(long);
+  assert.ok(whole.length > 1000);
+  // The note says what was cut and where the rest is, not "original was N",
+  // which would read as the whole result's size.
+  assert.equal(cut, `${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ${whole.length} characters; ` +
+    'the whole result is where this note says]');
+  // A cut never leaves half a surrogate pair.
+  // '{"name":"' is 9 characters and each emoji 2, so a cap of 14 falls inside the third.
+  const emoji = keptWhenWithheld({ success: true, data: { name: '\u{1F600}'.repeat(10) }, keepWhenWithheld: ['name'] }, 14)!;
+  const loneSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+  assert.doesNotMatch(emoji, loneSurrogate, `well-formed: ${JSON.stringify(emoji)}`);
+  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut at the inline cap: 13 of these fields' 31 characters;/u);
+});
+
+test('#277: a withheld batch keeps what each marked result listed; an unmarked one keeps nothing, and its file has everything', async () => {
+  const h = await workspaceHarness([[calls('marked', 'plain'), refused()], [answer()]]);
+  h.module.results.marked = { success: true, data: { written: ['LOG.md'], detail: 'payload-marked' }, keepWhenWithheld: ['written'] };
+  try {
+    await h.run();
+    const [marked, plain] = toolResults(h.framework).map((block) => String(block.content));
+    assert.deepEqual(keptLists(marked), { written: ['LOG.md'] });
+    assert.doesNotMatch(marked, /payload-marked/, 'only the marked field is kept');
+    assert.match(marked, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file work\/tool-results\/\S+-0-marked\.txt\. Kept from its result: /);
+    assert.equal(keptLists(plain), undefined);
+    assert.match(plain, /Its result is in workspace file work\/tool-results\/\S+-1-plain\.txt\.$/);
+    const file = await h.workspace.readBinary(/workspace file (\S+\.txt)\./.exec(marked)![1]);
+    assert.match((file as { data: Buffer }).data.toString('utf8'), /payload-marked/, 'the file holds the whole result');
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), [marked, plain], 'the retry already carries the lists');
+    assert.doesNotMatch(marked, /refus|test-category/, "#159's line: no refusal or category in the context");
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: a marked result skipped for a branch change keeps its fields in the stub that names the audit record', async () => {
+  const h = await workspaceHarness([[calls('marked', 'plain'), refused()], [answer()]]);
+  h.module.results.marked = { success: true, data: { written: ['LOG.md'], detail: 'payload-marked' }, keepWhenWithheld: ['written'] };
+  // Declined where it commits, and the store is back on the batch's branch by
+  // the edit, as after an undo and a redo.
+  (h.framework as unknown as { writeToolResultFile: () => Promise<unknown> }).writeToolResultFile = async () =>
+    ({ path: 'work/tool-results/declined.txt', branchLeft: true });
+  try {
+    await bounded(h.run(), 'the run');
+    const [marked, plain] = toolResults(h.framework).map((block) => String(block.content));
+    assert.equal(plain, AUDIT_STUB);
+    assert.ok(marked.startsWith(`${AUDIT_STUB} Kept from its result: `), marked);
+    assert.deepEqual(keptLists(marked), { written: ['LOG.md'] });
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: with no writable workspace the stub still keeps the file lists, cut at the agent\'s inline cap', async () => {
+  const written = Array.from({ length: 200 }, (_, i) => `file-${i}.txt`);
+  const h = await harness([[calls('marked'), refused()], [answer()]], { toolResultGuard: true },
+    { marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } });
+  try {
+    const spill = [...(h.framework as unknown as {
+      collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension>;
+    }).collectAgentSettingsExtensions().values()].find((ext) => ext.keys.includes('tool_result_inline_max_chars'))!;
+    spill.update('assistant', { tool_result_inline_max_chars: 1000 });
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    const whole = JSON.stringify({ written });
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: direct API: a withheld result keeps its file lists, cut at the house default cap it was stored under', async () => {
+  const h = await harness([], { toolResultGuard: true });
+  const responses: unknown[] = [calls('marked'), refused(), answer()];
+  (h.membrane as unknown as { stream: () => Promise<unknown> }).stream = async () => {
+    const response = responses.shift();
+    assert.ok(response);
+    return response;
+  };
+  try {
+    const agent = h.framework.getAgent('assistant')!;
+    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    await agent.runInference(h.framework.getAllTools());
+    const written = Array.from({ length: 3000 }, (_, i) => `file-${i}.txt`);
+    agent.provideToolResult('marked', { success: true, data: { written }, keepWhenWithheld: ['written'] });
+    await agent.runInference(h.framework.getAllTools());
+    const stub = String(toolResults(h.framework)[0].content);
+    const whole = JSON.stringify({ written });
+    assert.ok(whole.length > DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)}` +
+      ` [cut at the inline cap: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
+      'the whole result is where this note says]');
+  } finally { await h.framework.stop(); }
+});
+
+test('#283: a withheld materialize keeps the deletions it made; sync keeps a root it accepted ahead of its results', async () => {
+  const h = await workspaceHarness([[toolUse('m', 'workspace--materialize', { applyDeletions: true }), refused()], [answer()]]);
+  const call = (name: string, input: Record<string, unknown> = {}) => h.workspace.handleToolCall({ id: name, name, input } as never);
+  try {
+    // A file on disk that the workspace then deletes: the agent's materialize removes it.
+    assert.equal((await h.workspace.writeBinary('work/old.txt', Buffer.from('old'), 'text/plain')).success, true);
+    assert.equal((await call('materialize')).success, true);
+    assert.equal((await call('delete', { path: 'work/old.txt' })).success, true);
+    await h.run();
+    const [materialize] = toolResults(h.framework).map((block) => String(block.content));
+    assert.deepEqual(keptLists(materialize), { deleted: [{ mount: 'work', path: 'old.txt' }], materialized: [] }, materialize);
+    // sync marks a root it accepted first, so a long results list can't cut it away.
+    const synced = await call('sync');
+    assert.deepEqual(synced.keepWhenWithheld, ['rootsAccepted', 'results']);
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: withheld materialize, sync and delete keep the files they acted on in their stubs', async () => {
+  const h = await workspaceHarness([
+    [toolUse('m', 'workspace--materialize'), refused()], [answer()],
+    [toolUse('s', 'workspace--sync'), refused()], [answer()],
+    [toolUse('d', 'workspace--delete', { path: 'work/LOG.md' }), refused()], [answer()],
+  ]);
+  try {
+    // A workspace draft disk doesn't have yet: the materialize writes it.
+    assert.equal((await h.workspace.writeBinary('work/LOG.md', Buffer.from('log'), 'text/plain')).success, true);
+    await h.run();
+    // A file disk has and the workspace doesn't: the sync takes it in.
+    const mountDir = /^(.*)\/LOG\.md$/.exec(h.workspace.resolveAbsolutePath('work/LOG.md')!)![1];
+    writeFileSync(join(mountDir, 'disk.txt'), 'from disk');
+    await h.run();
+    await h.run();
+    const [materialize, sync, del] = toolResults(h.framework).map((block) => String(block.content));
+    assert.deepEqual(keptLists(materialize), { materialized: [{ mount: 'work', path: 'LOG.md' }] }, materialize);
+    const synced = keptLists(sync) as { results: Array<{ mount: string; synced: string[] }> };
+    assert.deepEqual(synced.results.map((r) => [r.mount, r.synced]), [['work', ['disk.txt']]], sync);
+    assert.deepEqual(keptLists(del), { path: 'work/LOG.md', deleted: true }, del);
+    for (const stub of [materialize, sync, del]) assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file /);
+  } finally { await h.framework.stop(); }
 });
 
 test('an unexpected annotation exception releases its compression hold', async () => {
@@ -2891,7 +3111,7 @@ test("a batch's deadline is taken when it is queued, not when the batches ahead 
     // A second batch queued behind the first, still writing.
     r.cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-2', name: 'search', input: {} }]);
     r.guard.storeResults([{ type: 'tool_result', toolUseId: 'tu-2', content: 'SECOND' }],
-      [{ toolUseId: 'tu-2', content: 'SECOND' }], []);
+      [{ toolUseId: 'tu-2', content: 'SECOND' }], [], undefined, undefined);
     r.guard.submissionResults([{ toolUseId: 'tu-2', content: 'SECOND' }]);
     assert.ok(r.guard.withhold('test-category'));
     assert.equal(taken, 2, "the second batch's deadline was taken when it was queued");
@@ -2979,7 +3199,7 @@ test('stop then start reopens withheld spills', async () => {
     framework.start();
     const guard = framework.getAgent('assistant')!.toolResultGuard;
     guard.storeResults([{ type: 'tool_result', toolUseId: 'one', content: 'original' }],
-      [{ toolUseId: 'one', content: 'original' }], []);
+      [{ toolUseId: 'one', content: 'original' }], [], undefined, undefined);
     guard.abandon('test');
     await guard.whenAnnotated();
     assert.equal(writes, 1);
@@ -3053,7 +3273,7 @@ test('slow successful writes share one batch deadline', async (t) => {
   try {
     t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
     guard.storeResults(['one', 'two', 'three'].map((id) => ({ type: 'tool_result', toolUseId: id, content: id })),
-      ['one', 'two', 'three'].map((id) => ({ toolUseId: id, content: id })), []);
+      ['one', 'two', 'three'].map((id) => ({ toolUseId: id, content: id })), [], undefined, undefined);
     guard.abandon('test');
     let annotated = false;
     void guard.whenAnnotated().then(() => { annotated = true; });
