@@ -15,18 +15,26 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 ## 0.22.1 — 2026-10-14
 
 **Operators upgrading from 0.22.0:** a provider's stated `retry-after` now
-holds the agent's turns, recorded in the store and kept across restarts,
-where 0.22.0 slept it inside the turn and `stop()` couldn't end the sleep. A
-hold longer than an hour raises a `provider-wait` ops alert, and the
-`release-provider-wait` host command lifts one. Discord reaction suppression
-now also covers 💤, the awareness emoji and retained recovery emoji by
-default; a host that injects the old refusal-only default should remove it.
-Going back to 0.22.0 is safe: it opens a store 0.22.1 wrote and ignores the
-recorded waits, so a long `retry-after` is slept inside the turn again, and a
-wait recorded before going back binds again if you return before it passes.
-Not tested: going back while the recorded waits can't be read (0.22.1 then
-holds every provider call), and going back under connectome-host rather than
-a bare framework.
+holds a resident's or conversation agent's turns, recorded in the store and
+kept across restarts, where 0.22.0 slept it inside the turn and `stop()`
+couldn't end the sleep. A hold longer than an hour raises a `provider-wait`
+ops alert, and the `release-provider-wait` host command lifts one. An
+ephemeral run, such as a subagent's, still sleeps a stated wait of up to ten
+minutes, and a longer one ends the run at once, telling its caller why. If
+the recorded waits can't be read, no resident's or conversation agent's
+provider call goes out until they read again (every 30 s), or until an
+operator releases that agent's waits with `release-provider-wait` for the
+life of the process; a `provider-wait` alert for agent `framework` says so.
+A misspelled model's 404 no longer sheds the agent's newest exchanges.
+Discord reaction suppression's default now also covers the awareness emoji
+(💤 unless configured otherwise) and retained recovery emoji; a host that
+injects the old refusal-only default should remove it. Going back to 0.22.0
+is safe. It opens a store 0.22.1 wrote and ignores the recorded waits, so a
+long `retry-after` is slept inside the turn again, and a wait recorded before
+going back binds again if you return before it passes. Not tested: going back
+while the recorded waits can't be read, going back after an operator released
+a wait under 0.22.1, and going back under connectome-host rather than a bare
+framework.
 
 ### Added
 
@@ -147,10 +155,9 @@ a bare framework.
 - A module's event that arrives after `stop()` began is dropped with a log line naming the module, through `ModuleContext.pushEvent()` or the deprecated `queue` handle alike, instead of throwing `Queue is closed`. `stop()` closes the event queue before it stops modules, so such an event comes from a listener that fires while `stop()` runs, where the throw can go unhandled, or from the module's own `stop()`, where it made the framework's `stop()` fail. A direct caller of `AgentFramework.pushEvent()` still gets the throw for anything but a tool result, and a module's tool result keeps that method's drop line, which names the call, the tool and its outcome. The deprecated `ModuleContext.queue` is now an object with `push` alone, as its `ProcessQueue` type always said; it was the framework's own queue object.
 
 - The poison-history breaker sheds history only for an `invalid_request` that came back as HTTP 400, 413 or 422 or that carries no status, and for a `context_length` at 413. The status is a heuristic for when shedding the newest exchange may help, not proof that the history is at fault. 400 and 422 are how a provider answers a request that fails its validation, as a history it can't accept does. A 413 is the request's size: when the newest exchange made it too large, as an oversized attachment does, shedding that exchange may recover, and nothing else in the framework does; when the history as a whole is too large, the shed doesn't help, and the breaker stops at its rewind cap. The 413 arm takes both labels a 413 arrives under, `invalid_request` and `context_length`, since membrane's label for a 413 differs by version and adapter. Other statuses keep the history, since shed history can't be got back and the status gives no sign that a shed would help: a 404 is a model or an endpoint that doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the resource, as a rule, rather than the conversation. The failure is still counted, logged and reported hard-down either way.
-  - As membrane 0.5.86 classifies them, Anthropic files only a 400 as `invalid_request`, and the chat adapters never file one, since they classify by the error's message text; a `context_length` they file that way carries status 400 whatever the response's was. So neither changes, and no 0.5.86 adapter produces a `context_length` at 413. The raw-fetch Responses adapter files every status it doesn't list as `invalid_request`, so it alone produces an `invalid_request` at 413 or 422 today: a 404, 405, 409, 410 or 415 from it no longer sheds history, and a 413 or 422 still does.
-  - From membrane #56 (merged, not yet in a release), one status table serves every adapter. An Anthropic 404 then arrives as `invalid_request`, which is the case this change is for: three failures for a misspelled model would otherwise shed the agent's newest exchanges, under a rewind marker saying "the model API kept rejecting the conversation on them". A 413 arrives as `context_length` and still sheds, so the breaker also sheds for an Anthropic 413, which no earlier version did. A `context_length` at 400 or 422 is a token overflow and keeps the history. A 422 from an OpenAI-compatible server that answers a validation failure with it, such as a FastAPI one, arrives as `invalid_request`. Hosts should take this change before a membrane release that includes #56.
+  - With membrane 0.5.87, which this release requires, one status table serves every adapter. A 404, such as a misspelled model's, arrives as `invalid_request`. Under 0.22.0, three of them shed the agent's newest exchanges, under a rewind marker saying "the model API kept rejecting the conversation on them"; 0.22.1 keeps the history. A 405, 409, 410 or 415 arrives as `invalid_request` too and is kept the same way. A 413 arrives as `context_length` and still sheds, so the breaker also sheds for an Anthropic 413, which no earlier release did. A `context_length` at 400 or 422 is a token overflow and keeps the history. A 422 from an OpenAI-compatible server that answers a validation failure with it, such as a FastAPI one, arrives as `invalid_request` and still sheds.
   - An error with no status, from a membrane that reports none, keeps the breaker's earlier rule, the type alone.
-  - Anthropic's "credit balance is too low" 400 still arrives as `invalid_request` at 400 and still sheds, until antra-tess/membrane#107, which classifies it as `auth`, is released and in agent-framework's membrane floor.
+  - Account refusals, such as Anthropic's "credit balance is too low" and usage-limit 400s, arrive as `auth` and never shed.
   - The rewind marker the breaker writes into the agent's context says the turns were set aside because the model API kept refusing the requests that carried them, so that the conversation could go on. It used to say the API kept rejecting the conversation on them.
 
 - A provider's stated `retry-after` on a turn that doesn't own provider admission, a conversation agent's or an ephemeral run's, is no longer slept in the turn for as long as it says. Such a turn went to the error policy, which returns a stated wait as it is: a 429 stating two hours held the turn asleep two hours per attempt, up to three times, with nothing recorded and nothing raised.
