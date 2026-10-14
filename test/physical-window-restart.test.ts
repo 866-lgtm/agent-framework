@@ -336,8 +336,9 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     // second alone crosses the window (a 190k prompt with 10k of output, so
     // with the appended tool result and the 32k reserve, about 238k). The
     // second boundary must project from the second call: figures kept from
-    // the first would project about 148k and dispatch past the cap. Every
-    // other restart test here crosses at the first boundary.
+    // the first would project about 148k and dispatch past the cap. When
+    // this test was added, every other restart test here crossed at the
+    // first boundary.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 20_000, cacheReadTokens: 60_000, outputTokens: 30_000 }),
@@ -350,7 +351,10 @@ describe('physical-window mid-turn restart (issue #92)', () => {
       assert.ok(t.done, 'the turn should finish');
       assert.strictEqual(t.restarts.length, 1, 'the second boundary must restart');
       assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
-      assert.ok((t.restarts[0]!.inputTokens ?? 0) > 200_000);
+      // The second call's own figures: its 190k prompt and 10k output, the
+      // appended round and the reserve. The first call's 30k output, kept,
+      // would project 258,043.
+      assert.strictEqual(t.restarts[0]!.inputTokens, 190_000 + 10_000 + APPENDED + 32_000);
       assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
       assert.ok(storedTexts(t.framework).includes('Answered after a restart'));
     } finally {
@@ -431,7 +435,28 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     }
   });
 
-  it('bounds the output of a call that reports nothing by maxTokens, so the projection fails safe', async () => {
+  it('bounds the output of a call that reports a prompt but no output by maxTokens', async () => {
+    // Call 1 reports a 150k prompt and no output, though it wrote a tool_use:
+    // its output counts as the 32k it could have been, so the first boundary
+    // projects 150k + 32k + the appended round + the 32k reserve = 220,043,
+    // a restart. Counting it as 0 would project 188,043 and dispatch.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 10_000, cacheReadTokens: 140_000, outputTokens: 0 }),
+        round(null, { inputTokens: 11_000, cacheReadTokens: 290_000, outputTokens: 500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1);
+      assert.strictEqual(t.restarts[0]!.inputTokens, 150_000 + 32_000 + APPENDED + 32_000);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('bounds the output of a call that reports nothing by maxTokens', async () => {
     // Call 2's usage event repeats the running total: no prompt and no
     // output reported. Its output is unknown, so the projection counts the
     // 32k it could have been: 120k + 5k + (the appended round + 32k) + the
@@ -455,8 +480,8 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     // Call 1 reports a 100k prompt; call 2 reports nothing, so the second
     // boundary projects 100k + 2k + (6,043 + 32k) + 6,043 + 32k = 178,086,
     // which fits. Call 3 reports a 140k prompt and 2k output: the third
-    // boundary projects from it alone, 180,043, and fits. Carrying call 2's
-    // growth past call 3 would project 218,086 and restart.
+    // boundary projects from it alone, 180,043, and fits. Carrying the growth
+    // past call 3 (6,043 + 32k + 6,043) would project 224,129 and restart.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 10_000, cacheReadTokens: 90_000, outputTokens: 2_000 }),

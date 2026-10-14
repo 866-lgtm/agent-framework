@@ -12964,20 +12964,24 @@ export class AgentFramework {
             // share, never the event's own figures: the event is the stream's
             // running total, which after k calls holds k prompts and would
             // restart a stream whose next request still fits. Every real call
-            // has a prompt, so a call that reported none (an adapter that left
-            // its counts at 0) is unreported, not empty: the fields stay the
-            // last call that reported one, which is what the provider billed,
-            // and its own output joins the growth since that call, or, when it
-            // reported no output either, maxTokens, the bound on it, so the
-            // projection fails safe (lastStreamUnreportedTokens).
+            // has a prompt, and a call that ends at a tool boundary wrote
+            // output (its tool_use), so a 0 in either is a count the adapter
+            // left at 0, not an empty call. A call that reported no prompt is
+            // unreported: the fields stay the last call that reported one,
+            // which is what the provider billed, and its own output joins the
+            // growth since that call (lastStreamUnreportedTokens). An output
+            // of 0 counts as maxTokens, the bound on it, in either case, so
+            // the projection errs toward a restart. That holds once a call on
+            // the stream has reported a prompt: the projection runs only then.
+            const callOutputTokens = perCallUsage.outputTokens > 0
+              ? perCallUsage.outputTokens
+              : agent.maxTokens;
             if (realTotal > 0) {
               agent.lastStreamRealInputTokens = realTotal;
-              agent.lastStreamOutputTokens = perCallUsage.outputTokens;
+              agent.lastStreamOutputTokens = callOutputTokens;
               agent.lastStreamUnreportedTokens = 0;
             } else {
-              agent.lastStreamUnreportedTokens += perCallUsage.outputTokens > 0
-                ? perCallUsage.outputTokens
-                : agent.maxTokens;
+              agent.lastStreamUnreportedTokens += callOutputTokens;
             }
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };

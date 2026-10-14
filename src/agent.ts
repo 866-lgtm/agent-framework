@@ -138,18 +138,22 @@ export class Agent {
    *  call on this stream reports a prompt, and the physical-window
    *  projection runs only once one has. */
   lastStreamRealInputTokens = 0;
-  /** Output tokens of the same call as lastStreamRealInputTokens — the
-   *  prior round's generated thinking/text/tool_use, which becomes part of
-   *  the NEXT round's input and so belongs in the physical-window
+  /** Output tokens of the same call as lastStreamRealInputTokens, or
+   *  maxTokens, the bound on them, when it reported none (a call that ends at
+   *  a tool boundary wrote a tool_use, so a 0 is a count left unreported) —
+   *  the prior round's generated thinking/text/tool_use, which becomes part
+   *  of the NEXT round's input and so belongs in the physical-window
    *  projection. */
   lastStreamOutputTokens = 0;
   /** What the stream has grown by since the call lastStreamRealInputTokens
    *  describes, for the physical-window projection: the blocks appended at
-   *  each boundary the stream continued past, and the output of each call
-   *  that reported no prompt (its reported output, or maxTokens, the bound
-   *  on it, when it reported none either). After calls that report no
-   *  prompt, the next request is that call's prompt and output plus this.
-   *  0 at stream start and whenever a call reports a prompt. */
+   *  each boundary the stream continued past (counted only for an agent with
+   *  physicalWindowTokens, whose projection is this field's one reader), and
+   *  the output of each call that reported no prompt (its reported output,
+   *  or maxTokens, the bound on it, when it reported none either). After
+   *  calls that report no prompt, the next request holds the prompt and
+   *  output of the call lastStreamRealInputTokens describes, plus this. 0 at
+   *  stream start and whenever a call reports a prompt. */
   lastStreamUnreportedTokens = 0;
   maxStreamTokens: number;
   /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
