@@ -443,16 +443,17 @@ const result = await framework.rollbackToMessage('cairn', {
   failing inside an append) leaves the journal refusing every read and write
   until the store is reopened; the next start reads that record with the
   rest. A batch whose surgery crashed after its switch (its target branch
-  active at startup) is completed then; one whose target branch doesn't
-  exist is retired at startup, since none of its marks apply (its surgery
-  crashed before it created that branch, or the branch was deleted later);
-  until then a rollback, a suppression, an offline recovery or the API's
-  `branch.create` refuses that name unless the batch is cancelled first, so
-  that no other surgery's branch arms it. One whose surgery was otherwise
-  interrupted before its branch switch was recorded is held at startup
-  until an operator releases or cancels it; an interrupted suppression's
-  redactions are resumed whenever its branch is active at startup, whatever
-  its marks' state.
+  active at startup) is completed then. One whose target branch doesn't
+  exist is retired at startup: either its surgery crashed before it created
+  that branch, so none of its messages were removed, or the branch was
+  deleted later, which gives up its marks. Until then a rollback, a
+  suppression, an offline recovery or the API's `branch.create` refuses
+  that name unless the batch is cancelled first, so that no other surgery's
+  branch arms it; while the journal can't be read, nothing is refused. One
+  whose surgery was otherwise interrupted before its branch switch was
+  recorded is held at startup until an operator releases or cancels it; an
+  interrupted suppression's redactions are resumed whenever its branch is
+  active at startup, whatever its marks' state.
 - **Operator controls,** each recorded in the operator log; once `stop()`
   has begun, cancel, retract and release refuse, like every operator entry
   point:

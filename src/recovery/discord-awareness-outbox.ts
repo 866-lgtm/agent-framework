@@ -852,10 +852,10 @@ export class DiscordAwarenessOutbox {
    *   it counts toward the bound: `givenUp` is how many operations it
    *   brought there, which won't be sent again;
    * - a prepared batch whose target branch doesn't exist (`branchExists`,
-   *   when given) is retired, since none of its marks apply. Either its
-   *   surgery ended before it created that branch, which is its body change,
-   *   so nothing it would mark was removed, or the branch was deleted later
-   *   (the API's `branch.delete`), and its removals with it;
+   *   when given) is retired. Either its surgery ended before it created
+   *   that branch, which is its body change, so none of its messages were
+   *   removed, or the branch was deleted later (the API's `branch.delete`),
+   *   which gives up its marks;
    * - a prepared batch whose target is exactly the active branch completes
    *   its crash window (activated), except a suppression, whose resume
    *   completes its body first;
@@ -893,8 +893,9 @@ export class DiscordAwarenessOutbox {
       if (batch.status !== 'prepared' || batch.cancelled) continue;
       if (branchExists && !branchExists(batch.targetBranch)) {
         // A rollback's or a suppression's target is the fork it creates, and
-        // an in-place batch's is the branch it changed: with no such branch,
-        // none of its marks apply. Held, an operator could release them.
+        // an in-place batch's is the branch it changed. With no such branch,
+        // either the surgery never made it, so a release would mark messages
+        // that were never removed, or it was deleted, which gives up the marks.
         records.push({ t: 'discarded', at, batchId: batch.id });
         retired.push(batch.id);
         continue;
