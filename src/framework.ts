@@ -1596,9 +1596,10 @@ export class AgentFramework {
   private maintenanceRunId = 0;
   private currentMaintenanceRun: ContextMaintenanceRun | null = null;
   private maintenanceHistory: ContextMaintenanceRun[] = [];
-  /** Each agent's last reported maintenance failure, by its recorded text,
-   *  until its maintenance goes without one (reportMaintenanceFailure). */
-  private maintenanceFailureReported = new Map<string, string>();
+  /** Each agent's last reported maintenance failure, its whole text and when
+   *  it was alerted, until its maintenance goes without one
+   *  (reportMaintenanceFailure). */
+  private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   private providerGates: Map<string, LocalProviderGate> = new Map();
   private providerAccelerationCooldowns: Map<string, ProviderAccelerationCooldown> = new Map();
   private providerAccelerationRecoveries: Map<string, ProviderAccelerationRecovery> = new Map();
@@ -1758,6 +1759,8 @@ export class AgentFramework {
    *  tick counts in the success log stop meaning anything. One kick per agent
    *  at a time; cleared when the kick settles (success or failure). */
   private overBudgetDrainInFlight: Set<string> = new Set();
+  /** The over-budget drain kicks running, which a branch move waits for as it waits for a maintenance pass. */
+  private overBudgetDrains = new Set<Promise<void>>();
   /** Per-agent current rewind episode: the single consolidated marker's id and
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
@@ -3394,10 +3397,23 @@ export class AgentFramework {
     });
   }
 
-  /** Wait for a maintenance pass that is running, whatever its outcome. */
+  /** resume()'s refusal while a surgery holds the store. */
+  private refuseResumeUnderSurgery(): void {
+    if (!this.surgeryHold) return;
+    throw new OperatorActionError(
+      'agent-busy',
+      `Cannot resume: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — retry when it completes`,
+    );
+  }
+
+  /** Whether maintenance work is running: a pass, or an over-budget drain kick. */
+  private maintenanceRunning(): boolean {
+    return this.maintenancePass !== null || this.overBudgetDrains.size > 0;
+  }
+
+  /** Wait for the maintenance work that is running, whatever its outcome. */
   private async settleMaintenancePass(): Promise<void> {
-    const pass = this.maintenancePass;
-    if (pass) await pass.catch(() => {});
+    await Promise.allSettled([...(this.maintenancePass ? [this.maintenancePass] : []), ...this.overBudgetDrains]);
   }
 
   private async runQueuedMaintenance(): Promise<void> {
@@ -3490,7 +3506,8 @@ export class AgentFramework {
 
     try {
       const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
-      await Promise.all(running.map(async ({ agent, cm, record }) => {
+      // Settled, not all: the pass ends only when every agent's work has.
+      const outcomes = await Promise.allSettled(running.map(async ({ agent, cm, record }) => {
         try {
           for (
             let i = 0;
@@ -3522,6 +3539,11 @@ export class AgentFramework {
           if (progress) record.progressAfter = progress;
         }
       }));
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          console.error('[context-maintenance] reporting an agent\'s failure failed:', describeFailureWithFrames(outcome.reason));
+        }
+      }
     } finally {
       run.finishedAt = Date.now();
       run.agents.sort((a, b) => a.agentName.localeCompare(b.agentName));
@@ -3537,13 +3559,17 @@ export class AgentFramework {
    * with the whole text. A failure that lasts, such as a manager whose
    * strategy failed to initialize, meets every pass, a few seconds apart:
    * each run records it, and it is logged and alerted again only when its
-   * text changes, or after a pass in which that agent's maintenance went
+   * whole text changes, once opsAlert's cooldown for it has passed (so the
+   * webhook, which posts a kind at most once per cooldown, hears a failure
+   * that lasts), or after a pass in which that agent's maintenance went
    * without a failure (maintenanceFailureReported).
    */
   private reportMaintenanceFailure(agentName: string, record: ContextMaintenanceAgentRun, wholeError: string): void {
     record.error = boundFailureText(wholeError);
-    if (this.maintenanceFailureReported.get(agentName) === record.error) return;
-    this.maintenanceFailureReported.set(agentName, record.error);
+    const reported = this.maintenanceFailureReported.get(agentName);
+    const now = Date.now();
+    if (reported && reported.text === wholeError && now - reported.at < this.opsAlertCooldownMs) return;
+    this.maintenanceFailureReported.set(agentName, { text: wholeError, at: now });
     console.error(`[context-maintenance] agent=${agentName} failed:`, record.error);
     this.opsAlert(
       'context-maintenance-failed',
@@ -4644,20 +4670,17 @@ export class AgentFramework {
     if (!this.quiesced) return this.getHostModeStatus();
     // A surgery switches or forks the branch while it holds the store, and a
     // manager whose initialization that left pending refuses its settings
-    // read: resume once it's done, as the other operator calls do.
-    if (this.surgeryHold) {
-      throw new OperatorActionError(
-        'agent-busy',
-        `Cannot resume: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — retry when it completes`,
-      );
-    }
+    // read: resume once it's done, as the other operator calls do. Checked
+    // again after the waits below, since a surgery can take the store while
+    // resume waits for a pass or a preview.
+    this.refuseResumeUnderSurgery();
 
     // The canonical operator flow is `maintain; resume`, and a timer-driven
     // pass may still be mid-flight: previewContext refuses to overlap one
     // ("already running"), which used to degrade the gate to "no opinion".
     // Wait for the pass first, then retry a few times for the case where a
     // fresh pass started in between.
-    if (this.maintenancePass) await this.settleMaintenancePass();
+    if (this.maintenanceRunning()) await this.settleMaintenancePass();
     const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
     for (const agentName of this.agents.keys()) {
       let preview: RuntimeSettingsPreview;
@@ -4690,6 +4713,7 @@ export class AgentFramework {
         );
       }
     }
+    this.refuseResumeUnderSurgery();
     // stop() closes the queue first. If it has begun, before this call or
     // during the waits above, leave the host quiesced, as it will boot,
     // rather than reopen what stop() is closing.
@@ -6537,15 +6561,22 @@ export class AgentFramework {
 
     // Determine the complete exchange to remove, newest first.
     const removedIds: MessageId[] = members.map((m) => m.id).reverse();
-    let paired: StoredMessage | undefined;
+    // Where the exchange starts: this body, or the tool_use turn paired with it.
+    let from = first;
     let kind: RewindRecord['kind'];
     let descriptor: string;
     if (toolBlocks.length > 0) {
       kind = 'tool';
-      // Pair the tool_result with the tool_use assistant turn right before it.
-      if (first - 1 >= 0 && hasBlock(all[first - 1], 'tool_use')) {
-        paired = all[first - 1];
-        removedIds.push(paired.id);
+      // Pair the tool_result with the tool_use assistant turn right before
+      // it, the whole of it: a turn stored as a body carries its tool_use on
+      // its first shard, not its last.
+      if (first - 1 >= 0) {
+        const turn = bodyRangeIn(all, first - 1);
+        const turnMembers = all.slice(turn.from, turn.to + 1);
+        if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
+          from = turn.from;
+          removedIds.push(...turnMembers.map((m) => m.id).reverse());
+        }
       }
       const sz = toolBlocks.reduce(
         (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
@@ -6564,8 +6595,8 @@ export class AgentFramework {
       ? { channelId: String(md.channelId), messageId: String(md.messageId) }
       : undefined;
 
-    removeStoredMessages(cm, all[first], msg);
-    if (paired !== undefined) removeStoredMessages(cm, paired, paired);
+    // One removal for the whole exchange, so it is never half applied.
+    removeStoredMessages(cm, all[from], msg);
     return { kind, descriptor, removedIds, discordRef };
   }
 
@@ -7431,7 +7462,7 @@ export class AgentFramework {
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
     try {
       // A maintenance tick already running finishes before the switch.
-      if (this.maintenancePass) await this.settleMaintenancePass();
+      if (this.maintenanceRunning()) await this.settleMaintenancePass();
       this.store.switchBranch(name);
       // Reversible Discord awareness markers are part of the branch
       // projection. Their delivery starts behind the data-plane gate, which
@@ -7830,7 +7861,7 @@ export class AgentFramework {
       let markers: SurgeryMarkerReceipt;
       try {
         // A maintenance tick already running finishes before the switch.
-        if (this.maintenancePass) await this.settleMaintenancePass();
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
         // promotes this batch by matching targetBranch to the active branch.
@@ -8000,7 +8031,7 @@ export class AgentFramework {
       let markers: SurgeryMarkerReceipt;
       try {
         // A maintenance tick already running finishes before the fork.
-        if (this.maintenancePass) await this.settleMaintenancePass();
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
           sourceBranch,
@@ -15653,23 +15684,30 @@ export class AgentFramework {
         { skipLog: true },
       );
     }
-    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)) {
+    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName) && !this.surgeryHold) {
       this.overBudgetDrainInFlight.add(agentName);
-      void (async () => {
+      // Like a maintenance pass: it starts no tick while a surgery holds the
+      // store, and a branch move waits for the tick in flight.
+      const drain = (async () => {
         let ticks = 0;
         try {
           const cm = agent.getContextManager();
-          while (ticks < 8) {
+          while (ticks < 8 && !this.surgeryHold) {
             await cm.tick();
             ticks++;
           }
-          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
+          console.error(
+            `[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks` +
+              `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
+          );
         } catch (err) {
           console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
       })();
+      this.overBudgetDrains.add(drain);
+      void drain.finally(() => { this.overBudgetDrains.delete(drain); });
     }
 
     // (3) Hard-down escalation on repeated identical failure.

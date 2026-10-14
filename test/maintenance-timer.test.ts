@@ -826,7 +826,7 @@ describe('queued context maintenance timer', () => {
       },
     },
   ] as Array<{ verb: string; who?: string; run: (framework: AgentFramework, first: string) => Promise<unknown> }>) {
-    it(`a ${surgery.verb} that begins during a tick waits for it before it moves the branch, and resume waits for the ${surgery.verb}`, { timeout: 10_000 }, async () => {
+    it(`a ${surgery.verb} that begins during a tick waits for it before it moves the branch, and resume refuses while the ${surgery.verb} holds the store`, { timeout: 10_000 }, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-waits-'));
       const strategy = new GatedTickStrategy();
       const framework = await AgentFramework.create({

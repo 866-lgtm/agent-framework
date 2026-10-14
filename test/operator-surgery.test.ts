@@ -420,6 +420,37 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one removal', async () => {
+    // As context-manager's chunker stores them: the tool_use block on the
+    // turn's first shard, text after it; then the result, also a body.
+    const store = (cm() as unknown as ShardStore).messageStore;
+    const turn = [
+      store.append('assistant', [{ type: 'tool_use', id: 't9', name: 'shell', input: {} }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 0 }).id,
+      store.append('assistant', [{ type: 'text', text: 'narration' }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 1 }).id,
+    ];
+    const result = [
+      store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
+      store.append('user', [{ type: 'text', text: 'r1' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
+    ];
+    const c = cm() as unknown as { removeMessages: (a: string, b: string) => void };
+    const ranges: Array<[string, string]> = [];
+    const original = c.removeMessages.bind(c);
+    c.removeMessages = (a: string, b: string) => { ranges.push([a, b]); original(a, b); };
+    try {
+      const internals = framework as unknown as {
+        shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+      };
+      const record = internals.shedNewestTurn(framework.getAgent('scout'));
+      assert.ok(record);
+      assert.equal(record.kind, 'tool');
+      assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
+      assert.deepEqual(ranges, [[turn[0], result[1]]], "one removal, from the turn's first shard to the result's last");
+    } finally {
+      c.removeMessages = original;
+    }
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
   // --- failure path ----------------------------------------------------------
 
   it('a failed suppression restores the source branch, retires its outbox batch, and leaves the store bootable', async () => {
