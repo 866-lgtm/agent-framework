@@ -181,6 +181,9 @@ describe('MCPL reconnect: a pending policy exchange holds its planes', () => {
     fw.traceListeners = [];
     fw.mcplPolicyExchanges = new WeakMap();
     fw.mcplServerConfigs = new Map([['srv', { id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] }]]);
+    // A runtime connect of this stdio server derives the protective reaction
+    // default; with no journal here, it covers the configured marker alone.
+    fw.discordAwarenessEmoji = '💤';
     fw.featureSetManager = new FeatureSetManager();
     fw.checkpointManager = null;
     fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: () => connection };
@@ -244,6 +247,9 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
     fw.traceListeners = [];
     fw.mcplPolicyExchanges = new WeakMap();
     fw.mcplServerConfigs = new Map([['srv', { id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] }]]);
+    // A runtime connect of this stdio server derives the protective reaction
+    // default; with no journal here, it covers the configured marker alone.
+    fw.discordAwarenessEmoji = '💤';
     fw.mcplPrefixMap = new Map();
     fw.featureSetManager = new FeatureSetManager();
     fw.checkpointManager = null;
@@ -266,7 +272,7 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
   it('a transport that drops during its exchange leaves the planes closed, and its late answer grants nothing', async () => {
     const h = harness();
     const traces: string[] = [];
-    h.fw.traceListeners = [(event: { type: string }) => traces.push(event.type)];
+    h.fw.onTrace((event: { type: string }) => traces.push(event.type));
     h.fw.wireMcplEvents(h.connection);
     h.reconnect();
     h.drop();
@@ -300,7 +306,7 @@ describe('MCPL policy exchanges: a transport that drops, a quiesced host, a runt
   it('a runtime connect whose transport drops during its exchange is neither opened nor announced', async () => {
     const h = harness();
     const traces: string[] = [];
-    h.fw.traceListeners = [(event: { type: string }) => traces.push(event.type)];
+    h.fw.onTrace((event: { type: string }) => traces.push(event.type));
     const connecting = h.fw.connectMcplServerInternal({ id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] });
     await h.settle();
     h.drop();

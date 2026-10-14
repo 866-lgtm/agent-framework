@@ -6,11 +6,13 @@
   drain. At the reported pace of about one reaction per second, 918 queued
   marks would take roughly 15 minutes; the household's client timed out
   after 60 seconds. Delivery now continues in the background. The result's
-  new `markers` field (`none` | `queued` | `not-scheduled` | `unresolved`)
-  says whether marks were scheduled, never that Discord accepted them. The
-  `[operator]` stderr line gains `marks=…` and the operator-actions log entry
-  gains `markers`. If the ledger write after the switch fails, the
-  rollback that already applied is no longer reported as failed: the batch is
-  retired (`not-scheduled`), or, if even that write fails, the result says
-  the batch may still be delivered (`unresolved`). A suppression whose
+  new `markers` field (`none` | `queued` | `not-scheduled` | `unresolved`,
+  the exported `SurgeryMarkerReceipt` type) says whether marks were
+  scheduled, never that Discord accepted them. The `[operator]` stderr line
+  gains `marks=…` and the operator-actions log entry gains `markers`. If the
+  ledger write after the switch fails, the rollback that already applied is
+  no longer reported as failed: the batch is retired (`not-scheduled`, with
+  a `discord-awareness-not-scheduled` ops alert), or, if even that write
+  fails, the result says the batch may still be delivered (`unresolved`,
+  with a `discord-awareness-unresolved` ops alert). A suppression whose
   redactions all committed is no longer undone by that failure.

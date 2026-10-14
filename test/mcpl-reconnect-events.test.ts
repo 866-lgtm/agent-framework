@@ -289,13 +289,19 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
       await waitFor(() => started, 5000, 'a reconnect handshake in flight');
       const reconnected: unknown[] = [];
       connection.on('reconnect', (p: unknown) => reconnected.push(p));
-      await connection.close();
+      // close() owns the handshake in flight: it settles only once that
+      // handshake has, and then closes the transport it brought.
+      let closeSettled = false;
+      const closing = connection.close().finally(() => { closeSettled = true; });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.strictEqual(closeSettled, false, 'close() waits for the handshake it owns');
       release({
         transport: { close: async () => { closedNew = true; }, on: () => {}, writeLine: () => {} },
         capabilities: { version: '0.5' },
         droppedCapabilities: [],
         mcpToolsAdvertised: false,
       });
+      await closing;
       await waitFor(() => closedNew, 2000, 'the new transport closed');
       assert.deepStrictEqual(reconnected, [], 'nothing is emitted for it');
       assert.strictEqual(connection.isConnected, false);

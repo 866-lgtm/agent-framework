@@ -48,6 +48,28 @@ import type {
 import { McplMethod } from './types.js';
 import type { ToolLifecycleParams, ToolObserveRule } from './tool-lifecycle.js';
 
+/**
+ * Payload of the connection `'close'` event (third argument; the first two
+ * stay `(code, signal)` for existing listeners). Lets a host see WHY the
+ * link went down — in particular a WebSocket close code such as 4001 from
+ * a server that refused or expired the credential — so it can refresh what
+ * `accessProvider` will hand the next dial instead of replaying it.
+ */
+export interface McplConnectionCloseInfo {
+  /** Transport kind that closed; null when the connection never had one
+   *  (a disconnected stub torn down before its first reconnect). */
+  transport: McplTransport['kind'] | null;
+  /** WebSocket close code (e.g. 4001) or stdio child exit code; null when unknown. */
+  code: number | null;
+  /** Signal that ended a stdio child; null otherwise. */
+  signal: NodeJS.Signals | null;
+  /** WebSocket close reason, or a short description of the cause. */
+  reason?: string;
+  /** True when the host closed the link (`close()` / `reconnectAfterFailure()`),
+   *  false when the transport dropped unexpectedly. */
+  byHost: boolean;
+}
+
 /** Timeout for the initialize handshake in milliseconds.
  *  Spring Boot + JDA servers can take 5-10s to boot, so 30s is safe. */
 const INITIALIZE_TIMEOUT_MS = 30_000;
@@ -121,7 +143,7 @@ interface RequestOptions {
  * - `'channels-changed'`   — Server sent `channels/changed`
  * - `'channels-incoming'`  — Server sent `channels/incoming`
  * - `'error'`              — Connection-level error
- * - `'close'`              — Connection closed
+ * - `'close'`              — Connection closed: `(code, signal, info: McplConnectionCloseInfo)`
  * - `'connect-failed'`     — Initial connect failed; background retry scheduled
  * - `'reconnect-failed'`   — A background reconnect attempt failed; next retry scheduled
  * - `'reconnect'`          — Background reconnect succeeded
@@ -252,6 +274,12 @@ export class McplServerConnection extends EventEmitter {
    * observable even though its original promise has already been rejected. */
   private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
   private closed = false;
+  /** Set by `reconnectAfterFailure()` before it closes a live transport, so
+   *  the transport close handler reports that teardown as `byHost: true`. */
+  private hostCloseRequested = false;
+  private closePromise: Promise<void> | null = null;
+  private closeIncomplete = false;
+  private reconnectPromise: Promise<void> | null = null;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
@@ -888,10 +916,10 @@ export class McplServerConnection extends EventEmitter {
       this.reconnectTimer = null;
     }
 
-    if (this.closed) {
-      return;
-    }
+    if (this.closePromise) return this.closePromise;
+    if (this.closed && !this.closeIncomplete && !this.reconnectPromise) return;
     this.closed = true;
+    this.closeIncomplete = true;
     this.resetPolicyForTransportBoundary();
 
     // Reject all pending requests
@@ -905,11 +933,54 @@ export class McplServerConnection extends EventEmitter {
     // Tear down the transport (kills the child / closes the socket). The
     // transport's own 'close' event is short-circuited by `this.closed` in
     // setupLifecycle, so this is the single source of the connection 'close'.
-    if (this.transport) {
-      await this.transport.close();
-    }
+    const attempt = Promise.resolve().then(async () => {
+      // An already opened handshake owns a transport too. It hands that
+      // transport back without admission once reconnect has been disabled.
+      // The registry bounds this wait; retry reuses this real close attempt.
+      if (this.reconnectPromise) await this.reconnectPromise;
+      if (this.transport) await this.transport.close();
+      this.closeIncomplete = false;
+      this.emit('close', null, null, this.closeInfoByHost());
+    });
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
+  }
 
-    this.emit('close');
+  /**
+   * Tear down a live transport without disabling configured auto-reconnect,
+   * so the connection redials as after a drop. The normal transport close
+   * handler rejects requests, emits lifecycle state, and schedules the next
+   * bounded reconnect attempt. With reconnect disabled this leaves the server
+   * closed.
+   */
+  async reconnectAfterFailure(): Promise<void> {
+    this.pauseDataPlane();
+    if (this.closed) {
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.transport) {
+      this.hostCloseRequested = true;
+      await this.transport.close();
+      return;
+    }
+    this.closed = true;
+    this.emit('close', null, null, this.closeInfoByHost());
+    this.scheduleReconnect();
+  }
+
+  /** 'close' payload for a host-initiated teardown (no transport close code). */
+  private closeInfoByHost(): McplConnectionCloseInfo {
+    return {
+      transport: this.transport?.kind ?? null,
+      code: null,
+      signal: null,
+      reason: 'closed by host',
+      byHost: true,
+    };
   }
 
   /**
@@ -942,8 +1013,19 @@ export class McplServerConnection extends EventEmitter {
    * approach this builds no throwaway connection instance, so there are no
    * leaked listeners on a dead object.
    */
-  private async attemptReconnect(): Promise<void> {
-    if (!this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
+  private attemptReconnect(): Promise<void> {
+    if (this.reconnectPromise) return this.reconnectPromise;
+    const attempt = this.reconnectOnce();
+    this.reconnectPromise = attempt;
+    const clear = () => { if (this.reconnectPromise === attempt) this.reconnectPromise = null; };
+    void attempt.then(clear, clear);
+    return attempt;
+  }
+
+  private async reconnectOnce(): Promise<void> {
+    // A queued recovery timer may outlive an earlier successful handshake.
+    // Recheck disconnection before opening or replacing any owned transport.
+    if (!this.closed || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
 
     // Ordinal of this attempt: 0 was the initial connect, so the Nth retry
     // reports attempt N (reconnectAttempts counts failures so far).
@@ -955,9 +1037,10 @@ export class McplServerConnection extends EventEmitter {
         this.hostCapabilities,
       );
       if (!this.reconnectEnabled) {
-        // close() ran while the handshake was in flight: the host is done
-        // with this server, so the new transport is closed, not adopted.
-        await transport.close().catch(() => {});
+        // The prior transport was disconnected before this retry began. Keep
+        // the fresh, unadmitted transport owned by close(), including on a
+        // failed transport cleanup, instead of reviving a stopped connection.
+        this.transport = transport;
         return;
       }
 
@@ -1316,6 +1399,7 @@ export class McplServerConnection extends EventEmitter {
    * and — when enabled — schedules a background reconnect.
    */
   private setupLifecycle(transport: McplTransport): void {
+    this.hostCloseRequested = false;
     transport.on('error', (err: Error) => {
       this.emit('error', new Error(`MCPL server "${this.id}" transport error: ${err.message}`));
     });
@@ -1338,7 +1422,20 @@ export class McplServerConnection extends EventEmitter {
         this.pendingRequests.clear();
         this.orphanedRequests.clear();
 
-        this.emit('close', info.code ?? null, info.signal ?? null);
+        // Forward the transport's close info so listeners can tell a server
+        // that refused the credential (WebSocket 4001) from a crash, and act
+        // before the reconnect below redials. A teardown the host asked for
+        // via reconnectAfterFailure() arrives here too; report it as such.
+        const byHost = this.hostCloseRequested;
+        this.hostCloseRequested = false;
+        const closeInfo: McplConnectionCloseInfo = {
+          transport: transport.kind,
+          code: info.code ?? null,
+          signal: info.signal ?? null,
+          reason: info.reason ?? (byHost ? 'closed by host' : undefined),
+          byHost,
+        };
+        this.emit('close', closeInfo.code, closeInfo.signal, closeInfo);
 
         // Schedule reconnect if enabled (unexpected disconnect triggers auto-reconnect)
         if (this.reconnectEnabled) {
