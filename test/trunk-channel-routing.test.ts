@@ -417,7 +417,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       return stream;
     };
     const held = framework as unknown as {
-      providerAccelerationCooldowns: Map<string, unknown>;
+      providerAccelerationCooldowns: Map<string, { until: number; heldRequests: Array<{ channelId?: string }> }>;
       releaseProviderAccelerationCooldown(agentName: string): void;
     };
     const triggerAtStart: Array<string | undefined> = [];
@@ -432,8 +432,10 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.ok(held.providerAccelerationCooldowns.has('scout'), 'the turn is held');
     framework.pushEvent(channelIncoming('discord:guild:chanB', 'B: unrelated chatter'));
     await framework.runUntilIdle();
-    const waiting = (held.providerAccelerationCooldowns.get('scout') as { heldRequests: Array<{ channelId?: string }> }).heldRequests;
-    assert.ok(waiting.some((r) => r.channelId === 'discord:guild:chanB'), "chanB's wake waits in the hold with the turn's");
+    const hold = held.providerAccelerationCooldowns.get('scout')!;
+    assert.ok(hold.heldRequests.some((r) => r.channelId === 'discord:guild:chanB'), "chanB's wake waits in the hold with the turn's");
+    // What the hold's timer does when it fires, at the hold's deadline.
+    hold.until = Date.now();
     held.releaseProviderAccelerationCooldown('scout');
     await framework.runUntilIdle();
 

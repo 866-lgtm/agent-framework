@@ -599,14 +599,17 @@ describe('present while acting', () => {
   });
 
   type Held = {
-    providerAccelerationCooldowns: Map<string, unknown>;
+    providerAccelerationCooldowns: Map<string, { until: number }>;
     releaseProviderAccelerationCooldown(agentName: string): void;
   };
 
-  /** Release the agent's capacity hold, as its timer does, and run the deferred compile. */
+  /** Bring the agent's capacity hold to its deadline and release it, as its
+   *  timer does then, and run the deferred compile. */
   async function release(framework: AgentFramework): Promise<void> {
     const internals = framework as unknown as Held;
-    assert.ok(internals.providerAccelerationCooldowns.has('assistant'), 'the turn is held');
+    const hold = internals.providerAccelerationCooldowns.get('assistant');
+    assert.ok(hold, 'the turn is held');
+    hold.until = Date.now();
     internals.releaseProviderAccelerationCooldown('assistant');
     await framework.runUntilIdle();
   }

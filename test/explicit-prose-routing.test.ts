@@ -1651,7 +1651,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const { chunks } = captureStream(framework);
     const internals = framework as unknown as {
-      providerAccelerationCooldowns: Map<string, unknown>;
+      providerAccelerationCooldowns: Map<string, { until: number }>;
       releaseProviderAccelerationCooldown(agentName: string): void;
     };
     let starts = 0;
@@ -1690,8 +1690,10 @@ describe('explicit prose routing', () => {
     await within(framework.runUntilIdle(), 'the first stream', 10000);
     if (how === 'capacity') {
       assert.equal(starts, 1, 'the hold defers the turn rather than retrying it at once');
-      assert.ok(internals.providerAccelerationCooldowns.has('assistant'), 'the turn is held');
-      // What the cooldown's timer does when it fires.
+      const hold = internals.providerAccelerationCooldowns.get('assistant');
+      assert.ok(hold, 'the turn is held');
+      // What the cooldown's timer does when it fires, at the hold's deadline.
+      hold.until = Date.now();
       internals.releaseProviderAccelerationCooldown('assistant');
       await within(framework.runUntilIdle(), 'the deferred compile', 10000);
     }
