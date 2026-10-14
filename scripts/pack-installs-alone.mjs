@@ -27,8 +27,12 @@ const INSTALL_TIMEOUT_MS = 10 * 60_000;
 class CheckError extends Error {}
 
 /** The target a set of conditions picks from an exports value, as Node
- *  resolves it: the first key, in order, that is active or `default`. */
+ *  resolves it: the first key, in order, that is active or `default`. A
+ *  `null` it reaches blocks the subpath for those conditions, so it answers
+ *  null, which stops the search as Node's does; undefined means no key
+ *  matched. */
 function pick(value, conditions) {
+  if (value === null) return null;
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -139,8 +143,10 @@ function main() {
     for (const [key, value] of subpaths(pkg.exports)) {
       if (!key.includes("*")) continue;
       for (const target of allTargets(value)) {
-        const [head, tail] = target.replace(/^\.\//, "").split("*");
-        if (!files.some((file) => file.startsWith(head) && file.endsWith(tail ?? ""))) {
+        // Node puts the same text in place of every `*` in a target.
+        const parts = target.replace(/^\.\//, "").split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+        const matches = new RegExp(`^${parts[0]}${parts.slice(1).map((part, i) => (i === 0 ? `(.+)${part}` : `\\1${part}`)).join("")}$`);
+        if (!files.some((file) => matches.test(file))) {
           missing.push([target, `exports['${key}'], a pattern no packed file matches`]);
         }
       }
@@ -156,14 +162,15 @@ function main() {
     const loads = [];
     const roots = subpaths(pkg.exports);
     if (pkg.exports === undefined && (typeof pkg.main === "string" || existsSync(join(installed, "index.js")))) {
-      loads.push([pkg.name, "import"]);
+      loads.push([pkg.name, typeof pkg.main === "string" && pkg.main.endsWith(".json") ? "import json" : "import"]);
     }
     for (const [key, value] of roots) {
       if (key.includes("*")) continue;
       const specifier = key === "." ? pkg.name : `${pkg.name}${key.slice(1)}`;
       const imported = pick(value, ["node", "import"]);
-      if (imported !== undefined) loads.push([specifier, imported.endsWith(".json") ? "import json" : "import"]);
-      else if (pick(value, ["node", "require"]) !== undefined) loads.push([specifier, "require"]);
+      const required = pick(value, ["node", "require"]);
+      if (typeof imported === "string") loads.push([specifier, imported.endsWith(".json") ? "import json" : "import"]);
+      else if (typeof required === "string") loads.push([specifier, "require"]);
     }
     for (const [specifier, how] of loads) {
       const code =

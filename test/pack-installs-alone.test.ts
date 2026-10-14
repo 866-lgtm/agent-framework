@@ -96,6 +96,26 @@ test("a string exports, an exports of conditions, and main without exports each 
   }
 });
 
+test("a pattern whose target repeats '*', an import blocked by null beside a require, and a JSON main each pass", async () => {
+  const repeated = await check(
+    fixture({ files: ["dist"], exports: { ".": "./dist/index.js", "./parts/*": "./dist/*/*.js" } }, { ...ENTRY, "dist/a/a.js": "export const a = 1;\n" }),
+  );
+  assert.equal(repeated.code, 0, repeated.stderr);
+  assert.match(repeated.stdout, /; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m);
+  // Node stops at the null that `import` reaches, so a consumer can only require it.
+  const blocked = await check(
+    fixture(
+      { files: ["dist"], exports: { ".": { import: null, require: "./dist/legacy.cjs", default: "./dist/index.js" } } },
+      { ...ENTRY, "dist/legacy.cjs": "module.exports = { legacy: true };\n" },
+    ),
+  );
+  assert.equal(blocked.code, 0, blocked.stderr);
+  assert.match(blocked.stdout, /; loaded '@zz\/fixture' \(require\)\.\n$/m);
+  const json = await check(fixture({ files: ["data.json"], main: "./data.json" }, { "data.json": '{"ok":true}\n' }));
+  assert.equal(json.code, 0, json.stderr);
+  assert.match(json.stdout, /; loaded '@zz\/fixture' \(import json\)\.\n$/m);
+});
+
 test("with neither exports nor main, the root is loaded from its index.js, and a bin-only package loads nothing", async () => {
   const fallback = await check(fixture({}, { "index.js": "export const ok = true;\n" }));
   assert.equal(fallback.code, 0, fallback.stderr);
