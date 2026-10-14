@@ -11133,6 +11133,24 @@ export class AgentFramework {
   }
 
   /**
+   * End a turn that beginAgentTurn drops before it sends anything. The turn
+   * emitted inference:started, and listeners that bracket a turn, such as a
+   * typing loop or an activity indicator, end it on a terminal event, so it
+   * gets inference:aborted with `reason`, and lastInference records its end
+   * as driveStream's would. Nothing of the kind when another turn of this
+   * agent's name holds the turn token (one begun after a stop and start, or
+   * by a replacement agent object): the event and the record carry only the
+   * name, so this frame's would end that newer turn instead.
+   */
+  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number): void {
+    const owner = this.activeTurnTokens.get(agentName);
+    if (owner !== undefined && owner !== turnToken) return;
+    const now = Date.now();
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), endedAt: now });
+    this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: now - startedAt });
+  }
+
+  /**
    * Body of startAgentStream, split out so the caller's try/finally owns the
    * turn token unconditionally. Returns true iff the token was handed off to
    * driveStream (whose finally then owns clearing it).
@@ -11431,17 +11449,11 @@ export class AgentFramework {
       // stream after its generation lost ownership, or once admission closed.
       if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed' : 'the framework was stopping';
-        console.error(`[turn] ${agent.name}: a turn assembled while ${why} is dropped before it sends anything`);
+        const reason = `a turn assembled while ${why} is dropped before it sends anything`;
+        console.error(`[turn] ${agent.name}: ${reason}`);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
-        // As at the drop after the compile below: the turn emitted
-        // inference:started, so it gets its one terminal event.
-        this.emitTrace({
-          type: 'inference:aborted',
-          agentName: agent.name,
-          reason: `a turn assembled while ${why} is dropped before it sends anything`,
-          durationMs: Date.now() - turnStartedAt,
-        });
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
         return false;
       }
 
@@ -11473,7 +11485,8 @@ export class AgentFramework {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
           : this.providerAdmissionClosed ? 'the framework was stopping'
             : 'the framework was stopped and started again';
-        console.error(`[turn] ${agent.name}: a turn compiled while ${why} is dropped before it sends anything`);
+        const reason = `a turn compiled while ${why} is dropped before it sends anything`;
+        console.error(`[turn] ${agent.name}: ${reason}`);
         stream.cancel();
         agent.cancelStream();
         if (this.agents.get(agent.name) === agent) {
@@ -11485,15 +11498,7 @@ export class AgentFramework {
         }
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
-        // The turn emitted inference:started before its compile, and every
-        // turn that does gets one terminal event, which listeners such as a
-        // typing loop rely on. Nothing was sent, so it ends as aborted.
-        this.emitTrace({
-          type: 'inference:aborted',
-          agentName: agent.name,
-          reason: `a turn compiled while ${why} is dropped before it sends anything`,
-          durationMs: Date.now() - turnStartedAt,
-        });
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
