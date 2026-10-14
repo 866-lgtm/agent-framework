@@ -396,10 +396,11 @@ test('maintenanceTick runs no pass while a surgery holds the store, and says so'
   const strategy = new QueuedStrategy();
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
-    framework.start();
-    await framework.quiesce({ reason: 'compression window' });
+    // Held before start(), whose first pass would otherwise tick at once.
     const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
     internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    framework.start();
+    await framework.quiesce({ reason: 'compression window' });
     const warn = t.mock.method(console, 'warn', () => {});
     try {
       const snapshot = await framework.maintenanceTick();
