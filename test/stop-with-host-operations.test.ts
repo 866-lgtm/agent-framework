@@ -811,6 +811,21 @@ describe('stop() with an operator operation in flight', () => {
           && error.code === 'agent-busy' && error.message === 'Cannot undo: the store is under live switch branch for every agent');
         assert.throws(() => framework.redo('agent'), (error: unknown) => error instanceof OperatorActionError
           && error.code === 'agent-busy' && error.message === 'Cannot redo: the store is under live switch branch for every agent');
+        // A host/command undo in turns mode answers the refusal with its code.
+        const connection = Object.assign(new EventEmitter(), { id: 'srv' });
+        fw.wireMcplEvents(connection);
+        let answer: unknown;
+        connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 1 }, {
+          id: 11,
+          respond: (result: unknown) => { answer = result; },
+          respondError: (error: unknown) => { answer = { respondError: String(error) }; },
+        });
+        await until(() => answer !== undefined, 'the host/command undo to answer');
+        assert.deepEqual(answer, {
+          ok: false,
+          error: 'Cannot undo: the store is under live switch branch for every agent',
+          code: 'agent-busy',
+        });
       } finally { release(); }
       await switching;
     } finally { await framework.stop(); }
