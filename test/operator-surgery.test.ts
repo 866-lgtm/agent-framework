@@ -420,6 +420,36 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  it('hide refuses while a surgery holds the store, and a missing Discord id matches nothing', async () => {
+    cm().addMessage('user', [{ type: 'text', text: 'held' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-held' });
+    const internals = framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+      reserveStoreForSurgery(verb: string, agentName: string): () => void;
+    };
+    const hide = (fromMessageId: string) => internals.handleHostCommand('discord', {
+      command: 'hide', agentName: 'scout', fromMessageId, requesterName: 'antra',
+    });
+    const release = internals.reserveStoreForSurgery('roll back', 'scout');
+    try {
+      const refused = await hide('d-held');
+      assert.equal(refused.ok, false);
+      assert.match(String(refused.error), /a live roll back for scout holds the store/);
+    } finally {
+      release();
+    }
+    // Two messages with no Discord id, such as the agent's replies: the
+    // text "undefined" names neither of them.
+    cm().addMessage('scout', [{ type: 'text', text: 'reply-1' }]);
+    cm().addMessage('scout', [{ type: 'text', text: 'reply-2' }]);
+    const none = await hide('undefined');
+    assert.equal(none.ok, false);
+    assert.match(String(none.error), /is not an addressable message in context/);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'held', 'reply-1', 'reply-2']);
+    const hidden = await hide('d-held');
+    assert.equal(hidden.ok, true, String(hidden.error));
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'reply-1', 'reply-2']);
+  });
+
   it('hide over a range widens both ends to whole bodies, and counts each message once', async () => {
     const appendBody = (discordId: string, group: string, texts: string[]): string[] =>
       texts.map((text, shardIndex) =>

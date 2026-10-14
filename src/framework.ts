@@ -6971,13 +6971,27 @@ export class AgentFramework {
       if (agent.state.status !== 'idle') {
         return { ok: false, error: `Cannot hide while agent is ${agent.state.status}` };
       }
+      // A surgery switches or forks the branch while it holds the store, so
+      // a removal now would land on the branch it's leaving, or meet a
+      // manager mid-switch: refused as busy, as the other operator calls are.
+      if (this.surgeryHold) {
+        return {
+          ok: false,
+          error: `Cannot hide: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — retry when it completes`,
+        };
+      }
       if (!params.fromMessageId) {
         return { ok: false, error: 'hide: fromMessageId is required' };
       }
       const cm = agent.getContextManager();
       const all = cm.getAllMessages();
-      const byDiscordId = (did: string) =>
-        all.findIndex((m) => String((m.metadata as { messageId?: unknown } | undefined)?.messageId) === String(did));
+      // Only a message that carries a Discord id matches: a missing one
+      // would otherwise read as the text "undefined".
+      const discordIdOf = (m: StoredMessage) => {
+        const id = (m.metadata as { messageId?: unknown } | undefined)?.messageId;
+        return id === undefined || id === null || id === '' ? undefined : String(id);
+      };
+      const byDiscordId = (did: string) => all.findIndex((m) => discordIdOf(m) === String(did));
 
       // Collect Discord refs of every message in [lo, hi] that carries one,
       // so the surface can mark them. channelId here is whatever the ingest
@@ -7060,7 +7074,7 @@ export class AgentFramework {
         // before its retry, both carrying the Discord id.
         const runs: Array<{ from: number; to: number }> = [];
         all.forEach((m, i) => {
-          if (String((m.metadata as { messageId?: unknown } | undefined)?.messageId) !== String(params.fromMessageId)) return;
+          if (discordIdOf(m) !== String(params.fromMessageId)) return;
           const { from, to } = bodyRangeIn(all, i);
           const last = runs[runs.length - 1];
           if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
