@@ -1176,6 +1176,10 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  * doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the
  * resource, as a rule, rather than the conversation.
  *
+ * The table test in test/inference-exhaustion-rewind.test.ts is this
+ * predicate's contract. The notes below on which membrane version gives which
+ * label are its history, and will go stale as hosts move to newer releases.
+ *
  * Which failures reach the gate with which label depends on the membrane:
  * - As membrane 0.5.86 classifies them: Anthropic files a 400 as
  *   invalid_request (after its context check) and its other 4xx as unknown.
