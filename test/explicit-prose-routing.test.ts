@@ -594,8 +594,6 @@ describe('explicit prose routing', () => {
       const framework = await createFramework(mode);
       const routed = stubRegistry(framework);
       const skip = answerSkipReply(framework);
-      // Count turns before feedTurn subscribes: a listener that unsubscribes
-      // during an event hides that event from the listener after it.
       let turns = 0;
       framework.onTrace((e) => {
         if ((e as { type: string }).type === 'inference:started') turns++;
