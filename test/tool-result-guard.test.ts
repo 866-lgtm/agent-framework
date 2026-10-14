@@ -3256,6 +3256,50 @@ test('a framework compile from before stop cannot drive after restart', async ()
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
 
+for (const how of ['stopping', 'removed'] as const) {
+  test(`a turn dropped before its compile (the framework ${how === 'stopping' ? 'stopping' : 'losing its agent'}) ends with inference:aborted`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-drop-before-compile-')); dirs.push(dir);
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const membrane = new ScriptMembrane([[answer()]]);
+    const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+    const agent = framework.getAgent('assistant')!;
+    // The turn waits in a module's gatherContext, before the check that comes ahead of the compile.
+    const held = gate();
+    const entered = gate();
+    const internal = framework as unknown as { moduleRegistry: { gatherContext: (n: string) => Promise<unknown[]> }; agents: Map<string, unknown> };
+    internal.moduleRegistry.gatherContext = async () => { entered.open(); await held.opened; return []; };
+    const turnEvents: Array<{ type: string; reason?: string }> = [];
+    framework.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') {
+        turnEvents.push({ type: event.type, ...('reason' in event ? { reason: String(event.reason) } : {}) });
+      }
+    });
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    let starting: Promise<unknown> | undefined;
+    try {
+      starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<unknown> }).startAgentStream(agent);
+      await entered.opened;
+      if (how === 'stopping') await framework.stop();
+      else internal.agents.delete('assistant');
+      held.open();
+      await starting;
+    } finally { console.error = error; held.open(); await starting; }
+    try {
+      const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
+      assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
+      assert.equal(turnEvents[1]?.reason, `a turn assembled while ${why} is dropped before it sends anything`);
+      assert.ok(lines.some((line) => line.includes(`a turn assembled while ${why} is dropped before it sends anything`)), lines.join('\n'));
+    } finally {
+      if (how === 'removed') internal.agents.set('assistant', agent);
+      await framework.stop(); store.close();
+    }
+  });
+}
+
 // Drain async storage/annotation continuations without advancing deadline time.
 async function flushAsync() {
   for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve));

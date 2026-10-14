@@ -11430,8 +11430,18 @@ export class AgentFramework {
       // and stop() may close provider admission. Do not create a provider
       // stream after its generation lost ownership, or once admission closed.
       if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
+        const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed' : 'the framework was stopping';
+        console.error(`[turn] ${agent.name}: a turn assembled while ${why} is dropped before it sends anything`);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
+        // As at the drop after the compile below: the turn emitted
+        // inference:started, so it gets its one terminal event.
+        this.emitTrace({
+          type: 'inference:aborted',
+          agentName: agent.name,
+          reason: `a turn assembled while ${why} is dropped before it sends anything`,
+          durationMs: Date.now() - turnStartedAt,
+        });
         return false;
       }
 
