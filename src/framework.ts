@@ -7430,6 +7430,8 @@ export class AgentFramework {
     this.refuseOperatorAfterStop('switch branch');
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
     try {
+      // A maintenance tick already running finishes before the switch.
+      if (this.maintenancePass) await this.settleMaintenancePass();
       this.store.switchBranch(name);
       // Reversible Discord awareness markers are part of the branch
       // projection. Their delivery starts behind the data-plane gate, which

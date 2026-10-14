@@ -817,7 +817,15 @@ describe('queued context maintenance timer', () => {
   for (const surgery of [
     { verb: 'roll back', run: (framework: AgentFramework, first: string) => framework.rollbackToMessage('agent', { messageId: first }) },
     { verb: 'suppress', run: (framework: AgentFramework, first: string) => framework.suppressMessages('agent', { messageIds: [first] }) },
-  ]) {
+    {
+      verb: 'switch branch',
+      who: 'every agent',
+      run: (framework: AgentFramework, first: string) => {
+        framework.getAgent('agent')!.getContextManager().branchAt(first as never, 'elsewhere');
+        return framework.switchBranch('elsewhere');
+      },
+    },
+  ] as Array<{ verb: string; who?: string; run: (framework: AgentFramework, first: string) => Promise<unknown> }>) {
     it(`a ${surgery.verb} that begins during a tick waits for it before it moves the branch, and resume waits for the ${surgery.verb}`, { timeout: 10_000 }, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-waits-'));
       const strategy = new GatedTickStrategy();
@@ -843,7 +851,7 @@ describe('queued context maintenance timer', () => {
         await assert.rejects(
           framework.resume(),
           (error: unknown) => error instanceof OperatorActionError && error.code === 'agent-busy'
-            && error.message.includes(`a live ${surgery.verb} for agent holds the store`),
+            && error.message.includes(`a live ${surgery.verb} for ${surgery.who ?? 'agent'} holds the store`),
         );
         assert.equal(cm.currentBranch().name, 'main', `the ${surgery.verb} waits for the running tick`);
         strategy.release();
