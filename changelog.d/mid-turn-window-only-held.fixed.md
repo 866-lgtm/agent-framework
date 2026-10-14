@@ -80,10 +80,10 @@
   warns, and what's deferred after that is kept in memory only. Only the
   host log names the held write.
 - Boot recovery drops a recovered deferred write whose participant isn't
-  text or whose content isn't an array of block objects, and logs it by id
-  and participant, rather than holding it in the queue. The store can't take
-  a null block, and while it keeps a string or number block as given,
-  membrane's native formatter refuses any request that carries one, and the
-  other formatters leave it out. Before, such an entry was dropped without a
-  line, except one whose blocks weren't all objects, which was kept: one
-  with a null block could never be stored.
+  text, whose content isn't an array, or that holds a null block, whose type
+  can't be read, and logs it by id and participant, rather than holding it
+  in the queue. An entry with a string or number block is restored with the
+  rest of its blocks: the store keeps such a block as given, and membrane's
+  formatters leave it out of requests. Before, an entry whose participant
+  isn't text or whose content isn't an array was dropped without a line, and
+  one with a null block was kept, where it could never be stored.

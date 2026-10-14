@@ -4948,17 +4948,17 @@ export class AgentFramework {
           if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
         }
       }
-      // An entry whose shape the queue's readers don't expect has no place in
-      // it: one whose participant isn't text, or whose content isn't an array
-      // of block objects, is dropped here with a line naming it, rather than
-      // held. Reading a null block's type throws, at the tool boundary and in
-      // the store. The store keeps a string or number block as given, but
-      // membrane's native formatter refuses any request that carries one (the
-      // other formatters leave such a block out).
+      // An entry the queue's readers can't handle has no place in it: one whose
+      // participant isn't text, whose content isn't an array, or that holds a
+      // null or undefined block, whose type can't be read (at the tool
+      // boundary, in the store, or in membrane's formatters), is dropped here
+      // with a line naming it, rather than held. A string or number block is
+      // restored with the rest of its entry: the store keeps it as given, and
+      // every formatter leaves it out of its requests.
       const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
         !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
           && Array.isArray((m as { content?: unknown }).content)
-          && (m as { content: unknown[] }).content.every((b) => !!b && typeof b === 'object');
+          && (m as { content: unknown[] }).content.every((b) => b !== null && b !== undefined);
       const malformed = data.filter((m) => !wellFormed(m));
       for (const m of malformed) {
         // What the entry holds there: a value that isn't text by its type.
