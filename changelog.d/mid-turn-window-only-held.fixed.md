@@ -34,9 +34,10 @@
   the primary's window. Each flush, at a turn's end, after surgery, after a
   withdrawn turn, after a start that ends before its stream and after a
   puppet call, now delivers the agent's deferred messages while another
-  agent's tool cycle is pending; only the agent's own state holds them. The flush after surgery stores several agents' entries in
-  the order they arrived, where it went agent by agent: residents share one
-  message slot, so that reordered their shared transcript.
+  agent's tool cycle is pending; only the agent's own state holds them. The
+  flush after surgery stores several agents' entries in the order they
+  arrived, where it went agent by agent: residents share one message slot,
+  so that reordered their shared transcript.
 - `stop()` now stores what is still deferred for each registered agent
   before the store closes, in the order it arrived; before, a memory-only
   queue lost it. Once `stop()` begins, a new ephemeral run is refused, and
