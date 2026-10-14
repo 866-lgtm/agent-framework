@@ -103,7 +103,7 @@ export {
   checkServerConfig,
 } from './mcpl/index.js';
 export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './mcpl/index.js';
-export type { McplHostCapabilities } from './mcpl/index.js';
+export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
 // needs to write McplServerConfig.toolLifecycle policy and class tables, and
@@ -154,7 +154,12 @@ export type {
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
 export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
-export type { OperatorLogEntry, OperatorLogInput, OperatorRequester } from './operator-log.js';
+export type {
+  OperatorLogEntry,
+  OperatorLogInput,
+  OperatorRequester,
+  SurgeryMarkerReceipt,
+} from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
   OfflineRecoveryBranchOptions,
