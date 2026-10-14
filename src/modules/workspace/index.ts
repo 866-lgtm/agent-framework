@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { filesystemTrustsCtime, locateRoot } from './observe.js';
+import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1220,7 +1220,14 @@ export class WorkspaceModule implements Module {
           + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
           + 'directory) is unavailable and listed under `incomplete`. Reconnect the drive; acceptRoot is for a '
           + 'directory replaced on purpose, or a drive back under a new device number, never for one still '
-          + 'unplugged, whose empty mountpoint would become the root.',
+          + 'unplugged, whose empty mountpoint would become the root. What the scan passed over by design and '
+          + 'reported nowhere else is counted under `passedOver`, by mount and reason: entries the mount\'s '
+          + 'ignore list covers that hold nothing the workspace tracks (an ignored directory counts once). So a '
+          + 'total of 0, with no conflicts and nothing under `passedOver`, `incomplete` or `skipped`, means the '
+          + 'sync looked everywhere and nothing had changed. A path the mount ignores is synced when you name '
+          + 'it, and listed under `ignored`: a sync without a path passes over it. Naming an ignored directory '
+          + 'sets aside the patterns that cover it or a directory above it; one that covers only something '
+          + 'inside it still applies, and what it covers is passed over.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2817,6 +2824,8 @@ export class WorkspaceModule implements Module {
     }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
     const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
+    const allPassedOver: Array<{ mount: string; reason: string; count: number }> = [];
+    const allIgnored: Array<{ mount: string; path: string; note: string }> = [];
     const rootsAccepted: string[] = [];
     if (input.acceptRoot && input.path) {
       return { success: false, error: 'acceptRoot takes a whole mount\'s root: give mount, or nothing, not path', isError: true };
@@ -2851,7 +2860,9 @@ export class WorkspaceModule implements Module {
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
-        const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn };
+        // named: ignore patterns covering the path asked for don't apply
+        // beneath it (a directory scope's walk; a path scope doesn't walk).
+        const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
         if (!isDir) return this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
         const beneath = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }, opts);
         // Something at the path itself is no part of a directory scope: a file
@@ -2866,12 +2877,15 @@ export class WorkspaceModule implements Module {
           || this.intents.get(name)!.get(relativePath) !== null;
         if (!atPath) return beneath;
         const itself = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
+        const passedOver = new Map(beneath.passedOver);
+        for (const [reason, count] of itself.passedOver) passedOver.set(reason, (passedOver.get(reason) ?? 0) + count);
         return {
           ops: [...beneath.ops, ...itself.ops],
           discarded: [...beneath.discarded, ...itself.discarded],
           newConflicts: [...beneath.newConflicts, ...itself.newConflicts],
           reports: new Map([...beneath.reports, ...itself.reports]),
           incomplete: [...beneath.incomplete, ...itself.incomplete],
+          passedOver,
           dirs: beneath.dirs,
           branchId: itself.branchId ?? beneath.branchId,
         };
@@ -2898,6 +2912,17 @@ export class WorkspaceModule implements Module {
         }
       }
       for (const region of pass.incomplete) allIncomplete.push({ mount: name, ...region });
+      for (const [reason, count] of pass.passedOver) allPassedOver.push({ mount: name, reason, count });
+      // A path named explicitly is synced even where the mount's ignore list
+      // covers it, and the result says so: a sync without a path passes
+      // over it, so nothing else keeps it current (agent-framework #276).
+      if (coveredByIgnore(relativePath, mount.config.ignore ?? [])) {
+        allIgnored.push({
+          mount: name,
+          path: relativePath,
+          note: 'this mount\'s ignore list covers it, so a sync without a path won\'t maintain it',
+        });
+      }
     }
 
     return {
@@ -2908,6 +2933,8 @@ export class WorkspaceModule implements Module {
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
         ...(allIncomplete.length > 0 ? { incomplete: allIncomplete } : {}),
+        ...(allPassedOver.length > 0 ? { passedOver: allPassedOver } : {}),
+        ...(allIgnored.length > 0 ? { ignored: allIgnored } : {}),
         ...(rootsAccepted.length > 0 ? { rootsAccepted } : {}),
       },
       // What the workspace took from disk, gave up, or now holds as a
