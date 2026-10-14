@@ -467,7 +467,9 @@ for (const ending of ['stop()', 'a disconnect'] as const) {
       const took = Date.now() - started;
       assert.ok(took < 10_000, `${ending} took ${took} ms, as if it waited out the handshake`);
       const refused = await connecting;
-      assert.match(refused?.message ?? 'connected', /MCPL server "silent" was closed while connecting/);
+      assert.match(refused?.message ?? 'connected', ending === 'stop()'
+        ? /^MCP server "silent" was not connected: the framework stopped while it was connecting$/
+        : /^MCP server "silent" was not connected: it was disconnected while connecting$/);
       if (ending === 'a disconnect') assert.ok(!framework.listMcplServers().some(s => s.id === 'silent'), 'nothing is left of it');
     });
   });
@@ -489,7 +491,7 @@ test("stop() ends a WebSocket dial still waiting for its access provider", async
     await framework.stop();
     assert.ok(Date.now() - started < 10_000, 'stop() did not wait for the provider');
     const refused = await connecting;
-    assert.match(refused?.message ?? 'connected', /MCPL server "dial" was closed while connecting/);
+    assert.match(refused?.message ?? 'connected', /^MCP server "dial" was not connected: the framework stopped while it was connecting$/);
   });
 });
 

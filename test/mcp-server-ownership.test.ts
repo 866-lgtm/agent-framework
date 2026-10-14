@@ -171,7 +171,7 @@ test('a modern connect is refused while a legacy connect for the same id is stil
   });
 });
 
-test('a disconnect during a legacy handshake ends that connect when the handshake finishes, and removes it whole', async () => {
+test('a disconnect during a legacy handshake ends that connect at once, and removes it whole', async () => {
   await withFramework(async ({ framework, dir }) => {
     const log = join(dir, 'legacy.log');
     const pending = framework.connectMcplServer(legacy('same', 'slow', log, { SLOW_INIT_MS: '600' }));
