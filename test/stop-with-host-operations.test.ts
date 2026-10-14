@@ -730,6 +730,31 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
+  it('two API switches handled together each announce their own move', async () => {
+    // With no workspace module, a switch holds the store for no await, so a
+    // second one can move the store before the first's continuation runs.
+    const framework = await create();
+    try {
+      const api = new ApiServer(framework) as unknown as {
+        cmdBranchCreate(params: { name: string }): Promise<unknown>;
+        cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+        cmdBranchCurrent(): Promise<{ name: string }>;
+        broadcast(event: string, data: unknown): void;
+      };
+      await api.cmdBranchCreate({ name: 'a' });
+      await api.cmdBranchCreate({ name: 'b' });
+      const broadcasts: Array<[string, unknown]> = [];
+      api.broadcast = (event, data) => { broadcasts.push([event, data]); };
+      await Promise.all([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
+      assert.deepEqual(broadcasts, [
+        ['branch:switched', { from: 'main', to: 'a' }],
+        ['branch:switched', { from: 'a', to: 'b' }],
+      ]);
+      assert.equal(framework.getStore().currentBranch().name, 'b');
+      assert.equal((await api.cmdBranchCurrent()).name, 'b');
+    } finally { await framework.stop(); }
+  });
+
   it("the API server's current branch is the store's while a switch is still running", { timeout: 20_000 }, async () => {
     const framework = await create();
     try {

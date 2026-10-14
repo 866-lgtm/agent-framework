@@ -544,24 +544,23 @@ export class ApiServer {
     // config mount. It refuses during a live turn or once stop() has begun,
     // and stop() waits for one already running.
     // The store has moved when the call returns, before its promise settles
-    // (a refusal moves nothing), and the switch holds the store until it's
-    // done, so the branch read here is current through the awaited steps.
+    // (a refusal moves nothing). The branch read then is this switch's
+    // destination: another switch can move the store before this one's
+    // awaited steps end, so the event names what was read here.
     const switching = this.framework.switchBranch(params.name);
     void switching.catch(() => {}); // awaited below; handled even if the next line throws
     this.followStoreBranch();
-    const moved = this.currentBranch !== from;
+    const to = this.currentBranch;
+    const moved = to !== from;
     let switched = false;
     try {
       await switching;
       switched = true;
     } finally {
       // A later step can fail after the store has moved: clients still hear
-      // where it is. A refusal moved nothing, so there's nothing to tell.
+      // where it went. A refusal moved nothing, so there's nothing to tell.
       if (switched || moved) {
-        this.broadcast('branch:switched', {
-          from,
-          to: this.currentBranch,
-        });
+        this.broadcast('branch:switched', { from, to });
       }
     }
 
