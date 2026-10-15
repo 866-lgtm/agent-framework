@@ -15,7 +15,9 @@
  * that isn't that directory any more (an unmounted drive whose mountpoint is
  * now empty, a replaced directory) is an unavailable mount, never a disk on
  * which every file was deleted; only an explicit acceptance takes it, and
- * that starts its evidence afresh.
+ * that starts its evidence afresh. A place, where a walk stopped (`walks`),
+ * binds no root: it only says where the next walk starts, in whatever
+ * directory the root is by then.
  *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
@@ -371,8 +373,8 @@ function apply(mount: MountEvidence, entry: JournalEntry): void {
 function applyRoot(mount: MountEvidence, entry: Extract<JournalEntry, { t: 'root' }>): void {
   mount.identity = entry.identity;
   if (entry.reset) {
-    // Evidence about another directory, and where its walks stopped, say
-    // nothing about this one.
+    // Evidence about another directory says nothing about this one, and the
+    // accepted root's walks start at its top.
     mount.paths.clear();
     mount.walks.clear();
   }

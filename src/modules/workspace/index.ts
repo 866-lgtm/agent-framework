@@ -791,6 +791,7 @@ export class WorkspaceModule implements Module {
       intents: this.intents.get(mount.config.name)!,
       readOnly: mount.config.mode === 'read-only',
       walkCap: mount.config.walkCap ?? WALK_CAP,
+      catchUpScan: (mount.config.watch ?? 'always') === 'always',
     };
   }
 
@@ -994,9 +995,12 @@ export class WorkspaceModule implements Module {
         this.watchers.set(name, watcher);
 
         // Chokidar is started with ignoreInitial:true, so changes made while
-        // the session was down would be invisible. One full pass catches up
-        // under the three-way rule: only real differences produce tree
-        // changes and events.
+        // the session was down would be invisible. A catch-up pass takes them
+        // in under the three-way rule: only real differences produce tree
+        // changes and events. It takes its turn with the mount's bare syncs,
+        // so on a mount over its walkCap it covers the walkCap entries after
+        // where the last turn stopped, and a change elsewhere waits for the
+        // rotation to reach it, or for a sync of its path.
         void this.initialScan(name);
       }
 
@@ -1226,8 +1230,8 @@ export class WorkspaceModule implements Module {
           + 'rechecked and nothing pending in the workspace is discarded. A sync takes up to the mount\'s walk '
           + 'cap of entries, files, links and the like (5000 unless configured). Past it, what this one didn\'t reach is listed under '
           + '`incomplete`, and the walk takes turns: the next sync of the same mount or directory picks up where '
-          + 'the last turn stopped, so repeated syncs cover it all. A mount\'s own catch-up scan, at start or when '
-          + 'its watcher reattaches, takes turns with its whole-mount syncs. With a '
+          + 'the last turn stopped, so repeated syncs cover it all. On a mount watched continuously, its own catch-up '
+          + 'scan, at start and when its watcher reattaches, takes turns with its whole-mount syncs. With a '
           + 'path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
@@ -3008,8 +3012,8 @@ export class WorkspaceModule implements Module {
    * on disk (a shell command's files, a deletion) is in the workspace when the
    * agent next looks. On a mount over its walkCap, that holds for the first
    * walkCap entries in the walk's order, which every batch's scan takes; files
-   * past them come in through the syncs, catch-up scans and listings that
-   * reach them. A scan that outlasts the deadline stops holding the
+   * past them come in through syncs, and the listings and reads that reach
+   * them. A scan that outlasts the deadline stops holding the
    * round: the miss is recorded on the mount's status and pushed as a
    * `workspace:agent-action-scan-incomplete` event, and the scan continues,
    * deciding on the branch selected when it applies.

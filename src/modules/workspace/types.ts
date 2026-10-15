@@ -48,16 +48,19 @@ export interface MountConfig {
    * The most entries one walk of this mount takes (default: 5000), a
    * positive integer no larger than Number.MAX_SAFE_INTEGER: files, and
    * links or other entries that aren't
-   * directories, each of which the pass observes. A sync, or the mount's
-   * catch-up scan (at start, and when its watcher reattaches), that reaches
-   * it reports the rest as incomplete, and the next one of the same scope
+   * directories, each of which the pass observes. A sync that reaches it
+   * reports the rest as incomplete, and the next sync of the same scope
    * resumes after the last entry it took, wrapping to the start, so repeated
-   * ones cover a larger mount; a whole mount's catch-up scan takes turns
-   * with its syncs, and a restart keeps the place. An agent-action scan
-   * (`watch: 'on-agent-action'`) and a listing (`ls`, `glob`, `grep`) take
-   * up to it from their scope's start every time. Each directory's listing
-   * is read whole, so a deletion is seen wherever the walk lists, whatever
-   * it took.
+   * syncs cover a larger mount. A watched mount's catch-up scan (at start,
+   * and when its watcher reattaches) takes its turn in the same rotation as
+   * the mount's bare syncs, so on a mount over the cap, a change made while
+   * the process was down waits for the rotation to reach it. The place is
+   * kept with the mount's disk evidence, so a restart resumes there, unless
+   * the machine went down before the store made the latest place durable.
+   * An agent-action scan (`watch: 'on-agent-action'`) and a listing (`ls`,
+   * `glob`, `grep`) take up to it from their scope's start every time. Each
+   * directory's listing is read whole, so a deletion is seen wherever the
+   * walk lists, whatever it took.
    *
    * It bounds what a walk observes, not the walk's own work: directories
    * don't count against it, and each one the walk visits is read whole, so

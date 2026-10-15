@@ -2141,8 +2141,11 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const env = new Env(t);
     for (const f of ['d/a.txt', 'd/b.txt', 'd/c.txt', 'top.txt']) env.writeDisk(f, f);
     const m = await env.open({ walkCap: 2 });
-    await call(m, 'sync', { path: 'work/d' });
+    const first = await call(m, 'sync', { path: 'work/d' });
     assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt']);
+    assert.ok(first.incomplete.some((r: { path: string; reason: string }) =>
+      r.path === 'd' && r.reason === 'the walk cap (2) was reached: the next sync of this directory resumes after work/d/b.txt'),
+      JSON.stringify(first.incomplete));
     await call(m, 'sync', { path: 'work/d' });
     assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt', 'd/c.txt']);
     assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), undefined, 'the mount root keeps its own place');
@@ -2234,11 +2237,23 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const synced = await call(m, 'sync', {});
     const resumes = synced.incomplete.filter((r: { reason: string }) => /resumes after/.test(r.reason));
     assert.deepEqual(resumes.map((r: { mount: string; path: string; reason: string }) => [r.mount, r.path, r.reason]),
-      [['work', '', 'the walk cap (1) was reached: the next sync of the mount, or its catch-up scan if that comes first, resumes after work/a.txt']]);
+      [['work', '', 'the walk cap (1) was reached: the next sync of the mount resumes after work/a.txt']]);
     // z/q.txt sits beneath z/, which wasn't listed: its reason is z/'s, not
     // that of the root, which holds an untaken b.txt.
     const skipped = synced.skipped?.find((x: { path: string }) => x.path === 'z/q.txt');
     assert.match(skipped?.reason ?? '', /not visited: the walk cap \(1\) was reached/, JSON.stringify(synced.skipped));
+  });
+
+  test("a watched mount's capped sync names its catch-up scan as the other turn", async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 1 });
+    // Read as a watched mount from here; opened unwatched, so no watcher runs.
+    (m as any).mounts.get('work').config.watch = 'always';
+    const synced = await call(m, 'sync', {});
+    assert.ok(synced.incomplete.some((r: { path: string; reason: string }) => r.path === ''
+      && r.reason === 'the walk cap (1) was reached: the next sync of the mount, or its catch-up scan if that comes first, resumes after work/a.txt'),
+      JSON.stringify(synced.incomplete));
   });
 
   test("an agent-action scan takes the mount's start after every batch, and leaves the syncs' place alone", async (t) => {
@@ -2246,12 +2261,20 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
     const m = await env.open({ watch: 'on-agent-action', walkCap: 2 });
     const agreement = (m as any).agreementOrThrow();
+    const stored = (p: string) => {
+      const e = env.store.treeGet(TREE, p);
+      return e ? env.store.getBlob(e.blobHash)?.toString('utf8') : null;
+    };
+    const capReports = () => env.events.filter((e) => e.type === 'workspace:agent-action-scan-incomplete').length;
     // What a shell tool did to the first file in the walk's order is in the
-    // workspace after every batch.
+    // workspace after every batch, and each capped scan says where the cap
+    // stopped it.
     for (const edit of ['edit one', 'edit number two', 'the third edit, longest']) {
       env.writeDisk('a.txt', edit);
+      const reported = capReports();
       await m.onToolBatchComplete('agent');
-      assert.equal(await contentOf(m, 'a.txt'), edit);
+      assert.equal(stored('a.txt'), edit);
+      assert.equal(capReports(), reported + 1, 'the batch\'s scan reported its cap');
     }
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt'], 'the same two files every time');
     assert.equal(agreement.walkResumesAfter('work', ''), undefined, 'and no place');
@@ -2263,6 +2286,10 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
     await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+    // A file a shell tool deleted among them is gone after the batch.
+    env.rmDisk('b.txt');
+    await m.onToolBatchComplete('agent');
+    assert.equal(stored('b.txt'), null);
   });
 
   test("a watched mount's catch-up scan resumes where the last stopped", async (t) => {
@@ -2760,7 +2787,8 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       return (seed >>> 8) % n;
     };
     // U+FF21 sorts before U+1F600 by UTF-8 byte and after it by UTF-16 code
-    // unit, the walk's order; U+E000 sorts between them by both.
+    // unit, the walk's order; U+E000 sorts before both by UTF-8 byte and
+    // between them by UTF-16 code unit.
     const names = ['a', 'b', 'm', 'z', '\uFF21', '\u{1F600}', '\uE000'];
     const pick = <T>(xs: T[]): T => xs[rand(xs.length)]!;
     const randomPath = (): string => {

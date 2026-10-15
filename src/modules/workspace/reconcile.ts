@@ -154,6 +154,12 @@ export interface MountRuntime {
   readOnly: boolean;
   /** The most entries one walk of the mount takes, files and the other entries that aren't directories (`MountConfig.walkCap`). */
   walkCap: number;
+  /**
+   * Whether the mount runs a catch-up scan (`watch: 'always'`, at start and
+   * when its watcher reattaches), which takes turns with its whole-mount
+   * syncs.
+   */
+  catchUpScan: boolean;
 }
 
 export type Scope =
@@ -852,11 +858,13 @@ export async function reconcilePass(
   if (walk) {
     const tracked = [...result.reports.values()].filter((r) => r.state === 'unverified').map((r) => r.path);
     if (typeof resumeAfter === 'string' && scope.kind === 'dir') {
-      // A whole mount's catch-up scan takes turns with its syncs; nothing
-      // else moves a place.
-      const next = scope.dir === ''
-        ? 'the next sync of the mount, or its catch-up scan if that comes first,'
-        : 'the next sync of this directory';
+      // A watched mount's catch-up scan takes turns with its whole-mount
+      // syncs; nothing else moves a place.
+      const next = scope.dir !== ''
+        ? 'the next sync of this directory'
+        : mount.catchUpScan
+          ? 'the next sync of the mount, or its catch-up scan if that comes first,'
+          : 'the next sync of the mount';
       result.incomplete.push({
         path: scope.dir,
         reason: `the walk cap (${opts.cap ?? mount.walkCap}) was reached: ${next} resumes after ${mount.name}/${resumeAfter}`,
