@@ -445,8 +445,8 @@ function buildSuppressionPlan(
     // before the later one began: from the earlier one's first stored copy
     // through the later one's first. Each end is every copy of it besides,
     // as a single suppression is, so a copy stored outside that span (a
-    // write cut short and retried later) goes alone, and nothing stored
-    // after the later one began goes with it.
+    // write cut short and retried later) is taken on its own, and nothing
+    // else stored after the later one began is taken.
     intervals.push({
       start: earlier.first,
       end: later.first,

@@ -360,7 +360,6 @@ class CallAfterGateStrategy implements ContextStrategy {
   ticks = 0;
   entered = false;
   outcome?: string;
-  outcomeMessage?: string;
   private open?: () => void;
   private readonly gate = new Promise<void>((resolve) => { this.open = resolve; });
 
@@ -385,7 +384,6 @@ class CallAfterGateStrategy implements ContextStrategy {
       this.outcome = 'sent';
     } catch (error) {
       this.outcome = (error as Error).name;
-      this.outcomeMessage = (error as Error).message;
       throw error;
     }
   }
@@ -1352,43 +1350,56 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  it("a conversation agent's call made once stop() has begun is refused, as a resident's is", { timeout: 10_000 }, async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-conversation-stopping-'));
-    const provider = new CapturingMembrane();
-    const conversation = new CallAfterGateStrategy();
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store'),
-      membrane: provider.asMembrane(),
-      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new ReadyStrategy() }],
-      modules: [],
-      syncIntervalMs: 0,
-      maintenanceIntervalMs: 10,
-      conversations: { templateAgent: 'agent', strategyFactory: () => conversation },
+  for (const kind of ['resident', 'conversation agent'] as const) {
+    it(`a ${kind}'s maintenance call made once stop() has begun is withdrawn, and no failure is reported`, { timeout: 10_000 }, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-stopping-'));
+      const provider = new CapturingMembrane();
+      const tick = new CallAfterGateStrategy();
+      const conversational = kind === 'conversation agent';
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane: provider.asMembrane(),
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: conversational ? new ReadyStrategy() : tick }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 10,
+        ...(conversational ? { conversations: { templateAgent: 'agent', strategyFactory: () => tick } } : {}),
+      });
+      const internals = framework as unknown as {
+        createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      };
+      const name = conversational ? 'agent-conv-1' : 'agent';
+      const alerts: string[] = [];
+      (framework as any).opsAlert = (...args: unknown[]) => { alerts.push(args.map(String).join(' ')); };
+      const quiet = console.error;
+      const logged: string[] = [];
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      let stopping: Promise<void> | undefined;
+      try {
+        if (conversational) await internals.createConversationAgent(name, 'chan-1');
+        framework.start();
+        await waitFor(() => tick.entered);
+        stopping = framework.stop();
+        tick.release();
+        await waitFor(() => tick.outcome !== undefined);
+        await stopping;
+        assert.equal(tick.outcome, 'MaintenanceWithdrawnError');
+        assert.equal(provider.calls.length, 0, 'the withdrawn call sent nothing');
+        assert.ok(logged.some((line) => line.includes(
+          `[context-maintenance] agent=${name} stopped: maintenance call withdrawn: provider admission closed while stopping (${name})`,
+        )), logged.join('\n'));
+        assert.deepEqual(alerts, [], 'no alert');
+        for (const run of framework.getContextMaintenanceSnapshot().history) {
+          for (const record of run.agents) assert.equal(record.error, undefined, `no failure recorded for ${record.agentName}`);
+        }
+      } finally {
+        console.error = quiet;
+        tick.release();
+        await (stopping ?? framework.stop());
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
-    const internals = framework as unknown as {
-      createConversationAgent(name: string, channelId: string): Promise<unknown>;
-    };
-    (framework as any).opsAlert = () => {};
-    const quiet = console.error;
-    console.error = () => {};
-    let stopping: Promise<void> | undefined;
-    try {
-      await internals.createConversationAgent('agent-conv-1', 'chan-1');
-      framework.start();
-      await waitFor(() => conversation.entered);
-      stopping = framework.stop();
-      conversation.release();
-      await waitFor(() => conversation.outcome !== undefined);
-      assert.match(conversation.outcomeMessage ?? '', /Provider admission closed while stopping \(agent-conv-1\)/);
-      assert.equal(provider.calls.length, 0, 'the refused call sent nothing');
-      await stopping;
-    } finally {
-      console.error = quiet;
-      conversation.release();
-      await (stopping ?? framework.stop());
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+  }
 
   it('no over-budget drain kick starts once stop() has begun', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-drain-after-stop-'));
@@ -1404,7 +1415,8 @@ describe('queued context maintenance timer', () => {
       noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
       overBudgetDrains: Set<Promise<void>>;
     };
-    (framework as any).opsAlert = () => {};
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (...args: unknown[]) => { alerts.push(args.map(String).join(' ')); };
     const quiet = console.error;
     const logged: string[] = [];
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -1413,6 +1425,8 @@ describe('queued context maintenance timer', () => {
       const stopping = framework.stop();
       internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
       assert.equal(internals.overBudgetDrains.size, 0, 'no kick was started');
+      assert.ok(alerts.some((alert) => alert.startsWith('context-refusal agent ')
+        && alert.includes('drain breaker not kicked: the framework is stopping;')), alerts.join('\n'));
       await stopping;
       assert.ok(!logged.some((line) => line.includes('drain kicked')), logged.join('\n'));
     } finally {

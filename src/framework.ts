@@ -721,18 +721,20 @@ function logSeedOmissions(
 }
 
 /**
- * A maintenance provider call withdrawn because a surgery holds the store. It
- * sent nothing: it was refused at the provider gate, or woken there from its
- * wait. context-manager counts no attempt for it. A merge keeps its queue
- * entry, so the next tick after the hold does it again. A chunk's
- * compression has already left the queue: it logs "Failed to compress chunk
- * (hierarchical)" with this error and records the call, and the chunk, still
- * uncompressed, is queued again at that manager's next rebuild (its next
- * initialization, message, sent compile or released hold).
+ * A maintenance provider call withdrawn because a surgery holds the store, or
+ * because stop() has closed provider admission: either is the framework's own
+ * doing, and no failure. It sent nothing: it was refused at the provider
+ * gate, or woken there from its wait. context-manager counts no attempt for
+ * it. A merge keeps its queue entry, so the next tick after the hold, or
+ * after the next start, does it again. A chunk's compression has already
+ * left the queue: it logs "Failed to compress chunk (hierarchical)" with
+ * this error and records the call, and the chunk, still uncompressed, is
+ * queued again at that manager's next rebuild (its next initialization,
+ * message, sent compile or released hold).
  */
 class MaintenanceWithdrawnError extends Error {
-  constructor(hold: { verb: string; agentName: string }) {
-    super(`maintenance call withdrawn: a live ${hold.verb} for ${hold.agentName} holds the store`);
+  constructor(reason: string) {
+    super(`maintenance call withdrawn: ${reason}`);
     this.name = 'MaintenanceWithdrawnError';
   }
 }
@@ -2854,9 +2856,7 @@ export class AgentFramework {
       // A surgery that took the store while this call was parked withdraws it.
       this.withdrawMaintenanceUnderSurgery();
     }
-    if (this.providerAdmissionClosed) {
-      throw new Error(`Provider admission closed while stopping (${agentName})`);
-    }
+    this.withdrawMaintenanceWhenStopping(agentName);
     // A wait recorded while this call was parked binds it too.
     this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
@@ -2886,7 +2886,19 @@ export class AgentFramework {
    * cooldown queues, which the hold itself keeps from starting.
    */
   private withdrawMaintenanceUnderSurgery(): void {
-    if (this.surgeryHold) throw new MaintenanceWithdrawnError(this.surgeryHold);
+    if (this.surgeryHold) {
+      throw new MaintenanceWithdrawnError(`a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store`);
+    }
+  }
+  /**
+   * Nor once stop() has closed provider admission: a stop that catches a
+   * tick is the framework stopping on purpose, so the call is withdrawn, as
+   * under a surgery's hold, and no failure is reported for it.
+   */
+  private withdrawMaintenanceWhenStopping(agentName: string): void {
+    if (this.providerAdmissionClosed) {
+      throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
+    }
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
@@ -2901,17 +2913,15 @@ export class AgentFramework {
    * recorded for it. (An ephemeral run records nothing, its name being
    * single-use, so its context manager keeps the plain membrane.) Its
    * compression is the background work a resident's is, whether a
-   * maintenance tick or a drain after a message starts it, so it meets the
-   * same refusals: a call made while a surgery holds the store is withdrawn,
-   * and one made once stop() has closed provider admission is refused.
+   * maintenance tick or a drain after a message starts it, so it is withdrawn
+   * as a resident's is: a call made while a surgery holds the store, or once
+   * stop() has closed provider admission, is withdrawn without being sent.
    */
   private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.refuseHeldProviderModel(agentName, model);
       this.withdrawMaintenanceUnderSurgery();
-      if (this.providerAdmissionClosed) {
-        throw new Error(`Provider admission closed while stopping (${agentName})`);
-      }
+      this.withdrawMaintenanceWhenStopping(agentName);
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
@@ -3494,9 +3504,10 @@ export class AgentFramework {
       const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
       // Settled, not all: the pass ends only when every agent's work has.
       const outcomes = await Promise.allSettled(running.map(async ({ agent, cm, record }) => {
-        // A tick whose provider call a surgery withdrew ends this agent's
-        // work for the pass, as the hold would have before its next tick: it
-        // is no failure, and what the failure reports remember stays as it is.
+        // A tick whose provider call a surgery or stop() withdrew ends this
+        // agent's work for the pass, as the hold or the stop would have before
+        // its next tick: it is no failure, and what the failure reports
+        // remember stays as it is.
         let withdrawn = false;
         try {
           for (
@@ -5339,7 +5350,8 @@ export class AgentFramework {
     } catch (error) {
       // A manager that refuses its queries gives no verdict, as a preview
       // that can't be computed gives none: the agent's own state still says
-      // its budget and the patch's path. Anything else throws as before.
+      // its budget and the patch's path, and whatever stopped the preview is
+      // its reason. When the manager answers, anything else throws as before.
       if (agent.contextManagerAnswers()) throw error;
       return { available: false, reason: error instanceof Error ? error.message : String(error), ...agent.runtimeBudgetPath(patch) };
     }
@@ -7078,9 +7090,9 @@ export class AgentFramework {
           // before the later one began: from the earlier one's first stored
           // copy through the later one's first, each whole. Each end is every
           // copy of it besides, as the single form takes, so a copy stored
-          // outside that span (a write cut short and retried later) goes
-          // alone, and nothing stored after the later one began goes with it.
-          // Offline recovery's range is the same.
+          // outside that span (a write cut short and retried later) is taken
+          // on its own, and nothing else stored after the later one began is
+          // taken. Offline recovery's range is the same.
           const span = {
             from: bodyRangeIn(all, Math.min(fromIdx, toIdx)).from,
             to: bodyRangeIn(all, Math.max(fromIdx, toIdx)).to,
@@ -15758,18 +15770,24 @@ export class AgentFramework {
     // this turn — surface it on the ops-alert pipeline (ops:alert trace +
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
     // The per-(agent,kind) cooldown throttles repeats; failures.log already
-    // has the per-exhaustion record from logFailure above.
+    // has the per-exhaustion record from logFailure above. It says whether
+    // the drain breaker kicks, decided where the kick is.
+    const drainState = !agent ? 'unavailable (no agent handle)'
+      : !this.running ? 'not kicked: the framework is stopping'
+      : this.surgeryHold ? 'not kicked: a surgery holds the store'
+      : this.overBudgetDrainInFlight.has(agentName) ? 'already draining'
+      : 'kicking';
     if (overBudget) {
       this.opsAlert(
         'context-refusal',
         agentName,
         `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
-        `drain breaker ${agent ? 'kicking' : 'unavailable (no agent handle)'}; ` +
+        `drain breaker ${drainState}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
         { skipLog: true },
       );
     }
-    if (agent && overBudget && this.running && !this.overBudgetDrainInFlight.has(agentName) && !this.surgeryHold) {
+    if (agent && overBudget && drainState === 'kicking') {
       this.overBudgetDrainInFlight.add(agentName);
       // Like a maintenance pass: none starts once stop() has begun, it starts
       // no tick while a surgery holds the store, and a branch move, or stop(),

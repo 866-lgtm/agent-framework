@@ -341,6 +341,15 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     assert.equal(preview.effective, undefined);
     // A patch whose values the agent refuses still throws.
     assert.throws(() => framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 5 }), /contextBudgetTokens must be/);
+    assert.throws(() => framework.previewAgentRuntimeSettings('agent', { tailTokens: -1 }), /tailTokens must be/);
+    // Whether the strategy takes a live tail or pace is the manager's to say,
+    // so while it refuses, a patch that sets one gets no verdict either.
+    for (const patch of [{ tailTokens: 2_000 }, { transitionPaceTokens: 1_000 }]) {
+      const unanswered = framework.previewAgentRuntimeSettings('agent', patch);
+      assert.equal(unanswered.available, false, JSON.stringify(patch));
+      assert.match(String(unanswered.reason), /requires successful strategy initialization/);
+      assert.equal(unanswered.liveBudgetTokens, 100_000);
+    }
 
     // An update of the budget is refused, by the manager, and the preflight
     // doesn't say it's applying one.
