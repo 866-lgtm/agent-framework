@@ -892,6 +892,28 @@ export class ResumeBlockedError extends Error {
   }
 }
 
+/**
+ * How `runEphemeralToCompletion` rejects when a retryable provider failure
+ * states a wait the run won't sleep: one longer than an ephemeral run sleeps
+ * in its turn (600 s), an infinite one, or one that is `NaN`. The run ends at
+ * once, without retrying inside the wait, and every other ending of the run
+ * rejects with a plain `Error`. `retryAfterMs` is the wait as the provider
+ * stated it, in milliseconds, so `Infinity` or `NaN` in those two cases: a
+ * host that schedules a rerun from it handles a value that isn't finite, and
+ * one past the 2,147,483,647 ms a timer can hold. The message says the same
+ * in words. A host can test `instanceof` or the `name`, which also holds for
+ * an error from another copy of this package.
+ */
+export class ProviderWaitNotSleptError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number,
+  ) {
+    super(message);
+    this.name = 'ProviderWaitNotSleptError';
+  }
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
@@ -3119,17 +3141,26 @@ export class AgentFramework {
     return undefined;
   }
   /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
-   *  for its caller. */
-  private statedWaitNotSlept(error: Error): string {
-    const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
+   *  for its caller: the text, and the wait itself, which its rejection
+   *  carries (ProviderWaitNotSleptError). */
+  private statedWaitNotSlept(error: Error): { error: string; statedWaitMs: number } {
+    // Called only after nonOwningProviderWait answered 'fail', which takes a
+    // numeric stated wait.
+    const stated = isMembraneError(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : Number.NaN;
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
-    if (typeof stated !== 'number' || Number.isNaN(stated)) {
-      return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
-        `stated wait of ${cap} or less, so it ends now)`;
+    if (Number.isNaN(stated)) {
+      return {
+        error: `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+          `stated wait of ${cap} or less, so it ends now)`,
+        statedWaitMs: Number.NaN,
+      };
     }
     const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
-    return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
-      `longer than ${cap}, so it ends now)`;
+    return {
+      error: `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+        `longer than ${cap}, so it ends now)`,
+      statedWaitMs: stated,
+    };
   }
   /** When a hold's timer next fires: at its deadline, stepped past what one
    *  timer can hold. A hold with no deadline (a wait held until released, or
@@ -5795,7 +5826,14 @@ export class AgentFramework {
    *  per-stream local survives budget restarts. */
   private settleAgent(
     agentName: string,
-    outcome: { stopReason: AgentSettleResult['stopReason']; speech: string; error?: string },
+    outcome: {
+      stopReason: AgentSettleResult['stopReason'];
+      speech: string;
+      error?: string;
+      /** An ephemeral run that ended rather than sleep the provider's stated
+       *  wait: that wait (statedWaitNotSlept). */
+      statedWaitMs?: number;
+    },
     /** The settling stream's logical turn (TurnRouting), when that stream
      *  still owns the agent: it ends here, so the agent's next fresh start
      *  opens a new one. A stream that no longer owns the agent passes none. */
@@ -5809,7 +5847,10 @@ export class AgentFramework {
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
       // The caller may log or relay the message, which can echo the whole request.
-      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
+      const message = boundFailureText(outcome.error ?? 'Unknown error');
+      run.settle.reject(outcome.statedWaitMs === undefined
+        ? new Error(message)
+        : new ProviderWaitNotSleptError(message, outcome.statedWaitMs));
       return;
     }
     run.settle.resolve({
@@ -5825,6 +5866,9 @@ export class AgentFramework {
    * The agent is temporarily registered, inference is triggered, and the
    * framework drives the stream (emitting traces, logging, dispatching tools).
    * Returns the agent's speech output when it finishes (no more tool calls).
+   * Rejects with ProviderWaitNotSleptError when the run ends rather than sleep
+   * a retryable failure's stated wait, and with a plain Error for any other
+   * ending.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
@@ -8676,13 +8720,18 @@ export class AgentFramework {
           // under budget instead of dispatching a doomed request.
           // Projection terms: prior round's real input + prior round's
           // OUTPUT (the just-generated thinking/text/tool_use joins the next
-          // round's input — omitting it is a systematic underestimate) +
-          // blocks about to be appended + reserve for the next response.
+          // round's input — omitting it is a systematic underestimate) + the
+          // growth since that round, when calls after it reported no prompt
+          // (lastStreamUnreportedTokens) + blocks about to be appended +
+          // reserve for the next response. It runs once a call on this
+          // stream has reported a prompt: before then there is no figure to
+          // project from.
           const projectedRealTokens = currentState.stream
             && agent.physicalWindowTokens !== undefined
             && agent.lastStreamRealInputTokens > 0
             ? agent.lastStreamRealInputTokens
               + agent.lastStreamOutputTokens
+              + agent.lastStreamUnreportedTokens
               + estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections)
               + agent.maxTokens
             : 0;
@@ -8812,6 +8861,12 @@ export class AgentFramework {
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
+            // What this round appends is in the next call's prompt. If that
+            // call reports no prompt, the next boundary projects it from the
+            // growth since the last call that did.
+            if (agent.physicalWindowTokens !== undefined) {
+              agent.lastStreamUnreportedTokens += estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections);
+            }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
             // messages (membrane ≥0.5.72) — appended after the tool_result
@@ -11797,7 +11852,7 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+          ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
         this.emitTrace({
           type: 'inference:exhausted',
@@ -11846,8 +11901,9 @@ export class AgentFramework {
     const myStreamId = agent.streamId;
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the
-    // physical provider-call boundary (estimator calibration and kv receipt
-    // acceptance) see this call only, not an ever-growing turn total.
+    // physical provider-call boundary (estimator calibration and the
+    // physical-window projection) see this call only, not an ever-growing
+    // turn total.
     let previousUsage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -13004,7 +13060,7 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+                ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
@@ -13133,12 +13189,9 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            // The stream's accumulated fresh input, which is what the
+            // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
-            agent.lastStreamRealInputTokens =
-              (event.usage.inputTokens ?? 0) +
-              (event.usage.cacheCreationTokens ?? 0) +
-              (event.usage.cacheReadTokens ?? 0);
-            agent.lastStreamOutputTokens = event.usage.outputTokens ?? 0;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
             // prefix size of THIS API call (fresh + cache write + cache read)
@@ -13169,6 +13222,34 @@ export class AgentFramework {
             };
             previousUsage = cumulativeUsage;
             outputTokensSinceStamp += perCallUsage.outputTokens;
+            const realTotal =
+              perCallUsage.inputTokens +
+              perCallUsage.cacheCreationTokens +
+              perCallUsage.cacheReadTokens;
+            // The physical-window projection adds the next two fields as the
+            // prior round's real input and output, so they take this call's
+            // share, never the event's own figures: the event is the stream's
+            // running total, which after k calls holds k prompts and would
+            // restart a stream whose next request still fits. Every real call
+            // has a prompt, and a call that ends at a tool boundary wrote
+            // output (its tool_use), so a 0 in either is a count the adapter
+            // left at 0, not an empty call. A call that reported no prompt is
+            // unreported: the fields stay the last call that reported one,
+            // which is what the provider billed, and its own output joins the
+            // growth since that call (lastStreamUnreportedTokens). An output
+            // of 0 counts as maxTokens, the bound on it, in either case, so
+            // the projection errs toward a restart. That holds once a call on
+            // the stream has reported a prompt: the projection runs only then.
+            const callOutputTokens = perCallUsage.outputTokens > 0
+              ? perCallUsage.outputTokens
+              : agent.maxTokens;
+            if (realTotal > 0) {
+              agent.lastStreamRealInputTokens = realTotal;
+              agent.lastStreamOutputTokens = callOutputTokens;
+              agent.lastStreamUnreportedTokens = 0;
+            } else {
+              agent.lastStreamUnreportedTokens += callOutputTokens;
+            }
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
@@ -13183,10 +13264,6 @@ export class AgentFramework {
                 }
               | undefined;
             try {
-              const realTotal =
-                perCallUsage.inputTokens +
-                perCallUsage.cacheCreationTokens +
-                perCallUsage.cacheReadTokens;
               strat?.reportRealInputTokens?.(realTotal);
             } catch { /* calibration is best-effort */ }
 
@@ -13265,7 +13342,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+        ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
       this.emitTrace({
         type: 'inference:exhausted',
