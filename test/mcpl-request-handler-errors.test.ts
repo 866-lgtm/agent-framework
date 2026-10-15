@@ -742,6 +742,59 @@ test('a request for an event nothing on the host listens for is answered -32601'
   assert.deepEqual(replies.map((r) => [r.id, r.error?.code, r.error?.message]), [[71, -32601, 'Method not found']]);
 });
 
+test("a long handler error is bounded in its trace, and its log line is cut with its length", async (t) => {
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  framework.channelRegistry = { async handleRegister() { throw new Error('x'.repeat(5000)); } };
+  connection.emit('channels-register', {}, responder());
+  await settle();
+  const failure = traces.find((e) => e.type === 'mcpl:request-handler-error');
+  assert.equal(failure?.error, `${'x'.repeat(500)}…`);
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.length < 600, `logged ${lines[0]!.length} characters`);
+  assert.ok(lines[0]!.endsWith('…(5000)'), lines[0]!.slice(-40));
+});
+
+test("the log line prints a failed reply write and a refused answer raw, and only the trace's copies are bounded", async (t) => {
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  framework.channelRegistry = {
+    async handleRegister(_server: string, _params: unknown, reply: any) {
+      try { reply.respond({ registered: [] }); } catch { /* swallowed */ }
+      reply.respondError(-32602, 'second\u0007answer');
+      throw new Error('handler\u0007failed');
+    },
+  };
+  const reply = responder();
+  reply.respond = () => { throw new Error('write\u0007broke'); };
+  connection.emit('channels-register', {}, reply);
+  await settle();
+  const failure = failureTraces(traces)[0];
+  assert.equal(failure.error, 'handler?failed');
+  assert.equal(failure.responseFailure, 'write?broke');
+  assert.deepEqual(failure.refusedResponse, { kind: 'error', code: -32602, message: 'second?answer' });
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.includes('handler failed: "handler\\u0007failed"'), lines[0]);
+  assert.ok(lines[0]!.includes('its reply write had failed: "write\\u0007broke"'), lines[0]);
+  assert.ok(lines[0]!.includes('it then tried to answer again with "error -32602: second\\u0007answer"'), lines[0]);
+});
+
+test("the log line prints a failed internal-error reply raw, and only the trace's copy is bounded", async (t) => {
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  framework.channelRegistry = { async handleRegister() { throw new Error('original failure'); } };
+  const reply = responder();
+  reply.respondError = () => { throw new Error('send\u0007failed'); };
+  connection.emit('channels-register', {}, reply);
+  await settle();
+  assert.equal(failureTraces(traces)[0].responseError, 'send?failed');
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.includes('the internal-error reply failed too: "send\\u0007failed"'), lines[0]);
+});
+
 test('a value printing cannot handle still leaves a stderr line naming the failure', async (t) => {
   const { framework, connection } = harness();
   framework.traceListeners = [];

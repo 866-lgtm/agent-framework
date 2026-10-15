@@ -17499,7 +17499,7 @@ export class AgentFramework {
         ...(respondError ? {
           respondError: (code: number, message: string, data?: unknown) =>
             writeResponse(() => respondError(code, message, data), {
-              kind: 'error', code, message: boundedForLog(typeof message === 'string' ? message : describeCause(message), 500),
+              kind: 'error', code, message: typeof message === 'string' ? message : describeCause(message),
             }),
         } : {}),
       }) as InboundResponder | undefined;
@@ -17547,10 +17547,14 @@ export class AgentFramework {
             event,
             requestId: responder?.id,
             responseAttempted: handlerResponseAttempted,
-            error: message,
-            ...(responseFailure === undefined ? {} : { responseFailure }),
-            ...(refused === undefined ? {} : { refusedResponse: refused }),
-            ...(responseError === undefined ? {} : { responseError }),
+            // The trace's copies are bounded, as data; the log line below
+            // prints each text raw through log-value, which escapes it.
+            error: boundedForLog(message, 500),
+            ...(responseFailure === undefined ? {} : { responseFailure: boundedForLog(responseFailure, 500) }),
+            ...(refused === undefined ? {} : {
+              refusedResponse: refused.kind === 'error' ? { ...refused, message: boundedForLog(refused.message, 500) } : refused,
+            }),
+            ...(responseError === undefined ? {} : { responseError: boundedForLog(responseError, 500) }),
           });
           // Keep headless hosts diagnosable even without a trace subscriber.
           // The handler's text and the server's go through log-value, so a
