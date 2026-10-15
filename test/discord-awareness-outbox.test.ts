@@ -620,6 +620,34 @@ test('release queues a held batch\'s recorded operations, explicitly', withJourn
   assert.deepEqual(third.batches().filter((b) => b.status === 'held').map((b) => b.id), ['held-3']);
 }));
 
+test('the framework\'s release, retract and cancel each record their act in the operator log, done or refused', withJournal(async (_outbox, h) => {
+  const outbox = importHeld(h, 'held-log', [ref('m1')]);
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessOutbox = outbox;
+  framework.deliverDiscordAwarenessInBackground = () => {};
+  const logged: Array<Record<string, any>> = [];
+  framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
+  const requester = { via: 'test', name: 'op' };
+  let released: unknown;
+  let retracted: unknown;
+  let cancelled: unknown;
+  await muted(async () => {
+    released = framework.releaseDiscordAwareness('held-log', { requester });
+    retracted = framework.retractDiscordAwareness('held-log', { requester });
+    cancelled = framework.cancelDiscordAwareness('held-log', { requester });
+    assert.throws(() => framework.releaseDiscordAwareness('held-log', { requester }),
+      (error) => error instanceof Error && (error as { code?: string }).code === 'invalid' && /is active, not held/.test(error.message));
+  });
+  assert.deepEqual(logged.map((entry) => [entry.kind, entry.agent, entry.requester, entry.params]), [
+    ['awareness-release', '*', requester, { batchId: 'held-log' }],
+    ['awareness-retract', '*', requester, { target: 'held-log' }],
+    ['awareness-cancel', '*', requester, { target: 'held-log' }],
+    ['awareness-release', '*', requester, { batchId: 'held-log' }],
+  ]);
+  assert.deepEqual(logged.slice(0, 3).map((entry) => entry.result), [released, retracted, cancelled].map((receipt) => ({ ...(receipt as object) })));
+  assert.match(logged[3].error, /is active, not held/, 'a refused act is recorded with its refusal');
+}));
+
 test('settleActivation says what the journal will do when activation cannot be recorded', withJournal((outbox) => {
   const ok = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'b1', refs: [ref('m1')], scope: 'all' })!;
   assert.deepEqual(outbox.settleActivation(ok.id), { status: 'queued', queued: 1 });
@@ -1268,6 +1296,8 @@ test('message-granular host/command undo places no marks unless asked; the marks
       { id: 'i2', metadata: { ...ref('m2'), tags: ['chat:ambient'] } },
       { id: 'i3', metadata: { ...ref('m3') } },
     ]);
+    const logged: Array<Record<string, any>> = [];
+    framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
     await muted(async () => {
       // A mistyped choice is refused before anything is removed.
       const typo = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', messages: 1, marks: 'adressed' });
@@ -1299,6 +1329,13 @@ test('message-granular host/command undo places no marks unless asked; the marks
       assert.equal(h.outbox.pendingDispatches('discord').length, 0);
       const missing = await framework.handleHostCommand('discord', { command: 'marks', action: 'retract' });
       assert.equal(missing.ok, false);
+      // Each undo that removed messages records its marks choice and the
+      // receipt it returned, and the verb's cancel records its act.
+      const undos = logged.filter((entry) => entry.kind === 'rollback');
+      assert.deepEqual(undos.map((entry) => [entry.params?.marks, entry.result?.markers]), [['none', silent.markers], [{ scope: 'addressed' }, marked.markers]]);
+      const cancels = logged.filter((entry) => entry.kind === 'awareness-cancel');
+      assert.deepEqual(cancels.map((entry) => [entry.params, entry.requester, entry.result]),
+        [[{ target: batch.id }, { via: 'host-command:discord', name: 'op' }, cancelled.awareness]]);
     });
   } finally {
     h.cleanup();
@@ -1406,6 +1443,8 @@ test('host/command hide takes the store reservation and marks only on request, t
       { id: 'i2', metadata: { ...ref('m2'), tags: ['chat:ambient'] } },
       { id: 'i3', metadata: { ...ref('m3') } },
     ]);
+    const logged: Array<Record<string, any>> = [];
+    framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
     await muted(async () => {
       // Another agent sharing the store is mid-turn: hide refuses, removes nothing.
       framework.activeTurnTokens.set('other', 99);
@@ -1430,6 +1469,10 @@ test('host/command hide takes the store reservation and marks only on request, t
       const [dispatch] = h.outbox.pendingDispatches('discord');
       assert.deepEqual(dispatch.key, { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1', emoji: '🫥' });
       assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup(), { retired: [], unknownAttempts: 0, givenUp: 0 });
+      // Each hide that removed messages records its marks choice and the
+      // receipt it returned; the refused one records nothing.
+      const hides = logged.filter((entry) => entry.kind === 'hide');
+      assert.deepEqual(hides.map((entry) => [entry.params?.marks, entry.result?.markers]), [['none', silent.markers], [{ scope: 'addressed' }, marked.markers]]);
     });
   } finally {
     h.cleanup();

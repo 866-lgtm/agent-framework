@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
@@ -85,6 +85,7 @@ test('the offline awareness controls record each act in the operator log, done o
     for (const entry of entries) {
       assert.equal(entry.agent, '*');
       assert.equal(entry.requester?.via, 'cli');
+      assert.equal(entry.requester?.name, userInfo().username, 'the OS account that ran it');
       assert.ok(entry.at);
     }
     assert.deepEqual(entries[0].params, { target: batch.id });
@@ -185,6 +186,7 @@ test('an offline recovery records its marks choice and receipt in the operator l
     assert.equal(recorded.kind, 'recovery');
     assert.equal(recorded.agent, 'cairn');
     assert.equal(recorded.requester?.via, 'cli');
+    assert.equal(recorded.requester?.name, userInfo().username, 'the OS account that ran it');
     assert.deepEqual(recorded.params, { messageId: 'm-safe', marks: { scope: 'addressed' } });
     assert.deepEqual(recorded.result, {
       sourceBranch: 'main',

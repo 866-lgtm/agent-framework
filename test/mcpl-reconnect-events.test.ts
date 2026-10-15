@@ -429,6 +429,8 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
     const filters: unknown[] = [];
     connection.on('tools-observe', (params: unknown) => filters.push(params));
+    const registrations: unknown[] = [];
+    connection.on('channels-register', (params: unknown) => registrations.push(params));
     let reconnected = 0;
     connection.on('reconnect', () => { reconnected++; });
     connection.ready();
@@ -437,15 +439,17 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
         .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
     connection.sendToolsList().catch(() => {});
     await waitFor(() => reconnected === 1, 5000, 'first reconnect');
-    // The fresh transport sends its filter right after initialize, while
-    // its exchange holds both planes, and then dies before the exchange
-    // settles.
+    // The fresh transport sends its filter and a channel registration right
+    // after initialize, while its exchange holds both planes, and then dies
+    // before the exchange settles.
     serverSends({ method: 'tools/observe', params: { rules: [{ tool: 'old-process' }] } });
+    serverSends({ id: 7, method: 'channels/register', params: { channels: [{ id: 'old-room', type: 'text', direction: 'bidirectional' }] } });
     connection.sendToolsList().catch(() => {});
     await waitFor(() => reconnected === 2, 5000, 'second reconnect');
-    connection.establishGrant(new CapabilityGrant(new Set(['toolLifecycle.observe']), []));
+    connection.establishGrant(new CapabilityGrant(new Set(['toolLifecycle.observe', 'channels.register']), []));
     connection.ready();
     assert.deepStrictEqual(filters, [], 'the closed transport\'s filter is not admitted under the next grant');
+    assert.deepStrictEqual(registrations, [], 'nor is its channel registration');
   });
 
   it('a close during a reconnect\'s handshake closes the new transport instead of adopting it', async () => {

@@ -250,6 +250,7 @@ describe('surgery and awareness marks', () => {
     assert.equal(rolled.markers.status === 'queued' && rolled.markers.queued, 3);
     const logged = framework.getOperatorLog({ limit: 5 }).find((entry) => entry.kind === 'rollback');
     assert.deepEqual(logged?.params?.marks, { scope: 'all', authorizedRefs: 4 });
+    assert.deepEqual(logged?.result?.markers, rolled.markers, 'the log keeps the receipt the rollback returned');
     void removed;
 
     // A suppression counts the same way.
@@ -259,6 +260,9 @@ describe('surgery and awareness marks', () => {
     const later = { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'later' };
     const suppressed = await framework.suppressMessages('resident', { messageIds: [kept], marks: { scope: 'all', refs: [later, elsewhere] } });
     assert.equal(suppressed.markers.notRemoved, 1);
+    const loggedSuppression = framework.getOperatorLog({ limit: 5 }).find((entry) => entry.kind === 'suppress');
+    assert.deepEqual(loggedSuppression?.params?.marks, { scope: 'all', authorizedRefs: 2 });
+    assert.deepEqual(loggedSuppression?.result?.markers, suppressed.markers, 'the log keeps the receipt the suppression returned');
   });
 
   it('a delivery that fails to start raises an ops alert and leaves no unhandled rejection', async () => {
@@ -815,8 +819,17 @@ describe('surgery and awareness marks', () => {
     const retry = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-1' });
     assert.equal(retry.targetBranch, 'fix-1');
     await framework.stop();
-    // The next start, on fix-1, retires the old batch: none of its marks is sent.
-    await start(true);
+    // The next start, on fix-1, retires the old batch: none of its marks is
+    // sent, and its alert names the redo.
+    await withAlerts(async (alerts) => {
+      await start(true);
+      assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-not-scheduled']);
+      assert.equal(alerts[0]!.message,
+        `The rollback of resident from ${sourceBranch} onto fix-1 (awareness batch ${first.id}) was interrupted. `
+        + 'Its 3 awareness mark(s) weren\'t applied, since a start never completes a surgery\'s marks. '
+        + `To apply them, switch to ${sourceBranch}, which still has every message it removed, and redo the rollback there, `
+        + 'onto a new branch name, with its marks');
+    });
     assert.equal(cm().currentBranch().name, 'fix-1');
     assert.equal(outbox().batches().find((batch) => batch.id === first.id)?.status, 'discarded');
     await framework.syncDiscordAwarenessMarkers();
