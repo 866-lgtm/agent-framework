@@ -12,7 +12,11 @@
  * whose stored prefix holds a message its request didn't.
  *
  * A message the stream carried has been read: RFC-006's consumed watermark
- * covers it, so a coalesced replacement can no longer remove it.
+ * covers it, so a coalesced replacement can no longer remove it. Only a
+ * stream that declares it carries injected messages (membrane's native
+ * path) is known to have carried them. One that declares it can't (membrane's
+ * XML prefill path) gets none, and what is queued waits for the turn's end.
+ * One that doesn't say (membrane 0.5.87) gets them, and they stay unread.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -239,16 +243,43 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  it('a message the stream carried is read: the consumed watermark covers it', async () => {
+  /** Whether the stored message with this text reads as unread (RFC-006). */
+  function unread(framework: AgentFramework, textOf: string): boolean {
+    const agent = framework.getAgent('assistant')!;
+    const stored = agent.getContextManager().getAllMessages()
+      .find((m) => m.content.some((b) => (b as { text?: string }).text === textOf))!;
+    assert.ok(stored, `'${textOf}' is stored`);
+    return (framework as unknown as {
+      isUnreadStoredMessage: (a: typeof agent, id: string) => boolean;
+    }).isUnreadStoredMessage.call(framework, agent, stored.id);
+  }
+
+  it('a message injected into a stream that declares it carries injections is read: the consumed watermark covers it', async () => {
+    membrane.supportsInjectedMessages = true; // membrane's native path declares it
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
     assert.deepEqual(injected(), ['Antra: look left']);
-    const agent = framework.getAgent('assistant')!;
-    const heard = agent.getContextManager().getAllMessages()
-      .find((m) => m.content.some((b) => (b as { text?: string }).text === 'look left'))!;
-    const isUnread = (framework as unknown as {
-      isUnreadStoredMessage: (a: typeof agent, id: string) => boolean;
-    }).isUnreadStoredMessage.bind(framework);
-    assert.equal(isUnread(agent, heard.id), false, 'a coalesced replacement must not remove what the agent heard');
+    assert.equal(unread(framework, 'look left'), false, 'a coalesced replacement must not remove what the agent heard');
+    await framework.stop();
+  });
+
+  it('a stream that doesn\'t say whether it carries injections gets them, and they stay unread', async () => {
+    // membrane 0.5.87 doesn't declare it, on either path, and its XML path
+    // drops what's injected: marked read there, a message the agent never
+    // saw could no longer be replaced.
+    const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
+    assert.deepEqual(injected(), ['Antra: look left']);
+    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'Antra: look left', 'assistant: Done.']);
+    assert.equal(unread(framework, 'look left'), true);
+    await framework.stop();
+  });
+
+  it('a stream that can\'t carry injections gets none: what is queued waits for the turn to end', async () => {
+    membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it
+    const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
+    assert.deepEqual(atBoundary(), undefined, 'the boundary drained nothing');
+    assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
+    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: look left']);
+    assert.equal(unread(framework, 'look left'), true);
     await framework.stop();
   });
 
