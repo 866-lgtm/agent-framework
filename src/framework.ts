@@ -2840,8 +2840,11 @@ export class AgentFramework {
   }
   private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T> {
     const gate = this.providerGate(agentName);
-    this.refuseHeldProviderModel(agentName, model);
+    // A surgery's hold or a stop withdraws the call before a provider wait
+    // can refuse it: either is the framework's own doing, and no failure.
     this.withdrawMaintenanceUnderSurgery();
+    this.withdrawMaintenanceWhenStopping(agentName);
+    this.refuseHeldProviderModel(agentName, model);
     // A parked call is woken when the gate opens, when stop() closes
     // admission, or when a surgery takes the store; one woken while the gate
     // is still closed parks again.
@@ -2919,9 +2922,9 @@ export class AgentFramework {
    */
   private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
-      this.refuseHeldProviderModel(agentName, model);
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
+      this.refuseHeldProviderModel(agentName, model);
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
@@ -15771,9 +15774,11 @@ export class AgentFramework {
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
     // The per-(agent,kind) cooldown throttles repeats; failures.log already
     // has the per-exhaustion record from logFailure above. It says whether
-    // the drain breaker kicks, decided where the kick is.
+    // the drain breaker kicks, decided where the kick is. What ends drains is
+    // stop(), not a framework that was never started: one run with
+    // runUntilIdle() has no maintenance timer, so a drain is its recovery.
     const drainState = !agent ? 'unavailable (no agent handle)'
-      : !this.running ? 'not kicked: the framework is stopping'
+      : this.providerAdmissionClosed ? 'not kicked: the framework is stopping'
       : this.surgeryHold ? 'not kicked: a surgery holds the store'
       : this.overBudgetDrainInFlight.has(agentName) ? 'already draining'
       : 'kicking';
@@ -15796,11 +15801,11 @@ export class AgentFramework {
         let ticks = 0;
         try {
           const cm = agent.getContextManager();
-          while (ticks < 8 && this.running && !this.surgeryHold) {
+          while (ticks < 8 && !this.providerAdmissionClosed && !this.surgeryHold) {
             await cm.tick();
             ticks++;
           }
-          const stopped = ticks >= 8 ? '' : !this.running ? ', stopped as the framework stops' : ', stopped while a surgery holds the store';
+          const stopped = ticks >= 8 ? '' : this.providerAdmissionClosed ? ', stopped as the framework stops' : ', stopped while a surgery holds the store';
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks${stopped})`);
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {

@@ -55,8 +55,6 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   fw.pendingRequests = [];
   fw.overBudgetDrainInFlight = new Set<string>();
   fw.overBudgetDrains = new Set();
-  // A drain kick ticks only while the framework runs.
-  fw.running = true;
   fw.opsAlertLastSent = new Map<string, number>();
   fw.opsAlertCooldownMs = 15 * 60_000;
   const traces: any[] = [];

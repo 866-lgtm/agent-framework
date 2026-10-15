@@ -25,6 +25,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { OperatorActionError } from '../src/operator-log.js';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
 
 class QueuedStrategy implements ContextStrategy {
   readonly name = 'queued-test';
@@ -354,6 +355,14 @@ class ParkedCallTickStrategy implements ContextStrategy {
   }
 }
 
+/** A provider's stated wait of `ms`, as membrane reports a 429 with retry-after. */
+function heldFor(ms: number): MembraneError {
+  return new MembraneError({
+    type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: ms,
+    message: 'rate limited for the test', rawError: { status: 429 },
+  });
+}
+
 /** A strategy whose first tick waits on a gate, then calls its manager's membrane, as a compression would. */
 class CallAfterGateStrategy implements ContextStrategy {
   readonly name = 'call-after-gate-test';
@@ -379,6 +388,7 @@ class CallAfterGateStrategy implements ContextStrategy {
     try {
       await ctx.membrane?.complete({
         model: 'test-model',
+        config: { model: 'test-model' },
         messages: [{ role: 'user', content: [{ type: 'text', text: 'compress' }] }],
       } as unknown as NormalizedRequest);
       this.outcome = 'sent';
@@ -1249,48 +1259,56 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  it("a conversation agent's tick that reaches its provider under a surgery's hold is withdrawn, as a resident's is", { timeout: 10_000 }, async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-conversation-withdrawn-'));
-    const provider = new CapturingMembrane();
-    const conversation = new CallAfterGateStrategy();
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store'),
-      membrane: provider.asMembrane(),
-      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new ReadyStrategy() }],
-      modules: [],
-      syncIntervalMs: 0,
-      maintenanceIntervalMs: 10,
-      conversations: { templateAgent: 'agent', strategyFactory: () => conversation },
-    });
-    const internals = framework as unknown as {
-      createConversationAgent(name: string, channelId: string): Promise<unknown>;
-      reserveStoreForSurgery(verb: string, agentName: string): () => void;
-    };
-    const alerts: string[] = [];
-    (framework as any).opsAlert = (kind: string, agentName: string) => alerts.push(`${kind}:${agentName}`);
-    const quiet = console.error;
-    console.error = () => {};
-    try {
-      await internals.createConversationAgent('agent-conv-1', 'chan-1');
-      framework.start();
-      await waitFor(() => conversation.entered);
-      const release = internals.reserveStoreForSurgery('roll back', 'agent');
-      try {
-        conversation.release();
-        await waitFor(() => conversation.outcome !== undefined);
-        assert.equal(conversation.outcome, 'MaintenanceWithdrawnError');
-        assert.equal(provider.calls.length, 0, 'the withdrawn call sent nothing');
-      } finally {
-        release();
-      }
-      assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
-    } finally {
-      console.error = quiet;
-      conversation.release();
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
+  for (const kind of ['resident', 'conversation agent'] as const) {
+    for (const held of [false, true]) {
+      it(`a ${kind}'s tick that reaches its provider under a surgery's hold is withdrawn${held ? ', though a provider wait holds its model' : ''}`, { timeout: 10_000 }, async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-surgery-withdrawn-'));
+        const provider = new CapturingMembrane();
+        const tick = new CallAfterGateStrategy();
+        const conversational = kind === 'conversation agent';
+        const framework = await AgentFramework.create({
+          storePath: join(dir, 'store'),
+          membrane: provider.asMembrane(),
+          agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: conversational ? new ReadyStrategy() : tick }],
+          modules: [],
+          syncIntervalMs: 0,
+          maintenanceIntervalMs: 10,
+          ...(conversational ? { conversations: { templateAgent: 'agent', strategyFactory: () => tick } } : {}),
+        });
+        const internals = framework as unknown as {
+          createConversationAgent(name: string, channelId: string): Promise<unknown>;
+          reserveStoreForSurgery(verb: string, agentName: string): () => void;
+          recordProviderWait(agentName: string, model: string, error: Error): unknown;
+        };
+        const name = conversational ? 'agent-conv-1' : 'agent';
+        const alerts: string[] = [];
+        (framework as any).opsAlert = (kind: string, agentName: string) => alerts.push(`${kind}:${agentName}`);
+        const quiet = console.error;
+        console.error = () => {};
+        try {
+          if (conversational) await internals.createConversationAgent(name, 'chan-1');
+          if (held) internals.recordProviderWait(name, 'test-model', heldFor(60_000));
+          framework.start();
+          await waitFor(() => tick.entered);
+          const release = internals.reserveStoreForSurgery('roll back', 'agent');
+          try {
+            tick.release();
+            await waitFor(() => tick.outcome !== undefined);
+            assert.equal(tick.outcome, 'MaintenanceWithdrawnError');
+            assert.equal(provider.calls.length, 0, 'the withdrawn call sent nothing');
+          } finally {
+            release();
+          }
+          assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
+        } finally {
+          console.error = quiet;
+          tick.release();
+          await framework.stop();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
     }
-  });
+  }
 
   it('a pass that only meets a failure already reported stays out of the history', { timeout: 10_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-repeats-'));
@@ -1350,8 +1368,8 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  for (const kind of ['resident', 'conversation agent'] as const) {
-    it(`a ${kind}'s maintenance call made once stop() has begun is withdrawn, and no failure is reported`, { timeout: 10_000 }, async () => {
+  for (const kind of ['resident', 'conversation agent'] as const) for (const held of [false, true]) {
+    it(`a ${kind}'s maintenance call made once stop() has begun is withdrawn${held ? ', though a provider wait holds its model,' : ''} and no failure is reported`, { timeout: 10_000 }, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-stopping-'));
       const provider = new CapturingMembrane();
       const tick = new CallAfterGateStrategy();
@@ -1367,6 +1385,7 @@ describe('queued context maintenance timer', () => {
       });
       const internals = framework as unknown as {
         createConversationAgent(name: string, channelId: string): Promise<unknown>;
+        recordProviderWait(agentName: string, model: string, error: Error): unknown;
       };
       const name = conversational ? 'agent-conv-1' : 'agent';
       const alerts: string[] = [];
@@ -1377,6 +1396,7 @@ describe('queued context maintenance timer', () => {
       let stopping: Promise<void> | undefined;
       try {
         if (conversational) await internals.createConversationAgent(name, 'chan-1');
+        if (held) internals.recordProviderWait(name, 'test-model', heldFor(60_000));
         framework.start();
         await waitFor(() => tick.entered);
         stopping = framework.stop();
@@ -1400,6 +1420,68 @@ describe('queued context maintenance timer', () => {
       }
     });
   }
+
+  it('stop() withdraws a maintenance call parked at the provider gate, and that is no failure', { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-parked-stop-'));
+    const strategy = new ParkedCallTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    strategy.framework = framework;
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (...args: unknown[]) => { alerts.push(args.map(String).join(' ')); };
+    const internals = framework as unknown as { providerGate(name: string): { auxiliaryWaiters: unknown[] } };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      framework.start();
+      await waitFor(() => internals.providerGate('agent').auxiliaryWaiters.length === 1);
+      await framework.stop();
+      assert.equal(strategy.outcome, 'MaintenanceWithdrawnError');
+      assert.equal(strategy.calls, 0, 'the withdrawn call sent nothing');
+      assert.deepEqual(alerts, []);
+    } finally {
+      console.error = quiet;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an over-budget drain kick starts in a framework that was never started, as one run with runUntilIdle() is', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-drain-unstarted-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new ReadyStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const internals = framework as unknown as {
+      noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
+      overBudgetDrains: Set<Promise<void>>;
+    };
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (...args: unknown[]) => { alerts.push(args.map(String).join(' ')); };
+    const quiet = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
+      assert.equal(internals.overBudgetDrains.size, 1, 'a kick was started');
+      assert.ok(alerts.some((alert) => alert.includes('drain breaker kicking;')), alerts.join('\n'));
+      await Promise.all([...internals.overBudgetDrains]);
+      assert.ok(logged.some((line) => line.includes('drain kicked for agent (OverBudget breaker, 8 ticks)')), logged.join('\n'));
+    } finally {
+      console.error = quiet;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('no over-budget drain kick starts once stop() has begun', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-drain-after-stop-'));
