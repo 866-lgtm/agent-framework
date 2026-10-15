@@ -13539,40 +13539,21 @@ export class AgentFramework {
                 } else if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
                   this.eventGate?.onInferenceEnded(agent.name);
                 }
-                if (cancelKind === 'quiesce_abandoned') {
-                  // Operator-initiated cancel during a quiesce drain. Settle
-                  // the turn honestly — deliberately NO inference:exhausted:
-                  // that trace centrally drives the consecutive-failure
-                  // streak, hard-down ops alerts, and the poison-history
-                  // breaker, none of which an operator cancel represents.
-                  // inference:aborted carries the observability instead.
-                  if (agent.streamId === myStreamId) {
-                    this.abortAgentScript(agent.name, 'turn abandoned by quiesce');
-                    agent.reset();
-                    this.settleAgent(agent.name, {
-                      stopReason: 'exhausted',
-                      speech: '',
-                      error: 'Turn abandoned by operator quiesce',
-                    }, streamRouting);
-                  }
-                  this.emitTrace({
-                    type: 'inference:aborted',
-                    agentName: agent.name,
-                    durationMs: Date.now() - startTime,
-                    reason: 'quiesce_abandoned',
-                  });
-                  return;
-                }
-                if (cancelKind === 'shutdown') {
-                  // AgentFramework.stop() with this stream still live. Same
-                  // contract as quiesce: settle honestly so an ephemeral
-                  // run's promise rejects now instead of riding out its
-                  // idle watchdog, no inference:exhausted, and no chronicle
-                  // marker of any kind — nobody stopped the agent, and a
-                  // resident must not read after restart that someone did.
+                if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
+                  // An operator's cancel during a quiesce drain, or
+                  // AgentFramework.stop() with this stream still live. Settle
+                  // the turn honestly, so an ephemeral run's promise rejects
+                  // now instead of riding out its idle watchdog — and
+                  // deliberately NO inference:exhausted: that trace centrally
+                  // drives the consecutive-failure streak, hard-down ops
+                  // alerts, and the poison-history breaker, none of which a
+                  // stop represents. No chronicle marker of any kind either:
+                  // nobody stopped the agent, and a resident must not read
+                  // after restart that someone did. inference:aborted and the
+                  // inference-log row carry the observability instead.
                   this.settleFrameworkCancel({
                     agent, myStreamId, startTime, requestId, compiledRequest,
-                    kind: 'shutdown',
+                    kind: cancelKind,
                     closes: streamRouting,
                   });
                   return;
@@ -13786,16 +13767,18 @@ export class AgentFramework {
       // and then calls cancelStream(), which also leaves a reasonless caller
       // record, so the caller record alone would end a shutdown as a user's
       // stop, marker and all. The caller record is consumed here either way,
-      // by the stream it ended. A silent end nobody asked for, or one after
-      // a framework cancel this block doesn't settle (endTurn, a budget
-      // restart, a quiesce abandon, none of which leaves a caller record),
-      // keeps the prior behaviour (the finally still releases the gate).
+      // by the stream it ended. A shutdown and an operator's quiesce abandon
+      // end through the framework's terminal, as their twins do. A silent
+      // end nobody asked for, or one after endTurn or a budget restart
+      // (whose own paths have settled the turn or handed it on, and which
+      // leave no caller record), keeps the prior behaviour (the finally
+      // still releases the gate).
       // Greptile on #172, 2026-09-28; Anarchid's review, 2026-10-12.
       if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
         const callerCancel = agent.takeCancel();
         const cancelKey = `${agent.name}:${myStreamId}`;
         const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
-        if (cancelKind === 'shutdown') {
+        if (cancelKind === 'shutdown' || cancelKind === 'quiesce_abandoned') {
           this.frameworkCancelledStreams.delete(cancelKey);
           lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
           this.settleFrameworkCancel({
