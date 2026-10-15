@@ -339,11 +339,29 @@ test("a payload whose workspace write rejects is lost from a completed call's re
   });
 });
 
+test('a modern server deployed with a host\'s MCPL deny-list connects, since what only narrows is already satisfied (R1-3)', async () => {
+  await withModern(async ({ framework, dir }) => {
+    await framework.connectMcplServer({
+      id: 'overlay',
+      command: process.execPath,
+      args: [MODERN, join(dir, 'overlay-starts.log'), join(dir, 'overlay-events.log')],
+      protocol: 'modern',
+      // connectome-host's overlay route stamps this on every server it deploys.
+      disabledCapabilities: ['contextHooks', 'inferenceLifecycle', 'inferenceRequest', 'toolLifecycle'],
+      disabledFeatureSets: ['*'],
+    });
+    const status = framework.listMcplServers().find((s) => s.id === 'overlay');
+    assert.equal(status?.connected, true);
+    assert.equal(status?.family, 'modern');
+    assert.ok(framework.getAllTools().some((t) => t.name === 'mcpl--overlay--echo'));
+  });
+});
+
 test('MCPL policy on a modern server is a configuration error at connect', async () => {
   await withModern(async ({ framework }) => {
     await assert.rejects(
       framework.connectMcplServer({ id: 'bad', url: 'https://example.invalid/mcp', enabledFeatureSets: ['x'] }),
-      /"enabledFeatureSets" is MCPL policy/,
+      /"enabledFeatureSets" asks for MCPL behaviour/,
     );
     await assert.rejects(
       framework.connectMcplServer({ id: 'bad2', url: 'https://example.invalid/mcp', protocol: 'modern' }),

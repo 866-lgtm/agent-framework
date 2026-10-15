@@ -17,9 +17,10 @@ import {
   credentialRedactor,
   serverCredentialPatterns,
   describeCredentialError,
-  MCPL_ONLY_POLICY_FIELDS,
+  mcplPolicyGrants,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
+import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from '../src/mcpl/reference-fetcher.js';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { WebSocketTransport } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
@@ -141,24 +142,44 @@ test('a legacy deadline above the timer limit is refused; every value that worke
   }
 });
 
-test('MCPL policy on a modern server is rejected, empty values are not', () => {
-  const effective: Partial<McplServerConfig> = {
-    enabledFeatureSets: ['a'],
-    disabledFeatureSets: ['b'],
-    enabledCapabilities: ['pushEvents'],
-    disabledCapabilities: ['channels'],
-    scopes: { a: {} as never },
-    channelSubscription: 'manual',
-    allowHostCommands: true,
-    toolLifecycle: { observe: {} } as never,
-    autofetch: { maxBytes: 10 },
-    shouldTriggerInference: () => true,
-  };
-  for (const field of MCPL_ONLY_POLICY_FIELDS) {
-    const problems = serverConfigProblems(cfg({ url: 'https://x/mcp', [field]: effective[field] }));
-    assert.equal(problems.length, 1, field);
-    assert.match(problems[0]!, new RegExp(`"${field}" is MCPL policy`));
+test('MCPL policy on a modern server is refused where its value grants, and accepted where it only narrows or repeats a default (R1-3)', () => {
+  const modern = (c: Partial<McplServerConfig>) => cfg({ url: 'https://x/mcp', ...c });
+  // Each value that asks for MCPL behaviour is refused, naming the part that grants.
+  const granting: Array<[Partial<McplServerConfig>, string]> = [
+    [{ enabledFeatureSets: ['a'] }, 'enabledFeatureSets'],
+    [{ enabledCapabilities: ['pushEvents'] }, 'enabledCapabilities'],
+    [{ allowHostCommands: true }, 'allowHostCommands'],
+    [{ channelSubscription: 'auto' }, 'channelSubscription'],
+    [{ channelSubscription: ['general'] }, 'channelSubscription'],
+    [{ scopes: { files: { whitelist: ['read:*'], blacklist: ['write:*'] } } }, 'scopes.files.whitelist'],
+    [{ toolLifecycle: { observe: {} } }, 'toolLifecycle.observe'],
+    [{ toolLifecycle: { inputs: { tools: ['x--*'] } } }, 'toolLifecycle.inputs'],
+    [{ autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES + 1 } }, 'autofetch.maxBytes'],
+    [{ autofetch: { maxTotalBytes: DEFAULT_MAX_TOTAL_BYTES + 1 } }, 'autofetch.maxTotalBytes'],
+  ];
+  for (const [config, path] of granting) {
+    assert.deepEqual(mcplPolicyGrants(modern(config)), [path], path);
+    const problems = serverConfigProblems(modern(config));
+    assert.equal(problems.length, 1, path);
+    assert.ok(problems[0]!.includes(`"${path}" asks for MCPL behaviour, which a modern MCP server cannot negotiate`), problems[0]);
   }
+  // What only takes something away, or repeats a default, is already
+  // satisfied: a modern server has no MCPL surface.
+  const narrowing: Partial<McplServerConfig>[] = [
+    // connectome-host's overlay route stamps this on every server it deploys.
+    { disabledCapabilities: ['contextHooks', 'inferenceLifecycle', 'inferenceRequest', 'toolLifecycle'] },
+    { disabledFeatureSets: ['b'] },
+    { scopes: { files: { blacklist: ['write:*'] } } },
+    { channelSubscription: 'manual' },
+    { toolLifecycle: { maxInputBytes: 1024 } },
+    { toolLifecycle: { observe: false } as never },
+    { autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES, maxTotalBytes: 1 } },
+    { shouldTriggerInference: () => false },
+  ];
+  for (const config of narrowing) {
+    assert.deepEqual(serverConfigProblems(modern(config)), [], JSON.stringify(config));
+  }
+  // Empty values grant nothing, on a modern stdio server too.
   const empty = cfg({
     command: 'srv',
     protocol: 'modern',
@@ -167,6 +188,7 @@ test('MCPL policy on a modern server is rejected, empty values are not', () => {
     scopes: {},
     allowHostCommands: false,
     toolLifecycle: {} as never,
+    channelSubscription: [],
   });
   assert.deepEqual(serverConfigProblems(empty), []);
 });

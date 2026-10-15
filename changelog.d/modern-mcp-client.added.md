@@ -5,10 +5,14 @@
   stays legacy unless its config sets `protocol: 'modern'`. A modern server's
   tools use the same prefix, tool policy, RFC-008 class hints and dispatch
   paths as any MCPL server's. It has no MCPL surface: no grant, push,
-  channels, inference requests, quiesce plane or awareness gate. MCPL-only
-  policy on one is a configuration error, and so is a modern
-  `requestTimeoutMs` outside 1..2^31−1, since 0 means "time out now" to the
-  SDK. Details:
+  channels, inference requests, quiesce plane or awareness gate. MCPL policy
+  that asks for that surface on one is a configuration error, such as
+  `enabledFeatureSets` or `allowHostCommands: true`. Policy that only takes
+  something away or repeats a default, such as `disabledCapabilities`, is
+  accepted as already satisfied, so a host that puts a deny-list on every
+  server it deploys can deploy a modern one. A modern `requestTimeoutMs`
+  outside 1..2^31−1 is a configuration error too, since 0 means "time out
+  now" to the SDK. Details:
   - **stdio:** runs through the framework's own spawner (env allowlist,
     `inheritEnv`, stderr lines including startup), launched once per connect.
   - **HTTP credentials:** come from `token`/`accessProvider`, as a cached

@@ -115,7 +115,7 @@ export {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
   MAX_TIMER_MS,
-  MCPL_ONLY_POLICY_FIELDS,
+  mcplPolicyGrants,
   resolveServerBinding,
   serverConfigProblems,
   serverConfigWarnings,

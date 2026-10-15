@@ -22,7 +22,8 @@
  * isn't `initialize`), the SDK's stdio probe launches the server twice, and a
  * server's era is a stable fact its configuration can state.
  */
-import type { McplServerConfig } from './types.js';
+import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
+import type { McplServerConfig, ScopeConfig } from './types.js';
 
 /** The one revision the legacy engine offers and accepts. */
 export const LEGACY_MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -40,23 +41,6 @@ export interface ServerBinding {
 /** The largest delay a Node/Bun timer honors (2³¹−1 ms, about 24.8 days). */
 export const MAX_TIMER_MS = 2_147_483_647;
 
-/**
- * Configuration fields that are MCPL policy: they have no meaning for a modern
- * server, which cannot negotiate MCPL. Setting one there is rejected rather
- * than ignored, so an operator who chose a policy learns that it cannot apply.
- */
-export const MCPL_ONLY_POLICY_FIELDS = [
-  'enabledFeatureSets',
-  'disabledFeatureSets',
-  'enabledCapabilities',
-  'disabledCapabilities',
-  'scopes',
-  'channelSubscription',
-  'allowHostCommands',
-  'toolLifecycle',
-  'autofetch',
-  'shouldTriggerInference',
-] as const satisfies readonly (keyof McplServerConfig)[];
 
 type BindingFields = Pick<McplServerConfig, 'id' | 'command' | 'url' | 'transport' | 'protocol'>;
 
@@ -389,6 +373,51 @@ function isEffective(value: unknown): boolean {
   return true;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The parts of a configuration's MCPL policy whose values grant something,
+ * by path, such as `allowHostCommands`, `scopes.<set>.whitelist` or
+ * `autofetch.maxBytes`: each asks for behaviour only an MCPL server can have.
+ * A modern server has none, so such a value can't apply there, and is
+ * refused rather than ignored, so that an operator who chose it learns so.
+ *
+ * A value that only takes something away, or repeats a default, is already
+ * satisfied on a modern server and isn't listed: `disabledFeatureSets`,
+ * `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
+ * 'manual'` (the default), `toolLifecycle` with only `maxInputBytes` or
+ * with an `observe` or `inputs` that isn't a policy object (which grants
+ * nothing), an `autofetch` bound at or below its default, and
+ * `shouldTriggerInference`, which only narrows which channel messages
+ * trigger inference. So a host that stamps a deny-list on every server it
+ * deploys can deploy a modern one. Empty values grant nothing either.
+ */
+export function mcplPolicyGrants(config: McplServerConfig): string[] {
+  const grants: string[] = [];
+  for (const field of ['enabledFeatureSets', 'enabledCapabilities', 'allowHostCommands'] as const) {
+    if (isEffective(config[field])) grants.push(field);
+  }
+  if (config.channelSubscription !== 'manual' && isEffective(config.channelSubscription)) grants.push('channelSubscription');
+  if (isPlainRecord(config.scopes)) {
+    for (const [set, scope] of Object.entries(config.scopes)) {
+      if (isEffective((scope as ScopeConfig | null | undefined)?.whitelist)) grants.push(`scopes.${set}.whitelist`);
+    }
+  } else if (isEffective(config.scopes)) {
+    grants.push('scopes');
+  }
+  for (const key of ['observe', 'inputs'] as const) {
+    if (isPlainRecord((config.toolLifecycle as Record<string, unknown> | undefined)?.[key])) grants.push(`toolLifecycle.${key}`);
+  }
+  const bounds = [['maxBytes', DEFAULT_EAGER_FETCH_MAX_BYTES], ['maxTotalBytes', DEFAULT_MAX_TOTAL_BYTES]] as const;
+  for (const [key, ceiling] of bounds) {
+    const value = (config.autofetch as Record<string, unknown> | undefined)?.[key];
+    if (value !== undefined && value !== null && !(typeof value === 'number' && value <= ceiling)) grants.push(`autofetch.${key}`);
+  }
+  return grants;
+}
+
 /**
  * Problems with a server configuration's protocol settings, as messages; empty
  * when it is usable. Legacy configurations are checked only for what this
@@ -429,10 +458,8 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
         `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${String(timeout)}); every modern call has a deadline`,
       );
     }
-    for (const field of MCPL_ONLY_POLICY_FIELDS) {
-      if (isEffective(config[field])) {
-        problems.push(`MCP server "${config.id}": "${field}" is MCPL policy, which a modern MCP server cannot negotiate`);
-      }
+    for (const path of mcplPolicyGrants(config)) {
+      problems.push(`MCP server "${config.id}": "${path}" asks for MCPL behaviour, which a modern MCP server cannot negotiate`);
     }
     // A modern stdio server takes no credential: nothing would carry it.
     if (binding.transport === 'stdio') {

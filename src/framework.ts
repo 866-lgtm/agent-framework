@@ -16561,8 +16561,9 @@ export class AgentFramework {
     // Configuration mistakes fail here, before any routing is registered: a
     // combination naming no usable transport (an http(s) url with transport
     // 'websocket', transport 'http' with a ws url or with no url at all),
-    // protocol on a URL, a modern deadline of 0, MCPL policy on a modern
-    // server. Every valid legacy shape resolves exactly as before.
+    // protocol on a URL, a modern deadline of 0, MCPL policy that asks for
+    // what a modern server lacks. Every valid legacy shape resolves exactly
+    // as before.
     const family = AgentFramework.usableConfigFamily(config);
     const taken = this.mcpServerIdTaken(config.id, claim);
     if (taken) throw new Error(taken);

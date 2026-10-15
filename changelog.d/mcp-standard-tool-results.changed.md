@@ -111,8 +111,8 @@
   registered. A teardown never removes what a later connection registered.
   `restartMcplServer` refuses, before it tears the running server down, what
   its connect would refuse: whatever the configuration check refuses (such as
-  an unusable binding, userinfo on an http(s) url, or MCPL policy on a modern
-  server), a new id another server holds, a tool prefix another server or a
+  an unusable binding, userinfo on an http(s) url, or MCPL policy that asks
+  for what a modern server lacks), a new id another server holds, a tool prefix another server or a
   module holds, a framework whose `stop()` has begun, and a connect or
   disconnect of the server in flight. Before, a restart disconnected first,
   so a refused connect left the server gone; now the server keeps running.
