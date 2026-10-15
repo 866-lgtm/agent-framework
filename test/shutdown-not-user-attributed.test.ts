@@ -193,6 +193,111 @@ describe('graceful shutdown is not attributed to the user', () => {
     }
   });
 
+  // The third shape, from Anarchid's review of #172 (2026-10-12): a stream
+  // whose cancel() just closes the iterator, with no `aborted` or `error`.
+  // stop() records 'shutdown' and then calls cancelStream(), which also
+  // leaves a reasonless caller record. The end of the stream loop must read
+  // the framework's record first, or the shutdown ends as a user's stop:
+  // a [turn-interrupted] marker in the resident's history and a log row
+  // reading `Stream cancelled (user)`.
+  class ClosingOnCancelStream implements YieldingStream {
+    private release: (() => void) | null = null;
+    private cancelled = false;
+    cancel(): void { this.cancelled = true; this.release?.(); }
+    provideToolResults(): void {}
+    get isWaitingForTools() { return false; }
+    get pendingToolCallIds(): string[] { return []; }
+    get toolDepth() { return 0; }
+    async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      if (!this.cancelled) await new Promise<void>((resolve) => { this.release = resolve; });
+    }
+  }
+  class ClosingMembrane extends MockMembrane {
+    override streamYielding(request: NormalizedRequest): YieldingStream {
+      this.calls.push(request);
+      return new ClosingOnCancelStream();
+    }
+  }
+
+  it('stop() with a stream whose cancel() just closes: the shutdown terminal, no marker', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'shutdown-silent-close-'));
+    const membrane = new ClosingMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Assist.' }],
+      modules: [],
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((t) => { traces.push(t); });
+    const logged: string[] = [];
+    const logs = framework as unknown as { logInference(entry: { error?: string }): void };
+    const logInference = logs.logInference.bind(framework);
+    logs.logInference = (entry) => { logged.push(entry.error ?? '(no error)'); logInference(entry); };
+    let stopped = false;
+    try {
+      framework.start();
+      framework.nudgeAgent('assistant', 'operator');
+      const agent = framework.getAgent('assistant')!;
+      await waitFor(() => agent.state.status === 'streaming');
+
+      const cm = agent.getContextManager();
+      const written: string[] = [];
+      const orig = cm.addMessage.bind(cm);
+      (cm as unknown as { addMessage: unknown }).addMessage = (role: never, content: Array<{ type: string; text?: string }>, meta: never) => {
+        for (const b of content) if (b.type === 'text' && b.text) written.push(b.text);
+        return orig(role, content as never, meta);
+      };
+
+      stopped = true;
+      await framework.stop();
+
+      const markers = written.filter((t) => t.includes('[turn-interrupted]') || t.includes('[inference-failed]'));
+      assert.deepEqual(markers, [], `graceful shutdown wrote a marker: ${JSON.stringify(markers)}`);
+      const kinds = traces.map((t) => String(t.type))
+        .filter((t) => ['inference:started', 'inference:failed', 'inference:exhausted', 'inference:aborted'].includes(t));
+      assert.deepEqual(kinds, ['inference:started', 'inference:aborted'], `expected started → aborted only, got ${JSON.stringify(kinds)}`);
+      const aborted = traces.find((t): t is Extract<TraceEvent, { type: 'inference:aborted' }> => t.type === 'inference:aborted')!;
+      assert.equal(aborted.reason, 'shutdown', 'the framework\'s record decides, not the caller record cancelStream() left');
+      assert.deepEqual(logged, ['Stream aborted: shutdown'], 'one inference-log row, attributed to the shutdown');
+      assert.equal(membrane.calls.length, 1, 'no relaunch of the cancelled inference');
+      assert.equal(agent.state.status, 'idle');
+    } finally {
+      if (!stopped) await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('stop() settles an in-flight ephemeral run whose stream just closes, with the shutdown terminal', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'shutdown-silent-eph-'));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: new ClosingMembrane().asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Assist.' }],
+      modules: [],
+    });
+    let stopped = false;
+    try {
+      framework.start();
+      const created = await framework.createEphemeralAgent({ name: 'eph', model: 'test-model', systemPrompt: 'Run.' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      let outcome = 'pending';
+      const run = framework.runEphemeralToCompletion(created.agent, created.contextManager)
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      await waitFor(() => created.agent.state.status === 'streaming');
+
+      stopped = true;
+      await framework.stop();
+      await Promise.race([run, new Promise((r) => setTimeout(r, 1500))]);
+
+      assert.match(outcome, /^rejected: Framework shutting down/, `expected the shutdown terminal, got "${outcome}"`);
+      assert.equal(created.agent.state.status, 'idle');
+    } finally {
+      if (!stopped) await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   // Review repro by Sol (Codex, via Anarchid) on #134, 2026-09-21: the first
   // shutdown branch emitted its trace and returned without settling, so the
   // ephemeral run stayed pending until its 15-minute idle watchdog rejected

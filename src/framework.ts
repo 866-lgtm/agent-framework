@@ -3966,6 +3966,61 @@ export class AgentFramework {
   }
 
   /**
+   * Terminal for a stop the framework itself made: stop()'s shutdown and an
+   * operator's quiesce abandon, each recorded in frameworkCancelledStreams
+   * before the cancel. A stream may report that cancel as `aborted`, as
+   * `error`, or by just closing, and each of those ends here, so the three
+   * cannot drift: settle the turn (an ephemeral run rejects with the stop's
+   * own text), an attributable inference-log terminal, ONE inference:aborted
+   * carrying the framework's reason, gate release. No [turn-interrupted]
+   * marker, since nobody stopped the agent, and none of the failure
+   * accounting that inference:failed / inference:exhausted drive.
+   *
+   * The script abort, reset and settle happen only while `agent` still owns
+   * stream `myStreamId`; the log line and the trace are written either way.
+   */
+  private settleFrameworkCancel(args: {
+    agent: Agent;
+    myStreamId: number;
+    startTime: number;
+    requestId: string;
+    compiledRequest: NormalizedRequest | undefined;
+    kind: 'shutdown' | 'quiesce_abandoned';
+    /** The settling stream's logical turn, as settleAgent takes it. */
+    closes: TurnRouting | undefined;
+  }): void {
+    const { agent, myStreamId, startTime, requestId, compiledRequest, kind, closes } = args;
+    const durationMs = Date.now() - startTime;
+    if (agent.streamId === myStreamId) {
+      this.abortAgentScript(agent.name, kind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce');
+      agent.reset();
+      this.settleAgent(agent.name, {
+        stopReason: 'exhausted',
+        speech: '',
+        error: kind === 'shutdown' ? 'Framework shutting down' : 'Turn abandoned by operator quiesce',
+      }, closes);
+    }
+    // Postmortem 2026-05-28 P2 #7: the abort is a terminal the inference log
+    // must be able to attribute later.
+    this.logInference({
+      timestamp: startTime,
+      agentName: agent.name,
+      requestId,
+      success: false,
+      error: `Stream aborted: ${kind}`,
+      request: compiledRequest ?? { note: `streaming request aborted by ${kind}` },
+      durationMs,
+    });
+    this.emitTrace({
+      type: 'inference:aborted',
+      agentName: agent.name,
+      durationMs,
+      reason: kind,
+    });
+    if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+  }
+
+  /**
    * Get all registered modules.
    */
   getAllModules(): Module[] {
@@ -13346,35 +13401,11 @@ export class AgentFramework {
               // gate liveness.
               this.frameworkCancelledStreams.delete(cancelKey);
               lifecyclePhase = 'aborted';
-              if (agent.streamId === myStreamId) {
-                this.abortAgentScript(agent.name, cancelKind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce');
-                agent.reset();
-                this.settleAgent(agent.name, {
-                  stopReason: 'exhausted',
-                  speech: '',
-                  error: cancelKind === 'shutdown' ? 'Framework shutting down' : 'Turn abandoned by operator quiesce',
-                }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined);
-              }
-              // Postmortem 2026-05-28 P2 #7: the abort is a terminal the
-              // inference log must be able to attribute later.
-              this.logInference({
-                timestamp: startTime,
-                agentName: agent.name,
-                requestId,
-                success: false,
-                error: `Stream aborted: ${cancelKind}`,
-                request: compiledRequest ?? { note: `streaming request aborted by ${cancelKind}` },
-                durationMs,
+              this.settleFrameworkCancel({
+                agent, myStreamId, startTime, requestId, compiledRequest,
+                kind: cancelKind,
+                closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
               });
-              this.emitTrace({
-                type: 'inference:aborted',
-                agentName: agent.name,
-                durationMs,
-                reason: cancelKind,
-              });
-              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
-                this.eventGate?.onInferenceEnded(agent.name);
-              }
               break;
             }
 
@@ -13523,32 +13554,10 @@ export class AgentFramework {
                   // idle watchdog, no inference:exhausted, and no chronicle
                   // marker of any kind — nobody stopped the agent, and a
                   // resident must not read after restart that someone did.
-                  const durationMs = Date.now() - startTime;
-                  if (agent.streamId === myStreamId) {
-                    this.abortAgentScript(agent.name, 'framework shutting down');
-                    agent.reset();
-                    this.settleAgent(agent.name, {
-                      stopReason: 'exhausted',
-                      speech: '',
-                      error: 'Framework shutting down',
-                    }, streamRouting);
-                  }
-                  // Postmortem 2026-05-28 P2 #7: the abort is a terminal the
-                  // inference log must be able to attribute later.
-                  this.logInference({
-                    timestamp: startTime,
-                    agentName: agent.name,
-                    requestId,
-                    success: false,
-                    error: 'Stream aborted: shutdown',
-                    request: compiledRequest ?? { note: 'streaming request aborted by shutdown' },
-                    durationMs,
-                  });
-                  this.emitTrace({
-                    type: 'inference:aborted',
-                    agentName: agent.name,
-                    durationMs,
-                    reason: 'shutdown',
+                  this.settleFrameworkCancel({
+                    agent, myStreamId, startTime, requestId, compiledRequest,
+                    kind: 'shutdown',
+                    closes: streamRouting,
                   });
                   return;
                 }
@@ -13756,13 +13765,29 @@ export class AgentFramework {
       // lifecycle terminal would read `completed`, no inference:aborted would
       // be emitted, and an in-flight runEphemeralToCompletion would ride out
       // its watchdog. If THIS side cancelled the stream, that cancel is the
-      // terminal: the same end as the `aborted` and `error` twins, the
-      // caller's reason consumed here by the stream it ended. A silent end
-      // nobody asked for keeps the prior behaviour (the finally still
-      // releases the gate). Greptile on #172, 2026-09-28.
+      // terminal: the same end as the `aborted` and `error` twins. As there,
+      // the framework's own record is read first: stop() records 'shutdown'
+      // and then calls cancelStream(), which also leaves a reasonless caller
+      // record, so the caller record alone would end a shutdown as a user's
+      // stop, marker and all. The caller record is consumed here either way,
+      // by the stream it ended. A silent end nobody asked for, or one after
+      // a framework cancel this block doesn't settle (endTurn, a budget
+      // restart, a quiesce abandon, none of which leaves a caller record),
+      // keeps the prior behaviour (the finally still releases the gate).
+      // Greptile on #172, 2026-09-28; Anarchid's review, 2026-10-12.
       if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
         const callerCancel = agent.takeCancel();
-        if (callerCancel !== undefined) {
+        const cancelKey = `${agent.name}:${myStreamId}`;
+        const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
+        if (cancelKind === 'shutdown') {
+          this.frameworkCancelledStreams.delete(cancelKey);
+          lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
+          this.settleFrameworkCancel({
+            agent, myStreamId, startTime, requestId, compiledRequest,
+            kind: cancelKind,
+            closes: streamRouting,
+          });
+        } else if (cancelKind === undefined && callerCancel !== undefined) {
           lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
           this.settleDeliberateCancel({
             agent, myStreamId, startTime, requestId, compiledRequest,
