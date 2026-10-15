@@ -14,7 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 import type { ContextInjection } from '@animalabs/context-manager';
 
 import type {
@@ -28,6 +28,7 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { McplServerConnection } from './server-connection.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { logDetail, logValue } from './log-value.js';
 
 /** Timeout for beforeInference per server (fail-open). */
 const BEFORE_INFERENCE_TIMEOUT_MS = 5_000;
@@ -58,79 +59,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // ============================================================================
 
 /**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- */
-function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      return { type: 'text', text: block.text };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (block.uri && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on context injection') ?? '[reference]' };
-      }
-      if (block.data && block.mimeType) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        };
-      }
-      if (block.uri) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        };
-      }
-      // Malformed image block — degrade to text
-      return { type: 'text', text: '[Image: missing data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (block.uri && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on context injection') ?? '[reference]' };
-      }
-      if (block.data && block.mimeType) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        };
-      }
-      // Audio without inline data — degrade to text
-      return { type: 'text', text: `[Audio: ${block.uri ?? 'missing data'}]` };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on context injection') ?? '[reference]' };
-
-    default:
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly.
-      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
-  }
-}
-
-/**
  * Convert MCPL injection content (string shorthand or block array) to membrane ContentBlock[].
  */
 function convertContent(content: string | McplContentBlock[]): ContentBlock[] {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content }];
   }
-  return content.map(convertBlock);
+  return content.map((block) => convertBlock(block, 'attachment on context injection'));
 }
 
 /**
@@ -261,12 +196,22 @@ export class HookOrchestrator {
         continue;
       }
 
+      // One server's malformed answer, or one malformed injection in it, is
+      // that server's to fix: it's left out with a line naming the server,
+      // and every other injection still arrives. Unguarded, a throw here
+      // leaves fanOutBeforeInference, and the framework's catch around the
+      // whole hook drops every server's injections for the turn.
+      const answered: unknown = result.contextInjections;
+      if (answered !== undefined && answered !== null && !Array.isArray(answered)) {
+        console.error(`[mcpl] ${server.id}: dropped its beforeInference injections — contextInjections isn't an array`);
+        continue;
+      }
       // §5.4/§10.8: authorize EACH injection by its typed position against
       // the grant CURRENT NOW, at response receipt — not when the request
       // was sent. A revocation that landed while the hook was in flight is
       // enforced here without extra machinery.
-      if (result.contextInjections && result.contextInjections.length > 0) {
-        for (const mcplInj of result.contextInjections) {
+      for (const mcplInj of (answered ?? []) as McplContextInjection[]) {
+        try {
           const leaf = INJECT_LEAVES.find((l) => l.position === mcplInj.position);
           if (!leaf || !CapabilityGrant.of(server).has(leaf.path)) {
             console.error(
@@ -276,6 +221,14 @@ export class HookOrchestrator {
             continue;
           }
           injections.push(convertMcplInjection(mcplInj));
+        } catch (error) {
+          // Such as a null block, content that isn't an array, a null
+          // injection, or a position with no string form.
+          const position = (mcplInj as { position?: unknown } | null | undefined)?.position;
+          console.error(
+            `[mcpl] ${server.id}: dropped beforeInference injection at position ${logValue(position)} ` +
+              `— it couldn't be read: ${logDetail(error instanceof Error ? error.message : error)}`,
+          );
         }
       }
     }
