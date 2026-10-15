@@ -298,6 +298,23 @@ describe('toolArgsProblems', () => {
     ]);
   });
 
+  it('reads OpenAPI\'s nullable: true as admitting null beside the type', () => {
+    const openApi = {
+      type: 'object',
+      properties: { note: { type: 'string', nullable: true }, count: { type: 'number', nullable: true }, plain: { type: 'string', nullable: false } },
+      required: ['note', 'plain'],
+    } as unknown as ToolDefinition['inputSchema'];
+    assert.deepEqual(toolArgsProblems({ note: null, plain: 'p', count: null }, openApi, { values: true }), []);
+    assert.deepEqual(toolArgsProblems({ note: 3, plain: null }, openApi, { values: true }), [
+      'needs "plain" (a string), and this call gave null',
+      '"note" must be a string or null, and this call gave a number',
+    ]);
+    assert.deepEqual(toolArgsProblems({ plain: 'p' }, openApi), ['needs "note" (a string or null), and this call gave none']);
+    // With no declared type, nullable adds nothing: any value is taken, as before.
+    const untyped = { type: 'object', properties: { any: { nullable: true } } } as unknown as ToolDefinition['inputSchema'];
+    assert.deepEqual(toolArgsProblems({ any: 'x' }, untyped, { values: true }), []);
+  });
+
   it('reads a key given as undefined as left out', () => {
     assert.deepEqual(toolArgsProblems({ path: undefined }, SCHEMA), ['needs "path" (a string), and this call gave none']);
     assert.deepEqual(toolArgsProblems({ path: 'p', count: undefined }, SCHEMA, { values: true }), []);

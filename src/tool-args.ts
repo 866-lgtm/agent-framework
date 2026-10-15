@@ -17,12 +17,17 @@ function withArticle(kind: string): string {
   return /^[aeiou]/.test(kind) ? `an ${kind}` : `a ${kind}`;
 }
 
-/** The kinds a declared type admits, each once, or none when it declares none. */
-function admittedKinds(type: unknown): string[] {
+/** The kinds a declaration's type admits, each once, or none when it declares
+ *  none. OpenAPI's `nullable: true`, the form Gemini's dialect uses, admits
+ *  `null` beside its type, as a type list naming `null` does. */
+function admittedKinds(param: { type?: unknown; nullable?: unknown } | undefined): string[] {
+  const type = param?.type;
   const types = Array.isArray(type) ? type : type === undefined ? [] : [type];
-  return [...new Set(types
+  const kinds = new Set(types
     .filter((t): t is string => typeof t === 'string')
-    .map((t) => (t === 'integer' ? 'number' : t)))];
+    .map((t) => (t === 'integer' ? 'number' : t)));
+  if (kinds.size > 0 && param?.nullable === true) kinds.add('null');
+  return [...kinds];
 }
 
 /** A value as the call gave it, briefly: its first 80 characters, then an
@@ -68,8 +73,9 @@ function own(obj: Record<string, unknown>, key: string): unknown {
  * - An absent input (`undefined` or `null`) gives no arguments: it's refused
  *   only for the keys the schema requires.
  * - A required key given as `null` has no value, the same as one left out,
- *   unless its declared type admits `null`. A key with no declared type takes
- *   `null` as a value, as it takes any other. An empty string is a value.
+ *   unless its declared type admits `null` (a type list naming it, or
+ *   `nullable: true`). A key with no declared type takes `null` as a value,
+ *   as it takes any other. An empty string is a value.
  * - A schema whose `required` isn't a list requires nothing here.
  *
  * A module tool's call is checked without `values`: a handler may take more
@@ -89,14 +95,14 @@ export function toolArgsProblems(
     return [`its ${options.field ?? 'input'} must be an object, and this call gave ${withArticle(kindOf(input))}`];
   }
   const obj = (absent ? {} : input) as Record<string, unknown>;
-  const properties = (schema.properties ?? {}) as Record<string, { type?: unknown; enum?: unknown } | undefined>;
+  const properties = (schema.properties ?? {}) as Record<string, { type?: unknown; nullable?: unknown; enum?: unknown } | undefined>;
   const declared = (key: string) => (Object.hasOwn(properties, key) ? properties[key] : undefined);
   const problems: string[] = [];
   const missing = new Set<string>();
   for (const key of Array.isArray(schema.required) ? schema.required : []) {
     if (typeof key !== 'string') continue;
     const value = own(obj, key);
-    const kinds = admittedKinds(declared(key)?.type);
+    const kinds = admittedKinds(declared(key));
     const admitsNull = kinds.length === 0 || kinds.includes('null');
     if (value !== undefined && (value !== null || admitsNull)) continue;
     missing.add(key);
@@ -107,7 +113,7 @@ export function toolArgsProblems(
   for (const [key, value] of Object.entries(obj)) {
     const param = declared(key);
     if (!param || value === undefined || missing.has(key)) continue;
-    const kinds = admittedKinds(param.type);
+    const kinds = admittedKinds(param);
     const kind = kindOf(value);
     const largeInteger = kind === 'string' && kinds.includes('number') && LARGE_INTEGER_TEXT.test(value as string);
     if (kinds.length > 0 && !kinds.includes(kind) && !largeInteger) {
