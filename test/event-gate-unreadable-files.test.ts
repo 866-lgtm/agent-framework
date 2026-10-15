@@ -10,7 +10,8 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  chmodSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
+  accessSync, chmodSync, chownSync, constants, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
+  utimesSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,6 +31,18 @@ const RULES: GateConfig = {
 const QUIET: GateConfig = { default: 'always', policies: [{ name: 'quiet', match: {}, behavior: { debounce: 60000 } }] };
 const INCOMING: GateEventInfo = { content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c1', tags: [] };
 const NO_CHMOD = process.platform === 'win32' || process.getuid?.() === 0;
+/** A group this process is in besides its own, which a gate.json can be shared through. */
+const OTHER_GROUP = process.platform === 'win32' ? undefined : process.getgroups?.().find((g) => g !== process.getegid?.());
+/** A file this process can read but whose group it isn't in, such as root's /etc/hosts. */
+const FOREIGN = NO_CHMOD ? undefined : ['/etc/hostname', '/etc/hosts', '/etc/passwd'].find((path) => {
+  try {
+    accessSync(path, constants.R_OK);
+    const file = statSync(path);
+    return file.isFile() && !process.getgroups!().includes(file.gid);
+  } catch {
+    return false;
+  }
+});
 
 function tempDir(t: TestContext): string {
   const dir = mkdtempSync(join(tmpdir(), 'gate-unreadable-'));
@@ -148,6 +161,64 @@ test('a gate.json that is not UTF-8 is kept byte for byte', (t) => {
   assert.deepEqual(readFileSync(join(dir, 'gate.json.unreadable-20261015T025905Z')), latin1);
   assert.deepEqual(readFileSync(join(dir, 'gate.json.unreadable-20261015T025905Z-2')), utf16);
   assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions']);
+});
+
+test("a copy has gate.json's group and permission bits: an owner-only file's copy is owner-only, and a group-readable one's stays group-readable", {
+  skip: process.platform === 'win32' ? 'needs POSIX permission bits' : false,
+}, (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  t.mock.method(console, 'error', () => {});
+  for (const [mode, kept] of [[0o600, 'gate.json.unreadable-20261015T025905Z'], [0o640, 'gate.json.unreadable-20261015T025905Z-2']] as const) {
+    writeFileSync(configPath, BROKEN);
+    chmodSync(configPath, mode);
+    gate.addPolicy({ name: `ambient-${mode.toString(8)}`, behavior: 'defer' });
+    const copy = statSync(join(dir, kept));
+    assert.equal(copy.mode & 0o777, mode, `the copy of a ${mode.toString(8)} gate.json`);
+    assert.equal(copy.gid, statSync(configPath).gid, "and gate.json's group");
+  }
+});
+
+test("a copy of a gate.json shared through another of this process's groups takes that group, so the group can read it", {
+  skip: OTHER_GROUP === undefined ? 'needs a group this process is in besides its own' : false,
+}, (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  t.mock.method(console, 'error', () => {});
+  writeFileSync(configPath, BROKEN);
+  chmodSync(configPath, 0o640);
+  try {
+    chownSync(configPath, -1, OTHER_GROUP!);
+  } catch (err) {
+    t.skip(`gate.json can't be given group ${OTHER_GROUP} here (${(err as Error).message})`);
+    return;
+  }
+
+  gate.addPolicy({ name: 'ambient', behavior: 'defer' });
+
+  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
+  assert.equal(copy.gid, OTHER_GROUP, "the copy has gate.json's group, not this process's own");
+  assert.equal(copy.mode & 0o777, 0o640, 'and its bits');
+});
+
+test("a copy that can't take gate.json's group stays owner-only", {
+  skip: FOREIGN === undefined ? "needs a file this process can read whose group it isn't in" : false,
+}, (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir);
+  t.mock.method(console, 'error', () => {});
+  // gate.json is a link to a file such as root's /etc/hosts. The copy is kept
+  // directly, not through a change, which would then write through the link.
+  symlinkSync(FOREIGN!, configPath);
+  const keep = gate as unknown as { keepUnreadableConfig(unreadable: { error: string; bytes?: Buffer }): string };
+
+  const kept = keep.keepUnreadableConfig({ error: 'not JSON', bytes: readFileSync(configPath) });
+
+  assert.equal(kept, join(dir, 'gate.json.unreadable-20261015T025905Z'));
+  assert.deepEqual(readFileSync(kept), readFileSync(FOREIGN!), 'the copy holds the bytes');
+  const copy = statSync(kept);
+  assert.notEqual(copy.gid, statSync(FOREIGN!).gid, "the copy couldn't take gate.json's group");
+  assert.equal(copy.mode & 0o777, 0o600, 'so it stays owner-only');
 });
 
 test('keeping a copy leaves a symlinked gate.json pointing at its file, which keeps its mode and takes the change', {

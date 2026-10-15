@@ -11,7 +11,7 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 
@@ -865,11 +865,17 @@ export class EventGate {
     // No colons: Windows doesn't allow them in a file name.
     const stamp = new Date(this.now()).toISOString().replace(/\.\d+Z$/, 'Z').replace(/[-:]/g, '');
     const base = `${this.configPath}.unreadable-${stamp}`;
+    // The copy is no more readable than gate.json: it's created owner-only,
+    // then given gate.json's group, and only then its permission bits. A copy
+    // that can't take the group (this process isn't in it), or whose
+    // gate.json can't be stat'd, stays owner-only.
+    let gateFile: { gid: number; mode: number } | undefined;
+    try { gateFile = statSync(this.configPath); } catch { /* owner-only */ }
     for (let n = 1; ; n++) {
       const kept = n === 1 ? base : `${base}-${n}`;
       try {
         // An exclusive create, so a copy never replaces an earlier one.
-        writeFileSync(kept, unreadable.bytes, { flag: 'wx' });
+        writeFileSync(kept, unreadable.bytes, { flag: 'wx', mode: 0o600 });
       } catch (err) {
         const e = err as NodeJS.ErrnoException;
         if (e.code === 'EEXIST') continue;
@@ -881,6 +887,12 @@ export class EventGate {
           `gate.json couldn't be read (${reason}), and keeping a copy of it at ${kept} failed (${e.message ?? String(err)}), `
           + 'so nothing was written.',
         );
+      }
+      if (gateFile) {
+        try {
+          chownSync(kept, -1, gateFile.gid);
+          chmodSync(kept, gateFile.mode & 0o777);
+        } catch { /* it stays owner-only */ }
       }
       console.error(`[gate] ${this.configPath} couldn't be read (${reason}); kept a copy at ${kept} before writing the rules in force`);
       this.emitTrace({
