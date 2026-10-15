@@ -9,4 +9,7 @@
   nested shapes) are still the handler's to check; an absent input
   (`undefined` or `null`) still reaches a tool that requires nothing; a name
   the module answers but doesn't declare goes on unchecked; MCPL servers'
-  tools keep their servers' own checks.
+  tools keep their servers' own checks. connectome-host needs no change: its
+  tools of this kind keep those keys required, since each such call did
+  something its agent didn't ask for, such as storing a lesson without its
+  content or starting a subagent named "undefined".
