@@ -430,9 +430,10 @@ describe('live operator surgery', () => {
     assert.equal(entry.result?.removedIdsTruncated, true);
     for (const id of huge) assert.equal(cm().getMessage(id as never), null);
 
-    // The range form runs from the earlier message's first copy through the
-    // later one's last, in either order: a range ending at a message stored
-    // twice takes its retry too.
+    // The range form takes what was stored between its two messages, from the
+    // earlier one's first copy through the later one's first, in either
+    // order, and every copy of both: a range ending at a message stored twice
+    // takes its retry too.
     const hideRange = (fromMessageId: string, toMessageId: string) => internals.handleHostCommand('discord', {
       command: 'hide', agentName: 'scout', fromMessageId, toMessageId, requesterName: 'antra',
     });
@@ -455,6 +456,30 @@ describe('live operator surgery', () => {
     assert.equal(backward.ok, true, String(backward.error));
     assert.equal(backward.hidden, 5, 'm2, m3, after, and both copies of the cut message');
     assert.deepEqual(remainingTexts(), ['m1', 'last']);
+
+    // What was stored between a message's first copy and its retry came after
+    // that message began, so a range ending at it leaves that in.
+    plain('A', 'd-a');
+    appendBody('d-b', 'g-b', ['bp0']);
+    plain('Z', 'd-z');
+    appendBody('d-b', 'g-b', ['br0', 'br1']);
+    const between = await hideRange('d-a', 'd-b');
+    assert.equal(between.ok, true, String(between.error));
+    assert.equal(between.hidden, 3, 'A, and both copies of B');
+    assert.deepEqual(refsOf(between), ['d-a', 'd-b']);
+    assert.deepEqual(remainingTexts(), ['m1', 'last', 'Z']);
+
+    // A copy of the earlier message stored after the later one goes too, on
+    // its own: what was stored between them stays.
+    appendBody('d-c', 'g-c', ['cp0']);
+    plain('D', 'd-d');
+    plain('E', 'd-e');
+    appendBody('d-c', 'g-c', ['cr0', 'cr1']);
+    const mirror = await hideRange('d-d', 'd-c');
+    assert.equal(mirror.ok, true, String(mirror.error));
+    assert.equal(mirror.hidden, 3, 'both copies of C, and D');
+    assert.deepEqual(refsOf(mirror), ['d-c', 'd-d']);
+    assert.deepEqual(remainingTexts(), ['m1', 'last', 'Z', 'E']);
   });
 
   it('hide refuses while a surgery holds the store, and a missing Discord id matches nothing', async () => {

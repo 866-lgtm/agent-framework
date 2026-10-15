@@ -517,9 +517,11 @@ export class Agent {
   }
 
   /**
-   * Whether the context manager answers its queries. It refuses them while
-   * its strategy's initialization is pending or has failed, until a
-   * switchBranch or setStrategy succeeds.
+   * Whether the context manager answers its queries, as its readiness says.
+   * It refuses them while its strategy's initialization is pending or has
+   * failed, until a switchBranch or setStrategy succeeds, and a strategy can
+   * refuse its readiness on its own, as the autobiographical one does for a
+   * branch it hasn't reloaded.
    */
   contextManagerAnswers(): boolean {
     try {

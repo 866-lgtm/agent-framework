@@ -339,8 +339,22 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     assert.equal(preview.liveBudgetTokens, 100_000);
     assert.equal(preview.transition, 'stable');
     assert.equal(preview.effective, undefined);
-    // A patch the agent refuses still throws.
+    // A patch whose values the agent refuses still throws.
     assert.throws(() => framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 5 }), /contextBudgetTokens must be/);
+
+    // An update of the budget is refused, by the manager, and the preflight
+    // doesn't say it's applying one.
+    const preflight = t.mock.method(console, 'warn', () => {});
+    try {
+      assert.throws(
+        () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 }),
+        /requires successful strategy initialization/,
+      );
+      assert.ok(!preflight.mock.calls.some((call) => String(call.arguments[0]).includes('applying without preflight')));
+    } finally {
+      preflight.mock.restore();
+    }
+    assert.equal(framework.getAgent('agent')!.runtimeBudgetPath().liveBudgetTokens, 100_000, 'the budget is as it was');
 
     const warn = t.mock.method(console, 'warn', () => {});
     let status: Awaited<ReturnType<typeof framework.resume>>;

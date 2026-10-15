@@ -2543,7 +2543,8 @@ export class AgentFramework {
    * @param teardownTimeoutMs Optional budget for each wait on cleanup: an
    * operator's operations already running, then modules and MCPL together.
    * Omit to wait until cleanup settles, as required by existing module/child
-   * contracts. This does not bound earlier stream or event-loop quiescence, or
+   * contracts. This does not bound earlier stream, event-loop or maintenance
+   * quiescence (a maintenance pass or over-budget drain kick in flight), or
    * cancel cleanup.
    */
   stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
@@ -2898,14 +2899,19 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) A
-   * conversation agent is ticked by the maintenance pass too, so a call made
-   * while a surgery holds the store is withdrawn, as a resident's is.
+   * single-use, so its context manager keeps the plain membrane.) Its
+   * compression is the background work a resident's is, whether a
+   * maintenance tick or a drain after a message starts it, so it meets the
+   * same refusals: a call made while a surgery holds the store is withdrawn,
+   * and one made once stop() has closed provider admission is refused.
    */
   private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.refuseHeldProviderModel(agentName, model);
       this.withdrawMaintenanceUnderSurgery();
+      if (this.providerAdmissionClosed) {
+        throw new Error(`Provider admission closed while stopping (${agentName})`);
+      }
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
@@ -3537,10 +3543,10 @@ export class AgentFramework {
       run.finishedAt = Date.now();
       run.agents.sort((a, b) => a.agentName.localeCompare(b.agentName));
       this.currentMaintenanceRun = null;
-      // A pass that only met failures already reported adds nothing the
-      // history doesn't hold, and a lasting one would otherwise fill it in
-      // minutes, pushing out the runs that did work.
-      if (!run.agents.every((record) => this.maintenanceRepeats.has(record))) this.maintenanceHistory.unshift(run);
+      // A pass that only met failures already reported, and took no tick,
+      // adds nothing the history doesn't hold, and a lasting failure would
+      // otherwise fill it in minutes, pushing out the runs that did work.
+      if (!run.agents.every((record) => record.ticks === 0 && this.maintenanceRepeats.has(record))) this.maintenanceHistory.unshift(run);
       if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
     }
   }
@@ -3549,12 +3555,14 @@ export class AgentFramework {
    * One agent's maintenance failure: recorded on its run, bounded as every
    * failure sink is (`record.error`), and logged and alerted for that agent
    * with the whole text. A failure that lasts, such as a manager whose
-   * strategy failed to initialize, meets every pass, a few seconds apart:
-   * each run records it, and it is logged and alerted again only when its
-   * whole text changes, once opsAlert's cooldown for it has passed since the
-   * webhook last posted it (so the webhook, which posts a kind at most once
-   * per cooldown, hears a failure that lasts), or after a pass in which that
-   * agent's maintenance went without a failure (maintenanceFailureReported).
+   * strategy failed to initialize, meets every pass, a few seconds apart. It
+   * is logged and alerted again only when its whole text changes, once
+   * opsAlert's cooldown for it has passed since the webhook last posted it
+   * (so the webhook, which posts a kind at most once per cooldown, hears a
+   * failure that lasts), or after a pass in which that agent's maintenance
+   * went without a failure (maintenanceFailureReported). A record whose
+   * failure isn't reported again is marked as a repeat, and a pass whose
+   * every record is a repeat that took no tick stays out of the history.
    */
   private reportMaintenanceFailure(agentName: string, record: ContextMaintenanceAgentRun, wholeError: string): void {
     record.error = boundFailureText(wholeError);
@@ -4366,7 +4374,8 @@ export class AgentFramework {
             `advance merges to go lower). Applying; the live compile budget is unchanged.`,
           );
         }
-      } else if (preview.reason) {
+      } else if (preview.reason && agent.contextManagerAnswers()) {
+        // A manager that refuses its queries refuses the update below too.
         console.warn(
           `[budget-preflight] preview unavailable for ${agentName} (${preview.reason}); ` +
           `applying without preflight`,
@@ -5300,7 +5309,10 @@ export class AgentFramework {
    * adaptive) path, and a context manager that refuses its queries (its
    * strategy's initialization pending or failed) all come back as
    * `{available: false, reason}`. Unknown agent still throws, matching the
-   * sibling accessors, and so does a patch the agent refuses.
+   * sibling accessors, and so does a patch whose values the agent refuses,
+   * whatever its context manager's state. Whether the strategy takes live
+   * tail and pace settings is the manager's to say, so while it refuses, a
+   * patch that sets them gets no verdict either.
    */
   previewAgentRuntimeSettings(
     agentName: string,
@@ -5316,7 +5328,8 @@ export class AgentFramework {
     agent: Agent,
     patch?: AgentRuntimeSettingsPatch,
   ): RuntimeSettingsPreview {
-    // A patch the agent refuses throws, whatever its context manager's state.
+    // A patch whose values the agent refuses throws, whatever its context
+    // manager's state.
     if (patch && Object.keys(patch).length > 0) agent.checkRuntimeSettingsPatch(patch);
     let plan: ReturnType<Agent['planRuntimeSettings']>;
     let settings: ReturnType<Agent['getRuntimeSettings']>;
@@ -6998,12 +7011,26 @@ export class AgentFramework {
         return id === undefined || id === null || id === '' ? undefined : String(id);
       };
       const byDiscordId = (did: string) => all.findIndex((m) => discordIdOf(m) === String(did));
-      const lastByDiscordId = (did: string) => {
-        for (let i = all.length - 1; i >= 0; i--) if (discordIdOf(all[i]) === String(did)) return i;
-        return -1;
+      /** Runs in stored order, those that overlap or touch made one. */
+      const merged = (runs: Array<{ from: number; to: number }>) => {
+        const out: Array<{ from: number; to: number }> = [];
+        for (const { from, to } of [...runs].sort((a, b) => a.from - b.from)) {
+          const last = out[out.length - 1];
+          if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
+          else out.push({ from, to });
+        }
+        return out;
+      };
+      // A message stored as a body (a long one, in shards) goes whole, and so
+      // does every copy of it: a write cut short leaves a partial body before
+      // its retry, both carrying the Discord id.
+      const copiesOf = (did: string) => {
+        const runs: Array<{ from: number; to: number }> = [];
+        all.forEach((m, i) => { if (discordIdOf(m) === String(did)) runs.push(bodyRangeIn(all, i)); });
+        return runs;
       };
 
-      // Collect Discord refs of every message in [lo, hi] that carries one,
+      // Collect Discord refs of every message in the runs that carries one,
       // so the surface can mark them. channelId here is whatever the ingest
       // path stored (raw id or "discord:guild:channel"); the surface
       // normalizes it.
@@ -7047,20 +7074,22 @@ export class AgentFramework {
           if (toIdx < 0) {
             return { ok: false, error: `Message ${params.toMessageId} is not an addressable message in context.` };
           }
-          // The earlier end from its first stored copy, the later end through
-          // its last, as offline recovery's range does: a write cut short and
-          // retried stores a message twice, and the range takes both copies.
-          const [first, laterId] = fromIdx <= toIdx
-            ? [fromIdx, params.toMessageId]
-            : [toIdx, params.fromMessageId];
-          const last = lastByDiscordId(laterId);
-          // A message stored as a body (a long one, in shards) is hidden whole.
-          const lo = bodyRangeIn(all, first).from;
-          const hi = bodyRangeIn(all, last).to;
-          const refs = refsIn([{ from: lo, to: hi }]);
-          const hidden = messagesIn([{ from: lo, to: hi }]);
-          const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
-          removeStoredMessages(cm, all[lo], all[hi]);
+          // What's between the two messages, after the earlier one began and
+          // before the later one began: from the earlier one's first stored
+          // copy through the later one's first, each whole. Each end is every
+          // copy of it besides, as the single form takes, so a copy stored
+          // outside that span (a write cut short and retried later) goes
+          // alone, and nothing stored after the later one began goes with it.
+          // Offline recovery's range is the same.
+          const span = {
+            from: bodyRangeIn(all, Math.min(fromIdx, toIdx)).from,
+            to: bodyRangeIn(all, Math.max(fromIdx, toIdx)).to,
+          };
+          const runs = merged([span, ...copiesOf(params.fromMessageId), ...copiesOf(params.toMessageId)]);
+          const refs = refsIn(runs);
+          const hidden = messagesIn(runs);
+          const rangeIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
+          for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -7085,17 +7114,7 @@ export class AgentFramework {
             lastVisible: await this.lastVisiblePreview(agentName),
           };
         }
-        // A message stored as a body (a long one, in shards) is hidden whole,
-        // and so is every copy of it: a write cut short leaves a partial body
-        // before its retry, both carrying the Discord id.
-        const runs: Array<{ from: number; to: number }> = [];
-        all.forEach((m, i) => {
-          if (discordIdOf(m) !== String(params.fromMessageId)) return;
-          const { from, to } = bodyRangeIn(all, i);
-          const last = runs[runs.length - 1];
-          if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
-          else runs.push({ from, to });
-        });
+        const runs = merged(copiesOf(params.fromMessageId));
         const refs = refsIn(runs);
         const hidden = messagesIn(runs);
         const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
@@ -15750,10 +15769,11 @@ export class AgentFramework {
         { skipLog: true },
       );
     }
-    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName) && !this.surgeryHold) {
+    if (agent && overBudget && this.running && !this.overBudgetDrainInFlight.has(agentName) && !this.surgeryHold) {
       this.overBudgetDrainInFlight.add(agentName);
-      // Like a maintenance pass: it starts no tick while a surgery holds the
-      // store, and a branch move waits for the tick in flight.
+      // Like a maintenance pass: none starts once stop() has begun, it starts
+      // no tick while a surgery holds the store, and a branch move, or stop(),
+      // waits for the tick in flight.
       const drain = (async () => {
         let ticks = 0;
         try {
