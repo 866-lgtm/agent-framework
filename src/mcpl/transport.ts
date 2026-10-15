@@ -22,6 +22,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -193,7 +194,7 @@ export class StdioTransport extends McplTransport {
     // itself closes the transport, so the write's failure is only reported.
     this.child.stdin?.on('error', (err) => {
       if (this.listenerCount('error') > 0) this.emit('error', err);
-      else console.error(`[mcpl] a write to the server's stdin failed: ${err.message}`);
+      else console.error(`[mcpl] a write to the server's stdin failed: ${logDetail(err.message)}`);
     });
     // A read error on the child's stdout or stderr reaches the transport's
     // 'error' listener if it has one, and is never thrown. The stdout

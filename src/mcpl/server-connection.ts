@@ -15,7 +15,7 @@ import { openTransport, type McplTransport, type TransportCloseInfo } from './tr
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, McplResponseSerializationError, boundedForLog, describeCause } from './errors.js';
-import { logValue } from './log-value.js';
+import { logDetail, logValue } from './log-value.js';
 
 import type {
   McplServerConfig,
@@ -106,7 +106,7 @@ interface RequestOptions {
 /** A request's method for a log line, whatever the server sent there. */
 function describeMethod(method: unknown): string {
   return typeof method === 'string'
-    ? `method "${boundedForLog(method)}"`
+    ? `method ${logValue(method)}`
     : `a method of type ${method === null ? 'null' : typeof method}`;
 }
 
@@ -420,7 +420,7 @@ export class McplServerConnection extends EventEmitter {
       const request = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
       if (typeof request?.respondError === 'function' && this.listenerCount(event) === 0) {
         request.respondError(-32601, 'Method not found');
-        console.error(`[mcpl] ${this.id}: answered -32601 to ${name}, which nothing on this host handles`);
+        console.error(`[mcpl] ${this.id}: answered -32601 to ${logValue(name)}, which nothing on this host handles`);
         return true;
       }
       return super.emit(event, ...args);
@@ -1322,15 +1322,18 @@ export class McplServerConnection extends EventEmitter {
    *  method) and request it was dispatching, and what failed. The message is
    *  what the framework's 'error' listener traces. */
   private reportInboundFailure(cause: unknown, context: { event?: string; requestId?: string | number } = {}): void {
-    const where = context.event === undefined ? '' : ` for ${boundedForLog(context.event)}` +
-      (context.requestId === undefined ? '' : ` (request ${boundedForLog(String(context.requestId))})`);
-    const error = new Error(`MCPL server "${this.id}" inbound dispatch failed${where}: ${boundedForLog(describeCause(cause))}`, { cause });
-    console.error(error.message, cause);
+    const where = (show: (text: string) => string): string => (context.event === undefined ? '' : ` for ${show(context.event)}`) +
+      (context.requestId === undefined ? '' : ` (request ${show(String(context.requestId))})`);
+    // The error's message is what the 'error' listener traces, as text a
+    // reader parses, so it is bounded rather than escaped (boundedForLog);
+    // the log line prints the same through log-value.
+    const error = new Error(`MCPL server "${this.id}" inbound dispatch failed${where(boundedForLog)}: ${boundedForLog(describeCause(cause))}`, { cause });
+    console.error(`[mcpl] ${this.id}: inbound dispatch failed${where(logValue)}: ${logDetail(describeCause(cause))}`);
     // EventEmitter's unhandled 'error' behavior would defeat containment before
     // framework wiring, so stderr remains the fallback when no listener exists.
     if (this.listenerCount('error') > 0) {
       try { this.emit('error', error); }
-      catch (reportError) { console.error('MCPL error listener failed:', reportError); }
+      catch (reportError) { console.error(`[mcpl] ${this.id}: an 'error' listener failed: ${logDetail(describeCause(reportError))}`); }
     }
   }
 

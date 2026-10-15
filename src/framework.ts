@@ -74,7 +74,7 @@ import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE
 import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
-import { logValue } from './mcpl/log-value.js';
+import { logDetail, logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -17539,9 +17539,6 @@ export class AgentFramework {
           }
           const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
             ? describeCause(writeFailure) : undefined;
-          // The trace first: it's built from strings alone, while printing
-          // hands the raw thrown value to util.inspect, which an exotic value
-          // (a Proxy whose traps throw) can make throw.
           this.emitTrace({
             type: 'mcpl:request-handler-error',
             serverId,
@@ -17554,18 +17551,21 @@ export class AgentFramework {
             ...(responseError === undefined ? {} : { responseError }),
           });
           // Keep headless hosts diagnosable even without a trace subscriber.
+          // The handler's text and the server's go through log-value, so a
+          // line stays one line of bounded, escaped text.
+          const tried = refused === undefined ? undefined
+            : refused.kind === 'result' ? 'a result' : `error ${refused.code}: ${refused.message}`;
           console.error(
-            `[mcpl] ${serverId} ${event} handler failed:`, primary,
-            ...(responseFailure === undefined ? [] : ['| its reply write had failed:', writeFailure]),
-            ...(refused === undefined ? [] : ['| it then tried to answer again:', refused]),
-            ...(responseError === undefined ? [] : ['| the internal-error reply failed too:', responseError]),
+            `[mcpl] ${serverId} ${event} handler failed: ${logDetail(message)}` +
+              (responseFailure === undefined ? '' : ` | its reply write had failed: ${logDetail(responseFailure)}`) +
+              (tried === undefined ? '' : ` | it then tried to answer again with ${logDetail(tried)}`) +
+              (responseError === undefined ? '' : ` | the internal-error reply failed too: ${logDetail(responseError)}`),
           );
         } catch (reportError) {
-          // Strings only: the raw values may be what failed to print.
           try {
             console.error(
-              `[mcpl] ${serverId} ${event} handler failed: ${describeCause(primary)}` +
-                ` (and reporting it failed too: ${describeCause(reportError)})`,
+              `[mcpl] ${serverId} ${event} handler failed: ${logDetail(describeCause(primary))}` +
+                ` (and reporting it failed too: ${logDetail(describeCause(reportError))})`,
             );
           } catch { /* stderr itself is gone */ }
         }

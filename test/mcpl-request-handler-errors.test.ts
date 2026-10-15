@@ -362,8 +362,9 @@ test('post-response failures reach stderr when no trace subscriber is attached',
   assert.equal(reply.results.length, 1);
   assert.equal(reply.errors.length, 0);
   assert.equal(errors.length, 1);
-  assert.match(String(errors[0]?.[0]), /srv.*channels-register/);
-  assert.match(String(errors[0]?.[1]), /headless reconciliation failed/);
+  // One line, its text through log-value.
+  assert.equal(errors[0]?.length, 1);
+  assert.match(String(errors[0]?.[0]), /^\[mcpl\] srv channels-register handler failed: "headless reconciliation failed"$/);
 });
 
 for (const mode of ['handshake', 'connected', 'throwing-listener']) {
@@ -631,8 +632,8 @@ test('a failed internal-error reply reaches stderr too', async (t) => {
   connection.emit('channels-register', {}, reply);
   await settle();
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /channels-register handler failed: .*register failed/);
-  assert.match(lines[0]!, /the internal-error reply failed too: internal-error reply could not be written/);
+  assert.match(lines[0]!, /channels-register handler failed: "register failed"/);
+  assert.match(lines[0]!, /the internal-error reply failed too: "internal-error reply could not be written"/);
 });
 
 test("an 'error' listener that throws is caught and logged, and the next message still arrives", (t) => {
@@ -646,7 +647,7 @@ test("an 'error' listener that throws is caught and logged, and the next message
   connection.removeAllListeners('tools-list-changed');
   connection.on('tools-list-changed', () => { received = true; });
   assert.doesNotThrow(() => transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 51, method: 'channels/list' })));
-  assert.ok(logged.some((line) => /MCPL error listener failed/.test(line)), logged.join('\n'));
+  assert.ok(logged.some((line) => line.includes(`an 'error' listener failed: "error listener exploded"`)), logged.join('\n'));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
   assert.equal(received, true);
 });
@@ -660,7 +661,7 @@ test("a failed write to a stdio server's stdin is reported, never thrown", (t) =
   const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
   // With nobody listening on the transport, it's logged.
   assert.doesNotThrow(() => child.stdin.emit('error', epipe));
-  assert.match(logged[0] ?? '', /stdin failed: write EPIPE/);
+  assert.match(logged[0] ?? '', /stdin failed: "write EPIPE"/);
   // With a listener, it's the transport's error.
   const reported: unknown[] = [];
   transport.on('error', (error) => reported.push(error));
@@ -753,7 +754,8 @@ test('a value printing cannot handle still leaves a stderr line naming the failu
   connection.emit('channels-register', {}, responder());
   await settle();
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /channels-register handler failed: the hostile failure \(and reporting it failed too: inspect refused\)/);
+  // The line is built from strings through log-value, so nothing inspects the value.
+  assert.match(lines[0]!, /channels-register handler failed: "the hostile failure"$/);
 });
 
 test('log text from a server has control, format and separator characters replaced', (t) => {

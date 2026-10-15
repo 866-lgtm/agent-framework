@@ -54,10 +54,14 @@ export function describeCause(cause: unknown): string {
   }
 }
 
-/** Text a server or a handler chose, made fit for one log or trace line:
- *  control and format characters replaced (C0 and C1 controls, bidi and other
- *  \p{Cf} characters, and the line and paragraph separators some log readers
- *  break lines on), and cut to `max` code points. */
+/** Text a server or a handler chose, made fit for an error's message or a
+ *  trace field: control and format characters replaced (C0 and C1 controls,
+ *  bidi and other \p{Cf} characters, and the line and paragraph separators
+ *  some log readers break lines on), and cut to `max` code points. Those are
+ *  read as data, by a trace's or an error listener's reader, so the text is
+ *  bounded rather than escaped. A log line prints text a server or a handler
+ *  chose through log-value instead (logValue for a field, logDetail for the
+ *  free text that ends the line). */
 export function boundedForLog(text: string, max = 200): string {
   const points = [...text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '?')];
   return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');

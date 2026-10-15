@@ -624,7 +624,7 @@ describe('stop() with work still in flight', () => {
       await answered(push);
 
       assert.deepEqual(push.answers, [{ error: { code: -32000, message: 'the host stopped while handling this request' } }]);
-      assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: Error: Queue is closed')), logged.join('\n'));
+      assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "Queue is closed"')), logged.join('\n'));
       assert.deepEqual(rejections, []);
     });
 
@@ -642,8 +642,8 @@ describe('stop() with work still in flight', () => {
         await until(() => logged.some((line) => line.includes('the handler broke on e4')), "the notification's log line");
 
         assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
-        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: Error: the handler broke on e3')), logged.join('\n'));
-        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: Error: the handler broke on e4')), logged.join('\n'));
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "the handler broke on e3"')), logged.join('\n'));
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "the handler broke on e4"')), logged.join('\n'));
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();
@@ -696,7 +696,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it("a long error is answered with the standard message, not the handler's text", async () => {
+    it("a long error is answered with the standard message, and logged bounded", async () => {
       const { framework, connection } = await wiredFramework();
       try {
         (framework as unknown as { pushHandler: unknown }).pushHandler = {
@@ -706,6 +706,9 @@ describe('stop() with work still in flight', () => {
         connection.emit('push-event', { featureSet: 'chat', eventId: 'e9', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
         await answered(push);
         assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
+        const line = logged.find((l) => l.includes('push-event handler failed')) ?? '';
+        assert.ok(line.length < 600, `logged ${line.length} characters`);
+        assert.ok(line.endsWith('…(5000)'), line.slice(-40));
       } finally {
         await framework.stop();
       }
@@ -726,7 +729,7 @@ describe('stop() with work still in flight', () => {
         await until(() => logged.some((line) => line.includes('the trace emit broke')), 'the log line');
 
         assert.deepEqual(push.answers, [{ result: { accepted: true } }]);
-        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: Error: the trace emit broke')), logged.join('\n'));
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "the trace emit broke"')), logged.join('\n'));
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();
@@ -808,7 +811,7 @@ describe('stop() with work still in flight', () => {
 
         for (const [i, [event, method]] of requests.entries()) {
           assert.deepEqual(answers[i]!.answers, [{ error: { code: -32603, message: 'Internal error' } }], method);
-          assert.ok(logged.some((line) => line.includes(`[mcpl] srv ${event} handler failed: Error: the handler broke`)), `${method}:\n${logged.join('\n')}`);
+          assert.ok(logged.some((line) => line.includes(`[mcpl] srv ${event} handler failed: "the handler broke"`)), `${method}:\n${logged.join('\n')}`);
         }
         assert.deepEqual(rejections, []);
       } finally {
