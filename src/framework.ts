@@ -4975,19 +4975,26 @@ export class AgentFramework {
         }
       }
       // An entry the queue's readers can't handle has no place in it: one whose
-      // participant isn't text, whose content isn't an array, or that holds a
-      // block that isn't an object, is dropped here with a line naming it,
-      // rather than held. Reading a null block's type throws, at the tool
-      // boundary and in the store. The store keeps a string or number block as
-      // given, but the context manager's token estimate keys a WeakMap on each
-      // block, which such a value can't be: once one is stored, every compile
-      // for that agent throws, and a restart doesn't clear it. What a block
-      // holds, such as a tool result's content, isn't checked here, as it isn't
-      // for a fresh write.
-      const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
-        !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
-          && Array.isArray((m as { content?: unknown }).content)
-          && (m as { content: unknown[] }).content.every((b) => !!b && typeof b === 'object');
+      // participant isn't text, whose content isn't an array, that holds a
+      // block that isn't an object, or whose `forAgent` is present but not a
+      // name, is dropped here with a line naming it, rather than held. Reading
+      // a null block's type throws, at the tool boundary and in the store. The
+      // store keeps a string or number block as given, but the context
+      // manager's token estimate keys a WeakMap on each block, which such a
+      // value can't be: once one is stored, every compile for that agent
+      // throws, and a restart doesn't clear it. What a block holds, such as a
+      // tool result's content, isn't checked here, as it isn't for a fresh
+      // write. The framework writes `forAgent` only as a non-empty name, so
+      // another value comes from damage or a hand edit, and the agent it
+      // meant can't be known: sent to the primary, as a falsy one would be, it
+      // could put another agent's message in the primary's window.
+      const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: unknown; seq?: unknown } => {
+        if (!m || typeof m !== 'object') return false;
+        const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
+        return typeof participant === 'string'
+          && Array.isArray(content) && content.every((b) => !!b && typeof b === 'object')
+          && (forAgent === undefined || (typeof forAgent === 'string' && forAgent !== ''));
+      };
       const malformed = data.filter((m) => !wellFormed(m));
       for (const m of malformed) {
         // What the entry holds there: a value that isn't text by its type.
@@ -5002,16 +5009,48 @@ export class AgentFramework {
           `${field('id')} (${field('participant')})`,
         );
       }
-      const candidates = data
-        .filter(wellFormed)
-        .map((m, i) => ({
-          ...m,
-          id: typeof m.id === 'string' ? m.id : randomUUID(),
-          // Files that predate `seq` are in write order already.
-          seq: typeof m.seq === 'number' ? m.seq : i + 1,
-        }))
+      // One entry per id: the boot dedup and the ack each take an id as one
+      // write, so an id that comes again is dropped with a line, and the first
+      // entry with it is kept. An entry with no id is given a fresh one.
+      const seen = new Set<string>();
+      const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
+      let duplicates = 0;
+      for (const m of data.filter(wellFormed)) {
+        const id = typeof m.id === 'string' && m.id !== '' ? m.id : randomUUID();
+        if (seen.has(id)) {
+          duplicates++;
+          console.error(
+            `[host-mode] a recovered deferred context write repeats id ${id} (${m.participant}) and was dropped; ` +
+            `the first entry with that id is kept`,
+          );
+          continue;
+        }
+        seen.add(id);
+        kept.push({ ...m, id });
+      }
+      // A seq is a positive whole number, the entry's place in arrival order.
+      // An entry without one (a file that predates seq, which is in write
+      // order already) or with any other value (damage or a hand edit:
+      // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
+      // file order, so the counter stays finite and the rest keep their order.
+      const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
+      let lastSeq = 0;
+      for (const m of kept) if (validSeq(m.seq)) lastSeq = Math.max(lastSeq, m.seq);
+      let renumbered = 0;
+      const candidates: DeferredWrite[] = kept
+        .map((m) => {
+          if (validSeq(m.seq)) return { ...m, seq: m.seq };
+          renumbered++;
+          if (m.seq !== undefined) {
+            console.error(
+              `[host-mode] a recovered deferred context write (${m.id}) has seq ${String(m.seq)}, not a positive ` +
+              `whole number; it is queued after the others`,
+            );
+          }
+          return { ...m, seq: ++lastSeq };
+        })
         .sort(bySeq);
-      this.deferredSeq = Math.max(this.deferredSeq, ...candidates.map((m) => m.seq));
+      this.deferredSeq = Math.max(this.deferredSeq, lastSeq);
       // Exactly-once: a message that landed before its ack was written is
       // already in the store under its deferredWriteId — do not replay it.
       // The scan covers every slot the interrupted batch could occupy (from
@@ -5028,9 +5067,9 @@ export class AgentFramework {
       this.deferredMessages.push(...restored);
       this.deferredWritesPersisted = true;
       // Rewrite the durable queue without the already-landed entries so a
-      // second interrupted boot does not re-scan them, and without the
-      // malformed ones.
-      if (landed.size > 0 || malformed.length > 0) this.persistDeferredWrites();
+      // second interrupted boot does not re-scan them, without the malformed
+      // and repeated ones, and with the seqs given here.
+      if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || renumbered > 0) this.persistDeferredWrites();
       return restored.length;
     } catch (err) {
       console.error('[host-mode] failed to restore persisted deferred context writes:', err);
