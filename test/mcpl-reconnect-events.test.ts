@@ -15,6 +15,7 @@ import { join } from 'node:path';
 
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // The .mjs fixture is not compiled/copied by tsc, so when this test runs from
@@ -329,6 +330,66 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(pushes, [{ n: 1 }]);
     assert.ok(logged.some((line) => /not answering request 9 with error -32002 \(channels-incoming rejected: capability "channels\.incoming" not in the effective grant\): the transport it came on has closed/.test(line)),
       logged.join('\n'));
+  });
+
+  it('admits a kept incoming message after the next transport registers its channel, rather than refusing it as unknown', async () => {
+    // A bridge's first exchange registers its channels and forwards its
+    // backlog together. The boundary drops the dead transport's registration
+    // and keeps its message; the next process registers the channel again,
+    // behind the kept message, and the registry refuses a message for a
+    // channel it doesn't know (§14.5), so that registration goes first.
+    const grant = () => new CapabilityGrant(new Set(['channels.register', 'channels.incoming']), []);
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    const traces: Array<{ type: string; reason?: unknown }> = [];
+    const admitted: Array<{ messageId?: unknown }> = [];
+    const server = {
+      grant: grant(),
+      async sendChannelsOpen() { return {}; },
+      async sendChannelsClose() { return {}; },
+    };
+    const registry = new ChannelRegistry(
+      { getServer: () => server } as never,
+      {} as never,
+      (event) => admitted.push(event as { messageId?: unknown }),
+      (event) => traces.push(event),
+    );
+    connection.on('channels-register', (params: unknown, responder: unknown) => {
+      void registry.handleRegister('flaky', params as never, responder as never);
+    });
+    connection.on('channels-incoming', (params: unknown, responder: unknown) => {
+      void registry.handleIncoming('flaky', params as never, responder as never);
+    });
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const register = (id: number) => serverSends({
+      id, method: 'channels/register', params: { channels: [{ id: 'room', type: 'text', direction: 'bidirectional' }] },
+    });
+    // The first exchange, held while its planes are closed, then the transport drops.
+    register(1);
+    serverSends({
+      id: 2,
+      method: 'channels/incoming',
+      params: { messages: [{ channelId: 'room', messageId: 'kept-1', content: [{ type: 'text', text: 'hello' }] }] },
+    });
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    // The next process registers the channel again.
+    register(3);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection.establishGrant(grant());
+      connection.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(traces.filter((trace) => trace.type === 'mcpl:channel-incoming-rejected'), [], 'not refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
   });
 
   it('a transport boundary crossed during a flush holds the rest of the snapshot to the boundary rule', async () => {

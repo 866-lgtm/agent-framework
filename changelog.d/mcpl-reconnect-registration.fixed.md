@@ -18,7 +18,9 @@
   channel registration) is dropped rather than admitted under the next
   transport's grant: the next process announces its own. Incoming channel
   messages and pushes still held are kept and admitted under the next
-  grant, since the next process won't send them again. An answer to a
+  grant, since the next process won't send them again, and the next
+  process's channel registrations are admitted ahead of them, so a kept
+  message isn't refused as an unknown channel. An answer to a
   request from a closed transport is never written to the next one. A
   `close()` during a reconnect's handshake now closes the new transport
   instead of adopting it.

@@ -131,6 +131,14 @@ interface RequestOptions {
   surfaceOrphanedResponse?: boolean;
 }
 
+/** A server→host message held while its plane is closed. `kept`: it came on
+ *  a transport that is gone, and the boundary kept it (keepAcrossBoundary). */
+interface HeldItem {
+  event: string;
+  args: unknown[];
+  kept?: true;
+}
+
 /**
  * McplServerConnection manages a single JSON-RPC 2.0 connection to an
  * MCPL server over stdio. Use the static `connect()` factory to create
@@ -263,9 +271,9 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /** What of these held items a transport boundary keeps (see
-   *  resetPolicyForTransportBoundary), in order; the rest is logged and
-   *  dropped. */
-  private keepAcrossBoundary(held: Array<{ event: string; args: unknown[] }>): Array<{ event: string; args: unknown[] }> {
+   *  resetPolicyForTransportBoundary), in order, each marked `kept`; the
+   *  rest is logged and dropped. */
+  private keepAcrossBoundary(held: HeldItem[]): HeldItem[] {
     const dropped = McplServerConnection.PROCESS_EVENTS;
     const kept = held.filter((item) => !dropped.has(item.event));
     if (kept.length < held.length) {
@@ -273,7 +281,7 @@ export class McplServerConnection extends EventEmitter {
         `[mcpl] ${this.id}: dropped ${held.length - kept.length} held message(s) from a transport that closed`,
       );
     }
-    return kept;
+    return kept.map((item) => ({ ...item, kept: true as const }));
   }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
@@ -308,7 +316,7 @@ export class McplServerConnection extends EventEmitter {
   // stays held, as through a quiesce.
   private controlPlaneReady = false;
   private dataPlaneReady = false;
-  private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
+  private bufferedEvents: HeldItem[] = [];
   /** Cap on buffered responder-less events during a plane pause (issue #122).
    *  Held server→host requests are never dropped and may exceed this. */
   private static readonly MAX_BUFFERED_EVENTS = 1000;
@@ -382,27 +390,49 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /**
-   * Re-emit a held snapshot in order, through the admission gate (this.emit).
-   * A transport boundary crossed during the flush (a listener that closes
-   * the connection, say) leaves the rest of the snapshot to the boundary rule,
-   * as if it had still been held: what the server said about its own process
-   * is dropped, and the rest is held again, after whatever this flush held.
+   * Re-emit a held snapshot through the admission gate (this.emit), in
+   * admission order (admissionOrder). A transport boundary crossed during the
+   * flush (a listener that closes the connection, say) leaves the rest of the
+   * snapshot to the boundary rule, as if it had still been held: what the
+   * server said about its own process is dropped, and the rest is held
+   * again, after whatever this flush held.
    */
-  private flushHeld(pending: Array<{ event: string; args: unknown[] }>): void {
+  private flushHeld(pending: HeldItem[]): void {
+    const ordered = McplServerConnection.admissionOrder(pending);
     const epoch = this.transportEpoch;
     this.flushDepth++;
     try {
-      for (let index = 0; index < pending.length; index++) {
+      for (let index = 0; index < ordered.length; index++) {
         if (this.transportEpoch !== epoch) {
-          this.bufferedEvents.push(...this.keepAcrossBoundary(pending.slice(index)));
+          this.bufferedEvents.push(...this.keepAcrossBoundary(ordered.slice(index)));
           return;
         }
-        const { event, args } = pending[index]!;
+        const { event, args } = ordered[index]!;
         this.emit(event, ...args);
       }
     } finally {
       this.flushDepth--;
     }
+  }
+
+  /**
+   * The order a flush admits a held snapshot in: as it was held, except that
+   * when it holds items a transport boundary kept, the current transport's
+   * channel registrations (`channels-register`, `channels-changed`) go
+   * first. The registry refuses a message for a channel it doesn't know
+   * (§14.5), and the next process registers its channels anew, behind what
+   * was kept: a kept message admitted first would be refused, and lost,
+   * since its bridge has advanced past it. Nothing else moves, so a snapshot
+   * with nothing kept is flushed as it was held. A registration also passes
+   * whatever its own transport sent before it, which a server that announces
+   * its channels first, as a bridge does, never has.
+   */
+  private static admissionOrder(pending: HeldItem[]): HeldItem[] {
+    if (!pending.some((item) => item.kept)) return pending;
+    const registrations = new Set(pending.filter((item) => !item.kept
+      && (item.event === 'channels-register' || item.event === 'channels-changed')));
+    if (registrations.size === 0) return pending;
+    return [...registrations, ...pending.filter((item) => !registrations.has(item))];
   }
 
   /**
