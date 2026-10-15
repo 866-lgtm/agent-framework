@@ -4739,16 +4739,18 @@ export class AgentFramework {
   }
 
   /**
-   * Land every deferred write whose target has no turn alive, one at a time,
-   * acknowledging each durably as it lands (the persisted queue is rewritten
-   * after every message). A crash mid-flush therefore replays exactly the
-   * un-acked remainder at the next boot — no loss, no duplicates. The batch
-   * is stored in queue order, whatever its targets (writeDrainedInOrder). A
-   * write the store rejects stays queued, logged, with what is queued behind
-   * it for its target, so the flush never stores that target's later entries
-   * ahead of it, and other targets' entries go on. (A write that isn't
-   * deferred can still land ahead of it, such as one for an idle agent once
-   * the host has resumed.) A boot that meets it again logs it and goes on.
+   * Land every deferred write whose target has no turn alive, as one batch
+   * acknowledged once: the chronicle is synced, then the persisted queue is
+   * rewritten without the batch (ackDeferredWrites). Until then the batch
+   * stays in the durable queue, so a crash mid-flush replays it at the next
+   * boot, which skips each entry that already landed, by its deferredWriteId
+   * — no loss, no duplicates. The batch is stored in queue order, whatever
+   * its targets (writeDrainedInOrder). A write the store rejects stays
+   * queued, logged, with what is queued behind it for its target, so the
+   * flush never stores that target's later entries ahead of it, and other
+   * targets' entries go on. (A write that isn't deferred can still land
+   * ahead of it, such as one for an idle agent once the host has resumed.)
+   * A boot that meets it again logs it and goes on.
    *
    * Per-target: an agent whose turn is still alive keeps ITS messages
    * deferred for its own turn boundary; everyone else's flush now.
@@ -4911,7 +4913,11 @@ export class AgentFramework {
    * window is operator-length, not turn-length. Lives in the
    * branch-independent recovery file so a rollback cannot orphan it.
    * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
-   * still memory-only: they flush within the turn, as before.
+   * still memory-only: they land within the turn, at a tool boundary or at
+   * its end, and a crash before then loses them. That window runs to the
+   * turn's end for a message held there and what is queued behind it, and,
+   * on a stream that can't carry injected messages, for every message
+   * deferred during the turn.
    */
   private persistDeferredWrites(): void {
     try {
