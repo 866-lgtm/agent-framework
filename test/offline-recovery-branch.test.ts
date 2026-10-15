@@ -412,8 +412,9 @@ test('a failed offline suppression retires its batch once the source is confirme
     );
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
 
-    // The source comes back but retiring the batch fails: the error says the
-    // surgery didn't happen, and to cancel the held batch rather than release it.
+    // The source comes back but retiring the batch fails: the error says its
+    // marks are never sent, and that its removals stay pending for the kept
+    // branch, whose name stays claimed.
     await seed();
     const discard = DiscordAwarenessOutbox.prototype.discard;
     DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
@@ -423,7 +424,7 @@ test('a failed offline suppression retires its batch once the source is confirme
           storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
           marks: { scope: 'all' }, branchName: 'recovery/cairn/fail1',
         }),
-        /awareness batch (\S+) could not be retired \(injected retire failure\); it stays prepared, and a start on main holds it: cancel it then \(--awareness cancel \1\), not release it, since its messages were never removed/,
+        /awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent, until a start retires it\. Its removals stay pending for recovery\/cairn\/fail1: a start on recovery\/cairn\/fail1 would finish them there, so delete that branch unless you want that, and until then a branch named recovery\/cairn\/fail1 is refused/,
       );
     } finally {
       DiscordAwarenessOutbox.prototype.discard = discard;
@@ -433,8 +434,9 @@ test('a failed offline suppression retires its batch once the source is confirme
       const store = JsStore.open({ path: storePath });
       try {
         const exists = (name: string) => store.listBranches().some((branch) => branch.name === name);
-        assert.equal(new DiscordAwarenessOutbox(store).recoverAtStartup('main', exists).held.length, 1,
-          'a start on the source holds it: its branch was created');
+        assert.deepEqual(new DiscordAwarenessOutbox(store).recoverAtStartup(exists).retired, [],
+          'a start on the source leaves it: its removals are pending on its branch, which exists');
+        assert.equal(new DiscordAwarenessOutbox(store).batches()[0].status, 'prepared');
       } finally {
         store.close();
       }
@@ -451,9 +453,9 @@ test('a failed offline suppression retires its batch once the source is confirme
         storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
         marks: { scope: 'all' }, branchName: 'recovery/cairn/fail2',
       }),
-      // One instruction for the kept branch: its batch completes the
-      // suppression at a start on it, so it isn't called unsafe to start.
-      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 completes it \(its suppression first\), and a start on another branch holds it$/,
+      // One instruction for the kept branch: a start on it finishes the
+      // suppression, so it isn't called unsafe to start.
+      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent$/,
     );
     assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
   } finally {
@@ -504,42 +506,68 @@ test('an offline recovery onto an existing branch is refused before any intent, 
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'] });
 
     // The same failure with its retirement failing too: the batch stays
-    // prepared, and since the recovery never created its branch, the next
-    // start retires it rather than holding it for an operator.
+    // prepared until a start retires it, none of its marks sent.
     const discard = DiscordAwarenessOutbox.prototype.discard;
     ContextManager.prototype.branchAt = function () { throw new Error('injected branch failure'); };
     DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
     try {
       await assert.rejects(
         createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
-        /could not be retired \(injected retire failure\); it stays prepared, and the next start retires it, since its surgery never created fresh2, and until then a branch with that name is refused unless the batch is cancelled first \(--awareness cancel \S+\)/,
+        /^Error: injected branch failure; awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent, until a start retires it$/,
       );
     } finally {
       ContextManager.prototype.branchAt = branchAt;
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded', 'prepared'] });
-    // A retry under the same name is refused while the batch is prepared, and
-    // the refusal says how to cancel it: the retry's branch would arm it.
-    await assert.rejects(
-      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
-      /^Error: Recovery branch fresh2 is the target of awareness batch (\S+), which is still prepared: a branch made under that name would arm it at the next start\. Cancel the batch first \(--awareness cancel \1\), or choose another --branch$/,
-    );
-    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded', 'prepared'] }, 'the refusal prepared nothing');
-    const reopened = JsStore.open({ path: storePath });
-    try {
-      const exists = (name: string) => reopened.listBranches().some((branch) => branch.name === name);
-      const recovered = new DiscordAwarenessOutbox(reopened).recoverAtStartup('main', exists);
-      assert.equal(recovered.retired.length, 1);
-      assert.deepEqual(recovered.held, []);
-    } finally {
-      reopened.close();
-    }
-    // Retired by that start, the batch no longer claims the name.
+    // A recovery without suppressions claims no name, since no start
+    // completes its marks: a retry under the same name goes ahead.
     const retried = await createOfflineRecoveryBranch({
       storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2',
     });
     assert.equal(retried.targetBranch, 'fresh2');
+    // The next start retires the old batch; the retry's own batch is active.
+    const reopened = JsStore.open({ path: storePath });
+    try {
+      const exists = (name: string) => reopened.listBranches().some((branch) => branch.name === name);
+      const recovered = new DiscordAwarenessOutbox(reopened).recoverAtStartup(exists);
+      assert.deepEqual(recovered.retired.map((r) => [r.targetBranch, r.reason]), [['fresh2', 'interrupted']]);
+      assert.deepEqual(new DiscordAwarenessOutbox(reopened).batches().map((b) => b.status), ['discarded', 'discarded', 'active']);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an offline recovery onto a name a pending suppression claims is refused, and prepares nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-claim-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'safe' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe' });
+    cm.addMessage('user', [{ type: 'text', text: 'later' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-later' });
+    // What a suppression whose retirement failed leaves: its removals
+    // pending for `claimed`, which doesn't exist.
+    new DiscordAwarenessOutbox(store).prepare({
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'claimed', refs: [], scope: 'none',
+      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'x1', toId: 'x1' }],
+    });
+    cm.close();
+    store.close();
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', branchName: 'claimed' }),
+      /^Error: Recovery branch claimed is the target of suppression \S+, whose removals aren't finished: a start on a branch with that name would apply them there\. Choose another --branch\. The name is free once a start finds no branch with it and gives the suppression up$/,
+    );
+    const reopened = JsStore.open({ path: storePath });
+    try {
+      assert.equal(reopened.currentBranch().name, 'main');
+      assert.equal(new DiscordAwarenessOutbox(reopened).batches().length, 1, 'the refusal prepared nothing');
+    } finally {
+      reopened.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

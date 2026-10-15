@@ -442,18 +442,24 @@ const result = await framework.rollbackToMessage('cairn', {
   the store took but this process can't read back (Chronicle's periodic sync
   failing inside an append) leaves the journal refusing every read and write
   until the store is reopened; the next start reads that record with the
-  rest. A batch whose surgery crashed after its switch (its target branch
-  active at startup) is completed then. One whose target branch doesn't
-  exist is retired at startup: either its surgery crashed before it created
-  that branch, so none of its messages were removed, or the branch was
-  deleted later, which gives up its marks. Until then a rollback, a
-  suppression, an offline recovery or the API's `branch.create` refuses
-  that name unless the batch is cancelled first, so that no other surgery's
-  branch arms it; while the journal can't be read, nothing is refused. One
-  whose surgery was otherwise interrupted before its branch switch was
-  recorded is held at startup until an operator releases or cancels it; an
-  interrupted suppression's redactions are resumed whenever its branch is
-  active at startup, whatever its marks' state.
+  rest. A `hide` or turn `undo` records its batch and the batch's
+  activation as one entry.
+- **A start never completes a surgery's marks.** A batch an interrupted
+  surgery left is retired at the next start, none of its marks sent, with a
+  `discord-awareness-not-scheduled` ops alert that names the surgery, its
+  agent and its branches, and the redo that applies the marks: switch to
+  the source, which still has every message the surgery removed, and run
+  the surgery there again onto a new branch name, choosing marks again. An
+  interrupted suppression's removals are still finished, at the first start
+  on its branch, and its batch is retired then. A suppression whose
+  removals are pending and whose branch doesn't exist (its surgery ended
+  before it created it, or it was deleted) is given up with a
+  `discord-awareness-suppression-unfinished` alert, since its removals
+  apply only there. Until a suppression is finished or given up, a
+  rollback, a suppression, an offline recovery or the API's `branch.create`
+  refuses its branch name, cancelled or not, since a start on a branch made
+  under it would apply those removals there; while the journal can't be
+  read, nothing is refused.
 - **Operator controls,** each recorded in the operator log; once `stop()`
   has begun, cancel, retract and release refuse, like every operator entry
   point:
@@ -464,8 +470,8 @@ const result = await framework.rollbackToMessage('cairn', {
     including earlier attempts later answered, any of which may still land;
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
-    of the batch (or of every batch not retired by its own surgery, prepared,
-    held or active, and every message an imported ledger recorded), whatever
+    of the batch (or of every batch not retired, prepared, held or active,
+    and every message an imported ledger recorded), whatever
     history says: removing an absent reaction does nothing. As the latest
     authorization for those messages, it stops adds that haven't ended and
     any an earlier choice would request later (a prepared batch's
@@ -473,16 +479,15 @@ const result = await framework.rollbackToMessage('cairn', {
     after it is a new act, whose adds go out. Its receipt discloses earlier
     add requests whose outcome is unknown (an unknown removal can't bring a
     mark back) and imported history that leaves outcomes unrecorded;
-  - `releaseDiscordAwareness(batch)` queues a held batch. A batch whose
-    surgery never ran isn't held: the next start retires it, since its
-    target branch doesn't exist;
+  - `releaseDiscordAwareness(batch)` queues a held batch: an imported
+    ledger's undelivered work, the only batches held;
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
-    a new branch that a prepared batch, not cancelled, names as its target,
-    since a branch made under that name would arm the batch at the next
-    start. Rollback, suppression and the API's `branch.create` call it; a
-    host that creates branches in the store itself calls it first. When the
-    journal can't be read it refuses nothing, so a surgery never waits on
-    the journal.
+    a new branch that a suppression with pending removals names as its
+    target, cancelled or not, since a start on a branch with that name
+    would apply them there. Rollback, suppression and the API's
+    `branch.create` call it; a host that creates branches in the store
+    itself calls it first. When the journal can't be read it refuses
+    nothing, so a surgery never waits on the journal.
 
   A request the journal won't carry out (an unknown batch, or one in the
   wrong state) is refused as `invalid`; a failure to read or write the

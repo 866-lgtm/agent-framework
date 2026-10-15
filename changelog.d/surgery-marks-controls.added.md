@@ -16,12 +16,15 @@
     cancelling it never revives them. Its receipt discloses earlier add
     requests whose outcome is unknown and imported history that leaves
     outcomes unrecorded.
-  - `releaseDiscordAwareness(batch)` queues a held batch.
+  - `releaseDiscordAwareness(batch)` queues a held batch: an imported
+    ledger's undelivered work, the only batches held.
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for a
-    new branch that a prepared batch, not cancelled, names as its target: a
-    branch made under that name would arm the batch at the next start.
-    Rollback, suppression, the offline recovery and the API's
-    `branch.create` check their names with it, and a host that creates
+    new branch that a suppression with pending removals names as its
+    target, cancelled or not: a start on a branch with that name would apply
+    them there. The name is free once a start on that branch finishes the
+    suppression, or a start finds no branch with the name and gives the
+    suppression up. Rollback, suppression, the offline recovery and the
+    API's `branch.create` check their names with it, and a host that creates
     branches in the store itself calls it first. When the journal can't be
     read it refuses nothing.
 

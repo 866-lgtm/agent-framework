@@ -188,8 +188,7 @@ export async function createOfflineRecoveryBranch(
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
-    // A known collision is refused before anything is prepared: a batch
-    // whose target names an existing branch would be armed by starting it.
+    // A known collision is refused before anything is prepared.
     if (store.listBranches().some((branch) => branch.name === targetBranch)) {
       throw new Error(`Recovery branch ${targetBranch} already exists; choose another --branch`);
     }
@@ -214,19 +213,20 @@ export async function createOfflineRecoveryBranch(
     const outbox = new DiscordAwarenessOutbox(store, {
       legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath),
     });
-    // Only a batch's own recovery may make its target branch: a prepared
-    // batch naming this one, left by a run that never made it, would be armed
-    // at the next start by the branch made here. When the journal can't be
-    // read, the recovery goes ahead, as the host's surgeries do.
-    let claimed: ReturnType<DiscordAwarenessOutbox['preparedFor']> = [];
+    // A suppression whose removals are pending for this name, left by a run
+    // that never made its branch, would have them applied to the branch made
+    // here at the next start on it (the framework's
+    // checkDiscordAwarenessBranchName refuses the same set). When the journal
+    // can't be read, the recovery goes ahead, as the host's surgeries do.
+    let claimed: ReturnType<DiscordAwarenessOutbox['pendingSuppressionsFor']> = [];
     try {
-      claimed = outbox.preparedFor(targetBranch);
+      claimed = outbox.pendingSuppressionsFor(targetBranch);
     } catch { /* unreadable: go ahead */ }
     if (claimed.length > 0) {
       throw new Error(
-        `Recovery branch ${targetBranch} is the target of awareness batch ${claimed[0].id}, which is still prepared: ` +
-          'a branch made under that name would arm it at the next start. Cancel the batch first ' +
-          `(--awareness cancel ${claimed[0].id}), or choose another --branch`,
+        `Recovery branch ${targetBranch} is the target of suppression ${claimed[0].id}, whose removals aren't ` +
+          'finished: a start on a branch with that name would apply them there. Choose another --branch. The name ' +
+          'is free once a start finds no branch with it and gives the suppression up',
       );
     }
     const batch = outbox.prepare({
@@ -268,9 +268,10 @@ export async function createOfflineRecoveryBranch(
       // Once the source is confirmed, the batch is retired (discard syncs the
       // restored state before it records that): its surgery never happened.
       // If it can't be confirmed, the batch stays prepared as the body's
-      // record: a start on its target branch completes it (a suppression's
-      // body first), since its body is in effect there, and a start on any
-      // other branch holds it. The error says which, and names the branch.
+      // record: a start on its target branch finishes a suppression's
+      // removals, since its body is in effect there, and a start retires the
+      // batch, none of its marks sent. The error says which, and names the
+      // branch.
       const failure = error instanceof Error ? error.message : String(error);
       let restore = '';
       try {
@@ -284,28 +285,34 @@ export async function createOfflineRecoveryBranch(
       let retire = '';
       if (batch) {
         if (!sourceConfirmed) {
-          retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: a start on ` +
-            `${targetBranch} completes it${suppression.intervals.length > 0 ? ' (its suppression first)' : ''}, ` +
-            'and a start on another branch holds it';
+          retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: ` +
+            (suppression.intervals.length > 0
+              ? `a start on ${targetBranch} finishes its removals and retires it`
+              : 'the next start retires it') + ', none of its marks sent';
         } else {
           try {
             outbox.discard(batch.id);
           } catch (discardError) {
-            // A start holds the batch when its branch exists, and retires it
-            // when this recovery never created that branch (recoverAtStartup).
-            // Until then, a recovery or surgery onto that name, from a later
-            // process that reads the batch, is refused unless it's cancelled.
-            let forked = true;
-            try {
-              forked = store.listBranches().some((branch) => branch.name === targetBranch);
-            } catch { /* unknown: say what a start on an existing branch does, whose cancel is right either way */ }
-            retire = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
+            // None of its marks is ever sent: a start retires it. A
+            // suppression's removals stay pending for its target branch: a
+            // start there finishes them, and a start that finds no such branch
+            // gives them up. Until then, a recovery or surgery onto that name,
+            // from a later process that reads the batch, is refused.
+            const kept = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
-            )}); it stays prepared, and ` + (forked
-              ? `a start on ${sourceBranch} holds it: cancel it then (--awareness cancel ${batch.id}), not release it, ` +
-                'since its messages were never removed'
-              : `the next start retires it, since its surgery never created ${targetBranch}, and until then a branch ` +
-                `with that name is refused unless the batch is cancelled first (--awareness cancel ${batch.id})`);
+            )}); it stays prepared, none of its marks to be sent, until a start retires it`;
+            if (suppression.intervals.length === 0) {
+              retire = kept;
+            } else {
+              let forked = true;
+              try {
+                forked = store.listBranches().some((branch) => branch.name === targetBranch);
+              } catch { /* unknown: say what a start on an existing branch would do */ }
+              retire = `${kept}. Its removals stay pending for ${targetBranch}: ` + (forked
+                ? `a start on ${targetBranch} would finish them there, so delete that branch unless you want that`
+                : 'the next start gives them up, since no branch has that name') +
+                `, and until then a branch named ${targetBranch} is refused`;
+            }
           }
         }
       }

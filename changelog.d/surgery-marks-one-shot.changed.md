@@ -16,35 +16,43 @@
   reconciliation gives up on any. A JSON-RPC error answer, which may come
   after the server acted, is recorded `unknown`. Between opposite requests
   for one reaction, the later authorization wins, whenever each was
-  created. A batch whose surgery was interrupted before its branch switch
-  was recorded is held at startup until an operator releases or cancels
-  it, unless its target branch doesn't exist, and then startup retires it:
-  either its surgery never created that branch, so none of its messages
-  were removed, or the branch was deleted later, which gives up its marks.
-  Until then a rollback, a suppression, an offline recovery or the API's
-  `branch.create` refuses that branch name unless the batch is cancelled
-  first, since a branch made under it would arm the batch; while the
-  journal can't be read, nothing is refused. An interrupted suppression's
-  redactions are resumed whenever its branch is active at startup,
-  independent of what happened to its marks.
+  created.
+- A start never completes a surgery's marks. A batch an interrupted
+  surgery left is retired at the next start, none of its marks sent, with a
+  `discord-awareness-not-scheduled` ops alert that names the surgery, its
+  agent and its branches, and the redo that applies the marks: the surgery
+  again from its source, which still has every message it removed, onto a
+  new branch name. An interrupted suppression's removals are still
+  finished, at the first start on its branch, and its batch is retired
+  then. A suppression whose removals are pending and whose branch doesn't
+  exist (its surgery ended before it created it, or it was deleted) is
+  given up with a `discord-awareness-suppression-unfinished` alert, since
+  its removals apply only there. Until a suppression is finished or given
+  up, a rollback, a suppression, an offline recovery or the API's
+  `branch.create` refuses its branch name, cancelled or not, since a start
+  on a branch made under it would apply those removals there; while the
+  journal can't be read, nothing is refused. A `hide` or turn `undo`
+  records its batch and the batch's activation as one journal entry, so a
+  crash never leaves it half recorded.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch, or the batch a `hide` or turn
   `undo` records after its change) is now written only after that change is
   synced to the store. Previously a crash could keep marks active for a
   rollback the store had lost. If writing a `hide` or turn `undo` batch
   fails, its receipt follows what the journal then holds: a batch that
-  reached the store is activated, retired or reported `unresolved`, never
-  reported `not-scheduled` while it could still be delivered. A write the
-  store took but this process can't read back (Chronicle's periodic sync
-  failing inside an append) leaves the journal refusing every read and write
-  until the store is reopened, and such a receipt says `unresolved`: the next
-  start reads that record with the rest.
+  reached the store is `queued`, one that may have is `unresolved`, and
+  neither is reported `not-scheduled` while it could still be delivered. A
+  write the store took but this process can't read back (Chronicle's
+  periodic sync failing inside an append) leaves the journal refusing every
+  read and write until the store is reopened, and such a receipt says
+  `unresolved`: the next start reads that record with the rest.
 - Awareness delivery no longer holds MCPL traffic. Previously every MCPL data
   plane waited at startup, at reconnect, at a tools list change and after each
   surgery until every queued mark had been attempted, which at Discord's pace
   could leave the resident deaf for minutes. Delivery now runs in the
   background. A route that is not connected keeps its work queued until it
   connects, and a delivery failure raises an ops alert instead of recycling
-  connections. A journal that cannot be read still stops startup, because it
-  also carries the suppression-resume record that protects the agent's
-  context.
+  connections. A journal that cannot be read still stops startup, as does a
+  pre-journal ledger that can't be imported: either can hold a suppression
+  whose removals a start must finish before the agent's context is served,
+  and a start that can't read it can't tell.

@@ -426,6 +426,7 @@ import {
   type DiscordAwarenessPrepareInput,
   type DiscordAwarenessReleaseReceipt,
   type DiscordAwarenessRetractReceipt,
+  type DiscordAwarenessRetirement,
   type DiscordAwarenessScope,
   type DiscordAwarenessSettlement,
 } from './recovery/discord-awareness-outbox.js';
@@ -2238,29 +2239,31 @@ export class AgentFramework {
     framework.providerHoldHook = config.providerHold;
 
     // Startup reconciliation of the awareness journal, before any delivery.
-    // It derives nothing from branch ancestry: a surgery that crashed after
-    // switching to exactly the active branch completes its activation; one
-    // that crashed before it created its branch is retired; any other
-    // prepared batch is held for an operator; an attempt the previous
-    // process left on the wire is recorded unknown. No content is read.
+    // It derives nothing from branch ancestry and activates nothing: a batch
+    // an interrupted surgery left is retired, none of its marks sent, except
+    // a suppression whose removals are pending on a branch that exists, which
+    // a start on that branch finishes (resumePreparedDiscordSuppressions); a
+    // pending suppression whose branch doesn't exist is given up; an attempt
+    // the previous process left on the wire is recorded unknown. No content
+    // is read.
     let recovered: ReturnType<DiscordAwarenessOutbox['recoverAtStartup']>;
     try {
       const branches = new Set(store.listBranches().map((branch) => branch.name));
-      recovered = discordAwarenessOutbox.recoverAtStartup(store.currentBranch().name, (name) => branches.has(name));
+      recovered = discordAwarenessOutbox.recoverAtStartup((name) => branches.has(name));
     } catch (error) {
       // The branch may be safe, but reporting the framework ready while its
       // durable awareness journal is unreadable creates a half-ready host.
       throw new DiscordAwarenessAccountingError('startup reconciliation', error);
     }
-    if (recovered.activated.length > 0 || recovered.held.length > 0 || recovered.retired.length > 0 || recovered.unknownAttempts > 0) {
+    if (recovered.retired.length > 0 || recovered.unknownAttempts > 0) {
+      const gone = recovered.retired.filter((retirement) => retirement.reason === 'branch-gone').length;
       console.error(
-        `[discord-awareness] startup: activated ${recovered.activated.length} interrupted batch(es) ` +
-          `for ${store.currentBranch().name}, held ${recovered.held.length}, ` +
-          `retired ${recovered.retired.length} whose target branch doesn't exist (its surgery never created it, ` +
-          'or it was deleted), ' +
+        `[discord-awareness] startup: retired ${recovered.retired.length - gone} batch(es) an interrupted surgery left, ` +
+          `none of their marks sent; gave up ${gone} suppression(s) whose branch doesn't exist; ` +
           `recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
       );
     }
+    for (const retirement of recovered.retired) framework.reportRetiredAwareness(retirement);
     if (recovered.givenUp > 0) {
       // The alert a delivery pass raises when it gives up on operations:
       // these reached the bound here, with no pass to report them.
@@ -7788,8 +7791,10 @@ export class AgentFramework {
    * After a failed surgery has put the source back: retire its prepared
    * awareness batch, but only when the store is confirmed on the source. If
    * it isn't, the batch stays prepared as the evidence of an unfinished body
-   * (startup resumes or holds it). Never throws: the caller is already
-   * reporting the surgery's failure; returns a clause to append to it.
+   * (a start on its target finishes a suppression's removals). Either way
+   * none of its marks is ever sent: a start retires what this can't.
+   * Never throws: the caller is already reporting the surgery's failure;
+   * returns a clause to append to it.
    */
   private retireAfterRestore(
     batch: DiscordAwarenessBatch | null,
@@ -7797,33 +7802,36 @@ export class AgentFramework {
     agentName: string,
   ): string {
     if (!batch) return '';
+    const suppression = !!batch.suppressionIntervals?.length;
     if (this.store.currentBranch().name !== sourceBranch) {
-      return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: a start on ` +
-        `${batch.targetBranch} completes it${batch.suppressionIntervals?.length ? ' (its suppression first)' : ''}, ` +
-        'and a start on another branch holds it';
+      return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: ` + (suppression
+        ? `a start on ${batch.targetBranch} finishes its removals and retires it`
+        : 'the next start retires it') + ', none of its marks sent';
     }
     try {
       this.discordAwarenessOutbox.discard(batch.id);
       return '';
     } catch (error) {
       const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
-      // Its surgery didn't happen, so its messages are still in context: a
-      // release would mark them. A start holds the batch, for the operator to
-      // cancel, when its branch exists, and retires it when its surgery never
-      // created that branch (recoverAtStartup). Until then a branch made
-      // under that name would arm it: while this process can read the batch,
+      const kept = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, none of its marks ` +
+        'to be sent, until a start retires it';
+      if (!suppression) return `; ${kept}`;
+      // A suppression's removals stay pending for its target branch: a start
+      // there finishes them, and a start that finds no such branch gives
+      // them up. Until then a branch made under that name would have them
+      // applied: while this process can read the batch,
       // checkDiscordAwarenessBranchName refuses one, and when it can't, the
       // operator is told to use another name.
       let forked = true;
       try {
         forked = this.store.listBranches().some((branch) => branch.name === batch.targetBranch);
-      } catch { /* unknown: say what a start on an existing branch does, whose cancel is right either way */ }
-      const what = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, and ` + (forked
-        ? `a start on ${sourceBranch} holds it: cancel it then, not release it, since its messages were never removed`
-        : `the next start retires it, since its surgery never created ${batch.targetBranch}, ` + (this.discordAwarenessOutbox.readable
-          ? 'and until then a branch with that name is refused unless the batch is cancelled first'
-          : `and until then a branch named ${batch.targetBranch} would arm it, so use another name`));
-      this.opsAlert('discord-awareness-unresolved', agentName, `A failed surgery's ${what}`, { data: { batchId: batch.id } });
+      } catch { /* unknown: say what a start on an existing branch would do */ }
+      const what = `${kept}. Its removals stay pending for ${batch.targetBranch}: ` + (forked
+        ? `a start on ${batch.targetBranch}, which is kept, would finish them there, so delete that branch unless you want that`
+        : `the next start gives them up, since no branch has that name`) + (this.discordAwarenessOutbox.readable
+        ? `, and until then a branch named ${batch.targetBranch} is refused`
+        : `, and until then a branch named ${batch.targetBranch} would have them applied, so use another name`);
+      this.opsAlert('discord-awareness-unresolved', agentName, `A failed suppression's ${what}`, { data: { batchId: batch.id } });
       return `; ${what}`;
     }
   }
@@ -7914,8 +7922,7 @@ export class AgentFramework {
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
       }
-      // A known collision is refused before any intent is prepared: a batch
-      // whose target names an existing branch would be armed by starting it.
+      // A known collision is refused before anything is prepared.
       if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
         throw new OperatorActionError('invalid', `Rollback branch ${targetBranch} already exists`);
       }
@@ -7929,11 +7936,11 @@ export class AgentFramework {
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
       try {
-        // Prepare the external side effect before switching Chronicle. If the
-        // process dies after the switch but before activate(), startup
-        // promotes this batch by matching targetBranch to the active branch.
-        // If the fork/switch itself throws, the batch is retired so it cannot
-        // arm a later branch that happens to reuse the name.
+        // Record the marks choice before switching Chronicle. If the process
+        // dies after the switch but before activate(), the next start retires
+        // the batch, none of its marks sent, and its alert names the redo: a
+        // start never completes a surgery's marks. If the fork or switch
+        // itself throws, the batch is retired here.
         const markerBatch = this.prepareMarkerBatch('Rollback', {
           agentName,
           sourceBranch,
@@ -8286,11 +8293,14 @@ export class AgentFramework {
   }
 
   /**
-   * Refuse a name for a new branch that a prepared awareness batch, not
-   * cancelled, names as its target (`OperatorActionError`, `invalid`, naming
-   * the batch). Startup completes a prepared batch whose target is the active
-   * branch, and only the batch's own surgery may make that branch: one made
-   * under its name by anything else would mark messages it never removed.
+   * Refuse a name for a new branch that a suppression with pending removals
+   * names as its target (`OperatorActionError`, `invalid`, naming the batch):
+   * a start on a branch with that name finishes those removals there, so a
+   * branch made under it by anything but that suppression's own surgery
+   * would lose those messages. The claim is the set startup resumes
+   * (DiscordAwarenessOutbox.pendingSuppressionsFor), cancelled and imported
+   * batches included, and it ends once a start on that branch finishes the
+   * suppression, or a start finds no branch with its name and gives it up.
    * Rollback and suppression check their target with it, and the API's
    * `branch.create` checks its name; a host that creates branches in the
    * store itself calls it first. When the journal can't be read, it refuses
@@ -8299,15 +8309,16 @@ export class AgentFramework {
   checkDiscordAwarenessBranchName(name: string): void {
     let claimed: DiscordAwarenessBatch[];
     try {
-      claimed = this.discordAwarenessOutbox.preparedFor(name);
+      claimed = this.discordAwarenessOutbox.pendingSuppressionsFor(name);
     } catch {
       return;
     }
     if (claimed.length === 0) return;
     throw new OperatorActionError(
       'invalid',
-      `Branch ${name} is the target of awareness batch ${claimed[0].id}, which is still prepared: a branch made ` +
-        'under that name would arm it at the next start. Cancel the batch first, or choose another name',
+      `Branch ${name} is the target of suppression ${claimed[0].id}, whose removals aren't finished: a start on a ` +
+        `branch with that name would apply them there. Choose another name. ${name} is free once a start on it ` +
+        'finishes the suppression, or a start finds no branch with that name and gives the suppression up',
     );
   }
 
@@ -8343,7 +8354,8 @@ export class AgentFramework {
     return receipt;
   }
 
-  /** Release a held batch's recorded operations, explicitly. */
+  /** Release a held batch (an imported ledger's undelivered work): queue its
+   *  recorded operations, explicitly. */
   releaseDiscordAwareness(
     batchId: string,
     opts: { requester?: OperatorRequester; note?: string } = {},
@@ -8394,16 +8406,15 @@ export class AgentFramework {
    * activated is retired, so no later start can deliver it behind a receipt
    * saying it was not scheduled (`not-scheduled`). If retiring fails too,
    * the receipt says only that the outcome is `unresolved`: the batch is
-   * retained, and it may still be delivered. The next start completes
-   * it if its target branch is active then (a suppression's after resuming
-   * its body), and holds it otherwise; nothing before a restart does.
+   * retained, and its marks go out only if its activation reached the store
+   * unseen; otherwise the next start retires it, unsent.
    *
    * A batch with no refs (a suppression journal with nothing addressable) is
    * still activated, which closes its resume journal. It schedules no marks,
    * so it reports `none` whatever the ledger does, and a failure is logged.
    * If it can be neither activated nor retired, its journal is left prepared
    * and closes at the next start on its branch: every interval it names has
-   * already committed, so the resume skips them all and activates it.
+   * already committed, so the resume skips them all and retires it.
    */
   private activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,
@@ -8420,7 +8431,7 @@ export class AgentFramework {
       if (settled.status !== 'queued') {
         const left = settled.status === 'not-scheduled'
           ? 'it was retired instead, so nothing is left to resume'
-          : 'it stays prepared: a start on this branch finds its removals applied and closes it, a start on another holds it';
+          : 'it stays prepared, and a start on this branch finds its removals applied and closes it';
         const message = `${verb} applied, but its resume journal (awareness batch ${batch.id}, no marks) ` +
           `could not be closed (${settled.error}); ${left}`;
         console.error(`[discord-awareness] agent=${agentName}: ${message}`);
@@ -16330,8 +16341,17 @@ export class AgentFramework {
     await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
   }
 
+  /**
+   * Finish the removals of every suppression pending on the active branch
+   * (an interrupted surgery's, or an imported ledger's not known complete),
+   * and record each complete. A batch its interrupted surgery left prepared
+   * is retired with it, none of its marks sent, and reported with the redo
+   * that applies them (reportRetiredAwareness): a start never completes a
+   * surgery's marks. An interval whose messages are only partly present
+   * can't be finished safely, and stops the start.
+   */
   private async resumePreparedDiscordSuppressions(): Promise<void> {
-    const batches = this.discordAwarenessOutbox.preparedSuppressionsForBranch(
+    const batches = this.discordAwarenessOutbox.pendingSuppressionsFor(
       this.store.currentBranch().name,
     );
     for (const batch of batches) {
@@ -16355,18 +16375,65 @@ export class AgentFramework {
         if (interval.fromId === interval.toId) cm.removeMessage(from.id);
         else cm.removeMessages(from.id, to.id);
       }
-      if (batch.status === 'prepared' && !batch.cancelled) {
-        // Crash completion of the surgery itself: body, then its marks.
-        this.discordAwarenessOutbox.activate(batch.id);
-        console.error(`[discord-awareness] resumed suppression batch ${batch.id}`);
+      // The body is the surgery's own effect, which the operator chose: it
+      // is finished. Marks wait on no crash: a prepared batch is retired.
+      const { retired } = this.discordAwarenessOutbox.completeSuppression(batch.id);
+      if (retired) {
+        this.reportRetiredAwareness({
+          batchId: batch.id,
+          agentName: batch.agentName,
+          sourceBranch: batch.sourceBranch,
+          targetBranch: batch.targetBranch,
+          marks: batch.cancelled ? 0 : batch.refs.length,
+          suppression: true,
+          reason: 'interrupted',
+        }, { finished: true });
       } else {
-        // Body integrity only. Its marks are the operator's: held at an
-        // earlier startup, released, or cancelled; a branch becoming active
-        // never changes them.
-        this.discordAwarenessOutbox.recordSuppressionComplete(batch.id);
+        // An imported batch: its marks are the operator's, as they were.
         console.error(`[discord-awareness] completed suppression body ${batch.id} (marks ${batch.status})`);
       }
     }
+  }
+
+  /**
+   * Report a batch a start retired, or whose suppression body it gave up,
+   * with the redo that applies what was lost: the surgery again from its
+   * source, which still has every message it removed, onto a new branch
+   * name, choosing marks again (framework.switchBranch, then
+   * rollbackToMessage or suppressMessages; offline, the recover CLI). One
+   * with marks not applied, or a body given up, raises an ops alert; one
+   * with neither (no marks chosen, or its marks cancelled, and its body
+   * finished) is only logged.
+   */
+  private reportRetiredAwareness(retirement: DiscordAwarenessRetirement, opts: { finished?: boolean } = {}): void {
+    const { batchId, agentName, sourceBranch, targetBranch, marks } = retirement;
+    const surgery = retirement.suppression ? 'suppression' : 'rollback';
+    const about = `The ${surgery} of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ${batchId})`;
+    const redo = `switch to ${sourceBranch}, which still has every message it removed, and redo the ${surgery} there, ` +
+      'onto a new branch name';
+    const unmarked = `Its ${marks} awareness mark(s) weren't applied, since a start never completes a surgery's marks. `;
+    if (retirement.reason === 'branch-gone') {
+      this.opsAlert(
+        'discord-awareness-suppression-unfinished',
+        agentName,
+        `${about} wasn't finished: ${targetBranch} doesn't exist (its surgery ended before it created it, or it ` +
+          'was deleted), and its removals apply only there, so none of them is in effect. ' +
+          `${marks > 0 ? unmarked : ''}To apply it, ${redo}${marks > 0 ? ', with its marks' : ''}`,
+        { data: { batchId, marks } },
+      );
+      return;
+    }
+    const body = opts.finished ? `; this start finished its removals on ${targetBranch}` : '';
+    if (marks === 0) {
+      console.error(`[discord-awareness] ${about} was interrupted${body}. It is retired, with no marks to apply`);
+      return;
+    }
+    this.opsAlert(
+      'discord-awareness-not-scheduled',
+      agentName,
+      `${about} was interrupted${body}. ${unmarked}To apply them, ${redo}, with its marks`,
+      { data: { batchId, marks } },
+    );
   }
 
   /**

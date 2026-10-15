@@ -552,8 +552,9 @@ export class ApiServer {
       throw new Error('name is required');
     }
 
-    // A name a prepared awareness batch names would arm that batch at the
-    // next start: refused here as in the framework's surgeries.
+    // A name a suppression with pending removals names: a start on a branch
+    // made under it would apply them there. Refused here as in the
+    // framework's surgeries.
     this.framework.checkDiscordAwarenessBranchName(params.name);
     const store = this.framework.getStore();
     store.createBranch(params.name);

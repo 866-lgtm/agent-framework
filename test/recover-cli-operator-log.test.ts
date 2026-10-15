@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -118,10 +118,18 @@ test('--dry-run with an awareness control is refused before the store opens: not
       agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all',
     })!;
     outbox.activate(active.id);
-    const held = outbox.prepare({
-      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/interrupted', refs: [ref('m2')], scope: 'all',
-    })!;
-    outbox.recoverAtStartup('main'); // its switch was never recorded: held
+    // Only an import holds a batch: a pre-journal ledger's undelivered work.
+    const legacyPath = join(storePath, 'recovery', 'discord-awareness-outbox.json');
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({
+      version: 2,
+      batches: [{
+        id: 'held-1', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/interrupted',
+        emoji: '💤', createdAt: 1, refs: [{ ...ref('m2'), desired: false, markerPresent: false, deliveryStatus: 'applied' }],
+      }],
+    }));
+    new DiscordAwarenessOutbox(store, { legacyPath }).batches();
+    const held = { id: 'held-1' };
     store.close();
     const before = journal();
     const heldView = before.view.find((v) => v.id === held.id);

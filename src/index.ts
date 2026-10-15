@@ -157,6 +157,7 @@ export type {
   DiscordAwarenessReleaseAction,
   DiscordAwarenessReleaseReceipt,
   DiscordAwarenessRetractReceipt,
+  DiscordAwarenessRetirement,
   DiscordAwarenessScope,
   DiscordAwarenessSettlement,
   DiscordSuppressionInterval,
