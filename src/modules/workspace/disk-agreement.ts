@@ -137,9 +137,10 @@ export class DiskAgreement {
   private readonly mounts = new Map<string, MountEvidence>();
   private configured: Array<{ name: string; root: string }> = [];
   /**
-   * An append (or a rebuild) not yet made durable. Cleared only by a
-   * barrier that succeeds, so a failed barrier stays owed: a later pass with
-   * nothing new to record still settles it before deciding anything.
+   * An append of evidence (or a rebuild) not yet made durable. Cleared only
+   * by a barrier that succeeds, so a failed barrier stays owed: a later pass
+   * with nothing new to record still settles it before deciding anything. A
+   * place owes none (recordWalk).
    */
   private unsynced = false;
 
@@ -279,6 +280,8 @@ export class DiskAgreement {
    * that's lost costs coverage, never a decision: an append that didn't land
    * loses one, and a checkpoint written by a version that doesn't keep them
    * (0.22) loses them all, and each scope's walks start at its top again.
+   * So recording one owes no barrier: a pass that moves only its place makes
+   * no store sync, and the place becomes durable with the next one.
    */
   recordWalk(mount: string, scope: string, after: string | null): void {
     if ((this.walkResumesAfter(mount, scope) ?? null) === after) return;
@@ -319,7 +322,9 @@ export class DiskAgreement {
 
   private write(entry: JournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {
     this.ensureReconciled();
-    this.unsynced = true; // until proven durable: a failed append may still have landed
+    // Evidence is owed a barrier until proven durable: a failed append may
+    // still have landed. A place isn't (recordWalk).
+    if (entry.t !== 'walk') this.unsynced = true;
     this.journal.append(entry, opts);
     if (opts.durable) this.unsynced = false; // synced after this append, and so everything before it
     const mount = this.mounts.get((entry as { mount: string }).mount);

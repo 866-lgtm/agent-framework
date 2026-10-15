@@ -168,10 +168,11 @@ export interface PassOptions {
   /** Walk cap for directory scopes; the mount's `walkCap` when absent. */
   cap?: number;
   /**
-   * A recursive directory pass of a sync or scan: its walk resumes after the
-   * last entry the previous one of this scope took, and records where it
-   * stopped, so repeated passes cover a scope larger than the cap. A
-   * listing's pass starts at its scope's start.
+   * A recursive directory pass of a sync or a catch-up scan: its walk resumes
+   * after the last entry the previous one of this scope took, and records
+   * where it stopped, so repeated passes cover a scope larger than the cap.
+   * A listing's pass, and an agent-action scan's, start at their scope's
+   * start and record no place.
    */
   resume?: boolean;
   /**
@@ -818,12 +819,12 @@ export async function reconcilePass(
   // Where the walk stopped, once what it observed is decided: the next pass
   // of this scope resumes after it, or starts afresh once this one covered
   // the scope. A walk that couldn't list its scope's own directory covered
-  // none of it, and leaves the place as it was. Like evidence, a place is
-  // recorded after the root it was gathered under.
+  // none of it, and leaves the place as it was. Unlike evidence, a place
+  // binds no root: it only says where the next walk starts, and that walk
+  // takes its turn after it in whatever directory is the root by then.
   let resumeAfter: string | null | undefined;
   if (opts.resume && walk && scope.kind === 'dir' && scope.recursive && walk.complete.has(scope.dir)) {
     resumeAfter = walk.stoppedAfter ?? null;
-    if (gathered.rootIdentity) agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
     agreement.recordWalk(mount.name, scope.dir, resumeAfter);
   }
 
@@ -851,9 +852,14 @@ export async function reconcilePass(
   if (walk) {
     const tracked = [...result.reports.values()].filter((r) => r.state === 'unverified').map((r) => r.path);
     if (typeof resumeAfter === 'string' && scope.kind === 'dir') {
+      // A whole mount's catch-up scan takes turns with its syncs; nothing
+      // else moves a place.
+      const next = scope.dir === ''
+        ? 'the next sync of the mount, or its catch-up scan if that comes first,'
+        : 'the next sync of this directory';
       result.incomplete.push({
         path: scope.dir,
-        reason: `the walk cap (${opts.cap ?? mount.walkCap}) was reached: the next sync or scan of this scope resumes after ${mount.name}/${resumeAfter}`,
+        reason: `the walk cap (${opts.cap ?? mount.walkCap}) was reached: ${next} resumes after ${mount.name}/${resumeAfter}`,
       });
     }
     for (const region of walk.incomplete) {

@@ -22,7 +22,9 @@ export interface MountConfig {
    * - 'on-agent-action': after each completed agent tool batch, the mount is
    *   scanned, and the agent's next inference waits for that scan up to
    *   `agentActionScanDeadlineMs`; a scan that takes longer finishes while
-   *   the round goes on
+   *   the round goes on. Each scan walks from the mount's start, so on a
+   *   mount over its `walkCap` it covers the first `walkCap` entries every
+   *   time, and files past them come in as `walkCap` describes
    * - 'never': no background reads; listings and lazy reads still observe
    *   the paths they show
    */
@@ -46,13 +48,20 @@ export interface MountConfig {
    * The most entries one walk of this mount takes (default: 5000), a
    * positive integer no larger than Number.MAX_SAFE_INTEGER: files, and
    * links or other entries that aren't
-   * directories, each of which the pass observes. A sync or scan that
-   * reaches it reports the rest as incomplete, and the next sync or scan of
-   * the same scope resumes after the last entry it took, wrapping to the
-   * start, so repeated ones cover a larger mount; a restart keeps the place.
-   * A listing (`ls`, `glob`, `grep`) takes up to it from its scope's start.
-   * Each directory's listing is read whole, so a deletion is seen wherever
-   * the walk lists, whatever it took.
+   * directories, each of which the pass observes. A sync, or the mount's
+   * catch-up scan (at start, and when its watcher reattaches), that reaches
+   * it reports the rest as incomplete, and the next one of the same scope
+   * resumes after the last entry it took, wrapping to the start, so repeated
+   * ones cover a larger mount; a whole mount's catch-up scan takes turns
+   * with its syncs, and a restart keeps the place. An agent-action scan
+   * (`watch: 'on-agent-action'`) and a listing (`ls`, `glob`, `grep`) take
+   * up to it from their scope's start every time. Each directory's listing
+   * is read whole, so a deletion is seen wherever the walk lists, whatever
+   * it took.
+   *
+   * It bounds what a walk observes, not the walk's own work: directories
+   * don't count against it, and each one the walk visits is read whole, so
+   * a tree of many directories that hold nothing is walked in full.
    */
   walkCap?: number;
   /**

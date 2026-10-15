@@ -1224,8 +1224,10 @@ export class WorkspaceModule implements Module {
         name: 'sync',
         description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
           + 'rechecked and nothing pending in the workspace is discarded. A sync takes up to the mount\'s walk '
-          + 'cap of entries, files, links and the like (5000 unless configured); past it, what this one didn\'t reach is listed under '
-          + '`incomplete`, and the next sync of the same mount or directory resumes where it stopped. With a '
+          + 'cap of entries, files, links and the like (5000 unless configured). Past it, what this one didn\'t reach is listed under '
+          + '`incomplete`, and the walk takes turns: the next sync of the same mount or directory picks up where '
+          + 'the last turn stopped, so repeated syncs cover it all. A mount\'s own catch-up scan, at start or when '
+          + 'its watcher reattaches, takes turns with its whole-mount syncs. With a '
           + 'path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
@@ -3004,7 +3006,10 @@ export class WorkspaceModule implements Module {
    * After an agent's completed tool batch, before anything continues its turn:
    * scan every `watch: 'on-agent-action'` mount, so what the batch's tools did
    * on disk (a shell command's files, a deletion) is in the workspace when the
-   * agent next looks. A scan that outlasts the deadline stops holding the
+   * agent next looks. On a mount over its walkCap, that holds for the first
+   * walkCap entries in the walk's order, which every batch's scan takes; files
+   * past them come in through the syncs, catch-up scans and listings that
+   * reach them. A scan that outlasts the deadline stops holding the
    * round: the miss is recorded on the mount's status and pushed as a
    * `workspace:agent-action-scan-incomplete` event, and the scan continues,
    * deciding on the branch selected when it applies.
@@ -3073,7 +3078,11 @@ export class WorkspaceModule implements Module {
     const scan: AgentActionScan = { late: false, settled: Promise.resolve() };
     const pass = this.withMount(mount, () => {
       if (mount.agentActionScanWaiting === scan) mount.agentActionScanWaiting = undefined;
-      return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { resume: true });
+      // From the mount's start, as a listing walks, keeping no place: on a
+      // mount over its walkCap, every batch's scan takes the first walkCap
+      // entries in the walk's order, and the place that syncs and catch-up
+      // scans resume from stays theirs.
+      return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
     });
     scan.settled = pass.then(
       (result) => {
