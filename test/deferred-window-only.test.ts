@@ -436,6 +436,81 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
+  /** A store listener that throws once, after the record with this text is
+   *  written: the write throws though its message is stored. */
+  function throwOnceAfterStoring(framework: AgentFramework, textOf: string): void {
+    let thrown = false;
+    framework.getAgent('assistant')!.getContextManager().onMessage((event) => {
+      if (thrown || event.type !== 'add') return;
+      if (!event.message.content.some((b) => (b as { text?: string }).text === textOf)) return;
+      thrown = true;
+      throw new Error('listener failed');
+    });
+  }
+
+  it('at a tool boundary, a write that throws after its message is stored counts as stored: injected, and not stored again', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'look left');
+    module.interjections = [
+      { participant: 'Antra', content: text('look left') },
+      { participant: 'Antra', content: text('look right') },
+    ];
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.deepEqual(injected(), ['Antra: look left', 'Antra: look right'], 'the stored copy is carried too');
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: look left',
+      'Antra: look right',
+      'assistant: Done.',
+    ], 'stored once, where the stream carried it');
+    assert.ok(errors.some((e) => e.includes("threw after it was stored; it counts as written and isn't stored again")
+      && e.includes('listener failed')), errors.join('\n'));
+    await framework.stop();
+  });
+
+  it('at the turn end, a write that throws after its message is stored is not queued again', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'look left');
+    // Held behind a message named as the agent, both wait for the turn end.
+    module.interjections = [
+      { participant: 'assistant', content: text('my own words') },
+      { participant: 'Antra', content: text('look left') },
+    ];
+    const error = console.error;
+    console.error = () => {};
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
+    await framework.stop(); // stop() lands whatever is still queued
+
+    const reopened = await createFramework();
+    assert.deepEqual(windowOf(reopened).slice(2), [
+      'user: <tool_result>',
+      'assistant: Done.',
+      'assistant: my own words',
+      'Antra: look left',
+    ], 'stored once, at the turn end');
+    await reopened.stop();
+  });
+
   it("a queued tool_use whose store throws keeps its tool_result from being stored alone", async () => {
     const framework = await createFramework();
     const internals = internalsOf(framework);

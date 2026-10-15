@@ -8696,13 +8696,12 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
-            // stored is injected (the round's results go on either way).
-            const storedIds = new Map<DeferredWrite, MessageId>();
-            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) => {
-              storedIds.set(msg, agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-            });
-            for (const msg of stored) {
-              const id = storedIds.get(msg)!;
+            // stored is injected (the round's results go on either way). A
+            // write that threw after its message was stored counts as stored,
+            // so that copy is injected too (writeDrainedInOrder).
+            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
+              agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
+            for (const [msg, id] of stored) {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
@@ -11462,16 +11461,10 @@ export class AgentFramework {
         // drain cuts there, and it and what follows stay queued, in order
         // (writeDrainedInOrder). What was stored is weighed for the turn now
         // starting and for every other resident's open turn.
-        const storedIds = new Map<DeferredWrite, MessageId>();
-        const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `turn-start flush for ${agent.name}`, (msg) => {
-          const id = agent.getContextManager().addMessage(
-            msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
-          );
-          storedIds.set(msg, id);
+        const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `turn-start flush for ${agent.name}`, (msg) =>
+          agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
+        for (const [msg, id] of stored) {
           this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
-        });
-        for (const msg of stored) {
-          const id = storedIds.get(msg)!;
           this.noteArrival(agent.name, msg.metadata, id);
           this.noteForOtherResidents(agent, msg.metadata, id);
         }
@@ -15349,34 +15342,92 @@ export class AgentFramework {
    * cycle are all idle and the host isn't quiesced. So an entry that keeps
    * failing holds only what is deferred behind it.
    *
-   * Returns what was written (stored, or deferred again by addMessage), in
-   * queue order: for one target, a prefix of its entries.
+   * A write can throw after its message is stored: a store listener, the
+   * strategy's handling of the add, or a later shard of a sharded body can
+   * throw once the record is written. Before an entry that threw is put
+   * back, its target's store is read from where it stood before the write,
+   * for the entry's `deferredWriteId`. A copy found there counts as written,
+   * under its stored id, so the entry isn't requeued and stored a second
+   * time. (Written through readdDrained, such a copy misses the notes
+   * addMessage takes after a store, as any write that throws after storing
+   * does. The tool boundary and the turn-start flush note what is returned.)
+   *
+   * Returns what was written (stored, or deferred again by addMessage, whose
+   * id is then empty), in queue order: for one target, a prefix of its
+   * entries.
    */
-  private writeDrainedInOrder(entries: DeferredWrite[], where: string, write: (msg: DeferredWrite) => void): DeferredWrite[] {
+  private writeDrainedInOrder(
+    entries: DeferredWrite[],
+    where: string,
+    write: (msg: DeferredWrite) => MessageId,
+  ): Map<DeferredWrite, MessageId> {
     const ordered = [...entries].sort(bySeq);
     const targetOf = (msg: DeferredWrite): string | null => msg.forAgent ?? this.primaryAgentName;
     const cut = new Set<string | null>();
-    const written: DeferredWrite[] = [];
+    const written = new Map<DeferredWrite, MessageId>();
     for (let i = 0; i < ordered.length; i++) {
       const msg = ordered[i]!;
       const target = targetOf(msg);
       if (cut.has(target)) continue;
+      const before = this.storedCountOf(target);
       try {
-        write(msg);
-        written.push(msg);
+        written.set(msg, write(msg));
       } catch (error) {
+        const copy = before === undefined ? undefined : this.storedCopyOf(target!, before, msg.id);
+        if (copy !== undefined) {
+          written.set(msg, copy);
+          this.logDeferredWriteError(msg, where, error, true);
+          continue;
+        }
         cut.add(target);
         this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
-        this.logStuckDeferredWrite(msg, where, error);
+        this.logDeferredWriteError(msg, where, error, false);
       }
     }
     return written;
   }
 
-  /** The line naming a drained write that couldn't be stored. The entries are
-   *  already back in the queue, and logging mustn't fail the flush that met
-   *  it, so a thrown value that has no text is named as such. */
-  private logStuckDeferredWrite(msg: DeferredWrite, where: string, error: unknown): void {
+  /** How many messages the agent's store holds: undefined when no such agent
+   *  is registered, or its store can't say. */
+  private storedCountOf(agentName: string | null): number | undefined {
+    const agent = agentName ? this.agents.get(agentName) : undefined;
+    if (!agent) return undefined;
+    try {
+      const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
+      return typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The id of the message carrying `deferredWriteId` among those the agent's
+   *  store gained from position `from` on, read without blobs, if there is
+   *  one. For a sharded body, its first shard. */
+  private storedCopyOf(agentName: string, from: number, deferredWriteId: string): MessageId | undefined {
+    const agent = this.agents.get(agentName);
+    if (!agent) return undefined;
+    try {
+      const cm = agent.getContextManager() as unknown as {
+        getMessageCount?: () => number;
+        getMessageWindow?: (o: number, l: number, opts?: { resolveBlobs?: boolean }) =>
+          { messages: Array<{ id: MessageId; metadata?: Record<string, unknown> }> };
+        getAllMessages: () => Array<{ id: MessageId; metadata?: Record<string, unknown> }>;
+      };
+      const gained = typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function'
+        ? cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from), { resolveBlobs: false }).messages
+        : cm.getAllMessages().slice(from);
+      return gained.find((m) => m.metadata?.deferredWriteId === deferredWriteId)?.id;
+    } catch (error) {
+      console.error(`[deferral] could not read ${agentName}'s store for a deferred write that threw:`, error);
+      return undefined;
+    }
+  }
+
+  /** The line naming a drained write that threw: one that couldn't be stored,
+   *  which is already back in the queue, or one whose message was stored
+   *  before the throw. Logging mustn't fail the flush that met it, so a thrown
+   *  value that has no text is named as such. */
+  private logDeferredWriteError(msg: DeferredWrite, where: string, error: unknown, stored: boolean): void {
     let reason: string;
     try {
       reason = error instanceof Error ? error.message : String(error);
@@ -15385,8 +15436,11 @@ export class AgentFramework {
     }
     console.error(
       `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
-      `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} could not be stored; it stays queued, ` +
-      `holding what is queued behind it for that agent: ${reason}`,
+      `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
+      (stored
+        ? `threw after it was stored; it counts as written and isn't stored again: `
+        : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
+      reason,
     );
   }
 
@@ -15394,14 +15448,14 @@ export class AgentFramework {
    *  it again, in queue order and cut per target (writeDrainedInOrder). With
    *  `bypassDeferral`, each is stored past its target's deferral (stop()). */
   private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
-    return this.writeDrainedInOrder(entries, where, (msg) => {
+    return [...this.writeDrainedInOrder(entries, where, (msg) => {
       const target = msg.forAgent ?? this.primaryAgentName;
-      this.addMessage(msg.participant, msg.content, msg.metadata, {
+      return this.addMessage(msg.participant, msg.content, msg.metadata, {
         fromQueue: { id: msg.id, seq: msg.seq },
         ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
         ...(opts?.bypassDeferral && target ? { bypassDeferralFor: target } : {}),
       });
-    });
+    }).keys()];
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
