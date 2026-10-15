@@ -9,7 +9,7 @@ import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
-async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolCall) => Promise<ToolResult>) {
+async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolCall) => Promise<ToolResult>, deferModule = false) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-allowed-tools-'));
   const membrane = new MockMembrane();
   const effects: ToolCall[] = [];
@@ -37,7 +37,7 @@ async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolC
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'Test', ...config }],
-    modules: [module], syncIntervalMs: 0, codeExecution: { enabled: true },
+    modules: deferModule ? [] : [module], syncIntervalMs: 0, codeExecution: { enabled: true },
     conversations: { templateAgent: 'assistant', bind: { channel: 'mention' } },
   });
   const traces: Array<Record<string, unknown>> = [];
@@ -53,11 +53,12 @@ async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolC
   // Use the real emitter with an in-memory observer, without an MCPL process.
   const internal = framework as unknown as {
     toolLifecycleEmitter: ToolLifecycleEmitter;
+    getToolsForAgent(name: string): ReturnType<AgentFramework['getAllTools']>;
     dispatchScriptToolCall(agent: string, tool: string, input: Record<string, unknown>): Promise<ToolResult>;
   };
   internal.toolLifecycleEmitter = emitter;
   return {
-    framework, membrane, effects, traces, lifecycle, emitter, internal,
+    framework, membrane, effects, traces, lifecycle, emitter, internal, module,
     moduleCall: (call: ToolCall) => moduleContext.callTool(call),
     async turn(calls: ToolCall[]) {
       membrane.pushResponse(createMockResponse(calls.map((call) => ({
@@ -353,7 +354,7 @@ for (const route of ['model', 'public', 'script'] as const) {
   });
 }
 
-for (const allowedTools of [['utils', 'probe--allowed_util'], ['utils'], 'all'] as AgentConfig['allowedTools'][]) {
+for (const allowedTools of [['utils', 'probe--allowed_util'], 'all'] as AgentConfig['allowedTools'][]) {
   test(`utility list and describe expose only executable names: ${JSON.stringify(allowedTools)}`, async () => {
     const h = await harness({ allowedTools });
     const call = (input: unknown) => h.framework.executeToolCall({ id: 'utility', name: 'utils', input, callerAgentName: 'assistant' });
@@ -464,7 +465,7 @@ test('script in flight cannot gain legacy permissions when its ephemeral run dis
     assert.equal(h.framework.getAgent(created.agent.name), null);
     release();
     const result = await script; assert.equal(result.success, true);
-    assert.match((result.data as { stdout: string }).stdout, /not permitted.*allowedTools/);
+    assert.match((result.data as { stdout: string }).stdout, /not a running agent.*only while registered/);
     assert.deepEqual(h.effects.map(call => call.input), [{phase: 'barrier'}]);
     assert.equal(h.emitter.openCount, 0);
     assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
@@ -502,4 +503,176 @@ test('public utility catalogue preserves names and the collapsed model surface',
     utilities.pop();
     assert.equal(framework.getAllUtilities().length, 2);
   } finally { await h.close(); }
+});
+
+
+for (const allowedTools of [['utils'], ['utils', 'probe--allowed']]) {
+  test(`empty permitted utility surface reports migration once: ${JSON.stringify(allowedTools)}`, async () => {
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args) => {
+      const line = args.join(' ');
+      if (!line.startsWith('[deprecated]')) warnings.push(line);
+    };
+    const h = await harness({ allowedTools });
+    try {
+      assert.equal(warnings.length, 1, 'resident warns after initial modules register');
+      assert.match(warnings[0], /assistant.*2 registered.*none permitted.*allowedTools.*module--utility/);
+      assert.ok(h.framework.getAllTools().some(tool => tool.name === 'utils'), 'global catalogue is unchanged');
+      for (let i = 0; i < 2; i++) {
+        assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
+        assert.ok(!(await h.framework.previewActivation('assistant')).tools?.some(tool => tool.name === 'utils'));
+      }
+      const call = (input: unknown) => h.framework.executeToolCall({ id: 'empty-utilities', name: 'utils', input, callerAgentName: 'assistant' });
+      const listed = await call({ action: 'list' });
+      assert.equal(listed.success, false); assert.equal(listed.isError, true);
+      assert.match(listed.error!, /2 registered.*0 permitted.*none permitted.*allowedTools.*module--utility/);
+      assert.equal(listed.data, undefined, 'empty permission diagnostic uses existing failure shape');
+      const unknown = await call({ action: 'describe', name: 'missing' });
+      assert.equal(unknown.isError, true);
+      assert.match(unknown.error!, /2 registered.*0 permitted.*none permitted.*allowedTools/);
+      assert.ok(!JSON.stringify(unknown).includes('probe--denied_util'), 'unknown diagnostics reveal no denied names');
+      assert.ok(!JSON.stringify(unknown).includes('Inert utility counter'));
+      assert.equal(warnings.length, 1, 'repeat surfaces do not repeat the warning');
+      assert.deepEqual(h.effects, []);
+    } finally { await h.close(); console.warn = warn; }
+  });
+}
+
+test('zero-module snapshots do not consume the later utility migration warning', async () => {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args) => {
+      const line = args.join(' ');
+      if (!line.startsWith('[deprecated]')) warnings.push(line);
+    };
+  const h = await harness({ allowedTools: ['utils'] }, undefined, true);
+  try {
+    assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
+    assert.deepEqual(warnings, []);
+    const empty = await h.framework.executeToolCall({ id: 'no-utilities', name: 'utils', input: { action: 'list' }, callerAgentName: 'assistant' });
+    assert.equal(empty.success, true); assert.deepEqual(empty.data, []);
+    await h.framework.addModule(h.module);
+    assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
+    h.internal.getToolsForAgent('assistant');
+    assert.equal(warnings.length, 1); assert.match(warnings[0], /assistant.*2 registered/);
+  } finally { await h.close(); console.warn = warn; }
+});
+
+for (const allowedTools of [['utils', 'probe--allowed_util'], ['probe--allowed_util'], 'all'] as AgentConfig['allowedTools'][]) {
+  test(`permitted utilities retain surface without migration warnings: ${JSON.stringify(allowedTools)}`, async () => {
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args) => {
+      const line = args.join(' ');
+      if (!line.startsWith('[deprecated]')) warnings.push(line);
+    };
+    const h = await harness({ allowedTools });
+    try {
+      const surface = (await h.framework.previewActivation('assistant')).tools ?? [];
+      assert.equal(surface.some(tool => tool.name === 'utils'), allowedTools === 'all' || allowedTools!.includes('utils'));
+      assert.deepEqual(warnings, []);
+    } finally { await h.close(); console.warn = warn; }
+  });
+}
+
+for (const route of ['model', 'public', 'script'] as const) {
+  test(`denied utility describe matches run refusal on ${route}`, async () => {
+    const h = await harness({ allowedTools: ['utils', 'probe--allowed_util'] });
+    try {
+      const errors: string[] = [];
+      for (const action of ['describe', 'run']) {
+        const input = { action, name: 'probe--denied_util', args: {} };
+        const id = `denied-${action}`;
+        if (route === 'model') {
+          const [result] = await h.turn([{ id, name: 'utils', input }]);
+          assert.equal(result.isError, true); errors.push(result.content);
+          const terminals = h.traces.filter(event => event.callId === id && ['tool:failed', 'tool:completed'].includes(event.type as string));
+          assert.deepEqual(terminals.map(event => event.tool), ['utils']);
+        } else {
+          const pending = route === 'public'
+            ? h.framework.executeToolCall({ id, name: 'utils', input, callerAgentName: 'assistant' })
+            : h.internal.dispatchScriptToolCall('assistant', 'utils', input);
+          const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
+          try {
+            const result = await pending;
+            assert.equal(result.isError, true); errors.push(result.error!);
+          } finally { clearInterval(processing); }
+        }
+      }
+      assert.equal(errors[0], errors[1]);
+      assert.match(errors[0], /not permitted.*allowedTools/);
+      assert.ok(!errors[0].includes('Inert utility counter'));
+      assert.equal(h.emitter.openCount, 0); assert.deepEqual(h.effects, []);
+      const unknown = await h.framework.executeToolCall({ id: 'unknown', name: 'utils', input: { action: 'describe', name: 'missing' }, callerAgentName: 'assistant' });
+      assert.match(unknown.error!, /2 registered.*1 permitted/);
+      assert.ok(!unknown.error!.includes('probe--denied_util'));
+    } finally { await h.close(); }
+  });
+
+  test(`named utility grant alone executes on ${route}`, async () => {
+    const h = await harness({ allowedTools: ['probe--allowed_util'] });
+    const call = { id: 'direct-utility', name: 'probe--allowed_util', input: {}, callerAgentName: 'assistant' };
+    try {
+      if (route === 'model') {
+        const [result] = await h.turn([call]); assert.ok(!result.isError);
+      } else {
+        const pending = route === 'public' ? h.framework.executeToolCall(call) : h.internal.dispatchScriptToolCall('assistant', call.name, {});
+        const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
+        try { assert.equal((await pending).success, true); }
+        finally { clearInterval(processing); }
+      }
+      assert.deepEqual(h.effects.map(effect => effect.name), ['allowed_util']);
+    } finally { await h.close(); }
+  });
+}
+
+test('never-run and retired ephemerals report missing registration before utility migration advice', async () => {
+  const h = await harness({ allowedTools: 'all' });
+  try {
+    const created = await h.framework.createEphemeralAgent({ name: 'identity-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['utils', 'probe--allowed_util'] });
+    const check = async () => {
+      const before = h.effects.length;
+      for (const [name, input] of [['probe--allowed_util', {}], ['utils', { action: 'list' }], ['utils', { action: 'describe', name: 'missing' }]] as const) {
+        const result = await h.framework.executeToolCall({ id: `unregistered-${name}`, name, input, callerAgentName: created.agent.name });
+        assert.equal(result.success, false); assert.equal(result.isError, true);
+        assert.match(result.error!, /identity-worker.*not a running agent.*only while registered/);
+        assert.ok(!result.error!.includes('allowedTools'), 'identity failure must not give allowlist advice');
+      }
+      assert.equal(h.effects.length, before); assert.deepEqual(h.lifecycle, []); assert.equal(h.emitter.openCount, 0);
+    };
+    await check();
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete.' }]);
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
+    const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    await h.framework.runUntilIdle(); await run;
+    assert.equal(h.framework.getAgent(created.agent.name), null);
+    await check(); created.cleanup();
+  } finally { await h.close(); }
+});
+
+test('ephemeral and conversation fork first surfaces warn once per Agent instance', async () => {
+  const h = await harness({ allowedTools: ['utils'] });
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args) => {
+      const line = args.join(' ');
+      if (!line.startsWith('[deprecated]')) warnings.push(line);
+    };
+  try {
+    const internals = h.framework as unknown as { createConversationAgent(name: string, channel: string): Promise<{name: string}>; disposeConversationAgent(name: string): void };
+    const fork = await internals.createConversationAgent('utility-fork-g1', 'world:probe');
+    const created = await h.framework.createEphemeralAgent({ name: 'utility-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['utils'] });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete.' }]);
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
+    const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    for (const name of [fork.name, created.agent.name]) {
+      assert.ok(!h.internal.getToolsForAgent(name).some(tool => tool.name === 'utils'));
+      h.internal.getToolsForAgent(name);
+      assert.equal(warnings.filter(line => line.includes(name)).length, 1);
+    }
+    await h.framework.runUntilIdle(); await run;
+    assert.equal(warnings.length, 2);
+    internals.disposeConversationAgent(fork.name); created.cleanup();
+  } finally { await h.close(); console.warn = warn; }
 });

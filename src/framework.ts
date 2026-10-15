@@ -1739,6 +1739,8 @@ export class AgentFramework {
   private usedEphemeralAgentNames: Set<string> = new Set();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  /** Warn only once per Agent instance after utilities are registered. */
+  private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
@@ -2265,6 +2267,9 @@ export class AgentFramework {
     // Add modules
     for (const module of config.modules) {
       await framework.addModule(module);
+    }
+    for (const agent of framework.agents.values()) {
+      framework.warnEmptyUtilityPermissions(agent);
     }
     for (const [agentName, presentation] of framework.toolPresentations) {
       const workspace = framework.getWorkspaceModule();
@@ -4103,6 +4108,15 @@ export class AgentFramework {
     };
   }
 
+  private warnEmptyUtilityPermissions(agent: Agent): void {
+    if (agent.allowedTools === 'all' || !agent.allowedTools.includes('utils')
+        || this.emptyUtilityPermissionWarnings.has(agent)) return;
+    const utilities = this.moduleRegistry.getAllUtilities();
+    if (utilities.length === 0 || utilities.some(tool => agent.canUseTool(tool.name))) return;
+    console.warn(`[utils] Agent '${agent.name}': ${utilities.length} registered utilities, 0 permitted; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`);
+    this.emptyUtilityPermissionWarnings.add(agent);
+  }
+
   private getToolsForAgent(
     agentName: string,
     snapshot?: InferenceToolSnapshot,
@@ -4121,7 +4135,11 @@ export class AgentFramework {
           : t);
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
-    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])].map((tool) => {
+    const agent = this.agents.get(agentName);
+    if (agent) this.warnEmptyUtilityPermissions(agent);
+    const hasPermittedUtility = !agent || this.moduleRegistry.getAllUtilities().some(tool => agent.canUseTool(tool.name));
+    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])]
+      .filter(tool => tool.name !== 'utils' || hasPermittedUtility).map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
@@ -5676,8 +5694,10 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
-   * Used by SubagentModule (and similar) to create short-lived agents
-   * that are driven externally (not by the framework's event loop).
+   * Used by SubagentModule (and similar) to prepare short-lived agents.
+   * Call runEphemeralToCompletion(agent, contextManager) to register and run
+   * the returned agent. Framework-created identities have tool authority only
+   * while registered; public tool calls before a run or after retirement fail.
    * The returned agent has its own ContextManager on a namespaced state
    * within the framework's shared Chronicle store — messages go to
    * `{namespace}/messages`, context log to `{namespace}/context`.
@@ -13412,8 +13432,12 @@ export class AgentFramework {
    * call entered through — a public method shared with model callers can
    * never confer module trust, whatever the input claims. Module origin
    * exists only through the private closure handed to ModuleRegistry
-   * (ctx.callTool → executeToolCallFrom with {kind:'module'}). Callers that
-   * don't identify themselves fail safe to agent semantics too.
+   * (ctx.callTool → executeToolCallFrom with {kind:'module'}), which is exempt
+   * from agent allowlists. Registered agents' allowedTools is enforced at
+   * dispatch, including namespaced utility names; utils only grants the
+   * list/describe/run slot. Genuinely unidentified public callers (including
+   * unknown legacy names) remain unrestricted. Framework-created identities
+   * are refused while unregistered, even if their configured list allows it.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
     return this.executeToolCallFrom(call, {
@@ -14850,7 +14874,9 @@ export class AgentFramework {
 
   private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
     if (this.canAgentUseTool(agentName, call.name)) return undefined;
-    const error = `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
+    const error = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
+      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered.`
+      : `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
     if (reportRefusal) {
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({
@@ -18959,25 +18985,36 @@ export class AgentFramework {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
     const allUtilities = this.moduleRegistry.getAllUtilities();
     const utilities = allUtilities.filter(def => options.trustedModule || this.canAgentUseTool(agentName, def.name));
-    const available = (): string =>
-      utilities.length ? utilities.map((u) => u.name).join(', ') : '(none registered)';
+    const counts = `${allUtilities.length} registered utilities, ${utilities.length} permitted`;
+    const available = (): string => utilities.length
+      ? `Available: ${utilities.map((u) => u.name).join(', ')} (${counts})`
+      : allUtilities.length
+        ? `${counts}; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`
+        : `${counts} (none registered)`;
     switch (input.action) {
       case 'list':
+        if (allUtilities.length > 0 && utilities.length === 0) {
+          return { success: false, isError: true, error: available() };
+        }
         return {
           success: true,
           data: utilities.map((u) => ({ name: u.name, description: utilityOneLiner(u.description) })),
         };
       case 'describe': {
-        const def = utilities.find((u) => u.name === input.name);
+        const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+        }
+        if (!options.trustedModule) {
+          const refusal = this.agentToolPermissionFailure(agentName, { ...call, name: def.name }, false);
+          if (refusal) return refusal;
         }
         return { success: true, data: def };
       }
       case 'run': {
         const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
         }
         if (!options.trustedModule) {
           // The allowed outer utils call owns its lifecycle and terminal trace;
