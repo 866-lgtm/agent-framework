@@ -17518,6 +17518,10 @@ export class AgentFramework {
           // What the handler's own writes did, before any internal-error
           // reply sent here.
           const handlerResponseAttempted = responseAttempted;
+          // A reply write the handler's own attempt failed, read before the
+          // internal-error reply below, whose own failure is responseError.
+          const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
+            ? describeCause(writeFailure) : undefined;
           let responseError: string | undefined;
           if (tracked && !responseAttempted) {
             // The server gets the standard message, not the handler's own
@@ -17537,8 +17541,6 @@ export class AgentFramework {
               responseError = describeCause(sendError);
             }
           }
-          const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
-            ? describeCause(writeFailure) : undefined;
           this.emitTrace({
             type: 'mcpl:request-handler-error',
             serverId,

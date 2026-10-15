@@ -634,6 +634,8 @@ test('a failed internal-error reply reaches stderr too', async (t) => {
   assert.equal(lines.length, 1);
   assert.match(lines[0]!, /channels-register handler failed: "register failed"/);
   assert.match(lines[0]!, /the internal-error reply failed too: "internal-error reply could not be written"/);
+  // Its failure is the internal-error reply's, not a reply write of the handler's own.
+  assert.doesNotMatch(lines[0]!, /its reply write had failed/);
 });
 
 test("an 'error' listener that throws is caught and logged, and the next message still arrives", (t) => {
