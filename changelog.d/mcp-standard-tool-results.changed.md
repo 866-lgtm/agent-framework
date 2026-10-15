@@ -153,6 +153,9 @@
   its error's class and its message's length, not its text, which may quote
   the credential.
 - `listMcplServers()` lists a configuration that connecting would refuse
-  with `refused` (why), and `family` and `transport` null, where it guessed
-  a legacy binding before. Its `policyEstablished` is null for a modern
-  server, which has no MCPL policy.
+  with `refused`, which says why and is the verdict to read. Its `family`
+  and `transport` are null only when the configuration names no usable
+  transport, where the listing guessed a legacy binding before. A usable
+  binding refused for something else, such as an https url with
+  `requestTimeoutMs: 0`, keeps them. Its `policyEstablished` is null for a
+  modern server, which has no MCPL policy.
