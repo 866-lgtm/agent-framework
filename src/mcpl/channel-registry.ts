@@ -543,6 +543,8 @@ interface ChannelRegistryOptions {
    * `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /** Whether this framework has EventGate and can honor skip_reply self-wakes. */
+  eventGatePresent?: boolean;
 }
 
 // ============================================================================
@@ -680,6 +682,7 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private channelTools: ToolDefinition[];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -696,6 +699,23 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
+      const schema = tool.inputSchema as {
+        type: 'object';
+        properties: NonNullable<ToolDefinition['inputSchema']['properties']>;
+        required?: string[];
+      };
+      const { wake_in_seconds: _wake, ...properties } = schema.properties;
+      return {
+        ...tool,
+        description: tool.description.replace(
+          ' To end this turn but come back on your own shortly, set wake_in_seconds.',
+          '',
+        ),
+        inputSchema: { ...schema, properties },
+      };
+    });
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1373,7 +1393,7 @@ export class ChannelRegistry {
    * Get synthesized tool definitions for channel operations.
    */
   getChannelTools(): ToolDefinition[] {
-    return CHANNEL_TOOL_DEFINITIONS;
+    return this.channelTools;
   }
 
   /**

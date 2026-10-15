@@ -3724,15 +3724,6 @@ export class AgentFramework {
     // Copy: getChannelTools() returns the registry's shared definitions
     // array; pushing onto it would append another tune_out on every call.
     const channelTools = [...(this.channelRegistry?.getChannelTools() ?? [])];
-    if (!this.eventGate) {
-      const index = channelTools.findIndex((tool) => tool.name === 'skip_reply');
-      if (index >= 0) {
-        const tool = channelTools[index]!;
-        const schema = tool.inputSchema as { type: 'object'; properties: NonNullable<import('./types/index.js').ToolDefinition['inputSchema']['properties']>; required?: string[] };
-        const { wake_in_seconds: _wake, ...properties } = schema.properties;
-        channelTools[index] = { ...tool, description: tool.description.replace(' To end this turn but come back on your own shortly, set wake_in_seconds.', ''), inputSchema: { ...schema, properties } };
-      }
-    }
     if (this.tuneOutCoordinator) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL);
     }
@@ -15012,9 +15003,10 @@ export class AgentFramework {
         if (wants && this.eventGate) {
           const { inMs } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
-        } else if (inputObj.wake_in_seconds !== undefined && !this.eventGate) {
-          const error = 'No EventGate configured (FrameworkConfig.gate is unset). ' + 'skip_reply wake_in_seconds was not armed; omit it to stay idle until an external wake.';
-          console.error(`[self-wake] agent=${agentName} ${error}`);
+        } else if (wants && !this.eventGate) {
+          const error = 'Your turn did not end, and no wake was set: this host cannot wake you on a timer, so skip_reply cannot take wake_in_seconds here. To end the turn and wait for the next message, call skip_reply without it. Anything you meant to come back to, do now.';
+          console.error(`[self-wake] agent=${agentName} No EventGate configured (FrameworkConfig.gate is unset). ${error}`);
+          this.toolLifecycleEmitter?.refuse(agentName, enrichedCall.id);
           this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result: { success: false, error, isError: true } });
           return;
@@ -15987,6 +15979,7 @@ export class AgentFramework {
           const routing = this.turnRouting.get(agentName);
           return routing?.locus ?? routing?.triggerChannel;
         },
+        eventGatePresent: this.eventGate !== null,
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
