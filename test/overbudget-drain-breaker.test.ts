@@ -33,6 +33,8 @@ function makeHarness(tick: () => Promise<void>) {
   fw.lastInferenceAt = new Map();
   fw.overBudgetDrainInFlight = new Set();
   fw.overBudgetDrains = new Set();
+  // A drain kick ticks only while the framework runs.
+  fw.running = true;
   fw.opsAlertLastSent = new Map();
   fw.pendingRequests = [];
   fw.traceListeners = [];

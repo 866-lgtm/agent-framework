@@ -1558,6 +1558,8 @@ export class AgentFramework {
    *  it was alerted, until its maintenance goes without one
    *  (reportMaintenanceFailure). */
   private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
+  /** Run records whose failure repeated one already reported, and whose report was suppressed. */
+  private maintenanceRepeats = new WeakSet<ContextMaintenanceAgentRun>();
   private providerGates: Map<string, LocalProviderGate> = new Map();
   private providerAccelerationCooldowns: Map<string, ProviderAccelerationCooldown> = new Map();
   private providerAccelerationRecoveries: Map<string, ProviderAccelerationRecovery> = new Map();
@@ -2693,9 +2695,9 @@ export class AgentFramework {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
     }
-    if (this.maintenancePass) {
-      await this.maintenancePass;
-    }
+    // The pass and any over-budget drain kick: a compression in flight lands
+    // before the store closes.
+    await this.settleMaintenancePass();
 
     if (this.loopPromise) {
       await this.loopPromise;
@@ -2896,11 +2898,14 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.)
+   * single-use, so its context manager keeps the plain membrane.) A
+   * conversation agent is ticked by the maintenance pass too, so a call made
+   * while a surgery holds the store is withdrawn, as a resident's is.
    */
   private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.refuseHeldProviderModel(agentName, model);
+      this.withdrawMaintenanceUnderSurgery();
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
@@ -3532,7 +3537,10 @@ export class AgentFramework {
       run.finishedAt = Date.now();
       run.agents.sort((a, b) => a.agentName.localeCompare(b.agentName));
       this.currentMaintenanceRun = null;
-      this.maintenanceHistory.unshift(run);
+      // A pass that only met failures already reported adds nothing the
+      // history doesn't hold, and a lasting one would otherwise fill it in
+      // minutes, pushing out the runs that did work.
+      if (!run.agents.every((record) => this.maintenanceRepeats.has(record))) this.maintenanceHistory.unshift(run);
       if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
     }
   }
@@ -3558,7 +3566,10 @@ export class AgentFramework {
       // changed text that the webhook didn't post doesn't push the reminder
       // back. With no webhook, it's counted from this failure's last report.
       const since = this.opsAlertLastSent.get(`${agentName}:context-maintenance-failed`) ?? reported.at;
-      if (now - since < this.opsAlertCooldownMs) return;
+      if (now - since < this.opsAlertCooldownMs) {
+        this.maintenanceRepeats.add(record);
+        return;
+      }
     }
     this.maintenanceFailureReported.set(agentName, { text: wholeError, at: now });
     console.error(`[context-maintenance] agent=${agentName} failed:`, record.error);
@@ -4674,26 +4685,16 @@ export class AgentFramework {
     if (this.maintenanceRunning()) await this.settleMaintenancePass();
     const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
     for (const agentName of this.agents.keys()) {
-      let preview: RuntimeSettingsPreview;
-      try {
+      // A preview that isn't available gives no verdict, and resume goes on
+      // for the others. That includes an agent whose context manager refuses
+      // its queries, as when its strategy failed to initialize: that manager
+      // refuses its compiles and writes until a switchBranch or setStrategy
+      // succeeds, so the agent can't run over budget, and maintenance reports it.
+      let preview = this.previewAgentRuntimeSettings(agentName);
+      for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        if (this.maintenancePass) await this.maintenancePass.catch(() => {});
         preview = this.previewAgentRuntimeSettings(agentName);
-        for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
-          await new Promise((resolve) => setTimeout(resolve, 250));
-          if (this.maintenancePass) await this.maintenancePass.catch(() => {});
-          preview = this.previewAgentRuntimeSettings(agentName);
-        }
-      } catch (error) {
-        // The agent's settings can't be read, as when its context manager's
-        // strategy failed to initialize: that manager refuses its compiles and
-        // writes until a switchBranch or setStrategy succeeds, and maintenance
-        // reports it. The gate guards against an agent that would run over
-        // budget, and this one can't run, so it gets no verdict, as a preview
-        // that isn't available gets none, and resume goes on for the others.
-        console.warn(
-          `[host-mode] resume: ${agentName}'s settings can't be read ` +
-          `(${error instanceof Error ? error.message : String(error)}) — proceeding without a verdict for it`,
-        );
-        continue;
       }
       if (preview.available && preview.effective && !preview.effective.fits) {
         failing.push({ agentName, preview });
@@ -5295,9 +5296,11 @@ export class AgentFramework {
    * the compile budget and rejected safe-by-construction paced descents.
    *
    * Never throws for preview-layer reasons: strategy without previewContext,
-   * preview overlap, stale branch generation, and the hierarchical (non-
-   * adaptive) path all come back as `{available: false, reason}`. Unknown
-   * agent still throws, matching the sibling accessors.
+   * preview overlap, stale branch generation, the hierarchical (non-
+   * adaptive) path, and a context manager that refuses its queries (its
+   * strategy's initialization pending or failed) all come back as
+   * `{available: false, reason}`. Unknown agent still throws, matching the
+   * sibling accessors, and so does a patch the agent refuses.
    */
   previewAgentRuntimeSettings(
     agentName: string,
@@ -5313,8 +5316,20 @@ export class AgentFramework {
     agent: Agent,
     patch?: AgentRuntimeSettingsPatch,
   ): RuntimeSettingsPreview {
-    const plan = agent.planRuntimeSettings(patch);
-    const settings = agent.getRuntimeSettings();
+    // A patch the agent refuses throws, whatever its context manager's state.
+    if (patch && Object.keys(patch).length > 0) agent.checkRuntimeSettingsPatch(patch);
+    let plan: ReturnType<Agent['planRuntimeSettings']>;
+    let settings: ReturnType<Agent['getRuntimeSettings']>;
+    try {
+      plan = agent.planRuntimeSettings(patch);
+      settings = agent.getRuntimeSettings();
+    } catch (error) {
+      // A manager that refuses its queries gives no verdict, as a preview
+      // that can't be computed gives none: the agent's own state still says
+      // its budget and the patch's path. Anything else throws as before.
+      if (agent.contextManagerAnswers()) throw error;
+      return { available: false, reason: error instanceof Error ? error.message : String(error), ...agent.runtimeBudgetPath(patch) };
+    }
     const base: RuntimeSettingsPreview = {
       available: false,
       path: plan.path,
@@ -6983,6 +6998,10 @@ export class AgentFramework {
         return id === undefined || id === null || id === '' ? undefined : String(id);
       };
       const byDiscordId = (did: string) => all.findIndex((m) => discordIdOf(m) === String(did));
+      const lastByDiscordId = (did: string) => {
+        for (let i = all.length - 1; i >= 0; i--) if (discordIdOf(all[i]) === String(did)) return i;
+        return -1;
+      };
 
       // Collect Discord refs of every message in [lo, hi] that carries one,
       // so the surface can mark them. channelId here is whatever the ingest
@@ -7028,7 +7047,13 @@ export class AgentFramework {
           if (toIdx < 0) {
             return { ok: false, error: `Message ${params.toMessageId} is not an addressable message in context.` };
           }
-          const [first, last] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+          // The earlier end from its first stored copy, the later end through
+          // its last, as offline recovery's range does: a write cut short and
+          // retried stores a message twice, and the range takes both copies.
+          const [first, laterId] = fromIdx <= toIdx
+            ? [fromIdx, params.toMessageId]
+            : [toIdx, params.fromMessageId];
+          const last = lastByDiscordId(laterId);
           // A message stored as a body (a long one, in shards) is hidden whole.
           const lo = bodyRangeIn(all, first).from;
           const hi = bodyRangeIn(all, last).to;
@@ -15733,14 +15758,12 @@ export class AgentFramework {
         let ticks = 0;
         try {
           const cm = agent.getContextManager();
-          while (ticks < 8 && !this.surgeryHold) {
+          while (ticks < 8 && this.running && !this.surgeryHold) {
             await cm.tick();
             ticks++;
           }
-          console.error(
-            `[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks` +
-              `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
-          );
+          const stopped = ticks >= 8 ? '' : !this.running ? ', stopped as the framework stops' : ', stopped while a surgery holds the store';
+          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks${stopped})`);
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {
             console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);

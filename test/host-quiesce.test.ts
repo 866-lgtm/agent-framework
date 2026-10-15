@@ -329,6 +329,19 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     await assert.rejects(cm.setStrategy(failing), /strategy initialization failed for the test/);
     assert.throws(() => cm.getHotContextSettings(), /requires successful strategy initialization/);
 
+    // The preview answers rather than throws: no verdict, with what the
+    // agent's own state still says.
+    // The agent runs at the default budget of 100,000 tokens, so 50,000 is a paced descent.
+    const preview = framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+    assert.equal(preview.available, false);
+    assert.match(String(preview.reason), /requires successful strategy initialization/);
+    assert.equal(preview.path, 'paced');
+    assert.equal(preview.liveBudgetTokens, 100_000);
+    assert.equal(preview.transition, 'stable');
+    assert.equal(preview.effective, undefined);
+    // A patch the agent refuses still throws.
+    assert.throws(() => framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 5 }), /contextBudgetTokens must be/);
+
     const warn = t.mock.method(console, 'warn', () => {});
     let status: Awaited<ReturnType<typeof framework.resume>>;
     try {
@@ -339,10 +352,10 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     assert.equal(status.quiesced, false);
     assert.ok(warn.mock.calls.some((call) => {
       const line = String(call.arguments[0]);
-      return line.includes("agent's settings can't be read")
+      return line.includes('feasibility preview unavailable for agent')
         && line.includes('requires successful strategy initialization')
-        && line.includes('proceeding without a verdict for it');
-    }), 'resume warns, naming the agent and the error');
+        && line.includes('proceeding without a verdict');
+    }), 'resume warns, naming the agent and the reason');
   });
 });
 

@@ -429,6 +429,32 @@ describe('live operator surgery', () => {
     assert.deepEqual(entry.result?.removedIds, huge.slice(0, 50));
     assert.equal(entry.result?.removedIdsTruncated, true);
     for (const id of huge) assert.equal(cm().getMessage(id as never), null);
+
+    // The range form runs from the earlier message's first copy through the
+    // later one's last, in either order: a range ending at a message stored
+    // twice takes its retry too.
+    const hideRange = (fromMessageId: string, toMessageId: string) => internals.handleHostCommand('discord', {
+      command: 'hide', agentName: 'scout', fromMessageId, toMessageId, requesterName: 'antra',
+    });
+    const plain = (text: string, discordId: string) => cm().addMessage('user', [{ type: 'text', text }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordId,
+    });
+    appendBody('d-cut2', 'g-cut2', ['p0', 'p1']);
+    appendBody('d-cut2', 'g-cut2', ['r0', 'r1', 'r2']);
+    plain('after', 'd-after');
+    const forward = await hideRange('d4', 'd-cut2');
+    assert.equal(forward.ok, true, String(forward.error));
+    assert.equal(forward.hidden, 4, 'm4, m5, and both copies of the cut message');
+    assert.deepEqual(refsOf(forward), ['d4', 'd5', 'd-cut2']);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'after']);
+
+    appendBody('d-cut3', 'g-cut3', ['q0']);
+    appendBody('d-cut3', 'g-cut3', ['s0', 's1']);
+    plain('last', 'd-last');
+    const backward = await hideRange('d-cut3', 'd2');
+    assert.equal(backward.ok, true, String(backward.error));
+    assert.equal(backward.hidden, 5, 'm2, m3, after, and both copies of the cut message');
+    assert.deepEqual(remainingTexts(), ['m1', 'last']);
   });
 
   it('hide refuses while a surgery holds the store, and a missing Discord id matches nothing', async () => {

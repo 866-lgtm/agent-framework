@@ -329,6 +329,49 @@ class ParkedCallTickStrategy implements ContextStrategy {
   }
 }
 
+/** A strategy whose first tick waits on a gate, then calls its manager's membrane, as a compression would. */
+class CallAfterGateStrategy implements ContextStrategy {
+  readonly name = 'call-after-gate-test';
+  ticks = 0;
+  entered = false;
+  outcome?: string;
+  private open?: () => void;
+  private readonly gate = new Promise<void>((resolve) => { this.open = resolve; });
+
+  release(): void {
+    this.open?.();
+  }
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'a compression queued' };
+  }
+
+  async tick(ctx: StrategyContext): Promise<void> {
+    this.ticks++;
+    if (this.ticks > 1) return;
+    this.entered = true;
+    await this.gate;
+    try {
+      await ctx.membrane?.complete({
+        model: 'test-model',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'compress' }] }],
+      } as unknown as NormalizedRequest);
+      this.outcome = 'sent';
+    } catch (error) {
+      this.outcome = (error as Error).name;
+      throw error;
+    }
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 /** A strategy whose ticks succeed and whose readiness can't be read once all of a pass's ticks have run. */
 class RefusesAfterTicksStrategy implements ContextStrategy {
   readonly name = 'refuses-after-ticks-test';
@@ -588,11 +631,12 @@ describe('queued context maintenance timer', () => {
           pending: 'compression blocked',
         },
       });
-      // Every pass meets the same failure and records it; it is alerted once.
-      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 3);
-      for (const run of framework.getContextMaintenanceSnapshot().history) {
-        assert.equal(run.agents[0].error, 'provider rejected maintenance request');
-      }
+      // Every pass meets the same failure. It is alerted once, and the
+      // passes that only repeat it stay out of the history.
+      await waitFor(() => (framework as unknown as { maintenanceRunId: number }).maintenanceRunId >= 3);
+      const history = framework.getContextMaintenanceSnapshot().history;
+      assert.equal(history.length, 1);
+      assert.equal(history[0]!.agents[0]!.error, 'provider rejected maintenance request');
       assert.equal(alerts.length, 1);
     } finally {
       await framework.stop();
@@ -801,9 +845,10 @@ describe('queued context maintenance timer', () => {
     await fence();
     try {
       framework.start();
-      await waitFor(() => runsWithError() >= 3);
+      await waitFor(() => passes >= 3);
       assert.deepEqual(alerts, ['context-maintenance-failed:fenced']);
       assert.equal(failedLines(), 1);
+      assert.equal(runsWithError(), 1, 'the passes that only repeat the failure stay out of the history');
 
       // Recovered with nothing to do: passes find it ready and skip it.
       await cm.setStrategy(new ReadyStrategy());
@@ -1179,6 +1224,77 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it("a conversation agent's tick that reaches its provider under a surgery's hold is withdrawn, as a resident's is", { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-conversation-withdrawn-'));
+    const provider = new CapturingMembrane();
+    const conversation = new CallAfterGateStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: provider.asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new ReadyStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+      conversations: { templateAgent: 'agent', strategyFactory: () => conversation },
+    });
+    const internals = framework as unknown as {
+      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      reserveStoreForSurgery(verb: string, agentName: string): () => void;
+    };
+    const alerts: string[] = [];
+    (framework as any).opsAlert = (kind: string, agentName: string) => alerts.push(`${kind}:${agentName}`);
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      await internals.createConversationAgent('agent-conv-1', 'chan-1');
+      framework.start();
+      await waitFor(() => conversation.entered);
+      const release = internals.reserveStoreForSurgery('roll back', 'agent');
+      try {
+        conversation.release();
+        await waitFor(() => conversation.outcome !== undefined);
+        assert.equal(conversation.outcome, 'MaintenanceWithdrawnError');
+        assert.equal(provider.calls.length, 0, 'the withdrawn call sent nothing');
+      } finally {
+        release();
+      }
+      assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
+    } finally {
+      console.error = quiet;
+      conversation.release();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a pass that only meets a failure already reported stays out of the history', { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-repeats-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new FailingStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    (framework as any).opsAlert = () => {};
+    const internals = framework as unknown as { maintenanceRunId: number };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      framework.start();
+      await waitFor(() => internals.maintenanceRunId >= 4);
+      const history = framework.getContextMaintenanceSnapshot().history;
+      assert.equal(history.length, 1, 'the first report only, though four passes met the failure');
+      assert.equal(history[0]!.id, 1);
+      assert.ok(history[0]!.agents[0]!.error);
+    } finally {
+      console.error = quiet;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a surgery that takes the store while resume waits for a tick is refused by resume after the wait', { timeout: 10_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-resume-rechecks-'));
     const strategy = new GatedTickStrategy();
@@ -1242,6 +1358,8 @@ describe('queued context maintenance timer', () => {
     const quiet = console.error;
     console.error = () => {};
     try {
+      // A drain kick ticks only while the framework runs.
+      framework.start();
       // A refused compile kicks the drain, whose first tick waits on the gate.
       internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
       await waitFor(() => strategy.ticks === 1);
@@ -1257,6 +1375,43 @@ describe('queued context maintenance timer', () => {
       console.error = quiet;
       strategy.release();
       await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stop() waits for an over-budget drain kick's tick in flight, and the kick ticks no more once stop() has begun", { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-drain-stop-'));
+    const strategy = new GatedTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    strategy.framework = framework;
+    const internals = framework as unknown as {
+      noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
+    };
+    const quiet = console.error;
+    console.error = () => {};
+    let stopped = false;
+    try {
+      framework.start();
+      // A refused compile kicks the drain, whose first tick waits on the gate.
+      internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
+      await waitFor(() => strategy.ticks === 1);
+      const stopping = framework.stop().then(() => { stopped = true; });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(stopped, false, 'stop() waits for the kick\'s tick in flight');
+      strategy.release();
+      await stopping;
+      assert.equal(strategy.ticks, 1, 'the kick starts no tick once stop() has begun');
+    } finally {
+      console.error = quiet;
+      strategy.release();
+      if (!stopped) await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
   });
