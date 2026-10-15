@@ -142,6 +142,24 @@ test('awareness survives a reconnect whose first listen is refused again', async
   await until(() => changes > before, 'the announced change on launch 2');
 });
 
+test('a child that exits during the connect-time subscribe fails the connect, rather than being adopted as connected (R1-2)', async () => {
+  const log = scratchLog();
+  await assert.rejects(connect('exit-on-listen-first', log), /closed its connection while connecting/);
+  assert.ok(wire(log).some((e) => e.method === 'subscriptions/listen'), 'it exited at the subscribe');
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch, and no reconnect');
+});
+
+test('with reconnect, a child that exits during the connect-time subscribe is a failed connect, and the next launch serves (R1-2)', async () => {
+  const log = scratchLog();
+  const connection = await connect('exit-on-listen-first', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
+  await until(() => connection.isConnected, 'connected on the next launch');
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 2, 'launch 1 failed its connect, and launch 2 serves');
+  const plain = await connection.callTool('plain', {});
+  assert.ok(plain.content.length > 0);
+  assert.equal(calls(log, 'plain'), 1);
+  assert.equal(wire(log).find((e) => e.method === 'tools/call')!.launch, 2);
+});
+
 test('close() during a reconnect handshake ends the launch it was waiting on, and stops', async () => {
   const log = scratchLog();
   const connection = await connect('hang-discover-later', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });

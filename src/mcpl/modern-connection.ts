@@ -338,6 +338,8 @@ interface Session {
   readonly generation: number;
   readonly client: Client;
   readonly wire: ObservedTransport;
+  /** Its transport has closed, whether or not the session was adopted yet. */
+  lost: boolean;
 }
 
 export class ModernMcpConnection extends EventEmitter {
@@ -543,6 +545,7 @@ export class ModernMcpConnection extends EventEmitter {
         },
       },
     );
+    const session: Session = { generation, client, wire, lost: false };
     client.onerror = (error: Error) => {
       // The SDK reports late responses to deadline-abandoned calls here
       // ("unknown message ID"), and a list-change subscription it could not
@@ -553,10 +556,12 @@ export class ModernMcpConnection extends EventEmitter {
       if (this.isCurrent(generation)) this.emit('error', error);
     };
     client.onclose = () => {
+      // Marked before the session is adopted too: a close during the connect
+      // makes it a failed connect (see establish).
+      session.lost = true;
       if (this.isCurrent(generation)) this.handleLost(generation, 'transport closed');
     };
 
-    const session: Session = { generation, client, wire };
     // `done` settles only once this connect's own cleanup has finished, on
     // every path: close() waits on it, and must not resolve while that
     // cleanup could still find a child it can't reap.
@@ -584,6 +589,17 @@ export class ModernMcpConnection extends EventEmitter {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
       return;
+    }
+    if (session.lost) {
+      // The transport closed while the client connected, such as a child
+      // that exited at the connect-time list-change subscribe: the SDK
+      // reports that subscribe's failure only as an error, and resolves the
+      // connect anyway (R1-2). Adopted, the session would read as connected
+      // with nothing behind it, and no later close would come to reconnect
+      // it. So the connect failed.
+      const failure = await ModernMcpConnection.closeSession(session);
+      if (failure) this.holdUnreaped(session, failure);
+      throw new Error(`MCP server "${this.id}" closed its connection while connecting`);
     }
     this.session = session;
     this.protocolVersion = MODERN_MCP_PROTOCOL_VERSION;

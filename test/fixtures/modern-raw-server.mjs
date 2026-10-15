@@ -6,6 +6,7 @@
 // Flags, comma-separated:
 //   invalid-schema       tools/list advertises an outputSchema that doesn't compile
 //   listen-fail-first    the first subscriptions/listen of each launch is refused
+//   exit-on-listen-first  the first launch exits when its subscriptions/listen arrives
 //   hang-discover-later  launches after the first never answer server/discover
 //   hang-discover        no launch ever answers server/discover
 //   reject-discover-later  launches after the first answer server/discover with an error
@@ -69,6 +70,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'raw-fixture', version: '1' } },
       });
     case 'subscriptions/listen':
+      if (flags.has('exit-on-listen-first') && launch === 1) process.exit(0);
       listens++;
       if (flags.has('listen-fail-first') && listens === 1) return error(m.id, -32603, 'first listen unavailable');
       subscription = m.id;
