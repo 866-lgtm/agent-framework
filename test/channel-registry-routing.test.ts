@@ -872,8 +872,22 @@ test("a server's error response to a request rejects with McplErrorResponse, car
     assert.equal(err.code, -32017);
     assert.deepEqual(err.data, { channelId: 'body:ears' });
     assert.equal(err.message, 'MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted');
+    assert.equal((err as McplErrorResponse).serverMessage, 'Channel not permitted');
     return true;
   });
+});
+
+test('a request on a connection already closed rejects with a plain Error, since nothing was sent (R1-2)', async () => {
+  const connection = new (McplServerConnection as any)('body', null, null) as McplServerConnection;
+  (connection as unknown as { closed: boolean }).closed = true;
+  await assert.rejects(
+    connection.sendChannelsPublish({ conversationId: 'linn', channelId: 'body:home', content: [{ type: 'text', text: 'hello' }] }),
+    (err: Error) => {
+      assert.equal(err instanceof McplErrorResponse, false, `a plain Error, not ${err.name}`);
+      assert.match(err.message, /is closed/);
+      return true;
+    },
+  );
 });
 
 test("a server's error response to the publish goes through fail(): a trace and the send-failure marker (R1-2)", async () => {
@@ -881,12 +895,14 @@ test("a server's error response to the publish goes through fail(): a trace and 
   await registry.handleRegister('body', {
     channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
   } as never);
-  const refusal = 'MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted';
-  setOnPublish(async () => { throw new McplErrorResponse(refusal, -32017); });
+  setOnPublish(async () => {
+    throw new McplErrorResponse('MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted', -32017, 'Channel not permitted');
+  });
 
   assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
   assert.equal(publishCalls.length, 1, 'the publish was sent, and the server refused it');
-  assert.deepEqual(failures.map((f) => f.reason), [refusal]);
+  assert.deepEqual(failures.map((f) => f.reason), ['server "body" refused the publish: Channel not permitted'],
+    "the marker gives the server's own words, without the method or the code");
   const failed = traces.filter((t) => t.type === 'mcpl:speech-route-failed');
   assert.equal(failed.length, 1);
   assert.equal(failed[0]!.channelId, 'body:home');
@@ -906,7 +922,9 @@ test('a publish that times out or loses its connection still rejects, with no ma
 });
 
 test("a lazily registered channel whose open answers inbound-only is refused before the publish, and stays refused (R1-3)", async () => {
-  const { registry, publishCalls, openCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
+  const announced: Array<{ source: string; channels: Array<{ channelId: string }> }> = [];
+  const { registry, publishCalls, openCalls, failures, traces, setOpenResult } =
+    makeRegistry({ delivered: true }, undefined, undefined, (info) => { announced.push(info); });
   registry.ensureChannelRegistered('body', 'body:ears', 'Body · ears');
   setOpenResult({ channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' } });
 
@@ -914,6 +932,11 @@ test("a lazily registered channel whose open answers inbound-only is refused bef
   assert.deepEqual(openCalls.map((c) => c.channelId), ['body:ears'], 'speech opened the channel, as for any closed locus');
   assert.equal(publishCalls.length, 0, 'nothing was published after the server declared it');
   assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
+  // The open happened, and the channel stays open: the notice says so, and
+  // how to close it, while the marker reports the refused speech.
+  assert.deepEqual(announced.map((a) => [a.source, a.channels.map((c) => c.channelId)]), [['opened-by-delivery', ['body:ears']]]);
+  assert.equal(traces.filter((t) => t.type === 'mcpl:channel-opened-by-send').length, 1);
+  assert.equal(registry.isChannelOpen('body:ears'), true);
 
   // The next speech is refused before anything goes to the server.
   assert.equal(await registry.routeSpeech('linn', 'again', 'body:ears'), null);
@@ -922,7 +945,7 @@ test("a lazily registered channel whose open answers inbound-only is refused bef
   assert.equal(failures.length, 2);
 });
 
-test("an open's answer changes nothing unless it names the channel and declares it inbound-only (R1-3)", async () => {
+test("an open's answer that names another channel, declares no direction or declares one that isn't inbound leaves speech published (R1-3)", async () => {
   for (const answer of [
     { channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' } },
     { channel: { id: 'body:other', type: 'chat', label: 'Body · other', direction: 'inbound' } },
@@ -939,16 +962,111 @@ test("an open's answer changes nothing unless it names the channel and declares 
 });
 
 test('a channel removed while the host opens it for speech is refused, and nothing is published (R1-3)', async () => {
-  const { registry, publishCalls, openCalls, failures, setOnOpen } = makeRegistry({ delivered: true });
+  // Whatever the open's answer declares: there's no entry left to apply it to.
+  for (const answer of [{}, { channel: { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'inbound' } }]) {
+    const { registry, publishCalls, openCalls, failures, setOnOpen, setOpenResult } = makeRegistry({ delivered: true });
+    await registry.handleRegister('body', {
+      channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+    } as never);
+    setOpenResult(answer);
+    setOnOpen(async () => {
+      await registry.handleChanged('body', { removed: ['body:home'] } as never);
+    });
+
+    assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
+    assert.deepEqual(openCalls.map((c) => c.channelId), ['body:home']);
+    assert.equal(publishCalls.length, 0, 'nothing was published to the removed channel');
+    assert.deepEqual(failures.map((f) => f.reason), ['the channel was removed while it was opening'],
+      `refused as removed, after the answer ${JSON.stringify(answer)}`);
+  }
+});
+
+test("an open's answer can't lift an inbound-only declaration: a server lifts it by changing or registering the channel (R1-3)", async () => {
+  const { registry, publishCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
   await registry.handleRegister('body', {
-    channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+    channels: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
   } as never);
+  setOpenResult({ channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' } });
+  const opened = await registry.handleChannelToolCall('channel_open', { channelId: 'body:ears' }, { kind: 'agent', agentName: 'linn' });
+  assert.equal(opened.success, true);
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:ears'), null, 'still refused after the answer');
+  assert.equal(publishCalls.length, 0);
+  assert.match(failures[0]!.reason, /^inbound-only: server "body" declared/);
+});
+
+test("an open's answer that arrives in the same read as a newer channels/changed can't lift its refusal (R1-3)", async () => {
+  // Greta-2425's probe: the connection resolves the open's answer, then
+  // handles the next line at once, so the answer is applied after, and
+  // over, the channels/changed the server sent after it.
+  let answerOpen!: (answer: unknown) => void;
+  const publishCalls: string[] = [];
+  const failures: string[] = [];
+  const mockServer = {
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    sendChannelsPublish: async (p: { channelId?: string }) => { publishCalls.push(String(p.channelId)); return { delivered: true }; },
+    sendChannelsOutgoingChunk: () => {},
+    sendChannelsOutgoingComplete: () => {},
+    sendChannelsOpen: () => new Promise((resolve) => { answerOpen = resolve; }),
+    sendChannelsClose: async () => ({}),
+  };
+  const registry = new ChannelRegistry(
+    { getServer: () => mockServer } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    { onRouteFailure: (info) => { failures.push(info.reason); } },
+  );
+  await registry.handleChanged('body', {
+    added: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' }],
+  } as never);
+  const delivery = registry.routeSpeech('linn', 'hello', 'body:ears');
+  await new Promise((resolve) => setImmediate(resolve));
+  answerOpen({ channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' } });
+  void registry.handleChanged('body', {
+    updated: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
+  } as never);
+
+  assert.equal(await delivery, null);
+  assert.deepEqual(publishCalls, [], 'nothing was published into the channel declared inbound-only');
+  assert.match(failures[0]!, /^inbound-only: server "body" declared/);
+});
+
+test("an open by reconcile applies its answer too: a channel the answer declares inbound-only is refused (R1-3)", async () => {
+  const { registry, publishCalls, openCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
+  const ears = { id: 'body:ears', type: 'chat', label: 'Body · ears' };
+  await registry.handleRegister('body', { channels: [ears] } as never);
+  const opened = await registry.handleChannelToolCall('channel_open', { channelId: 'body:ears' }, { kind: 'agent', agentName: 'linn' });
+  assert.equal(opened.success, true);
+  // The server registers again, as after a reconnect, and reconcile reopens
+  // the channel the agent opened: this time the answer declares it.
+  setOpenResult({ channel: { ...ears, direction: 'inbound' } });
+  await registry.handleRegister('body', { channels: [ears] } as never);
+  assert.equal(openCalls.length, 2, 'reconcile opened it again');
+
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:ears'), null);
+  assert.equal(publishCalls.length, 0);
+  assert.match(failures[0]!.reason, /^inbound-only: server "body" declared/);
+});
+
+test('a channel announced again while the host opens it is recorded open once the open answers, and the publish goes there (R1-3)', async () => {
+  const { registry, publishCalls, setOnOpen } = makeRegistry({ delivered: true });
+  const home = { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' };
+  await registry.handleRegister('body', { channels: [home] } as never);
+  // The announcement replaces the entry at once, closed, and its reconcile's
+  // own open waits until the speech is done.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let announced: Promise<void> | undefined;
+  let opens = 0;
   setOnOpen(async () => {
-    await registry.handleChanged('body', { removed: ['body:home'] } as never);
+    opens++;
+    if (opens === 1) announced = registry.handleChanged('body', { added: [home] } as never);
+    else await held;
   });
 
-  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
-  assert.deepEqual(openCalls.map((c) => c.channelId), ['body:home']);
-  assert.equal(publishCalls.length, 0, 'nothing was published to the removed channel');
-  assert.deepEqual(failures.map((f) => f.reason), ['the channel was removed while it was opening']);
+  assert.deepEqual(await registry.routeSpeech('linn', 'hello', 'body:home'), { delivered: true, channelId: 'body:home' });
+  assert.equal(publishCalls.length, 1);
+  assert.equal(registry.isChannelOpen('body:home'), true, "the channel's current entry is recorded open before its reconcile's open answers");
+  release();
+  await announced;
 });

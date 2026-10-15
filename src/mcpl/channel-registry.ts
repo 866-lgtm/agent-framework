@@ -2284,12 +2284,13 @@ export class ChannelRegistry {
       }
 
       try {
-        await server.sendChannelsOpen({
+        const answer = await server.sendChannelsOpen({
           channelId: channel.id,
           type: channel.type,
           address: channel.address,
         });
         if (entry) entry.open = true;
+        this.applyOpenAnswer(serverId, channel.id, answer);
       } catch (err) {
         if (entry) entry.open = false;
         this.emitTraceFn({
@@ -2478,17 +2479,34 @@ export class ChannelRegistry {
       ...(history ? { history } : {}),
     });
     entry.open = true;
-    // The open's answer carries the server's descriptor (§14.3), the first
-    // place a lazily registered channel's own declaration can arrive. An
-    // inbound-only declaration there is applied to the channel's current
-    // entry: whatever the server sent before answering has been applied by
-    // now, and whatever it sends after will be applied over it.
-    const answered = (result as { channel?: { id?: unknown; direction?: unknown } } | undefined)?.channel;
-    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
-    if (current && answered?.id === entry.descriptor.id && answered.direction === 'inbound') {
+    this.applyOpenAnswer(entry.serverId, entry.descriptor.id, result);
+    return result;
+  }
+
+  /**
+   * What a successful `channels/open` tells the host, wherever the host
+   * opens a channel: the channel is open, and the answer carries the
+   * server's descriptor for it (§14.3), the first place a lazily registered
+   * channel's own declaration can arrive. Both go to the channel's current
+   * entry, which a register or `channels/changed` during the open may have
+   * replaced.
+   *
+   * Only an inbound-only declaration is applied. The answer isn't always the
+   * server's latest word: a `channels/changed` that arrives in the same read
+   * as the answer is handled before the open's caller resumes, so the answer
+   * is applied over it. Applying only a refusal keeps that race fail-closed:
+   * a stale answer can keep a channel refused until the server's next
+   * update, but never lift a newer refusal. A server lifts its declaration
+   * by changing or registering the channel again.
+   */
+  private applyOpenAnswer(serverId: string, channelId: string, answer: unknown): void {
+    const current = this.channels.get(`${serverId}:${channelId}`);
+    if (!current) return;
+    current.open = true;
+    const declared = (answer as { channel?: { id?: unknown; direction?: unknown } } | undefined)?.channel;
+    if (declared?.id === channelId && declared.direction === 'inbound') {
       current.descriptor = { ...current.descriptor, direction: 'inbound' };
     }
-    return result;
   }
 
   /**
@@ -3120,8 +3138,8 @@ export class ChannelRegistry {
     // never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
-    // A stream is a copy of speech the host would post, and nothing is
-    // posted into an inbound-only channel.
+    // A stream is a copy of speech the host would publish, and nothing is
+    // published into an inbound-only channel.
     if (isInboundOnly(matches[0]!)) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
@@ -3214,6 +3232,10 @@ export class ChannelRegistry {
     // alive with the reply. If the open fails, the speech does NOT go out:
     // a half-alive delivery is worse than a loud marker.
     if (!entry.open) {
+      // The trace and the notice below report the open, which has happened
+      // whatever the checks after it decide: speech they refuse leaves the
+      // channel open, and the notice is how the agent learns that and how to
+      // close it. The send-failure marker reports the speech.
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
@@ -3269,11 +3291,14 @@ export class ChannelRegistry {
     try {
       result = await server.sendChannelsPublish(publishParams);
     } catch (err) {
-      // The server answered with an error, so it didn't post the speech. A
-      // timeout or a lost connection leaves that unknown, and goes to the
-      // caller as before.
+      // An error response is the server's answer that the publish failed, so
+      // the marker says the human didn't receive it, in the server's own
+      // words. Any other rejection goes to the caller as before: after a
+      // timeout, or a connection lost before an answer, whether the server
+      // posted it is unknown, and a connection already closed rejects before
+      // anything is sent.
       if (err instanceof McplErrorResponse) {
-        return fail(channelId, err.message);
+        return fail(channelId, `server "${entry.serverId}" refused the publish: ${err.serverMessage}`);
       }
       throw err;
     }

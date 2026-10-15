@@ -332,7 +332,8 @@ const PROSE_ROUTING_HELP =
   '  One message may hold several sections: each line starting with ">>" begins\n' +
   '  a new envelope, routed to its own destination independently.\n' +
   '  A destination applies to the rest of that turn, until another is named.\n' +
-  '  A channel its server declared inbound-only is refused, and clears it.\n' +
+  '  A name that matches no channel, or several, bounces and leaves it as it\n' +
+  '  was. A channel its server declared inbound-only is refused, and clears it.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
   '  immediately when this one ends, instead of pausing until the next event.\n' +
   '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
@@ -595,7 +596,9 @@ interface TurnRouting {
   /**
    * Explicit mode: the destination the turn's delivered rounds have set,
    * decided at each round boundary (roundDestination), where each of the
-   * turn's streams starts.
+   * turn's streams starts. The turn's final text doesn't set it: the stream
+   * settles the turn before delivering that text, so no later stream of the
+   * turn starts after it, and a later start opens a turn of its own.
    */
   destination: string | null;
   /**
@@ -11145,6 +11148,15 @@ export class AgentFramework {
       if (result?.delivered) {
         this.proseBounceStreaks.delete(name);
         if (usedClipboard) this.proseClipboards.delete(name);
+      } else if (routing.pin === targetChannel && this.channelRegistry!.inboundOnlyServer(targetChannel) !== undefined) {
+        // routeSpeech refused it for speech: its server declared it
+        // inbound-only after the round was admitted, or in its answer to
+        // opening it. The pin goes, as a refusal at admission takes it, so
+        // later text bounces rather than meeting the same refusal. The
+        // stream's destination is left: while the channel stays
+        // inbound-only, the stream withholds it anyway. Another failed
+        // delivery keeps the pin, as before.
+        delete routing.pin;
       }
     } catch (err) {
       console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);

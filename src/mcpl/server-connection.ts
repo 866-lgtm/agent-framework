@@ -1287,6 +1287,7 @@ export class McplServerConnection extends EventEmitter {
         new McplErrorResponse(
           `MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`,
           response.error.code,
+          String(response.error.message),
           response.error.data,
         ),
       );

@@ -1535,6 +1535,72 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  for (const refusal of ['inbound-only', 'another failure'] as const) {
+    it(`explicit: a delivery routeSpeech fails (${refusal}) ${refusal === 'inbound-only' ? "clears the turn's destination, as a refusal at admission does" : 'keeps the destination, as before'}`, async () => {
+      // #alpha resolves when the round is admitted. By its delivery, its
+      // server has declared it inbound-only (as a channels/changed, or the
+      // answer to opening it, can), or the publish fails some other way.
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: '>>#alpha first' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'and more' },
+      ] as ContentBlock[]));
+      const framework = await createFramework('explicit');
+      const routed = stubRegistry(framework);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      const declared = new Set<string>();
+      registry.inboundOnlyServer = (channelId: string) => (declared.has(channelId) ? 'body' : undefined);
+      registry.routeSpeech = async (_agent: string, text: string, locus?: string | null) => {
+        routed.push({ text, locus: locus ?? null });
+        if (refusal === 'inbound-only') declared.add(locus ?? '');
+        return null;
+      };
+      feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      const bounces = context(framework).texts.filter((t) => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+      if (refusal === 'inbound-only') {
+        assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }], 'the later text never went to the refused channel');
+        assert.ok(bounces.some((t) => t.includes('this turn has no destination now')), `the later text bounced: ${bounces.join(' | ')}`);
+      } else {
+        assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }, { text: 'and more', locus: 'chan-alpha' }]);
+        assert.equal(bounces.length, 0);
+      }
+      await framework.stop();
+    });
+  }
+
+  it("explicit: a target refused in the turn's final text reaches nothing of its ' !' continuation, which starts a turn of its own", async () => {
+    // The turn's final text is delivered after the turn settles, so it never
+    // set the destination a later stream of the turn would start at: the
+    // continuation is a new turn, with none.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#ears ! for the room' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    const routed = stubRegistry(framework);
+    const stream = captureStream(framework);
+    feedTurn(framework, 2, [{ type: 'text', text: 'and more for the room' }] as ContentBlock[]);
+    feedTurn(framework, 3, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    feedTurn(framework, 4, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.ok(membrane.calls.length >= 2, `the continuation ran (${membrane.calls.length} calls)`);
+    assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }]);
+    const toAlpha = stream.chunks.filter((c) => c.channelId === 'chan-alpha').map((c) => c.delta).join('');
+    assert.equal(toAlpha.includes('and more'), false, `the continuation streamed nothing to #alpha: ${toAlpha}`);
+    assert.equal(stream.completes.some((c) => c.text.includes('and more')), false);
+    const bounces = context(framework).texts.filter((t) => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+    assert.ok(bounces.some((t) => t.includes('this turn has no destination now')), `the continuation's text bounced: ${bounces.join(' | ')}`);
+    await framework.stop();
+  });
+
   it('hybrid leaves unprefixed prose on the frozen locus', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');

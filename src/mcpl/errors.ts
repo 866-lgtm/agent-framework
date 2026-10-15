@@ -37,19 +37,24 @@ export const UNKNOWN_CHANNEL = -32023;
 export const CHANNEL_OPEN_FAILED = -32024;
 
 /**
- * A server's JSON-RPC error response to a request the host sent: the server
- * answered with an error rather than a result. A request that times out, or
- * whose connection closes first, rejects with a plain Error instead, since
- * whether the server acted on it is unknown.
+ * A server's JSON-RPC error response to a request the host sent once
+ * connected: the server answered with an error rather than a result.
+ * `serverMessage` is the error's own message, as the server sent it, and
+ * `message` adds which server answered which request. A request that times
+ * out, whose connection closes before an answer, or that finds its connection
+ * already closed, rejects with a plain Error instead, as does a failed
+ * handshake.
  */
 export class McplErrorResponse extends Error {
   readonly code: number;
+  readonly serverMessage: string;
   readonly data?: unknown;
 
-  constructor(message: string, code: number, data?: unknown) {
+  constructor(message: string, code: number, serverMessage: string, data?: unknown) {
     super(message);
     this.name = 'McplErrorResponse';
     this.code = code;
+    this.serverMessage = serverMessage;
     this.data = data;
   }
 }
