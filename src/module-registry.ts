@@ -319,21 +319,6 @@ export class ModuleRegistry {
       };
     }
 
-    // The call against the tool's declared schema, before the module runs: a
-    // missing required argument is refused with what to send, where the
-    // handler would otherwise fail deep inside, or run without it. Values
-    // aren't checked here, since a handler may take more than its schema can
-    // say (toolArgsProblems).
-    const definition = [...module.getTools(), ...(module.getUtilities?.() ?? [])].find((tool) => tool.name === toolName);
-    const problems = toolArgsProblems(call.input, definition?.inputSchema);
-    if (problems.length > 0) {
-      return {
-        success: false,
-        error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
-        isError: true,
-      };
-    }
-
     // Create a call with the un-prefixed name (preserving caller identity)
     const moduleCall: ToolCall = {
       id: call.id,
@@ -343,6 +328,21 @@ export class ModuleRegistry {
     };
 
     try {
+      // The call against the tool's declared schema, before the module runs:
+      // a missing required argument is refused with what to send, where the
+      // handler would otherwise fail deep inside, or run without it. Values
+      // aren't checked here, since a handler may take more than its schema
+      // can say (toolArgsProblems). The module's own listing runs inside the
+      // try, so its throw is answered like any other.
+      const definition = [...module.getTools(), ...(module.getUtilities?.() ?? [])].find((tool) => tool.name === toolName);
+      const problems = toolArgsProblems(call.input, definition?.inputSchema);
+      if (problems.length > 0) {
+        return {
+          success: false,
+          error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
+          isError: true,
+        };
+      }
       return await module.handleToolCall(moduleCall);
     } catch (error) {
       return thrownResult(error);

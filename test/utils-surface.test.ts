@@ -138,6 +138,10 @@ describe('utils surface', () => {
 
       const badType = await call({ action: 'run', name: 'stub--rare_op', args: { mode: 'soft', count: 'three' } });
       assert.match(badType.error!, /"count" must be a number, and this call gave a string/);
+
+      // The utility's input is the run's `args`, so the refusal names them.
+      const notObject = await call({ action: 'run', name: 'stub--rare_op', args: 'soft' });
+      assert.match(notObject.error!, /^Nothing was done: stub--rare_op its args must be an object, and this call gave a string\./);
       assert.equal(stub.calls.length, 0, 'handler never reached on a validation miss');
 
       const unknown = await call({ action: 'run', name: 'stub--nope', args: {} });

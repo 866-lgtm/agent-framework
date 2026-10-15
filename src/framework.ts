@@ -18944,7 +18944,7 @@ export class AgentFramework {
           return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
         }
         const args = input.args ?? {};
-        const problems = toolArgsProblems(args, def.inputSchema, { values: true });
+        const problems = toolArgsProblems(args, def.inputSchema, { values: true, field: 'args' });
         if (problems.length > 0) {
           // Teach by bounce: the error carries the schema, so the retry needs
           // no describe round-trip.
