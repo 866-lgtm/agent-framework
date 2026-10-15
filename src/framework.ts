@@ -15777,7 +15777,8 @@ export class AgentFramework {
     // the drain breaker kicks, decided where the kick is. What ends drains is
     // stop(), not a framework that was never started: one run with
     // runUntilIdle() has no maintenance timer, so a drain is its recovery.
-    const drainState = !agent ? 'unavailable (no agent handle)'
+    const drainState = !overBudget ? undefined
+      : !agent ? 'unavailable (no agent handle)'
       : this.providerAdmissionClosed ? 'not kicked: the framework is stopping'
       : this.surgeryHold ? 'not kicked: a surgery holds the store'
       : this.overBudgetDrainInFlight.has(agentName) ? 'already draining'
