@@ -21,8 +21,8 @@
     "src"
   ],
   "bin": {
-    "agent-framework-mcp": "./dist/src/api/mcp-server.js",
-    "agent-framework-recover": "./dist/src/recovery/recover-cli.js"
+    "agent-framework-mcp": "dist/src/api/mcp-server.js",
+    "agent-framework-recover": "dist/src/recovery/recover-cli.js"
   },
   "scripts": {
     "build": "tsc",
