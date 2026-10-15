@@ -118,7 +118,11 @@ test("the resident's refusals reach the model as error results, and a tune-out i
     ],
   ]);
   assert.deepEqual(first!.get('unknown'), { content: 'unknown channel: disc:guild:none', isError: true });
-  assert.deepEqual(first!.get('cancel'), { content: `channel ${CHANNEL} is not tuned out`, isError: true });
+  assert.deepEqual(first!.get('cancel'), {
+    content: 'Nothing was cancelled: no connected channel is tuned out now. A tune-out also ends by itself when its '
+      + 'duration runs out, or at the first wake past its wake budget, and its backlog goes to you then.',
+    isError: true,
+  });
   assert.deepEqual(first!.get('api'), { content: 'Unknown tool', isError: true });
   // A control: the same tool's success still reads as one.
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
@@ -127,7 +131,9 @@ test("the resident's refusals reach the model as error results, and a tune-out i
     isError: false,
   });
   assert.deepEqual(third!.get('again'), {
-    content: `channel ${CHANNEL} is already tuned out (cancel first to change params)`,
+    content: `Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap `
+      + `${backlogCap} and maxWakes ${maxWakes}. To change those, cancel it first with tune_out mode "cancel", which `
+      + 'delivers its backlog to you now, then call tune_out again with the new settings.',
     isError: true,
   });
   assert.deepEqual(third!.get('open'), { content: TUNED_OUT, isError: true });
@@ -141,11 +147,25 @@ test("the subconscious's refusals reach it as error results", async (t) => {
     { id: 'note', name: 'note_disposition', input: { key: '', text: 'ignore release-bot' } },
     { id: 'speak', name: 'speak_in_channel', input: { channelId: CHANNEL, text: 'They are tuned out.' } },
   ]]);
-  assert.deepEqual(round!.get('summary'), { content: 'empty summary', isError: true });
-  assert.deepEqual(round!.get('cancel'), { content: `channel ${CHANNEL} is not tuned out`, isError: true });
-  assert.deepEqual(round!.get('note'), { content: 'key required', isError: true });
+  assert.deepEqual(round!.get('summary'), {
+    content: 'Nothing was delivered: deliver_summary needs the summary in "text". If there\'s nothing to report, '
+      + "don't call it: staying silent is allowed.",
+    isError: true,
+  });
+  assert.deepEqual(round!.get('cancel'), {
+    content: 'Nothing was cancelled: no connected channel is tuned out now. A tune-out also ends by itself when its '
+      + 'duration runs out, or at the first wake past its wake budget, and its backlog goes to the resident then.',
+    isError: true,
+  });
+  assert.deepEqual(round!.get('note'), {
+    content: 'Nothing was recorded: note_disposition needs a "key", a short stable name for the note, such as '
+      + '"busy-channels". To delete a note, call it with that note\'s key and an empty "text".',
+    isError: true,
+  });
   assert.deepEqual(round!.get('speak'), {
-    content: 'channel speech is disabled for the subconscious (recipe: subconscious.allowChannelSpeech)',
+    content: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and calling "
+      + "it again won't change that. The resident can speak there: tell it what's needed with deliver_summary, or, if the "
+      + 'channel is tuned out and needs the resident now, end the tune-out with cancel_tuneout.',
     isError: true,
   });
 });
@@ -155,7 +175,10 @@ test("the subconscious's speak_in_channel with no text, where channel speech is 
   const [round] = await runRounds(framework, membrane, 'Subconscious', [[
     { id: 'speak', name: 'speak_in_channel', input: { channelId: CHANNEL, text: '   ' } },
   ]]);
-  assert.deepEqual(round!.get('speak'), { content: 'empty message', isError: true });
+  assert.deepEqual(round!.get('speak'), {
+    content: 'Nothing was posted: speak_in_channel needs the message in "text".',
+    isError: true,
+  });
 });
 
 test('a script, and a module calling in process, get the refusals as errors too', async (t) => {
