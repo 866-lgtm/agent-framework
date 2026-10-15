@@ -17,16 +17,17 @@ function withArticle(kind: string): string {
   return /^[aeiou]/.test(kind) ? `an ${kind}` : `a ${kind}`;
 }
 
-/** The kinds a declared type admits, or none when it declares none. */
+/** The kinds a declared type admits, each once, or none when it declares none. */
 function admittedKinds(type: unknown): string[] {
   const types = Array.isArray(type) ? type : type === undefined ? [] : [type];
-  return types
+  return [...new Set(types
     .filter((t): t is string => typeof t === 'string')
-    .map((t) => (t === 'integer' ? 'number' : t));
+    .map((t) => (t === 'integer' ? 'number' : t)))];
 }
 
-/** A value as the call gave it, briefly: at most 80 characters, cut between
- *  characters rather than inside one. */
+/** A value as the call gave it, briefly: its first 80 characters, then an
+ *  ellipsis when there are more, cut between characters rather than inside
+ *  one. Only what it shows is read, however long the value. */
 function shown(value: unknown): string {
   let text: string;
   try {
@@ -34,8 +35,14 @@ function shown(value: unknown): string {
   } catch {
     text = '(a value that could not be shown)';
   }
-  const chars = Array.from(text);
-  return chars.length <= 80 ? text : `${chars.slice(0, 80).join('')}…`;
+  let head = '';
+  let count = 0;
+  for (const char of text) {
+    if (count === 80) return `${head}…`;
+    head += char;
+    count++;
+  }
+  return head;
 }
 
 /** A list in prose: `a`, `a or b`, `a, b or c`. */
@@ -60,8 +67,9 @@ function own(obj: Record<string, unknown>, key: string): unknown {
  *
  * - An absent input (`undefined` or `null`) gives no arguments: it's refused
  *   only for the keys the schema requires.
- * - A required key given as `null` has no value, the same as one left out.
- *   An empty string is a value.
+ * - A required key given as `null` has no value, the same as one left out,
+ *   unless its declared type admits `null`. A key with no declared type takes
+ *   `null` as a value, as it takes any other. An empty string is a value.
  * - A schema whose `required` isn't a list requires nothing here.
  *
  * A module tool's call is checked without `values`: a handler may take more
@@ -88,9 +96,10 @@ export function toolArgsProblems(
   for (const key of Array.isArray(schema.required) ? schema.required : []) {
     if (typeof key !== 'string') continue;
     const value = own(obj, key);
-    if (value !== undefined && value !== null) continue;
-    missing.add(key);
     const kinds = admittedKinds(declared(key)?.type);
+    const admitsNull = kinds.length === 0 || kinds.includes('null');
+    if (value !== undefined && (value !== null || admitsNull)) continue;
+    missing.add(key);
     const wanted = kinds.length > 0 ? `"${key}" (${oneOf(kinds.map(withArticle))})` : `"${key}"`;
     problems.push(`needs ${wanted}, and this call gave ${value === null ? 'null' : 'none'}`);
   }

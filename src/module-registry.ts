@@ -295,6 +295,9 @@ export class ModuleRegistry {
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
    * calling the registry). A module's throw is answered as an error result.
+   * A call whose input isn't an object, or lacks a key the tool's schema
+   * requires, is answered before the module runs, with an error result that
+   * opens "Nothing was done:" and names what to send (toolArgsProblems).
    */
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     // Parse module--tool name

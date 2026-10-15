@@ -9,4 +9,6 @@
   followed by the utility's schema. It now admits any type of a declared
   type list, where it refused every value of such a parameter, and takes a
   run of 16 or more digits for a number, as membrane's XML tool mode sends a
-  large integer.
+  large integer, passing it to the utility as text.
+- The Discord module's `activate` reads a call with no input as no
+  arguments, where it threw a `TypeError`.

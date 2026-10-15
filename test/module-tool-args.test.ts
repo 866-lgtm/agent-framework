@@ -14,6 +14,8 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { toolArgsProblems } from '../src/tool-args.js';
+import { DiscordModule } from '../src/modules/discord/index.js';
+import type { DiscordClientInterface } from '../src/modules/discord/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const SCHEMA: ToolDefinition['inputSchema'] = {
@@ -211,6 +213,10 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
       const result = await call(framework, {}, 'probe--undeclared');
       assert.equal(result.success, true, result.error);
       assert.equal(probe.calls[0]!.name, 'undeclared');
+      // Not even an input that isn't an object is refused there.
+      const odd = await call(framework, 'zz', 'probe--undeclared');
+      assert.equal(odd.success, true, odd.error);
+      assert.equal(probe.calls[1]!.input, 'zz');
     });
   });
 
@@ -278,6 +284,20 @@ describe('toolArgsProblems', () => {
       ['"count" must be a number, and this call gave null']);
   });
 
+  it('takes null as a required key\'s value where its declared type admits null, or it declares none', () => {
+    const nullable: ToolDefinition['inputSchema'] = {
+      type: 'object',
+      properties: { note: { type: ['string', 'null'] }, any: {} },
+      required: ['note', 'any'],
+    };
+    assert.deepEqual(toolArgsProblems({ note: null, any: null }, nullable), []);
+    assert.deepEqual(toolArgsProblems({ note: null, any: null }, nullable, { values: true }), []);
+    assert.deepEqual(toolArgsProblems({}, nullable), [
+      'needs "note" (a string or null), and this call gave none',
+      'needs "any", and this call gave none',
+    ]);
+  });
+
   it('reads a key given as undefined as left out', () => {
     assert.deepEqual(toolArgsProblems({ path: undefined }, SCHEMA), ['needs "path" (a string), and this call gave none']);
     assert.deepEqual(toolArgsProblems({ path: 'p', count: undefined }, SCHEMA, { values: true }), []);
@@ -286,6 +306,37 @@ describe('toolArgsProblems', () => {
   it('reads only the input\'s own keys, and a required list that isn\'t a list as requiring nothing', () => {
     assert.deepEqual(toolArgsProblems({}, { type: 'object', required: ['constructor'] }), ['needs "constructor", and this call gave none']);
     assert.deepEqual(toolArgsProblems({}, { type: 'object', required: true as unknown as string[] }), []);
+    // An entry of the list that isn't a name is passed over.
+    assert.deepEqual(toolArgsProblems({}, { type: 'object', required: ['a', 5, null] as unknown as string[] }),
+      ['needs "a", and this call gave none']);
+  });
+
+  it('ignores a declared type or enum of the wrong shape rather than throwing on it', () => {
+    const odd = {
+      type: 'object',
+      properties: { t: { type: [5, 'string'] }, e: { enum: 'x' } },
+    } as unknown as ToolDefinition['inputSchema'];
+    assert.deepEqual(toolArgsProblems({ t: 'ok', e: 'anything' }, odd, { values: true }), []);
+    assert.deepEqual(toolArgsProblems({ t: 3 }, odd, { values: true }), ['"t" must be a string, and this call gave a number']);
+  });
+
+  it('takes a digit run only as the whole of a string, for a number', () => {
+    assert.deepEqual(toolArgsProblems({ path: 'p', id: ['1234567890123456'] }, SCHEMA, { values: true }),
+      ['"id" must be a number, and this call gave an array']);
+    assert.deepEqual(toolArgsProblems({ path: 'p', id: '1234567890123456x' }, SCHEMA, { values: true }),
+      ['"id" must be a number, and this call gave a string']);
+    assert.deepEqual(toolArgsProblems({ path: 'p', id: 'x1234567890123456' }, SCHEMA, { values: true }),
+      ['"id" must be a number, and this call gave a string']);
+  });
+
+  it('reports a wrong-typed value once, as its type, even where it has an enum', () => {
+    assert.deepEqual(toolArgsProblems({ path: 'p', mode: 3 }, SCHEMA, { values: true }),
+      ['"mode" must be a string, and this call gave a number']);
+  });
+
+  it('names a kind once when a type list names it twice', () => {
+    const both: ToolDefinition['inputSchema'] = { type: 'object', properties: { n: { type: ['integer', 'number'] } } };
+    assert.deepEqual(toolArgsProblems({ n: 'x' }, both, { values: true }), ['"n" must be a number, and this call gave a string']);
   });
 
   it('names the input by the caller\'s word for it', () => {
@@ -308,5 +359,31 @@ describe('toolArgsProblems', () => {
     const [astral] = toolArgsProblems({ path: 'p', mode: `${'x'.repeat(78)}😀${'y'.repeat(10)}` }, SCHEMA, { values: true });
     assert.ok(astral!.includes('😀…'), astral);
     assert.doesNotMatch(astral!, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
+  it('shows a value of 80 characters whole, cuts one of 81, and shows a value JSON can\'t through its own text', () => {
+    const enumOnly: ToolDefinition['inputSchema'] = { type: 'object', properties: { k: { enum: ['a'] } } };
+    // JSON.stringify quotes a string, so 78 characters show as 80.
+    const [eighty] = toolArgsProblems({ k: 'x'.repeat(78) }, enumOnly, { values: true });
+    assert.ok(eighty!.endsWith(`gave "${'x'.repeat(78)}"`), eighty);
+    const [eightyOne] = toolArgsProblems({ k: 'x'.repeat(79) }, enumOnly, { values: true });
+    assert.ok(eightyOne!.endsWith(`gave "${'x'.repeat(79)}…`), eightyOne);
+    const [fn] = toolArgsProblems({ k: function named() {} }, enumOnly, { values: true });
+    assert.match(fn!, /gave function named\(\) \{\s*\}$/);
+  });
+});
+
+describe('a module tool that requires nothing reads an absent input as no arguments', () => {
+  it('activates Discord speech when the call has no input at all', async () => {
+    const discord = new DiscordModule({} as unknown as DiscordClientInterface, { token: 'test-token' });
+    const registered: unknown[] = [];
+    (discord as unknown as { ctx: ModuleContext }).ctx = {
+      registerSpeechHandler: (_key: string, options: unknown) => { registered.push(options); },
+    } as unknown as ModuleContext;
+    for (const input of [undefined, null]) {
+      const result = await discord.handleToolCall({ id: 'c1', name: 'activate', input } as unknown as ToolCall);
+      assert.equal(result.success, true, result.error);
+    }
+    assert.deepEqual(registered, [{ additive: undefined }, { additive: undefined }]);
   });
 });
