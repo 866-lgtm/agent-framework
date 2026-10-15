@@ -2035,6 +2035,36 @@ test('#277: stop waits for an annotation started by an ephemeral run it has alre
   } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
+test("stop() over a running ephemeral run settles the run's pending batch before the run is disposed", async () => {
+  // stop() ends the run's stream through the framework's own terminal, and
+  // that terminal's settle rejects the run's caller, whose finally disposes
+  // the agent. driveStream's finally abandons a pending batch only while the
+  // agent is still registered, so the terminal abandons the batch itself.
+  const h = await harness([[calls('one')]]);
+  let spills = 0;
+  slowSpill(h.framework, async () => { spills++; });
+  h.membrane.onSubmit = () => { queueMicrotask(() => { void h.framework.stop(); }); };
+  let outcome = 'pending';
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+      .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+    h.framework.start();
+    await completion;
+  } finally { await h.framework.stop(); }
+  assert.match(outcome, /^rejected: Framework shutting down/, 'the run ends through the shutdown terminal');
+  assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
+  const restarted = await AgentFramework.create(h.base);
+  try {
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const settled = audit.filter((r) => r.agentName === 'ephemeral' && r.type === 'withheld').map((r) => r.reason);
+    assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
+  } finally { await restarted.stop(); }
+});
+
 // ---------------------------------------------------------------------------
 // #281's review: each withheld result's file is its own, a branch change stops
 // the annotation's writes, and the direct API's refusal retry fits the budget.

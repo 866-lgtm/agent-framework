@@ -3994,6 +3994,22 @@ export class AgentFramework {
     if (agent.streamId === myStreamId) {
       this.abortAgentScript(agent.name, kind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce');
       agent.reset();
+      // A stop hands its tool-result batch to no successor, so abandon the
+      // batch here, before the run is settled. driveStream's finally
+      // abandons a pending batch too, but only while the agent is still
+      // registered, and for an ephemeral run the settle below rejects the
+      // run's caller, whose own finally deregisters the agent. The `aborted`
+      // cases that reach here leave the loop with `return`, which closes the
+      // iterator first and gives the deregistration time to win. abandon()
+      // clears the batch before its audit append, so a failed write can't
+      // re-arm it or stop the settle.
+      if (agent.toolResultGuard.hasPending) {
+        try {
+          agent.toolResultGuard.abandon('aborted');
+        } catch (error) {
+          console.error(`[tool-result-guard] agent=${agent.name} failed to record aborted batch:`, error);
+        }
+      }
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
