@@ -629,6 +629,41 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D4', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const g1 = framework.getAgent('conversation-slack-D4-g1')!;
+    assert.ok(g1, 'g1 fork should exist after spawn');
+
+    forceExpiry(framework, 'slack:D4', IDLE_TTL_MS);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+    // While the closure turn is alive, a write addressed to the fork is
+    // deferred to that turn's end.
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+    };
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    let deferred: string | undefined;
+    membrane.streamYielding = (request, options) => {
+      deferred = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
+        { forAgent: 'conversation-slack-D4-g1' });
+      return streamYielding(request, options);
+    };
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+
+    assert.equal(deferred, '', 'deferred: the closure turn was alive');
+    assert.equal(framework.getAgent('conversation-slack-D4-g1'), null, 'disposed once its closure turn finished');
+    const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+    assert.ok(stored[stored.length - 2]!.includes('Final report posted.'), stored.join('\n'));
+    assert.ok(stored[stored.length - 1]!.includes('one more thing'), 'stored after the closure reply, before the fork was disposed');
+
+    await framework.stop();
+  });
+
   it('restart does not reuse generation names or re-seed an existing namespace', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
     const fw1 = await makeFramework({}, 'restart.chronicle');

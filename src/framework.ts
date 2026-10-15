@@ -6016,6 +6016,18 @@ export class AgentFramework {
       agent.cancelStream();
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
+        // What is still queued for the run, such as a message held for its
+        // turn's end, goes to its store now, past its deferral: once the run
+        // is deregistered, a flush finds no agent to take it and drops it.
+        // The run's namespace stays in the store for investigation, so the
+        // messages stay with it. A quiesced host defers them again instead,
+        // as stop() does, and with the run gone, the flush that meets them
+        // later drops them.
+        const queued = this.drainDeferredFor(agent.name);
+        if (queued.length > 0) {
+          this.readdDrained(queued, `end of ephemeral run ${agent.name}`, { bypassDeferral: !this.quiesced });
+          this.ackDeferredWrites();
+        }
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched.
@@ -13478,12 +13490,6 @@ export class AgentFramework {
         this.pendingAssistantBlocks.delete(agent.name);
       }
 
-      // A conversation fork whose TTL closure turn just finished is done for
-      // good — dispose it so the agent map doesn't grow monotonically.
-      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
-        this.disposeConversationAgent(agent.name);
-      }
-
       // The turn is torn down — release the turn-alive marker BEFORE the
       // deferred flush below, so the flush appends at the settled tail.
       // Token-matched: if a successor turn already owns the agent (endTurn
@@ -13508,6 +13514,14 @@ export class AgentFramework {
       if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
         this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
+      }
+
+      // A conversation fork whose TTL closure turn just finished is done for
+      // good — dispose it so the agent map doesn't grow monotonically. After
+      // the flush above, so what was held for the turn's end lands in the
+      // fork's store instead of being dropped as addressed to no agent.
+      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+        this.disposeConversationAgent(agent.name);
       }
     }
   }
