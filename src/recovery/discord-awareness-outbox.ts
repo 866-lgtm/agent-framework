@@ -664,29 +664,27 @@ export class DiscordAwarenessOutbox {
    * in this process's view; or a batch left prepared, which the next start
    * retires, unsent. A suppression's batch also names removals for its
    * target branch, which its surgery never created: until it's retired, a
-   * branch made under that name would have them applied at a start on it.
-   * Where this process can read the batch, every way the framework makes a
-   * branch refuses that name (pendingSuppressionsFor). After a write that
-   * failed inside the store it can't, so the error says to use another name.
+   * branch made under that name would have them applied at a start on it,
+   * so every way the framework makes a branch refuses that name
+   * (pendingSuppressionsFor). After a write that failed inside the store
+   * this process can't read the journal, and every name is refused until a
+   * restart reopens the store.
    */
   private failedPrepare(batch: DiscordAwarenessBatchRecord, error: unknown): string {
     const detail = `recording awareness batch ${batch.id} failed: ${errorText(error)}`;
     const retired = 'the next start retires it, none of its marks sent';
-    const suppression = !!batch.suppressionIntervals?.length;
-    const unseen = suppression
-      ? `, and until then a branch named ${batch.targetBranch} would have its removals applied, so use another name`
-      : '';
+    const unreadable = '. Until a restart reopens the store, no branch can be made, since the journal can\'t be read';
     if (this.journal.needsReopen) {
       return `${detail}; the batch may be in the store, unseen until the store is reopened, ` +
-        `and if so ${retired}${unseen}`;
+        `and if so ${retired}${unreadable}`;
     }
     if (!this.journal.needsReconcile) return detail;
     try {
       return this.discard(batch.id) ? `${detail}; it reached the journal and is retired` : detail;
     } catch (retireError) {
       return `${detail}; it reached the journal, and retiring it also failed (${errorText(retireError)}), ` +
-        `so ${retired}` +
-        (!suppression ? '' : this.journal.needsReopen ? unseen : `, and until then a branch named ${batch.targetBranch} is refused`);
+        `so ${retired}` + (this.journal.needsReopen ? unreadable
+          : batch.suppressionIntervals?.length ? `, and until then a branch named ${batch.targetBranch} is refused` : '');
     }
   }
 

@@ -565,8 +565,22 @@ test('an offline recovery onto a name a pending suppression claims is refused, a
     try {
       assert.equal(reopened.currentBranch().name, 'main');
       assert.equal(new DiscordAwarenessOutbox(reopened).batches().length, 1, 'the refusal prepared nothing');
+      // A journal that can't be read can't say which names are claimed: any
+      // recovery is refused.
+      reopened.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { records: 'nope' });
     } finally {
       reopened.close();
+    }
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', branchName: 'unclaimed' }),
+      /^Error: Recovery branch unclaimed can't be made: the Discord awareness journal can't be read \(Corrupt Discord awareness journal entry \S+\), so whether a suppression's pending removals claim that name can't be checked$/,
+    );
+    const after = JsStore.open({ path: storePath });
+    try {
+      assert.equal(after.currentBranch().name, 'main');
+      assert.ok(!after.listBranches().some((branch) => branch.name === 'unclaimed'), 'no branch was made');
+    } finally {
+      after.close();
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });

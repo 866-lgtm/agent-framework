@@ -7819,9 +7819,8 @@ export class AgentFramework {
       // A suppression's removals stay pending for its target branch: a start
       // there finishes them, and a start that finds no such branch gives
       // them up. Until then a branch made under that name would have them
-      // applied: while this process can read the batch,
-      // checkDiscordAwarenessBranchName refuses one, and when it can't, the
-      // operator is told to use another name.
+      // applied, so checkDiscordAwarenessBranchName refuses it, and while
+      // this process can't read the journal it refuses every name.
       let forked = true;
       try {
         forked = this.store.listBranches().some((branch) => branch.name === batch.targetBranch);
@@ -7830,7 +7829,7 @@ export class AgentFramework {
         ? `a start on ${batch.targetBranch}, which is kept, would finish them there, so delete that branch unless you want that`
         : `the next start gives them up, since no branch has that name`) + (this.discordAwarenessOutbox.readable
         ? `, and until then a branch named ${batch.targetBranch} is refused`
-        : `, and until then a branch named ${batch.targetBranch} would have them applied, so use another name`);
+        : ', and until a restart no branch can be made, since the journal can\'t be read');
       this.opsAlert('discord-awareness-unresolved', agentName, `A failed suppression's ${what}`, { data: { batchId: batch.id } });
       return `; ${what}`;
     }
@@ -8301,17 +8300,29 @@ export class AgentFramework {
    * (DiscordAwarenessOutbox.pendingSuppressionsFor), cancelled and imported
    * batches included, and it ends once a start on that branch finishes the
    * suppression, or a start finds no branch with its name and gives it up.
-   * Rollback and suppression check their target with it, and the API's
-   * `branch.create` checks its name; a host that creates branches in the
-   * store itself calls it first. When the journal can't be read, it refuses
-   * nothing, so making a branch never waits on the journal.
+   * Rollback and suppression check their target with it, whether or not
+   * they chose marks, and the API's `branch.create` checks its name; a host
+   * that creates branches in the store itself calls it first. While the
+   * journal can't be read (after a write that failed inside the store,
+   * until a restart reopens it, or while an entry or a legacy ledger can't
+   * be read), it refuses every name (`failed`): it can't tell which are
+   * claimed, and a branch made under a claimed name would lose messages at
+   * its next start.
    */
   checkDiscordAwarenessBranchName(name: string): void {
     let claimed: DiscordAwarenessBatch[];
     try {
       claimed = this.discordAwarenessOutbox.pendingSuppressionsFor(name);
-    } catch {
-      return;
+    } catch (error) {
+      throw new OperatorActionError(
+        'failed',
+        `Branch ${name} can't be made now: the Discord awareness journal can't be read ` +
+          `(${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}), so whether a ` +
+          'suppression\'s pending removals claim that name can\'t be checked, and a branch made under a claimed name ' +
+          'would lose messages at its next start. This lasts until the journal can be read: after a write that failed ' +
+          'inside the store, until a restart reopens the store',
+        { cause: error },
+      );
     }
     if (claimed.length === 0) return;
     throw new OperatorActionError(
@@ -16403,10 +16414,34 @@ export class AgentFramework {
    * rollbackToMessage or suppressMessages; offline, the recover CLI). One
    * with marks not applied, or a body given up, raises an ops alert; one
    * with neither (no marks chosen, or its marks cancelled, and its body
-   * finished) is only logged.
+   * finished) is only logged. An in-place change's batch (a hide or a turn
+   * undo, which a pre-release build recorded in two appends) has nothing to
+   * redo: its change stands on its branch, and its alert says only that its
+   * marks weren't applied.
    */
   private reportRetiredAwareness(retirement: DiscordAwarenessRetirement, opts: { finished?: boolean } = {}): void {
     const { batchId, agentName, sourceBranch, targetBranch, marks } = retirement;
+    if (!retirement.suppression && sourceBranch === targetBranch) {
+      // An in-place change (a hide, a turn undo) left between its batch and
+      // its activation, as a pre-release build's two appends could: the
+      // change stands on its branch, and there's nothing to redo it from.
+      if (marks === 0) {
+        console.error(
+          `[discord-awareness] A hide or turn undo of ${agentName} on ${targetBranch} (awareness batch ${batchId}) ` +
+            'stands, and its batch is retired, with no marks to apply',
+        );
+        return;
+      }
+      this.opsAlert(
+        'discord-awareness-not-scheduled',
+        agentName,
+        `A hide or turn undo of ${agentName} on ${targetBranch} (awareness batch ${batchId}) stands, but its ` +
+          `${marks} awareness mark(s) weren't applied: the process ended before they were activated, and a start ` +
+          'never completes a surgery\'s marks. The change itself stands on that branch, so there is nothing to redo',
+        { data: { batchId, marks } },
+      );
+      return;
+    }
     const surgery = retirement.suppression ? 'suppression' : 'rollback';
     const about = `The ${surgery} of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ${batchId})`;
     const redo = `switch to ${sourceBranch}, which still has every message it removed, and redo the ${surgery} there, ` +

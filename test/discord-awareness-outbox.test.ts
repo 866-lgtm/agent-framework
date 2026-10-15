@@ -1197,6 +1197,27 @@ test('framework finishes the body of a suppression an operator cancelled, retire
   }
 });
 
+test('a start retires a pre-release in-place batch with an alert that says the change stands and offers no redo', withJournal((outbox, h) => {
+  // What a crash between a pre-release build's two appends for a hide or a
+  // turn undo left: a batch for exactly its branch, with no intervals.
+  const batch = outbox.prepare({
+    agentName: 'cairn', sourceBranch: 'main', targetBranch: 'main', refs: [ref('m1'), ref('m2')], scope: 'all',
+    activationPolicy: 'explicit',
+  })!;
+  const recovered = h.reopen().recoverAtStartup((name) => name === 'main');
+  assert.deepEqual(recovered.retired.map((r) => [r.batchId, r.reason, r.marks, r.suppression]), [[batch.id, 'interrupted', 2, false]]);
+  const alerts: Array<{ kind: string; message: string }> = [];
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.opsAlert = (kind: string, _agent: string, message: string) => { alerts.push({ kind, message }); };
+  framework.reportRetiredAwareness(recovered.retired[0]);
+  assert.deepEqual(alerts, [{
+    kind: 'discord-awareness-not-scheduled',
+    message: `A hide or turn undo of cairn on main (awareness batch ${batch.id}) stands, but its 2 awareness mark(s) `
+      + 'weren\'t applied: the process ended before they were activated, and a start never completes a surgery\'s marks. '
+      + 'The change itself stands on that branch, so there is nothing to redo',
+  }]);
+}));
+
 /** A framework stub whose agent context is a plain list (ids i0..), for host/command. */
 function hostCommandFramework(h: ReturnType<typeof storeHarness>, messages: Array<{ id: string; metadata: Record<string, unknown> }>) {
   let currentBranch = 'main';
@@ -1688,13 +1709,13 @@ test('a prepare whose write failed says what the journal may hold, and retires a
   // Written but out of this view: the next start retires it, and the error
   // says so. A rollback's batch claims no name: no start completes it.
   seams.fail('append', 'unindexed', () => true);
-  assert.throws(() => outbox.prepare(input(2)), /may be in the store, unseen until the store is reopened, and if so the next start retires it, none of its marks sent$/);
+  assert.throws(() => outbox.prepare(input(2)), /may be in the store, unseen until the store is reopened, and if so the next start retires it, none of its marks sent\. Until a restart reopens the store, no branch can be made, since the journal can't be read$/);
   const fresh = new DiscordAwarenessOutbox(h.store);
   const recovered = fresh.recoverAtStartup((name) => name === 'main');
   assert.deepEqual(recovered.retired.map((r) => [r.targetBranch, r.reason]), [['rollback/cairn/2', 'interrupted']]);
 }));
 
-test('a suppression whose prepare was written out of this view: the error says to use another name', withJournal((_outbox, h) => {
+test('a suppression whose prepare was written out of this view: the error says no branch can be made until a restart', withJournal((_outbox, h) => {
   const seams = journalSeams(h.store);
   const outbox = new DiscordAwarenessOutbox(seams.store);
   outbox.batches();
@@ -1704,7 +1725,7 @@ test('a suppression whose prepare was written out of this view: the error says t
       agentName: 'cairn', sourceBranch: 'main', targetBranch: 'fix-1', refs: [ref('m1')], scope: 'all',
       activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }],
     }),
-    /if so the next start retires it, none of its marks sent, and until then a branch named fix-1 would have its removals applied, so use another name$/,
+    /if so the next start retires it, none of its marks sent\. Until a restart reopens the store, no branch can be made, since the journal can't be read$/,
   );
   const recovered = new DiscordAwarenessOutbox(h.store).recoverAtStartup((name) => name === 'main');
   assert.deepEqual(recovered.retired.map((r) => [r.targetBranch, r.reason]), [['fix-1', 'branch-gone']]);

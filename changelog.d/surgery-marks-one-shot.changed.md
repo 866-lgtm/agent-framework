@@ -30,10 +30,12 @@
   its removals apply only there. Until a suppression is finished or given
   up, a rollback, a suppression, an offline recovery or the API's
   `branch.create` refuses its branch name, cancelled or not, since a start
-  on a branch made under it would apply those removals there; while the
-  journal can't be read, nothing is refused. A `hide` or turn `undo`
-  records its batch and the batch's activation as one journal entry, so a
-  crash never leaves it half recorded.
+  on a branch made under it would apply those removals there. While the
+  journal can't be read, every new branch name is refused, since none can
+  be checked; after a write that failed inside the store, a restart, which
+  reopens the store, ends that. A `hide` or turn `undo` records its batch
+  and the batch's activation as one journal entry, so a crash never leaves
+  it half recorded.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch, or the batch a `hide` or turn
   `undo` records after its change) is now written only after that change is

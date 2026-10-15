@@ -458,8 +458,10 @@ const result = await framework.rollbackToMessage('cairn', {
   apply only there. Until a suppression is finished or given up, a
   rollback, a suppression, an offline recovery or the API's `branch.create`
   refuses its branch name, cancelled or not, since a start on a branch made
-  under it would apply those removals there; while the journal can't be
-  read, nothing is refused.
+  under it would apply those removals there. While the journal can't be
+  read, every new branch name is refused (`failed`), since none can be
+  checked; after a write that failed inside the store, a restart, which
+  reopens the store, ends that.
 - **Operator controls,** each recorded in the operator log; once `stop()`
   has begun, cancel, retract and release refuse, like every operator entry
   point:
@@ -485,9 +487,10 @@ const result = await framework.rollbackToMessage('cairn', {
     a new branch that a suppression with pending removals names as its
     target, cancelled or not, since a start on a branch with that name
     would apply them there. Rollback, suppression and the API's
-    `branch.create` call it; a host that creates branches in the store
-    itself calls it first. When the journal can't be read it refuses
-    nothing, so a surgery never waits on the journal.
+    `branch.create` call it, with marks chosen or not; a host that creates
+    branches in the store itself calls it first. While the journal can't
+    be read it refuses every name (`failed`), and says why and what ends
+    that.
 
   A request the journal won't carry out (an unknown batch, or one in the
   wrong state) is refused as `invalid`; a failure to read or write the

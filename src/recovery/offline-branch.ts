@@ -216,12 +216,20 @@ export async function createOfflineRecoveryBranch(
     // A suppression whose removals are pending for this name, left by a run
     // that never made its branch, would have them applied to the branch made
     // here at the next start on it (the framework's
-    // checkDiscordAwarenessBranchName refuses the same set). When the journal
-    // can't be read, the recovery goes ahead, as the host's surgeries do.
-    let claimed: ReturnType<DiscordAwarenessOutbox['pendingSuppressionsFor']> = [];
+    // checkDiscordAwarenessBranchName refuses the same set). A journal that
+    // can't be read can't say which names are claimed, so the recovery is
+    // refused, as the host's surgeries are.
+    let claimed: ReturnType<DiscordAwarenessOutbox['pendingSuppressionsFor']>;
     try {
       claimed = outbox.pendingSuppressionsFor(targetBranch);
-    } catch { /* unreadable: go ahead */ }
+    } catch (error) {
+      throw new Error(
+        `Recovery branch ${targetBranch} can't be made: the Discord awareness journal can't be read ` +
+          `(${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}), so whether a ` +
+          'suppression\'s pending removals claim that name can\'t be checked',
+        { cause: error },
+      );
+    }
     if (claimed.length > 0) {
       throw new Error(
         `Recovery branch ${targetBranch} is the target of suppression ${claimed[0].id}, whose removals aren't ` +

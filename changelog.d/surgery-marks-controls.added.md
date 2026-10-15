@@ -25,8 +25,8 @@
     suppression, or a start finds no branch with the name and gives the
     suppression up. Rollback, suppression, the offline recovery and the
     API's `branch.create` check their names with it, and a host that creates
-    branches in the store itself calls it first. When the journal can't be
-    read it refuses nothing.
+    branches in the store itself calls it first. While the journal can't be
+    read it refuses every name (`failed`), and says why and what ends that.
 
   Each control is recorded in the operator log. A request the journal won't
   carry out (an unknown batch, or one in the wrong state) is refused as

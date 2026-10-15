@@ -824,17 +824,27 @@ describe('surgery and awareness marks', () => {
     assert.deepEqual(outbox().operations(), []);
   });
 
-  it("when the journal can't be read, the branch name check refuses nothing: a surgery doesn't wait on the journal", async () => {
+  it("when the journal can't be read, every new branch name is refused, marks or not, until it can be", async () => {
     await start(false);
-    const { tail } = seed(1);
+    const { tail, removed } = seed(2);
+    const sourceBranch = cm().currentBranch().name;
     const pendingSuppressionsFor = DiscordAwarenessOutbox.prototype.pendingSuppressionsFor;
     DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = function () { throw new Error('injected unreadable journal'); };
+    const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
+      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. This lasts until the journal can be read: after a write that failed inside the store, until a restart reopens the store$/.test(error.message);
     try {
-      const result = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' });
-      assert.equal(result.targetBranch, 'fix-2');
+      await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' }), refused);
+      await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'fix-2' }), refused);
+      const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
+      await assert.rejects(api.cmdBranchCreate({ name: 'fix-2' }), refused);
     } finally {
       DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = pendingSuppressionsFor;
     }
+    assert.equal(cm().currentBranch().name, sourceBranch, 'nothing moved');
+    assert.ok(!framework.getStore().listBranches().some((branch) => branch.name === 'fix-2'), 'no branch was made');
+    // Readable again, the same rollback goes ahead.
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' });
+    assert.equal(result.targetBranch, 'fix-2');
   });
 
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {
