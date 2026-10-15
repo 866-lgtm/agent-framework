@@ -26,7 +26,11 @@
  *   `input_required` answer asks for another round, so a call that ends
  *   after one has no answer.
  * - **Lifetime.** On a lost transport the connection restarts with the same
- *   backoff settings as legacy, when `reconnect` is set. A server that shares
+ *   backoff settings as legacy, when `reconnect` is set, once the lost
+ *   launch is reaped, so a second child never runs beside the first. A
+ *   stdio child that stays alive but silently stops reading its stdin is
+ *   no loss the pipes show: each call's deadline is the only bound on it.
+ *   A server that shares
  *   no revision with this client is a configuration verdict, as for legacy
  *   (`McplProtocolVersionError`): it is never retried. List-change
  *   awareness is kept while the connection lives: a subscription the server
@@ -368,6 +372,9 @@ export class ModernMcpConnection extends EventEmitter {
    * first. close() retries them and reports what still fails.
    */
   private unreaped: Array<{ session: Session; failure: Error }> = [];
+  /** A lost session's reap in flight: the reconnect follows it, and
+   *  close() waits for it. */
+  private losing: { session: Session; done: Promise<void> } | null = null;
   /** Child stderr from before anyone listens (the caller attaches only once
    *  connect() returns), delivered to the first listener. Bounded: the
    *  newest lines are kept. */
@@ -700,11 +707,22 @@ export class ModernMcpConnection extends EventEmitter {
 
   /** The transport went away (child exit, or a closed HTTP client). */
   private handleLost(generation: number, reason: string): void {
-    if (this.session?.generation !== generation) return;
+    const session = this.session;
+    if (session?.generation !== generation) return;
     this.session = null;
     this.cancelRelisten();
     this.emit('close', { reason });
-    if (this.willReconnect) this.scheduleReconnect();
+    // Reap before any reconnect, so a second child never runs beside the
+    // first. A transport usually closes once its child has exited, but a
+    // loss read from a failed pipe can come while the child still runs
+    // (R1-1). A launch that can't be reaped halts reconnecting, as a failed
+    // connect's does.
+    const done = ModernMcpConnection.closeSession(session).then((failure) => {
+      if (this.losing?.session === session) this.losing = null;
+      if (failure) this.holdUnreaped(session, failure);
+      else if (this.willReconnect) this.scheduleReconnect();
+    });
+    this.losing = { session, done };
   }
 
   /** The legacy engine's backoff: doubling from the base interval, capped,
@@ -860,14 +878,17 @@ export class ModernMcpConnection extends EventEmitter {
     this.reconnectTimer = null;
     this.cancelRelisten();
     const opening = this.opening;
+    const losing = this.losing;
     const session = this.session;
     this.session = null;
     if (session) this.closeIncomplete = true;
     // Every generation this connection still owns: a connect in flight, the
-    // live one, and any a failed cleanup couldn't reap.
+    // live one, a lost one still being reaped, and any a failed cleanup
+    // couldn't reap.
     const targets: Session[] = [];
     if (opening) targets.push(opening.session);
     if (session) targets.push(session);
+    if (losing) targets.push(losing.session);
     for (const held of this.unreaped) if (!targets.includes(held.session)) targets.push(held.session);
     this.unreaped = [];
     const failures: Error[] = [];
@@ -880,11 +901,12 @@ export class ModernMcpConnection extends EventEmitter {
         if (!this.unreaped.some((held) => held.session === target)) this.unreaped.push({ session: target, failure });
       }
     }
-    if (opening) {
-      // The connect's own cleanup closes its generation again, after the
-      // close above; `done` settles once it has. A child that cleanup
-      // couldn't reap is this close's failure too.
-      await opening.done;
+    // The connect's own cleanup, and a lost session's reap, close their
+    // generation again, after the close above; each `done` settles once it
+    // has. A child either couldn't reap is this close's failure too.
+    for (const pending of [opening, losing]) {
+      if (!pending) continue;
+      await pending.done;
       for (const held of this.unreaped) if (!failures.includes(held.failure)) failures.push(held.failure);
     }
     if (failures.length === 1) throw failures[0];

@@ -160,6 +160,58 @@ test('with reconnect, a child that exits during the connect-time subscribe is a 
   assert.equal(wire(log).find((e) => e.method === 'tools/call')!.launch, 2);
 });
 
+/**
+ * The stdio line under a connection's live session, reached from inside, to
+ * stand for a loss read from a failed pipe while the child still runs: the
+ * transport closes before the child has exited (R1-1).
+ */
+function liveLine(connection: ModernMcpConnection): { markClosed: (info: { reason: string }) => void; child: { pid: number; kill: (signal?: string) => boolean } } {
+  const session = (connection as unknown as { session: { wire: { inner: { line: unknown } } } | null }).session;
+  assert.ok(session, 'a live session');
+  return session.wire.inner.line as never;
+}
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test('a transport lost while its child still runs is reaped before the reconnect, so no second child runs beside the first (R1-1)', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
+  const first = wire(log).find((e) => e.event === 'start')!.pid!;
+  liveLine(connection).markClosed({ reason: 'stdio pipe failed' });
+  await until(() => wire(log).filter((e) => e.event === 'start').length === 2, 'the next launch');
+  assert.equal(alive(first), false, 'the first child was gone when the second started');
+  await until(() => connection.isConnected, 'connected on the next launch');
+});
+
+test('close() during a lost transport\'s reap waits for its child to exit (R1-1)', async () => {
+  const log = scratchLog();
+  const connection = await connect('ignore-sigterm', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
+  const first = wire(log).find((e) => e.event === 'start')!.pid!;
+  liveLine(connection).markClosed({ reason: 'stdio pipe failed' });
+  await connection.close();
+  assert.equal(alive(first), false, 'dead when close() resolved');
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no launch after close');
+});
+
+test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const line = liveLine(connection);
+  const realKill = line.child.kill.bind(line.child);
+  line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  // Before the connection's close(), which then reaps an exited child.
+  cleanups.push(async () => {
+    realKill('SIGKILL');
+    await until(() => !alive(line.child.pid), 'the held child killed');
+  });
+  line.markClosed({ reason: 'stdio pipe failed' });
+  await until(() => errors.some((m) => /Not starting another launch while it may still be running/.test(m)), 'the launch held as unreaped', 8000);
+  assert.equal(connection.willReconnect, false);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no second launch');
+});
+
 test('close() during a reconnect handshake ends the launch it was waiting on, and stops', async () => {
   const log = scratchLog();
   const connection = await connect('hang-discover-later', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
