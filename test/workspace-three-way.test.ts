@@ -2755,6 +2755,10 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
     const m = await env.open({ walkCap: 2 });
+    // Without ctime trust no fingerprint vouches, so no pass re-records one
+    // once the files are older than the racy window, however slowly this
+    // runs: what's left to record is the place alone.
+    (m as any).ctimeTrust.set(realpathSync(env.dir), null);
     await call(m, 'sync', {});
     await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
