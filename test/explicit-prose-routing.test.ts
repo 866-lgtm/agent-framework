@@ -85,7 +85,7 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     resolveProseTarget: (spec: string, opts?: { forSpeech?: boolean }) =>
       spec === '#ears'
         ? opts?.forSpeech
-          ? { error: 'body:ears is inbound-only: server "body" declared this channel\'s direction "inbound", so the host posts nothing into it; to speak there, use that server\'s own tools' }
+          ? { error: 'body:ears is inbound-only: server "body" declared this channel\'s direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools', refusedChannelId: 'body:ears' }
           : { channelId: 'body:ears', label: 'Body · ears' }
         : known[spec] ?? { error: `no channel matches "${spec}"` },
     routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
@@ -1246,6 +1246,11 @@ describe('explicit prose routing', () => {
       ['>>#nowhere bounced'],
       ['>>skip_reply kept\nand unprefixed'],
       ['unprefixed', '>>#alpha second segment'],
+      // A target refused for speech clears the destination (R1-1), and a
+      // later one that resolves sets it again.
+      ['>>#ears for the room'],
+      ['>>#alpha first\n>>#ears for the room'],
+      ['>>#ears for the room', '>>#alpha after'],
     ];
     try {
       for (const segments of rounds) {
@@ -1499,6 +1504,36 @@ describe('explicit prose routing', () => {
       await framework.stop();
     });
   }
+
+  it("explicit: a target refused for speech clears the turn's destination, so later unprefixed text bounces rather than going to the earlier one", async () => {
+    // Anarchid's probe (agent-framework#350, R1-1): the turn names #alpha,
+    // then #ears, which its server declared inbound-only, then writes on
+    // without a prefix. That text was meant for the room, not #alpha.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#ears for the room' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'south' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'and more for the room' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    const routed = stubRegistry(framework);
+    // The wakes the bounces ask for set the retained text aside.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }], 'only the text before the refusal was published');
+    const bounces = framework.getAgent('assistant')!.getContextManager().getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text)
+      .filter(t => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+    assert.ok(bounces.some(t => t.includes('body:ears is inbound-only')), `the refused target bounced with its reason: ${bounces.join(' | ')}`);
+    assert.ok(bounces.some(t => t.includes('this turn has no destination now')), `the later unprefixed text bounced: ${bounces.join(' | ')}`);
+    await framework.stop();
+  });
 
   it('hybrid leaves unprefixed prose on the frozen locus', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));

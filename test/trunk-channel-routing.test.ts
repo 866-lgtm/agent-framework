@@ -323,7 +323,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
   it('the invitation offers no reply into a channel its server declared inbound-only, and says why', async () => {
     // pocket-body's live transcript: another agent speaking in the room arrives
-    // on it addressed, and the host posts nothing into it, so a ">>" reply would
+    // on it addressed, and the host publishes nothing into it, so a ">>" reply would
     // only be refused.
     const framework = await makeFramework();
     const i = internals(framework);

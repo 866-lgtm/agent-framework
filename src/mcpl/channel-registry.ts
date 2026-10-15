@@ -42,6 +42,7 @@ import { isVisiblyEmptyContent } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { McplErrorResponse } from './errors.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -215,10 +216,11 @@ interface ChannelEntry {
 
 /**
  * A channel its server declared inbound-only (SPEC §14.2 `direction`): its
- * messages come in, and the host posts nothing into it. No publish, from
+ * messages come in, and the host publishes nothing into it. No publish, from
  * plain speech, `channel_publish` or `publishForAgent`, and no outgoing
- * stream. A channel declared `outbound` or `bidirectional`, or with no
- * direction, isn't one.
+ * stream. Typing and acknowledgements, which carry no content, still go
+ * (SPEC §14.5: "Delivery occurs only via `channels/publish`"). A channel
+ * declared `outbound` or `bidirectional`, or with no direction, isn't one.
  */
 function isInboundOnly(entry: ChannelEntry): boolean {
   return entry.descriptor.direction === 'inbound';
@@ -229,7 +231,7 @@ function isInboundOnly(entry: ChannelEntry): boolean {
 function inboundOnlyReason(entry: ChannelEntry): string {
   return (
     `inbound-only: server "${entry.serverId}" declared this channel's direction "inbound", ` +
-    'so the host posts nothing into it; to speak there, use that server\'s own tools'
+    'so the host publishes nothing into it; to speak there, use that server\'s own tools'
   );
 }
 
@@ -1503,7 +1505,7 @@ export class ChannelRegistry {
     }
 
     // Default outgoing: the resolved outbound locus (home channel for forks),
-    // unless its server declared it inbound-only: routeSpeech posts nothing
+    // unless its server declared it inbound-only: routeSpeech publishes nothing
     // there, so it isn't where the agent's speech goes.
     if (outgoing && !this.inboundOnlyServer(outgoing)) {
       context.defaultOutgoing = {
@@ -2476,6 +2478,16 @@ export class ChannelRegistry {
       ...(history ? { history } : {}),
     });
     entry.open = true;
+    // The open's answer carries the server's descriptor (§14.3), the first
+    // place a lazily registered channel's own declaration can arrive. An
+    // inbound-only declaration there is applied to the channel's current
+    // entry: whatever the server sent before answering has been applied by
+    // now, and whatever it sends after will be applied over it.
+    const answered = (result as { channel?: { id?: unknown; direction?: unknown } } | undefined)?.channel;
+    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    if (current && answered?.id === entry.descriptor.id && answered.direction === 'inbound') {
+      current.descriptor = { ...current.descriptor, direction: 'inbound' };
+    }
     return result;
   }
 
@@ -2495,17 +2507,21 @@ export class ChannelRegistry {
    *
    * `forSpeech` is for a target the agent's speech will be posted to: a
    * channel its server declared inbound-only (isInboundOnly) then resolves
-   * to an error that says so, since nothing is posted there. Without it, as
-   * for reading a channel's history, any registered channel resolves.
+   * to an error that says so, since nothing is published there, and that
+   * names the channel as `refusedChannelId`, so a caller can tell a refused
+   * channel from a name that resolved to nothing. Without it, as for reading
+   * a channel's history, any registered channel resolves.
    */
   resolveProseTarget(
     spec: string,
     opts?: { forSpeech?: boolean },
-  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[]; refusedChannelId?: string } {
     const resolved = this.resolveTargetByName(spec);
     if (!opts?.forSpeech || 'error' in resolved) return resolved;
     const entry = this.findChannelEntry(resolved.channelId);
-    return entry && isInboundOnly(entry) ? { error: `${resolved.channelId} is ${inboundOnlyReason(entry)}` } : resolved;
+    return entry && isInboundOnly(entry)
+      ? { error: `${resolved.channelId} is ${inboundOnlyReason(entry)}`, refusedChannelId: resolved.channelId }
+      : resolved;
   }
 
   private resolveTargetByName(
@@ -3132,9 +3148,12 @@ export class ChannelRegistry {
    * Called by the framework on a text-only turn — replaces the per-surface
    * sticky auto-post that used to live in discord-mcpl. Returns null when there
    * is no locus, the channel or its server can't be resolved, its server
-   * declared it inbound-only, or the open or publish fails. Each of these goes
-   * through fail(): a trace, and the host's send-failure marker. The speech
-   * stays in chronicle + module surfaces.
+   * declared it inbound-only, the channel was removed while it opened, the
+   * open fails, or the server answers the publish with an error or reports it
+   * undelivered. Each of these goes through fail(): a trace, and the host's
+   * send-failure marker. A publish that times out or loses its connection
+   * rejects instead, since whether the server posted it is unknown, and the
+   * caller logs it. The speech stays in chronicle + module surfaces.
    */
   async routeSpeech(
     conversationId: string,
@@ -3220,8 +3239,12 @@ export class ChannelRegistry {
       }
     }
     // The open awaited the server, and a channels/changed update or a
-    // re-register may have declared the channel inbound-only meanwhile.
-    const declared = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`) ?? entry;
+    // re-register may have declared the channel inbound-only meanwhile, or a
+    // removal taken it away: nothing is published to a channel that's gone.
+    const declared = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    if (!declared) {
+      return fail(channelId, 'the channel was removed while it was opening');
+    }
     if (isInboundOnly(declared)) {
       return fail(channelId, inboundOnlyReason(declared));
     }
@@ -3242,7 +3265,18 @@ export class ChannelRegistry {
       channelId,
       content: [{ type: 'text', text }],
     };
-    const result = await server.sendChannelsPublish(publishParams);
+    let result: unknown;
+    try {
+      result = await server.sendChannelsPublish(publishParams);
+    } catch (err) {
+      // The server answered with an error, so it didn't post the speech. A
+      // timeout or a lost connection leaves that unknown, and goes to the
+      // caller as before.
+      if (err instanceof McplErrorResponse) {
+        return fail(channelId, err.message);
+      }
+      throw err;
+    }
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
     // trace consumers can act on the just-posted message — e.g. a TTS-relay

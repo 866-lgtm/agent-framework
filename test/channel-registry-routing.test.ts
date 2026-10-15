@@ -2,6 +2,8 @@ import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-gr
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { McplErrorResponse } from '../src/mcpl/errors.js';
+import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { parseProsePrefix } from '../src/mcpl/prose-grammar.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -33,6 +35,7 @@ function makeRegistry(
   let failOpens = false;
   let onOpen: (() => Promise<void>) | undefined;
   let onPublish: (() => Promise<void>) | undefined;
+  let openResult: unknown = {};
 
   const mockServer = {
     // Post-policy state: full grant, so tests exercise delivery, not §5.3 denial.
@@ -52,7 +55,7 @@ function makeRegistry(
       if (failOpens) throw new Error('open refused by server');
       openCalls.push(params);
       await onOpen?.();
-      return {};
+      return openResult;
     },
     sendChannelsClose: async (params: { channelId?: string }) => {
       closeCalls.push(params);
@@ -90,6 +93,8 @@ function makeRegistry(
     setOnOpen: (fn: (() => Promise<void>) | undefined) => { onOpen = fn; },
     /** Runs while the server is answering a publish, before it returns. */
     setOnPublish: (fn: (() => Promise<void>) | undefined) => { onPublish = fn; },
+    /** What the server answers channels/open with. */
+    setOpenResult: (result: unknown) => { openResult = result; },
   };
 }
 
@@ -804,6 +809,10 @@ test('an inbound-only channel resolves as a speech target to an error naming the
     (speech as { error: string }).error,
     /^body:ears is inbound-only: server "body" declared this channel's direction "inbound"/,
   );
+  // It names the refused channel, which a name that resolves to nothing doesn't.
+  assert.equal((speech as { refusedChannelId?: string }).refusedChannelId, 'body:ears');
+  const nowhere = registry.resolveProseTarget('#nowhere', { forSpeech: true });
+  assert.ok('error' in nowhere && !('refusedChannelId' in nowhere), 'an unknown name is no refusal');
   // Reading its history still finds it.
   assert.deepEqual(registry.resolveProseTarget('body:ears'), { channelId: 'body:ears', label: 'Body · ears' });
   assert.deepEqual(registry.resolveProseTargetDurable('body:ears'), { channelId: 'body:ears', label: 'Body · ears' });
@@ -846,4 +855,100 @@ test("publishForAgent's routed trace names the server it published through, thou
   const routed = traces.filter((t) => t.type === 'mcpl:speech-routed');
   assert.equal(routed.length, 1);
   assert.equal(routed[0]!.serverId, 'body');
+});
+
+test("a server's error response to a request rejects with McplErrorResponse, carrying its code and data", async () => {
+  const connection = new (McplServerConnection as any)('body', null, null) as McplServerConnection;
+  const internals = connection as unknown as {
+    pendingRequests: Map<number, { resolve(r: unknown): void; reject(e: Error): void; method: string }>;
+    handleResponse(response: unknown): void;
+  };
+  const answer = new Promise((resolve, reject) => {
+    internals.pendingRequests.set(7, { resolve, reject, method: 'channels/publish' });
+  });
+  internals.handleResponse({ jsonrpc: '2.0', id: 7, error: { code: -32017, message: 'Channel not permitted', data: { channelId: 'body:ears' } } });
+  await assert.rejects(answer, (err: Error) => {
+    assert.ok(err instanceof McplErrorResponse);
+    assert.equal(err.code, -32017);
+    assert.deepEqual(err.data, { channelId: 'body:ears' });
+    assert.equal(err.message, 'MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted');
+    return true;
+  });
+});
+
+test("a server's error response to the publish goes through fail(): a trace and the send-failure marker (R1-2)", async () => {
+  const { registry, failures, traces, publishCalls, setOnPublish } = makeRegistry({ delivered: true });
+  await registry.handleRegister('body', {
+    channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+  const refusal = 'MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted';
+  setOnPublish(async () => { throw new McplErrorResponse(refusal, -32017); });
+
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
+  assert.equal(publishCalls.length, 1, 'the publish was sent, and the server refused it');
+  assert.deepEqual(failures.map((f) => f.reason), [refusal]);
+  const failed = traces.filter((t) => t.type === 'mcpl:speech-route-failed');
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.channelId, 'body:home');
+  assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
+});
+
+test('a publish that times out or loses its connection still rejects, with no marker claiming it went undelivered (R1-2)', async () => {
+  const { registry, failures, traces, setOnPublish } = makeRegistry({ delivered: true });
+  await registry.handleRegister('body', {
+    channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+  setOnPublish(async () => { throw new Error('Request channels/publish to MCPL server "body" timed out after 30000ms'); });
+
+  await assert.rejects(registry.routeSpeech('linn', 'hello', 'body:home'), /timed out/);
+  assert.equal(failures.length, 0, 'whether the server posted it is unknown');
+  assert.equal(traces.filter((t) => t.type === 'mcpl:speech-route-failed').length, 0);
+});
+
+test("a lazily registered channel whose open answers inbound-only is refused before the publish, and stays refused (R1-3)", async () => {
+  const { registry, publishCalls, openCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
+  registry.ensureChannelRegistered('body', 'body:ears', 'Body · ears');
+  setOpenResult({ channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' } });
+
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:ears'), null);
+  assert.deepEqual(openCalls.map((c) => c.channelId), ['body:ears'], 'speech opened the channel, as for any closed locus');
+  assert.equal(publishCalls.length, 0, 'nothing was published after the server declared it');
+  assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
+
+  // The next speech is refused before anything goes to the server.
+  assert.equal(await registry.routeSpeech('linn', 'again', 'body:ears'), null);
+  assert.equal(openCalls.length, 1);
+  assert.equal(publishCalls.length, 0);
+  assert.equal(failures.length, 2);
+});
+
+test("an open's answer changes nothing unless it names the channel and declares it inbound-only (R1-3)", async () => {
+  for (const answer of [
+    { channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' } },
+    { channel: { id: 'body:other', type: 'chat', label: 'Body · other', direction: 'inbound' } },
+    {},
+  ]) {
+    const { registry, publishCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
+    registry.ensureChannelRegistered('body', 'body:ears', 'Body · ears');
+    setOpenResult(answer);
+    assert.deepEqual(await registry.routeSpeech('linn', 'hello', 'body:ears'), { delivered: true, channelId: 'body:ears' },
+      `published after the answer ${JSON.stringify(answer)}`);
+    assert.equal(publishCalls.length, 1);
+    assert.equal(failures.length, 0);
+  }
+});
+
+test('a channel removed while the host opens it for speech is refused, and nothing is published (R1-3)', async () => {
+  const { registry, publishCalls, openCalls, failures, setOnOpen } = makeRegistry({ delivered: true });
+  await registry.handleRegister('body', {
+    channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
+  } as never);
+  setOnOpen(async () => {
+    await registry.handleChanged('body', { removed: ['body:home'] } as never);
+  });
+
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
+  assert.deepEqual(openCalls.map((c) => c.channelId), ['body:home']);
+  assert.equal(publishCalls.length, 0, 'nothing was published to the removed channel');
+  assert.deepEqual(failures.map((f) => f.reason), ['the channel was removed while it was opening']);
 });

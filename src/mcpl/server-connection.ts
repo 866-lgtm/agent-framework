@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
-import { CAPABILITY_DISABLED } from './errors.js';
+import { CAPABILITY_DISABLED, McplErrorResponse } from './errors.js';
 import { logValue } from './log-value.js';
 
 import type {
@@ -1284,7 +1284,11 @@ export class McplServerConnection extends EventEmitter {
 
     if (response.error) {
       pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`),
+        new McplErrorResponse(
+          `MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`,
+          response.error.code,
+          response.error.data,
+        ),
       );
     } else {
       pending.resolve(response.result);

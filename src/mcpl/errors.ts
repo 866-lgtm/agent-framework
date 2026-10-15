@@ -36,6 +36,24 @@ export const UNKNOWN_CHANNEL = -32023;
 /** Server could not open/connect the requested channel. */
 export const CHANNEL_OPEN_FAILED = -32024;
 
+/**
+ * A server's JSON-RPC error response to a request the host sent: the server
+ * answered with an error rather than a result. A request that times out, or
+ * whose connection closes first, rejects with a plain Error instead, since
+ * whether the server acted on it is unknown.
+ */
+export class McplErrorResponse extends Error {
+  readonly code: number;
+  readonly data?: unknown;
+
+  constructor(message: string, code: number, data?: unknown) {
+    super(message);
+    this.name = 'McplErrorResponse';
+    this.code = code;
+    this.data = data;
+  }
+}
+
 // ============================================================================
 // Error Factories
 // ============================================================================

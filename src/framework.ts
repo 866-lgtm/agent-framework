@@ -237,7 +237,7 @@ function estimateAppendedRoundTokens(
 /**
  * What a notice says in place of "your plain speech lands there" when the
  * channel's server declared it inbound-only (isInboundOnly in the channel
- * registry, which posts nothing there). ChannelRegistry.inboundOnlyServer
+ * registry, which publishes nothing there). ChannelRegistry.inboundOnlyServer
  * names the declaring server.
  */
 function inboundOnlySpeechNote(serverId: string): string {
@@ -331,7 +331,8 @@ const PROSE_ROUTING_HELP =
   '  >>#channel-name …    or    >>@person …  (DM)    or    >>service:guild:id …\n' +
   '  One message may hold several sections: each line starting with ">>" begins\n' +
   '  a new envelope, routed to its own destination independently.\n' +
-  '  The first destination in a turn applies to the rest of that turn.\n' +
+  '  A destination applies to the rest of that turn, until another is named.\n' +
+  '  A channel its server declared inbound-only is refused, and clears it.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
   '  immediately when this one ends, instead of pausing until the next event.\n' +
   '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
@@ -534,7 +535,7 @@ function splitExplicitEnvelopes(rawText: string): string[] {
  */
 interface AdmittedEnvelope {
   text: string;
-  resolved?: { channelId: string } | { error: string; candidates?: string[] };
+  resolved?: { channelId: string } | { error: string; candidates?: string[]; refusedChannelId?: string };
 }
 
 /**
@@ -10959,11 +10960,17 @@ export class AgentFramework {
    * explicit gateway sets it once the round's envelopes run: each `>>`
    * envelope whose target resolved becomes the destination. One that didn't
    * resolve bounces and leaves it, as do `>>skip_reply` and unprefixed text.
+   * One refused for speech (its server declared the channel inbound-only)
+   * bounces and clears it: the text after it was meant for that channel, so
+   * it bounces too rather than going to the turn's earlier destination.
    */
   private roundDestination(current: string | null, envelopes: AdmittedEnvelope[]): string | null {
     let destination = current;
     for (const envelope of envelopes) {
-      if (envelope.resolved && 'channelId' in envelope.resolved) destination = envelope.resolved.channelId;
+      const resolved = envelope.resolved;
+      if (!resolved) continue;
+      if ('channelId' in resolved) destination = resolved.channelId;
+      else if (resolved.refusedChannelId) destination = null;
     }
     return destination;
   }
@@ -11103,6 +11110,10 @@ export class AgentFramework {
       const res = envelope.resolved;
       if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
+        // A target refused for speech ends the turn's destination, as
+        // roundDestination does: the text after it was meant for that
+        // channel, not the earlier one, so it bounces too.
+        if (res.refusedChannelId) delete routing.pin;
         this.bounceProse(agent, parsed.body, res.error, res.candidates);
         return;
       }
@@ -11113,7 +11124,7 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
-        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
+        this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now');
         return;
       }
       targetChannel = sticky;
