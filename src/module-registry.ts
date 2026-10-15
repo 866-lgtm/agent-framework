@@ -25,6 +25,7 @@ import type {
 } from './types/index.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
+import { toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -314,6 +315,21 @@ export class ModuleRegistry {
       return {
         success: false,
         error: `Module not found: ${moduleName}`,
+        isError: true,
+      };
+    }
+
+    // The call against the tool's declared schema, before the module runs: a
+    // missing required argument is refused with what to send, where the
+    // handler would otherwise fail deep inside, or run without it. Values
+    // aren't checked here, since a handler may take more than its schema can
+    // say (toolArgsProblems).
+    const definition = [...module.getTools(), ...(module.getUtilities?.() ?? [])].find((tool) => tool.name === toolName);
+    const problems = toolArgsProblems(call.input, definition?.inputSchema);
+    if (problems.length > 0) {
+      return {
+        success: false,
+        error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
         isError: true,
       };
     }

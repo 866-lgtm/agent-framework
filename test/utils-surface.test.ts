@@ -130,14 +130,14 @@ describe('utils surface', () => {
 
       const missing = await call({ action: 'run', name: 'stub--rare_op', args: {} });
       assert.ok(!missing.success && missing.isError);
-      assert.match(missing.error!, /missing required "mode"/);
+      assert.match(missing.error!, /^Nothing was done: stub--rare_op needs "mode" \(a string\), and this call gave none\./);
       assert.match(missing.error!, /"enum":\["soft","hard"\]/, 'schema included for the retry');
 
       const badEnum = await call({ action: 'run', name: 'stub--rare_op', args: { mode: 'loud' } });
-      assert.match(badEnum.error!, /"mode" must be one of \["soft","hard"\]/);
+      assert.match(badEnum.error!, /"mode" must be one of "soft" or "hard", and this call gave "loud"/);
 
       const badType = await call({ action: 'run', name: 'stub--rare_op', args: { mode: 'soft', count: 'three' } });
-      assert.match(badType.error!, /"count" must be number, got string/);
+      assert.match(badType.error!, /"count" must be a number, and this call gave a string/);
       assert.equal(stub.calls.length, 0, 'handler never reached on a validation miss');
 
       const unknown = await call({ action: 'run', name: 'stub--nope', args: {} });

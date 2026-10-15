@@ -360,38 +360,9 @@ const utilityOneLiner = (description: string): string => {
   return (dot >= 0 ? line.slice(0, dot + 1) : line).slice(0, 160);
 };
 
-/** Shallow validation of run args against a utility's declared inputSchema:
- *  required keys, primitive types, enums. Deliberately not a full JSON-Schema
- *  engine — handlers still hand-validate (they always did); this layer exists
- *  so an arg-shape miss teaches by bounce instead of failing deep in a handler
- *  with a less instructive message. Returns an error string or null. */
-function validateUtilityArgs(
-  input: unknown,
-  schema: import('./types/index.js').ToolDefinition['inputSchema'],
-): string | null {
-  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-    return 'args must be an object';
-  }
-  const obj = input as Record<string, unknown>;
-  for (const req of schema.required ?? []) {
-    if (!(req in obj) || obj[req] === undefined) return `missing required "${req}"`;
-  }
-  for (const [key, value] of Object.entries(obj)) {
-    const param = schema.properties?.[key];
-    if (!param || value === undefined) continue; // unknown keys: handler's business
-    if (param.enum && !(param.enum as unknown[]).includes(value)) {
-      return `"${key}" must be one of ${JSON.stringify(param.enum)}`;
-    }
-    if (param.type) {
-      const actual = Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value;
-      const expected = param.type === 'integer' ? 'number' : param.type;
-      if (actual !== expected) return `"${key}" must be ${param.type}, got ${actual}`;
-    }
-  }
-  return null;
-}
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
+import { toolArgsProblems } from './tool-args.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -18973,14 +18944,14 @@ export class AgentFramework {
           return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
         }
         const args = input.args ?? {};
-        const problem = validateUtilityArgs(args, def.inputSchema);
-        if (problem) {
+        const problems = toolArgsProblems(args, def.inputSchema, { values: true });
+        if (problems.length > 0) {
           // Teach by bounce: the error carries the schema, so the retry needs
           // no describe round-trip.
           return {
             success: false,
             isError: true,
-            error: `${problem}. Schema for ${def.name}: ${JSON.stringify(def.inputSchema)}`,
+            error: `Nothing was done: ${def.name} ${problems.join('; ')}. Schema for ${def.name}: ${JSON.stringify(def.inputSchema)}`,
           };
         }
         // Same dispatch as a first-class tool call — the module cannot tell
