@@ -5,19 +5,30 @@
   behind it wait with it, so the queue keeps its order; messages queued
   before it are still heard at the boundary. The cost: a message addressed to
   the agent but queued behind a held one isn't heard mid-turn, and waits for
-  the turn's end. Stored between rounds, a held message sat before the turn's
-  later replies in every later compile although their requests never held
-  it: a prompt-cache divergence, and on a provider that binds signed thinking
-  to the prefix it was minted under (anima-research/context-manager#155,
-  whose binding anima-research/context-manager#160 walks), a reply whose
-  thinking is refused.
+  the turn's end, and a held message and what is queued behind it live only
+  in memory until then, so a crash during the turn loses them. Stored
+  between rounds, a held message sat before the turn's later replies in
+  every later compile although their requests never held it: a
+  prompt-cache divergence, and on a provider that binds signed thinking to
+  the prefix it was minted under (anima-research/context-manager#155, whose
+  binding anima-research/context-manager#160 walks), a reply whose thinking
+  is refused.
 - A message injected into the live stream at a tool boundary now counts as
-  read for RFC-006 coalescing: the consumed watermark moves when messages
-  are injected, not only at a compile. Before, an injected message sat above
-  the watermark of the turn's compile, so a coalesced replacement for its
-  subject could remove a message the agent had heard and answered. Within a
-  branch the watermark only advances: a compile that started before such a
-  mark doesn't roll it back when it finishes.
+  read for RFC-006 coalescing when the stream says it carries injected
+  messages (membrane's `ToolContext.supportsInjectedMessages`, true on its
+  native path in releases after 0.5.87): the consumed watermark moves when
+  messages are injected, not only at a compile. Before, an injected message
+  sat above the watermark of the turn's compile, so a coalesced replacement
+  for its subject could remove a message the agent had heard and answered.
+  Within a branch the watermark only advances: a compile that started before
+  such a mark doesn't roll it back when it finishes. A stream that doesn't
+  say, as on membrane 0.5.87, still gets injected messages, and they stay
+  unread, as before: 0.5.87's XML tool path drops them with a warning.
+- A stream that says it can't carry injected messages (membrane's XML
+  prefill path, in releases after 0.5.87) gets none: everything deferred
+  for the agent during the turn waits for the turn's end, after its last
+  round, as a held message does, instead of being stored between rounds the
+  stream never showed it.
 - A deferred write that a flush defers again does so whatever its content,
   under its id and in its place in the order writes arrived. That happens
   while its target's own turn, stream or tool cycle is alive, or the host is
@@ -53,6 +64,10 @@
   persisted queue for boot recovery. An entry for a target no longer
   registered (a disposed fork) is dropped from a memory-only queue at exit,
   as before.
+- What is deferred for a conversation fork whose closure turn ends, or for
+  an ephemeral run that ends, is now stored in that agent's store before the
+  fork is disposed or the run deregistered. Before, the turn-end flush ran
+  after, found no agent to take it, and dropped it.
 - A deferred write whose store throws goes back into the queue under its id,
   and so does every entry queued behind it for that agent, so none of them
   lands ahead of an earlier one, and a queued `tool_use` that can't be
@@ -80,6 +95,10 @@
   the file's size cap; past it the file isn't rewritten, as the host log
   warns, and what's deferred after that is kept in memory only. Only the
   host log names the held write.
+- A deferred write that throws after its message was stored, such as one
+  whose store listener throws, counts as written: it isn't put back into the
+  queue and stored a second time, and at a tool boundary it's injected with
+  the rest. The log line says it was stored.
 - Boot recovery drops a recovered deferred write whose participant isn't
   text, whose content isn't an array, or that holds a block that isn't an
   object, and logs it by id and participant, rather than holding it in the
@@ -90,4 +109,7 @@
   whose content isn't an array was dropped without a line, and one with a
   block that isn't an object was kept: a null block could never be stored,
   and a string or number block, once stored, made every compile for its
-  agent fail.
+  agent fail. Boot recovery also drops an entry whose `forAgent` is present
+  but empty or not text, keeps the first entry with an id and drops and
+  names a later one, and numbers an entry whose `seq` isn't a positive whole
+  number after the others, naming it unless it has none.
