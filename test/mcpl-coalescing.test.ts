@@ -829,6 +829,33 @@ function holdNextCommit(f: Awaited<ReturnType<typeof fixture>>): Promise<() => v
   });
 }
 
+test("the fixture's reply deadline: a request still unanswered at 3 s fails at 60 s, naming the bound", { timeout: 20_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // A host that never answers: the batch's first commit is held, so its
+  // admission waits.
+  const held = holdNextCommit(f);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let release: (() => void) | undefined;
+  try {
+    const batch = f.send('channels/incoming', { messages: [
+      f.channel('e1', 'one', {}, 'chat', 'm1'), f.channel('e2', 'two', {}, 'chat', 'm2'), f.channel('e3', 'three', {}, 'chat', 'm3'),
+    ] }).then(() => 'replied', (err: Error) => err.message);
+    release = await held;
+    // Whether the wait has settled once the timers that are due have run.
+    const now = () => Promise.race([batch, new Promise<string>((r) => setImmediate(() => r('pending')))]);
+    t.mock.timers.tick(3_000);
+    assert.equal(await now(), 'pending', 'still waiting at 3 s');
+    t.mock.timers.tick(56_999);
+    assert.equal(await now(), 'pending', 'still waiting just short of 60 s');
+    t.mock.timers.tick(1);
+    assert.equal(await now(), 'no reply to channels/incoming within 60 s');
+  } finally {
+    // Real timers again before the held work goes on, and before the close.
+    t.mock.timers.reset();
+    release?.();
+  }
+});
+
 test('R11: a retraction during the render-start commit wait is final; the batch is not restored', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'withdrawn_fallback', { deferred: true, initial: true }));

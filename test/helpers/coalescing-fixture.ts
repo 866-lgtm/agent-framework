@@ -15,6 +15,16 @@ import { AgentFramework } from '../../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './mock-membrane.js';
 
 export const TS = '2026-09-30T00:00:00Z';
+
+/**
+ * How long send() waits for any request's reply. The deadline is a hang
+ * guard: it turns a reply that never comes into a failure instead of a hung
+ * run, and no assertion rests on it. So it's set wide, and the same for every
+ * request: a loaded host's stall needn't be in proportion to a request's
+ * work, so a bound sized to the work can still cut off a host that answers.
+ */
+export const REPLY_DEADLINE_MS = 60_000;
+
 export const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
 
 export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown>; mcpl?: Record<string, unknown> } = {}) {
@@ -72,9 +82,10 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     } as FrameworkConfig);
     return framework;
   };
+  // Sends a request and waits for its reply, for up to REPLY_DEADLINE_MS.
   const send = (method: string, params: unknown): Promise<any> => new Promise((resolve, reject) => {
     const id = next++;
-    const timer = setTimeout(() => reject(new Error(`no reply to ${method}`)), 3000);
+    const timer = setTimeout(() => reject(new Error(`no reply to ${method} within ${REPLY_DEADLINE_MS / 1000} s`)), REPLY_DEADLINE_MS);
     replies.set(id, (value) => { clearTimeout(timer); resolve(value); });
     socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
   });
