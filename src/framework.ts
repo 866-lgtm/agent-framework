@@ -13651,7 +13651,7 @@ export class AgentFramework {
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
         this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
-        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+        logStream({ success: false,
           error: `Provider wait: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abortAgentScript(agent.name, 'provider wait');

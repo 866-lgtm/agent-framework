@@ -603,6 +603,40 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
       rmSync(r.dir, { recursive: true, force: true });
     }
   });
+
+  it("a conversation agent's stated provider wait that cuts a turn after a finished round logs and counts that round once", async () => {
+    const statedWait = (request: unknown) => new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000,
+      message: 'zz rate limit reached for requests', rawError: { status: 429 }, rawRequest: request,
+    });
+    const r = await resident([(request) => new RoundThenEnd(firstUsage, statedWait(request))]);
+    // A conversation agent doesn't own provider admission, so a stated wait
+    // holds its turn (the "Provider wait" end) instead of the organization's
+    // cooldown. Its turns aren't an external message's default target, so
+    // the turn is started directly.
+    const internal = r.framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
+    };
+    r.framework.start();
+    try {
+      internal.conversationAgentHomes.set('resident', 'world:zz');
+      r.framework.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'first' }]);
+      await internal.startAgentStream(r.framework.getAgent('resident'),
+        { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'usage:updated')
+        && r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'the finished round was counted and logged');
+      const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+      assert.equal(logs.length, 1, 'the wait writes the stream\'s one entry');
+      assert.match(String(logs[0].error), /^Provider wait: /);
+      assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'and it carries the finished round');
+      assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
+      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);
+    } finally {
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** A completion the stream would yield next; these tests end it before it's handled. */
