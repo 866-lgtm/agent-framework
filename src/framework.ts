@@ -730,13 +730,33 @@ function logSeedOmissions(
  * left the queue: it logs "Failed to compress chunk (hierarchical)" with
  * this error and records the call, and the chunk, still uncompressed, is
  * queued again at that manager's next rebuild (its next initialization,
- * message, sent compile or released hold).
+ * message, sent compile or released hold). That holds where the withdrawal
+ * leaves the tick: a merge's call, or a chunk's first. One inside
+ * context-manager 0.14's compression fallback ladder, after a chunk's first
+ * call was refused or cut short, is caught by the rung that made it and
+ * recorded as a provider error, since 0.14 rethrows only its own
+ * CompressionBranchDiscard there; once every rung has failed, the chunk's
+ * request family is quarantined, with its alert, and the tick returns.
  */
 class MaintenanceWithdrawnError extends Error {
   constructor(reason: string) {
     super(`maintenance call withdrawn: ${reason}`);
     this.name = 'MaintenanceWithdrawnError';
   }
+}
+
+/**
+ * A runtime-settings preview's reason, from what stopped it: the strategy's
+ * known throws as the codes `RuntimeSettingsPreview.reason` documents, and
+ * anything else verbatim. Message matching is fragile by nature, so an
+ * unknown message surfaces as the reason rather than being swallowed.
+ */
+function previewStoppedReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('requires reinitialization for the current branch generation')) return 'branch_generation_changed';
+  if (message.includes('already running; previews must not overlap')) return 'preview_in_flight';
+  if (message.includes('requires adaptiveResolution')) return 'no_adaptive_resolution';
+  return message;
 }
 
 class DiscordAwarenessAccountingError extends Error {
@@ -1562,6 +1582,8 @@ export class AgentFramework {
   private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   /** Run records whose failure repeated one already reported, and whose report was suppressed. */
   private maintenanceRepeats = new WeakSet<ContextMaintenanceAgentRun>();
+  /** An operator's maintain (maintenanceTick) asked for the pass running or about to run: it's kept in the history whatever it met. */
+  private maintenancePassRequested = false;
   private providerGates: Map<string, LocalProviderGate> = new Map();
   private providerAccelerationCooldowns: Map<string, ProviderAccelerationCooldown> = new Map();
   private providerAccelerationRecoveries: Map<string, ProviderAccelerationRecovery> = new Map();
@@ -3559,8 +3581,11 @@ export class AgentFramework {
       this.currentMaintenanceRun = null;
       // A pass that only met failures already reported, and took no tick,
       // adds nothing the history doesn't hold, and a lasting failure would
-      // otherwise fill it in minutes, pushing out the runs that did work.
-      if (!run.agents.every((record) => record.ticks === 0 && this.maintenanceRepeats.has(record))) this.maintenanceHistory.unshift(run);
+      // otherwise fill it in minutes, pushing out the runs that did work. One
+      // an operator asked for is kept: it's the pass their maintain reports.
+      const requested = this.maintenancePassRequested;
+      this.maintenancePassRequested = false;
+      if (requested || !run.agents.every((record) => record.ticks === 0 && this.maintenanceRepeats.has(record))) this.maintenanceHistory.unshift(run);
       if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
     }
   }
@@ -5121,8 +5146,11 @@ export class AgentFramework {
       );
       return { ...this.getContextMaintenanceSnapshot(), ran: false };
     }
+    this.maintenancePassRequested = true;
     this.startQueuedMaintenance();
     await this.maintenancePass;
+    // A pass with nothing queued records no run, and the next pass wasn't asked for.
+    this.maintenancePassRequested = false;
     return { ...this.getContextMaintenanceSnapshot(), ran: true };
   }
 
@@ -5356,7 +5384,7 @@ export class AgentFramework {
       // its budget and the patch's path, and whatever stopped the preview is
       // its reason. When the manager answers, anything else throws as before.
       if (agent.contextManagerAnswers()) throw error;
-      return { available: false, reason: error instanceof Error ? error.message : String(error), ...agent.runtimeBudgetPath(patch) };
+      return { available: false, reason: previewStoppedReason(error), ...agent.runtimeBudgetPath(patch) };
     }
     const base: RuntimeSettingsPreview = {
       available: false,
@@ -5381,20 +5409,7 @@ export class AgentFramework {
         }
         return { result: result as Record<string, unknown> };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        // Structured mapping of the strategy's known throw paths. Message
-        // matching is fragile by nature, so unknown messages surface verbatim
-        // as the reason rather than being swallowed or rethrown.
-        if (message.includes('requires reinitialization for the current branch generation')) {
-          return { reason: 'branch_generation_changed' };
-        }
-        if (message.includes('already running; previews must not overlap')) {
-          return { reason: 'preview_in_flight' };
-        }
-        if (message.includes('requires adaptiveResolution')) {
-          return { reason: 'no_adaptive_resolution' };
-        }
-        return { reason: message };
+        return { reason: previewStoppedReason(error) };
       }
     };
 
@@ -15793,12 +15808,16 @@ export class AgentFramework {
         { skipLog: true },
       );
     }
-    if (agent && overBudget && drainState === 'kicking') {
+    // A stop() or a surgery begun from inside the alert, by an ops:alert
+    // listener, is read again here.
+    if (agent && overBudget && drainState === 'kicking' && !this.providerAdmissionClosed && !this.surgeryHold) {
       this.overBudgetDrainInFlight.add(agentName);
       // Like a maintenance pass: none starts once stop() has begun, it starts
       // no tick while a surgery holds the store, and a branch move, or stop(),
-      // waits for the tick in flight.
-      const drain = (async () => {
+      // waits for the tick in flight. It joins the drains they wait for
+      // before its body runs, so a stop() made from inside its first tick,
+      // before that tick's first await, waits for it too.
+      const drain = Promise.resolve().then(async () => {
         let ticks = 0;
         try {
           const cm = agent.getContextManager();
@@ -15817,7 +15836,7 @@ export class AgentFramework {
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
-      })();
+      });
       this.overBudgetDrains.add(drain);
       void drain.finally(() => { this.overBudgetDrains.delete(drain); });
     }

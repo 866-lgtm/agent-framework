@@ -382,6 +382,31 @@ test('resume proceeds without a verdict for an agent whose context manager refus
   });
 });
 
+test('a preview stopped by a stale branch generation says branch_generation_changed, as the reason documents', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // As the autobiographical strategy refuses a branch it hasn't reloaded:
+    // its readiness and its settings both say so.
+    const stale = 'TestStrategy.getHotContextSettings requires reinitialization for the current branch generation';
+    const strategy = {
+      name: 'stale-generation-test',
+      async initialize() {},
+      checkReadiness: () => { throw new Error(stale); },
+      getHotContextSettings: () => { throw new Error(stale); },
+      updateHotContextSettings: () => { throw new Error(stale); },
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    const cm = framework.getAgent('agent')!.getContextManager();
+    await cm.setStrategy(strategy);
+    const preview = framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+    assert.equal(preview.available, false);
+    assert.equal(preview.reason, 'branch_generation_changed');
+    assert.equal(preview.liveBudgetTokens, 100_000);
+  });
+});
+
 test('maintenanceTick runs the real maintenance pass while quiesced', async () => {
   class QueuedStrategy implements ContextStrategy {
     readonly name = 'queued-test';

@@ -501,6 +501,7 @@ export class Agent {
    * whether a descent is in flight, from the agent's own state alone: what a
    * runtime-settings preview can still say while the context manager refuses
    * its queries.
+   * @internal For the framework's runtime-settings preview; not a host API.
    */
   runtimeBudgetPath(patch?: AgentRuntimeSettingsPatch): {
     liveBudgetTokens: number;
@@ -522,6 +523,7 @@ export class Agent {
    * failed, until a switchBranch or setStrategy succeeds, and a strategy can
    * refuse its readiness on its own, as the autobiographical one does for a
    * branch it hasn't reloaded.
+   * @internal For the framework's runtime-settings preview; not a host API.
    */
   contextManagerAnswers(): boolean {
     try {
@@ -799,7 +801,10 @@ export class Agent {
     }
   }
 
-  /** The checks of a runtime-settings patch that need nothing from the context manager. */
+  /**
+   * The checks of a runtime-settings patch that need nothing from the context manager.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
   checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
     if (patch.contextBudgetTokens !== undefined) {
