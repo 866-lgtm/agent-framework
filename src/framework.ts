@@ -1027,6 +1027,12 @@ const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
 const MAINTENANCE_TICKS_PER_PASS = 8;
+/** How long a failed create() waits for each part of its release, as stop()'s
+ *  teardownTimeoutMs. stop() leaves its deadline to its caller, who owns the
+ *  framework, but the caller of a failed create() never got one: unbounded, a
+ *  module whose stop() never settles would turn a failed boot that exits into
+ *  one that hangs. */
+const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
@@ -2107,7 +2113,11 @@ export class AgentFramework {
   }
 
   /**
-   * Create and start the framework.
+   * Create and start the framework. A create() that fails releases what it
+   * had acquired before its error reaches the caller, so that the caller can
+   * try again in the same process: the framework it had begun is stopped, as
+   * stop() stops one but waiting at most 30 s for each part, and a store it
+   * opened is closed. A store the caller passed in is left open.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
@@ -2127,6 +2137,52 @@ export class AgentFramework {
       throw new Error('Either storePath or store must be provided');
     }
 
+    const building: { framework?: AgentFramework } = {};
+    try {
+      return await AgentFramework.createOn(store, ownsStore, config, building);
+    } catch (error) {
+      throw await AgentFramework.releaseFailedCreate(error, building.framework, store, ownsStore);
+    }
+  }
+
+  /**
+   * The error a failed create() rejects with, once what it acquired is
+   * released: the framework it had begun is stopped, within
+   * FAILED_CREATE_TEARDOWN_TIMEOUT_MS, and a store create() opened is closed,
+   * even where part of that stop failed or didn't finish. stop() then keeps
+   * its store open, so that it can be called again, but no one can call it on
+   * a framework that create() never returned. When the release doesn't finish
+   * cleanly, the rejection carries create()'s error and then the release's,
+   * and says that part of what it started may still be running.
+   */
+  private static async releaseFailedCreate(
+    error: unknown,
+    framework: AgentFramework | undefined,
+    store: JsStore,
+    ownsStore: boolean,
+  ): Promise<unknown> {
+    const failures: unknown[] = [];
+    if (framework) {
+      try { await framework.stop(FAILED_CREATE_TEARDOWN_TIMEOUT_MS); } catch (stopError) { failures.push(stopError); }
+    }
+    if (ownsStore && !store.isClosed()) {
+      try { store.close(); } catch (closeError) { failures.push(closeError); }
+    }
+    if (failures.length === 0) return error;
+    return new AggregateError([error, ...failures],
+      `AgentFramework.create() failed: ${shutdownErrorMessage(error)}. Releasing what it had started ` +
+      `didn't finish cleanly, so part of it may still be running: ${failures.map(shutdownErrorMessage).join('; ')}`);
+  }
+
+  /** create()'s work once it holds its store. The framework is named in
+   *  `building` as soon as it exists, so that create() can stop it if a later
+   *  step fails. */
+  private static async createOn(
+    store: JsStore,
+    ownsStore: boolean,
+    config: FrameworkConfig,
+    building: { framework?: AgentFramework },
+  ): Promise<AgentFramework> {
     // Register framework states
     try {
       store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
@@ -2201,7 +2257,7 @@ export class AgentFramework {
       );
     }
 
-    const framework = new AgentFramework(
+    const framework = building.framework = new AgentFramework(
       store,
       ownsStore,
       config.membrane,
