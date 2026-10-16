@@ -1,9 +1,11 @@
 - `stop()` now ends every ephemeral run still registered once its event
-  loop has ended, with "refused: the framework is stopping". Before, a run
-  whose wake the loop hadn't taken up when `stop()` began waited for its
-  startup watchdog (30 s by default) before it rejected. A run's startup
-  or idle watchdog that fires once `stop()` has begun, before that end,
-  now rejects with the same error followed by what it saw, such as
+  loop has ended, with "refused: the framework is stopping": a run whose
+  wake the loop hadn't taken up when `stop()` began, whose turn `stop()`
+  refused, or whose retry it cancelled. Before, such a run waited for its
+  startup watchdog (30 s by default) or, once its inference had started,
+  its idle watchdog (15 minutes by default) before it rejected. A run's
+  startup or idle watchdog that fires once `stop()` has begun, before that
+  end, now rejects with the same error followed by what it saw, such as
   "(inference not started within 30000ms)". Before, it named a stalled
   event loop or a lost stream as the cause, even for a run whose turn
   `stop()` had refused.
