@@ -378,6 +378,15 @@ for (const mode of ['handshake', 'connected', 'throwing-listener']) {
   });
 }
 
+test('a separate stdio host whose server answers initialize with an error message no template can convert is refused at once, and survives', () => {
+  const probe = spawnSync(process.execPath, [
+    '--import', 'tsx', fileURLToPath(new URL('./fixtures/mcpl-initialize-error-probe.mjs', import.meta.url)),
+  ], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(probe.error, undefined);
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.match(probe.stdout, /refused/);
+});
+
 for (const value of [null, 42, 'hi', true, []]) {
   test('non-object inbound ' + JSON.stringify(value) + ' leaves the next notification deliverable', () => {
     const { connection, transport } = wireHarness();

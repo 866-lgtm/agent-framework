@@ -606,7 +606,12 @@ export class McplServerConnection extends EventEmitter {
           if (msg.id !== initId) return;
           cleanup();
           if (msg.error) {
-            reject(new Error(`MCPL server "${config.id}" initialize error: ${msg.error.message}`));
+            // describeCause rather than the template's own conversion: the
+            // server's `message` can be any JSON value, and one that has no
+            // primitive form, such as {"toString":1}, would throw out of this
+            // listener after cleanup() has cleared the timeout, leaving the
+            // handshake to wait forever.
+            reject(new Error(`MCPL server "${config.id}" initialize error: ${describeCause(msg.error.message)}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;
