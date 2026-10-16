@@ -7,10 +7,10 @@
 - The `utils` tool's check of a run's arguments reads the same way ("Nothing
   was done: …"), names every problem at once, and is still followed by the
   utility's schema. It now admits any type of a declared type list, where it
-  refused every value of such a parameter, takes any value of a parameter
-  whose `type` names no JSON Schema type, such as `any`, which it refused
-  whatever it was, and takes a run of 16 or more digits for a number, as
-  membrane's XML tool mode sends a large integer, passing it to the utility
-  as text.
+  refused every value of such a parameter; no longer checks the type of a
+  parameter whose `type` names no JSON Schema type, such as `any`, or a list
+  naming one, which it refused whatever it was (its `enum` is still
+  checked); and takes a run of 16 or more digits sent as text for a number,
+  passing it to the utility as text.
 - The Discord module's `activate` reads a call with no input as no
   arguments, where it threw a `TypeError`.

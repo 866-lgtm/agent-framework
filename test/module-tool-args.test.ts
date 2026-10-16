@@ -203,7 +203,11 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
 
   it('refuses an input that\'s there but isn\'t an object, naming what it was', async () => {
     await withFramework(async (framework, probe) => {
-      const cases: Array<[unknown, string]> = [['zz-text', 'a string'], [7, 'a number'], [true, 'a boolean'], [['zz-one'], 'an array']];
+      const cases: Array<[unknown, string]> = [
+        ['zz-text', 'a string'], [7, 'a number'], [true, 'a boolean'], [['zz-one'], 'an array'],
+        // Falsy, and still there: only undefined and null are an absent input.
+        ['', 'a string'], [0, 'a number'], [false, 'a boolean'],
+      ];
       for (const [input, kind] of cases) {
         const result = await call(framework, input);
         assert.equal(result.error, `Nothing was done: probe--echo its input must be an object, and this call gave ${kind}.`);
@@ -379,13 +383,17 @@ describe('toolArgsProblems', () => {
     ]);
   });
 
-  it('takes the digits of a large integer for a number, as membrane passes them, from 16 digits on', () => {
+  it('takes the digits of a large integer sent as text for a number, from 16 digits on', () => {
     assert.deepEqual(toolArgsProblems({ path: 'p', id: '1234567890123456789' }, SCHEMA, { values: true }), []);
     assert.deepEqual(toolArgsProblems({ path: 'p', id: '1234567890123456' }, SCHEMA, { values: true }), []);
     assert.deepEqual(toolArgsProblems({ path: 'p', id: '123456789012345' }, SCHEMA, { values: true }),
       ['"id" must be a number, and this call gave a string']);
     assert.deepEqual(toolArgsProblems({ path: 'p', id: '12' }, SCHEMA, { values: true }),
       ['"id" must be a number, and this call gave a string']);
+    // An integer reads as a number here too.
+    assert.deepEqual(toolArgsProblems({ path: 'p', count: '1234567890123456789' }, SCHEMA, { values: true }), []);
+    assert.deepEqual(toolArgsProblems({ path: 'p', count: '123456789012345' }, SCHEMA, { values: true }),
+      ['"count" must be a number, and this call gave a string']);
     // Only where a number is declared.
     assert.deepEqual(toolArgsProblems({ path: 'p', opts: '1234567890123456' }, SCHEMA, { values: true }),
       ['"opts" must be an object, and this call gave a string']);
@@ -454,7 +462,8 @@ describe('toolArgsProblems', () => {
       properties: { t: { type: [5, 'string'] }, e: { enum: 'x' } },
     } as unknown as ToolDefinition['inputSchema'];
     assert.deepEqual(toolArgsProblems({ t: 'ok', e: 'anything' }, odd, { values: true }), []);
-    assert.deepEqual(toolArgsProblems({ t: 3 }, odd, { values: true }), ['"t" must be a string, and this call gave a number']);
+    // A type list with an entry it can't read declares no type, as membrane reads it.
+    assert.deepEqual(toolArgsProblems({ t: 3 }, odd, { values: true }), []);
   });
 
   it('takes a digit run only as the whole of a string, for a number', () => {
@@ -542,7 +551,8 @@ describe('toolArgsProblems', () => {
     ];
     for (const [way, fields] of ways) {
       const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], ...fields } as unknown as ToolDefinition['inputSchema'];
-      assert.deepEqual(toolArgsProblems({ y: 1 }, schema), ['needs "x" (a string), and this call gave none'], way);
+      // None at all: a key no part of the schema mentions goes unnamed too.
+      assert.deepEqual(toolArgsProblems({ y: 1, zz: 1 }, schema), ['needs "x" (a string), and this call gave none'], way);
     }
     // true or false for additionalProperties or unevaluatedProperties declares no keys, nor does
     // then or else without if, nor a keyword JSON Schema doesn't have.
@@ -560,18 +570,25 @@ describe('toolArgsProblems', () => {
     }
   });
 
-  it('reads a type name JSON Schema doesn\'t have as declaring no type', () => {
+  it('reads a type name JSON Schema doesn\'t have, alone or in a list, as declaring no type', () => {
     const anyTyped = {
       type: 'object',
-      properties: { v: { type: 'any' }, w: { type: ['any', 'string'] } },
-      required: ['v'],
+      properties: {
+        v: { type: 'any' },
+        w: { type: ['any', 'string'] },
+        n: { type: ['String', 'null'] },
+        u: { type: 'any', nullable: true },
+        t: {},
+      },
+      required: ['v', 'n', 'u', 't'],
     } as unknown as ToolDefinition['inputSchema'];
-    // null is a value for a key with no type the check can read, as for an untyped one.
-    assert.deepEqual(toolArgsProblems({ v: null }, anyTyped), []);
-    assert.deepEqual(toolArgsProblems({}, anyTyped), ['needs "v", and this call gave none']);
-    // Its value isn't checked against the name, and a list keeps the types it can read.
-    assert.deepEqual(toolArgsProblems({ v: 3, w: 'x' }, anyTyped, { values: true }), []);
-    assert.deepEqual(toolArgsProblems({ v: 3, w: 4 }, anyTyped, { values: true }), ['"w" must be a string, and this call gave a number']);
+    // Its values aren't checked against the type, a list's known names included.
+    assert.deepEqual(toolArgsProblems({ v: 3, w: 4, n: 'x', u: 5, t: 6 }, anyTyped, { values: true }), []);
+    // null is no value for a type the check can't read, unless the declaration names it;
+    // a key with no type at all takes it.
+    assert.deepEqual(toolArgsProblems({ v: null, n: null, u: null, t: null }, anyTyped), ['needs "v", and this call gave null']);
+    assert.deepEqual(toolArgsProblems({}, anyTyped), ['needs "v", and this call gave none', 'needs "n", and this call gave none',
+      'needs "u", and this call gave none', 'needs "t", and this call gave none']);
   });
 
   it('names the input by the caller\'s word for it', () => {
@@ -596,7 +613,7 @@ describe('toolArgsProblems', () => {
     assert.doesNotMatch(astral!, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   });
 
-  it('shows a value of 80 characters whole, cuts one of 81, and shows a value JSON can\'t through its own text', () => {
+  it('shows a value of 80 characters whole, cuts one of 81, and shows a function, which JSON can\'t, by its own text', () => {
     const enumOnly: ToolDefinition['inputSchema'] = { type: 'object', properties: { k: { enum: ['a'] } } };
     // JSON.stringify quotes a string, so 78 characters show as 80.
     const [eighty] = toolArgsProblems({ k: 'x'.repeat(78) }, enumOnly, { values: true });

@@ -24,16 +24,27 @@ function withArticle(kind: string): string {
 const JSON_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null']);
 
 /** The kinds a declaration's type admits, each once, or none when it declares
- *  none it can read. OpenAPI's `nullable: true`, the form Gemini's dialect
+ *  none it can read. A type list naming anything JSON Schema doesn't have is
+ *  one it can't read as a whole, as membrane reads it, rather than the names
+ *  in it that it knows. OpenAPI's `nullable: true`, the form Gemini's dialect
  *  uses, admits `null` beside its type, as a type list naming `null` does. */
 function admittedKinds(param: { type?: unknown; nullable?: unknown } | undefined): string[] {
   const type = param?.type;
   const types = Array.isArray(type) ? type : type === undefined ? [] : [type];
-  const kinds = new Set(types
-    .filter((t): t is string => typeof t === 'string' && JSON_TYPES.has(t))
-    .map((t) => (t === 'integer' ? 'number' : t)));
+  if (!types.every((t) => typeof t === 'string' && JSON_TYPES.has(t))) return [];
+  const kinds = new Set((types as string[]).map((t) => (t === 'integer' ? 'number' : t)));
   if (kinds.size > 0 && param?.nullable === true) kinds.add('null');
   return [...kinds];
+}
+
+/** Whether `null` is a value for a key so declared: where the declaration
+ *  admits it (a type list naming it, or `nullable: true`), or declares no
+ *  type at all. A type the check can't read says nothing about `null`, so
+ *  there `null` is no value unless the declaration names it. */
+function takesNull(param: { type?: unknown; nullable?: unknown } | undefined): boolean {
+  const type = param?.type;
+  if (type === undefined || param?.nullable === true) return true;
+  return Array.isArray(type) ? type.includes('null') : type === 'null';
 }
 
 /** A value as the call gave it, briefly: the first 80 characters of its JSON
@@ -80,11 +91,16 @@ function isMap(value: unknown): value is Record<string, unknown> {
 }
 
 /** Every root keyword in JSON Schema's drafts 4 to 2020-12, besides
- *  `properties` and `required`, that can accept or name an object's keys,
- *  except the two read by declaresKeysPlainly (`additionalProperties` and
- *  `unevaluatedProperties`, which count only as a schema object). `then` and
- *  `else` act only beside `if`, and a keyword JSON Schema doesn't have
- *  declares nothing. */
+ *  `properties` and `required`, that can accept, require or name an object's
+ *  keys, except the two read by declaresKeysPlainly (`additionalProperties`
+ *  and `unevaluatedProperties`, which count only as a schema object). The
+ *  reading is cautious: a root with any of them names no key, whatever its
+ *  subschemas hold, since naming a key the schema takes would mislead the
+ *  agent more than a hint left out. So `not` is here too, since a negation
+ *  can require a key (`not: {properties: {y: {type: 'string'}}}` refuses an
+ *  object without a non-string `y`), and so is `if` with or without `then`
+ *  and `else`. `then` and `else` act only beside `if`, and a keyword JSON
+ *  Schema doesn't have declares nothing. */
 const OTHER_KEY_DECLARERS = [
   'allOf', 'anyOf', 'oneOf', 'not', 'if', '$ref', '$dynamicRef', '$recursiveRef',
   'dependentSchemas', 'dependencies', 'dependentRequired', 'patternProperties',
@@ -93,9 +109,11 @@ const OTHER_KEY_DECLARERS = [
 
 /** Whether a schema's root declares its keys only in `properties` and
  *  `required`, so that a key in neither isn't one of its parameters. A root
- *  with any keyword in OTHER_KEY_DECLARERS, or a schema object for
- *  `additionalProperties` or `unevaluatedProperties`, can declare keys
- *  another way. `true` or `false` there declares no key. */
+ *  with any keyword in OTHER_KEY_DECLARERS can declare keys another way. A
+ *  schema object for `additionalProperties` or `unevaluatedProperties`, `{}`
+ *  included, says the root takes keys `properties` doesn't list, as a map's
+ *  input does, so a key in neither list may be meant. `true` or `false`
+ *  there adds nothing to what a key in neither list means, so it names. */
 function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
   return !OTHER_KEY_DECLARERS.some((key) => Object.hasOwn(schema, key))
     && !isMap(schema.additionalProperties)
@@ -115,10 +133,12 @@ function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
  * - An absent input (`undefined` or `null`) gives no arguments: it's refused
  *   only for the keys the schema requires.
  * - A required key given as `null` has no value, the same as one left out,
- *   unless its declared type admits `null` (a type list naming it, or
- *   `nullable: true`). A key with no declared type takes `null` as a value,
- *   as it takes any other, and so does one whose `type` names no type JSON
- *   Schema has. An empty string is a value.
+ *   unless its declaration admits `null` (a type list naming it, or
+ *   `nullable: true`), or declares no type: a key with no declared type takes
+ *   `null` as a value, as it takes any other. One whose `type` the check
+ *   can't read, such as `any`, or a list naming one, takes `null` only where
+ *   the declaration names it, and its values aren't checked against the
+ *   type. An empty string is a value.
  * - A schema whose `required` isn't a list requires nothing here, and a key
  *   it lists twice is reported once.
  * - Where a required key is missing and the call gave keys the schema
@@ -154,8 +174,7 @@ export function toolArgsProblems(
     if (typeof key !== 'string' || missing.has(key)) continue;
     const value = own(obj, key);
     const kinds = admittedKinds(declared(key));
-    const admitsNull = kinds.length === 0 || kinds.includes('null');
-    if (value !== undefined && (value !== null || admitsNull)) continue;
+    if (value !== undefined && (value !== null || takesNull(declared(key)))) continue;
     missing.add(key);
     const wanted = kinds.length > 0 ? `"${key}" (${oneOf(kinds.map(withArticle))})` : `"${key}"`;
     problems.push(`needs ${wanted}, and this call gave ${value === null ? 'null' : 'none'}`);
