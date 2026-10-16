@@ -79,13 +79,27 @@ function isMap(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Every root keyword in JSON Schema's drafts 4 to 2020-12, besides
+ *  `properties` and `required`, that can accept or name an object's keys,
+ *  except the two read by declaresKeysPlainly (`additionalProperties` and
+ *  `unevaluatedProperties`, which count only as a schema object). `then` and
+ *  `else` act only beside `if`, and a keyword JSON Schema doesn't have
+ *  declares nothing. */
+const OTHER_KEY_DECLARERS = [
+  'allOf', 'anyOf', 'oneOf', 'not', 'if', '$ref', '$dynamicRef', '$recursiveRef',
+  'dependentSchemas', 'dependencies', 'dependentRequired', 'patternProperties',
+  'propertyNames', 'enum', 'const',
+];
+
 /** Whether a schema's root declares its keys only in `properties` and
  *  `required`, so that a key in neither isn't one of its parameters. A root
- *  with `oneOf`, `anyOf`, `allOf`, `$ref` or `patternProperties`, or a schema
- *  for `additionalProperties`, can declare keys there too. */
+ *  with any keyword in OTHER_KEY_DECLARERS, or a schema object for
+ *  `additionalProperties` or `unevaluatedProperties`, can declare keys
+ *  another way. `true` or `false` there declares no key. */
 function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
-  return !['oneOf', 'anyOf', 'allOf', '$ref', 'patternProperties'].some((key) => Object.hasOwn(schema, key))
-    && !isMap(schema.additionalProperties);
+  return !OTHER_KEY_DECLARERS.some((key) => Object.hasOwn(schema, key))
+    && !isMap(schema.additionalProperties)
+    && !isMap(schema.unevaluatedProperties);
 }
 
 /**

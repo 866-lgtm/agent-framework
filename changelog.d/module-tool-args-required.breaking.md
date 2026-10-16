@@ -2,7 +2,8 @@
   runs when it lacks a key the tool's `inputSchema` lists in `required` (a
   key given as `null` counts as lacking it, unless its declared type
   admits `null`, by a type list naming it or `nullable: true`, or it
-  declares no type), or when its input is there but isn't an object. **Who
+  declares no type, or a `type` naming no JSON Schema type, such as
+  `any`), or when its input is there but isn't an object. **Who
   needs to act:** a module whose handler runs without a key its schema
   requires, since calls that leave the key out ran before and are now
   refused. **Migration:** if the key is optional, drop it from `required`

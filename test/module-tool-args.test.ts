@@ -519,22 +519,44 @@ describe('toolArgsProblems', () => {
   });
 
   it('names none where the schema\'s root can declare keys another way', () => {
-    const ways: Array<[string, unknown]> = [
-      ['oneOf', [{ properties: { y: { type: 'number' } } }]],
-      ['anyOf', [{ properties: { y: { type: 'number' } } }]],
-      ['allOf', [{ properties: { y: { type: 'number' } } }]],
-      ['$ref', '#/$defs/args'],
-      ['patternProperties', { '^y': { type: 'number' } }],
-      ['additionalProperties', { type: 'number' }],
+    const y = { properties: { y: { type: 'number' } } };
+    const ways: Array<[string, Record<string, unknown>]> = [
+      ['oneOf', { oneOf: [y] }],
+      ['anyOf', { anyOf: [y] }],
+      ['allOf', { allOf: [y] }],
+      ['not', { not: { required: ['y'] } }],
+      ['if', { if: { required: ['mode'] }, then: y }],
+      ['$ref', { $ref: '#/$defs/args' }],
+      ['$dynamicRef', { $dynamicRef: '#args' }],
+      ['$recursiveRef', { $recursiveRef: '#' }],
+      ['dependentSchemas', { dependentSchemas: { mode: y } }],
+      ['dependencies with a schema', { dependencies: { mode: y } }],
+      ['dependencies with a list', { dependencies: { mode: ['y'] } }],
+      ['dependentRequired', { dependentRequired: { mode: ['y'] } }],
+      ['patternProperties', { patternProperties: { '^y': { type: 'number' } } }],
+      ['propertyNames', { propertyNames: { enum: ['x', 'y'] } }],
+      ['enum', { enum: [{ x: 'a', y: 1 }] }],
+      ['const', { const: { x: 'a', y: 1 } }],
+      ['additionalProperties', { additionalProperties: { type: 'number' } }],
+      ['unevaluatedProperties', { unevaluatedProperties: { type: 'number' } }],
     ];
-    for (const [way, value] of ways) {
-      const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], [way]: value } as unknown as ToolDefinition['inputSchema'];
+    for (const [way, fields] of ways) {
+      const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], ...fields } as unknown as ToolDefinition['inputSchema'];
       assert.deepEqual(toolArgsProblems({ y: 1 }, schema), ['needs "x" (a string), and this call gave none'], way);
     }
-    // additionalProperties true or false declares no keys.
-    for (const additionalProperties of [true, false]) {
-      const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], additionalProperties } as unknown as ToolDefinition['inputSchema'];
-      assert.deepEqual(toolArgsProblems({ y: 1 }, schema), ['needs "x" (a string), and this call gave none', '"y" isn\'t one of its parameters']);
+    // true or false for additionalProperties or unevaluatedProperties declares no keys, nor does
+    // then or else without if, nor a keyword JSON Schema doesn't have.
+    const noWays: Array<[string, Record<string, unknown>]> = [
+      ['additionalProperties true', { additionalProperties: true }],
+      ['additionalProperties false', { additionalProperties: false }],
+      ['unevaluatedProperties true', { unevaluatedProperties: true }],
+      ['unevaluatedProperties false', { unevaluatedProperties: false }],
+      ['then and else without if', { then: y, else: y }],
+      ['a keyword JSON Schema lacks', { 'x-parameters': y }],
+    ];
+    for (const [way, fields] of noWays) {
+      const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], ...fields } as unknown as ToolDefinition['inputSchema'];
+      assert.deepEqual(toolArgsProblems({ y: 1 }, schema), ['needs "x" (a string), and this call gave none', '"y" isn\'t one of its parameters'], way);
     }
   });
 
