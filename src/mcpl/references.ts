@@ -89,17 +89,26 @@ export function classifyBlock(block: unknown): BlockClassification {
       const hasUri = typeof block.uri === 'string';
       if (hasData) {
         // Inline form claiming bulk disposition (or smuggling a uri beside
-        // the data) is the vector-2 contradiction: fail closed, withhold.
-        return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
+        // the data, a string or any other value but null) is the vector-2
+        // contradiction: fail closed, withhold.
+        return { kind: 'inline', contradiction: block.disposition !== undefined || (block.uri !== undefined && block.uri !== null) };
       }
       if (hasUri) return parseReferenceFields(block);
-      return { kind: 'invalid', reason: `${block.type} block with neither data nor uri` };
+      return { kind: 'invalid', reason: `${block.type} block ${mediaWithoutStringReason(block)}` };
     }
     case 'resource':
       return parseReferenceFields(block);
     default:
       return { kind: 'invalid', reason: `unknown block type: ${block.type}` };
   }
+}
+
+/** What a media block with neither string data nor a string uri has instead:
+ *  nothing, or a field that isn't a string. */
+function mediaWithoutStringReason(block: Record<string, unknown>): string {
+  const notString = (['data', 'uri'] as const).filter((f) => block[f] !== undefined && block[f] !== null);
+  if (notString.length === 0) return 'with neither data nor uri';
+  return notString.length === 2 ? "whose data and uri aren't strings" : `whose ${notString[0]} isn't a string`;
 }
 
 function parseReferenceFields(block: Record<string, unknown>): BlockClassification {
