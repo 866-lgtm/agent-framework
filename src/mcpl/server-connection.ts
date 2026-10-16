@@ -1426,12 +1426,23 @@ export class McplServerConnection extends EventEmitter {
     // the log line prints the same through log-value.
     const error = new Error(`MCPL server "${this.id}" inbound dispatch failed${where(boundedForLog)}: ${boundedForLog(describeCause(cause))}`, { cause });
     console.error(`[mcpl] ${this.id}: inbound dispatch failed${where(logValue)}: ${logDetail(describeCause(cause))}`);
-    // EventEmitter's unhandled 'error' behavior would defeat containment before
-    // framework wiring, so stderr remains the fallback when no listener exists.
-    if (this.listenerCount('error') > 0) {
-      try { this.emit('error', error); }
-      catch (reportError) { console.error(`[mcpl] ${this.id}: an 'error' listener failed: ${logDetail(describeCause(reportError))}`); }
-    }
+    this.emitToErrorListeners(error);
+  }
+
+  /**
+   * Give an error to the connection's 'error' listeners, and say whether it
+   * has any. EventEmitter throws an 'error' that nothing listens for, and
+   * from a transport's callback, where these errors arise, nothing catches
+   * that throw, so it ends the process. A bare connection has no listener:
+   * the class is exported, and a probe, a playtest or a harness often attaches
+   * none. So with no listener the caller logs the error instead. A listener
+   * that throws is caught and logged too.
+   */
+  private emitToErrorListeners(error: Error): boolean {
+    if (this.listenerCount('error') === 0) return false;
+    try { this.emit('error', error); }
+    catch (listenerError) { console.error(`[mcpl] ${this.id}: an 'error' listener failed: ${logDetail(describeCause(listenerError))}`); }
+    return true;
   }
 
   /**
@@ -1527,7 +1538,8 @@ export class McplServerConnection extends EventEmitter {
   private setupLifecycle(transport: McplTransport): void {
     this.hostCloseRequested = false;
     transport.on('error', (err: Error) => {
-      this.emit('error', new Error(`MCPL server "${this.id}" transport error: ${err.message}`));
+      const error = new Error(`MCPL server "${this.id}" transport error: ${err.message}`);
+      if (!this.emitToErrorListeners(error)) console.error(`[mcpl] ${this.id}: transport error: ${logDetail(err.message)}`);
     });
 
     transport.on('close', (info: TransportCloseInfo) => {
