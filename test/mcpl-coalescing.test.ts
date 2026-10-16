@@ -402,15 +402,28 @@ test('vectors 7/47: restart keeps accepted content, receipts, and appends after 
 });
 
 test('#196 finding 2 / vector 34c: a busy channel never hits a subject cap', async (t) => {
-  const f = await fixture({ framework: { gate: { config: { policies: [{ name: 'attention', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }], default: 'skip' } } } as never }); t.after(f.close); await f.register();
+  // The periodic store sync stays off (syncIntervalMs: 0), so every sync
+  // counted below is an acceptance's.
+  const f = await fixture({ framework: { gate: { config: { policies: [{ name: 'attention', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }], default: 'skip' } }, syncIntervalMs: 0 } as never }); t.after(f.close); await f.register();
   const msg = (i: number | string, tags: string[]) => ({ channelId: 'chat', messageId: 'm' + i, eventId: 'e' + i, timestamp: TS, author: { id: 'u', name: 'User' }, tags,
     content: [{ type: 'text', text: 'text_' + i }], coalesce: { key: 'message:m' + i, initial: true } });
+  // #196's review measured 85 ms a message on this path, because its journal
+  // synced the store for each of three operations per message. An acceptance
+  // now awaits one durable commit (RFC-006), so 300 messages sent one at a
+  // time make 300 store syncs. The bound is on that count, from above, so
+  // commits shared between acceptances would still pass. The time depends on
+  // the disk and the host's load, so it's reported, not asserted.
+  const store = (f.framework as unknown as { store: { sync: (...a: unknown[]) => unknown } }).store;
+  const sync = store.sync.bind(store);
+  let syncs = 0;
+  store.sync = (...a: unknown[]) => { syncs++; return sync(...a); };
   const t0 = Date.now();
   for (let i = 0; i < 300; i++) {
     const r = await f.send('channels/incoming', { messages: [msg(i, [])] });
     assert.equal(r.result.results[0].accepted, true);
   }
   const elapsed = Date.now() - t0;
+  const synced = syncs;
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 0);
   const mention = await f.send('channels/incoming', { messages: [msg('mention', ['chat:mention'])] });
@@ -418,10 +431,8 @@ test('#196 finding 2 / vector 34c: a busy channel never hits a subject cap', asy
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('text_mention') && f.lastRequest().includes('text_0'));
-  // Each acceptance awaits a group-committed fsync (RFC-006 durability); serial
-  // sends cannot batch, so this is ~300 fsyncs. Bounded, and reported.
-  console.log(`# 300 serial coalesced channel messages: ${elapsed}ms (${(elapsed / 300).toFixed(1)} ms/msg incl. fsync)`);
-  assert(elapsed < 30_000, `300 coalesced messages took ${elapsed}ms`);
+  console.log(`# 300 serial coalesced channel messages: ${elapsed}ms (${(elapsed / 300).toFixed(1)} ms/msg incl. fsync), ${synced} store syncs`);
+  assert(synced <= 300, `300 coalesced messages made ${synced} store syncs, more than one a message`);
 });
 
 test('#196 finding 4: a context-budget restart does not assemble a pending batch', async (t) => {
