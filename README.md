@@ -78,8 +78,8 @@ Chronicle's audit history.
 list/describe/run slot; `run` still requires the named utility grant. The slot
 is hidden when the agent can use no registered utility. If utilities exist
 but none are permitted, `list` returns a failed `ToolResult` with the registered
-and permitted counts and migration advice. A list containing `utils` with no
-permitted utility logs one warning per Agent instance after registration.
+and permitted counts and migration advice, and a list containing `utils`
+logs one warning per Agent instance after registration.
 An empty registry still returns a successful empty list.
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
