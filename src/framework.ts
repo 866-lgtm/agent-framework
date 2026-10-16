@@ -2730,12 +2730,10 @@ export class AgentFramework {
     // on: beginAgentTurn opens the turn again for it.
     this.openLogical.clear();
 
-    // Cancel all active streams
+    // Cancel the stream of every agent whose state holds one: streaming,
+    // waiting on its tools, or ready at a tool boundary.
     for (const agent of this.agents.values()) {
-      if (agent.state.status === 'streaming' ||
-          (agent.state.status === 'waiting_for_tools' && agent.state.stream)) {
-        agent.cancelStream();
-      }
+      if ('stream' in agent.state && agent.state.stream) agent.cancelStream();
     }
 
     // Wait for all stream iteration handles to settle
@@ -8822,14 +8820,6 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
-          // Flush pending assistant blocks (tool_use + preamble text) to context
-          const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
-          const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
-          if (pendingBlocks) {
-            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
-            this.pendingAssistantBlocks.delete(agent.name);
-          }
-
           // Effective inline cap: agent_settings override → durable config →
           // house default, clamped to the strategy bound (see resolver).
           const maxChars = this.resolveToolResultInlineCap(agent).cap;
@@ -8842,6 +8832,45 @@ export class AgentFramework {
           // divergence breaks the compile prefix).
           const { blocks: toolResultContent, spilled } =
             await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars);
+
+          // A spill writes to the workspace, and the turn can be stopped
+          // meanwhile: a host's cancelStream, stop() and abortInference cancel
+          // the round's stream at `ready` and leave the agent idle, a quiesce's
+          // abandon cancels it and driveStream resets the agent, and an
+          // ephemeral run's disposal cancels it before deregistering. Each
+          // replaces the `ready` state this boundary began from. The round
+          // then ends here: it isn't resumed, restarted or settled again, and
+          // neither its tool_use nor its results are stored, since its blocks
+          // are stored only below; the stop's teardown deletes them, as when a
+          // stop comes while the round's tools run. A result that spilled
+          // keeps its workspace file, and its images stay in the agent's image
+          // ledger until the ledger evicts them; nothing stored names either.
+          // One tool:result_dropped goes out, for the result being handled,
+          // as at the batch hook's drop above.
+          const after = agent.state as AgentState;
+          if (after !== currentState) {
+            console.warn(
+              `[framework] Dropping the tool round of agent '${agent.name}' (callId=${event.callId}): ` +
+              `its turn changed while the round's results were prepared (status '${after.status}'), ` +
+              `so the round isn't stored and its stream isn't resumed.`,
+            );
+            this.emitTrace({
+              type: 'tool:result_dropped',
+              agentName: agent.name,
+              callId: event.callId,
+              agentStatus: after.status,
+              result: event.result,
+            });
+            return;
+          }
+
+          // Flush pending assistant blocks (tool_use + preamble text) to context
+          const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
+          const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
+          if (pendingBlocks) {
+            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
+            this.pendingAssistantBlocks.delete(agent.name);
+          }
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
@@ -9048,16 +9077,6 @@ export class AgentFramework {
             // endTurn above).
             if (currentState.stream) {
               this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
-              // Cancel the LIVE stream object directly (like the endTurn
-              // branch above): at a tool boundary the state machine reads
-              // 'ready', and Agent.cancelStream only signals the stream from
-              // 'streaming'/'waiting_for_tools' — so the old call left the
-              // provider stream parked forever awaiting tool results that
-              // would never come (zombie: driveStream's finally never ran,
-              // its activeStreams entry survived until the restart's stream
-              // overwrote it). Harmless by accident before turn-alive
-              // tracking; a genuine teardown leak after it.
-              currentState.stream.cancel();
             }
             agent.cancelStream();
             this.emitTrace({
