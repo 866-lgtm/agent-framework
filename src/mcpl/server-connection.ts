@@ -674,6 +674,18 @@ export class McplServerConnection extends EventEmitter {
             return; // Ignore non-JSON lines (e.g. logback output from Java servers)
           }
           if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
+          // A request or a notification from the server is never the
+          // initialize response, whatever its id: a server's own ids can start
+          // at 0, this handshake's. MCP lets a server ping before
+          // initialization completes, and the ping gets its empty result, as
+          // on a connected transport. Anything else it sends now is ignored.
+          if ('method' in msg) {
+            const request = msg as unknown as JsonRpcRequest;
+            if (request.method === 'ping' && request.id != null) {
+              transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }));
+            }
+            return;
+          }
           if (msg.id !== initId) return;
           cleanup();
           if (msg.error) {
@@ -1343,6 +1355,17 @@ export class McplServerConnection extends EventEmitter {
 
     // It is an inbound request or notification from the server
     const request = msg as JsonRpcRequest;
+
+    // MCP's ping, which either side may send: its receiver answers promptly
+    // with an empty result. It's answered as it arrives, before admission and
+    // buffering, since it asks only whether the connection is alive, and a
+    // paused plane mustn't hold that answer. A ping sent as a notification
+    // has nothing to answer. The handshake answers one too.
+    if (request.method === 'ping') {
+      if (request.id != null) this.sendResponse(request.id, {});
+      return;
+    }
+
     const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
 
