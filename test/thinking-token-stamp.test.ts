@@ -72,6 +72,20 @@ describe('stampThinkingTokenEstimates (pure)', () => {
     assert.equal(stampThinkingTokenEstimates(overshoot, 100), overshoot);
     assert.equal(stampThinkingTokenEstimates(overshoot, 0), overshoot);
   });
+
+  it('counts a pre-priced display block at its price, not its text (Responses reasoning summary)', () => {
+    // gpt-5.1 on /v1/responses: output_tokens = reasoning + visible answer;
+    // the summary text is not billed, so membrane stamps it 0.
+    const summary = { type: 'thinking', thinking: 's'.repeat(1_800), tokenEstimate: 0 } as ContentBlock;
+    const blocks: ContentBlock[] = [
+      summary,
+      { type: 'redacted_thinking', data: 'E'.repeat(10_000) } as ContentBlock,
+      { type: 'text', text: '105' },
+    ];
+    const out = stampThinkingTokenEstimates(blocks, 955) as Stamped[];
+    assert.equal(out[0], summary, 'the summary block keeps its own price and identity');
+    assert.equal(out[1]!.tokenEstimate, 955 - Math.ceil(3 / 2.9));
+  });
 });
 
 class EchoModule implements Module {

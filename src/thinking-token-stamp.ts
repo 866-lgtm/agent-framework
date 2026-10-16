@@ -75,10 +75,17 @@ export function stampThinkingTokenEstimates(blocks: ContentBlock[], outputTokens
   let visible = 0;
   for (const block of blocks) {
     const already = (block as { tokenEstimate?: unknown }).tokenEstimate;
-    const w = typeof already === 'number' ? 0 : carrierWeight(block);
+    // A block that already carries its price counts at that price, never by
+    // its text: a Responses reasoning summary is unsigned thinking stamped 0
+    // by the provider, and its text is neither output-billed nor replayed
+    // (probed on gpt-5.1, 2026-10-16), so it must not shrink the residual.
+    if (typeof already === 'number') {
+      visible += already;
+      continue;
+    }
+    const w = carrierWeight(block);
     if (w > 0) totalWeight += w;
     else visible += visibleTokens(block);
-    if (typeof already === 'number') visible += already;
   }
   if (totalWeight <= 0) return blocks;
   const residual = outputTokens - visible;
