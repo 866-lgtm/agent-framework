@@ -818,10 +818,14 @@ export class EventGate {
     }
   }
 
-  /** gate.json's current error, replacing the last one, and traced when it's new. */
+  /**
+   * gate.json's current error, replacing the last one, and traced and logged
+   * when it's new, so an edit that doesn't load is in the log once.
+   */
   private configUnreadable(err: unknown): { state: 'unreadable'; error: string } {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg !== this.configError) {
+      console.error(`[gate] ${this.configPath} couldn't be read (${msg}), so what it holds isn't in force`);
       this.emitTrace({
         type: 'gate:config-error',
         error: msg,
@@ -890,7 +894,9 @@ export class EventGate {
       }
       if (gateFile) {
         try {
-          chownSync(kept, -1, gateFile.gid);
+          // The copy's own owner, this process, rather than -1 for "unchanged",
+          // which Bun 1.3.14 refuses with EPERM.
+          chownSync(kept, process.geteuid?.() ?? -1, gateFile.gid);
           chmodSync(kept, gateFile.mode & 0o777);
         } catch { /* it stays owner-only */ }
       }

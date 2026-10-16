@@ -9,10 +9,11 @@
  */
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import fs, {
   accessSync, chmodSync, chownSync, constants, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
   utimesSync, writeFileSync,
 } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -111,7 +112,11 @@ test('a change over a gate.json that will not load keeps a copy first, then writ
   assert.equal(keptTraces[0]!.error, kept[0]!.reason);
   assert.deepEqual(
     logged.mock.calls.map((c) => c.arguments[0]),
-    [`[gate] ${configPath} couldn't be read (${kept[0]!.reason}); kept a copy at ${keptPath} before writing the rules in force`],
+    [
+      `[gate] ${configPath} couldn't be read (${kept[0]!.reason}), so what it holds isn't in force`,
+      `[gate] ${configPath} couldn't be read (${kept[0]!.reason}); kept a copy at ${keptPath} before writing the rules in force`,
+    ],
+    'the failed load is logged once, then the copy',
   );
 
   // A second unreadable file in the same second takes the next free name, by removePolicy.
@@ -198,6 +203,32 @@ test("a copy of a gate.json shared through another of this process's groups take
 
   const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
   assert.equal(copy.gid, OTHER_GROUP, "the copy has gate.json's group, not this process's own");
+  assert.equal(copy.mode & 0o777, 0o640, 'and its bits');
+});
+
+test("a copy takes gate.json's group and bits where chown refuses -1 for its owner, as Bun 1.3.14 does", {
+  skip: process.platform === 'win32' ? 'needs POSIX permission bits' : false,
+}, (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  t.mock.method(console, 'error', () => {});
+  writeFileSync(configPath, BROKEN);
+  chmodSync(configPath, 0o640);
+  const original = fs.chownSync;
+  const chown = t.mock.method(fs, 'chownSync', (path: unknown, uid: number, gid: number) => {
+    if (uid === -1) throw Object.assign(new Error(`EPERM: operation not permitted, chown '${String(path)}'`), { code: 'EPERM', syscall: 'chown' });
+    original(path as string, uid, gid);
+  });
+  syncBuiltinESMExports();
+  try {
+    gate.addPolicy({ name: 'ambient', behavior: 'defer' });
+  } finally {
+    chown.mock.restore();
+    syncBuiltinESMExports();
+  }
+
+  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
+  assert.equal(copy.gid, statSync(configPath).gid, "the copy has gate.json's group");
   assert.equal(copy.mode & 0o777, 0o640, 'and its bits');
 });
 
@@ -505,13 +536,22 @@ test("the startup's failure to reconcile gate.json shows beside a gate.json that
   assert.deepEqual(gate.getStatus().errors, [], 'new text in gate.json decides the rules now');
 });
 
-test('an unreadable gate.json read again unchanged is traced once', (t) => {
+test('an unreadable gate.json read again unchanged is traced and logged once, and again once it fails another way', (t) => {
   const dir = tempDir(t);
   const traces: Array<{ type: string }> = [];
   const { gate, configPath } = makeGate(dir, { config: RULES, traces });
+  const logged = t.mock.method(console, 'error', () => {});
+  const loadLines = () => logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.startsWith(`[gate] ${configPath} couldn't be read (`));
   writeFileSync(configPath, BROKEN);
   for (let i = 0; i < 3; i++) gate.listPolicyNames();
   assert.equal(traces.filter((e) => e.type === 'gate:config-error').length, 1);
+  assert.equal(loadLines().length, 1);
+  assert.match(loadLines()[0]!, /JSON.*\), so what it holds isn't in force$/);
+
+  writeFileSync(configPath, '[1,');
+  for (let i = 0; i < 3; i++) gate.listPolicyNames();
+  assert.equal(traces.filter((e) => e.type === 'gate:config-error').length, 2);
+  assert.equal(loadLines().length, 2, 'a new error is logged once too');
 });
 
 test('a privileged-users file that parses but holds no list is its error, and the last list that loaded stays', (t) => {
