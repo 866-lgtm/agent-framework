@@ -631,6 +631,64 @@ test('a manifest refresh that fails is reported as a handler failure', async (t)
   assert.match(failures[0].error, /manifest fetch failed/);
 });
 
+test('mcpl/manifestChanged and tools/list_changed sent as requests are answered at once with an empty result, whatever the refresh does', async (t) => {
+  const { framework, connection, transport, traces } = wireHarness();
+  t.mock.method(console, 'error', () => {});
+  framework.handleManifestChanged = async () => { throw new Error('manifest fetch failed'); };
+  const seen: Array<{ answered: number; responder: unknown }> = [];
+  connection.removeAllListeners('tools-list-changed');
+  connection.on('tools-list-changed', (_params: unknown, responder?: unknown) => {
+    seen.push({ answered: transport.lines.length, responder });
+  });
+  // An id of 0 makes a request like any other id.
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'notifications/tools/list_changed' }));
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'mcpl/manifestChanged', params: { revision: 'r2' } }));
+  await settle();
+  assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [
+    { jsonrpc: '2.0', id: 0, result: {} },
+    { jsonrpc: '2.0', id: 0, result: {} },
+  ]);
+  // The handler runs as for the notification, with no responder, once the answer is written.
+  assert.deepEqual(seen, [{ answered: 1, responder: undefined }]);
+  // The failed manifest refresh is reported, and answers nothing more.
+  const failures = failureTraces(traces);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].event, 'manifest-changed');
+  assert.equal(failures[0].requestId, undefined);
+});
+
+test('a request form that arrives before the framework wires the connection is answered when its plane opens', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const transport = new ResponseTransport();
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  // Nothing on the host listens yet, and both planes are closed, so it's held.
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'notifications/tools/list_changed' }));
+  assert.deepEqual(transport.lines, []);
+  harness(connection);
+  const seen: unknown[] = [];
+  connection.removeAllListeners('tools-list-changed');
+  connection.on('tools-list-changed', (_params: unknown, responder?: unknown) => { seen.push(responder); });
+  connection.ready();
+  await settle();
+  assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 0, result: {} }]);
+  assert.deepEqual(seen, [undefined]);
+});
+
+test('with nothing listening for them, their request forms are still answered -32601', (t) => {
+  const transport = new ResponseTransport();
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  connection.ready();
+  t.mock.method(console, 'error', () => {});
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'notifications/tools/list_changed' }));
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'mcpl/manifestChanged' }));
+  assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [
+    { jsonrpc: '2.0', id: 0, error: { code: -32601, message: 'Method not found' } },
+    { jsonrpc: '2.0', id: 0, error: { code: -32601, message: 'Method not found' } },
+  ]);
+});
+
 test('a failed internal-error reply reaches stderr too', async (t) => {
   const { framework, connection } = harness();
   framework.traceListeners = [];

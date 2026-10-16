@@ -417,11 +417,26 @@ export class McplServerConnection extends EventEmitter {
       }
       // §6.6: a request that will never be answered MUST get an error. A
       // request whose event nothing on this host listens for would never be.
-      const request = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+      const request = args[1] as {
+        respond?: (result: unknown) => void;
+        respondError?: (code: number, message: string, data?: unknown) => void;
+      } | undefined;
       if (typeof request?.respondError === 'function' && this.listenerCount(event) === 0) {
         request.respondError(-32601, 'Method not found');
         console.error(`[mcpl] ${this.id}: answered -32601 to ${logValue(name)}, which nothing on this host handles`);
         return true;
+      }
+      // mcpl/manifestChanged (§17.3) and tools/list_changed are notifications.
+      // Sent as a request, either is answered with an empty result as it's
+      // admitted, and passed on as the notification is, with no responder:
+      // the host acts on it the same way, so the answer doesn't depend on what
+      // the refresh does, and it's written before any request the refresh
+      // sends. This is where live routing and buffer flushes meet, so a request
+      // held while its plane is closed is answered only when it's let through,
+      // never by a startup that fails first.
+      if ((name === 'manifest-changed' || name === 'tools-list-changed') && typeof request?.respond === 'function') {
+        request.respond({});
+        return super.emit(event, args[0]);
       }
       return super.emit(event, ...args);
     }
