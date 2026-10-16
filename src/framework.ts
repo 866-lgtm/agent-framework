@@ -489,6 +489,18 @@ interface DeferredWrite {
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
+/** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
+ *  (empty when addMessage deferred it again; a sharded body's first shard)
+ *  and what the store holds of it. `afterThrow` marks an entry whose write
+ *  threw after storing it, found in the store and counted as written: its
+ *  content is what landed, which for a sharded body can be its first shards
+ *  alone. */
+interface DrainedWrite {
+  id: MessageId;
+  content: ContentBlock[];
+  afterThrow?: true;
+}
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
@@ -5093,11 +5105,12 @@ export class AgentFramework {
    * window is operator-length, not turn-length. Lives in the
    * branch-independent recovery file so a rollback cannot orphan it.
    * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
-   * still memory-only: they land within the turn, at a tool boundary or at
-   * its end, and a crash before then loses them. That window runs to the
-   * turn's end for a message held there and what is queued behind it, and,
-   * on a stream that can't carry injected messages, for every message
-   * deferred during the turn.
+   * mirrored only while such a queue is still persisted; otherwise they are
+   * memory-only: they land within the turn, at a tool boundary or at its
+   * end, and a crash before then loses them. That window runs to the turn's
+   * end for a message held there and what is queued behind it, and, on a
+   * stream that can't carry injected messages, for every message deferred
+   * during the turn.
    */
   private persistDeferredWrites(): void {
     try {
@@ -5197,12 +5210,18 @@ export class AgentFramework {
       }
       // One entry per id: the boot dedup and the ack each take an id as one
       // write, so an id that comes again is dropped with a line, and the first
-      // entry with it is kept. An entry with no id is given a fresh one.
+      // entry with it is kept. An entry with no id is given a fresh one, with
+      // a line: a copy of it that already landed carries the id it lost, so
+      // the boot dedup can't find it, and it may be stored again.
       const seen = new Set<string>();
       const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
       let duplicates = 0;
       for (const m of data.filter(wellFormed)) {
-        const id = typeof m.id === 'string' && m.id !== '' ? m.id : randomUUID();
+        const hasId = typeof m.id === 'string' && m.id !== '';
+        const id = hasId ? (m.id as string) : randomUUID();
+        if (!hasId) {
+          console.error(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
+        }
         if (seen.has(id)) {
           duplicates++;
           console.error(
@@ -5214,7 +5233,8 @@ export class AgentFramework {
         seen.add(id);
         kept.push({ ...m, id });
       }
-      // A seq is a positive whole number, the entry's place in arrival order.
+      // A seq is a positive whole number no larger than
+      // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
       // An entry without one (a file that predates seq, which is in write
       // order already) or with any other value (damage or a hand edit:
       // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
@@ -5228,9 +5248,12 @@ export class AgentFramework {
           if (validSeq(m.seq)) return { ...m, seq: m.seq };
           renumbered++;
           if (m.seq !== undefined) {
+            // A value that isn't a number is named by its type: it could be
+            // any size.
+            const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
             console.error(
-              `[host-mode] a recovered deferred context write (${m.id}) has seq ${String(m.seq)}, not a positive ` +
-              `whole number; it is queued after the others`,
+              `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
+              `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
             );
           }
           return { ...m, seq: ++lastSeq };
@@ -9039,17 +9062,18 @@ export class AgentFramework {
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
             // stored is injected (the round's results go on either way). A
-            // write that threw after its message was stored counts as stored,
-            // so that copy is injected too (writeDrainedInOrder).
+            // write that threw after storing counts as stored, and what landed
+            // of it is what's injected, so the request carries what the store
+            // holds (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-            for (const [msg, id] of stored) {
+            for (const [msg, { id, content }] of stored) {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
               const injection = {
                 participant: msg.participant,
-                content: msg.content,
+                content,
                 ...(msg.metadata ? { metadata: msg.metadata } : {}),
               };
               midTurnInjections.push(injection);
@@ -11846,7 +11870,7 @@ export class AgentFramework {
         // starting and for every other resident's open turn.
         const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `turn-start flush for ${agent.name}`, (msg) =>
           agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-        for (const [msg, id] of stored) {
+        for (const [msg, { id }] of stored) {
           this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           this.noteArrival(agent.name, msg.metadata, id);
           this.noteForOtherResidents(agent, msg.metadata, id);
@@ -13902,10 +13926,12 @@ export class AgentFramework {
       }
 
       // A conversation fork whose TTL closure turn just finished is done for
-      // good — dispose it so the agent map doesn't grow monotonically. After
-      // the flush above, so what was held for the turn's end lands in the
-      // fork's store instead of being dropped as addressed to no agent.
-      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+      // good — dispose it so the agent map doesn't grow monotonically. The
+      // frame that ends the turn disposes it, after the flush above, so what
+      // was held for the turn's end lands in the fork's store instead of
+      // being dropped as addressed to no agent. A frame that hands the turn
+      // to a successor (a guard or budget restart) leaves the fork to it.
+      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
         this.disposeConversationAgent(agent.name);
       }
     }
@@ -15606,12 +15632,7 @@ export class AgentFramework {
       bypassDeferralFor?: string;
     }
   ): MessageId {
-    // Route to the named agent, else the primary (not ephemeral subagents).
-    const agent = opts?.forAgent
-      ? this.agents.get(opts.forAgent)
-      : this.primaryAgentName
-        ? this.agents.get(this.primaryAgentName)
-        : this.agents.values().next().value;
+    const agent = this.deliveryAgent(opts?.forAgent);
     if (!agent) {
       if (opts?.forAgent) {
         console.error(
@@ -15688,13 +15709,29 @@ export class AgentFramework {
       opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
-    // Stored while none of the agent's turns is alive, or assembled for the
-    // start now beginning: no tool boundary will weigh it.
-    if (!this.activeTurnTokens.has(agent.name) || opts?.bypassDeferralFor === agent.name) {
+    this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
+    return stored;
+  }
+
+  /** Where addMessage delivers: the named agent, else the primary, else the
+   *  first registered agent. Undefined when there is no such agent. */
+  private deliveryAgent(forAgent?: string): Agent | undefined {
+    return forAgent
+      ? this.agents.get(forAgent)
+      : this.primaryAgentName
+        ? this.agents.get(this.primaryAgentName)
+        : this.agents.values().next().value;
+  }
+
+  /** The notes addMessage takes for a message it stored: an arrival for the
+   *  agent when none of its turns is alive or the message was assembled for
+   *  the start now beginning (no tool boundary will weigh it), and one for
+   *  every other resident's open turn. */
+  private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
+    if (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name) {
       this.noteArrival(agent.name, metadata, stored);
     }
     this.noteForOtherResidents(agent, metadata, stored);
-    return stored;
   }
 
   /**
@@ -15766,13 +15803,16 @@ export class AgentFramework {
    *
    * A write can throw after its message is stored: a store listener, the
    * strategy's handling of the add, or a later shard of a sharded body can
-   * throw once the record is written. Before an entry that threw is put
-   * back, its target's store is read from where it stood before the write,
-   * for the entry's `deferredWriteId`. A copy found there counts as written,
-   * under its stored id, so the entry isn't requeued and stored a second
-   * time. (Written through readdDrained, such a copy misses the notes
-   * addMessage takes after a store, as any write that throws after storing
-   * does. The tool boundary and the turn-start flush note what is returned.)
+   * throw once a record is written. Before an entry that threw is put back,
+   * its target's store is read from where it stood before the write, for
+   * messages carrying the entry's `deferredWriteId`. What it finds counts as
+   * written, at most once: the entry isn't requeued and stored a second
+   * time, and what landed is what it returns as the entry's content. For a
+   * sharded body, that can be its first shards alone, since the append loop
+   * stops at the throw; the rest of the body isn't stored. (Requeued, the
+   * landed shards would be stored twice, and only the rest could not be
+   * appended later without splitting the body.) Boot's scan for landed
+   * writes counts a landed shard the same way.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
@@ -15782,74 +15822,72 @@ export class AgentFramework {
     entries: DeferredWrite[],
     where: string,
     write: (msg: DeferredWrite) => MessageId,
-  ): Map<DeferredWrite, MessageId> {
+  ): Map<DeferredWrite, DrainedWrite> {
     const ordered = [...entries].sort(bySeq);
-    const targetOf = (msg: DeferredWrite): string | null => msg.forAgent ?? this.primaryAgentName;
+    // An entry's target as addMessage resolves it, keyed by name for the cut.
+    const targetOf = (msg: DeferredWrite): string | null => msg.forAgent ?? this.deliveryAgent()?.name ?? null;
     const cut = new Set<string | null>();
-    const written = new Map<DeferredWrite, MessageId>();
+    const written = new Map<DeferredWrite, DrainedWrite>();
     for (let i = 0; i < ordered.length; i++) {
       const msg = ordered[i]!;
       const target = targetOf(msg);
       if (cut.has(target)) continue;
-      const before = this.storedCountOf(target);
+      const agent = this.deliveryAgent(msg.forAgent);
+      const before = agent ? this.storedCountOf(agent) : undefined;
       try {
-        written.set(msg, write(msg));
+        written.set(msg, { id: write(msg), content: msg.content });
       } catch (error) {
-        const copy = before === undefined ? undefined : this.storedCopyOf(target!, before, msg.id);
-        if (copy !== undefined) {
-          written.set(msg, copy);
-          this.logDeferredWriteError(msg, where, error, true);
+        const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
+        if (landed.length > 0) {
+          written.set(msg, { id: landed[0]!.id, content: landed.flatMap((m) => m.content), afterThrow: true });
+          this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
           continue;
         }
         cut.add(target);
         this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
-        this.logDeferredWriteError(msg, where, error, false);
+        this.logDeferredWriteError(msg, where, error);
       }
     }
     return written;
   }
 
-  /** How many messages the agent's store holds: undefined when no such agent
-   *  is registered, or its store can't say. */
-  private storedCountOf(agentName: string | null): number | undefined {
-    const agent = agentName ? this.agents.get(agentName) : undefined;
-    if (!agent) return undefined;
+  /** How many messages the agent's store holds: undefined when its store
+   *  can't say. */
+  private storedCountOf(agent: Agent): number | undefined {
     try {
-      const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
-      return typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+      return agent.getContextManager().getMessageCount();
     } catch {
       return undefined;
     }
   }
 
-  /** The id of the message carrying `deferredWriteId` among those the agent's
-   *  store gained from position `from` on, read without blobs, if there is
-   *  one. For a sharded body, its first shard. */
-  private storedCopyOf(agentName: string, from: number, deferredWriteId: string): MessageId | undefined {
-    const agent = this.agents.get(agentName);
-    if (!agent) return undefined;
+  /** The messages carrying `deferredWriteId` among those the agent's store
+   *  gained from position `from` on, in store order, with their blobs
+   *  resolved, as a request carries them. A sharded body's carry its
+   *  `bodyGroupId`. */
+  private storedCopiesOf(agent: Agent, from: number, deferredWriteId: string): Array<{ id: MessageId; content: ContentBlock[]; bodyGroupId?: string }> {
     try {
-      const cm = agent.getContextManager() as unknown as {
-        getMessageCount?: () => number;
-        getMessageWindow?: (o: number, l: number, opts?: { resolveBlobs?: boolean }) =>
-          { messages: Array<{ id: MessageId; metadata?: Record<string, unknown> }> };
-        getAllMessages: () => Array<{ id: MessageId; metadata?: Record<string, unknown> }>;
-      };
-      const gained = typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function'
-        ? cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from), { resolveBlobs: false }).messages
-        : cm.getAllMessages().slice(from);
-      return gained.find((m) => m.metadata?.deferredWriteId === deferredWriteId)?.id;
+      const cm = agent.getContextManager();
+      return cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from)).messages
+        .filter((m) => m.metadata?.deferredWriteId === deferredWriteId)
+        .map((m) => ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) }));
     } catch (error) {
-      console.error(`[deferral] could not read ${agentName}'s store for a deferred write that threw:`, error);
-      return undefined;
+      console.error(`[deferral] could not read ${agent.name}'s store for a deferred write that threw:`, error);
+      return [];
     }
   }
 
   /** The line naming a drained write that threw: one that couldn't be stored,
-   *  which is already back in the queue, or one whose message was stored
-   *  before the throw. Logging mustn't fail the flush that met it, so a thrown
-   *  value that has no text is named as such. */
-  private logDeferredWriteError(msg: DeferredWrite, where: string, error: unknown, stored: boolean): void {
+   *  which is already back in the queue, or, with `landed`, one stored before
+   *  the throw (for a sharded body, how many of its shards). Logging mustn't
+   *  fail the flush that met it, so a thrown value that has no text is named
+   *  as such. */
+  private logDeferredWriteError(
+    msg: DeferredWrite,
+    where: string,
+    error: unknown,
+    landed?: { count: number; sharded: boolean },
+  ): void {
     let reason: string;
     try {
       reason = error instanceof Error ? error.message : String(error);
@@ -15859,8 +15897,10 @@ export class AgentFramework {
     console.error(
       `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
       `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
-      (stored
-        ? `threw after it was stored; it counts as written and isn't stored again: `
+      (landed
+        ? `threw after ${landed.sharded
+          ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
+          : 'it was stored'}; what was stored counts as written and isn't stored again: `
         : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
       reason,
     );
@@ -15868,16 +15908,23 @@ export class AgentFramework {
 
   /** Re-add drained entries through addMessage, which stores each or defers
    *  it again, in queue order and cut per target (writeDrainedInOrder). With
-   *  `bypassDeferral`, each is stored past its target's deferral (stop()). */
+   *  `bypassDeferral`, each is stored past its target's deferral (stop()). A
+   *  write that threw after storing missed the notes addMessage takes after a
+   *  store, so they're taken here for what landed. */
   private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
-    return [...this.writeDrainedInOrder(entries, where, (msg) => {
-      const target = msg.forAgent ?? this.primaryAgentName;
-      return this.addMessage(msg.participant, msg.content, msg.metadata, {
+    const bypassFor = (msg: DeferredWrite): string | undefined =>
+      opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
+    const written = this.writeDrainedInOrder(entries, where, (msg) =>
+      this.addMessage(msg.participant, msg.content, msg.metadata, {
         fromQueue: { id: msg.id, seq: msg.seq },
         ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-        ...(opts?.bypassDeferral && target ? { bypassDeferralFor: target } : {}),
-      });
-    }).keys()];
+        ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
+      }));
+    for (const [msg, w] of written) {
+      const agent = w.afterThrow ? this.deliveryAgent(msg.forAgent) : undefined;
+      if (agent) this.noteStored(agent, msg.metadata, w.id, bypassFor(msg));
+    }
+    return [...written.keys()];
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {

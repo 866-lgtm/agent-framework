@@ -505,8 +505,82 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       'Antra: look right',
       'assistant: Done.',
     ], 'stored once, where the stream carried it');
-    assert.ok(errors.some((e) => e.includes("threw after it was stored; it counts as written and isn't stored again")
+    assert.ok(errors.some((e) => e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
       && e.includes('listener failed')), errors.join('\n'));
+    await framework.stop();
+  });
+
+  /** Shard a message whose first block is `marker` into one shard per block,
+   *  as a strategy's ingress chunking does. */
+  function shardOn(framework: AgentFramework, marker: string): void {
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as { strategy: Record<string, unknown> };
+    cm.strategy.chunkIngressMessage = (_participant: string, content: ContentBlock[]) =>
+      (content[0] as { text?: string } | undefined)?.text === marker
+        ? { bodyGroupId: `body-${marker}`, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) }
+        : null;
+  }
+
+  it("at a tool boundary, a sharded body that throws after its first shard: what landed is carried and counts as written, and the rest isn't stored", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    shardOn(framework, 'part one');
+    // The listener throws on the first shard's add, which stops the append
+    // loop before the second shard.
+    throwOnceAfterStoring(framework, 'part one');
+    module.interjections = [
+      { participant: 'Antra', content: [...text('part one'), ...text('part two')] },
+      { participant: 'Antra', content: text('look right') },
+    ];
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.deepEqual(injected(), ['Antra: part one', 'Antra: look right'], 'the request carries what the store holds');
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: part one',
+      'Antra: look right',
+      'assistant: Done.',
+    ], 'the first shard alone, stored once');
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
+    assert.ok(errors.some((e) => e.includes("threw after 1 shard of its body was stored; what was stored counts as written and isn't stored again")
+      && e.includes('listener failed')), errors.join('\n'));
+    await framework.stop();
+  });
+
+  it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'from beta');
+    const internals = framework as unknown as {
+      openLogical: Map<string, unknown>;
+      readdDrained(entries: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>, where: string): unknown[];
+    };
+    // A logical turn still open between its streams, engaged with chan-beta:
+    // no turn is alive, so no tool boundary weighs what is stored now, and
+    // addMessage notes it as one of the turn's arrivals.
+    const open = { engaged: new Set(['chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
+    internals.openLogical.set('assistant', open);
+    const error = console.error;
+    console.error = () => {};
+    let written: unknown[];
+    try {
+      written = internals.readdDrained(
+        [{ id: 'w1', seq: 1, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta' } }],
+        'test flush',
+      );
+    } finally { console.error = error; }
+    assert.equal(written.length, 1, 'it counts as written');
+    const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
+    assert.equal(copies.length, 1, 'stored once');
+    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channelId: 'chan-beta' }], 'and noted as one of the open turn\'s arrivals');
     await framework.stop();
   });
 
@@ -523,13 +597,17 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { participant: 'assistant', content: text('my own words') },
       { participant: 'Antra', content: text('look left') },
     ];
+    const errors: string[] = [];
     const error = console.error;
-    console.error = () => {};
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
       await framework.runUntilIdle();
     } finally { console.error = error; }
     assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
+    assert.ok(errors.some((e) => e.includes("turn-end flush: deferred write")
+      && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
+      && e.includes('listener failed')), errors.join('\n'));
     await framework.stop(); // stop() lands whatever is still queued
 
     const reopened = await createFramework();

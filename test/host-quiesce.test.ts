@@ -1001,19 +1001,23 @@ test('boot recovery keeps one entry per id, and numbers a seq that isn\'t a posi
     await framework.stop();
 
     // What the framework never writes, as damage or a hand edit could leave
-    // it: an id that comes twice, a seq of 1e400 (JSON reads it as Infinity)
-    // and a negative one. The entries with a bad seq come before 'second' in
-    // the file. Nothing here is malformed, so only these make boot rewrite it.
+    // it: an id that comes twice, an entry with no id, a seq of 1e400 (JSON
+    // reads it as Infinity), a negative one, zero and a string. The entries
+    // with a bad seq come before 'second' in the file. Nothing here is
+    // malformed, so only these make boot rewrite it.
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
-    const entry = (id: string, seq: unknown, text: string) =>
-      ({ id, seq, participant: 'user', content: [{ type: 'text', text }] });
+    const entry = (id: string | undefined, seq: unknown, text: string) =>
+      ({ ...(id === undefined ? {} : { id }), seq, participant: 'user', content: [{ type: 'text', text }] });
     doc.pending.splice(1, 0,
       entry('infinite-seq', '__INFINITY__', 'infinite seq'),
       entry('negative-seq', -3, 'negative seq'),
       entry('twice', 50, 'first with its id'),
       entry('twice', 51, 'second with its id'),
+      entry('zero-seq', 0, 'zero seq'),
+      entry('string-seq', 'seven', 'string seq'),
+      entry(undefined, 52, 'no id'),
     );
     writeFileSync(file, JSON.stringify(doc).replace('"__INFINITY__"', '1e400'));
 
@@ -1021,19 +1025,69 @@ test('boot recovery keeps one entry per id, and numbers a seq that isn\'t a posi
     framework = await AgentFramework.create(config());
     console.error = error;
     const named = (text: string) => assert.ok(lines.some((line) => line.includes(text)), `${text}:\n${lines.join('\n')}`);
+    const late = 'not a positive whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others';
     named('repeats id twice (user) and was dropped; the first entry with that id is kept');
-    named('(infinite-seq) has seq Infinity, not a positive whole number; it is queued after the others');
-    named('(negative-seq) has seq -3, not a positive whole number; it is queued after the others');
-    assert.equal(framework.getHostModeStatus().deferredWrites, 5);
+    named(`(infinite-seq) has seq Infinity, ${late}`);
+    named(`(negative-seq) has seq -3, ${late}`);
+    named(`(zero-seq) has seq 0, ${late}`);
+    named(`(string-seq) has seq of type string, ${late}`);
+    named('a recovered deferred context write (user) has no id; it is given ');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 8);
 
-    const rewritten = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ id: string; seq: unknown }> };
-    assert.equal(rewritten.pending.length, 5, 'the recovery file is rewritten without the repeated id');
+    const rewritten = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ id: unknown; seq: unknown }> };
+    assert.equal(rewritten.pending.length, 8, 'the recovery file is rewritten without the repeated id');
     assert.ok(rewritten.pending.every((m) => Number.isSafeInteger(m.seq) && (m.seq as number) > 0), JSON.stringify(rewritten.pending));
 
     await framework.resume();
     const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
       .map((m) => (m.content[0] as { text: string }).text);
-    assert.deepEqual(texts, ['first', 'second', 'first with its id', 'infinite seq', 'negative seq']);
+    assert.deepEqual(texts, ['first', 'second', 'first with its id', 'no id', 'infinite seq', 'negative seq', 'zero seq', 'string seq']);
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('boot recovery restores a recovery file that predates seq in file order, and rewrites it with seqs', { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-noseq-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    for (const text of ['first', 'second', 'third']) add('user', [{ type: 'text', text }]);
+    await framework.stop();
+
+    // A file written before entries carried a seq is in write order. Here
+    // that order is third, first, second, so only the file can give it.
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 3);
+    const [first, second, third] = doc.pending.map(({ seq: _seq, ...rest }) => rest);
+    writeFileSync(file, JSON.stringify({ version: 1, pending: [third, first, second] }));
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.ok(!lines.some((line) => line.includes('has seq')), `an entry with no seq isn't named:\n${lines.join('\n')}`);
+    const rewritten = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ seq: unknown; content: Array<{ text: string }> }> };
+    assert.deepEqual(rewritten.pending.map((m) => [m.content[0]!.text, m.seq]), [['third', 1], ['first', 2], ['second', 3]],
+      'rewritten with seqs, in file order');
+
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['third', 'first', 'second']);
   } finally {
     console.error = error;
     await framework.stop();
