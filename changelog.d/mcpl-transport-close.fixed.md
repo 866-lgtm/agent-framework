@@ -11,7 +11,8 @@
   settled until the connection takes it, and one that a failed handshake is
   closing. A malformed frame from a WebSocket server is such an error.
 - A failed write to a stdio child's stdin, such as EPIPE from a child that
-  has gone, reaches the transport's `'error'` listener if it has one and is
-  otherwise dropped, since the child's exit is reported anyway. It was thrown
-  as an uncaught exception. So was a read error on the child's stdout or
-  stderr, which is now handled the same way.
+  has gone, reaches the transport's `'error'` listener if it has one, and is
+  logged when nothing listens. A read error on the child's stdout or stderr
+  reaches the listener the same way, and is dropped when nothing listens,
+  since the child's exit is reported anyway. Each was thrown as an uncaught
+  exception.
