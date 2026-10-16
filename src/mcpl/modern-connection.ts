@@ -258,6 +258,8 @@ class SpawnerStdioTransport implements Transport {
   onerror?: (error: Error) => void;
   onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
   private line: McplTransport | null = null;
+  /** The spawn start() awaits, so a close() made meanwhile closes its child. */
+  private spawning: Promise<McplTransport> | null = null;
 
   /** Built once for the transport: every malformed line uses it. */
   private readonly recorded: (text: unknown) => string;
@@ -272,7 +274,8 @@ class SpawnerStdioTransport implements Transport {
   async start(): Promise<void> {
     // A command that can't be spawned rejects here, with its spawn error, so
     // the connect fails with it rather than waiting out its discover probe.
-    const line = await StdioTransport.spawn(this.config);
+    this.spawning = StdioTransport.spawn(this.config);
+    const line = await this.spawning;
     this.line = line;
     line.on('line', (text: string) => {
       // A line that isn't JSON is ignored, as the legacy engine ignores it.
@@ -305,6 +308,10 @@ class SpawnerStdioTransport implements Transport {
   }
 
   async close(): Promise<void> {
+    // A close() during the spawn closes the child it yields. start()
+    // awaited the spawn first, so the line is wired by then, and its close
+    // ends what the SDK has in flight, as it does after the spawn.
+    if (!this.line && this.spawning) await this.spawning.catch(() => null);
     await this.line?.close();
   }
 }

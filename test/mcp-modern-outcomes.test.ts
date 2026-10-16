@@ -212,6 +212,22 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no second launch');
 });
 
+test('close() right after start() ends a modern stdio connect still spawning, without waiting out its discover probe', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'hang-discover', log], protocol: 'modern' });
+  const started = connection.start().then(() => null, (error: unknown) => error);
+  const began = Date.now();
+  await connection.close();
+  const tookMs = Date.now() - began;
+  assert.ok(tookMs < 5000, `close() took ${tookMs} ms, not the discover probe's 30 s`);
+  await started;
+  assert.equal(connection.isConnected, false);
+  // The child may have been ended before it could log its start.
+  for (const launch of wire(log).filter((e) => e.event === 'start')) {
+    assert.equal(alive(launch.pid!), false, 'the child is gone once close() resolved');
+  }
+});
+
 test('close() during a reconnect handshake ends the launch it was waiting on, and stops', async () => {
   const log = scratchLog();
   const connection = await connect('hang-discover-later', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
