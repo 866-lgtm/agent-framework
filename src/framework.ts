@@ -15727,9 +15727,14 @@ export class AgentFramework {
         },
       );
     } else if (event.type === 'inference:completed') {
-      // A successful response — even mid-turn between tool calls — proves the
-      // agent isn't hard-down; clear its consecutive-failure streak (and the
-      // poison-history breaker's rewind budget).
+      // A completed turn, a tool-ended one included, shows the agent can
+      // complete turns: clear its consecutive-failure streak and the
+      // poison-history breaker's rewind budget. A provider call answered
+      // mid-turn (inference:usage) doesn't. The streak exists to catch an
+      // agent that can't complete a turn, and an agent whose every turn has a
+      // first call that answers and a later one that fails is exactly that:
+      // a reset per answered call would keep it below the hard-down
+      // threshold, so neither the alert nor the breaker would come.
       const name = event.agentName as string | undefined;
       if (name && this.consecutiveInferenceFailures.get(name)) {
         this.consecutiveInferenceFailures.set(name, 0);
@@ -16232,7 +16237,7 @@ export class AgentFramework {
    * push event to wake the agent onto the same context.
    *
    * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
-   * sheds per failure episode; the budget resets on any successful inference.
+   * sheds per failure episode; the budget resets when a turn completes.
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
