@@ -481,6 +481,12 @@ export type TraceEvent =
       type: 'mcpl:server-connect-failed';
       serverId: string;
       error: string;
+      /** The last of the server's stderr, when its handshake failed by its
+       *  transport closing, a transport error or its timeout and it had
+       *  written any: the server's own text, which `error` never carries. A
+       *  transport that failed its handshake was never wired, so its lines
+       *  never reached `mcpl:server-stderr`. */
+      stderrTail?: string;
       /** Ordinal of the failed attempt: 0 is the initial connect, N is the Nth background retry. */
       attempt: number;
       /** True when a background reconnect loop will keep retrying. */

@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
@@ -72,6 +73,16 @@ export abstract class McplTransport extends EventEmitter {
 
   get closed(): boolean {
     return this._closed;
+  }
+
+  /**
+   * The last of what the server wrote to its diagnostic stream: at most its
+   * last {@link STDERR_TAIL_CHARS} UTF-16 code units, never opening inside a
+   * surrogate pair, after a '…' when earlier ones were dropped. A stdio
+   * child's stderr, and '' for a transport that has none.
+   */
+  get stderrTail(): string {
+    return '';
   }
 
   /** Deliver an inbound line, buffering it if nobody is listening yet. */
@@ -170,10 +181,19 @@ export function buildChildEnv(
   return merged;
 }
 
+/** The most of a stdio child's stderr a transport keeps for {@link McplTransport.stderrTail}. */
+export const STDERR_TAIL_CHARS = 2_048;
+
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
   /** The first error on the child's stdin or stdout, named in the close reason. */
   private pipeError: Error | undefined;
+  private stderrEnd = '';
+  private stderrCut = false;
+
+  override get stderrTail(): string {
+    return (this.stderrCut ? '…' : '') + this.stderrEnd;
+  }
 
   private constructor(
     private readonly child: ChildProcess,
@@ -183,13 +203,27 @@ export class StdioTransport extends McplTransport {
 
     this.rl.on('line', (line: string) => this.pushLine(line));
 
-    // Stitch stderr chunks into whole lines (a chunk can split a line).
+    // Stitch stderr chunks into whole lines (a chunk can split a line, and a
+    // character's bytes), and keep the stream's last characters for
+    // stderrTail.
     let carry = '';
-    this.child.stderr?.on('data', (chunk: Buffer) => {
-      const text = carry + chunk.toString('utf8');
-      const lines = text.split('\n');
+    const decoder = new StringDecoder('utf8');
+    const received = (text: string) => {
+      const end = this.stderrEnd + text;
+      this.stderrCut ||= end.length > STDERR_TAIL_CHARS;
+      let kept = end.slice(-STDERR_TAIL_CHARS);
+      // A cut between a surrogate pair's halves drops the low half too.
+      if (/^[\uDC00-\uDFFF]/.test(kept) && end.length > STDERR_TAIL_CHARS) kept = kept.slice(1);
+      this.stderrEnd = kept;
+      const lines = (carry + text).split('\n');
       carry = lines.pop() ?? '';
       for (const l of lines) if (l.length > 0) this.pushStderr(l);
+    };
+    this.child.stderr?.on('data', (chunk: Buffer) => received(decoder.write(chunk)));
+    // A last line with no newline is complete once the stream ends.
+    this.child.stderr?.on('end', () => {
+      received(decoder.end());
+      if (carry.length > 0) this.pushStderr(carry);
     });
 
     this.child.on('error', (err) => this.emit('error', err));
