@@ -9,7 +9,7 @@ import type { GateConfig } from '../src/gate/types.js';
 // must load like the same file without one.
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-bom');
-const BOM = '﻿';
+const BOM = '\uFEFF';
 
 function writeWithBom(name: string, value: unknown): string {
   const path = join(TMP_DIR, name);
