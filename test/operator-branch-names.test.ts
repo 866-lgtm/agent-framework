@@ -1,11 +1,12 @@
 /**
  * Default operator branch names (`<kind>/<agent>/<ms>`) are chosen so the
- * store doesn't hold them yet: two changes of one kind in one millisecond
- * get a branch each (`…/<ms>` and `…/<ms>-2`), where the second used to be
- * refused, its name being the first one's branch: as the active branch
- * ("must differ from the active branch") or as a branch the store holds
- * ("Branch already exists", for a turn undone again after a redo). Each case
- * pins Date.now so the two changes share a millisecond.
+ * store doesn't hold them yet: two changes of one kind made one after the
+ * other in a millisecond get a branch each (`…/<ms>` and `…/<ms>-2`), where
+ * the second used to be refused, its name being the first one's branch: as
+ * the active branch ("must differ from the active branch") or as a branch the
+ * store holds ("Branch already exists", for a turn undone again after a
+ * redo). A name the store holds from elsewhere counts as taken too. Each case
+ * pins Date.now so the changes share a millisecond.
  */
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -108,12 +109,23 @@ describe('default operator branch names', () => {
     assert.equal(framework.getStore().currentBranch().name, `undo/scout/6-${T}-2`);
   });
 
+  it('a default name the store already holds, on a branch the framework did not make, takes the next free name', async () => {
+    // A counter kept by the framework would hand out the bare name here,
+    // since it never gave it out; only asking the store finds it taken.
+    framework.getStore().createBranch(`rollback/scout/${T}`);
+    pinNow();
+    const rolled = await framework.rollbackToMessage('scout', { messageId: ids[3] });
+    assert.equal(rolled.targetBranch, `rollback/scout/${T}-2`);
+    assert.equal(cm().currentBranch().name, `rollback/scout/${T}-2`);
+  });
+
   it("an explicit name stays the caller's: a taken one is refused, not renamed", async () => {
     await framework.rollbackToMessage('scout', { messageId: ids[3], branchName: 'chosen' });
     await framework.switchBranch('main');
     await assert.rejects(
       framework.rollbackToMessage('scout', { messageId: ids[1], branchName: 'chosen' }),
-      (error: unknown) => error instanceof OperatorActionError && error.code === 'failed',
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
+        && /Branch already exists: chosen/.test(error.message),
     );
     assert.deepEqual(branchNames(), ['chosen', 'main']);
   });
@@ -121,6 +133,32 @@ describe('default operator branch names', () => {
 
 describe('default offline recovery branch names', () => {
   afterEach(() => { mock.restoreAll(); });
+
+  it('an offline recovery whose default name the store already holds, on a branch that is not active, takes the next free name', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-held-'));
+    const storePath = join(dir, 'agent.chronicle');
+    try {
+      const store = JsStore.openOrCreate({ path: storePath });
+      const seeded = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      for (let i = 1; i <= 3; i++) {
+        seeded.addMessage('user', [{ type: 'text', text: `m${i}` }], {
+          serverId: 'discord', channelId: 'discord:g1:c1', messageId: `m${i}`,
+        });
+      }
+      seeded.close();
+      // Made outside offline recovery, and left inactive: main stays the source.
+      store.createBranch(`recovery/cairn/${T}`);
+      assert.equal(store.currentBranch().name, 'main');
+      store.close();
+
+      pinNow();
+      const recovered = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm2' });
+      assert.equal(recovered.sourceBranch, 'main');
+      assert.equal(recovered.targetBranch, `recovery/cairn/${T}-2`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('two offline recoveries in one millisecond each get a branch', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-names-'));

@@ -7809,10 +7809,11 @@ export class AgentFramework {
   }
 
   /**
-   * A default name for an operator branch: `base`, the timestamped name, or
-   * the first of `base-2`, `base-3`, … that the store doesn't hold
-   * (firstFreeBranchName). Two changes of one kind in one millisecond then
-   * get a branch each, rather than the second failing on a taken name.
+   * A default name for an operator branch: `base`, the timestamped name the
+   * caller passes, when the store doesn't hold it, else the first of `base-2`,
+   * `base-3`, … that it doesn't hold (firstFreeBranchName). Two changes of one
+   * kind made one after the other in a millisecond then get a branch each,
+   * where the second used to be refused under the first one's name.
    */
   private newOperatorBranchName(base: string): string {
     const held = new Set(this.store.listBranches().map((branch) => branch.name));
@@ -8088,7 +8089,8 @@ export class AgentFramework {
 
   /**
    * Suppress specific messages from the live context without touching the
-   * source branch: fork at the current head (`suppress/<agent>/<ts>`), redact
+   * source branch: fork at the current head (by default `suppress/<agent>/<ts>`,
+   * numbered `-2`, `-3`, … when the store already holds that name), redact
    * the messages on the fork, switch to it. Shards of a body group are always
    * removed together. Discord originals get awareness markers via the outbox;
    * the batch is `explicit`-activated only after every removal succeeded, and
