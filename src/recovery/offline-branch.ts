@@ -64,6 +64,9 @@ export interface OfflineRecoveryBranchResult {
   unmarked: number;
   /** Authorized refs (marks.refs) this recovery does not remove. */
   notRemoved: number;
+  /** Set when a suppression-only batch's resume journal couldn't be closed:
+   *  what of it is left, as the host's surgeries report it. */
+  suppressionJournal?: string;
 }
 
 /**
@@ -224,9 +227,10 @@ export async function createOfflineRecoveryBranch(
       claimed = outbox.pendingSuppressionsFor(targetBranch);
     } catch (error) {
       throw new Error(
-        `Recovery branch ${targetBranch} can't be made: the Discord awareness journal can't be read ` +
-          `(${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}), so whether a ` +
-          'suppression\'s pending removals claim that name can\'t be checked',
+        `Recovery branch ${targetBranch} can't be made: the Discord awareness journal, or the pre-journal ledger ` +
+          `it imports (--outbox), can't be read (${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}), ` +
+          'so whether a suppression\'s pending removals claim that name can\'t be checked. Running the recovery ' +
+          'again changes nothing until both can be read',
         { cause: error },
       );
     }
@@ -291,12 +295,16 @@ export async function createOfflineRecoveryBranch(
       }
       const sourceConfirmed = store.currentBranch().name === sourceBranch;
       let retire = '';
+      // A batch with marks never sends them once kept: the recovery, run
+      // again, chooses them again.
+      const redo = batch && batch.refs.length > 0
+        ? '. To apply its marks, run the recovery again onto a new --branch, choosing them again' : '';
       if (batch) {
         if (!sourceConfirmed) {
           retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: ` +
             (suppression.intervals.length > 0
               ? `a start on ${targetBranch} finishes its removals and retires it`
-              : 'the next start retires it') + ', none of its marks sent';
+              : 'the next start retires it') + `, none of its marks sent${redo}`;
         } else {
           try {
             outbox.discard(batch.id);
@@ -308,18 +316,19 @@ export async function createOfflineRecoveryBranch(
             // from a later process that reads the batch, is refused.
             const kept = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
-            )}); it stays prepared, none of its marks to be sent, until a start retires it`;
+            )}); it stays prepared, none of its marks to be sent`;
             if (suppression.intervals.length === 0) {
-              retire = kept;
+              retire = `${kept}, until the next start retires it${redo}`;
             } else {
               let forked = true;
               try {
                 forked = store.listBranches().some((branch) => branch.name === targetBranch);
               } catch { /* unknown: say what a start on an existing branch would do */ }
               retire = `${kept}. Its removals stay pending for ${targetBranch}: ` + (forked
-                ? `a start on ${targetBranch} would finish them there, so delete that branch unless you want that`
-                : 'the next start gives them up, since no branch has that name') +
-                `, and until then a branch named ${targetBranch} is refused`;
+                ? `a start on ${targetBranch} would finish them there and retire the batch, so delete that branch ` +
+                  'unless you want that, through the host API\'s branch.delete once the host runs'
+                : 'the next start gives them up and retires the batch, since no branch has that name') +
+                `, and until then a branch named ${targetBranch} is refused${redo}`;
             }
           }
         }
@@ -343,6 +352,7 @@ export async function createOfflineRecoveryBranch(
       notRemoved: selection.notRemoved,
     };
     let markers: SurgeryMarkerReceipt = { ...facts, status: 'none', queued: 0 };
+    let suppressionJournal: string | undefined;
     if (batch) {
       const settled = outbox.settleActivation(batch.id);
       if (batch.refs.length > 0) {
@@ -351,9 +361,16 @@ export async function createOfflineRecoveryBranch(
           : settled.status === 'not-scheduled'
             ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
             : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
+      } else if (settled.status !== 'queued') {
+        // A suppression-only batch carries no marks, and its activation
+        // closes the body's resume journal: if that failed, say what's left.
+        suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) could not be closed ` +
+          `(${settled.error}); ` + (settled.status === 'not-scheduled'
+            ? 'it was retired instead, so nothing is left to resume'
+            : `it stays prepared, and a start on ${targetBranch} finds its removals applied and closes it`);
       }
     }
-    return { ...result, discordMarkersQueued: markers.queued, markers };
+    return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionJournal ? { suppressionJournal } : {}) };
   } finally {
     contextManager?.close();
     store.close();

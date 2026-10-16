@@ -601,7 +601,7 @@ describe('surgery and awareness marks', () => {
     try {
       await assert.rejects(
         framework.suppressMessages('resident', { messageIds: [removed[0]], marks: { scope: 'all' } }),
-        /could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent, until a start retires it\. Its removals stay pending for (\S+): the next start gives them up, since no branch has that name, and until then a branch named \1 is refused: injected fork failure$/,
+        /could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent\. Its removals stay pending for (\S+): the next start gives them up and retires the batch, since no branch has that name, and until then a branch named \1 is refused: injected fork failure$/,
       );
     } finally {
       live.fork = realFork;
@@ -844,7 +844,7 @@ describe('surgery and awareness marks', () => {
     const pendingSuppressionsFor = DiscordAwarenessOutbox.prototype.pendingSuppressionsFor;
     DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = function () { throw new Error('injected unreadable journal'); };
     const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
-      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. This lasts until the journal can be read: after a write that failed inside the store, until a restart reopens the store$/.test(error.message);
+      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. Calling again changes nothing until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry or a pre-journal ledger that can't be read stays so until it is repaired, and stops the next start too$/.test(error.message);
     try {
       await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' }), refused);
       await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'fix-2' }), refused);

@@ -424,7 +424,7 @@ test('a failed offline suppression retires its batch once the source is confirme
           storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
           marks: { scope: 'all' }, branchName: 'recovery/cairn/fail1',
         }),
-        /awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent, until a start retires it\. Its removals stay pending for recovery\/cairn\/fail1: a start on recovery\/cairn\/fail1 would finish them there, so delete that branch unless you want that, and until then a branch named recovery\/cairn\/fail1 is refused/,
+        /awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/fail1: a start on recovery\/cairn\/fail1 would finish them there and retire the batch, so delete that branch unless you want that, through the host API's branch\.delete once the host runs, and until then a branch named recovery\/cairn\/fail1 is refused\. To apply its marks, run the recovery again onto a new --branch, choosing them again/,
       );
     } finally {
       DiscordAwarenessOutbox.prototype.discard = discard;
@@ -455,12 +455,71 @@ test('a failed offline suppression retires its batch once the source is confirme
       }),
       // One instruction for the kept branch: a start on it finishes the
       // suppression, so it isn't called unsafe to start.
-      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent$/,
+      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
     );
     assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
   } finally {
     ContextManager.prototype.removeMessage = removeMessage;
     ContextManager.prototype.switchBranch = switchBranch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed offline suppression whose branch was never made says the next start gives its removals up', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-unforked-'));
+  const storePath = join(dir, 'agent.chronicle');
+  const branchAt = ContextManager.prototype.branchAt;
+  const discard = DiscordAwarenessOutbox.prototype.discard;
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'keep' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-keep' });
+    cm.addMessage('user', [{ type: 'text', text: 'hide me' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-a' });
+    cm.addMessage('user', [{ type: 'text', text: 'anchor' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current' });
+    cm.close();
+    store.close();
+    ContextManager.prototype.branchAt = function () { throw new Error('injected branch failure'); };
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
+        marks: { scope: 'all' }, branchName: 'recovery/cairn/never',
+      }),
+      /^Error: injected branch failure; awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/never: the next start gives them up and retires the batch, since no branch has that name, and until then a branch named recovery\/cairn\/never is refused\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
+    );
+  } finally {
+    ContextManager.prototype.branchAt = branchAt;
+    DiscordAwarenessOutbox.prototype.discard = discard;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an offline suppression whose resume journal could not be closed says what is left of it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-unclosed-'));
+  const storePath = join(dir, 'agent.chronicle');
+  const settleActivation = DiscordAwarenessOutbox.prototype.settleActivation;
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'keep' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-keep' });
+    cm.addMessage('user', [{ type: 'text', text: 'hide me' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-a' });
+    cm.addMessage('user', [{ type: 'text', text: 'anchor' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current' });
+    cm.close();
+    store.close();
+    DiscordAwarenessOutbox.prototype.settleActivation = function () {
+      return { status: 'unresolved', error: 'injected activation failure' };
+    };
+    // No marks: the batch is the suppression's resume journal alone.
+    const result = await createOfflineRecoveryBranch({
+      storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'], branchName: 'recovery/cairn/close',
+    });
+    assert.equal(result.markers?.status, 'none');
+    assert.match(
+      result.suppressionJournal ?? '',
+      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, and a start on recovery\/cairn\/close finds its removals applied and closes it$/,
+    );
+  } finally {
+    DiscordAwarenessOutbox.prototype.settleActivation = settleActivation;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -513,7 +572,7 @@ test('an offline recovery onto an existing branch is refused before any intent, 
     try {
       await assert.rejects(
         createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
-        /^Error: injected branch failure; awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent, until a start retires it$/,
+        /^Error: injected branch failure; awareness batch \S+ could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent, until the next start retires it\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
       );
     } finally {
       ContextManager.prototype.branchAt = branchAt;
@@ -573,7 +632,7 @@ test('an offline recovery onto a name a pending suppression claims is refused, a
     }
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', branchName: 'unclaimed' }),
-      /^Error: Recovery branch unclaimed can't be made: the Discord awareness journal can't be read \(Corrupt Discord awareness journal entry \S+\), so whether a suppression's pending removals claim that name can't be checked$/,
+      /^Error: Recovery branch unclaimed can't be made: the Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read \(Corrupt Discord awareness journal entry \S+\), so whether a suppression's pending removals claim that name can't be checked\. Running the recovery again changes nothing until both can be read$/,
     );
     const after = JsStore.open({ path: storePath });
     try {

@@ -144,7 +144,9 @@ export interface SurgeryMarkerFacts {
  *   the addressable ones left unmarked, the surgery's `removedRefs` list
  *   every one, and the operator log's `discordRefs` counts them.
  * - `queued` — one add request per mark is durably recorded, and delivered
- *   when its route is up: a pass starts at once unless the host is stopping,
+ *   when its route is up (with `error`, when the journal's sync after a
+ *   hide's or turn undo's one-entry batch failed: recorded and delivered, but
+ *   a host or power failure before the store's next sync could lose it): a pass starts at once unless the host is stopping,
  *   and a later one (a reconnect, a tools-list change or the next start)
  *   takes what remains. If a delivery pass fails, the requests stay
  *   recorded and the `discord-awareness-delivery` ops alert says so. The
@@ -163,7 +165,7 @@ export interface SurgeryMarkerFacts {
  */
 export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
   | { status: 'none'; queued: 0 }
-  | { status: 'queued'; queued: number; batchId: string }
+  | { status: 'queued'; queued: number; batchId: string; error?: string }
   | { status: 'not-scheduled'; queued: 0; error: string }
   | { status: 'unresolved'; queued: 0; batchId: string; error: string }
 );

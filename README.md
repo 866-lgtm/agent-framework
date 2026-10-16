@@ -423,8 +423,10 @@ const result = await framework.rollbackToMessage('cairn', {
   operations raises one `discord-awareness-delivery` ops alert, and so does
   a start whose reconciliation gives up on any. A JSON-RPC error answer,
   which may come after the server acted, counts as unanswered.
-- **Marks are one-shot.** Switching branches, undo/redo and restarts never add
-  or remove a mark. The journal is an append-only history of requests and
+- **Marks are one-shot.** Switching branches, undo/redo and restarts never
+  request a mark or a removal of their own: what goes out is what a surgery,
+  a hide or turn undo, a release or a retract recorded, and a start's
+  delivery sends what of that hasn't gone out. The journal is an append-only history of requests and
   their attempts, kept as typed records in the Chronicle store: it survives
   rollbacks, branch deletion and a killed process, and lives with its store.
   Each request is written ahead of its dispatch, and a dispatch is admitted
@@ -444,8 +446,9 @@ const result = await framework.rollbackToMessage('cairn', {
   until the store is reopened; the next start reads that record with the
   rest. A `hide` or turn `undo` records its batch and the batch's
   activation as one entry.
-- **A start never completes a surgery's marks.** A batch an interrupted
-  surgery left is retired at the next start, none of its marks sent, with a
+- **A start never activates a surgery's marks.** A batch an interrupted
+  surgery left (prepared, or held by a pre-release build of this journal) is
+  retired at the next start, none of its marks sent, with a
   `discord-awareness-not-scheduled` ops alert that names the surgery, its
   agent and its branches, and the redo that applies the marks: switch to
   the source, which still has every message the surgery removed, and run
@@ -462,7 +465,8 @@ const result = await framework.rollbackToMessage('cairn', {
   read, every new branch name is refused (`failed`), since none can be
   checked; after a write that failed inside the store, a restart, which
   reopens the store, ends that.
-- **Operator controls,** each recorded in the operator log; once `stop()`
+- **Operator controls,** each that changes the journal recorded in the
+  operator log (a list or a preview records nothing); once `stop()`
   has begun, cancel, retract and release refuse, like every operator entry
   point:
   - `listDiscordAwareness()` lists batches and retract requests;
@@ -472,8 +476,8 @@ const result = await framework.rollbackToMessage('cairn', {
     including earlier attempts later answered, any of which may still land;
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
-    of the batch (or of every batch not retired, prepared, held or active,
-    and every message an imported ledger recorded), whatever
+    of the batch (or of every batch that isn't retired, whether prepared,
+    held or active, and every message an imported ledger recorded), whatever
     history says: removing an absent reaction does nothing. As the latest
     authorization for those messages, it stops adds that haven't ended and
     any an earlier choice would request later (a prepared batch's
@@ -482,13 +486,17 @@ const result = await framework.rollbackToMessage('cairn', {
     add requests whose outcome is unknown (an unknown removal can't bring a
     mark back) and imported history that leaves outcomes unrecorded;
   - `releaseDiscordAwareness(batch)` queues a held batch: an imported
-    ledger's undelivered work, the only batches held;
+    ledger's undelivered work, the only batches held. A batch a pre-release
+    build held for its surgery is refused, and a start retires it;
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
     a new branch that a suppression with pending removals names as its
     target, cancelled or not, since a start on a branch with that name
     would apply them there. Rollback, suppression and the API's
     `branch.create` call it, with marks chosen or not; a host that creates
-    branches in the store itself calls it first. While the journal can't
+    branches in the store itself calls it first. The API's `branch.switch`
+    refuses such a target too, since its removals aren't finished, and a
+    turn undo's branch, whose generated name carries its time, isn't
+    checked. While the journal can't
     be read it refuses every name (`failed`), and says why and what ends
     that.
 

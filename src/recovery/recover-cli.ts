@@ -315,6 +315,7 @@ async function main(): Promise<void> {
         messagesSuppressed: result.messagesSuppressed,
         discordRefs: result.discordAddressable,
         ...(result.markers ? { markers: result.markers } : {}),
+        ...(result.suppressionJournal ? { suppressionJournal: result.suppressionJournal } : {}),
       },
     });
   }

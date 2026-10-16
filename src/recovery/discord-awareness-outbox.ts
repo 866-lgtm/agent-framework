@@ -13,9 +13,12 @@ import { RecordJournal, type AppendOptions } from '../record-journal.js';
  * Marks are an explicit publication choice, separate from the surgery itself
  * (`DiscordAwarenessMarks`, default `none`). Once requested, they are
  * one-shot: branch moves and restarts never derive new operations from branch
- * state, and a restart never completes a surgery's marks. A batch a crash
- * left prepared is retired at startup, unsent, and the operator redoes the
- * surgery from its source to choose marks again (see recoverAtStartup). What
+ * state, and a restart never activates a surgery's marks. A batch a crash
+ * left prepared (or a pre-release build held for its surgery) is retired at
+ * startup, unsent, and the operator redoes the surgery from its source to
+ * choose marks again (see recoverAtStartup). Marks already recorded as
+ * requests (an activated batch's, or the one-entry batch of a hide or turn
+ * undo) go out with any delivery pass, a start's included. What
  * a restart does finish is an interrupted suppression's body, on its own
  * branch. An operator retracts or cancels explicitly, and releases what an
  * imported ledger left held.
@@ -191,7 +194,8 @@ export interface DiscordAwarenessPrepareInput {
  *   the next start; otherwise none of them is sent.
  */
 export type DiscordAwarenessSettlement =
-  | { status: 'queued'; queued: number }
+  /** `error`: the entry was recorded, and the journal's sync after it failed. */
+  | { status: 'queued'; queued: number; error?: string }
   | { status: 'not-scheduled'; error: string }
   | { status: 'unresolved'; error: string };
 
@@ -394,11 +398,15 @@ export interface DiscordAwarenessRetirement {
   suppression: boolean;
   /**
    * - `interrupted`: its surgery was interrupted, or failed and couldn't
-   *   retire it, and left it prepared;
+   *   retire it, and left it prepared (or, in a pre-release build's journal,
+   *   held);
    * - `branch-gone`: a suppression whose body was pending, whose target
    *   branch doesn't exist, so its removals are in effect nowhere.
    */
   reason: 'interrupted' | 'branch-gone';
+  /** For an imported ledger's held or active batch, given up because its
+   *  branch is gone: the status its marks keep. */
+  imported?: 'held' | 'active';
 }
 
 /** Per-batch view for operators: what was asked and what is known. */
@@ -665,7 +673,7 @@ export class DiscordAwarenessOutbox {
    * retires, unsent. A suppression's batch also names removals for its
    * target branch, which its surgery never created: until it's retired, a
    * branch made under that name would have them applied at a start on it,
-   * so every way the framework makes a branch refuses that name
+   * so the ways the framework makes a branch from a chosen name refuse it
    * (pendingSuppressionsFor). After a write that failed inside the store
    * this process can't read the journal, and every name is refused until a
    * restart reopens the store.
@@ -747,7 +755,8 @@ export class DiscordAwarenessOutbox {
         if (!after.batches.has(batch.id)) return settle({ status: 'not-scheduled', error: detail });
         const queued = [...after.ops.values()]
           .filter((op) => op.cause.kind === 'batch' && op.cause.batchId === batch.id && !op.cancelled).length;
-        return settle({ status: 'queued', queued });
+        // Recorded, so delivered, but not known to be on stable storage.
+        return settle({ status: 'queued', queued, error: detail });
       } catch (readError) {
         return settle({ status: 'unresolved', error: `${detail}; reading the journal back also failed: ${errorText(readError)}` });
       }
@@ -851,13 +860,17 @@ export class DiscordAwarenessOutbox {
    * The suppressions whose body may still be applied on `branch`: batches
    * whose target is exactly that branch and whose body was never recorded
    * complete or given up (isPendingSuppression), prepared (cancelled or
-   * not), or an imported ledger's held or active batch, since the old
-   * ledger could record activation before the redactions were synced. A
-   * start on that branch finishes their removals (the framework's
+   * not), held (a pre-release build's, for its surgery, or an imported
+   * ledger's), or an imported ledger's active batch, since the old ledger
+   * could record activation before the redactions were synced. A start on
+   * that branch finishes their removals (the framework's
    * resumePreparedDiscordSuppressions). The same set claims the name: a
    * branch made under it by anything else would have those removals applied
-   * at a start on it, so every way the framework makes a branch refuses such
-   * a name (checkDiscordAwarenessBranchName), as does the offline recovery.
+   * at a start on it, so rollback, suppression and the API's `branch.create`
+   * refuse such a name (checkDiscordAwarenessBranchName), as does the
+   * offline recovery, and the API's `branch.switch` won't serve it. A turn
+   * undo's branch, whose generated name carries the time it was made, isn't
+   * checked.
    * Branch ancestry is never consulted. Reads the journal, so it throws when
    * the journal can't be read.
    */
@@ -875,7 +888,8 @@ export class DiscordAwarenessOutbox {
    * retired.
    */
   completeSuppression(batchId: string): { retired: boolean } {
-    const retired = this.load().batches.get(batchId)?.status === 'prepared';
+    const batch = this.load().batches.get(batchId);
+    const retired = !!batch && isSurgeryLeftover(batch);
     const at = Date.now();
     const records: JournalRecord[] = [{ t: 'suppression-complete', at, batchId }];
     if (retired) records.push({ t: 'discarded', at, batchId });
@@ -909,7 +923,14 @@ export class DiscordAwarenessOutbox {
    */
   recoverAtStartup(
     branchExists?: (name: string) => boolean,
-  ): { retired: DiscordAwarenessRetirement[]; unknownAttempts: number; givenUp: number } {
+  ): {
+    retired: DiscordAwarenessRetirement[];
+    /** Suppressions whose removals stay pending for a branch that exists:
+     *  a start on that branch finishes them. */
+    pending: Array<{ batchId: string; agentName: string; targetBranch: string }>;
+    unknownAttempts: number;
+    givenUp: number;
+  } {
     const state = this.load();
     const at = Date.now();
     const records: JournalRecord[] = [];
@@ -931,13 +952,18 @@ export class DiscordAwarenessOutbox {
       }
     }
     const retired: DiscordAwarenessRetirement[] = [];
+    const kept: Array<{ batchId: string; agentName: string; targetBranch: string }> = [];
     for (const batch of state.batches.values()) {
       if (batch.status === 'discarded') continue;
       const pending = isPendingSuppression(batch);
       const gone = pending && !!branchExists && !branchExists(batch.targetBranch);
-      if (batch.status === 'prepared') {
+      const leftover = isSurgeryLeftover(batch);
+      if (leftover) {
         // A body still to finish on a branch that exists waits for a start on it.
-        if (pending && !gone) continue;
+        if (pending && !gone) {
+          kept.push({ batchId: batch.id, agentName: batch.agentName, targetBranch: batch.targetBranch });
+          continue;
+        }
         records.push({ t: 'discarded', at, batchId: batch.id });
       } else {
         // An imported ledger's held or active batch: its marks are the
@@ -950,9 +976,10 @@ export class DiscordAwarenessOutbox {
         agentName: batch.agentName,
         sourceBranch: batch.sourceBranch,
         targetBranch: batch.targetBranch,
-        marks: batch.status === 'prepared' && !batch.cancelled ? batch.refs.length : 0,
+        marks: leftover && !batch.cancelled ? batch.refs.length : 0,
         suppression: !!batch.suppressionIntervals?.length,
         reason: gone ? 'branch-gone' : 'interrupted',
+        ...(leftover ? {} : { imported: batch.status as 'held' | 'active' }),
       });
     }
     // A body given up relies on its branch's deletion, which may be unsynced
@@ -965,7 +992,7 @@ export class DiscordAwarenessOutbox {
       const op = after.ops.get(opId);
       return !!op && !op.cancelled && unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS;
     }).length;
-    return { retired, unknownAttempts, givenUp };
+    return { retired, pending: kept, unknownAttempts, givenUp };
   }
 
   // -- operator controls ------------------------------------------------------
@@ -1141,6 +1168,13 @@ export class DiscordAwarenessOutbox {
     const state = this.load();
     const batch = state.batches.get(batchId);
     if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch not found: ${batchId}`);
+    if (batch.status === 'held' && batch.scope !== 'legacy') {
+      throw new DiscordAwarenessRefusal(
+        `Discord awareness batch ${batchId} is held by a pre-release build for its surgery, not imported from a ` +
+          'pre-journal ledger: only an import is released. A start retires it, none of its marks sent; to apply ' +
+          'them, redo the surgery from its source onto a new branch name, choosing marks again',
+      );
+    }
     if (batch.status !== 'held' || !batch.held) {
       // A repeated release changes nothing. A release and a cancel each
       // settle a held batch, and either can come first: the refusal names
@@ -1634,8 +1668,10 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
         break;
       }
       case 'discarded': {
+        // A retirement: of a prepared batch, or of one a pre-release build
+        // held for its surgery (isSurgeryLeftover).
         const batch = state.batches.get(record.batchId);
-        if (batch && batch.status === 'prepared') batch.status = 'discarded';
+        if (batch && isSurgeryLeftover(batch)) batch.status = 'discarded';
         break;
       }
       case 'held': {
@@ -1912,12 +1948,21 @@ function legacyEvidence(
   };
 }
 
+/** A batch a start treats as an interrupted surgery's: one still prepared,
+ *  or one a pre-release build of this journal held for its surgery. Held
+ *  batches, and release, belong to an imported ledger's batches alone
+ *  (scope `legacy`). */
+function isSurgeryLeftover(batch: DiscordAwarenessBatch): boolean {
+  return batch.status === 'prepared' || (batch.status === 'held' && batch.scope !== 'legacy');
+}
+
 /**
  * A suppression whose body may still need applying on its target branch: it
  * names removal intervals (`explicit`), its body was never recorded complete
  * or given up, and it isn't retired. A retired batch is never resumed: its
- * surgery gave the body up after putting the source back, or startup retired
- * it once its body was finished or its branch was gone.
+ * surgery gave the body up after putting the source back, completeSuppression
+ * retired it once a start finished its body, or startup gave it up when its
+ * branch was gone.
  */
 function isPendingSuppression(batch: DiscordAwarenessBatch): boolean {
   return batch.status !== 'discarded'

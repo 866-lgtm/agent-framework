@@ -1,5 +1,6 @@
 - Awareness marks are one-shot. Switching branches, undo/redo and restarts no
-  longer add or remove marks; previously a mark followed the branch, removed
+  longer request marks or removals of their own; previously a mark followed
+  the branch, removed
   when the source branch became active and re-added when the recovery branch
   did. Each request is written ahead of its dispatch, and a dispatch is
   admitted from the journal as it is at that moment. A request that went out
@@ -17,8 +18,9 @@
   after the server acted, is recorded `unknown`. Between opposite requests
   for one reaction, the later authorization wins, whenever each was
   created.
-- A start never completes a surgery's marks. A batch an interrupted
-  surgery left is retired at the next start, none of its marks sent, with a
+- A start never activates a surgery's marks. A batch an interrupted
+  surgery left (prepared, or held by a pre-release build of this journal) is
+  retired at the next start, none of its marks sent, with a
   `discord-awareness-not-scheduled` ops alert that names the surgery, its
   agent and its branches, and the redo that applies the marks: the surgery
   again from its source, which still has every message it removed, onto a
