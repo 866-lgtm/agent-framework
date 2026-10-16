@@ -689,6 +689,17 @@ test('with nothing listening for them, their request forms are still answered -3
   ]);
 });
 
+test('the failure trace keeps a request id only when it is a string or a number, and bounds a long string', async (t) => {
+  const { framework, connection, traces } = harness();
+  t.mock.method(console, 'error', () => {});
+  framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
+  for (const id of [{ nested: [1] }, 'x'.repeat(2000), 0]) {
+    connection.emit('channels-register', {}, { ...responder(), id });
+  }
+  await settle();
+  assert.deepEqual(failureTraces(traces).map((trace) => trace.requestId), [undefined, `${'x'.repeat(500)}…`, 0]);
+});
+
 test('a failed internal-error reply reaches stderr too', async (t) => {
   const { framework, connection } = harness();
   framework.traceListeners = [];

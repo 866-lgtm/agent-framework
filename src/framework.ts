@@ -17545,7 +17545,11 @@ export class AgentFramework {
             type: 'mcpl:request-handler-error',
             serverId,
             event,
-            requestId: responder?.id,
+            // The trace's type is string | number. Only those are kept, as
+            // the connection's own reports keep them, and a string is
+            // bounded like the texts beside it.
+            requestId: typeof responder?.id === 'number' ? responder.id
+              : typeof responder?.id === 'string' ? boundedForLog(responder.id, 500) : undefined,
             responseAttempted: handlerResponseAttempted,
             // The trace's copies are bounded, as data; the log line below
             // prints each text raw through log-value, which escapes it.
