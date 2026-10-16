@@ -430,14 +430,29 @@ export class McplServerConnection extends EventEmitter {
    * since its bridge has advanced past it. Nothing else moves, so a snapshot
    * with nothing kept is flushed as it was held. A registration also passes
    * whatever its own transport sent before it, which a server that announces
-   * its channels first, as a bridge does, never has.
+   * its channels first, as a bridge does, never has. Nothing passes a
+   * removal: registrations move only up to the transport's first
+   * `channels-changed` that removes a channel, which stays where it was held,
+   * with everything after it. So what the transport sent before a removal is
+   * admitted before it, its messages for that channel included, and a
+   * registration it sent after a removal is admitted after it.
    */
   private static admissionOrder(pending: HeldItem[]): HeldItem[] {
     if (!pending.some((item) => item.kept)) return pending;
-    const registrations = new Set(pending.filter((item) => !item.kept
-      && (item.event === 'channels-register' || item.event === 'channels-changed')));
+    const registrations = new Set<HeldItem>();
+    for (const item of pending) {
+      if (item.kept) continue;
+      if (item.event === 'channels-changed' && McplServerConnection.removesChannels(item)) break;
+      if (item.event === 'channels-register' || item.event === 'channels-changed') registrations.add(item);
+    }
     if (registrations.size === 0) return pending;
     return [...registrations, ...pending.filter((item) => !registrations.has(item))];
+  }
+
+  /** Whether a held `channels-changed` removes any channel. */
+  private static removesChannels(item: HeldItem): boolean {
+    const params = item.args[0] as { removed?: unknown } | null | undefined;
+    return Array.isArray(params?.removed) && params.removed.length > 0;
   }
 
   /**

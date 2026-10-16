@@ -405,8 +405,14 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
       (event) => admitted.push(event as { messageId?: unknown }),
       (event) => traces.push(event),
     );
+    // Each registration as it reaches the registry, by request id.
+    const registered: unknown[] = [];
     connection.on('channels-register', (params: unknown, responder: unknown) => {
+      registered.push((responder as { id?: unknown } | undefined)?.id);
       void registry.handleRegister('flaky', params as never, responder as never);
+    });
+    connection.on('channels-changed', (params: unknown, responder: unknown) => {
+      void registry.handleChanged('flaky', params as never, responder as never);
     });
     connection.on('channels-incoming', (params: unknown, responder: unknown) => {
       void registry.handleIncoming('flaky', params as never, responder as never);
@@ -422,12 +428,14 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const incoming = (id: number, messageId: string) => serverSends({
       id, method: 'channels/incoming', params: { messages: [{ channelId: 'room', messageId, content: [{ type: 'text', text: 'hello' }] }] },
     });
+    const removeRoom = (id: number) => serverSends({ id, method: 'channels/changed', params: { removed: ['room'] } });
     register(1);
     incoming(2, 'kept-1');
     connection.sendToolsList().catch(() => {});
     await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    registered.length = 0;
     const rejected = () => traces.filter((trace) => trace.type === 'mcpl:channel-incoming-rejected');
-    return { grant, admitted, rejected, register, incoming };
+    return { grant, admitted, rejected, register, incoming, removeRoom, registered };
   }
 
   it("lets a registration pass what its own transport sent before it, once a kept message is held", async () => {
@@ -448,8 +456,28 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-1']);
   });
 
+  it("doesn't move a registration past a removal, so what the transport sent before the removal is admitted", async () => {
+    const { grant, admitted, rejected, register, incoming, removeRoom } = await keptIncomingSetup();
+    // The next process registers the channel, sends a message in it, and
+    // then removes it, all while the kept message is held.
+    register(3);
+    incoming(4, 'new-1');
+    removeRoom(5);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(rejected(), [], 'no message is refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-1']);
+  });
+
   it('during a quiesce, admits the registration as the control plane opens and the kept message once the data plane does', async () => {
-    const { grant, admitted, rejected, register } = await keptIncomingSetup();
+    const { grant, admitted, rejected, register, registered } = await keptIncomingSetup();
     register(3);
     const consoleError = console.error;
     console.error = () => {};
@@ -457,6 +485,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
       connection!.establishGrant(grant());
       connection!.readyControlPlane();
       await new Promise((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(registered, [3], 'the registration is admitted as the control plane opens');
       assert.equal(admitted.length, 0, 'the kept message waits for the data plane');
       connection!.ready();
       await new Promise((resolve) => setImmediate(resolve));
@@ -483,6 +512,8 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     serverSends({ id: 10, method: 'channels/incoming', params: { messages: [{ id: 'm' }] } });
     serverSends({ id: 11, method: 'inference/request', params: { n: 11 } });
     serverSends({ method: 'push/event', params: { n: 12 } });
+    serverSends({ method: 'tools/observe', params: { rules: [] } });
+    serverSends({ id: 13, method: 'inference/request', params: { n: 13 } });
     const logged: string[] = [];
     const consoleError = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -494,8 +525,11 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     await closing;
     assert.deepStrictEqual(seen, ['incoming'], 'nothing after the boundary reached a listener');
     const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
-    assert.deepStrictEqual(held, ['push-event'], 'the push is kept, the inference request dropped');
-    assert.ok(logged.some((line) => line.includes('dropped 1 held message(s) from a transport that closed: 1 inference-request')), logged.join('\n'));
+    assert.deepStrictEqual(held, ['push-event'], 'the push is kept, the inference requests and the filter dropped');
+    assert.ok(
+      logged.some((line) => line.includes('dropped 3 held message(s) from a transport that closed: 2 inference-request, 1 tools-observe')),
+      logged.join('\n'),
+    );
     connection = null;
   });
 

@@ -18,11 +18,15 @@
   channel registration) is dropped rather than admitted under the next
   transport's grant: the next process announces its own. Incoming channel
   messages and pushes still held are kept and admitted under the next
-  grant, since the next process won't send them again, and a channel
+  grant, since the next process won't send them again. A channel
   registration the next process sends while they are still held is
   admitted ahead of them, so a kept message isn't refused as an unknown
-  channel. One that arrives once they're admitted is too late for them: a
-  kept message for a channel not yet registered again is refused. An answer to a
-  request from a closed transport is never written to the next one. A
-  `close()` during a reconnect's handshake now closes the new transport
-  instead of adopting it.
+  channel, up to the first `channels/changed` it sends that removes a
+  channel: nothing passes a removal, so what the next process sent before
+  one is admitted before it. A registration that arrives once the kept
+  messages are admitted is too late for them, and a kept message for a
+  channel the registry doesn't know is refused. An answer to a request from
+  a closed transport is never written to the next one, whether the request
+  was still held or its listener was still working when the transport
+  closed. A `close()` during a reconnect's handshake now closes the new
+  transport instead of adopting it.
