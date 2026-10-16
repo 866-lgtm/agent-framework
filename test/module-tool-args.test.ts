@@ -108,6 +108,55 @@ async function withFramework(
 const call = (framework: AgentFramework, input: unknown, name = 'probe--echo'): Promise<ToolResult> =>
   framework.executeToolCall({ id: 'zz-1', name, input: input as Record<string, unknown>, callerAgentName: 'agent' });
 
+/** A framework with one module of the test's own. */
+async function withModule(module: Module, fn: (framework: AgentFramework, membrane: MockMembrane) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'module-tool-args-own-'));
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', allowedTools: 'all' }],
+    modules: [module],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+  try {
+    await fn(framework, membrane);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** A module with a tool and a utility of one name, each with its own schema. */
+class TwinModule implements Module {
+  readonly name = 'twin';
+  calls: ToolCall[] = [];
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'dup', description: 'The tool.', inputSchema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }];
+  }
+  getUtilities(): ToolDefinition[] {
+    return [{ name: 'dup', description: 'The utility.', inputSchema: { type: 'object', properties: { b: { type: 'string' } }, required: ['b'] } }];
+  }
+  async handleToolCall(c: ToolCall): Promise<ToolResult> { this.calls.push(c); return { success: true, data: c.input }; }
+  async onProcess(): Promise<Record<string, never>> { return {}; }
+}
+
+/** The tool results the model was sent for its first round of calls, once
+ *  they arrive: the framework is started and woken for one turn. */
+async function firstToolResults(framework: AgentFramework, membrane: MockMembrane): Promise<Array<{ isError?: boolean; content?: unknown }> | undefined> {
+  framework.start();
+  (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+    agentName: 'agent', reason: 'external-message', source: 'test', timestamp: Date.now(),
+  });
+  const stream = () => membrane.lastStream as unknown as { receivedToolResults: unknown[][] } | undefined;
+  const deadline = Date.now() + 5_000;
+  while ((stream()?.receivedToolResults.length ?? 0) < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  return stream()?.receivedToolResults[0] as Array<{ isError?: boolean; content?: unknown }> | undefined;
+}
+
 describe('a module tool\'s arguments are checked before the module runs', () => {
   it('refuses a call missing a required argument, naming it and its type', async () => {
     await withFramework(async (framework, probe) => {
@@ -206,52 +255,75 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
     });
   });
 
-  it('lists utilities only for a name the tools don\'t have, so a utility listing that throws reaches only utility calls', async () => {
+  it('lists utilities only for a name the tools don\'t have, so a utility listing that throws reaches only calls to such names', async () => {
     await withFramework(async (framework, probe) => {
       probe.utilitiesThrow = true;
       const tool = await call(framework, { path: 'p' });
       assert.equal(tool.success, true, tool.error);
       const utility = await call(framework, { mode: 'x' }, 'probe--rare_op');
       assert.deepEqual(utility, { success: false, isError: true, error: 'zz-utilities broke' });
+      // A name the module answers without declaring it is looked for there too.
+      const undeclared = await call(framework, {}, 'probe--undeclared');
+      assert.deepEqual(undeclared, { success: false, isError: true, error: 'zz-utilities broke' });
+      assert.deepEqual(probe.calls.map((c) => c.name), ['echo']);
     });
   });
 
   it('checks a utils run against the utility it resolved, where a tool shares its name', async () => {
-    class TwinModule implements Module {
-      readonly name = 'twin';
-      calls: ToolCall[] = [];
-      async start(_ctx: ModuleContext): Promise<void> {}
-      async stop(): Promise<void> {}
-      getTools(): ToolDefinition[] {
-        return [{ name: 'dup', description: 'The tool.', inputSchema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }];
-      }
-      getUtilities(): ToolDefinition[] {
-        return [{ name: 'dup', description: 'The utility.', inputSchema: { type: 'object', properties: { b: { type: 'string' } }, required: ['b'] } }];
-      }
-      async handleToolCall(c: ToolCall): Promise<ToolResult> { this.calls.push(c); return { success: true, data: c.input }; }
-      async onProcess(): Promise<Record<string, never>> { return {}; }
-    }
-    const dir = mkdtempSync(join(tmpdir(), 'module-tool-args-twin-'));
     const twin = new TwinModule();
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store'),
-      membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', allowedTools: 'all' }],
-      modules: [twin],
-      syncIntervalMs: 0,
-      maintenanceIntervalMs: 0,
-    });
-    try {
+    await withModule(twin, async (framework) => {
       const run = await framework.executeToolCall({ id: 'zz-twin', name: 'utils', input: { action: 'run', name: 'twin--dup', args: { b: 'x' } }, callerAgentName: 'agent' });
       assert.equal(run.success, true, run.error);
       assert.deepEqual(twin.calls[0]!.input, { b: 'x' });
       // The tool keeps its own schema on its own path.
       const tool = await framework.executeToolCall({ id: 'zz-twin-2', name: 'twin--dup', input: { b: 'x' }, callerAgentName: 'agent' });
       assert.equal(tool.error, 'Nothing was done: twin--dup needs "a" (a string), and this call gave none; "b" isn\'t one of its parameters.');
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
+    });
+  });
+
+  it('checks the model\'s own utils run against the utility it resolved, where a tool shares its name', async () => {
+    const twin = new TwinModule();
+    await withModule(twin, async (framework, membrane) => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'zz-twin-run', name: 'utils', input: { action: 'run', name: 'twin--dup', args: { b: 'x' } } },
+      ], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-done' }]));
+      const results = await firstToolResults(framework, membrane);
+      assert.ok(results, 'the model was answered');
+      assert.equal(results!.length, 1);
+      assert.notEqual(results![0]!.isError, true, JSON.stringify(results));
+      assert.deepEqual(twin.calls.map((c) => c.input), [{ b: 'x' }]);
+    });
+  });
+
+  it('names a key a utils run gave inside args that the utility doesn\'t declare, where a required one is missing', async () => {
+    await withFramework(async (framework, probe) => {
+      const result = await call(framework, { action: 'run', name: 'probe--rare_op', args: { mood: 'x' } }, 'utils');
+      assert.equal(result.error,
+        'Nothing was done: probe--rare_op needs "mode" (a string), and this call gave none; "mood" isn\'t one of its parameters. ' +
+        `Schema for probe--rare_op: ${JSON.stringify(RARE_SCHEMA)}`);
+      assert.equal(probe.calls.length, 0);
+    });
+  });
+
+  it('runs a name the module answers but doesn\'t declare, on a module that lists no utilities', async () => {
+    class Plain implements Module {
+      readonly name = 'plain';
+      calls: ToolCall[] = [];
+      async start(_ctx: ModuleContext): Promise<void> {}
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] {
+        return [{ name: 'echo', description: 'Echo the input.', inputSchema: SCHEMA }];
+      }
+      async handleToolCall(c: ToolCall): Promise<ToolResult> { this.calls.push(c); return { success: true }; }
+      async onProcess(): Promise<Record<string, never>> { return {}; }
     }
+    const plain = new Plain();
+    await withModule(plain, async (framework) => {
+      const result = await call(framework, {}, 'plain--former');
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(plain.calls.map((c) => c.name), ['former']);
+    });
   });
 
   it('answers a throw from the module\'s own tool listing as an error result', async () => {
@@ -279,14 +351,7 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
     await withFramework(async (framework, probe, membrane) => {
       membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'zz-call', name: 'probe--echo', input: {} }], 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-done' }]));
-      framework.start();
-      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-        agentName: 'agent', reason: 'external-message', source: 'test', timestamp: Date.now(),
-      });
-      const stream = () => membrane.lastStream as unknown as { receivedToolResults: unknown[][] } | undefined;
-      const deadline = Date.now() + 5_000;
-      while ((stream()?.receivedToolResults.length ?? 0) < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
-      const results = stream()?.receivedToolResults[0] as Array<{ isError?: boolean; content?: unknown }> | undefined;
+      const results = await firstToolResults(framework, membrane);
       assert.ok(results, 'the model was answered');
       assert.equal(results!.length, 1);
       assert.equal(results![0]!.isError, true);
@@ -434,11 +499,57 @@ describe('toolArgsProblems', () => {
     // Nothing missing, nothing said: an extra key is never refused for itself.
     assert.deepEqual(toolArgsProblems({ path: 'p', zz: 1 }, SCHEMA), []);
     assert.deepEqual(toolArgsProblems({ path: 'p', content: 'c', zz: 1 }, WRITE_SCHEMA, { values: true }), []);
-    // A schema that declares no properties can't say which keys are its own.
-    assert.deepEqual(toolArgsProblems({ y: 1 }, { type: 'object', required: ['x'] }), ['needs "x", and this call gave none']);
     // A long key is shown briefly, as a value is.
     const long = 'k'.repeat(100);
     assert.deepEqual(toolArgsProblems({ [long]: 1 }, RARE_SCHEMA)[1], `"${'k'.repeat(79)}… isn't one of its parameters`);
+  });
+
+  it('names a key the schema declares neither in properties nor in required, however its properties are given', () => {
+    // A properties of another shape declares nothing, even a key a string or a list has of its own.
+    const cases: Array<[unknown, string]> = [[undefined, 'y'], [null, 'y'], [{}, 'y'], ['zz', 'length'], [['y'], '0']];
+    for (const [properties, key] of cases) {
+      const schema = { type: 'object', required: ['x'], ...(properties === undefined ? {} : { properties }) } as unknown as ToolDefinition['inputSchema'];
+      assert.deepEqual(toolArgsProblems({ [key]: 1 }, schema), ['needs "x", and this call gave none', `"${key}" isn't one of its parameters`],
+        JSON.stringify(properties));
+    }
+    // A key the schema requires is one of its parameters, declared in properties or not.
+    const requiredOnly = { type: 'object', properties: {}, required: ['x', 'z'] } as unknown as ToolDefinition['inputSchema'];
+    assert.deepEqual(toolArgsProblems({ x: undefined, z: 1, y: 1 }, requiredOnly),
+      ['needs "x", and this call gave none', '"y" isn\'t one of its parameters']);
+  });
+
+  it('names none where the schema\'s root can declare keys another way', () => {
+    const ways: Array<[string, unknown]> = [
+      ['oneOf', [{ properties: { y: { type: 'number' } } }]],
+      ['anyOf', [{ properties: { y: { type: 'number' } } }]],
+      ['allOf', [{ properties: { y: { type: 'number' } } }]],
+      ['$ref', '#/$defs/args'],
+      ['patternProperties', { '^y': { type: 'number' } }],
+      ['additionalProperties', { type: 'number' }],
+    ];
+    for (const [way, value] of ways) {
+      const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], [way]: value } as unknown as ToolDefinition['inputSchema'];
+      assert.deepEqual(toolArgsProblems({ y: 1 }, schema), ['needs "x" (a string), and this call gave none'], way);
+    }
+    // additionalProperties true or false declares no keys.
+    for (const additionalProperties of [true, false]) {
+      const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], additionalProperties } as unknown as ToolDefinition['inputSchema'];
+      assert.deepEqual(toolArgsProblems({ y: 1 }, schema), ['needs "x" (a string), and this call gave none', '"y" isn\'t one of its parameters']);
+    }
+  });
+
+  it('reads a type name JSON Schema doesn\'t have as declaring no type', () => {
+    const anyTyped = {
+      type: 'object',
+      properties: { v: { type: 'any' }, w: { type: ['any', 'string'] } },
+      required: ['v'],
+    } as unknown as ToolDefinition['inputSchema'];
+    // null is a value for a key with no type the check can read, as for an untyped one.
+    assert.deepEqual(toolArgsProblems({ v: null }, anyTyped), []);
+    assert.deepEqual(toolArgsProblems({}, anyTyped), ['needs "v", and this call gave none']);
+    // Its value isn't checked against the name, and a list keeps the types it can read.
+    assert.deepEqual(toolArgsProblems({ v: 3, w: 'x' }, anyTyped, { values: true }), []);
+    assert.deepEqual(toolArgsProblems({ v: 3, w: 4 }, anyTyped, { values: true }), ['"w" must be a string, and this call gave a number']);
   });
 
   it('names the input by the caller\'s word for it', () => {

@@ -18955,8 +18955,10 @@ export class AgentFramework {
           };
         }
         // Same dispatch as a first-class tool call — the module cannot tell
-        // which surface the call came through. An in-process caller gets the
-        // module's own result; the model's path takes its checked form.
+        // which surface the call came through. The registry checks the call
+        // against the utility resolved here, even where one of the module's
+        // tools shares its name. An in-process caller gets the module's own
+        // result; the model's path takes the result's stored form.
         const utilityCall = { id: call.id, name: def.name, input: args, callerAgentName: agentName };
         return options.inProcess
           ? this.moduleRegistry.handleToolCall(utilityCall, { definition: def })

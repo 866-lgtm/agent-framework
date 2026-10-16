@@ -341,7 +341,9 @@ export class ModuleRegistry {
       // can say (toolArgsProblems). The module's own listing runs inside the
       // try, so its throw is answered like any other. Utilities are listed
       // only for a name the tools don't have, so a utility listing that
-      // throws or is slow reaches only utility calls.
+      // throws or is slow reaches only calls to such names: a utility called
+      // by its own name, and a name the module answers without declaring it.
+      // A caller that passes `definition` lists nothing.
       const definition = options.definition
         ?? module.getTools().find((tool) => tool.name === toolName)
         ?? module.getUtilities?.()?.find((tool) => tool.name === toolName);

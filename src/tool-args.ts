@@ -19,22 +19,26 @@ function withArticle(kind: string): string {
   return /^[aeiou]/.test(kind) ? `an ${kind}` : `a ${kind}`;
 }
 
+/** The types JSON Schema names. A `type` naming anything else, such as
+ *  `any`, is one the check can't read. */
+const JSON_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null']);
+
 /** The kinds a declaration's type admits, each once, or none when it declares
- *  none. OpenAPI's `nullable: true`, the form Gemini's dialect uses, admits
- *  `null` beside its type, as a type list naming `null` does. */
+ *  none it can read. OpenAPI's `nullable: true`, the form Gemini's dialect
+ *  uses, admits `null` beside its type, as a type list naming `null` does. */
 function admittedKinds(param: { type?: unknown; nullable?: unknown } | undefined): string[] {
   const type = param?.type;
   const types = Array.isArray(type) ? type : type === undefined ? [] : [type];
   const kinds = new Set(types
-    .filter((t): t is string => typeof t === 'string')
+    .filter((t): t is string => typeof t === 'string' && JSON_TYPES.has(t))
     .map((t) => (t === 'integer' ? 'number' : t)));
   if (kinds.size > 0 && param?.nullable === true) kinds.add('null');
   return [...kinds];
 }
 
-/** A value as the call gave it, briefly: its first 80 characters, then an
- *  ellipsis when there are more, cut between characters rather than inside
- *  one. Only what it shows is read, however long the value. */
+/** A value as the call gave it, briefly: the first 80 characters of its JSON
+ *  text, then an ellipsis when there are more, cut between characters rather
+ *  than inside one. The whole value is serialized before the cut. */
 function shown(value: unknown): string {
   let text: string;
   try {
@@ -70,6 +74,20 @@ function own(obj: Record<string, unknown>, key: string): unknown {
   return Object.hasOwn(obj, key) ? obj[key] : undefined;
 }
 
+/** An object that isn't a list: a map of keys, as `properties` should be. */
+function isMap(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Whether a schema's root declares its keys only in `properties` and
+ *  `required`, so that a key in neither isn't one of its parameters. A root
+ *  with `oneOf`, `anyOf`, `allOf`, `$ref` or `patternProperties`, or a schema
+ *  for `additionalProperties`, can declare keys there too. */
+function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
+  return !['oneOf', 'anyOf', 'allOf', '$ref', 'patternProperties'].some((key) => Object.hasOwn(schema, key))
+    && !isMap(schema.additionalProperties);
+}
+
 /**
  * What's wrong with a call's input against its tool's declared inputSchema,
  * checked shallowly: the input is an object, and each root `required` key has
@@ -85,13 +103,16 @@ function own(obj: Record<string, unknown>, key: string): unknown {
  * - A required key given as `null` has no value, the same as one left out,
  *   unless its declared type admits `null` (a type list naming it, or
  *   `nullable: true`). A key with no declared type takes `null` as a value,
- *   as it takes any other. An empty string is a value.
+ *   as it takes any other, and so does one whose `type` names no type JSON
+ *   Schema has. An empty string is a value.
  * - A schema whose `required` isn't a list requires nothing here, and a key
  *   it lists twice is reported once.
- * - Where a required key is missing and the call gave keys the schema's
- *   `properties` don't declare, those are named too, since the commonest
- *   reason a key is missing is that it was sent under another name. They're
- *   never refused for themselves.
+ * - Where a required key is missing and the call gave keys the schema
+ *   declares neither in its `properties` nor in its `required` list, those
+ *   are named too, since a key sent under another name is one reason a
+ *   required key goes missing. They're never refused for themselves. A schema
+ *   whose root can declare keys another way names none
+ *   (declaresKeysPlainly).
  *
  * A module tool's call is checked without `values`: a handler may take more
  * than its schema can say on every provider, such as one name where a list
@@ -110,11 +131,12 @@ export function toolArgsProblems(
     return [`its ${options.field ?? 'input'} must be an object, and this call gave ${withArticle(kindOf(input))}`];
   }
   const obj = (absent ? {} : input) as Record<string, unknown>;
-  const properties = (schema.properties ?? {}) as Record<string, { type?: unknown; nullable?: unknown; enum?: unknown } | undefined>;
+  const properties = (isMap(schema.properties) ? schema.properties : {}) as Record<string, { type?: unknown; nullable?: unknown; enum?: unknown } | undefined>;
   const declared = (key: string) => (Object.hasOwn(properties, key) ? properties[key] : undefined);
   const problems: string[] = [];
   const missing = new Set<string>();
-  for (const key of Array.isArray(schema.required) ? schema.required : []) {
+  const required: unknown[] = Array.isArray(schema.required) ? schema.required : [];
+  for (const key of required) {
     if (typeof key !== 'string' || missing.has(key)) continue;
     const value = own(obj, key);
     const kinds = admittedKinds(declared(key));
@@ -124,8 +146,8 @@ export function toolArgsProblems(
     const wanted = kinds.length > 0 ? `"${key}" (${oneOf(kinds.map(withArticle))})` : `"${key}"`;
     problems.push(`needs ${wanted}, and this call gave ${value === null ? 'null' : 'none'}`);
   }
-  if (missing.size > 0 && schema.properties !== null && typeof schema.properties === 'object') {
-    const undeclared = Object.keys(obj).filter((key) => !Object.hasOwn(properties, key));
+  if (missing.size > 0 && declaresKeysPlainly(schema as Record<string, unknown>)) {
+    const undeclared = Object.keys(obj).filter((key) => !Object.hasOwn(properties, key) && !required.includes(key));
     if (undeclared.length > 0) {
       const named = undeclared.slice(0, UNDECLARED_SHOWN).map(shown);
       if (undeclared.length > UNDECLARED_SHOWN) named.push(`${undeclared.length - UNDECLARED_SHOWN} more`);
