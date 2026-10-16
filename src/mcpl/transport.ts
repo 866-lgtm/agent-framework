@@ -30,6 +30,9 @@ export interface TransportCloseInfo {
   code?: number | null;
   signal?: NodeJS.Signals | null;
   reason?: string;
+  /** True when `reason` is the peer's own text, a WebSocket server's close
+   *  reason, rather than the transport's words. */
+  reasonFromPeer?: boolean;
 }
 
 /**
@@ -183,6 +186,8 @@ export const STDERR_TAIL_CHARS = 2_048;
 
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
+  /** The first error on the child's stdin or stdout, named in the close reason. */
+  private pipeError: Error | undefined;
   private stderrEnd = '';
   private stderrCut = false;
 
@@ -222,27 +227,38 @@ export class StdioTransport extends McplTransport {
     });
 
     this.child.on('error', (err) => this.emit('error', err));
-    // A write racing the child's exit fails with EPIPE on stdin. That is the
-    // exit's echo, which 'close' already reports, never a reason to crash: an
-    // unhandled stream 'error' would end the host.
-    this.child.stdin?.on('error', (err) => {
-      if (this.listenerCount('error') > 0) this.emit('error', err);
-    });
-    // A read error on the child's stdout or stderr is reported the same way,
-    // never thrown with nothing listening. The stdout listener is on the
-    // stream itself, since close() closes readline, which takes its own
+    // The child's stdin and stdout carry the protocol, so after an error on
+    // either, a write's EPIPE or a read error, this transport can't reach the
+    // child even if it's still running. The handler sends a running child
+    // SIGTERM, and the exit's close names the error, so the connection handles
+    // it as any other exit. The close is the report: no 'error' is emitted,
+    // nothing is thrown. Nothing here escalates to SIGKILL, so a child that
+    // ignores SIGTERM keeps running, unreported. A child that stops reading
+    // without closing its stdin raises no error: the writes are buffered, and
+    // only request timeouts bound it (McplServerConfig.requestTimeoutMs).
+    const endOnPipeError = (err: Error) => {
+      this.pipeError ??= err;
+      if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
+    };
+    this.child.stdin?.on('error', endOnPipeError);
+    // On the stream itself, since close() closes readline, which takes its own
     // listener off the stream. While readline is open, its listener, which
     // came first, re-emits the error on the interface, where an empty
-    // listener absorbs that copy; the stream listener's report is the only one.
-    const reportReadError = (err: Error) => {
+    // listener absorbs that copy.
+    this.child.stdout?.on('error', endOnPipeError);
+    this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
+    // stderr carries diagnostics only: a read error on it is reported if
+    // anyone listens and never thrown. It ends nothing once the connection
+    // is wired; during a handshake the listener is the handshake's, which
+    // fails it.
+    this.child.stderr?.on('error', (err) => {
       if (this.listenerCount('error') > 0) this.emit('error', err);
-    };
-    this.child.stdout?.on('error', reportReadError);
-    this.rl.on('error', () => { /* readline's copy of a stdout error, reported above */ });
-    this.child.stderr?.on('error', reportReadError);
-    this.child.on('exit', (code, signal) =>
-      this.markClosed({ code, signal, reason: 'child process exited' }),
-    );
+    });
+    this.child.on('exit', (code, signal) => this.markClosed({
+      code,
+      signal,
+      reason: this.pipeError ? `child process exited, and its pipe failed with ${this.pipeError.message}` : 'child process exited',
+    }));
   }
 
   /**
@@ -330,9 +346,10 @@ export class WebSocketTransport extends McplTransport {
     });
 
     this.ws.on('error', (err: Error) => this.emit('error', err));
-    this.ws.on('close', (code: number, reason: Buffer) =>
-      this.markClosed({ code, reason: reason?.toString('utf8') || 'websocket closed' }),
-    );
+    this.ws.on('close', (code: number, reason: Buffer) => {
+      const text = reason?.toString('utf8');
+      this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });
+    });
   }
 
   /**
