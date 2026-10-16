@@ -1742,6 +1742,15 @@ function gate() {
   const opened = new Promise<void>((resolve) => { open = resolve; });
   return { opened, open };
 }
+/** Hold a stream's compile: opens `entered` when a turn's stream start
+ *  assembles its request, then waits for `release`. The stream path assembles
+ *  through the agent's own assembler (buildActivationRequest is only its
+ *  preview), so the hold goes there. */
+function holdStreamCompile(agent: object, entered: { open(): void }, release: Promise<void>): void {
+  const assembler = agent as { assembleActivationRequest: (...args: unknown[]) => Promise<unknown> };
+  const assemble = assembler.assembleActivationRequest.bind(agent);
+  assembler.assembleActivationRequest = async (...args) => { entered.open(); await release; return assemble(...args); };
+}
 async function until(check: () => boolean, what: string) {
   for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(check(), `timed out waiting until ${what}`);
@@ -3218,8 +3227,7 @@ test('a framework compile from before stop cannot drive after restart', async ()
   const agent = framework.getAgent('assistant')!;
   const compile = gate();
   const entered = gate();
-  const build = agent.buildActivationRequest.bind(agent);
-  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  holdStreamCompile(agent, entered, compile.opened);
   let driven = 0;
   const stream = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (...args) => {
@@ -3290,8 +3298,7 @@ for (const phase of ['before', 'after'] as const) {
       if (phase === 'before') {
         internal.moduleRegistry.gatherContext = async () => { entered.open(); await held.opened; return []; };
       } else {
-        const build = agent.buildActivationRequest.bind(agent);
-        agent.buildActivationRequest = async (...args) => { entered.open(); await held.opened; return build(...args); };
+        holdStreamCompile(agent, entered, held.opened);
       }
       const turnEvents: Array<{ type: string; reason?: string; durationMs?: number }> = [];
       framework.onTrace((event) => {
