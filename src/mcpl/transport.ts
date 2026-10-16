@@ -23,6 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -95,6 +96,20 @@ export abstract class McplTransport extends EventEmitter {
   protected pushStderr(line: string): void {
     if (this.listenerCount('stderr') > 0) this.emit('stderr', line);
     else this.stderrBuffer.push(line);
+  }
+
+  /**
+   * Report a transport error: to the 'error' listeners if there are any, else
+   * as a log line. EventEmitter throws an 'error' that nothing listens for,
+   * and a transport reports its errors from I/O callbacks, where nothing
+   * catches that throw, so it would end the process. A transport has no
+   * listener from its creation until the handshake attaches one, and a
+   * WebSocket server that sends a malformed frame with its upgrade response
+   * makes ws raise an 'error' in that window.
+   */
+  protected reportError(err: Error): void {
+    if (this.listenerCount('error') > 0) this.emit('error', err);
+    else console.error(`[mcpl] a ${this.kind} transport error, with nothing listening for it: ${logDetail(err.message)}`);
   }
 
   /** Emit 'close' exactly once. */
@@ -228,7 +243,7 @@ export class StdioTransport extends McplTransport {
       if (carry.length > 0) this.pushStderr(carry);
     });
 
-    this.child.on('error', (err) => this.emit('error', err));
+    this.child.on('error', (err) => this.reportError(err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
     // child even if it's still running. The handler sends a running child
@@ -249,13 +264,11 @@ export class StdioTransport extends McplTransport {
     // listener absorbs that copy.
     this.child.stdout?.on('error', endOnPipeError);
     this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
-    // stderr carries diagnostics only: a read error on it is reported if
-    // anyone listens and never thrown. It ends nothing once the connection
-    // is wired; during a handshake the listener is the handshake's, which
-    // fails it.
-    this.child.stderr?.on('error', (err) => {
-      if (this.listenerCount('error') > 0) this.emit('error', err);
-    });
+    // stderr carries diagnostics only: a read error on it is reported, to the
+    // listeners or else in the log, and never thrown. It ends nothing once
+    // the connection is wired; during a handshake the listener is the
+    // handshake's, which fails it.
+    this.child.stderr?.on('error', (err) => this.reportError(err));
     this.child.on('exit', (code, signal) => this.markClosed({
       code,
       signal,
@@ -347,7 +360,7 @@ export class WebSocketTransport extends McplTransport {
       }
     });
 
-    this.ws.on('error', (err: Error) => this.emit('error', err));
+    this.ws.on('error', (err: Error) => this.reportError(err));
     this.ws.on('close', (code: number, reason: Buffer) => {
       const text = reason?.toString('utf8');
       this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });

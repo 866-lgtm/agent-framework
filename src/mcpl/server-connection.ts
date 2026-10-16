@@ -1435,13 +1435,19 @@ export class McplServerConnection extends EventEmitter {
    * from a transport's callback, where these errors arise, nothing catches
    * that throw, so it ends the process. A bare connection has no listener:
    * the class is exported, and a probe, a playtest or a harness often attaches
-   * none. So with no listener the caller logs the error instead. A listener
-   * that throws is caught and logged too.
+   * none. So with no listener, the error is the caller's to log, unless it
+   * already has. A listener that throws is caught and logged, with the error
+   * it was handling.
    */
   private emitToErrorListeners(error: Error): boolean {
     if (this.listenerCount('error') === 0) return false;
     try { this.emit('error', error); }
-    catch (listenerError) { console.error(`[mcpl] ${this.id}: an 'error' listener failed: ${logDetail(describeCause(listenerError))}`); }
+    catch (listenerError) {
+      console.error(
+        `[mcpl] ${this.id}: an 'error' listener failed: ${logDetail(describeCause(listenerError))}` +
+          `, handling ${logDetail(error.message)}`,
+      );
+    }
     return true;
   }
 
