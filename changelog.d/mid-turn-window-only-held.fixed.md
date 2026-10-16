@@ -16,21 +16,20 @@
   refused.
 - A message injected into the live stream at a tool boundary now counts as
   read for RFC-006 coalescing when the stream says it carries injected
-  messages (membrane's `ToolContext.supportsInjectedMessages`, true on its
-  native path in releases after 0.5.87): the consumed watermark moves when
-  messages are injected, not only at a compile. Before, an injected message
-  sat above the watermark of the turn's compile, so a coalesced replacement
-  for its subject could remove a message the agent had heard and answered.
-  Within a branch the watermark only advances: a compile that started before
-  such a mark doesn't roll it back when it finishes. A stream that doesn't
-  say, as on membrane 0.5.87, still gets injected messages, and they stay
-  unread, as before: 0.5.87's XML tool path doesn't carry them, and warns
-  that they'll come next turn instead.
-- A stream that says it can't carry injected messages (membrane's XML
-  prefill path, in releases after 0.5.87) gets none: everything deferred
-  for the agent during the turn waits for the turn's end, after its last
-  round, as a held message does, instead of being stored between rounds the
-  stream never showed it.
+  messages (membrane's `ToolContext.supportsInjectedMessages`, which
+  membrane's main sets true on its native path): the consumed watermark moves
+  when messages are injected, not only at a compile. Before, an injected
+  message sat above the watermark of the turn's compile, so a coalesced
+  replacement for its subject could remove a message the agent had heard and
+  answered. Within a branch the watermark only advances: a compile that
+  started before such a mark doesn't roll it back when it finishes. A stream
+  that doesn't say, as on membrane 0.5.87, still gets injected messages, and
+  they stay unread, as before: 0.5.87's XML tool path doesn't carry them, and
+  warns that they'll come next turn instead.
+- A stream that says it can't carry injected messages (as membrane's main says
+  of its XML prefill path) gets none: everything deferred for the agent during
+  the turn waits for the turn's end, after its last round, as a held message
+  does, instead of being stored between rounds the stream never showed it.
 - A deferred write that a flush defers again does so whatever its content,
   under its id and in its place in the order writes arrived. That happens
   while its target's own turn, stream or tool cycle is alive, or the host is
