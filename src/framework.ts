@@ -418,6 +418,7 @@ import type {
 } from './mcpl/types.js';
 import type { ContextInjection } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
+import { firstFreeBranchName } from './branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
@@ -7223,7 +7224,7 @@ export class AgentFramework {
       try {
         const r = await this.rollbackToMessage(agentName, {
           messageId: String(target.id),
-          branchName: `undo-msgs/${agentName}/${Date.now()}`,
+          branchName: this.newOperatorBranchName(`undo-msgs/${agentName}/${Date.now()}`),
           requester: hostCommandRequester(serverId, params),
         });
         return {
@@ -7661,7 +7662,7 @@ export class AgentFramework {
     this.saveTurnCheckpoints(agentName, checkpoints);
 
     const currentBranch = this.store.currentBranch();
-    const undoBranchName = `undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`;
+    const undoBranchName = this.newOperatorBranchName(`undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`);
 
     this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
     this.store.switchBranch(undoBranchName);
@@ -7808,6 +7809,17 @@ export class AgentFramework {
   }
 
   /**
+   * A default name for an operator branch: `base`, the timestamped name, or
+   * the first of `base-2`, `base-3`, … that the store doesn't hold
+   * (firstFreeBranchName). Two changes of one kind in one millisecond then
+   * get a branch each, rather than the second failing on a taken name.
+   */
+  private newOperatorBranchName(base: string): string {
+    const held = new Set(this.store.listBranches().map((branch) => branch.name));
+    return firstFreeBranchName(base, (name) => held.has(name));
+  }
+
+  /**
    * The surgery gate — STORE-wide, not per agent. A branch switch moves the
    * active chronicle branch for every context manager sharing this store,
    * so an in-flight turn on *any* agent would have its next writes land on
@@ -7937,7 +7949,7 @@ export class AgentFramework {
       messageId: string;
       requester?: OperatorRequester;
       note?: string;
-      /** Branch name for the fork (default `rollback/<agent>/<ts>`). */
+      /** Branch name for the fork (default `rollback/<agent>/<ts>`, or with `-2`, `-3`, … appended when the store already holds that name). */
       branchName?: string;
     },
   ): Promise<{
@@ -7984,7 +7996,7 @@ export class AgentFramework {
       const discarded = cm.getMessageWindow(targetIndex + 1, messagesRemoved, { resolveBlobs: false }).messages;
       const removedRefs = extractDiscordAwarenessRefs(discarded);
       const sourceBranch = this.store.currentBranch().name;
-      const targetBranch = opts.branchName ?? `rollback/${agentName}/${Date.now()}`;
+      const targetBranch = opts.branchName ?? this.newOperatorBranchName(`rollback/${agentName}/${Date.now()}`);
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
       }
@@ -8095,7 +8107,7 @@ export class AgentFramework {
       messageIds: string[];
       requester?: OperatorRequester;
       note?: string;
-      /** Branch name for the fork (default `suppress/<agent>/<ts>`). */
+      /** Branch name for the fork (default `suppress/<agent>/<ts>`, or with `-2`, `-3`, … appended when the store already holds that name). */
       branchName?: string;
     },
   ): Promise<{
@@ -8155,7 +8167,7 @@ export class AgentFramework {
       const removedRefs = extractDiscordAwarenessRefs(targeted);
 
       const sourceBranch = this.store.currentBranch().name;
-      const targetBranch = opts.branchName ?? `suppress/${agentName}/${Date.now()}`;
+      const targetBranch = opts.branchName ?? this.newOperatorBranchName(`suppress/${agentName}/${Date.now()}`);
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
       }
