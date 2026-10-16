@@ -112,6 +112,34 @@ describe('skip_reply wake capability', () => {
     await framework.stop();
   });
 
+  it('does not mutate the stored assistant tool_use input when refusing a wake', async () => {
+    const originalInput = { reason: 'continue later', wake_in_seconds: 60 };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'wake-stored', name: 'skip_reply', input: originalInput },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[]));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'stored-input'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+    });
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      getChannelTools: () => [], resolveLocus: () => 'channel:test',
+      routeSpeech: async () => ({ delivered: true, channelId: 'channel:test' }),
+      handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true } }),
+    }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+    const agent = framework.getAgent('agent')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(agent, { agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
+    await framework.runUntilIdle();
+    const stored = agent.getContextManager().getAllMessages()
+      .flatMap((message) => message.content)
+      .find((block) => block.type === 'tool_use' && block.id === 'wake-stored') as { input: Record<string, unknown> } | undefined;
+    assert.deepEqual(stored?.input, { reason: 'continue later', wake_in_seconds: 60 });
+    assert.deepEqual(originalInput, { reason: 'continue later', wake_in_seconds: 60 });
+    await framework.stop();
+  });
+
   it('preserves silence that existed before a refused wake', async () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([

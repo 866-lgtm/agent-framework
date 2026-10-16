@@ -15018,7 +15018,8 @@ export class AgentFramework {
       // confirmation. Without a gate, a positive timer request is refused so
       // the model learns that its turn remains open and no wake was armed.
       if (enrichedCall.name === 'skip_reply') {
-        const inputObj = (enrichedCall.input ?? {}) as Record<string, unknown>;
+        const inputObj = { ...((enrichedCall.input ?? {}) as Record<string, unknown>) };
+        enrichedCall.input = inputObj;
         const secs = Number(inputObj.wake_in_seconds);
         const wants = inputObj.wake_in_seconds !== undefined && Number.isFinite(secs) && secs > 0;
         if (wants && this.eventGate) {
