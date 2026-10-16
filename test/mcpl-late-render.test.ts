@@ -28,7 +28,7 @@ class LineTransport extends McplTransport {
 const RENDER: PushRenderParams = { featureSet: 'fs', key: 'k1', eventId: 'e7', notices: [], dropped: 0 };
 
 /** A real connection, wired by the framework, whose push/render has timed out. */
-async function timedOutRender(t: TestContext) {
+async function timedOutRender(t: TestContext, params: PushRenderParams = RENDER) {
   const transport = new LineTransport();
   const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
   connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
@@ -42,31 +42,65 @@ async function timedOutRender(t: TestContext) {
   connection.ready();
   t.mock.method(console, 'error', () => {});
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const render = connection.sendPushRender(RENDER);
+  const render = connection.sendPushRender(params);
   const { id } = JSON.parse(transport.lines[0]!) as { id: number };
   t.mock.timers.tick(5_000);
   await assert.rejects(render, /did not respond to push\/render/);
-  const answerLate = () => transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'late' }] } }));
-  return { connection, traces, orphans, id, answerLate };
+  const answerLate = (answer: object = { result: { content: [{ type: 'text', text: 'late' }] } }) =>
+    transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, ...answer }));
+  const recorded = () => traces
+    .filter((e) => e.type === 'mcpl:coalescing' || e.type === 'mcpl:orphaned-response')
+    .map(({ timestamp: _timestamp, ...rest }) => rest);
+  return { connection, transport, traces, orphans, id, answerLate, recorded };
 }
 
 const lateRender = { type: 'mcpl:coalescing', kind: 'late-render', serverId: 'srv', eventId: 'e7', featureSet: 'fs', key: 'k1', discarded: true };
 
 test('a push/render answered after its timeout is recorded as a discarded late-render, linked by its eventId', async (t) => {
-  const { traces, orphans, id, answerLate } = await timedOutRender(t);
+  const { orphans, id, answerLate, recorded } = await timedOutRender(t);
   answerLate();
   // The connection's one event for a response whose request timed out.
   assert.deepEqual(orphans, [{ id, method: 'push/render', hadState: false, hadCheckpoint: false, featureSet: 'fs', key: 'k1', eventId: 'e7' }]);
-  const recorded = traces.filter((e) => e.type === 'mcpl:coalescing' || e.type === 'mcpl:orphaned-response');
-  assert.deepEqual(recorded.map(({ timestamp: _timestamp, ...rest }) => rest), [lateRender]);
+  assert.deepEqual(recorded(), [lateRender]);
+});
+
+test('a late push/render error is recorded as a late-render with its message, and a late null result as a late-render', async (t) => {
+  const failed = await timedOutRender(t);
+  failed.answerLate({ error: { code: -32603, message: 'render exploded' } });
+  assert.deepEqual(failed.orphans, [{
+    id: failed.id, method: 'push/render', hadState: false, hadCheckpoint: false, featureSet: 'fs', key: 'k1', eventId: 'e7',
+    error: { code: -32603, message: 'render exploded' },
+  }]);
+  assert.deepEqual(failed.recorded(), [{ ...lateRender, error: 'render exploded' }]);
+  t.mock.timers.reset();
+  const empty = await timedOutRender(t);
+  empty.answerLate({ result: null });
+  assert.deepEqual(empty.recorded(), [lateRender]);
+});
+
+test("a channel-scoped push/render answered late names its channel", async (t) => {
+  const { answerLate, recorded } = await timedOutRender(t, { ...RENDER, featureSet: '', channelId: 'discord:guild:42' });
+  answerLate();
+  assert.deepEqual(recorded(), [{ ...lateRender, featureSet: '', channelId: 'discord:guild:42' }]);
+});
+
+test('a late answer to a tool call whose deadline passed is still recorded as mcpl:orphaned-response, never as a late-render', async (t) => {
+  const { connection, transport, recorded } = await timedOutRender(t);
+  const call = connection.sendToolsCallWithDeadline('stuck', {}, 75);
+  const { id } = JSON.parse(transport.lines.at(-1)!) as { id: number };
+  t.mock.timers.tick(75);
+  await assert.rejects(call, /outcome is unknown/);
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, result: { content: [] } }));
+  assert.deepEqual(recorded(), [
+    { type: 'mcpl:orphaned-response', serverId: 'srv', responseId: id, method: 'tools/call', hadState: false, hadCheckpoint: false },
+  ]);
 });
 
 test('while the data plane is paused, a late push/render answer is recorded at once and takes no slot', async (t) => {
-  const { connection, traces, answerLate } = await timedOutRender(t);
+  const { connection, answerLate, recorded } = await timedOutRender(t);
   // A quiesce or an awareness drain: control traffic flows, data is held.
   connection.pauseDataPlane();
   answerLate();
   assert.equal((connection as any).bufferedEvents.length, 0);
-  const recorded = traces.filter((e) => e.type === 'mcpl:coalescing');
-  assert.deepEqual(recorded.map(({ timestamp: _timestamp, ...rest }) => rest), [lateRender]);
+  assert.deepEqual(recorded(), [lateRender]);
 });

@@ -315,8 +315,10 @@ export type TraceEvent =
    *  rendered / revoked / render-cancelled / late-render / render-failed).
    *  A late-render whose push/render had already timed out, its fallback
    *  materialized, is recorded by the connection's wiring rather than the
-   *  coalescer: it names `serverId`, `featureSet` and `key` instead of
-   *  `subject`, and its `eventId` links it to the batch's render-failed. */
+   *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
+   *  channel-scoped subject, `channelId` instead of `subject`, carries a late
+   *  JSON-RPC error's message as `error`, and its `eventId` links it to the
+   *  batch's render-failed. */
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
       kind: string;

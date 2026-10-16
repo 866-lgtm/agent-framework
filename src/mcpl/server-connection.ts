@@ -276,7 +276,10 @@ export class McplServerConnection extends EventEmitter {
   private pendingRequests = new Map<string | number, PendingRequest>();
   /** Metadata retained after selected request deadlines so a late response is
    * observable even though its original promise has already been rejected. */
-  private orphanedRequests = new Map<string | number, { method: string; renderParams?: { featureSet: string; key: string; eventId: string } }>();
+  private orphanedRequests = new Map<string | number, {
+    method: string;
+    renderParams?: { featureSet: string; key: string; eventId: string; channelId?: string };
+  }>();
   private closed = false;
   /** Set by `reconnectAfterFailure()` before it closes a live transport, so
    *  the transport close handler reports that teardown as `byHost: true`. */
@@ -1197,7 +1200,14 @@ export class McplServerConnection extends EventEmitter {
             this.orphanedRequests.set(id, {
               method,
               ...(method === 'push/render'
-                ? { renderParams: { featureSet: params.featureSet as string, key: params.key as string, eventId: params.eventId as string } }
+                ? {
+                  renderParams: {
+                    featureSet: params.featureSet as string,
+                    key: params.key as string,
+                    eventId: params.eventId as string,
+                    ...(typeof params.channelId === 'string' ? { channelId: params.channelId } : {}),
+                  },
+                }
                 : {}),
             });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
@@ -1453,11 +1463,14 @@ export class McplServerConnection extends EventEmitter {
       // re-inject either result because the original dispatch context is gone.
       const orphaned = this.orphanedRequests.get(response.id);
       this.orphanedRequests.delete(response.id);
-      // A push/render answered after its timeout (RFC-006 §5.3) carries its
-      // subject and eventId, so its discarded result can be recorded beside
-      // its batch's other coalescing records (§11). It is only reported: the
-      // fallback the timeout materialized stands (§5.4 rule 3).
+      // A push/render answered after its timeout (RFC-006 §5.3) carries the
+      // render's featureSet, key, eventId and, for a channel-scoped subject,
+      // channelId, so its discarded answer can be recorded beside its batch's
+      // other coalescing records (§11). It is only reported: the fallback the
+      // timeout materialized stands (§5.4 rule 3). A late JSON-RPC error is
+      // carried as such, so it isn't read as a late result.
       const render = orphaned?.renderParams ?? {};
+      const failure = response.error ? { error: { code: response.error.code, message: response.error.message } } : {};
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };
@@ -1468,6 +1481,7 @@ export class McplServerConnection extends EventEmitter {
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
             ...render,
+            ...failure,
           });
         }
       } else if (orphaned) {
@@ -1477,6 +1491,7 @@ export class McplServerConnection extends EventEmitter {
           hadState: false,
           hadCheckpoint: false,
           ...render,
+          ...failure,
         });
       }
       return; // Orphaned response — ignore

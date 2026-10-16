@@ -20141,12 +20141,15 @@ export class AgentFramework {
       featureSet?: string;
       key?: string;
       eventId?: string;
+      channelId?: string;
+      error?: { code: unknown; message: unknown };
     }) => {
       // A push/render answered after its timeout, when the batch's fallback
       // was already materialized: RFC-006's audit records the discarded
-      // result (§5.4 rule 3, §11) where the coalescer records the rest, beside
-      // the batch's render-failed, linked by its eventId.
-      if (info.eventId !== undefined) {
+      // answer (§5.4 rule 3, §11) where the coalescer records the rest, beside
+      // the batch's render-failed, linked by its eventId. A late JSON-RPC
+      // error keeps its message, bounded like the trace fields around it.
+      if (info.method === 'push/render') {
         this.emitTrace({
           type: 'mcpl:coalescing',
           kind: 'late-render',
@@ -20154,7 +20157,9 @@ export class AgentFramework {
           eventId: info.eventId,
           featureSet: info.featureSet,
           key: info.key,
+          ...(info.channelId === undefined ? {} : { channelId: info.channelId }),
           discarded: true,
+          ...(info.error === undefined ? {} : { error: boundedForLog(describeCause(info.error.message), 500) }),
         });
         return;
       }
