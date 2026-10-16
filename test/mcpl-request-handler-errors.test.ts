@@ -16,7 +16,9 @@ import { McplResponseSerializationError } from '../src/mcpl/errors.js';
 function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) {
   const traces: any[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
-  framework.traceListeners = [(event: unknown) => traces.push(event)];
+  // Main's trace listeners are registrations (#318), which onTrace makes.
+  framework.traceListeners = [];
+  framework.onTrace((event: unknown) => traces.push(event));
   framework.wireMcplEvents(connection);
   return { framework, connection, traces };
 }
