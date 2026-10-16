@@ -14,9 +14,11 @@
 //     through require() when only `require` serves it, and, when bun is on
 //     PATH, each `bun` target through bun's import();
 //   - each bin starts with a `#!` line, without which npm's link can't run
-//     it as a command, and a node bin's imports load. Bins aren't run: a
-//     load hook makes the bin throw as soon as its imports have loaded,
-//     before its own code, which for the MCP server would start it.
+//     it as a command, and an ES module node bin's imports load. Bins aren't
+//     run: a load hook makes the bin throw as soon as its imports have
+//     loaded, before its own code, which for the MCP server would start it.
+//     A CommonJS bin's requires run with its code, so the hook stops it
+//     before it loads, and it's only parsed (`node --check`).
 // Before packing it checks that the files package.json names exist in this
 // tree, so an unbuilt tree says so rather than looking like a packaging
 // fault. The publish workflow runs it after its build and before
@@ -30,11 +32,15 @@ import { pathToFileURL } from "node:url";
 
 const LOAD_TIMEOUT_MS = 60_000;
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
-// What the load hook makes a bin throw once its imports have loaded.
+// What the load hook makes an ES module bin throw once its imports have
+// loaded, and what it throws in place of loading a bin that isn't one.
 const LINKED = "__pack_installs_alone_linked__";
+const NOT_MODULE = "__pack_installs_alone_not_module__";
 const HOOK = `export async function load(url, context, nextLoad) {
   const result = await nextLoad(url, context);
-  if (url !== process.env.PACK_INSTALLS_ALONE_BIN || result.format !== "module") return result;
+  if (url !== process.env.PACK_INSTALLS_ALONE_BIN) return result;
+  // A CommonJS bin's requires run with its code, so it isn't loaded at all.
+  if (result.format !== "module") throw new Error("${NOT_MODULE}");
   const lines = String(result.source).split("\\n");
   lines.splice(lines[0].startsWith("#!") ? 1 : 0, 0, 'throw "${LINKED}";');
   return { ...result, source: lines.join("\\n") };
@@ -264,11 +270,14 @@ function main() {
         ["-e", `await import(${JSON.stringify(specifier)}); process.exit(0);`],
         { cwd: dir, timeout: LOAD_TIMEOUT_MS },
         `loading '${specifier}' under bun, from its bun target, in the installed ${packed.filename} failed (above). ` +
-          "A file it imports that the package leaves out does that, or a dependency only devDependencies supplied.",
+          "A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or " +
+          "a dependency's new release (rerun this on main to tell).",
       );
     }
 
     const bins = binsOf(pkg);
+    const binsLoaded = [];
+    const binsParsed = [];
     for (const [bin, path] of Object.entries(bins)) {
       const file = join(installed, path);
       const first = readFileSync(file, "utf8").split("\n", 1)[0];
@@ -278,8 +287,9 @@ function main() {
         );
       }
       if (/\bnode\b/.test(first)) {
-        // The hook makes the bin throw once its imports have loaded, so its
-        // own code never runs; any other failure is the bin's.
+        // The hook makes an ES module bin throw once its imports have loaded,
+        // so its own code never runs, and stops a CommonJS bin before it
+        // loads, which is then only parsed; any other failure is the bin's.
         const hook = join(work, "bin-hook.mjs");
         const register = join(work, "bin-register.mjs");
         writeFileSync(hook, HOOK);
@@ -290,15 +300,24 @@ function main() {
           timeout: LOAD_TIMEOUT_MS,
           env: { ...process.env, PACK_INSTALLS_ALONE_BIN: pathToFileURL(realpathSync(file)).href },
         });
-        if (!`${loaded.stderr}`.includes(LINKED)) {
-          process.stderr.write(loaded.stderr ?? "");
-          throw new CheckError(
-            loaded.error?.code === "ETIMEDOUT"
-              ? `loading bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${LOAD_TIMEOUT_MS / 1000} s.`
-              : `bin '${bin}' (${path}) in ${packed.filename} doesn't load (above): a package it imports that only ` +
-                  "devDependencies supplies does that, as does a file the package leaves out, or a syntax error.",
-          );
+        const stderr = `${loaded.stderr ?? ""}`;
+        if (stderr.includes(LINKED)) {
+          binsLoaded.push(bin);
+          continue;
         }
+        if (stderr.includes(NOT_MODULE)) {
+          run(process.execPath, ["--check", file], {}, `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`);
+          binsParsed.push(bin);
+          continue;
+        }
+        process.stderr.write(stderr);
+        throw new CheckError(
+          loaded.error?.code === "ETIMEDOUT"
+            ? `loading bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${LOAD_TIMEOUT_MS / 1000} s.`
+            : `bin '${bin}' (${path}) in ${packed.filename} doesn't load (above): a package it imports that only ` +
+                "devDependencies supplies does that, as does a file the package leaves out, a syntax error, or a " +
+                "dependency's new release (rerun this on main to tell).",
+        );
       }
     }
 
@@ -311,7 +330,9 @@ function main() {
             ? `; loaded under bun: ${bunLoads.map((s) => `'${s}'`).join(", ")}`
             : `; bun targets present, not loaded (bun isn't on PATH): ${bunLoads.map((s) => `'${s}'`).join(", ")}`
           : "") +
-        (Object.keys(bins).length > 0 ? `; bins start with '#!', and node bins' imports load: ${Object.keys(bins).join(", ")}` : "") +
+        (Object.keys(bins).length > 0 ? `; bins start with '#!': ${Object.keys(bins).join(", ")}` : "") +
+        (binsLoaded.length > 0 ? `; ES module bins' imports load: ${binsLoaded.join(", ")}` : "") +
+        (binsParsed.length > 0 ? `; CommonJS bins parse, not loaded: ${binsParsed.join(", ")}` : "") +
         (patterns.length > 0 ? `; export patterns matched, not loaded: ${patterns.join(", ")}` : "") +
         ".",
     );

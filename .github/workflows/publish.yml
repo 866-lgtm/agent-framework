@@ -76,8 +76,10 @@ jobs:
         with:
           node-version: 24
 
+      # As publish installs, so a build that came to need a dependency's
+      # install script fails here, before a tag, rather than in publish.
       - name: Install dependencies
-        run: npm install
+        run: npm install --ignore-scripts
 
       # npm publish builds again first, through prepublishOnly, from the
       # same sources.

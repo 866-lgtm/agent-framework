@@ -7,7 +7,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -96,7 +96,7 @@ test("a package whose files carry everything it names installs alone, and each e
   assert.doesNotMatch(result.stderr, /zz-serve ran/, "a bin is never run");
   assert.match(
     result.stdout,
-    /^zz-fixture-1\.0\.0\.tgz \(\d+ files\) installs on its own; every file package\.json names is in it; loaded '@zz\/fixture' \(import\), '@zz\/fixture\/extra' \(import\), '@zz\/fixture\/package\.json' \(import json\), '@zz\/fixture\/legacy' \(require\); bun targets present, not loaded \(bun isn't on PATH\): '@zz\/fixture'; bins start with '#!', and node bins' imports load: zz-serve, zz-shell; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m,
+    /^zz-fixture-1\.0\.0\.tgz \(\d+ files\) installs on its own; every file package\.json names is in it; loaded '@zz\/fixture' \(import\), '@zz\/fixture\/extra' \(import\), '@zz\/fixture\/package\.json' \(import json\), '@zz\/fixture\/legacy' \(require\); bun targets present, not loaded \(bun isn't on PATH\): '@zz\/fixture'; bins start with '#!': zz-serve, zz-shell; ES module bins' imports load: zz-serve; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m,
   );
 });
 
@@ -138,7 +138,7 @@ test("with neither exports nor main, the root is loaded from its index.js, and a
   assert.match(fallback.stdout, /; loaded '@zz\/fixture' \(import\)\.\n$/m);
   const binOnly = await check(fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": NODE_BIN }));
   assert.equal(binOnly.code, 0, binOnly.stderr);
-  assert.match(binOnly.stdout, /installs on its own; every file package\.json names is in it; bins start with '#!', and node bins' imports load: fixture\.\n$/m);
+  assert.match(binOnly.stdout, /installs on its own; every file package\.json names is in it; bins start with '#!': fixture; ES module bins' imports load: fixture\.\n$/m);
 });
 
 test("a tree that hasn't been built, or a main beside exports that names no file, says so before packing", async () => {
@@ -198,7 +198,7 @@ test("a bin needs a '#!' line, and a node bin's imports must load; none is run",
     ...ENTRY, "dist/serve.js": "#!/usr/bin/env node\nexport const = ;\n",
   }));
   assert.equal(unparsed.code, 1);
-  assert.match(unparsed.stderr, /pack-installs-alone: bin 'fixture' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz doesn't load \(above\): a package it imports that only devDependencies supplies does that, as does a file the package leaves out, or a syntax error\.\n$/);
+  assert.match(unparsed.stderr, /pack-installs-alone: bin 'fixture' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz doesn't load \(above\): a package it imports that only devDependencies supplies does that, as does a file the package leaves out, a syntax error, or a dependency's new release \(rerun this on main to tell\)\.\n$/);
   // A bin whose imports the root never reaches: the root loads, the bin doesn't.
   const devOnlyBin = await check(fixture(
     { files: ["dist"], main: "./dist/index.js", bin: { "zz-serve": "./dist/serve.js" }, devDependencies: { "zz-dev-only": "1.0.0" } },
@@ -215,6 +215,30 @@ test("a bin needs a '#!' line, and a node bin's imports must load; none is run",
   ));
   assert.equal(imports.code, 0, imports.stderr);
   assert.doesNotMatch(imports.stderr, /zz-serve ran/);
+});
+
+test("a CommonJS bin is parsed, never run, whatever marks it CommonJS, and one that doesn't parse fails", async () => {
+  const marks = mkdtempSync(join(tmpdir(), "pack-installs-alone-marks-"));
+  made.push(marks);
+  const bin = (mark: string) =>
+    `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(join(marks, mark))}, "ran");\nconsole.error("zz CommonJS bin ran");\n`;
+  // CommonJS by the package's type, and by a .cjs extension in an ES module package.
+  for (const [mark, pkg, path] of [
+    ["typed", { type: "commonjs", files: ["dist"], main: "./dist/index.cjs", bin: { "zz-cjs": "./dist/serve.js" } }, "dist/serve.js"],
+    ["extension", { files: ["dist"], main: "./dist/index.js", bin: { "zz-cjs": "./dist/serve.cjs" } }, "dist/serve.cjs"],
+  ] as const) {
+    const result = await check(fixture(pkg, { ...ENTRY, "dist/index.cjs": "exports.ok = true;\n", [path]: bin(mark) }));
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /; bins start with '#!': zz-cjs; CommonJS bins parse, not loaded: zz-cjs\.\n$/m);
+    assert.equal(existsSync(join(marks, mark)), false, `the ${mark} CommonJS bin ran`);
+    assert.doesNotMatch(result.stderr, /zz CommonJS bin ran/);
+  }
+  const unparsed = await check(fixture(
+    { type: "commonjs", files: ["dist"], main: "./dist/index.cjs", bin: { "zz-cjs": "./dist/serve.js" } },
+    { "dist/index.cjs": "exports.ok = true;\n", "dist/serve.js": "#!/usr/bin/env node\nconst = ;\n" },
+  ));
+  assert.equal(unparsed.code, 1);
+  assert.match(unparsed.stderr, /pack-installs-alone: bin 'zz-cjs' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz doesn't parse \(above\)\.\n$/);
 });
 
 test("a package imported only through another dependency's copy fails, since the install is nested", async () => {
@@ -251,7 +275,7 @@ test("with bun on PATH, a bun target is loaded under bun, and one that doesn't l
   assert.match(loads.stdout, /; loaded '@zz\/fixture' \(import\); loaded under bun: '@zz\/fixture'\.\n$/m);
   const broken = await check(fixture(pkg, { ...ENTRY, "src/index.js": "import './left-out.js';\n" }), BUN_BY_NODE);
   assert.equal(broken.code, 1);
-  assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun, from its bun target, in the installed zz-fixture-1\.0\.0\.tgz failed \(above\)\./);
+  assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun, from its bun target, in the installed zz-fixture-1\.0\.0\.tgz failed \(above\)\. A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or a dependency's new release \(rerun this on main to tell\)\.\n$/);
 });
 
 test("a declaration file the build wrote beside types, left out of files, fails, and exports: null falls back to main", async () => {
@@ -268,11 +292,11 @@ test("a declaration file the build wrote beside types, left out of files, fails,
 
 test("npm pack's JSON is read in npm 12's shape too, and a prepack's output doesn't break it", async () => {
   // npm 12 prints an object keyed by package name: a shim in front of the
-  // real npm rewrites npm 11's array that way.
+  // real npm rewrites npm 11's array that way, and passes npm 12's through.
   const realNpm = execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim();
   const npm12 = shim(
     "npm",
-    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\ntry {\n  const out = execFileSync(${JSON.stringify(realNpm)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] });\n  if (args[0] === "pack" && args.includes("--json")) {\n    const [record] = JSON.parse(out);\n    process.stdout.write(JSON.stringify({ [record.name]: record }));\n  } else process.stdout.write(out);\n} catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`,
+    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\ntry {\n  const out = execFileSync(${JSON.stringify(realNpm)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] });\n  if (args[0] === "pack" && args.includes("--json")) {\n    const parsed = JSON.parse(out);\n    // npm 12 prints the object already; npm 11's array is rewritten.\n    process.stdout.write(Array.isArray(parsed) ? JSON.stringify({ [parsed[0].name]: parsed[0] }) : out);\n  } else process.stdout.write(out);\n} catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`,
   );
   const twelve = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npm12}:`);
   assert.equal(twelve.code, 0, twelve.stderr);
