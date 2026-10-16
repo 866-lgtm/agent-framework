@@ -35,6 +35,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -553,6 +554,61 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.ok(errors.some((e) => e.includes("threw after 1 shard of its body was stored; what was stored counts as written and isn't stored again")
       && e.includes('listener failed')), errors.join('\n'));
     await framework.stop();
+  });
+
+  it('at a tool boundary, the shards that landed before a throw are carried as the next compile renders them', async () => {
+    // Probe by Ansel-2428: the autobiographical strategy shards a long
+    // message on ingest and joins a body's consecutive shards when it
+    // compiles, so the boundary must carry what landed in that shape.
+    const long = Array.from({ length: 60 }, (_, i) => `Sentence ${i} of a long message from Antra.`).join(' ');
+    const ofLong = (messages: Array<{ content: unknown }>) =>
+      messages.filter((m) => JSON.stringify(m.content).includes('Sentence 0 '));
+    for (const throwAt of [2, 3]) {
+      membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Moving.' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse(text('Done.')));
+      const framework = await createFramework({
+        storePath: join(tempDir, `shards-${throwAt}.chronicle`),
+        membrane: membrane.asMembrane(),
+        agents: [{
+          name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.',
+          strategy: new AutobiographicalStrategy({
+            adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30_000, kvStableReachTokens: 8_000,
+            targetChunkTokens: 50,
+          }),
+        } as never],
+      });
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      let shards = 0;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || !(event.message as { bodyGroupId?: string }).bodyGroupId) return;
+        if (++shards === throwAt) throw new Error('listener failed');
+      });
+      module.interjections = [{ participant: 'Antra', content: text(long) }];
+      const error = console.error;
+      console.error = () => {};
+      try {
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
+        assert.equal(landed.length, throwAt, `${throwAt} shards landed before the throw stopped the body`);
+        const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+        // The next turn's request is compiled from the store.
+        membrane.pushResponse(createMockResponse(text('Okay.')));
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        const next = ofLong(membrane.calls.at(-1)!.messages);
+        assert.equal(injected.length, 1, `throw at shard ${throwAt}: one message injected`);
+        assert.equal(next.length, 1, `throw at shard ${throwAt}: one message in the next request`);
+        assert.deepEqual(injected[0]!.content, next[0]!.content, `throw at shard ${throwAt}: the boundary carried what the next compile renders`);
+      } finally {
+        console.error = error;
+        await framework.stop();
+      }
+    }
   });
 
   it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {

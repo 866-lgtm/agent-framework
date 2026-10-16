@@ -493,12 +493,26 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
  *  (empty when addMessage deferred it again; a sharded body's first shard)
  *  and what the store holds of it. `afterThrow` marks an entry whose write
  *  threw after storing it, found in the store and counted as written: its
- *  content is what landed, which for a sharded body can be its first shards
- *  alone. */
+ *  content is what landed, as later compiles render it, which for a sharded
+ *  body can be its first shards alone. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
   afterThrow?: true;
+}
+
+/** What later compiles render from the store for the copies of one write
+ *  that landed: one copy as it is, and two or more, the shards of a sharded
+ *  body, as context-manager's autobiographical strategy (the one that
+ *  shards on ingest) joins a body's consecutive shards: their non-text
+ *  blocks, then one text block of their joined text. The join is that
+ *  strategy's `mergeAdjacentBodyGroupRaw`, which context-manager doesn't
+ *  export, so the rule is copied here, and a test compares the two. */
+function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): ContentBlock[] {
+  if (landed.length === 1) return landed[0]!.content;
+  const blocks = landed.flatMap((m) => m.content);
+  const text = blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+  return [...blocks.filter((b) => b.type !== 'text'), { type: 'text', text } as ContentBlock];
 }
 
 /** Stamp a deferred write's durable id into the metadata it is stored with
@@ -15807,9 +15821,10 @@ export class AgentFramework {
    * its target's store is read from where it stood before the write, for
    * messages carrying the entry's `deferredWriteId`. What it finds counts as
    * written, at most once: the entry isn't requeued and stored a second
-   * time, and what landed is what it returns as the entry's content. For a
-   * sharded body, that can be its first shards alone, since the append loop
-   * stops at the throw; the rest of the body isn't stored. (Requeued, the
+   * time, and what landed, as later compiles render it (asCompiled), is what
+   * it returns as the entry's content. For a sharded body, that can be its
+   * first shards alone, since the append loop stops at the throw; the rest
+   * of the body isn't stored. (Requeued, the
    * landed shards would be stored twice, and only the rest could not be
    * appended later without splitting the body.) Boot's scan for landed
    * writes counts a landed shard the same way.
@@ -15839,7 +15854,7 @@ export class AgentFramework {
       } catch (error) {
         const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
         if (landed.length > 0) {
-          written.set(msg, { id: landed[0]!.id, content: landed.flatMap((m) => m.content), afterThrow: true });
+          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed), afterThrow: true });
           this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
           continue;
         }

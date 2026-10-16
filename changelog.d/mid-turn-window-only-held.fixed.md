@@ -108,8 +108,9 @@
   queue and stored a second time, and at a tool boundary what was stored is
   injected with the rest. For a body the strategy shards, that can be its
   first shards alone, since the throw stops the store's append loop: the
-  rest of the body isn't stored, and the request carries what the store
-  holds. The log line says it was stored, or how many shards were.
+  rest of the body isn't stored, and the request carries what landed, joined
+  as the strategy joins a body's shards when it compiles. The log line says
+  it was stored, or how many shards were.
 - Boot recovery drops a recovered deferred write whose participant isn't
   text, whose content isn't an array, or that holds a block that isn't an
   object, and logs it by id and participant, rather than holding it in the
