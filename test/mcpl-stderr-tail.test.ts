@@ -148,7 +148,7 @@ test('a stderr stream that ends after a newline emits no empty last line', () =>
   assert.deepEqual(lines, ['one', 'two']);
 });
 
-test("a reconnect that fails its handshake reports the server's stderr as `stderrTail`, and the host's log line prints it, each line through log-value", { timeout: 30_000 }, async (t) => {
+test("a connect and a reconnect that fail their handshakes report the server's stderr as `stderrTail`, and the host's log lines print it, each line through log-value", { timeout: 30_000 }, async (t) => {
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const connection = await McplServerConnection.connectWithReconnect(
@@ -163,20 +163,22 @@ test("a reconnect that fails its handshake reports the server's stderr as `stder
     { version: '0.5' },
   );
   t.after(() => connection.close());
-  const failed = new Promise<{ error: string; stderrTail?: string; attempt: number }>((resolve) => {
-    connection.once('reconnect-failed', resolve);
-  });
+  type Failed = { error: string; stderrTail?: string; attempt: number };
+  const connectFailed = new Promise<Failed>((resolve) => { connection.once('connect-failed', resolve); });
+  const reconnectFailed = new Promise<Failed>((resolve) => { connection.once('reconnect-failed', resolve); });
   // The stub holds its lifecycle events until the host says it's ready.
   connection.ready();
-  const event = await within(failed, null);
-  assert.ok(event, 'a reconnect attempt failed within 15 s');
   const failure = 'MCPL server "needs-token" transport closed before handshake completed (child process exited)';
+  const stderr = '. The last of its stderr:\n  stderr: "fatal: DISCORD_TOKEN is not set"';
+  const first = await within(connectFailed, null);
+  assert.ok(first, 'the first connect failed and was reported within 15 s');
+  assert.deepEqual(first, { error: failure, stderrTail: 'fatal: DISCORD_TOKEN is not set', attempt: 0 });
+  assert.ok(logged.includes(`MCPL server "needs-token" initial connect failed, will retry: ${failure}${stderr}`), logged.join('\n'));
+  const event = await within(reconnectFailed, null);
+  assert.ok(event, 'a reconnect attempt failed within 15 s');
   assert.equal(event.error, failure);
   assert.equal(event.stderrTail, 'fatal: DISCORD_TOKEN is not set');
-  assert.ok(
-    logged.includes(`MCPL server "needs-token" reconnect failed: ${failure}. The last of its stderr:\n  stderr: "fatal: DISCORD_TOKEN is not set"`),
-    logged.join('\n'),
-  );
+  assert.ok(logged.includes(`MCPL server "needs-token" reconnect failed: ${failure}${stderr}`), logged.join('\n'));
 });
 
 /** A prototype instance with only what wiring, tracing and opsAlert touch, as
