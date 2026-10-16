@@ -31,9 +31,12 @@ test('a ping on a connected transport is answered with an empty result; a ping n
   const { connection, receive, written } = bareConnection();
   connection.ready();
   receive({ jsonrpc: '2.0', method: 'ping' });
+  // 0 is a server's first id when its ids start at 0.
+  receive({ jsonrpc: '2.0', id: 0, method: 'ping' });
   receive({ jsonrpc: '2.0', id: 1, method: 'ping' });
   receive({ jsonrpc: '2.0', id: 'p-2', method: 'ping' });
   assert.deepEqual(written(), [
+    { jsonrpc: '2.0', id: 0, result: {} },
     { jsonrpc: '2.0', id: 1, result: {} },
     { jsonrpc: '2.0', id: 'p-2', result: {} },
   ]);
@@ -48,59 +51,96 @@ test('a ping is answered at once while the planes are paused, and nothing is hel
   assert.equal((connection as any).bufferedEvents.length, 0);
 });
 
-// A stdio server that pings as soon as initialize arrives, with id 0 (an SDK
-// whose request ids start at 0 sends that), and answers initialize once its
-// pong arrives, or after 2 s without one. Before answering, it writes to
-// stderr whether the pong came.
-const PINGING_SERVER = String.raw`
+// Stdio servers for the handshake. Each records every response the host
+// writes it, by id and by whether it's a pong (an empty result) or an error,
+// and once the pong it waits for has arrived it writes that list to stderr.
+// - pings-first: pings with id 0 as soon as initialize arrives, as a server
+//   whose own request ids start at 0 would, and answers initialize only once
+//   its pong arrives.
+// - one-chunk: as initialize arrives, writes in one chunk a request with id 0
+//   that isn't a ping, a request whose method isn't a string, a ping sent as
+//   a notification, a log notification, its initialize response, and a ping
+//   with the id "late", which the connected transport answers.
+const HANDSHAKE_SERVER = String.raw`
+const mode = process.argv[1];
 let buf = '';
+const responses = [];
+const line = (m) => JSON.stringify(m) + '\n';
+const initResult = (id) => ({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true } } } } });
+const report = () => process.stderr.write('responses:' + JSON.stringify(responses) + '\n');
 let init = null;
-let answered = false;
-const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
-const answer = (pong) => {
-  if (answered) return;
-  answered = true;
-  process.stderr.write('pong:' + (pong ? 'yes' : 'no') + '\n');
-  send({ jsonrpc: '2.0', id: init.id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true } } } } });
-};
 process.stdin.on('data', (c) => {
   buf += c;
   let i;
   while ((i = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, i); buf = buf.slice(i + 1);
-    if (!line.trim()) continue;
-    const m = JSON.parse(line);
+    const text = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!text.trim()) continue;
+    const m = JSON.parse(text);
     if (m.method === 'initialize') {
       init = m;
-      send({ jsonrpc: '2.0', id: 0, method: 'ping' });
-      setTimeout(() => answer(false), 2000);
-    } else if (m.id === 0 && m.method === undefined && init && !answered) {
-      answer(m.result !== undefined && Object.keys(m.result).length === 0 && m.error === undefined);
+      if (mode === 'pings-first') {
+        process.stdout.write(line({ jsonrpc: '2.0', id: 0, method: 'ping' }));
+      } else {
+        process.stdout.write(
+          line({ jsonrpc: '2.0', id: 0, method: 'roots/list' }) +
+          line({ jsonrpc: '2.0', id: 0, method: 5 }) +
+          line({ jsonrpc: '2.0', method: 'ping' }) +
+          line({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'starting' } }) +
+          line(initResult(init.id)) +
+          line({ jsonrpc: '2.0', id: 'late', method: 'ping' }));
+      }
+    } else if (m.method === undefined) {
+      const pong = m.error === undefined && m.result !== null && typeof m.result === 'object' && Object.keys(m.result).length === 0;
+      responses.push(('id' in m ? JSON.stringify(m.id) : '(no id)') + ':' + (pong ? 'pong' : 'error ' + (m.error && m.error.code)));
+      if (mode === 'pings-first' && m.id === 0 && pong) {
+        process.stdout.write(line(initResult(init.id)));
+        report();
+      }
+      if (mode === 'one-chunk' && m.id === 'late') report();
     }
   }
 });
 setInterval(() => {}, 1 << 30);
 `;
 
-test('a ping sent before the initialize response is answered, and is not taken for that response', async () => {
+/** Connects to a HANDSHAKE_SERVER and returns the capabilities the host took
+ *  from the handshake, and the server's stderr report. */
+async function handshakeWith(mode: 'pings-first' | 'one-chunk') {
   const connection = await McplServerConnection.connect(
-    { id: 'pinger', command: process.execPath, args: ['-e', PINGING_SERVER], requestTimeoutMs: 5_000 },
+    { id: 'pinger', command: process.execPath, args: ['-e', HANDSHAKE_SERVER, mode], requestTimeoutMs: 5_000 },
     { version: '0.5' },
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    // stderr is its own pipe, so its line may arrive after the response.
+    // stderr is its own pipe, so its line may arrive after the response; the
+    // wait ends at the line, with 10 s as its outer bound.
     const said = new Promise<string>((resolve, reject) => {
       timer = setTimeout(() => reject(new Error('the server wrote nothing to stderr within 10 s')), 10_000);
       connection.once('stderr', ({ line }: { line: string }) => resolve(line));
     });
     said.catch(() => {});
     connection.ready();
-    // The initialize response, not the ping, set the capabilities.
-    assert.equal(connection.capabilities?.pushEvents, true);
-    assert.equal(await said, 'pong:yes');
+    const capabilities = connection.capabilities;
+    return { capabilities, report: await said };
   } finally {
     clearTimeout(timer);
     await connection.close();
   }
+}
+
+test('a ping sent before the initialize response is answered, and is not taken for that response', async () => {
+  const { capabilities, report } = await handshakeWith('pings-first');
+  // The initialize response, which the server sent only after its pong, set the capabilities.
+  assert.equal(capabilities?.pushEvents, true);
+  assert.equal(report, 'responses:["0:pong"]');
+});
+
+test('during the handshake nothing that carries a method is taken for the initialize response, and only pings are answered', async () => {
+  const { capabilities, report } = await handshakeWith('one-chunk');
+  // Neither request with id 0 was taken for the response.
+  assert.equal(capabilities?.pushEvents, true);
+  // Nothing during the handshake was answered, the ping notification
+  // included; the ping after the response, held while the connection
+  // subscribed, was answered by the connected transport.
+  assert.equal(report, 'responses:["\\"late\\":pong"]');
 });
