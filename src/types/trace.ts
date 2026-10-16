@@ -565,13 +565,18 @@ export type TraceEvent =
       serverId: string;
       /** Connection event name, e.g. channels-register or push-event. */
       event: string;
-      /** Absent for notifications. */
+      /** The request's id when it is a number, or a string id bounded as the
+       *  other texts here are: control, format and line-separator characters
+       *  replaced, and cut at 500 code points. Absent for a notification, for
+       *  a request whose id is neither, and for a request form of
+       *  mcpl/manifestChanged or tools/list_changed, which is answered as
+       *  it's admitted and then handled as the notification is. */
       requestId?: string | number;
       /** Whether the handler's own reply may have reached the server: true
        *  once it attempted one, unless the attempt failed while encoding,
        *  before any bytes were written. When it's false and a responder was
-       *  given, the host answered -32603 "Internal error" itself, unless
-       *  `responseError` says that reply failed. */
+       *  given, the host answered -32603 "Internal error" itself, or -32000
+       *  while it stops, unless `responseError` says that reply failed. */
       responseAttempted: boolean;
       /** The handler's own error when it threw or rejected; otherwise the
        *  reply write that failed and that it swallowed, or that it tried to

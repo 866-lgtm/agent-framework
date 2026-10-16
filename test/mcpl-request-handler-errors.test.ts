@@ -334,7 +334,7 @@ test('a swallowed pre-write encoding failure still receives a fallback response'
   assert.equal(failureTraces(traces)[0].responseAttempted, false);
 });
 
-test('a real transport write failure remains single-attempt after serialization', async () => {
+test('a transport write that throws remains single-attempt after serialization', async () => {
   const { framework, traces, transport, request } = wireHarness();
   framework.handleHostCommand = async () => ({ maintained: true });
   transport.failWrite = true;
@@ -378,13 +378,35 @@ for (const mode of ['handshake', 'connected', 'throwing-listener']) {
   });
 }
 
-test('a separate stdio host whose server answers initialize with an error message no template can convert is refused at once, and survives', () => {
+test('a separate stdio host whose server answers initialize with an error message no template can convert is refused well before the handshake times out, and survives', () => {
   const probe = spawnSync(process.execPath, [
     '--import', 'tsx', fileURLToPath(new URL('./fixtures/mcpl-initialize-error-probe.mjs', import.meta.url)),
   ], { encoding: 'utf8', timeout: 120_000 });
   assert.equal(probe.error, undefined);
   assert.equal(probe.status, 0, probe.stderr);
   assert.match(probe.stdout, /refused/);
+});
+
+test("an initialize error's message is bounded, as a server's text in the framework's errors is", { timeout: 30_000 }, async () => {
+  // Its message has a line break and runs past 200 code points.
+  const server = String.raw`
+let input = '';
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+  let end;
+  while ((end = input.indexOf('\n')) >= 0) {
+    const request = JSON.parse(input.slice(0, end));
+    input = input.slice(end + 1);
+    if (request.method === 'initialize') {
+      process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:request.id, error:{code:-32603, message:'first line\nsecond' + 'x'.repeat(300)}}) + '\n');
+    }
+  }
+});
+`;
+  await assert.rejects(
+    McplServerConnection.connect({ id: 'srv', command: process.execPath, args: ['-e', server] }, { version: '0.5' }),
+    { message: `MCPL server "srv" initialize error: first line?second${'x'.repeat(183)}…` },
+  );
 });
 
 for (const value of [null, 42, 'hi', true, []]) {
@@ -627,7 +649,7 @@ test('a dispatch failure names the event, the request and what failed', (t) => {
   assert.ok(logged.includes('[mcpl] srv: inbound dispatch failed for channels-list (request 41): "listener exploded"'), logged.join('\n'));
 });
 
-test('a manifest refresh that fails is reported as a handler failure', async (t) => {
+test('a manifest-changed handler that throws is reported as a handler failure', async (t) => {
   const { framework, connection, traces } = harness();
   t.mock.method(console, 'error', () => {});
   framework.handleManifestChanged = async () => { throw new Error('manifest fetch failed'); };
@@ -640,25 +662,47 @@ test('a manifest refresh that fails is reported as a handler failure', async (t)
   assert.match(failures[0].error, /manifest fetch failed/);
 });
 
-test('mcpl/manifestChanged and tools/list_changed sent as requests are answered at once with an empty result, whatever the refresh does', async (t) => {
+test('a manifest fetch that fails is only logged, as in 0.22.x: the previous manifest stands, and no handler failure is reported', async (t) => {
+  const { framework, connection, traces } = harness();
+  const errors = t.mock.method(console, 'error', () => {});
+  framework.manifestRefreshState = new Map();
+  framework.mcplServerConfigs = new Map([['srv', { id: 'srv' }]]);
+  (connection as any).sendManifestRequest = async () => { throw new Error('the server is gone'); };
+  connection.emit('manifest-changed', { revision: 'r2' });
+  await settle();
+  assert.deepEqual(failureTraces(traces), []);
+  assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0])), [
+    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): the server is gone',
+  ]);
+});
+
+test('mcpl/manifestChanged and tools/list_changed sent as requests are answered with an empty result as they are admitted, whatever their handlers do', async (t) => {
   const { framework, connection, transport, traces } = wireHarness();
   t.mock.method(console, 'error', () => {});
-  framework.handleManifestChanged = async () => { throw new Error('manifest fetch failed'); };
-  const seen: Array<{ answered: number; responder: unknown }> = [];
+  const manifestParams: unknown[] = [];
+  framework.handleManifestChanged = async (_connection: unknown, params: unknown) => {
+    manifestParams.push(params);
+    throw new Error('manifest fetch failed');
+  };
+  const seen: Array<{ answered: number; params: unknown; responder: unknown }> = [];
+  // A listener in place of the framework's tools-list-changed one, to see
+  // when it runs and with what.
   connection.removeAllListeners('tools-list-changed');
-  connection.on('tools-list-changed', (_params: unknown, responder?: unknown) => {
-    seen.push({ answered: transport.lines.length, responder });
+  connection.on('tools-list-changed', (params: unknown, responder?: unknown) => {
+    seen.push({ answered: transport.lines.length, params, responder });
   });
   // An id of 0 makes a request like any other id.
-  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'notifications/tools/list_changed' }));
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'notifications/tools/list_changed', params: { sequence: 4 } }));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'mcpl/manifestChanged', params: { revision: 'r2' } }));
   await settle();
   assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [
     { jsonrpc: '2.0', id: 0, result: {} },
     { jsonrpc: '2.0', id: 0, result: {} },
   ]);
-  // The handler runs as for the notification, with no responder, once the answer is written.
-  assert.deepEqual(seen, [{ answered: 1, responder: undefined }]);
+  // Each is handled as its notification is, with its params and no
+  // responder, once its answer is written.
+  assert.deepEqual(seen, [{ answered: 1, params: { sequence: 4 }, responder: undefined }]);
+  assert.deepEqual(manifestParams, [{ revision: 'r2' }]);
   // The failed manifest refresh is reported, and answers nothing more.
   const failures = failureTraces(traces);
   assert.equal(failures.length, 1);
@@ -684,6 +728,52 @@ test('a request form that arrives before the framework wires the connection is a
   assert.deepEqual(seen, [undefined]);
 });
 
+function stagedHarness() {
+  const transport = new ResponseTransport();
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  const { framework } = harness(connection);
+  const refreshed: Array<{ revision?: string }> = [];
+  framework.handleManifestChanged = async (_connection: unknown, params: { revision?: string }) => { refreshed.push(params); };
+  // The control plane open and the data plane paused, as in a quiesce.
+  connection.readyControlPlane();
+  return { connection, transport, refreshed };
+}
+
+test('a request-form mcpl/manifestChanged held while the data plane is paused is answered, and its params passed on, when the data plane opens', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { connection, transport, refreshed } = stagedHarness();
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'mcpl/manifestChanged', params: { revision: 'r2' } }));
+  await settle();
+  assert.deepEqual(transport.lines, [], 'held: mcpl/manifestChanged is a data-plane event');
+  assert.deepEqual(refreshed, []);
+  connection.ready();
+  await settle();
+  assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 3, result: {} }]);
+  assert.deepEqual(refreshed, [{ revision: 'r2' }]);
+});
+
+test('a request form held at the buffer cap is kept, and answered when its plane opens, while the oldest notifications are dropped', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const { connection, transport, refreshed } = stagedHarness();
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'mcpl/manifestChanged', params: { revision: 'held' } }));
+  // 1,100 notifications pass the cap of 1,000 held events by 101.
+  for (let i = 0; i < 1_100; i++) {
+    transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'mcpl/manifestChanged', params: { revision: `n${i}` } }));
+  }
+  connection.ready();
+  await settle();
+  assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 5, result: {} }]);
+  assert.equal(refreshed.length, 1_000);
+  assert.deepEqual(refreshed.slice(0, 2), [{ revision: 'held' }, { revision: 'n101' }]);
+  assert.deepEqual(refreshed.at(-1), { revision: 'n1099' });
+  assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0])), [
+    '[mcpl] srv: buffered-event cap (1000) — dropped 1 responder-less event(s) while the plane is paused',
+    '[mcpl] srv: buffered-event cap (1000) — dropped 101 responder-less event(s) while the plane is paused',
+    '[mcpl] srv: flushing 1000 buffered event(s) synchronously (long pause backlog; 101 dropped at cap)',
+  ]);
+});
+
 test('with nothing listening for them, their request forms are still answered -32601', (t) => {
   const transport = new ResponseTransport();
   const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
@@ -696,6 +786,21 @@ test('with nothing listening for them, their request forms are still answered -3
     { jsonrpc: '2.0', id: 0, error: { code: -32601, message: 'Method not found' } },
     { jsonrpc: '2.0', id: 0, error: { code: -32601, message: 'Method not found' } },
   ]);
+});
+
+test('a failed request is answered -32603 with its own id, while its trace bounds a string id and leaves out one that is neither a string nor a number', async (t) => {
+  const { framework, traces, transport } = wireHarness();
+  t.mock.method(console, 'error', () => {});
+  framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
+  for (const id of ['a\u0000b\nc\u202e', true]) {
+    transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, method: 'channels/register', params: { channels: [] } }));
+  }
+  await settle();
+  assert.deepEqual(
+    transport.lines.map((line) => JSON.parse(line)).map((reply) => [reply.id, reply.error?.code]),
+    [['a\u0000b\nc\u202e', -32603], [true, -32603]],
+  );
+  assert.deepEqual(failureTraces(traces).map((trace) => trace.requestId), ['a?b?c?', undefined]);
 });
 
 test('the failure trace keeps a request id only when it is a string or a number, and bounds a long string', async (t) => {

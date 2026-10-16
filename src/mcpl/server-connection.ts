@@ -610,8 +610,9 @@ export class McplServerConnection extends EventEmitter {
             // server's `message` can be any JSON value, and one that has no
             // primitive form, such as {"toString":1}, would throw out of this
             // listener after cleanup() has cleared the timeout, leaving the
-            // handshake to wait forever.
-            reject(new Error(`MCPL server "${config.id}" initialize error: ${describeCause(msg.error.message)}`));
+            // handshake to wait forever. It's the server's text in an error's
+            // message, so it's bounded as errors.ts says.
+            reject(new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(describeCause(msg.error.message))}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;

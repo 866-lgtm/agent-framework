@@ -17710,8 +17710,10 @@ export class AgentFramework {
     // §17.3: a manifest-change announcement. Rate-limited re-fetch → diff
     // → §6.7 consequences → one receipt. The announcement itself carries no
     // payload and no authority; everything below acts on FETCHED content.
-    // A notification, contained and reported like every inbound handler: a
-    // refresh that fails emits mcpl:request-handler-error.
+    // A notification, contained like every inbound handler. A manifest fetch
+    // that fails is caught and logged inside handleManifestChanged, and the
+    // previous manifest stands (§17.5); anything else it throws or rejects
+    // with emits mcpl:request-handler-error.
     onRequest('manifest-changed', (params: { revision?: string; domains?: string[] }) =>
       this.handleManifestChanged(connection, params));
 
