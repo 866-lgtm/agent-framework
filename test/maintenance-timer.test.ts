@@ -1397,6 +1397,51 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+
+  it("a maintain whose pass had nothing to run leaves no request for the next pass", { timeout: 10_000 }, async () => {
+    // Gordon-2414's probe. While the agent's own call holds its provider gate,
+    // a maintain's pass queues nothing and records no run, so the next pass,
+    // which nobody asked for and which meets only the failure already
+    // reported, stays out of the history.
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-request-reset-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new FailingStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const internals = framework as unknown as {
+      acquirePrimaryProviderGate(agentName: string): void;
+      releasePrimaryProviderGate(agentName: string): void;
+      startQueuedMaintenance(): void;
+      maintenancePass: Promise<void> | null;
+    };
+    (framework as any).opsAlert = () => {};
+    const quiet = console.error;
+    const quietWarn = console.warn;
+    console.error = () => {};
+    console.warn = () => {};
+    try {
+      framework.start();
+      const first = await framework.maintenanceTick();
+      assert.equal(first.history.length, 1, 'the first maintain reports the failure');
+      internals.acquirePrimaryProviderGate('agent');
+      const second = await framework.maintenanceTick();
+      assert.equal(second.ran, true);
+      assert.equal(second.history.length, 1, 'a pass with nothing queued records no run');
+      internals.releasePrimaryProviderGate('agent');
+      internals.startQueuedMaintenance();
+      await internals.maintenancePass;
+      assert.equal(framework.getContextMaintenanceSnapshot().history.length, 1, 'the repeat nobody asked for stays out of the history');
+    } finally {
+      console.error = quiet;
+      console.warn = quietWarn;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('a pass that took a tick before meeting a failure already reported stays in the history', { timeout: 10_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-repeats-after-work-'));
     const framework = await AgentFramework.create({

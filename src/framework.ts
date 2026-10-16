@@ -730,13 +730,14 @@ function logSeedOmissions(
  * left the queue: it logs "Failed to compress chunk (hierarchical)" with
  * this error and records the call, and the chunk, still uncompressed, is
  * queued again at that manager's next rebuild (its next initialization,
- * message, sent compile or released hold). That holds where the withdrawal
- * leaves the tick: a merge's call, or a chunk's first. One inside
- * context-manager 0.14's compression fallback ladder, after a chunk's first
- * call was refused or cut short, is caught by the rung that made it and
- * recorded as a provider error, since 0.14 rethrows only its own
- * CompressionBranchDiscard there; once every rung has failed, the chunk's
- * request family is quarantined, with its alert, and the tick returns.
+ * message, sent compile or released hold). That holds for every call outside
+ * context-manager 0.14's compression fallback ladder: a merge's, and a
+ * chunk's canonical call with its retries after a tool_use stop. One inside
+ * the ladder, after a chunk's canonical call was refused or cut short, is
+ * caught by the rung that made it and recorded as a provider error, since
+ * 0.14 rethrows only its own CompressionBranchDiscard there; once every rung
+ * has failed, the chunk's request family is quarantined, with its alert, and
+ * the tick returns.
  */
 class MaintenanceWithdrawnError extends Error {
   constructor(reason: string) {
