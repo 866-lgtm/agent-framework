@@ -2127,6 +2127,20 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null);
   });
 
+  test('a listing, and an agent-action scan, prove a deletion in a directory larger than the cap too', async (t) => {
+    for (const via of ['ls', 'agent-action'] as const) {
+      const env = new Env(t);
+      const m = await env.open({ walkCap: 2, ...(via === 'agent-action' ? { watch: 'on-agent-action' } : {}) });
+      for (const f of ['big/a.txt', 'big/b.txt', 'big/c.txt', 'big/d.txt', 'big/e.txt']) await seedSynced(env, m, f, f);
+      env.rmDisk('big/e.txt');
+      // Each takes a.txt and b.txt; big's listing, read whole, lacks e.txt.
+      if (via === 'ls') await call(m, 'ls', { path: 'work/big' });
+      else await m.onToolBatchComplete('agent');
+      assert.equal(env.store.treeGet(TREE, 'big/e.txt'), null, via);
+      assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null, via);
+    }
+  });
+
   test('a listing starts at its scope every time, and leaves no place behind', async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);
