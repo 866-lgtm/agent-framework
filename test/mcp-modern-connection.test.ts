@@ -183,6 +183,16 @@ test('a first connect that fails keeps retrying with reconnect, and close stops 
   void dir;
 });
 
+test('a modern stdio server whose command can\'t be spawned fails its connect at once, with its spawn error (R1-4)', async () => {
+  const began = Date.now();
+  await assert.rejects(
+    ModernMcpConnection.connect({ id: 'typo', command: 'no-such-command-r1-4', protocol: 'modern' }),
+    /^Error: MCPL server "typo" could not be started: spawn no-such-command-r1-4 ENOENT$/,
+  );
+  const tookMs = Date.now() - began;
+  assert.ok(tookMs < 5000, `failed after ${tookMs} ms, not at the discover probe's 30 s timeout`);
+});
+
 test('configuration mistakes throw before anything is launched', async () => {
   // x.invalid never resolves, so a dial would fail with a connect error instead.
   await assert.rejects(ModernMcpConnection.connect({ id: 'x', url: 'https://x.invalid/mcp', protocol: 'modern' }), /applies only to stdio/);
