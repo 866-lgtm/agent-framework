@@ -3012,11 +3012,12 @@ export class WorkspaceModule implements Module {
    * on disk (a shell command's files, a deletion) is in the workspace when the
    * agent next looks. On a mount over its walkCap, that holds for the first
    * walkCap entries in the walk's order, which every batch's scan takes; files
-   * past them come in through syncs, and the listings and reads that reach
-   * them. A scan that outlasts the deadline stops holding the
-   * round: the miss is recorded on the mount's status and pushed as a
-   * `workspace:agent-action-scan-incomplete` event, and the scan continues,
-   * deciding on the branch selected when it applies.
+   * past them come in through syncs and the listings that reach them, while a
+   * read takes in only a file the workspace doesn't hold yet. A scan that
+   * outlasts the deadline stops holding the round: the miss is recorded on
+   * the mount's status and pushed as a `workspace:agent-action-scan-incomplete`
+   * event, and the scan continues, deciding on the branch selected when it
+   * applies.
    */
   async onToolBatchComplete(_agentName?: string): Promise<void> {
     // Every agent's workspace is the store's current branch, so the agent

@@ -2244,6 +2244,15 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.match(skipped?.reason ?? '', /not visited: the walk cap \(1\) was reached/, JSON.stringify(synced.skipped));
   });
 
+  test("the sync tool's description says how the walk takes turns", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({});
+    const sync = m.getTools().find((tool: { name: string }) => tool.name === 'sync');
+    assert.ok(sync);
+    assert.match(sync.description, /the next sync of the same mount or directory picks up where the last turn stopped/);
+    assert.match(sync.description, /its own catch-up scan, at start and when its watcher reattaches, takes turns with its whole-mount syncs/);
+  });
+
   test("a watched mount's capped sync names its catch-up scan as the other turn", async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt']) env.writeDisk(f, f);
