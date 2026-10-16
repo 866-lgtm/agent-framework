@@ -139,11 +139,14 @@ never do.
   which refuses a tag with no matching changelog section, checks in a job
   of its own that the packed release installs on its own
   (`node scripts/pack-installs-alone.mjs` packs it, installs the tarball
-  alone into an empty directory with its dependencies from npm, checks
-  that every file `package.json` names is in it, loads each entry point and
-  checks each bin's `#!` line; to run it by hand, `npm run build` first,
-  for example before `git push --follow-tags`, or dispatch the workflow on
-  a branch, where it publishes nothing), publishes
+  alone into an empty directory with its dependencies from npm, nested so
+  the package reaches only its own, checks that every file `package.json`
+  names is in it, declaration files included, loads each entry point under
+  Node and, with bun on PATH, its `bun` target under bun, and checks that
+  each bin has its `#!` line and that a node bin's imports load, without
+  running it; to run it by hand, `npm run build` first, for example before
+  `git push --follow-tags`, or dispatch the workflow on a branch, where it
+  publishes nothing), publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
   creates the GitHub release with that section as its notes. The two
   release jobs are independent: some consumers run github-clone checkouts,
