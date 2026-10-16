@@ -521,6 +521,60 @@ describe('framework code_execution integration (real python3)', () => {
     }
   });
 
+  it('a module tool that returns a string hands the script that string, not its JSON encoding', async () => {
+    // The tool contract: a script's tool function returns "the same text the
+    // tool would have returned to you directly". For a string result that
+    // is the string itself, newlines and quotes intact.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    class ListingModule extends ScriptToolModule {
+      override getTools(): ToolDefinition[] {
+        return [...super.getTools(), {
+          name: 'listing',
+          description: 'A line-per-item listing.',
+          inputSchema: { type: 'object', properties: {} },
+        }];
+      }
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('listing')) return { success: true, data: listing };
+        return super.handleToolCall(call);
+      }
+    }
+    const { tempDir, storePath } = tempStorePath('pytc-string-');
+    const membrane = new MockMembrane();
+    const code = [
+      'r = await test__listing({})',
+      'lines = r.split("\\n")',
+      'print("count:", len(lines))',
+      'print("second:", lines[1])',
+      'print("quoted:", r.startswith(\'"\'))',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_ce_str', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const framework = await createFrameworkWithCodeExecution(storePath, membrane, new ListingModule());
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      const out = JSON.parse(wireResult.content) as { stdout: string; return_code: number };
+      assert.strictEqual(out.return_code, 0, wireResult.content);
+      assert.match(out.stdout, /count: 2\n/);
+      assert.match(out.stdout, /second: \[review\] org\/repo#1 "Fix it"\n/);
+      assert.match(out.stdout, /quoted: False/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('two code_execution calls in one response: one runs, the other is refused, the turn completes', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-two-');
     const membrane = new MockMembrane();
