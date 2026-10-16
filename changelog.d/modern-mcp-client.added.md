@@ -7,8 +7,9 @@
   paths as any MCPL server's. It has no MCPL surface: no grant, push,
   channels, inference requests, quiesce plane or awareness gate. MCPL policy
   that asks for that surface on one is a configuration error, such as
-  `enabledFeatureSets` or `allowHostCommands: true`. Policy that only takes
-  something away or repeats a default, such as `disabledCapabilities`, is
+  `allowHostCommands: true` or a scope's `whitelist`. Policy that only takes
+  something away or repeats a default, such as `disabledCapabilities` or an
+  allow-list like `enabledFeatureSets`, is
   accepted as already satisfied, so a host that puts a deny-list on every
   server it deploys can deploy a modern one. A modern `requestTimeoutMs`
   outside 1..2^31−1 is a configuration error too, since 0 means "time out

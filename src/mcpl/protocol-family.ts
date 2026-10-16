@@ -22,6 +22,7 @@
  * isn't `initialize`), the SDK's stdio probe launches the server twice, and a
  * server's era is a stable fact its configuration can state.
  */
+import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
 import type { McplServerConfig, ScopeConfig } from './types.js';
 
@@ -379,13 +380,17 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * The parts of a configuration's MCPL policy whose values grant something,
- * by path, such as `allowHostCommands`, `scopes.<set>.whitelist` or
- * `autofetch.maxBytes`: each asks for behaviour only an MCPL server can have.
- * A modern server has none, so such a value can't apply there, and is
- * refused rather than ignored, so that an operator who chose it learns so.
+ * by path, such as `allowHostCommands`, `scopes.<set>.whitelist`,
+ * `enabledCapabilities: toolLifecycle.observe` or `autofetch.maxBytes`: each
+ * asks for behaviour only an MCPL server can have. A modern server has none,
+ * so such a value can't apply there, and is refused rather than ignored, so
+ * that an operator who chose it learns so.
  *
  * A value that only takes something away, or repeats a default, is already
- * satisfied on a modern server and isn't listed: `disabledFeatureSets`,
+ * satisfied on a modern server and isn't listed: `enabledFeatureSets`, an
+ * allow-list over every declared set (`feature-set-manager.ts`);
+ * `enabledCapabilities` patterns that match no path denied by default, since
+ * elsewhere it is an allow-list too; `disabledFeatureSets`,
  * `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
  * 'manual'` (the default), `toolLifecycle` with only `maxInputBytes` or
  * with an `observe` or `inputs` that isn't a policy object (which grants
@@ -396,8 +401,18 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  */
 export function mcplPolicyGrants(config: McplServerConfig): string[] {
   const grants: string[] = [];
-  for (const field of ['enabledFeatureSets', 'enabledCapabilities', 'allowHostCommands'] as const) {
-    if (isEffective(config[field])) grants.push(field);
+  if (isEffective(config.allowHostCommands)) grants.push('allowHostCommands');
+  // An allow-list, except that a pattern matching a path denied by default
+  // grants it (computeGrant's explicitlyEnabled), named by the path.
+  const enabled = config.enabledCapabilities as unknown;
+  if (Array.isArray(enabled)) {
+    for (const path of DENY_BY_DEFAULT) {
+      if (enabled.some((pattern) => typeof pattern !== 'string' || capabilityPatternMatches(pattern, path))) {
+        grants.push(`enabledCapabilities: ${path}`);
+      }
+    }
+  } else if (isEffective(enabled)) {
+    grants.push('enabledCapabilities');
   }
   if (config.channelSubscription !== 'manual' && isEffective(config.channelSubscription)) grants.push('channelSubscription');
   if (isPlainRecord(config.scopes)) {

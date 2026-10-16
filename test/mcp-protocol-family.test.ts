@@ -146,8 +146,8 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
   const modern = (c: Partial<McplServerConfig>) => cfg({ url: 'https://x/mcp', ...c });
   // Each value that asks for MCPL behaviour is refused, naming the part that grants.
   const granting: Array<[Partial<McplServerConfig>, string]> = [
-    [{ enabledFeatureSets: ['a'] }, 'enabledFeatureSets'],
-    [{ enabledCapabilities: ['pushEvents'] }, 'enabledCapabilities'],
+    [{ enabledCapabilities: ['toolLifecycle.observe'] }, 'enabledCapabilities: toolLifecycle.observe'],
+    [{ enabledCapabilities: ['contextHooks.beforeInference.inject.*'] }, 'enabledCapabilities: contextHooks.beforeInference.inject.system'],
     [{ allowHostCommands: true }, 'allowHostCommands'],
     [{ channelSubscription: 'auto' }, 'channelSubscription'],
     [{ channelSubscription: ['general'] }, 'channelSubscription'],
@@ -157,6 +157,13 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
     [{ autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES + 1 } }, 'autofetch.maxBytes'],
     [{ autofetch: { maxTotalBytes: DEFAULT_MAX_TOTAL_BYTES + 1 } }, 'autofetch.maxTotalBytes'],
   ];
+  // Patterns reaching every path denied by default name each. A `*` matches
+  // one segment, and counts must agree (capabilityPatternMatches).
+  assert.deepEqual(mcplPolicyGrants(modern({ enabledCapabilities: ['*.*', '*.*.*.*'] })), [
+    'enabledCapabilities: contextHooks.beforeInference.inject.system',
+    'enabledCapabilities: toolLifecycle.observe',
+    'enabledCapabilities: toolLifecycle.inputs',
+  ]);
   for (const [config, path] of granting) {
     assert.deepEqual(mcplPolicyGrants(modern(config)), [path], path);
     const problems = serverConfigProblems(modern(config));
@@ -169,6 +176,13 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
     // connectome-host's overlay route stamps this on every server it deploys.
     { disabledCapabilities: ['contextHooks', 'inferenceLifecycle', 'inferenceRequest', 'toolLifecycle'] },
     { disabledFeatureSets: ['b'] },
+    // Allow-lists: absent, every declared set or advertised capability is a
+    // candidate, so a list can only narrow, except where it names a path
+    // denied by default.
+    { enabledFeatureSets: ['a'] },
+    { enabledCapabilities: ['pushEvents', 'contextHooks.afterInference'] },
+    // A one-segment `*` reaches no path denied by default.
+    { enabledCapabilities: ['*'] },
     { scopes: { files: { blacklist: ['write:*'] } } },
     { channelSubscription: 'manual' },
     { toolLifecycle: { maxInputBytes: 1024 } },

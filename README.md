@@ -301,14 +301,16 @@ shows its `family`, `protocolVersion` and `transport`. Its config differs in
 three ways:
 - It has no MCPL surface (grant, push, channels, inference requests, feature
   sets). A setting that asks for that surface can't apply, so it is a
-  configuration error: `enabledFeatureSets`, `enabledCapabilities`,
-  `allowHostCommands: true`, `channelSubscription` other than `'manual'`, a
-  scope's `whitelist`, a `toolLifecycle` `observe` or `inputs` block, and an
-  `autofetch` bound above its default. A setting that only takes something
-  away, or repeats a default, is already satisfied, so it is accepted:
-  `disabledFeatureSets`, `disabledCapabilities`, a scope's `blacklist`,
-  `channelSubscription: 'manual'`, `toolLifecycle.maxInputBytes`, an
-  `autofetch` bound at or below its default, and `shouldTriggerInference`.
+  configuration error: `allowHostCommands: true`, an `enabledCapabilities`
+  pattern that names a path denied by default, `channelSubscription` other
+  than `'manual'`, a scope's `whitelist`, a `toolLifecycle` `observe` or
+  `inputs` block, and an `autofetch` bound above its default. A setting
+  that only takes something away, or repeats a default, is already
+  satisfied, so it is accepted: `enabledFeatureSets` and the rest of
+  `enabledCapabilities`, which are allow-lists, `disabledFeatureSets`,
+  `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
+  'manual'`, `toolLifecycle.maxInputBytes`, an `autofetch` bound at or
+  below its default, and `shouldTriggerInference`.
   So a host that puts a deny-list on every server it deploys can deploy a
   modern one.
 - `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
