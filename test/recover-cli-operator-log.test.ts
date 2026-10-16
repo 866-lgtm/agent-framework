@@ -15,10 +15,10 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
-import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
+import { DISCORD_AWARENESS_RECORD_TYPE, DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import type { OperatorLogEntry } from '../src/operator-log.js';
 
 const CLI = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
@@ -291,6 +291,65 @@ test('a control still acts when the operator log can\'t be written, and says the
     } finally {
       reopened.close();
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a list or a control on a journal that can't be read is refused, saying running it again changes nothing until it can be", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    // An entry a later build wrote.
+    store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { v: 99, records: [] });
+    store.close();
+    const refusal = /^\[agent-framework-recover\] The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read \(Discord awareness journal entry \S+ is in format 99, which this build can't read \(it reads format 1\); a later build wrote it\), so nothing is listed or changed\. Running this again changes nothing until both can be read: an entry a later build wrote, a corrupt entry, or a pre-journal ledger that can't be read stays so, and stops the next start too, until a build that reads that entry's format runs, or the entry or the ledger is repaired$/m;
+    const listed = recover(storePath, '--awareness', 'list');
+    assert.equal(listed.status, 1);
+    assert.match(listed.stderr, refusal);
+    const cancelled = recover(storePath, '--awareness', 'cancel', 'some-batch');
+    assert.equal(cancelled.status, 1);
+    assert.match(cancelled.stderr, refusal);
+    const [refused, ...rest] = operatorLog(storePath);
+    assert.equal(rest.length, 0);
+    assert.equal(refused.kind, 'awareness-cancel');
+    assert.match(refused.error ?? '', /^The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an offline recovery whose resume journal couldn't be closed records what's left of it in the operator log", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'keep' }], { ...ref('m-keep') });
+    cm.addMessage('user', [{ type: 'text', text: 'hide me' }], { ...ref('m-a') });
+    cm.addMessage('user', [{ type: 'text', text: 'anchor' }], { ...ref('m-current') });
+    cm.close();
+    store.close();
+    // Loaded into the CLI's process before it runs: every activation there
+    // settles as not scheduled. The module is the one the CLI imports.
+    const preload = join(dir, 'settle-not-scheduled.mjs');
+    writeFileSync(preload, [
+      `import { DiscordAwarenessOutbox } from ${JSON.stringify(new URL('../src/recovery/discord-awareness-outbox.js', import.meta.url).href)};`,
+      "DiscordAwarenessOutbox.prototype.settleActivation = () => ({ status: 'not-scheduled', error: 'injected activation failure' });",
+    ].join('\n'));
+    const run = spawnSync(process.execPath, [
+      '--import', pathToFileURL(preload).href, CLI, '--store', storePath,
+      '--agent', 'cairn', '--message-id', 'm-current', '--suppress', 'm-a', '--branch', 'recovery/cairn/close',
+    ], { encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+    const [recorded, ...rest] = operatorLog(storePath);
+    assert.equal(rest.length, 0);
+    assert.equal(recorded.kind, 'recovery');
+    assert.match(
+      String((recorded.result as { suppressionJournal?: unknown } | undefined)?.suppressionJournal),
+      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it was retired instead, so nothing is left to resume$/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

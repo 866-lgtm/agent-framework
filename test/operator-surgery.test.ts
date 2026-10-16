@@ -385,7 +385,8 @@ describe('live operator surgery', () => {
       await assert.rejects(
         framework.suppressMessages('scout', { messageIds: [s0] }),
         (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
-          && /active branch restored to main/.test(e.message) && /injected/.test(e.message),
+          && /^Suppression failed on suppress\/\S+, which is kept for diagnosis: it may be partly suppressed, so don't serve from it, and delete it once it has been looked at, since nothing refuses a switch onto it once its awareness batch is retired; active branch restored to main/.test(e.message)
+          && /injected/.test(e.message),
       );
     } finally {
       c.removeMessages = original;
@@ -399,8 +400,9 @@ describe('live operator surgery', () => {
 
     // The reproduction from review: open the failed fork, restart the host.
     // Before the fix, the orphaned prepared batch re-ran the failed removal
-    // at boot and AgentFramework.create() threw.
-    await cm().switchBranch(fork!.name);
+    // at boot and AgentFramework.create() threw. Nothing refuses the switch,
+    // as the error says: the batch was retired once the source came back.
+    await framework.switchBranch(fork!.name);
     await framework.stop();
     framework = await AgentFramework.create({
       storePath,

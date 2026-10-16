@@ -237,8 +237,8 @@ export async function createOfflineRecoveryBranch(
     if (claimed.length > 0) {
       throw new Error(
         `Recovery branch ${targetBranch} is the target of suppression ${claimed[0].id}, whose removals aren't ` +
-          'finished: a start on a branch with that name would apply them there. Choose another --branch. The name ' +
-          'is free once a start finds no branch with it and gives the suppression up',
+          'recorded as finished: a start on a branch with that name would apply them there. Choose another ' +
+          '--branch. The name is free once a start finds no branch with it and gives the suppression up',
       );
     }
     const batch = outbox.prepare({
@@ -301,10 +301,17 @@ export async function createOfflineRecoveryBranch(
         ? '. To apply its marks, run the recovery again onto a new --branch, choosing them again' : '';
       if (batch) {
         if (!sourceConfirmed) {
+          // The recovery starts from the store's current branch, which this
+          // one couldn't put back: a run from there would start from the fork.
+          const redoFromSource = batch.refs.length > 0
+            ? `. To apply its marks, redo it from ${sourceBranch}, choosing them again: the recovery starts from the ` +
+              `store's current branch, which isn't ${sourceBranch} now, so switch to ${sourceBranch} first through the ` +
+              'host API\'s branch.switch, then run the recovery again onto a new --branch with the host stopped'
+            : '';
           retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: ` +
             (suppression.intervals.length > 0
               ? `a start on ${targetBranch} finishes its removals and retires it`
-              : 'the next start retires it') + `, none of its marks sent${redo}`;
+              : 'the next start retires it') + `, none of its marks sent${redoFromSource}`;
         } else {
           try {
             outbox.discard(batch.id);
@@ -356,18 +363,31 @@ export async function createOfflineRecoveryBranch(
     if (batch) {
       const settled = outbox.settleActivation(batch.id);
       if (batch.refs.length > 0) {
+        // A queued settlement's error: recorded, so delivered, but its sync
+        // failed, as the host's receipt says too.
         markers = settled.status === 'queued'
-          ? { ...facts, status: 'queued', queued: settled.queued, batchId: batch.id }
+          ? {
+            ...facts, status: 'queued', queued: settled.queued, batchId: batch.id,
+            ...(settled.error === undefined ? {} : { error: settled.error }),
+          }
           : settled.status === 'not-scheduled'
             ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
             : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
-      } else if (settled.status !== 'queued') {
+      } else if (settled.status === 'queued') {
         // A suppression-only batch carries no marks, and its activation
-        // closes the body's resume journal: if that failed, say what's left.
+        // closes the body's resume journal: say if that record's sync failed.
+        if (settled.error !== undefined) {
+          suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) is closed, but the ` +
+            `journal's sync after it failed (${settled.error}): a host or power failure before the store's next ` +
+            `sync could lose that record, and a start on ${targetBranch} then finds its removals applied and closes it`;
+        }
+      } else {
+        // If closing it failed, say what's left.
         suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) could not be closed ` +
           `(${settled.error}); ` + (settled.status === 'not-scheduled'
             ? 'it was retired instead, so nothing is left to resume'
-            : `it stays prepared, and a start on ${targetBranch} finds its removals applied and closes it`);
+            : 'unless its closing record reached the store unseen, it stays prepared, and a start on ' +
+              `${targetBranch} finds its removals applied and closes it`);
       }
     }
     return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionJournal ? { suppressionJournal } : {}) };

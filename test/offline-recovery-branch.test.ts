@@ -455,7 +455,8 @@ test('a failed offline suppression retires its batch once the source is confirme
       }),
       // One instruction for the kept branch: a start on it finishes the
       // suppression, so it isn't called unsafe to start.
-      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
+      // The redo starts from the source, which isn't the store's current branch.
+      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent\. To apply its marks, redo it from main, choosing them again: the recovery starts from the store's current branch, which isn't main now, so switch to main first through the host API's branch\.switch, then run the recovery again onto a new --branch with the host stopped$/,
     );
     assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
   } finally {
@@ -494,11 +495,13 @@ test('a failed offline suppression whose branch was never made says the next sta
   }
 });
 
-test('an offline suppression whose resume journal could not be closed says what is left of it', async () => {
+test('an offline suppression whose resume journal could not be closed, or whose closing sync failed, says what is left of it', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-unclosed-'));
   const storePath = join(dir, 'agent.chronicle');
   const settleActivation = DiscordAwarenessOutbox.prototype.settleActivation;
-  try {
+  // Each case on a fresh store, since a recovery leaves its fork current.
+  const recoverWith = async (settled: ReturnType<typeof settleActivation>, marks: 'none' | { scope: 'all' }) => {
+    rmSync(storePath, { recursive: true, force: true });
     const store = JsStore.openOrCreate({ path: storePath });
     const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
     cm.addMessage('user', [{ type: 'text', text: 'keep' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-keep' });
@@ -506,18 +509,36 @@ test('an offline suppression whose resume journal could not be closed says what 
     cm.addMessage('user', [{ type: 'text', text: 'anchor' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current' });
     cm.close();
     store.close();
-    DiscordAwarenessOutbox.prototype.settleActivation = function () {
-      return { status: 'unresolved', error: 'injected activation failure' };
-    };
-    // No marks: the batch is the suppression's resume journal alone.
-    const result = await createOfflineRecoveryBranch({
-      storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'], branchName: 'recovery/cairn/close',
+    DiscordAwarenessOutbox.prototype.settleActivation = function () { return settled; };
+    return createOfflineRecoveryBranch({
+      storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'], branchName: 'recovery/cairn/close', marks,
     });
-    assert.equal(result.markers?.status, 'none');
+  };
+  try {
+    // No marks: the batch is the suppression's resume journal alone.
+    const unresolved = await recoverWith({ status: 'unresolved', error: 'injected activation failure' }, 'none');
+    assert.equal(unresolved.markers?.status, 'none');
     assert.match(
-      result.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, and a start on recovery\/cairn\/close finds its removals applied and closes it$/,
+      unresolved.suppressionJournal ?? '',
+      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); unless its closing record reached the store unseen, it stays prepared, and a start on recovery\/cairn\/close finds its removals applied and closes it$/,
     );
+    const retired = await recoverWith({ status: 'not-scheduled', error: 'injected activation failure' }, 'none');
+    assert.match(
+      retired.suppressionJournal ?? '',
+      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it was retired instead, so nothing is left to resume$/,
+    );
+    const unsynced = await recoverWith({ status: 'queued', queued: 0, error: 'injected sync failure' }, 'none');
+    assert.match(
+      unsynced.suppressionJournal ?? '',
+      /^the resume journal \(awareness batch \S+, no marks\) is closed, but the journal's sync after it failed \(injected sync failure\): a host or power failure before the store's next sync could lose that record, and a start on recovery\/cairn\/close then finds its removals applied and closes it$/,
+    );
+    const closed = await recoverWith({ status: 'queued', queued: 0 }, 'none');
+    assert.equal(closed.suppressionJournal, undefined, 'a journal closed and synced says nothing');
+    // With marks, the receipt carries a queued settlement's sync error.
+    const marked = await recoverWith({ status: 'queued', queued: 2, error: 'injected sync failure' }, { scope: 'all' });
+    assert.equal(marked.markers?.status, 'queued');
+    assert.equal((marked.markers as { error?: string }).error, 'injected sync failure');
+    assert.equal(marked.suppressionJournal, undefined);
   } finally {
     DiscordAwarenessOutbox.prototype.settleActivation = settleActivation;
     rmSync(dir, { recursive: true, force: true });
@@ -618,7 +639,7 @@ test('an offline recovery onto a name a pending suppression claims is refused, a
     store.close();
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', branchName: 'claimed' }),
-      /^Error: Recovery branch claimed is the target of suppression \S+, whose removals aren't finished: a start on a branch with that name would apply them there\. Choose another --branch\. The name is free once a start finds no branch with it and gives the suppression up$/,
+      /^Error: Recovery branch claimed is the target of suppression \S+, whose removals aren't recorded as finished: a start on a branch with that name would apply them there\. Choose another --branch\. The name is free once a start finds no branch with it and gives the suppression up$/,
     );
     const reopened = JsStore.open({ path: storePath });
     try {

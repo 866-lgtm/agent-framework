@@ -5,6 +5,8 @@ import { JsStore } from '@animalabs/chronicle';
 import { createOfflineRecoveryBranch } from './offline-branch.js';
 import {
   DiscordAwarenessOutbox,
+  DISCORD_AWARENESS_ENTRY_LIFT,
+  boundDiscordAwarenessText,
   defaultDiscordAwarenessOutboxPath,
   type DiscordAwarenessMarks,
 } from './discord-awareness-outbox.js';
@@ -195,8 +197,22 @@ function awareness(options: CliOptions): void {
       legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath!),
     });
     const { verb, target } = options.awareness!;
+    // Every verb reads the journal first, so a journal that can't be read is
+    // refused saying so, and what ends it, before anything else is decided.
+    const view = () => {
+      try {
+        return outbox.view();
+      } catch (error) {
+        throw new Error(
+          'The Discord awareness journal, or the pre-journal ledger it imports (--outbox), can\'t be read ' +
+            `(${boundDiscordAwarenessText(errorMessage(error))}), so nothing is listed or changed. Running this again ` +
+            `changes nothing until both can be read: ${DISCORD_AWARENESS_ENTRY_LIFT}`,
+          { cause: error },
+        );
+      }
+    };
     if (verb === 'list') {
-      console.log(JSON.stringify({ store: options.storePath, batches: outbox.view() }, null, 2));
+      console.log(JSON.stringify({ store: options.storePath, batches: view() }, null, 2));
       return;
     }
     const by = 'agent-framework-recover';
@@ -209,6 +225,7 @@ function awareness(options: CliOptions): void {
     };
     let result: object;
     try {
+      view();
       result = verb === 'cancel' ? outbox.cancel(target!, by)
         : verb === 'retract' ? outbox.retract(target!, by)
         : outbox.release(target!, by);

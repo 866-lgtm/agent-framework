@@ -17,8 +17,10 @@
     requests whose outcome is unknown and imported history that leaves
     outcomes unrecorded.
   - `releaseDiscordAwareness(batch)` queues a held batch: an imported
-    ledger's undelivered work, the only batches held. A batch a pre-release
-    build held for its surgery is refused, and a start retires it.
+    ledger's undelivered work. A batch a pre-release build held for its
+    surgery is held too, and is refused: a start retires it, none of its
+    marks sent, except that one whose suppression's removals are pending on
+    a branch that exists is kept until a start on that branch finishes them.
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for a
     new branch that a suppression with pending removals names as its
     target, cancelled or not: a start on a branch with that name would apply
@@ -26,11 +28,12 @@
     suppression, or a start finds no branch with the name and gives the
     suppression up. Rollback, suppression and the API's `branch.create`
     check their names with it, the offline recovery checks the same set
-    (`pendingSuppressionsFor`), the API's `branch.switch` refuses such a
-    target, and a host that creates branches in the store itself calls it
-    first. A turn undo's branch, whose generated name carries its time,
-    isn't checked. While the journal can't be
-    read it refuses every name (`failed`), and says why and what ends that.
+    (`pendingSuppressionsFor`), the API's `branch.switch` and a redo refuse
+    such a target, and a host that creates branches in the store itself
+    calls it first. A turn undo's branch, whose generated name carries its
+    time, isn't checked. While the journal can't be read it refuses every
+    name, and `branch.switch` and a redo refuse every switch (`failed`),
+    each saying why and what ends that.
 
   Each control that changes the journal (cancel, retract and release) is
   recorded in the operator log. A request the journal won't

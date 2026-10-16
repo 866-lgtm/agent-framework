@@ -423,48 +423,53 @@ const result = await framework.rollbackToMessage('cairn', {
   operations raises one `discord-awareness-delivery` ops alert, and so does
   a start whose reconciliation gives up on any. A JSON-RPC error answer,
   which may come after the server acted, counts as unanswered.
-- **Marks are one-shot.** Switching branches, undo/redo and restarts never
+- **Marks are one-shot.** Switching branches, a redo and restarts never
   request a mark or a removal of their own: what goes out is what a surgery,
-  a hide or turn undo, a release or a retract recorded, and a start's
-  delivery sends what of that hasn't gone out. The journal is an append-only history of requests and
-  their attempts, kept as typed records in the Chronicle store: it survives
-  rollbacks, branch deletion and a killed process, and lives with its store.
-  Each request is written ahead of its dispatch, and a dispatch is admitted
-  from the journal as it is at that moment, so a cancel takes effect even
-  while an earlier request is on the wire. A request written and never
-  answered stays `unknown` in its operation's history and in every receipt's
-  unresolved count, even after a later attempt is confirmed; an operation's
-  status is its latest answer. Between opposite requests for one reaction,
-  the later *authorization* wins, whenever each request was created: a
-  surgery's adds carry the moment of its marks choice, even when activation
-  comes later, so a retract made in between prevails; a release is a new
-  act. A record that certifies a body change (an activation, a completed
-  suppression, a retirement, or the batch a hide or turn undo records after
-  its change) is written only after that change is synced. A journal write
-  the store took but this process can't read back (Chronicle's periodic sync
-  failing inside an append) leaves the journal refusing every read and write
-  until the store is reopened; the next start reads that record with the
-  rest. A `hide` or turn `undo` records its batch and the batch's
-  activation as one entry.
+  a hide or turn undo (the marks chosen for it), a release or a retract
+  recorded, and a start's delivery sends what of that hasn't gone out. The
+  journal is an append-only history of requests and their attempts, kept as
+  typed records in the Chronicle store: it survives rollbacks, branch
+  deletion and a killed process, and lives with its store. Each request is
+  written ahead of its dispatch, and a dispatch is admitted from the journal
+  as it is at that moment, so a cancel takes effect even while an earlier
+  request is on the wire. A request written and never answered stays
+  `unknown` in its operation's history and in every receipt's unresolved
+  count, even after a later attempt is confirmed; an operation's status is
+  its latest answer. Between opposite requests for one reaction, the later
+  *authorization* wins, whenever each request was created: a surgery's adds
+  carry the moment of its marks choice, even when activation comes later, so
+  a retract made in between prevails; a release is a new act. A record that
+  certifies a body change (an activation, a completed suppression, a
+  retirement, or the batch a hide or turn undo records after its change) is
+  written only after that change is synced. A journal write the store took
+  but this process can't read back (Chronicle's periodic sync failing inside
+  an append) leaves the journal refusing every read and write until the
+  store is reopened; the next start reads that record with the rest. A
+  `hide` or turn `undo` records its batch and the batch's activation as one
+  entry.
 - **A start never activates a surgery's marks.** A batch an interrupted
   surgery left (prepared, or held by a pre-release build of this journal) is
-  retired at the next start, none of its marks sent, with a
-  `discord-awareness-not-scheduled` ops alert that names the surgery, its
-  agent and its branches, and the redo that applies the marks: switch to
-  the source, which still has every message the surgery removed, and run
-  the surgery there again onto a new branch name, choosing marks again. An
-  interrupted suppression's removals are still finished, at the first start
-  on its branch, and its batch is retired then. A suppression whose
-  removals are pending and whose branch doesn't exist (its surgery ended
-  before it created it, or it was deleted) is given up with a
-  `discord-awareness-suppression-unfinished` alert, since its removals
-  apply only there. Until a suppression is finished or given up, a
-  rollback, a suppression, an offline recovery or the API's `branch.create`
-  refuses its branch name, cancelled or not, since a start on a branch made
-  under it would apply those removals there. While the journal can't be
-  read, every new branch name is refused (`failed`), since none can be
-  checked; after a write that failed inside the store, a restart, which
-  reopens the store, ends that.
+  retired at the next start, none of its marks sent. One that had marks to
+  apply raises a `discord-awareness-not-scheduled` ops alert that names the
+  surgery, its agent and its branches, and the redo that applies the marks:
+  switch to the source, which still has every message the surgery removed,
+  and run the surgery there again onto a new branch name, choosing marks
+  again. One with none to apply (none chosen, or its marks cancelled) is
+  only logged. An interrupted suppression's removals are still finished, at
+  the first start on its branch, and its batch is retired then. A
+  suppression whose removals are pending and whose branch doesn't exist (its
+  surgery ended before it created it, or it was deleted) is given up with a
+  `discord-awareness-suppression-unfinished` alert, since its removals apply
+  only there. Until a suppression is finished or given up, a rollback, a
+  suppression, an offline recovery or the API's `branch.create` refuses its
+  branch name, cancelled or not, since a start on a branch made under it
+  would apply those removals there. While the journal can't be read, every
+  new branch name is refused (`failed`), since none can be checked; after a
+  write that failed inside the store, a restart, which reopens the store,
+  ends that, and an entry a later build wrote, a corrupt entry or a
+  pre-journal ledger that can't be read stops the next start too, until a
+  build that reads that entry's format runs, or the entry or the ledger is
+  repaired.
 - **Operator controls,** each that changes the journal recorded in the
   operator log (a list or a preview records nothing); once `stop()`
   has begun, cancel, retract and release refuse, like every operator entry
@@ -486,19 +491,21 @@ const result = await framework.rollbackToMessage('cairn', {
     add requests whose outcome is unknown (an unknown removal can't bring a
     mark back) and imported history that leaves outcomes unrecorded;
   - `releaseDiscordAwareness(batch)` queues a held batch: an imported
-    ledger's undelivered work, the only batches held. A batch a pre-release
-    build held for its surgery is refused, and a start retires it;
+    ledger's undelivered work. A batch a pre-release build held for its
+    surgery is held too, and is refused: a start retires it, none of its
+    marks sent, except that one whose suppression's removals are pending on
+    a branch that exists is kept until a start on that branch finishes them;
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
     a new branch that a suppression with pending removals names as its
     target, cancelled or not, since a start on a branch with that name
     would apply them there. Rollback, suppression and the API's
     `branch.create` call it, with marks chosen or not; a host that creates
     branches in the store itself calls it first. The API's `branch.switch`
-    refuses such a target too, since its removals aren't finished, and a
-    turn undo's branch, whose generated name carries its time, isn't
-    checked. While the journal can't
-    be read it refuses every name (`failed`), and says why and what ends
-    that.
+    and a redo refuse such a target too, since its removals aren't recorded
+    as finished, and a turn undo's branch, whose generated name carries its
+    time, isn't checked. While the journal can't be read it refuses every
+    name, and `branch.switch` and a redo refuse every switch (`failed`),
+    each saying why and what ends that.
 
   A request the journal won't carry out (an unknown batch, or one in the
   wrong state) is refused as `invalid`; a failure to read or write the

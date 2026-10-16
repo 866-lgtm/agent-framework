@@ -773,7 +773,7 @@ describe('surgery and awareness marks', () => {
       activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(kept.id), toId: String(kept.id) }],
     })!;
     const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
-      && error.message === `Branch fix-1 is the target of suppression ${first.id}, whose removals aren't finished: a start `
+      && error.message === `Branch fix-1 is the target of suppression ${first.id}, whose removals aren't recorded as finished: a start `
         + 'on a branch with that name would apply them there. Choose another name. fix-1 is free once a start on it '
         + 'finishes the suppression, or a start finds no branch with that name and gives the suppression up';
     await assert.rejects(framework.rollbackToMessage('resident', { messageId: removed[1], branchName: 'fix-1' }), refused);
@@ -844,7 +844,7 @@ describe('surgery and awareness marks', () => {
     const pendingSuppressionsFor = DiscordAwarenessOutbox.prototype.pendingSuppressionsFor;
     DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = function () { throw new Error('injected unreadable journal'); };
     const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
-      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. Calling again changes nothing until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry or a pre-journal ledger that can't be read stays so until it is repaired, and stops the next start too$/.test(error.message);
+      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. Calling again changes nothing until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry a later build wrote, a corrupt entry, or a pre-journal ledger that can't be read stays so, and stops the next start too, until a build that reads that entry's format runs, or the entry or the ledger is repaired$/.test(error.message);
     try {
       await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' }), refused);
       await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'fix-2' }), refused);
