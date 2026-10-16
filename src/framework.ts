@@ -724,20 +724,19 @@ function logSeedOmissions(
  * A maintenance provider call withdrawn because a surgery holds the store, or
  * because stop() has closed provider admission: either is the framework's own
  * doing, and no failure. It sent nothing: it was refused at the provider
- * gate, or woken there from its wait. context-manager counts no attempt for
- * it. A merge keeps its queue entry, so the next tick after the hold, or
- * after the next start, does it again. A chunk's compression has already
- * left the queue: it logs "Failed to compress chunk (hierarchical)" with
- * this error and records the call, and the chunk, still uncompressed, is
- * queued again at that manager's next rebuild (its next initialization,
- * message, sent compile or released hold). That holds for every call outside
- * context-manager 0.14's compression fallback ladder: a merge's, and a
- * chunk's canonical call with its retries after a tool_use stop. One inside
- * the ladder, after a chunk's canonical call was refused or cut short, is
- * caught by the rung that made it and recorded as a provider error, since
- * 0.14 rethrows only its own CompressionBranchDiscard there; once every rung
- * has failed, the chunk's request family is quarantined, with its alert, and
- * the tick returns.
+ * gate, or woken there from its wait. For a call outside context-manager
+ * 0.14's compression fallback ladder, a merge's or a chunk's canonical call
+ * with its retries after a tool_use stop, context-manager counts no attempt.
+ * A merge keeps its queue entry, so the next tick after the hold, or after
+ * the next start, does it again. A chunk's compression has already left the
+ * queue: it logs "Failed to compress chunk (hierarchical)" with this error
+ * and records the call, and the chunk, still uncompressed, is queued again at
+ * that manager's next rebuild (its next initialization, message, sent compile
+ * or released hold). A call inside the ladder, after a chunk's canonical call
+ * was refused or cut short, is caught by the rung that made it and recorded
+ * as a provider error, since 0.14 rethrows only its own
+ * CompressionBranchDiscard there; once every rung has failed, the chunk's
+ * request family is quarantined, with its alert, and the tick returns.
  */
 class MaintenanceWithdrawnError extends Error {
   constructor(reason: string) {
@@ -1583,7 +1582,7 @@ export class AgentFramework {
   private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   /** Run records whose failure repeated one already reported, and whose report was suppressed. */
   private maintenanceRepeats = new WeakSet<ContextMaintenanceAgentRun>();
-  /** An operator's maintain (maintenanceTick) asked for the pass running or about to run: it's kept in the history whatever it met. */
+  /** An operator's maintain (maintenanceTick) asked for the pass running or about to run: the run it records is kept in the history whatever it met. A pass with nothing to run records none. */
   private maintenancePassRequested = false;
   private providerGates: Map<string, LocalProviderGate> = new Map();
   private providerAccelerationCooldowns: Map<string, ProviderAccelerationCooldown> = new Map();
@@ -15799,25 +15798,16 @@ export class AgentFramework {
       : this.surgeryHold ? 'not kicked: a surgery holds the store'
       : this.overBudgetDrainInFlight.has(agentName) ? 'already draining'
       : 'kicking';
-    if (overBudget) {
-      this.opsAlert(
-        'context-refusal',
-        agentName,
-        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
-        `drain breaker ${drainState}; ` +
-        `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
-        { skipLog: true },
-      );
-    }
-    // A stop() or a surgery begun from inside the alert, by an ops:alert
-    // listener, is read again here.
-    if (agent && overBudget && drainState === 'kicking' && !this.providerAdmissionClosed && !this.surgeryHold) {
+    if (agent && drainState === 'kicking') {
       this.overBudgetDrainInFlight.add(agentName);
       // Like a maintenance pass: none starts once stop() has begun, it starts
-      // no tick while a surgery holds the store, and a branch move, or stop(),
-      // waits for the tick in flight. It joins the drains they wait for
-      // before its body runs, so a stop() made from inside its first tick,
-      // before that tick's first await, waits for it too.
+      // no tick while a surgery holds the store, and a surgery, a
+      // switchBranch or stop() waits for the tick in flight. It joins the
+      // drains they wait for before the alert is raised and before its body
+      // runs, so the alert's listeners find it: one that begins stop() or a
+      // surgery waits for it, and its body then ticks none and says why. So
+      // does a stop() made from inside its first tick, before that tick's
+      // first await.
       const drain = Promise.resolve().then(async () => {
         let ticks = 0;
         try {
@@ -15840,6 +15830,16 @@ export class AgentFramework {
       });
       this.overBudgetDrains.add(drain);
       void drain.finally(() => { this.overBudgetDrains.delete(drain); });
+    }
+    if (overBudget) {
+      this.opsAlert(
+        'context-refusal',
+        agentName,
+        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
+        `drain breaker ${drainState}; ` +
+        `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        { skipLog: true },
+      );
     }
 
     // (3) Hard-down escalation on repeated identical failure.
