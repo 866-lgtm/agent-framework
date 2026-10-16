@@ -457,6 +457,13 @@ export type TraceEvent =
       channelId: string;
       reason: string;
       textLen: number;
+      /** What the host knows of the text. `failed`: nothing was posted.
+       *  `unknown`: the server answered the publish with an error, which can
+       *  follow a partial post, so some or all of it may have been. Absent
+       *  on speak_in_channel's trace after any other rejection (a timeout, a
+       *  lost connection, or a connection already closed), which it can't
+       *  tell apart. */
+      outcome?: 'failed' | 'unknown';
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the

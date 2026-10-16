@@ -602,9 +602,13 @@ interface TurnRouting {
   /** The sticky destination, set by each `>>` (hybrid: `>>>`) prefix that resolves. */
   pin?: string;
   /**
-   * Explicit mode: the destination the turn's delivered rounds have set,
-   * decided at each round boundary (roundDestination), where each of the
-   * turn's streams starts. The turn's final text doesn't set it: the stream
+   * Explicit mode: where each of the turn's streams starts. It changes as a
+   * round is admitted, before its delivery (roundDestination): a `>>` target
+   * that resolves sets it, and one refused for speech clears it. A target
+   * that matches no channel, or several, leaves it, and so does a round that
+   * names none, or one kept private by skip_reply. A failed delivery to a channel that is
+   * inbound-only by then clears it too, while it still names that channel
+   * (deliverProseEnvelope). The turn's final text doesn't set it: the stream
    * settles the turn before delivering that text, so no later stream of the
    * turn starts after it, and a later start opens a turn of its own.
    */
@@ -11193,9 +11197,9 @@ export class AgentFramework {
   }
 
   /**
-   * Where a delivered round leaves its turn's sticky destination, as the
-   * explicit gateway sets it once the round's envelopes run: each `>>`
-   * envelope whose target resolved becomes the destination. One that didn't
+   * Where an admitted round leaves its turn's sticky destination, set as
+   * the round is admitted, before its delivery: each `>>` envelope whose
+   * target resolved becomes the destination. One that didn't
    * resolve bounces and leaves it, as do `>>skip_reply` and unprefixed text.
    * One refused for speech (its server declared the channel inbound-only)
    * bounces and clears it: the text after it was meant for that channel, so
@@ -11347,9 +11351,12 @@ export class AgentFramework {
       const res = envelope.resolved;
       if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
-        // A target refused for speech ends the turn's destination, as
-        // roundDestination does: the text after it was meant for that
-        // channel, not the earlier one, so it bounces too.
+        // A target refused for speech ends the turn's destination. This drops
+        // the pin, which later text follows. roundDestination cleared the
+        // destination later streams start at when it admitted the round, for
+        // any round but the turn's final text, after which nothing of the turn
+        // streams. The text after the target was meant for that channel, not
+        // the earlier one, so it bounces too.
         if (res.refusedChannelId) delete routing.pin;
         this.bounceProse(agent, parsed.body, res.error, res.candidates);
         return;
@@ -11377,23 +11384,28 @@ export class AgentFramework {
       return;
     }
 
+    let delivered = false;
     try {
       const result = await this.channelRegistry!.routeSpeech(name, body, targetChannel);
-      if (result?.delivered) {
+      delivered = !!result?.delivered;
+      if (delivered) {
         this.proseBounceStreaks.delete(name);
         if (usedClipboard) this.proseClipboards.delete(name);
-      } else if (routing.pin === targetChannel && this.channelRegistry!.inboundOnlyServer(targetChannel) !== undefined) {
-        // routeSpeech refused it for speech: its server declared it
-        // inbound-only after the round was admitted, or in its answer to
-        // opening it. The pin goes, as a refusal at admission takes it, so
-        // later text bounces rather than meeting the same refusal. The
-        // stream's destination is left: while the channel stays
-        // inbound-only, the stream withholds it anyway. Another failed
-        // delivery keeps the pin, as before.
-        delete routing.pin;
       }
     } catch (err) {
       console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
+    }
+    if (!delivered && this.channelRegistry!.inboundOnlyServer(targetChannel) !== undefined) {
+      // The channel is inbound-only by now: its server declared it after the
+      // round was admitted, or in its answer to opening it. Whatever made this
+      // delivery fail, a refusal or a publish that rejected, later text there
+      // would be refused, so what still names the channel ends, as a refusal
+      // at admission ends it: the pin, unless a later delivery has moved it,
+      // and the destination later streams start at, unless a later round has
+      // named another. A failed delivery to a channel that isn't inbound-only
+      // keeps them, as before.
+      if (routing.pin === targetChannel) delete routing.pin;
+      if (routing.destination === targetChannel) routing.destination = null;
     }
   }
 
@@ -12332,7 +12344,7 @@ export class AgentFramework {
           // Explicit text has no destination until a `>>` prefix names one,
           // so a fresh turn's stream starts suppressed. A later stream of the
           // turn (a resume, a retry, a re-inference, a capacity-deferred
-          // compile) starts at the destination the turn's delivered rounds
+          // compile) starts at the destination the turn's admitted rounds
           // have set: a private round's prefixes don't count, and the
           // gateway's queued deliveries needn't have run. The trigger channel
           // is only where explicit mode's typing indicator shows.
@@ -12451,8 +12463,8 @@ export class AgentFramework {
             proseStream?.reset();
             lastTextBlock = undefined;
             // Explicit mode's retried attempt starts where the turn's
-            // delivered rounds have set the destination, not at the stream's
-            // seed: rounds this stream delivered before the refusal stand.
+            // admitted rounds have set the destination, not at the stream's
+            // seed: rounds this stream admitted before the refusal stand.
             if (turnProseRouting === 'explicit') proseStream?.retarget(streamRouting.destination);
             this.emitTrace({
               type: 'inference:tokens',
@@ -16324,11 +16336,11 @@ export class AgentFramework {
         },
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
-        // agent sees, on her next turn, that her reply never reached the human.
-        // addMessage() alone does not request inference, so this never wakes
-        // her (matching the `discord-send-failed-skip` gate intent: context
-        // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        // agent sees, on her next turn, that her reply didn't reach the human,
+        // or wasn't confirmed to. addMessage() alone does not request
+        // inference, so this never wakes her (matching the
+        // `discord-send-failed-skip` gate intent: context yes, wake no).
+        onRouteFailure: ({ channelId, reason, textLen, outcome }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
@@ -16347,9 +16359,13 @@ export class AgentFramework {
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: outcome === 'unknown'
+                  // A request went out and no valid receipt came back: it may
+                  // have been posted (in part or whole). Never claim it wasn't.
+                  ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted, so sending it again could post it twice. It is saved in your archive.`
+                  : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason, outcome },
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);

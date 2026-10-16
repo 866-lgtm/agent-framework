@@ -226,6 +226,19 @@ function isInboundOnly(entry: ChannelEntry): boolean {
   return entry.descriptor.direction === 'inbound';
 }
 
+/** What a failed request to a server says to the agent: a server's error
+ *  response in its own words, naming the server, and any other failure as its
+ *  message, or as text when it has none. */
+function failureText(err: unknown, serverId: string): string {
+  if (err instanceof McplErrorResponse) return `server "${serverId}" answered with an error: ${err.serverMessage}`;
+  try {
+    const message = (err as { message?: unknown } | null | undefined)?.message;
+    return typeof message === 'string' && message !== '' ? message : String(err);
+  } catch {
+    return 'a failure that could not be printed';
+  }
+}
+
 /** Why the host sends nothing into an inbound-only channel, as the resident
  *  reads it in a send-failure marker or a tool error. */
 function inboundOnlyReason(entry: ChannelEntry): string {
@@ -511,16 +524,21 @@ interface ChannelRegistryOptions {
   /**
    * Called when a text-only turn's speech could NOT be delivered to its
    * conversational locus — no locus, an unregistered channel, a missing
-   * server, or the server reporting `delivered: false`. The host wires this
-   * to drop a `[discord-send-failed]` marker into chronicle so the failure is
-   * visible to the agent (and operator) rather than silently lost. Must not
-   * itself trigger inference (avoid wake loops).
+   * server, or the server reporting `delivered: false` — or the server
+   * answered its publish with an error, after which whether it was posted is
+   * unknown. The host wires this to drop a `[discord-send-failed]` marker into
+   * chronicle so the failure is visible to the agent (and operator) rather
+   * than silently lost. Must not itself trigger inference (avoid wake loops).
    */
   onRouteFailure?: (info: {
     conversationId: string;
     channelId: string | null;
     reason: string;
     textLen: number;
+    /** `failed`: nothing was posted. `unknown`: the server answered the
+     *  publish with an error, which can follow a partial post, so some or
+     *  all of it may have been. */
+    outcome: 'failed' | 'unknown';
   }) => void;
   /**
    * Called when channels were opened WITHOUT the agent asking (subscription
@@ -603,6 +621,7 @@ export class ChannelRegistry {
     channelId: string | null;
     reason: string;
     textLen: number;
+    outcome: 'failed' | 'unknown';
   }) => void;
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
@@ -2123,7 +2142,8 @@ export class ChannelRegistry {
     // The server the publish goes to, as handleToolPublish finds it before
     // it awaits: the channel may be removed while the reply is pending.
     const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
-    const result = await this.handleToolPublish({ channelId, content: text });
+    const seen: { rejection?: 'error-response' | 'other' } = {};
+    const result = await this.handleToolPublish({ channelId, content: text }, seen);
     const reply = result.data as { delivered?: boolean; messageId?: string } | undefined;
     if (result.success && reply?.delivered !== false) {
       this.emitTraceFn({
@@ -2137,12 +2157,19 @@ export class ChannelRegistry {
         ...(reply?.messageId !== undefined ? { messageId: reply.messageId } : {}),
       });
     } else {
+      // What the host knows of the text, as routeSpeech's trace says it: an
+      // error response may follow a partial post; a refusal before the
+      // publish, or delivered:false, posted nothing; after any other
+      // rejection (a timeout, a lost connection, or a connection already
+      // closed) it can't tell which, and the trace says neither.
+      const outcome = seen.rejection === 'error-response' ? 'unknown' : seen.rejection === undefined ? 'failed' : undefined;
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId: agentName,
         channelId,
         reason: result.success ? 'the server reported delivered:false' : (result.error ?? 'the publish failed'),
         textLen: text.length,
+        ...(outcome ? { outcome } : {}),
       });
     }
     return result;
@@ -2820,7 +2847,7 @@ export class ChannelRegistry {
     } catch (err) {
       return {
         success: false,
-        error: `Failed to open channel: ${(err as Error).message}`,
+        error: `Failed to open channel: ${failureText(err, entry.serverId)}`,
         isError: true,
       };
     }
@@ -2934,7 +2961,7 @@ export class ChannelRegistry {
     } catch (err) {
       return {
         success: false,
-        error: `Failed to close channel: ${(err as Error).message}`,
+        error: `Failed to close channel: ${failureText(err, entry.serverId)}`,
         isError: true,
       };
     }
@@ -2987,7 +3014,7 @@ export class ChannelRegistry {
               'The channel integration could not post the acknowledgment.';
           }
         } catch (error) {
-          acknowledgmentError = (error as Error).message;
+          acknowledgmentError = failureText(error, entry.serverId);
         }
       }
     }
@@ -3169,9 +3196,11 @@ export class ChannelRegistry {
    * declared it inbound-only, the channel was removed while it opened, the
    * open fails, or the server answers the publish with an error or reports it
    * undelivered. Each of these goes through fail(): a trace, and the host's
-   * send-failure marker. A publish that times out or loses its connection
-   * rejects instead, since whether the server posted it is unknown, and the
-   * caller logs it. The speech stays in chronicle + module surfaces.
+   * send-failure marker. Any other failed publish rejects to the caller, as
+   * before: one that times out or loses its connection before an answer,
+   * whose outcome is unknown, and one whose connection was already closed,
+   * which sent nothing. Plain speech logs it, and a hybrid `>>>` caller
+   * bounces it. The speech stays in chronicle + module surfaces.
    */
   async routeSpeech(
     conversationId: string,
@@ -3187,17 +3216,19 @@ export class ChannelRegistry {
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
-    // reply never reached the human, instead of it vanishing silently.
-    const fail = (channelId: string | null, reason: string): null => {
-      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
+    // reply didn't reach the human, or wasn't confirmed to, instead of it
+    // vanishing silently.
+    const fail = (channelId: string | null, reason: string, outcome: 'failed' | 'unknown' = 'failed'): null => {
+      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${outcome === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
+        outcome,
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length });
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome });
       return null;
     };
 
@@ -3257,7 +3288,7 @@ export class ChannelRegistry {
           console.error('onChannelAutoOpened (delivery) failed:', err);
         }
       } catch (err) {
-        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
+        return fail(channelId, `the channel was closed, and opening it failed: ${failureText(err, entry.serverId)}`);
       }
     }
     // The open awaited the server, and a channels/changed update or a
@@ -3291,14 +3322,15 @@ export class ChannelRegistry {
     try {
       result = await server.sendChannelsPublish(publishParams);
     } catch (err) {
-      // An error response is the server's answer that the publish failed, so
-      // the marker says the human didn't receive it, in the server's own
-      // words. Any other rejection goes to the caller as before: after a
-      // timeout, or a connection lost before an answer, whether the server
-      // posted it is unknown, and a connection already closed rejects before
-      // anything is sent.
+      // An error response is the server's answer, in its own words, that the
+      // publish failed. It may follow a partial post (a multi-part send whose
+      // later part failed), so the marker says delivery wasn't confirmed,
+      // never that nothing was posted. Any other rejection goes to the caller
+      // as before: one after a timeout, or a connection lost before an
+      // answer, and one on a connection already closed, before anything is
+      // sent.
       if (err instanceof McplErrorResponse) {
-        return fail(channelId, `server "${entry.serverId}" refused the publish: ${err.serverMessage}`);
+        return fail(channelId, `server "${entry.serverId}" answered the publish with an error: ${err.serverMessage}`, 'unknown');
       }
       throw err;
     }
@@ -3331,7 +3363,12 @@ export class ChannelRegistry {
     return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
   }
 
-  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+  /** `seen`, when given, says how the publish rejected, if it did: an error
+   *  response, or another rejection. */
+  private async handleToolPublish(
+    input: { channelId?: string; content?: string; text?: string },
+    seen?: { rejection?: 'error-response' | 'other' },
+  ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
     if (!messageText) {
@@ -3397,9 +3434,15 @@ export class ChannelRegistry {
         data: result ?? { delivered: true },
       };
     } catch (err) {
+      if (seen) seen.rejection = err instanceof McplErrorResponse ? 'error-response' : 'other';
+      // An error response may follow a partial post (a multi-part send whose
+      // later part failed), so it isn't called a failure, as routeSpeech's
+      // marker doesn't call it one.
       return {
         success: false,
-        error: `Failed to publish to channel: ${(err as Error).message}`,
+        error: err instanceof McplErrorResponse
+          ? `Publish to ${channelId} wasn't confirmed: ${failureText(err, entry.serverId)}. It may or may not have been posted, so sending it again could post it twice.`
+          : `Failed to publish to channel: ${failureText(err, entry.serverId)}`,
         isError: true,
       };
     }
