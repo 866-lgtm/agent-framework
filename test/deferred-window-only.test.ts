@@ -559,11 +559,20 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   it('at a tool boundary, the shards that landed before a throw are carried as the next compile renders them', async () => {
     // Probe by Ansel-2428: the autobiographical strategy shards a long
     // message on ingest and joins a body's consecutive shards when it
-    // compiles, so the boundary must carry what landed in that shape.
+    // compiles, so the boundary must carry what landed in that shape. The
+    // body with an image between two texts fails here if the join changes
+    // where it puts a non-text block, so the copy of the join can't drift.
     const long = Array.from({ length: 60 }, (_, i) => `Sentence ${i} of a long message from Antra.`).join(' ');
     const ofLong = (messages: Array<{ content: unknown }>) =>
       messages.filter((m) => JSON.stringify(m.content).includes('Sentence 0 '));
-    for (const throwAt of [2, 3]) {
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const image = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } } as ContentBlock;
+    const cases: Array<{ name: string; content: ContentBlock[]; throwAt: number }> = [
+      { name: 'text, throw at shard 2', content: text(long), throwAt: 2 },
+      { name: 'text, throw at shard 3', content: text(long), throwAt: 3 },
+      { name: 'a short text, an image, then the long text, throw at shard 2', content: [...text('Intro. '), image, ...text(long)], throwAt: 2 },
+    ];
+    for (const [i, { name, content, throwAt }] of cases.entries()) {
       membrane = new MockMembrane();
       membrane.pushResponse(createMockResponse([
         { type: 'text', text: 'Moving.' },
@@ -571,7 +580,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       ] as ContentBlock[], 'tool_use'));
       membrane.pushResponse(createMockResponse(text('Done.')));
       const framework = await createFramework({
-        storePath: join(tempDir, `shards-${throwAt}.chronicle`),
+        storePath: join(tempDir, `shards-${i}.chronicle`),
         membrane: membrane.asMembrane(),
         agents: [{
           name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.',
@@ -587,23 +596,23 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         if (event.type !== 'add' || !(event.message as { bodyGroupId?: string }).bodyGroupId) return;
         if (++shards === throwAt) throw new Error('listener failed');
       });
-      module.interjections = [{ participant: 'Antra', content: text(long) }];
+      module.interjections = [{ participant: 'Antra', content }];
       const error = console.error;
       console.error = () => {};
       try {
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
-        assert.equal(landed.length, throwAt, `${throwAt} shards landed before the throw stopped the body`);
+        assert.equal(landed.length, throwAt, `${name}: ${throwAt} shards landed before the throw stopped the body`);
         const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
         // The next turn's request is compiled from the store.
         membrane.pushResponse(createMockResponse(text('Okay.')));
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const next = ofLong(membrane.calls.at(-1)!.messages);
-        assert.equal(injected.length, 1, `throw at shard ${throwAt}: one message injected`);
-        assert.equal(next.length, 1, `throw at shard ${throwAt}: one message in the next request`);
-        assert.deepEqual(injected[0]!.content, next[0]!.content, `throw at shard ${throwAt}: the boundary carried what the next compile renders`);
+        assert.equal(injected.length, 1, `${name}: one message injected`);
+        assert.equal(next.length, 1, `${name}: one message in the next request`);
+        assert.deepEqual(injected[0]!.content, next[0]!.content, `${name}: the boundary carried what the next compile renders`);
       } finally {
         console.error = error;
         await framework.stop();
