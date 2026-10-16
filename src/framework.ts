@@ -13943,17 +13943,14 @@ export class AgentFramework {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
-    // MCPL tools are dispatched via the MCPL subsystem
+    // MCPL tools are dispatched via the MCPL subsystem, to the server the
+    // model's own call would reach (resolveMcplTool): the one that listed the
+    // tool, else the longest matching prefix, whatever order the servers were
+    // configured in.
     if (this.mcplServerRegistry) {
-      // Check if this is an MCPL-prefixed tool
-      const prefix = call.name.split('--').slice(0, -1).join('--');
-      const serverConfigs = this.mcplServerConfigs;
-      for (const [, config] of serverConfigs) {
-        const toolPrefix = config.toolPrefix ?? `mcpl--${config.id}`;
-        if (call.name.startsWith(toolPrefix + '--')) {
-          return this.executeMcplToolCall(call, config);
-        }
-      }
+      const mcpl = this.resolveMcplTool(call.name);
+      const config = mcpl ? this.mcplServerConfigs.get(mcpl[0]) : undefined;
+      if (config) return this.executeMcplToolCall(call, config);
     }
 
     // Synthesized channel tools. This route was missing: when
