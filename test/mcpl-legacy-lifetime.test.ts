@@ -67,8 +67,8 @@ function unreapableFrom(from: number): Array<{ pid: number; kill: () => void }> 
   const realSpawn = StdioTransport.spawn;
   const stuck: Array<{ pid: number; kill: () => void }> = [];
   let launches = 0;
-  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (c) => {
-    const transport = realSpawn.call(StdioTransport, c);
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
+    const transport = await realSpawn.call(StdioTransport, c);
     if (++launches >= from) {
       const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
       const realKill = child.kill.bind(child);

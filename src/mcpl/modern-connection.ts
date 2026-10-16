@@ -270,7 +270,9 @@ class SpawnerStdioTransport implements Transport {
   }
 
   async start(): Promise<void> {
-    const line = StdioTransport.spawn(this.config);
+    // A command that can't be spawned rejects here, with its spawn error, so
+    // the connect fails with it rather than waiting out its discover probe.
+    const line = await StdioTransport.spawn(this.config);
     this.line = line;
     line.on('line', (text: string) => {
       // A line that isn't JSON is ignored, as the legacy engine ignores it.

@@ -751,6 +751,15 @@ export class McplServerConnection extends EventEmitter {
       if (signal?.aborted) throw closedWhileConnecting();
       throw error;
     }
+    // Once the handshake stops listening for 'error', this logs what the
+    // transport reports, until the handshake hands the transport on, or for
+    // good if the handshake fails. EventEmitter throws an 'error' that has no
+    // listener, and from an I/O callback nothing catches it. A malformed
+    // WebSocket frame that arrives with the initialize response, or while a
+    // failed handshake's close() runs, is such an error.
+    const logAfterSettled = (err: Error) => {
+      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${err.message}`);
+    };
 
     try {
       if (signal?.aborted) throw closedWhileConnecting();
@@ -774,6 +783,7 @@ export class McplServerConnection extends EventEmitter {
           transport.off('close', onClose);
           transport.off('error', onError);
           signal?.removeEventListener('abort', onAbort);
+          transport.on('error', logAfterSettled);
           clearTimeout(timer);
         };
         const onAbort = () => {
@@ -857,6 +867,10 @@ export class McplServerConnection extends EventEmitter {
         console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.map(logValue).join(', ')}`);
       }
 
+      // The caller wires the transport, or keeps it for close() with a
+      // listener of its own, in the continuation of this return, before any
+      // I/O callback can emit.
+      transport.off('error', logAfterSettled);
       return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion };
     } catch (err) {
       // Never leak the child / socket if the handshake fails. A cleanup that
@@ -1397,6 +1411,13 @@ export class McplServerConnection extends EventEmitter {
     if (signal.aborted) {
       // Closed by the host while the handshake finished: this launch never
       // serves. close() is waiting on this attempt, so it hears the verdict.
+      // The transport isn't wired, and the handshake has taken its own
+      // listeners off, so an error it reports while it closes, such as a
+      // malformed frame from a WebSocket server, is logged here rather than
+      // thrown where nothing catches it.
+      transport.on('error', (err: Error) => {
+        console.error(`[mcpl] ${this.id}: a transport closed before it served reported an error: ${err.message}`);
+      });
       await transport.close().catch((error: unknown) => this.holdUnreaped(transport, errorOf(error)));
       return;
     }

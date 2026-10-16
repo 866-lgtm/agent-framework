@@ -76,8 +76,8 @@ const call = (name: string) => ({ id: `t-${Math.random()}`, name, input: {} });
 function unreapable(): { active: boolean; stuck: Array<{ pid: number; kill: () => void }> } {
   const realSpawn = StdioTransport.spawn;
   const state = { active: true, stuck: [] as Array<{ pid: number; kill: () => void }> };
-  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (c) => {
-    const transport = realSpawn.call(StdioTransport, c);
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
+    const transport = await realSpawn.call(StdioTransport, c);
     if (state.active) {
       const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
       const realKill = child.kill.bind(child);

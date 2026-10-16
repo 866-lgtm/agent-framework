@@ -389,7 +389,7 @@ test('close() reaps: a child that ignores SIGTERM is killed before close resolve
 });
 
 test('a child that cannot be reaped fails close() explicitly, never a claimed exit', async () => {
-  const transport = StdioTransport.spawn({ id: 'stuck', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1 << 30)'] });
+  const transport = await StdioTransport.spawn({ id: 'stuck', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1 << 30)'] });
   const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
@@ -404,8 +404,8 @@ test('a failed launch that cannot be reaped halts reconnecting; close() settles 
   const realSpawn = StdioTransport.spawn;
   const stuck: Array<{ pid: number; kill: (signal?: string) => boolean }> = [];
   let launches = 0;
-  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (config) => {
-    const transport = realSpawn.call(StdioTransport, config);
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (config) => {
+    const transport = await realSpawn.call(StdioTransport, config);
     if (++launches > 1) {
       // From the second launch on, signals never arrive.
       const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
@@ -442,8 +442,8 @@ test('concurrent close() calls share one teardown and its verdict; a later close
   let stuck: { pid: number; kill: (signal?: string) => boolean } | null = null;
   // Every signal teardown sends: one teardown escalates once, SIGTERM then SIGKILL.
   const signals: Array<string | undefined> = [];
-  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (config) => {
-    const transport = realSpawn.call(StdioTransport, config);
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (config) => {
+    const transport = await realSpawn.call(StdioTransport, config);
     const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
     const realKill = child.kill.bind(child);
     child.kill = (signal?: string) => { signals.push(signal); return true; }; // teardown can't reap it
