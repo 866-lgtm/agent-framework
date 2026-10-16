@@ -62,6 +62,30 @@ class EphemeralToolModule implements Module {
   }
 }
 
+/** A tool that, while its call runs, has `duringCall` run: there, a test
+ *  addresses the run as the event gate does, through the framework's
+ *  addMessage with `forAgent`. */
+class DuringCallToolModule implements Module {
+  readonly name = 'test';
+  duringCall: (() => void) | null = null;
+
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+
+  getTools(): ToolDefinition[] {
+    return [{ name: 'echo', description: 'Echo input', inputSchema: { type: 'object', properties: {} } }];
+  }
+
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    this.duringCall?.();
+    return { success: true, data: { ok: true } };
+  }
+
+  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    return {};
+  }
+}
+
 class ThrowingMembrane extends MockMembrane {
   readonly errors: Error[];
 
@@ -521,6 +545,49 @@ describe('runEphemeralToCompletion settle signal', () => {
       });
       assert.strictEqual(tools.calls.length, 2);
       assert.strictEqual(framework.getAgent(agent.name), null);
+    } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it('what is queued for a run when it ends is stored in its namespace, not dropped once it is deregistered', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-queued-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const tools = new DuringCallToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+    // While the run's tool call is pending, two messages for it are deferred:
+    // one named as the run itself, which waits for its turn's end, and one
+    // queued behind it.
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: undefined, opts?: { forAgent?: string }): string;
+    };
+    const returned: string[] = [];
+    tools.duringCall = () => {
+      returned.push(internals.addMessage('worker', [{ type: 'text', text: 'my own words' }], undefined, { forAgent: 'worker' }));
+      returned.push(internals.addMessage('Antra', [{ type: 'text', text: 'look left' }], undefined, { forAgent: 'worker' }));
+    };
+
+    try {
+      const { agent, contextManager } = await createEphemeral(framework, 'worker');
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+      assert.strictEqual(result.speech, 'Done.');
+      assert.deepStrictEqual(returned, ['', ''], 'both were deferred: the run was waiting on its tool');
+      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
+      const stored = contextManager.getAllMessages().map((m) =>
+        `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
+      assert.deepStrictEqual(stored.slice(-3), ['worker: Done.', 'worker: my own words', 'Antra: look left'],
+        'held to the turn end, and stored after the run\'s last reply');
     } finally {
       await stopAndRemove(framework, tempDir);
     }

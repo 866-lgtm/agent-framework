@@ -312,6 +312,40 @@ test('resume proceeds with a warn when the strategy cannot preview', async () =>
   });
 });
 
+test('resume proceeds without a verdict for an agent whose context manager refuses, and warns naming it', async (t) => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // A failed strategy initialization fences the context manager: its
+    // settings queries throw until a successful switchBranch or setStrategy.
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const failing = {
+      name: 'refusing-init-test',
+      async initialize() { throw new Error('strategy initialization failed for the test'); },
+      checkReadiness: () => ({ ready: true }),
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    await assert.rejects(cm.setStrategy(failing), /strategy initialization failed for the test/);
+    assert.throws(() => cm.getHotContextSettings(), /requires successful strategy initialization/);
+
+    const warn = t.mock.method(console, 'warn', () => {});
+    let status: Awaited<ReturnType<typeof framework.resume>>;
+    try {
+      status = await framework.resume();
+    } finally {
+      warn.mock.restore();
+    }
+    assert.equal(status.quiesced, false);
+    assert.ok(warn.mock.calls.some((call) => {
+      const line = String(call.arguments[0]);
+      return line.includes("agent's settings can't be read")
+        && line.includes('requires successful strategy initialization')
+        && line.includes('proceeding without a verdict for it');
+    }), 'resume warns, naming the agent and the error');
+  });
+});
+
 test('maintenanceTick runs the real maintenance pass while quiesced', async () => {
   class QueuedStrategy implements ContextStrategy {
     readonly name = 'queued-test';
@@ -338,6 +372,47 @@ test('maintenanceTick runs the real maintenance pass while quiesced', async () =
     const snapshot = await framework.maintenanceTick();
     assert.ok(strategy.ticks >= 2, `maintenance ticked while quiesced (${strategy.ticks})`);
     assert.ok(snapshot.agents.some((a) => a.agentName === 'agent'));
+  }, { strategy });
+});
+
+test('maintenanceTick runs no pass while a surgery holds the store, and says so', async (t) => {
+  class QueuedStrategy implements ContextStrategy {
+    readonly name = 'queued-test';
+    ticks = 0;
+    checkReadiness(): ReadinessState {
+      return { ready: false, description: 'test maintenance queued' };
+    }
+    async tick(_ctx: StrategyContext): Promise<void> {
+      this.ticks++;
+    }
+    select(
+      _store: MessageStoreView,
+      _log: ContextLogView,
+      _budget: TokenBudget,
+    ): ContextEntry[] {
+      return [];
+    }
+  }
+  const strategy = new QueuedStrategy();
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    // Held before start(), whose first pass would otherwise tick at once.
+    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    framework.start();
+    await framework.quiesce({ reason: 'compression window' });
+    const warn = t.mock.method(console, 'warn', () => {});
+    try {
+      const snapshot = await framework.maintenanceTick();
+      assert.equal(snapshot.ran, false);
+      assert.equal(strategy.ticks, 0);
+      assert.equal(snapshot.history.length, 0);
+      assert.ok(warn.mock.calls.some((call) =>
+        String(call.arguments[0]).includes('a rollback for agent holds the store — no pass executed')));
+    } finally {
+      internals.surgeryHold = null;
+      warn.mock.restore();
+    }
   }, { strategy });
 });
 
@@ -864,20 +939,23 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
 
     // Entries no write of the framework's makes, as other code could leave
     // them in the recovery file: a null block, a string block and a number
-    // block beside a text block, content that isn't blocks, and a participant
-    // that isn't text, which the line names by its type. Once stored, a string
-    // or number block would make every compile for the agent throw, since the
-    // context manager's token estimate keys a WeakMap on each block.
+    // block beside a text block, content that isn't blocks, a participant
+    // that isn't text, which the line names by its type, and a target that
+    // is empty or isn't text. Once stored, a string or number block would
+    // make every compile for the agent throw, since the context manager's
+    // token estimate keys a WeakMap on each block.
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
-    const dropped = ['null-block', 'string-block', 'number-block', 'not-blocks', 'number-participant'];
+    const dropped = ['null-block', 'string-block', 'number-block', 'not-blocks', 'number-participant', 'empty-target', 'number-target'];
     doc.pending.splice(1, 0,
       { id: 'null-block', seq: 100, participant: 'user', content: [{ type: 'text', text: 'x' }, null] },
       { id: 'string-block', seq: 101, participant: 'user', content: [{ type: 'text', text: 'x' }, 'a bare string'] },
       { id: 'number-block', seq: 102, participant: 'user', content: [{ type: 'text', text: 'x' }, 42] },
       { id: 'not-blocks', seq: 103, participant: 'user', content: 'x' },
       { id: 'number-participant', seq: 104, participant: 42, content: [{ type: 'text', text: 'x' }] },
+      { id: 'empty-target', seq: 105, participant: 'user', content: [{ type: 'text', text: 'x' }], forAgent: '' },
+      { id: 'number-target', seq: 106, participant: 'user', content: [{ type: 'text', text: 'x' }], forAgent: 7 },
     );
     writeFileSync(file, JSON.stringify(doc));
 
@@ -885,7 +963,7 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
     framework = await AgentFramework.create(config());
     console.error = error;
     assert.equal(framework.getHostModeStatus().deferredWrites, 2, 'the well-formed entries are restored');
-    for (const entry of ['null-block (user)', 'string-block (user)', 'number-block (user)', 'not-blocks (user)', 'number-participant (participant of type number)']) {
+    for (const entry of ['null-block (user)', 'string-block (user)', 'number-block (user)', 'not-blocks (user)', 'number-participant (participant of type number)', 'empty-target (user)', 'number-target (user)']) {
       assert.ok(lines.some((line) => line.includes(`malformed and was dropped: ${entry}`)), `${entry} is named:\n${lines.join('\n')}`);
     }
     const rewritten = readFileSync(file, 'utf8');
@@ -895,6 +973,121 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
       .map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(texts, ['first', 'second']);
     await assert.doesNotReject(framework.getAgent('agent')!.compileContext(), 'and the agent compiles');
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('boot recovery keeps one entry per id, and numbers a seq that isn\'t a positive whole number after the others', { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-identity-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'first' }]);
+    add('user', [{ type: 'text', text: 'second' }]);
+    await framework.stop();
+
+    // What the framework never writes, as damage or a hand edit could leave
+    // it: an id that comes twice, an entry with no id, a seq of 1e400 (JSON
+    // reads it as Infinity), a negative one, zero and a string. The entries
+    // with a bad seq come before 'second' in the file. Nothing here is
+    // malformed, so only these make boot rewrite it.
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 2);
+    const entry = (id: string | undefined, seq: unknown, text: string) =>
+      ({ ...(id === undefined ? {} : { id }), seq, participant: 'user', content: [{ type: 'text', text }] });
+    doc.pending.splice(1, 0,
+      entry('infinite-seq', '__INFINITY__', 'infinite seq'),
+      entry('negative-seq', -3, 'negative seq'),
+      entry('twice', 50, 'first with its id'),
+      entry('twice', 51, 'second with its id'),
+      entry('zero-seq', 0, 'zero seq'),
+      entry('string-seq', 'seven', 'string seq'),
+      entry(undefined, 52, 'no id'),
+    );
+    writeFileSync(file, JSON.stringify(doc).replace('"__INFINITY__"', '1e400'));
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    const named = (text: string) => assert.ok(lines.some((line) => line.includes(text)), `${text}:\n${lines.join('\n')}`);
+    const late = 'not a positive whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others';
+    named('repeats id twice (user) and was dropped; the first entry with that id is kept');
+    named(`(infinite-seq) has seq Infinity, ${late}`);
+    named(`(negative-seq) has seq -3, ${late}`);
+    named(`(zero-seq) has seq 0, ${late}`);
+    named(`(string-seq) has seq of type string, ${late}`);
+    named('a recovered deferred context write (user) has no id; it is given ');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 8);
+
+    const rewritten = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ id: unknown; seq: unknown }> };
+    assert.equal(rewritten.pending.length, 8, 'the recovery file is rewritten without the repeated id');
+    assert.ok(rewritten.pending.every((m) => Number.isSafeInteger(m.seq) && (m.seq as number) > 0), JSON.stringify(rewritten.pending));
+
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second', 'first with its id', 'no id', 'infinite seq', 'negative seq', 'zero seq', 'string seq']);
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('boot recovery restores a recovery file that predates seq in file order, and rewrites it with seqs', { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-noseq-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    for (const text of ['first', 'second', 'third']) add('user', [{ type: 'text', text }]);
+    await framework.stop();
+
+    // A file written before entries carried a seq is in write order. Here
+    // that order is third, first, second, so only the file can give it.
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 3);
+    const [first, second, third] = doc.pending.map(({ seq: _seq, ...rest }) => rest);
+    writeFileSync(file, JSON.stringify({ version: 1, pending: [third, first, second] }));
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.ok(!lines.some((line) => line.includes('has seq')), `an entry with no seq isn't named:\n${lines.join('\n')}`);
+    const rewritten = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ seq: unknown; content: Array<{ text: string }> }> };
+    assert.deepEqual(rewritten.pending.map((m) => [m.content[0]!.text, m.seq]), [['third', 1], ['first', 2], ['second', 3]],
+      'rewritten with seqs, in file order');
+
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['third', 'first', 'second']);
   } finally {
     console.error = error;
     await framework.stop();

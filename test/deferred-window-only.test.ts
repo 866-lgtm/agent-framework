@@ -12,7 +12,11 @@
  * whose stored prefix holds a message its request didn't.
  *
  * A message the stream carried has been read: RFC-006's consumed watermark
- * covers it, so a coalesced replacement can no longer remove it.
+ * covers it, so a coalesced replacement can no longer remove it. Only a
+ * stream that declares it carries injected messages (membrane's native
+ * path) is known to have carried them. One that declares it can't (membrane's
+ * XML prefill path) gets none, and what is queued waits for the turn's end.
+ * One that doesn't say (membrane 0.5.87) gets them, and they stay unread.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -31,6 +35,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -239,16 +244,43 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  it('a message the stream carried is read: the consumed watermark covers it', async () => {
+  /** Whether the stored message with this text reads as unread (RFC-006). */
+  function unread(framework: AgentFramework, textOf: string): boolean {
+    const agent = framework.getAgent('assistant')!;
+    const stored = agent.getContextManager().getAllMessages()
+      .find((m) => m.content.some((b) => (b as { text?: string }).text === textOf))!;
+    assert.ok(stored, `'${textOf}' is stored`);
+    return (framework as unknown as {
+      isUnreadStoredMessage: (a: typeof agent, id: string) => boolean;
+    }).isUnreadStoredMessage.call(framework, agent, stored.id);
+  }
+
+  it('a message injected into a stream that declares it carries injections is read: the consumed watermark covers it', async () => {
+    membrane.supportsInjectedMessages = true; // membrane's native path declares it
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
     assert.deepEqual(injected(), ['Antra: look left']);
-    const agent = framework.getAgent('assistant')!;
-    const heard = agent.getContextManager().getAllMessages()
-      .find((m) => m.content.some((b) => (b as { text?: string }).text === 'look left'))!;
-    const isUnread = (framework as unknown as {
-      isUnreadStoredMessage: (a: typeof agent, id: string) => boolean;
-    }).isUnreadStoredMessage.bind(framework);
-    assert.equal(isUnread(agent, heard.id), false, 'a coalesced replacement must not remove what the agent heard');
+    assert.equal(unread(framework, 'look left'), false, 'a coalesced replacement must not remove what the agent heard');
+    await framework.stop();
+  });
+
+  it('a stream that doesn\'t say whether it carries injections gets them, and they stay unread', async () => {
+    // membrane 0.5.87 doesn't declare it, on either path, and its XML path
+    // drops what's injected: marked read there, a message the agent never
+    // saw could no longer be replaced.
+    const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
+    assert.deepEqual(injected(), ['Antra: look left']);
+    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'Antra: look left', 'assistant: Done.']);
+    assert.equal(unread(framework, 'look left'), true);
+    await framework.stop();
+  });
+
+  it('a stream that can\'t carry injections gets none: what is queued waits for the turn to end', async () => {
+    membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it
+    const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
+    assert.deepEqual(atBoundary(), undefined, 'the boundary drained nothing');
+    assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
+    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: look left']);
+    assert.equal(unread(framework, 'look left'), true);
     await framework.stop();
   });
 
@@ -434,6 +466,223 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       'Antra: look right',
     ], 'both were kept, and stored at the turn end in queue order');
     await framework.stop();
+  });
+
+  /** A store listener that throws once, after the record with this text is
+   *  written: the write throws though its message is stored. */
+  function throwOnceAfterStoring(framework: AgentFramework, textOf: string): void {
+    let thrown = false;
+    framework.getAgent('assistant')!.getContextManager().onMessage((event) => {
+      if (thrown || event.type !== 'add') return;
+      if (!event.message.content.some((b) => (b as { text?: string }).text === textOf)) return;
+      thrown = true;
+      throw new Error('listener failed');
+    });
+  }
+
+  it('at a tool boundary, a write that throws after its message is stored counts as stored: injected, and not stored again', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'look left');
+    module.interjections = [
+      { participant: 'Antra', content: text('look left') },
+      { participant: 'Antra', content: text('look right') },
+    ];
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.deepEqual(injected(), ['Antra: look left', 'Antra: look right'], 'the stored copy is carried too');
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: look left',
+      'Antra: look right',
+      'assistant: Done.',
+    ], 'stored once, where the stream carried it');
+    assert.ok(errors.some((e) => e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
+      && e.includes('listener failed')), errors.join('\n'));
+    await framework.stop();
+  });
+
+  /** Shard a message whose first block is `marker` into one shard per block,
+   *  as a strategy's ingress chunking does. */
+  function shardOn(framework: AgentFramework, marker: string): void {
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as { strategy: Record<string, unknown> };
+    cm.strategy.chunkIngressMessage = (_participant: string, content: ContentBlock[]) =>
+      (content[0] as { text?: string } | undefined)?.text === marker
+        ? { bodyGroupId: `body-${marker}`, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) }
+        : null;
+  }
+
+  it("at a tool boundary, a sharded body that throws after its first shard: what landed is carried and counts as written, and the rest isn't stored", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    shardOn(framework, 'part one');
+    // The listener throws on the first shard's add, which stops the append
+    // loop before the second shard.
+    throwOnceAfterStoring(framework, 'part one');
+    module.interjections = [
+      { participant: 'Antra', content: [...text('part one'), ...text('part two')] },
+      { participant: 'Antra', content: text('look right') },
+    ];
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.deepEqual(injected(), ['Antra: part one', 'Antra: look right'], 'the request carries what the store holds');
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: part one',
+      'Antra: look right',
+      'assistant: Done.',
+    ], 'the first shard alone, stored once');
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
+    assert.ok(errors.some((e) => e.includes("threw after 1 shard of its body was stored; what was stored counts as written and isn't stored again")
+      && e.includes('listener failed')), errors.join('\n'));
+    await framework.stop();
+  });
+
+  it('at a tool boundary, the shards that landed before a throw are carried as the next compile renders them', async () => {
+    // Probe by Ansel-2428: the autobiographical strategy shards a long
+    // message on ingest and joins a body's consecutive shards when it
+    // compiles, so the boundary must carry what landed in that shape. The
+    // body with an image between two texts fails here if the join changes
+    // where it puts a non-text block, so the copy of the join can't drift.
+    const long = Array.from({ length: 60 }, (_, i) => `Sentence ${i} of a long message from Antra.`).join(' ');
+    const ofLong = (messages: Array<{ content: unknown }>) =>
+      messages.filter((m) => JSON.stringify(m.content).includes('Sentence 0 '));
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const image = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } } as ContentBlock;
+    const cases: Array<{ name: string; content: ContentBlock[]; throwAt: number }> = [
+      { name: 'text, throw at shard 2', content: text(long), throwAt: 2 },
+      { name: 'text, throw at shard 3', content: text(long), throwAt: 3 },
+      { name: 'a short text, an image, then the long text, throw at shard 2', content: [...text('Intro. '), image, ...text(long)], throwAt: 2 },
+    ];
+    for (const [i, { name, content, throwAt }] of cases.entries()) {
+      membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Moving.' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse(text('Done.')));
+      const framework = await createFramework({
+        storePath: join(tempDir, `shards-${i}.chronicle`),
+        membrane: membrane.asMembrane(),
+        agents: [{
+          name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.',
+          strategy: new AutobiographicalStrategy({
+            adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30_000, kvStableReachTokens: 8_000,
+            targetChunkTokens: 50,
+          }),
+        } as never],
+      });
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      let shards = 0;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || !(event.message as { bodyGroupId?: string }).bodyGroupId) return;
+        if (++shards === throwAt) throw new Error('listener failed');
+      });
+      module.interjections = [{ participant: 'Antra', content }];
+      const error = console.error;
+      console.error = () => {};
+      try {
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
+        assert.equal(landed.length, throwAt, `${name}: ${throwAt} shards landed before the throw stopped the body`);
+        const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+        // The next turn's request is compiled from the store.
+        membrane.pushResponse(createMockResponse(text('Okay.')));
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        const next = ofLong(membrane.calls.at(-1)!.messages);
+        assert.equal(injected.length, 1, `${name}: one message injected`);
+        assert.equal(next.length, 1, `${name}: one message in the next request`);
+        assert.deepEqual(injected[0]!.content, next[0]!.content, `${name}: the boundary carried what the next compile renders`);
+      } finally {
+        console.error = error;
+        await framework.stop();
+      }
+    }
+  });
+
+  it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'from beta');
+    const internals = framework as unknown as {
+      openLogical: Map<string, unknown>;
+      readdDrained(entries: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>, where: string): unknown[];
+    };
+    // A logical turn still open between its streams, engaged with chan-beta:
+    // no turn is alive, so no tool boundary weighs what is stored now, and
+    // addMessage notes it as one of the turn's arrivals.
+    const open = { engaged: new Set(['chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
+    internals.openLogical.set('assistant', open);
+    const error = console.error;
+    console.error = () => {};
+    let written: unknown[];
+    try {
+      written = internals.readdDrained(
+        [{ id: 'w1', seq: 1, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta' } }],
+        'test flush',
+      );
+    } finally { console.error = error; }
+    assert.equal(written.length, 1, 'it counts as written');
+    const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
+    assert.equal(copies.length, 1, 'stored once');
+    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channelId: 'chan-beta' }], 'and noted as one of the open turn\'s arrivals');
+    await framework.stop();
+  });
+
+  it('at the turn end, a write that throws after its message is stored is not queued again', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'look left');
+    // Held behind a message named as the agent, both wait for the turn end.
+    module.interjections = [
+      { participant: 'assistant', content: text('my own words') },
+      { participant: 'Antra', content: text('look left') },
+    ];
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
+    assert.ok(errors.some((e) => e.includes("turn-end flush: deferred write")
+      && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
+      && e.includes('listener failed')), errors.join('\n'));
+    await framework.stop(); // stop() lands whatever is still queued
+
+    const reopened = await createFramework();
+    assert.deepEqual(windowOf(reopened).slice(2), [
+      'user: <tool_result>',
+      'assistant: Done.',
+      'assistant: my own words',
+      'Antra: look left',
+    ], 'stored once, at the turn end');
+    await reopened.stop();
   });
 
   it("a queued tool_use whose store throws keeps its tool_result from being stored alone", async () => {
