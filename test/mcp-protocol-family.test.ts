@@ -178,6 +178,9 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
   ];
   for (const config of narrowing) {
     assert.deepEqual(serverConfigProblems(modern(config)), [], JSON.stringify(config));
+    // Nor a warning: a host that stamps its deny-list on every server would
+    // hear it at every start, with nothing to do about it.
+    assert.deepEqual(serverConfigWarnings(modern(config)), [], JSON.stringify(config));
   }
   // Empty values grant nothing, on a modern stdio server too.
   const empty = cfg({
