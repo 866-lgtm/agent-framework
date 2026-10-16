@@ -2975,8 +2975,8 @@ export class ChannelRegistry {
    */
   private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
-    // EventGate) BEFORE this dispatch; when the gate is absent the framework
-    // strips the field so this confirmation stays truthful.
+    // EventGate) BEFORE this dispatch. Without a gate, a positive timer request
+    // is refused before this successful end-turn handler is reached.
     const wakeSecs = Number(input.wake_in_seconds);
     const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
       ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))

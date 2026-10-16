@@ -73,11 +73,37 @@ describe('skip_reply wake capability', () => {
     assert.match(gateTool.description, /wake_in_seconds/);
   });
 
+  it('framework wiring exposes timer wake only when its EventGate exists', async () => {
+    const noGate = await AgentFramework.create({
+      storePath: join(dir, 'framework-no-gate'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+    });
+    const withGate = await AgentFramework.create({
+      storePath: join(dir, 'framework-with-gate'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      gate: { configPath: join(dir, 'framework-gate.json') },
+    });
+    const live = (framework: AgentFramework) => framework as unknown as {
+      initializeMcpl(configs: unknown[], routing?: unknown): Promise<void>;
+      getAllTools(): Array<{ name: string; description: string; inputSchema: { properties?: Record<string, unknown> } }>;
+    };
+    await live(noGate).initializeMcpl([]);
+    await live(withGate).initializeMcpl([]);
+    const absent = live(noGate).getAllTools().find((tool) => tool.name === 'skip_reply')!;
+    const present = live(withGate).getAllTools().find((tool) => tool.name === 'skip_reply')!;
+    assert.equal('wake_in_seconds' in (absent.inputSchema.properties ?? {}), false);
+    assert.doesNotMatch(absent.description, /wake_in_seconds/);
+    assert.equal('wake_in_seconds' in (present.inputSchema.properties ?? {}), true);
+    assert.match(present.description, /wake_in_seconds/);
+    await noGate.stop();
+    await withGate.stop();
+  });
+
   it('returns an error and does not end the turn when EventGate is absent', async () => {
     const { framework, membrane, routed } = await make(false);
     const result = membrane.lastStream!.receivedToolResults[0]![0] as { content: string; isError?: boolean };
     assert.equal(result.isError, true);
-    assert.match(result.content, /Your turn did not end, and no wake was set/);
+    assert.match(result.content, /Your turn didn't end, and no wake was set/);
     assert.match(result.content, /call skip_reply without it/);
     assert.equal(membrane.lastStream!.receivedToolResults.length, 1,
       'the refused result resumes the stream instead of falsely ending the turn');
@@ -124,8 +150,9 @@ describe('skip_reply wake capability', () => {
 });
 
 
-describe('Alfred-2570 review probes', () => {
+describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
   async function runProbe(wake: unknown) {
+    const dir = mkdtempSync(join(tmpdir(), 'skip-wake-probe-'));
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'same-round text must stay private' },
@@ -133,7 +160,7 @@ describe('Alfred-2570 review probes', () => {
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'next-round reply' }] as ContentBlock[]));
     const framework = await AgentFramework.create({
-      storePath: join(tmpdir(), `probe-${String(wake)}-${Date.now()}`), membrane: membrane.asMembrane(),
+      storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
     });
     const lifecycle: ToolLifecycleParams[] = [];
@@ -157,6 +184,7 @@ describe('Alfred-2570 review probes', () => {
     await framework.runUntilIdle();
     const results = membrane.lastStream?.receivedToolResults ?? [];
     await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
     return { lifecycle, routed, results };
   }
 
