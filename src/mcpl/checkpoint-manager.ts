@@ -13,6 +13,7 @@
  */
 
 import type { JsStore } from '@animalabs/chronicle';
+import { ensureStateRegistered } from '../module-registry.js';
 
 import type { StateCheckpoint, JsonPatchOperation } from './types.js';
 
@@ -190,11 +191,7 @@ export class CheckpointManager {
     this.emitTraceFn = emitTraceFn;
 
     // Register the checkpoint metadata state slot
-    try {
-      store.registerState({ id: CHECKPOINTS_STATE_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered (e.g. framework restart)
-    }
+    ensureStateRegistered(store, { id: CHECKPOINTS_STATE_ID, strategy: 'snapshot' });
 
     // Load existing tree from Chronicle
     this.loadFromStore();
@@ -227,11 +224,7 @@ export class CheckpointManager {
     // Register per-feature-set state slot for host-managed state
     if (opts.hostState) {
       const stateId = this.stateId(serverId, featureSet);
-      try {
-        this.store.registerState({ id: stateId, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
       // Load existing state if any
       const existing = this.store.getStateJson(stateId);
       if (existing !== null && existing !== undefined) {
