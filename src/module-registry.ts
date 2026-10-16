@@ -286,8 +286,8 @@ export class ModuleRegistry {
    * model. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
-  async storableToolCall(call: ToolCall): Promise<ToolResult> {
-    return storableToolResult(call, await this.handleToolCall(call));
+  async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    return storableToolResult(call, await this.handleToolCall(call, options));
   }
 
   /**
@@ -298,8 +298,11 @@ export class ModuleRegistry {
    * A call whose input isn't an object, or lacks a key the tool's schema
    * requires, is answered before the module runs, with an error result that
    * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * A caller that has already resolved the tool's definition, as the `utils`
+   * tool has a utility's, passes it as `definition`, and it's checked against
+   * that one.
    */
-  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
@@ -336,8 +339,12 @@ export class ModuleRegistry {
       // handler would otherwise fail deep inside, or run without it. Values
       // aren't checked here, since a handler may take more than its schema
       // can say (toolArgsProblems). The module's own listing runs inside the
-      // try, so its throw is answered like any other.
-      const definition = [...module.getTools(), ...(module.getUtilities?.() ?? [])].find((tool) => tool.name === toolName);
+      // try, so its throw is answered like any other. Utilities are listed
+      // only for a name the tools don't have, so a utility listing that
+      // throws or is slow reaches only utility calls.
+      const definition = options.definition
+        ?? module.getTools().find((tool) => tool.name === toolName)
+        ?? module.getUtilities?.()?.find((tool) => tool.name === toolName);
       const problems = toolArgsProblems(call.input, definition?.inputSchema);
       if (problems.length > 0) {
         return {

@@ -1,7 +1,9 @@
 import type { ToolDefinition } from './types/index.js';
 
 /** A run of 16 or more digits, which membrane's XML parser passes as text for
- *  a number parameter: as a JavaScript number it would lose precision. */
+ *  a number or integer parameter: some such runs would lose precision as a
+ *  JavaScript number, so membrane keeps every one as text, and so does this
+ *  check. */
 const LARGE_INTEGER_TEXT = /^\d{16,}$/;
 
 /** The JSON kind of a value, as a schema's `type` names it. */
@@ -55,6 +57,14 @@ function oneOf(items: string[]): string {
   return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`;
 }
 
+/** A list in prose: `a`, `a and b`, `a, b and c`. */
+function allOf(items: string[]): string {
+  return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+/** At most this many keys a call gave that its schema doesn't declare are named. */
+const UNDECLARED_SHOWN = 5;
+
 /** An own property, so a key such as `constructor` isn't found on the prototype. */
 function own(obj: Record<string, unknown>, key: string): unknown {
   return Object.hasOwn(obj, key) ? obj[key] : undefined;
@@ -76,7 +86,12 @@ function own(obj: Record<string, unknown>, key: string): unknown {
  *   unless its declared type admits `null` (a type list naming it, or
  *   `nullable: true`). A key with no declared type takes `null` as a value,
  *   as it takes any other. An empty string is a value.
- * - A schema whose `required` isn't a list requires nothing here.
+ * - A schema whose `required` isn't a list requires nothing here, and a key
+ *   it lists twice is reported once.
+ * - Where a required key is missing and the call gave keys the schema's
+ *   `properties` don't declare, those are named too, since the commonest
+ *   reason a key is missing is that it was sent under another name. They're
+ *   never refused for themselves.
  *
  * A module tool's call is checked without `values`: a handler may take more
  * than its schema can say on every provider, such as one name where a list
@@ -100,7 +115,7 @@ export function toolArgsProblems(
   const problems: string[] = [];
   const missing = new Set<string>();
   for (const key of Array.isArray(schema.required) ? schema.required : []) {
-    if (typeof key !== 'string') continue;
+    if (typeof key !== 'string' || missing.has(key)) continue;
     const value = own(obj, key);
     const kinds = admittedKinds(declared(key));
     const admitsNull = kinds.length === 0 || kinds.includes('null');
@@ -108,6 +123,14 @@ export function toolArgsProblems(
     missing.add(key);
     const wanted = kinds.length > 0 ? `"${key}" (${oneOf(kinds.map(withArticle))})` : `"${key}"`;
     problems.push(`needs ${wanted}, and this call gave ${value === null ? 'null' : 'none'}`);
+  }
+  if (missing.size > 0 && schema.properties !== null && typeof schema.properties === 'object') {
+    const undeclared = Object.keys(obj).filter((key) => !Object.hasOwn(properties, key));
+    if (undeclared.length > 0) {
+      const named = undeclared.slice(0, UNDECLARED_SHOWN).map(shown);
+      if (undeclared.length > UNDECLARED_SHOWN) named.push(`${undeclared.length - UNDECLARED_SHOWN} more`);
+      problems.push(undeclared.length === 1 ? `${named[0]} isn't one of its parameters` : `${allOf(named)} aren't among its parameters`);
+    }
   }
   if (!options.values) return problems;
   for (const [key, value] of Object.entries(obj)) {

@@ -57,6 +57,7 @@ class ProbeModule implements Module {
   readonly name = 'probe';
   calls: ToolCall[] = [];
   listingThrows = false;
+  utilitiesThrow = false;
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
@@ -68,6 +69,7 @@ class ProbeModule implements Module {
     ];
   }
   getUtilities(): ToolDefinition[] {
+    if (this.utilitiesThrow) throw new Error('zz-utilities broke');
     return [{ name: 'rare_op', description: 'A rarely-used operation.', inputSchema: RARE_SCHEMA }];
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
@@ -97,6 +99,7 @@ async function withFramework(
     await fn(framework, probe, membrane);
   } finally {
     probe.listingThrows = false;
+    probe.utilitiesThrow = false;
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -121,6 +124,10 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
       assert.equal(result.error,
         'Nothing was done: probe--write needs "path" (a string), and this call gave none; ' +
         'needs "content" (a string), and this call gave none.');
+      // A key sent under another name is named, so the retry can see why.
+      const renamed = await call(framework, { file_path: 'a.txt', content: 'c' }, 'probe--write');
+      assert.equal(renamed.error,
+        'Nothing was done: probe--write needs "path" (a string), and this call gave none; "file_path" isn\'t one of its parameters.');
       assert.equal(probe.calls.length, 0);
     });
   });
@@ -197,6 +204,54 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
       assert.equal(given.success, true, given.error);
       assert.equal(probe.calls[0]!.name, 'rare_op');
     });
+  });
+
+  it('lists utilities only for a name the tools don\'t have, so a utility listing that throws reaches only utility calls', async () => {
+    await withFramework(async (framework, probe) => {
+      probe.utilitiesThrow = true;
+      const tool = await call(framework, { path: 'p' });
+      assert.equal(tool.success, true, tool.error);
+      const utility = await call(framework, { mode: 'x' }, 'probe--rare_op');
+      assert.deepEqual(utility, { success: false, isError: true, error: 'zz-utilities broke' });
+    });
+  });
+
+  it('checks a utils run against the utility it resolved, where a tool shares its name', async () => {
+    class TwinModule implements Module {
+      readonly name = 'twin';
+      calls: ToolCall[] = [];
+      async start(_ctx: ModuleContext): Promise<void> {}
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] {
+        return [{ name: 'dup', description: 'The tool.', inputSchema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }];
+      }
+      getUtilities(): ToolDefinition[] {
+        return [{ name: 'dup', description: 'The utility.', inputSchema: { type: 'object', properties: { b: { type: 'string' } }, required: ['b'] } }];
+      }
+      async handleToolCall(c: ToolCall): Promise<ToolResult> { this.calls.push(c); return { success: true, data: c.input }; }
+      async onProcess(): Promise<Record<string, never>> { return {}; }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'module-tool-args-twin-'));
+    const twin = new TwinModule();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', allowedTools: 'all' }],
+      modules: [twin],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    try {
+      const run = await framework.executeToolCall({ id: 'zz-twin', name: 'utils', input: { action: 'run', name: 'twin--dup', args: { b: 'x' } }, callerAgentName: 'agent' });
+      assert.equal(run.success, true, run.error);
+      assert.deepEqual(twin.calls[0]!.input, { b: 'x' });
+      // The tool keeps its own schema on its own path.
+      const tool = await framework.executeToolCall({ id: 'zz-twin-2', name: 'twin--dup', input: { b: 'x' }, callerAgentName: 'agent' });
+      assert.equal(tool.error, 'Nothing was done: twin--dup needs "a" (a string), and this call gave none; "b" isn\'t one of its parameters.');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('answers a throw from the module\'s own tool listing as an error result', async () => {
@@ -354,6 +409,36 @@ describe('toolArgsProblems', () => {
   it('names a kind once when a type list names it twice', () => {
     const both: ToolDefinition['inputSchema'] = { type: 'object', properties: { n: { type: ['integer', 'number'] } } };
     assert.deepEqual(toolArgsProblems({ n: 'x' }, both, { values: true }), ['"n" must be a number, and this call gave a string']);
+  });
+
+  it('reports a required key the schema lists twice once', () => {
+    const twice: ToolDefinition['inputSchema'] = { type: 'object', properties: { a: { type: 'string' } }, required: ['a', 'a'] };
+    assert.deepEqual(toolArgsProblems({}, twice), ['needs "a" (a string), and this call gave none']);
+  });
+
+  it('names keys the call gave that the schema doesn\'t declare, only where a required key is missing', () => {
+    assert.deepEqual(toolArgsProblems({ file_path: 'a.txt' }, WRITE_SCHEMA), [
+      'needs "path" (a string), and this call gave none',
+      'needs "content" (a string), and this call gave none',
+      '"file_path" isn\'t one of its parameters',
+    ]);
+    assert.deepEqual(toolArgsProblems({ path: 'p', text: 't', mode: 'w' }, WRITE_SCHEMA), [
+      'needs "content" (a string), and this call gave none',
+      '"text" and "mode" aren\'t among its parameters',
+    ]);
+    const many = Object.fromEntries(['k1', 'k2', 'k3', 'k4', 'k5', 'k6', 'k7'].map((k) => [k, 1]));
+    assert.deepEqual(toolArgsProblems(many, RARE_SCHEMA), [
+      'needs "mode" (a string), and this call gave none',
+      '"k1", "k2", "k3", "k4", "k5" and 2 more aren\'t among its parameters',
+    ]);
+    // Nothing missing, nothing said: an extra key is never refused for itself.
+    assert.deepEqual(toolArgsProblems({ path: 'p', zz: 1 }, SCHEMA), []);
+    assert.deepEqual(toolArgsProblems({ path: 'p', content: 'c', zz: 1 }, WRITE_SCHEMA, { values: true }), []);
+    // A schema that declares no properties can't say which keys are its own.
+    assert.deepEqual(toolArgsProblems({ y: 1 }, { type: 'object', required: ['x'] }), ['needs "x", and this call gave none']);
+    // A long key is shown briefly, as a value is.
+    const long = 'k'.repeat(100);
+    assert.deepEqual(toolArgsProblems({ [long]: 1 }, RARE_SCHEMA)[1], `"${'k'.repeat(79)}… isn't one of its parameters`);
   });
 
   it('names the input by the caller\'s word for it', () => {

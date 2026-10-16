@@ -18959,8 +18959,8 @@ export class AgentFramework {
         // module's own result; the model's path takes its checked form.
         const utilityCall = { id: call.id, name: def.name, input: args, callerAgentName: agentName };
         return options.inProcess
-          ? this.moduleRegistry.handleToolCall(utilityCall)
-          : this.moduleRegistry.storableToolCall(utilityCall);
+          ? this.moduleRegistry.handleToolCall(utilityCall, { definition: def })
+          : this.moduleRegistry.storableToolCall(utilityCall, { definition: def });
       }
       default:
         return { success: false, isError: true, error: 'action must be "list", "describe", or "run"' };

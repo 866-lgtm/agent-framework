@@ -12,7 +12,11 @@
   enums, nested shapes) are still the handler's to check; an absent input
   (`undefined` or `null`) still reaches a tool that requires nothing; a
   name the module answers but doesn't declare goes on unchecked; MCPL
-  servers' tools keep their servers' own checks. connectome-host needs no
-  change: its tools of this kind keep those keys required, since each such
-  call did something its agent didn't ask for, such as storing a lesson
-  without its content or starting a subagent named "undefined".
+  servers' tools keep their servers' own checks. Where a required key is
+  missing, the refusal also names keys the call gave that the schema
+  doesn't declare, since a key sent under another name is the commonest
+  cause; such keys are never refused for themselves. connectome-host needs
+  no change: its tools of this kind keep those keys required, since each
+  such call did something its agent didn't ask for, such as starting a
+  subagent named "undefined", or one with no system prompt, which was
+  accepted and then failed once its run began.
