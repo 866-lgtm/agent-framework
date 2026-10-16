@@ -340,9 +340,13 @@ test('vector 24: revoked authority before assembly drops the batch without a ren
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'previously_permitted', { deferred: true }));
   await f.framework.stop(); await f.create(false);
+  let withdrawn = 0;
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 0);
   assert(!f.context().includes('previously_permitted'));
+  assert.equal(f.membrane.calls.length, 0, 'and the revoked batch, the only cause, started no inference');
+  assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
 });
 
 test('vector 27i: a deferred notice displaces an unread plain occurrence', async (t) => {
@@ -855,6 +859,8 @@ test('R11: a retraction during the render-start commit wait is final; the batch 
 test('R12: endpoint reassignment during the render-start commit wait never sends the batch to the new peer', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'old_fallback', { deferred: true, data: { secret: 'private_notice_data' } }));
+  let withdrawn = 0;
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
   const held = holdNextCommit(f);
   const run = f.framework.runUntilIdle();
   const release = await held;
@@ -866,6 +872,8 @@ test('R12: endpoint reassignment during the render-start commit wait never sends
   assert.equal(f.renders.length, 0, 'no push/render to the new peer');
   assert(!JSON.stringify(f.renders).includes('private_notice_data'));
   assert(!f.context().includes('old_fallback'));
+  assert.equal(f.membrane.calls.length, 0, 'and the revoked batch, the only cause, started no inference');
+  assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
 });
 
 // ---------------------------------------------------------------------------
@@ -891,6 +899,24 @@ test('R13: a retraction during the audience lookup is final; the stale batch is 
   assert(!f.context().includes('withdrawn_fallback') && !f.context().includes('document_diff'), 'nothing of the withdrawn batch was published');
   await f.turn();
   assert(!f.context().includes('document_diff'));
+});
+
+test('a turn whose agent left the batch\'s audience before the assembly starts no inference', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'moved_fallback', { deferred: true, initial: true }));
+  // The admission's wake has looked the audience up; the next lookup is the
+  // assembly's, and it no longer names the agent, as when a conversation
+  // fork's channel is bound to a new fork in between.
+  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> };
+  const orig = internals.coalescedAudience.bind(internals);
+  internals.coalescedAudience = async () => { internals.coalescedAudience = orig; return []; };
+  let withdrawn = 0;
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0);
+  assert(!f.context().includes('moved_fallback'));
+  assert.equal(f.membrane.calls.length, 0, 'the batch, the only cause, started no inference');
+  assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
 });
 
 test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {
@@ -932,7 +958,7 @@ test('R15: a retraction arriving between the render result and its publication w
 // Review round 8 (#197): liveness after a failed render-start commit
 // ---------------------------------------------------------------------------
 
-test('R16: a batch whose render-start commit failed is re-woken once storage recovers', async (t) => {
+test('R16: a batch whose render-start commit failed is re-woken once storage recovers', { timeout: 30_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = 50;
@@ -941,15 +967,32 @@ test('R16: a batch whose render-start commit failed is re-woken once storage rec
   const orig = store.sync.bind(store);
   let failing = 0;
   store.sync = () => { if (failing > 0) { failing--; throw new Error('EIO simulated'); } orig(); };
+  const traced: Array<{ kind: string; source?: string }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing') traced.push({ kind: (e as { kind: string }).kind, source: (e as { source?: string }).source });
+  });
+  // Every turn that reaches the model is answered, so a model call nothing
+  // should have caused is counted rather than left waiting for a response.
+  f.alwaysRespond();
   await f.send('push/event', f.params('1', 'asleep_fallback', { deferred: true, initial: true }));
   failing = 1; // the render-start commit fails; storage then recovers
+  // The recovery wake can fire inside the first drain or after it, so drive
+  // until the batch renders rather than for a fixed number of drains.
   await f.framework.runUntilIdle();
+  while (!traced.some((e) => e.kind === 'rendered')) {
+    await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
+    await f.framework.runUntilIdle();
+  }
+  assert.equal(f.membrane.calls.length, 1, 'the wake whose render-start commit failed, the only cause, started no inference');
+  assert(f.lastRequest().includes('asleep_fallback'), 'the recovery turn delivered the batch');
+  const kinds = traced.map((e) => e.kind);
+  const order = (...steps: string[]) => kinds.filter((k) => steps.includes(k));
+  assert.deepEqual(order('persist-failed', 'turn-withdrawn', 'rendered'), ['persist-failed', 'turn-withdrawn', 'rendered'], 'the failed freeze withdrew its turn');
+  assert.deepEqual(order('persist-failed', 'recovery-wake', 'rendered'), ['persist-failed', 'recovery-wake', 'rendered'], 're-woken by the recovery timer, without unrelated traffic');
+  // The failed commit can't prove that no render started, so the batch takes
+  // its fallback and the server is never asked to render it.
+  assert.equal(traced.find((e) => e.kind === 'rendered')?.source, 'fallback');
   assert.equal(f.renders.length, 0);
-  assert.equal(coalescer.pendingBatches(), 1, 'the batch is kept');
-  assert(!f.lastRequest().includes('asleep_fallback'));
-  await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
-  await f.turn();
-  assert(f.lastRequest().includes('asleep_fallback'), 'delivered without unrelated traffic');
   assert.equal(coalescer.pendingBatches(), 0);
 });
 

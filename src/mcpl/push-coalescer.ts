@@ -129,11 +129,16 @@ interface Rendering<E> {
 
 /** What an assembly did, per subject, for the turn being assembled. */
 export interface AssemblyResult {
-  /** Subjects whose render this assembly waited on to completion. */
+  /** Subjects this assembly finished with: it waited on their render to
+   *  completion, took their batch and started no render, or found the agent
+   *  outside their batch's audience. */
   settled: Set<string>;
   /** Of those, the subjects whose render or fallback was delivered as content.
    *  A settled subject that is not here gave the turn nothing to read: empty
-   *  or blank render (§5.2), cancelled, or revoked at response. */
+   *  or blank render (§5.2), cancelled, revoked before the render or at its
+   *  response, a render-start that could not be made durable (the batch then
+   *  waits for its recovery wake), or a batch whose audience doesn't include
+   *  the agent. */
   materialized: Set<string>;
 }
 
@@ -667,7 +672,8 @@ export class PushCoalescer<E = unknown> {
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock.
       const started = await this.locked(() => this.freeze(subject, agentName));
-      if (started) {
+      if (started === 'declined') result.settled.add(subject);
+      else if (started) {
         work.push(started.done.then(() => {
           result.settled.add(subject);
           if (started.rendering.materialized) result.materialized.add(subject);
@@ -683,9 +689,12 @@ export class PushCoalescer<E = unknown> {
    * Under the lock: decide whether `subject`'s batch renders for `agentName`,
    * freeze it, make the render-start durable, re-check authority, and start
    * the RPC. Returns the render's completion (shared by every assembly that
-   * waits on this batch, vector 25) or undefined when nothing was started.
+   * waits on this batch, vector 25); 'declined' when the turn being assembled
+   * gets nothing of the batch, because the agent isn't in its audience or
+   * because this assembly took the batch and started no render; or undefined
+   * when the batch was not this assembly's to decide on.
    */
-  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void>; rendering: Rendering<E> } | undefined> {
+  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void>; rendering: Rendering<E> } | 'declined' | undefined> {
     const state = this.subjects.get(subject);
     if (!state || this.suspended) return undefined;
     if (state.rendering) {
@@ -698,12 +707,16 @@ export class PushCoalescer<E = unknown> {
     // The audience lookup may spawn a fork. Under the lock no admission can
     // move the subject on meanwhile; the identity check guards the host.
     const audience = await this.host.audience(batch.latest);
-    if (!audience.includes(agentName) || state.batch !== batch || state.rendering) return undefined;
+    if (state.batch !== batch || state.rendering) return undefined;
+    // Not this agent's batch, or no longer: an agent woken for it can have left
+    // its audience since. The batch stays for its audience, and this turn has
+    // nothing of it to show.
+    if (!audience.includes(agentName)) return 'declined';
     state.batch = undefined;
     this.host.cancelWake(subject);
     if (!this.host.authorized(batch.latest)) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
-      return undefined;
+      return 'declined';
     }
     const rendering: Rendering<E> = { batch, cancelled: false, done: Promise.resolve() };
     state.rendering = rendering;
@@ -721,7 +734,7 @@ export class PushCoalescer<E = unknown> {
       // unrelated traffic happens by. Re-wake with backoff, so a persistent
       // storage outage does not become a tight loop of model turns.
       this.scheduleRecovery(subject, state);
-      return undefined;
+      return 'declined';
     }
     this.clearRecovery(subject);
     if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
@@ -731,7 +744,7 @@ export class PushCoalescer<E = unknown> {
     if (!this.host.authorized(batch.latest)) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
       state.rendering = undefined;
-      return undefined;
+      return 'declined';
     }
     rendering.done = this.render(subject, state, rendering, agentName);
     return { done: rendering.done, rendering };
