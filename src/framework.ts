@@ -2824,12 +2824,13 @@ export class AgentFramework {
     // Nothing drives an ephemeral run once the loop has ended: no turn starts
     // after stop() begins, every stream it found was cancelled and has
     // settled, and a tool result that arrives now is dropped, since the queue
-    // is closed. So a run still registered could only wait for a watchdog:
-    // its wake never taken up, its turn refused, its retry cancelled, or its
-    // continuation still queued. End each one now, while the store is open
-    // for its cleanup. (A start() during a stop() is #315's. One made before
-    // the loop ended keeps a loop running, so this stop waits for it; one
-    // made just after, before this point, has its runs ended here too.)
+    // is closed. So a run still registered could only wait for a watchdog,
+    // such as one whose wake was never taken up, whose turn was refused,
+    // whose retry was cancelled, or whose continuation is still queued. End
+    // each one now, while the store is open for its cleanup. (A start()
+    // during a stop() is #315's. One made before the loop ended keeps a loop
+    // running, so this stop waits for it; one made just after, before this
+    // point, has its runs ended here too.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,

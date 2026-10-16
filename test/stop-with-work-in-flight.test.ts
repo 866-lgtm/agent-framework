@@ -355,7 +355,7 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
-  it('a turn whose retry stop() cancels leaves no agent inferring at the event gate', async () => {
+  it('a turn whose retry stop() cancels leaves no agent inferring at the event gate', { timeout: 60_000 }, async () => {
     // The stream can't start, and its retry waits longer than the test, so
     // only stop() ends the wait, which cancels the retry. While an agent is
     // inferring at the gate, the gate buffers every batch it debounces
@@ -392,7 +392,7 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
-  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', async () => {
+  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', { timeout: 60_000 }, async () => {
     // A restart left queued when stop() ends the loop continues its turn once
     // a start() on the same framework takes it up. stop() cleared the gate's
     // entries, and a turn that continues another doesn't start a new one, so
@@ -423,8 +423,10 @@ describe('stop() with work still in flight', () => {
     try {
       framework.start();
       await framework.stop();
-      framework.start();
+      // Queued while the framework is stopped, as a restart that stop() left
+      // queued is: the next start()'s loop takes it up.
       internal.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+      framework.start();
       await inStream;
       assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['assistant'], 'the continuing turn holds its entry');
       release();
