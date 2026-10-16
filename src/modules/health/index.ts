@@ -25,6 +25,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { AgentFramework } from '../../framework.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
+import { safeSlice } from '../../safe-slice.js';
 
 export interface HealthModuleConfig {
   /** IANA zone for timestamps returned by the snapshot tool. */
@@ -196,7 +197,7 @@ export class HealthModule implements Module {
       .map((s) => ({
         timestamp: s.timestamp,
         agentName: s.agentName,
-        error: typeof s.error === 'string' ? s.error.slice(0, 400) : s.error,
+        error: typeof s.error === 'string' ? safeSlice(s.error, 0, 400) : s.error,
         requestId: s.requestId,
       }));
 

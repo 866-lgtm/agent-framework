@@ -102,6 +102,7 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import { boundedErrorMessage as thrownText } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
@@ -388,7 +389,7 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
 const utilityOneLiner = (description: string): string => {
   const line = description.split('\n')[0]!;
   const dot = line.indexOf('. ');
-  return (dot >= 0 ? line.slice(0, dot + 1) : line).slice(0, 160);
+  return safeSlice(dot >= 0 ? line.slice(0, dot + 1) : line, 0, 160);
 };
 
 /** Shallow validation of run args against a utility's declared inputSchema:
@@ -1670,28 +1671,6 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
 export function shedMayHelp(errorType: string | undefined, httpStatus: number | undefined): boolean {
   if (httpStatus === 413) return errorType === 'invalid_request' || errorType === 'context_length';
   return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
-}
-
-/** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
-const THROWN_TEXT_LIMIT = 500;
-
-/**
- * What a thrown value says, safely and briefly: an Error's message, or any
- * other value, as a string. Every inspection and coercion of the value is
- * inside the try, so reading it can't throw: a revoked Proxy (whose
- * instanceof throws), a hostile getter, an Error whose message isn't a
- * string, or a value with no string form reads as text or as unreadable.
- * The text is bounded, since a provider or handler error can carry a whole
- * request body.
- */
-function thrownText(error: unknown): string {
-  let text: string;
-  try {
-    text = String(error instanceof Error ? error.message : error);
-  } catch {
-    text = '(a value that could not be read)';
-  }
-  return text.length <= THROWN_TEXT_LIMIT ? text : `${text.slice(0, THROWN_TEXT_LIMIT)}… (${text.length} characters)`;
 }
 
 /** A stored value that read but isn't in a form this code takes, as against
@@ -15890,7 +15869,8 @@ export class AgentFramework {
     // promise die silently. Deliberate cancels/disposes stay silent (the
     // agent or host chose them); clean exits stay silent (the null path).
     if (record.status === 'died' && !record.cancelled) {
-      const tail = (exec.tail ?? exec.stderr ?? '').slice(-2000);
+      const output = exec.tail ?? exec.stderr ?? '';
+      const tail = safeSlice(output, Math.max(0, output.length - 2000), output.length);
       const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
       const envelope =
         `[background script ${record.id}] Your background script DIED ${elapsedMin}m after start ` +
@@ -16137,7 +16117,7 @@ export class AgentFramework {
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);
     }
-    failure = failure.slice(0, 200);
+    failure = safeSlice(failure, 0, 200);
     this.emitTrace({
       type: 'tool:spill_failed',
       label: safeLabel,

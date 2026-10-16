@@ -1339,6 +1339,51 @@ describe('framework background scripts + spill (real python3)', () => {
     }
   });
 
+  it('a dead script\'s last output is cut at 2000 units without halving a surrogate pair', async () => {
+    // 1500 emoji, then the traceback. Whichever parity the cut 2000 units
+    // from the end has, one of the two runs (with or without one more unit
+    // after the emoji) puts it on a pair's second half.
+    for (const after of ['', 'x']) {
+      const { tempDir, storePath } = tempStorePath('pytc-bgpair-');
+      const membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+      const framework = await createBgFramework(storePath, membrane, {});
+      try {
+        framework.start();
+        const started = await framework.executeToolCall({
+          id: 'c1',
+          name: 'code_execution',
+          input: {
+            code: `import asyncio\nprint("\\U0001F600" * 1500 + "${after}", flush=True)\nawait asyncio.sleep(0.1)\nraise ValueError("done")`,
+            background: true,
+          },
+          callerAgentName: 'prime',
+        });
+        assert.strictEqual(started.success, true, JSON.stringify(started));
+
+        const deadline = Date.now() + 20_000;
+        let crashMessage: { content: ContentBlockLike[] } | null = null;
+        while (Date.now() < deadline && !crashMessage) {
+          await new Promise((r) => setTimeout(r, 100));
+          const cm = framework.getAgent('prime')?.getContextManager();
+          const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+          crashMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
+        }
+        assert.ok(crashMessage, 'crash wake should be injected');
+        const text = (crashMessage.content[0] as { text?: string }).text ?? '';
+        // A halved pair would be stored as U+FFFD, or kept as a lone surrogate.
+        const last = text.split('Last output:\n')[1] ?? '';
+        assert.ok(last.startsWith('\u{1F600}'),
+          `the last output starts on a whole emoji (after ${JSON.stringify(after)}): ${JSON.stringify(last.slice(0, 4))}`);
+        assert.ok(!text.includes('\ufffd') && !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text),
+          `no half of a pair (after ${JSON.stringify(after)})`);
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('oversized tool results spill to a workspace file with a reference', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-spill-');
     const mountDir = join(tempDir, 'mount');

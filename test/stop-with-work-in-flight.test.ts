@@ -871,6 +871,35 @@ describe('stop() with work still in flight', () => {
         await framework.stop();
       }
     });
+
+    it('a rejection over 500 characters is cut there, counting code points, without halving a surrogate pair', async () => {
+      const { framework, settle, pushed } = await withTuneOut();
+      try {
+        // 499 characters, then an emoji whose two UTF-16 units straddle unit
+        // 500. Counted in code points, the emoji is the 500th character.
+        const message = `${'x'.repeat(499)}😀 and more`;
+        settle().reject(new Error(message));
+        await until(() => pushed.length > 0, 'the failed result');
+        const result = (pushed[0] as unknown as { result: ToolResult }).result;
+        assert.equal(result.error, `${'x'.repeat(499)}😀… (509 characters)`, 'the cut keeps the emoji whole, and the count is of code points');
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('a rejection of 500 characters or fewer comes back whole, though it is longer than 500 UTF-16 units', async () => {
+      const { framework, settle, pushed } = await withTuneOut();
+      try {
+        // 300 emoji: 600 UTF-16 units, 300 characters.
+        const message = '😀'.repeat(300);
+        settle().reject(new Error(message));
+        await until(() => pushed.length > 0, 'the failed result');
+        const result = (pushed[0] as unknown as { result: ToolResult }).result;
+        assert.equal(result.error, message, 'within 500 characters, nothing is cut and no note is added');
+      } finally {
+        await framework.stop();
+      }
+    });
   });
 
   it('every tool result the framework produces names its tool, and the call it answers', () => {
