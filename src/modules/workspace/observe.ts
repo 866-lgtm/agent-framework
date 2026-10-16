@@ -603,8 +603,9 @@ export async function readPrefix(handle: FileHandle, limit: number, sizeHint: nu
 
 /**
  * Read and hash a mount-relative file through one located descriptor. The
- * whole file is returned when it is at most `limit` bytes; larger files are
- * hashed in chunks and only their head is kept.
+ * whole file is returned when it is at most `limit` bytes, both at its fstat
+ * and as read; any other file, including one that grew past `limit` since its
+ * fstat, is hashed in chunks and only its head is kept.
  */
 export async function readPath(
   view: MountView,
@@ -619,8 +620,13 @@ export async function readPath(
     const hashedAt = Date.now();
     const size = Number(info.size);
     const fp: Fingerprint = { ...statFingerprint(info), hashedAt };
-    if (size <= limit) {
-      const bytes = await handle.readFile();
+    // A file within the limit at its fstat is read no further than the limit,
+    // so one that has grown past it since is hashed below, from its start,
+    // never loaded whole. One over the limit at its fstat is hashed below
+    // without that read.
+    const within = size <= limit ? await readPrefix(handle, limit, size) : null;
+    if (within && !within.more) {
+      const { bytes } = within;
       return {
         kind: 'read',
         size: bytes.byteLength,

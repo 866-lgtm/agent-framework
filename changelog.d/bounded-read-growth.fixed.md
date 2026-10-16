@@ -17,3 +17,9 @@
     file's size by an `fstat` after the read, or `maxBytes + 1` if that's
     less. Before, `size` was the open's `fstat` size, so it could disagree
     with the bytes returned for a file that changed in between.
+- **A sync, listing or scan now takes a file that grew past the mount's
+  `maxFileSize` after its `fstat` as oversize.** The workspace hashes it
+  in chunks and keeps only its head, as for any file over the limit.
+  Before, its read of a file within the limit at its `fstat` used
+  `readFile`, so a file that grew in between was loaded whole, and a sync
+  could store the whole of a text file over the limit.
