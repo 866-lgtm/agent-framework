@@ -403,7 +403,7 @@ import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import type { McplServerConnection } from './mcpl/server-connection.js';
+import type { McplConnectionCloseInfo, McplServerConnection } from './mcpl/server-connection.js';
 import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -17869,7 +17869,7 @@ export class AgentFramework {
     // on it would erase every checkpoint tree on an ordinary host restart while
     // a SIGKILL preserves them. Permanent removal is owned solely by
     // disconnectMcplServer, which deletes the trees explicitly.
-    connection.on('close', (code?: number | null, signal?: string | null) => {
+    connection.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) => {
       this.featureSetManager?.removeServer(connection.id);
       // RFC-008: a closed provider's class hints are stale — on reconnect it
       // may class its tools differently. Until the next tools/list its tools
@@ -17880,6 +17880,9 @@ export class AgentFramework {
         serverId: connection.id,
         code: code ?? null,
         signal: signal ?? null,
+        // The transport's own words only: a WebSocket server's close text
+        // stays off the trace.
+        reason: info?.reason !== undefined && !info.reasonFromPeer ? boundFailureText(info.reason) : null,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
