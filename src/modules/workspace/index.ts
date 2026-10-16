@@ -1167,11 +1167,12 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'glob',
-        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes.',
+        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes. '
+          + 'The pattern is relative to path (or to each mount\'s root), or mount-prefixed like the paths it returns.',
         inputSchema: {
           type: 'object' as const,
           properties: {
-            pattern: { type: 'string', description: 'Glob pattern (e.g., "**/*.ts")' },
+            pattern: { type: 'string', description: 'Glob pattern, relative (e.g., "**/*.ts") or mount-prefixed (e.g., "project/src/**/*.ts")' },
             path: { type: 'string', description: 'Directory to search in (mount-prefixed, optional)' },
           },
           required: ['pattern'],
@@ -1189,7 +1190,7 @@ export class WorkspaceModule implements Module {
           properties: {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
-            glob: { type: 'string', description: 'Glob pattern to filter files' },
+            glob: { type: 'string', description: 'Glob pattern to filter files, relative to the mount root (e.g., "src/**/*.ts") or mount-prefixed (e.g., "project/src/**/*.ts")' },
             contextBefore: { type: 'number', description: 'Context lines before match' },
             contextAfter: { type: 'number', description: 'Context lines after match' },
           },
@@ -2401,7 +2402,6 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleGlob(input: GlobInput): Promise<ToolResult> {
-    const regex = globToRegex(input.pattern);
     const matches: Array<Record<string, unknown>> = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
@@ -2411,11 +2411,12 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     for (const { mount, relativePath } of mountsToSearch) {
+      const globs = mountGlobs(input.pattern, mount.config.name);
       const pass = await this.withMount(mount, () =>
         this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }));
       for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
         const testPath = relativePath ? report.path.slice(relativePath.length + 1) : report.path;
-        if (regex.test(testPath)) {
+        if (globs.relative.test(testPath) || globs.prefixed?.test(report.path) === true) {
           matches.push({ path: `${mount.config.name}/${report.path}`, ...stateView(report) });
         }
       }
@@ -2444,7 +2445,6 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Invalid regex: ${input.pattern}`, isError: true };
     }
 
-    const fileGlob = input.glob ? globToRegex(input.glob) : null;
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;
 
@@ -2507,8 +2507,9 @@ export class WorkspaceModule implements Module {
         }
 
         const intents = this.intents.get(mount.config.name)!;
+        const fileGlobs = input.glob ? mountGlobs(input.glob, mount.config.name) : null;
         for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
-          if (fileGlob && !fileGlob.test(report.path)) continue;
+          if (fileGlobs && !fileGlobs.relative.test(report.path) && fileGlobs.prefixed?.test(report.path) !== true) continue;
           const file = `${mount.config.name}/${report.path}`;
           if (report.state === 'disk-only') {
             skipped.push({
@@ -3166,6 +3167,23 @@ function stateView(report: PathReport): Record<string, unknown> {
 // ==========================================================================
 // Utilities
 // ==========================================================================
+
+/**
+ * The two ways a glob can be written for one mount. `relative` is the pattern
+ * as given, matched relative to the search root as it always was. `prefixed`
+ * is set when the pattern's first segment is this mount's name: every path
+ * the tools take and return is mount-prefixed, so `notes/diary/*.md` is the
+ * natural way to write a pattern, and tested as written against a
+ * mount-relative path it could never match — a glob answered "no matches"
+ * for files that were there. It matches the rest of the pattern against the
+ * mount-relative path. A pattern that names another mount, or none, matches
+ * as before.
+ */
+function mountGlobs(pattern: string, mountName: string): { relative: RegExp; prefixed: RegExp | null } {
+  const slash = pattern.indexOf('/');
+  const prefixed = slash > 0 && pattern.slice(0, slash) === mountName ? globToRegex(pattern.slice(slash + 1)) : null;
+  return { relative: globToRegex(pattern), prefixed };
+}
 
 /**
  * Convert a glob pattern to a RegExp.
