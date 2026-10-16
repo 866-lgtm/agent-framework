@@ -140,13 +140,10 @@ never do.
   of its own that the packed release installs on its own
   (`node scripts/pack-installs-alone.mjs` packs it, installs the tarball
   alone into an empty directory with its dependencies from npm, nested so
-  the package reaches only its own, checks that every file `package.json`
-  names is in it, declaration files included, loads each entry point under
-  Node and, with bun on PATH, its `bun` target under bun, and checks that
-  each bin has its `#!` line and that an ES module node bin's imports load,
-  without running it, a CommonJS one being only parsed; to run it by hand,
-  `npm run build` first, for example before `git push --follow-tags`, or
-  dispatch the workflow on a branch, where it publishes nothing), publishes
+  the package reaches only its own, and checks the installed package, as
+  the script's header lists; to run it by hand, `npm run build` first, for
+  example before `git push --follow-tags`, or dispatch the workflow on a
+  branch, where it publishes nothing), publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
   creates the GitHub release with that section as its notes. The two
   release jobs are independent: some consumers run github-clone checkouts,
@@ -205,10 +202,11 @@ branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI
-installs with plain `npm install` and there is no lock to keep in sync. It
-also runs the pack check the publish workflow runs before publishing
-(`node scripts/pack-installs-alone.mjs`, on ubuntu), so a file left out of
-the package, or an import only `devDependencies` supply, fails the PR.
+installs with `npm install` rather than `npm ci`, and there is no lock to
+keep in sync. It also runs the pack check the publish workflow runs before
+publishing (`node scripts/pack-installs-alone.mjs`, on ubuntu, with bun set
+up), so a file left out of the package, or an import only `devDependencies`
+supply, fails the PR.
 
 When working against local sibling checkouts rather than published versions,
 see the ecosystem workspace setup — `bun install` at the `rust-connectome`

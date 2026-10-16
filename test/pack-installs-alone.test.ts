@@ -75,6 +75,7 @@ test("a package whose files carry everything it names installs alone, and each e
         "./extra": "./dist/extra.js",
         "./package.json": "./package.json",
         "./legacy": { require: "./dist/legacy.cjs" },
+        "./dual": { import: "./dist/index.js", require: "./dist/legacy.cjs" },
         "./types": { types: "./dist/types.d.ts" },
         "./internal": null,
         "./parts/*": "./dist/*.js",
@@ -96,14 +97,15 @@ test("a package whose files carry everything it names installs alone, and each e
   assert.doesNotMatch(result.stderr, /zz-serve ran/, "a bin is never run");
   assert.match(
     result.stdout,
-    /^zz-fixture-1\.0\.0\.tgz \(\d+ files\) installs on its own; every file package\.json names is in it; loaded '@zz\/fixture' \(import\), '@zz\/fixture\/extra' \(import\), '@zz\/fixture\/package\.json' \(import json\), '@zz\/fixture\/legacy' \(require\); bun targets present, not loaded \(bun isn't on PATH\): '@zz\/fixture'; bins start with '#!': zz-serve, zz-shell; ES module bins' imports load: zz-serve; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m,
+    /^zz-fixture-1\.0\.0\.tgz \(\d+ files\) installs on its own; every file package\.json's main, types, exports and bin name is in it; loaded '@zz\/fixture' \(import\), '@zz\/fixture\/extra' \(import\), '@zz\/fixture\/package\.json' \(import json\), '@zz\/fixture\/legacy' \(require\), '@zz\/fixture\/dual' \(import\), '@zz\/fixture\/dual' \(require\); bun targets present, not loaded \(bun isn't on PATH\): '@zz\/fixture'; bins start with '#!': zz-serve, zz-shell; ES module bins' static imports load: zz-serve; bins whose '#!' line names no node, not loaded: zz-shell; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m,
   );
 });
 
-test("a string exports, an exports of conditions, and main without exports each load as the root", async () => {
+test("a string exports, an exports of conditions, an exports array, and main without exports each load as the root", async () => {
   for (const pkg of [
     { files: ["dist"], exports: "./dist/index.js" },
     { files: ["dist"], exports: { import: "./dist/index.js", default: "./dist/index.js" } },
+    { files: ["dist"], exports: ["./dist/index.js"] },
     { files: ["dist"], main: "./dist/index.js" },
   ]) {
     const result = await check(fixture(pkg, ENTRY));
@@ -138,7 +140,7 @@ test("with neither exports nor main, the root is loaded from its index.js, and a
   assert.match(fallback.stdout, /; loaded '@zz\/fixture' \(import\)\.\n$/m);
   const binOnly = await check(fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": NODE_BIN }));
   assert.equal(binOnly.code, 0, binOnly.stderr);
-  assert.match(binOnly.stdout, /installs on its own; every file package\.json names is in it; bins start with '#!': fixture; ES module bins' imports load: fixture\.\n$/m);
+  assert.match(binOnly.stdout, /installs on its own; every file package\.json's main, types, exports and bin name is in it; bins start with '#!': fixture; ES module bins' static imports load: fixture\.\n$/m);
 });
 
 test("a tree that hasn't been built, or a main beside exports that names no file, says so before packing", async () => {
@@ -158,6 +160,7 @@ test("a file the package names but leaves out of files fails, under any conditio
     // the bun and types targets of the root, which no import() reads
     [{ files: ["dist"], exports: { ".": { bun: "./src/index.ts", import: "./dist/index.js" } } }, { ...ENTRY, "src/index.ts": "" }, /\.\/src\/index\.ts \(exports\['\.'\]\) isn't in zz-fixture-1\.0\.0\.tgz: add it to package\.json's `files`\./],
     [{ files: ["dist/index.js"], types: "./dist/index.d.ts", exports: "./dist/index.js" }, { ...ENTRY, "dist/index.d.ts": "" }, /\.\/dist\/index\.d\.ts \(types\) isn't in/],
+    [{ files: ["dist/index.js"], typings: "./dist/index.d.ts", exports: "./dist/index.js" }, { ...ENTRY, "dist/index.d.ts": "" }, /\.\/dist\/index\.d\.ts \(typings\) isn't in/],
     // a pattern that matches nothing packed
     [{ files: ["dist/index.js"], exports: { ".": "./dist/index.js", "./parts/*": "./parts/*.js" } }, { ...ENTRY, "parts/a.js": "" }, /\.\/parts\/\*\.js \(exports\['\.\/parts\/\*'\], a pattern no packed file matches\) isn't in/],
   ];
@@ -208,13 +211,19 @@ test("a bin needs a '#!' line, and a node bin's imports must load; none is run",
   assert.match(devOnlyBin.stderr, /Cannot find package 'zz-dev-only'/);
   assert.doesNotMatch(devOnlyBin.stderr, /zz-serve ran/);
   assert.match(devOnlyBin.stderr, /pack-installs-alone: bin 'zz-serve' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz doesn't load \(above\)/);
-  // One whose imports load is never run either.
+  // One whose imports load is never run either, and the hook leaves what it
+  // imports alone: a CommonJS one among them doesn't make the bin CommonJS.
   const imports = await check(fixture(
     { files: ["dist"], main: "./dist/index.js", bin: { "zz-serve": "./dist/serve.js" } },
-    { ...ENTRY, "dist/serve.js": "#!/usr/bin/env node\nimport { ok } from './index.js';\nthrow new Error('zz-serve ran ' + ok);\n" },
+    {
+      ...ENTRY,
+      "dist/legacy.cjs": "module.exports = { legacy: true };\n",
+      "dist/serve.js": "#!/usr/bin/env node\nimport { ok } from './index.js';\nimport legacy from './legacy.cjs';\nthrow new Error('zz-serve ran ' + ok + legacy.legacy);\n",
+    },
   ));
   assert.equal(imports.code, 0, imports.stderr);
   assert.doesNotMatch(imports.stderr, /zz-serve ran/);
+  assert.match(imports.stdout, /; bins start with '#!': zz-serve; ES module bins' static imports load: zz-serve\.\n$/m);
 });
 
 test("a CommonJS bin is parsed, never run, whatever marks it CommonJS, and one that doesn't parse fails", async () => {
@@ -275,19 +284,53 @@ test("with bun on PATH, a bun target is loaded under bun, and one that doesn't l
   assert.match(loads.stdout, /; loaded '@zz\/fixture' \(import\); loaded under bun: '@zz\/fixture'\.\n$/m);
   const broken = await check(fixture(pkg, { ...ENTRY, "src/index.js": "import './left-out.js';\n" }), BUN_BY_NODE);
   assert.equal(broken.code, 1);
-  assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun, from its bun target, in the installed zz-fixture-1\.0\.0\.tgz failed \(above\)\. A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or a dependency's new release \(rerun this on main to tell\)\.\n$/);
+  assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun from the installed zz-fixture-1\.0\.0\.tgz failed \(above\)\. A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or a dependency's new release \(rerun this on main to tell\)\.\n$/);
 });
 
-test("a declaration file the build wrote beside types, left out of files, fails, and exports: null falls back to main", async () => {
-  const declarations = await check(fixture(
-    { files: ["dist/**/*.js", "dist/index.d.ts"], main: "./dist/index.js", types: "./dist/index.d.ts" },
-    { ...ENTRY, "dist/index.d.ts": "export * from './extra.js';\n", "dist/extra.d.ts": "export declare const extra: boolean;\n" },
-  ));
-  assert.equal(declarations.code, 1);
-  assert.match(declarations.stderr, /dist\/extra\.d\.ts \(a declaration beside \.\/dist\/index\.d\.ts\) isn't in zz-fixture-1\.0\.0\.tgz/);
+test("the declaration the build wrote beside a packed module, left out of files, fails, whether types, typings or a types condition gives the package types, and exports: null falls back to main", async () => {
+  const declarations = { "dist/index.d.ts": "export * from './extra.js';\n", "dist/extra.d.ts": "export declare const extra: boolean;\n" };
+  for (const typed of [
+    { types: "./dist/index.d.ts" },
+    { typings: "./dist/index.d.ts" },
+    { exports: { ".": { types: "./dist/index.d.ts", import: "./dist/index.js" } } },
+  ]) {
+    const result = await check(fixture({ files: ["dist/**/*.js", "dist/index.d.ts"], main: "./dist/index.js", ...typed }, { ...ENTRY, ...declarations }));
+    assert.equal(result.code, 1, JSON.stringify(typed));
+    assert.match(result.stderr, /: dist\/extra\.d\.ts \(the declaration beside dist\/extra\.js\) isn't in zz-fixture-1\.0\.0\.tgz/);
+  }
   const nullExports = await check(fixture({ files: ["dist"], main: "./dist/index.js", exports: null }, ENTRY));
   assert.equal(nullExports.code, 0, nullExports.stderr);
   assert.match(nullExports.stdout, /; loaded '@zz\/fixture' \(import\)\.\n$/m);
+});
+
+test("no declaration is required beside a module the package doesn't pack, or in a package without types", async () => {
+  // A root-level types, with a packed module and its declaration beside it,
+  // and a test's and a dependency's declarations, which stay out.
+  const root = await check(fixture(
+    { files: ["index.js", "index.d.ts", "lib.js", "lib.d.ts"], main: "./index.js", types: "./index.d.ts" },
+    {
+      "index.js": "export * from './lib.js';\n",
+      "index.d.ts": "export * from './lib.js';\n",
+      "lib.js": "export const ok = true;\n",
+      "lib.d.ts": "export declare const ok: boolean;\n",
+      "test/helper.js": "export {};\n",
+      "test/helper.d.ts": "export {};\n",
+      "node_modules/zz-dep/index.d.ts": "export {};\n",
+    },
+  ));
+  assert.equal(root.code, 0, root.stderr);
+  // Without types, a declaration the build wrote may stay out.
+  const untyped = await check(fixture({ files: ["dist/**/*.js"], main: "./dist/index.js" }, { ...ENTRY, "dist/index.d.ts": "export declare const ok: boolean;\n" }));
+  assert.equal(untyped.code, 0, untyped.stderr);
+});
+
+test("npm pack output that isn't one record with a filename and its files fails, saying so", async () => {
+  for (const printed of ["zz: not JSON", JSON.stringify({ "@zz/fixture": { filename: "zz-fixture-1.0.0.tgz" } })]) {
+    const npm = shim("npm", `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(printed)}\n`);
+    const result = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npm}:`);
+    assert.equal(result.code, 1, printed);
+    assert.equal(result.stderr, `${printed}\npack-installs-alone: npm pack --json didn't print one record with a filename and its files (its output is above).\n`);
+  }
 });
 
 test("npm pack's JSON is read in npm 12's shape too, and a prepack's output doesn't break it", async () => {

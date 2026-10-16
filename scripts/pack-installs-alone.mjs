@@ -1,33 +1,37 @@
 // Packs this package as `npm publish` packs it, installs the tarball alone
-// into an empty directory with its dependencies from the registry, as
-// someone installing the release does, and checks what the installed
-// package.json offers. The install is nested (npm's --install-strategy
-// nested), so the package reaches only its own dependencies: a package it
-// imports but only devDependencies lists fails to load even when another
-// dependency brings that package in.
-//   - every file it names is in the package: `main`, `types`, each `exports`
-//     target under every condition (the `bun` and `types` targets too), at
-//     least one file for each export pattern, each `bin`, and each
-//     declaration file the build wrote beside `types`;
+// into an empty directory with its dependencies from the registry, and
+// checks, under the Node that runs this, what the installed package.json
+// offers. The install is nested (npm's --install-strategy nested), which is
+// stricter than npm's default: the package reaches only its own
+// dependencies, so a package it imports but only devDependencies lists
+// fails to load even when another dependency brings that package in.
+//   - every file its `main`, `types` (or `typings`), `exports` and `bin`
+//     name is in the package: each `exports` target under every condition
+//     (the `bun` and `types` targets too), at least one file for each export
+//     pattern, and each `bin`; and, in a package with types (`types`,
+//     `typings` or a `types` condition), so is the `.d.ts` the build wrote
+//     beside each `.js` it packs;
 //   - each entry point loads as a consumer loads it: the root and each
-//     subpath through import() (a JSON target with its import attribute), or
-//     through require() when only `require` serves it, and, when bun is on
-//     PATH, each `bun` target through bun's import();
+//     subpath, patterns aside, through import() (a JSON target with its
+//     import attribute), and through require() where `require` picks a file
+//     import() doesn't; and, when bun is on PATH, each one with a `bun`
+//     condition through bun's import() of its name;
 //   - each bin starts with a `#!` line, without which npm's link can't run
-//     it as a command, and an ES module node bin's imports load. Bins aren't
-//     run: a load hook makes the bin throw as soon as its imports have
-//     loaded, before its own code, which for the MCP server would start it.
-//     A CommonJS bin's requires run with its code, so the hook stops it
-//     before it loads, and it's only parsed (`node --check`).
+//     it as a command, and an ES module node bin's static imports load.
+//     Bins aren't run: a load hook makes the bin throw as soon as its
+//     imports have loaded, before its own code, which for the MCP server
+//     would start it. A CommonJS bin's requires run with its code, so the
+//     hook stops it before it loads, and it's only parsed (`node --check`).
+//     A bin whose `#!` line names no node is checked for that line alone.
 // Before packing it checks that the files package.json names exist in this
 // tree, so an unbuilt tree says so rather than looking like a packaging
 // fault. The publish workflow runs it after its build and before
 // `npm publish` (which builds again from the same sources first); to check
 // by hand, run `npm run build` and then this, from the repository root.
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const LOAD_TIMEOUT_MS = 60_000;
@@ -41,8 +45,9 @@ const HOOK = `export async function load(url, context, nextLoad) {
   if (url !== process.env.PACK_INSTALLS_ALONE_BIN) return result;
   // A CommonJS bin's requires run with its code, so it isn't loaded at all.
   if (result.format !== "module") throw new Error("${NOT_MODULE}");
+  // Only a bin whose first line starts with '#!' gets here.
   const lines = String(result.source).split("\\n");
-  lines.splice(lines[0].startsWith("#!") ? 1 : 0, 0, 'throw "${LINKED}";');
+  lines.splice(1, 0, 'throw "${LINKED}";');
   return { ...result, source: lines.join("\\n") };
 }
 `;
@@ -75,10 +80,10 @@ function pick(value, conditions) {
   return undefined;
 }
 
-/** Every file target an exports value names, under any condition. */
+/** Every file target an exports value names, under any condition (an
+ *  array's items are its values). */
 function allTargets(value, out = []) {
   if (typeof value === "string") out.push(value);
-  else if (Array.isArray(value)) for (const item of value) allTargets(item, out);
   else if (value && typeof value === "object") for (const inner of Object.values(value)) allTargets(inner, out);
   return out;
 }
@@ -112,21 +117,9 @@ function namedFiles(pkg) {
   return named;
 }
 
-/** Each declaration file under `dir` in this tree, as a path from here. */
-function declarations(dir) {
-  if (!existsSync(dir)) return [];
-  const out = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...declarations(path));
-    else if (entry.name.endsWith(".d.ts")) out.push(path);
-  }
-  return out;
-}
-
-/** Whether an exports value names `condition` anywhere. */
+/** Whether an exports value names `condition` anywhere (an array's keys
+ *  are its indexes). */
 function hasCondition(value, condition) {
-  if (Array.isArray(value)) return value.some((item) => hasCondition(item, condition));
   if (!value || typeof value !== "object") return false;
   return Object.entries(value).some(([key, inner]) => key === condition || hasCondition(inner, condition));
 }
@@ -177,11 +170,12 @@ function main() {
     } catch {
       records = [];
     }
-    if (records.length !== 1 || typeof records[0]?.filename !== "string") {
+    if (records.length !== 1 || typeof records[0]?.filename !== "string" || !Array.isArray(records[0]?.files)) {
       process.stderr.write(out);
-      throw new CheckError("npm pack --json didn't print one record with a filename (its output is above).");
+      throw new CheckError("npm pack --json didn't print one record with a filename and its files (its output is above).");
     }
     const packed = records[0];
+    const files = packed.files.map((file) => file.path);
     const tarball = join(work, packed.filename);
     const dir = join(work, "install");
     mkdirSync(dir);
@@ -193,22 +187,24 @@ function main() {
       `${packed.filename} didn't install on its own into an empty directory (npm's output is above). A dependency ` +
         "that isn't on the registry does that, or a registry or network error, which a re-run gets past.",
     );
-    const installed = join(dir, "node_modules", ...packed.name.split("/"));
+    const installed = join(dir, "node_modules", ...source.name.split("/"));
     // What a consumer reads: the manifest in the tarball.
     const pkg = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
-    const files = packed.files.map((file) => file.path);
 
     // This tree has each named file (checked before packing), so one the
     // package lacks is one `files` leaves out.
-    const missing = namedFiles(pkg).filter(([path]) => !existsSync(join(installed, path)));
-    // The declaration files the build wrote beside `types`, which it imports.
-    const types = typeof pkg.types === "string" ? pkg.types : typeof pkg.typings === "string" ? pkg.typings : undefined;
-    if (types !== undefined) {
-      for (const declaration of declarations(dirname(types))) {
-        const path = relative(".", declaration);
-        // `types` itself is already named above.
-        if (path === relative(".", types)) continue;
-        if (!existsSync(join(installed, path))) missing.push([path, `a declaration beside ${types}`]);
+    const named = namedFiles(pkg);
+    const missing = named.filter(([path]) => !existsSync(join(installed, path)));
+    // A consumer's TypeScript reads the declaration beside each module it
+    // reaches, so a package with types carries the one the build wrote
+    // beside each module it packs. A named one was checked above.
+    if (typeof pkg.types === "string" || typeof pkg.typings === "string" || hasCondition(pkg.exports, "types")) {
+      const checked = new Set([...files, ...named.map(([path]) => relative(".", path))]);
+      for (const file of files) {
+        const declaration = file.replace(/\.js$/, ".d.ts");
+        if (declaration !== file && !checked.has(declaration) && existsSync(declaration)) {
+          missing.push([declaration, `the declaration beside ${file}`]);
+        }
       }
     }
     for (const [key, value] of subpaths(pkg.exports)) {
@@ -241,7 +237,7 @@ function main() {
       const imported = pick(value, ["node", "import"]);
       const required = pick(value, ["node", "require"]);
       if (typeof imported === "string") loads.push([specifier, imported.endsWith(".json") ? "import json" : "import"]);
-      else if (typeof required === "string") loads.push([specifier, "require"]);
+      if (typeof required === "string" && required !== imported) loads.push([specifier, "require"]);
     }
     for (const [specifier, how] of loads) {
       const code =
@@ -257,7 +253,9 @@ function main() {
           "dependency's new release (rerun this on main to tell).",
       );
     }
-    // bun reads the `bun` condition, which Node never does.
+    // bun reads the `bun` condition, which Node never does. Importing the
+    // package's name under bun loads what a bun consumer gets: the `bun`
+    // target where `bun` is the first condition bun matches.
     const bunLoads = [];
     const bun = bunOnPath();
     for (const [key, value] of roots) {
@@ -269,7 +267,7 @@ function main() {
         "bun",
         ["-e", `await import(${JSON.stringify(specifier)}); process.exit(0);`],
         { cwd: dir, timeout: LOAD_TIMEOUT_MS },
-        `loading '${specifier}' under bun, from its bun target, in the installed ${packed.filename} failed (above). ` +
+        `loading '${specifier}' under bun from the installed ${packed.filename} failed (above). ` +
           "A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or " +
           "a dependency's new release (rerun this on main to tell).",
       );
@@ -278,6 +276,7 @@ function main() {
     const bins = binsOf(pkg);
     const binsLoaded = [];
     const binsParsed = [];
+    const binsNotNode = [];
     for (const [bin, path] of Object.entries(bins)) {
       const file = join(installed, path);
       const first = readFileSync(file, "utf8").split("\n", 1)[0];
@@ -286,44 +285,46 @@ function main() {
           `bin '${bin}' (${path}) has no '#!' line, so npm's link can't run it as a command: start its source with '#!/usr/bin/env node'.`,
         );
       }
-      if (/\bnode\b/.test(first)) {
-        // The hook makes an ES module bin throw once its imports have loaded,
-        // so its own code never runs, and stops a CommonJS bin before it
-        // loads, which is then only parsed; any other failure is the bin's.
-        const hook = join(work, "bin-hook.mjs");
-        const register = join(work, "bin-register.mjs");
-        writeFileSync(hook, HOOK);
-        writeFileSync(register, `import { register } from "node:module";\nregister(${JSON.stringify(pathToFileURL(hook).href)});\n`);
-        const loaded = spawnSync(process.execPath, ["--import", pathToFileURL(register).href, file], {
-          cwd: dir,
-          encoding: "utf8",
-          timeout: LOAD_TIMEOUT_MS,
-          env: { ...process.env, PACK_INSTALLS_ALONE_BIN: pathToFileURL(realpathSync(file)).href },
-        });
-        const stderr = `${loaded.stderr ?? ""}`;
-        if (stderr.includes(LINKED)) {
-          binsLoaded.push(bin);
-          continue;
-        }
-        if (stderr.includes(NOT_MODULE)) {
-          run(process.execPath, ["--check", file], {}, `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`);
-          binsParsed.push(bin);
-          continue;
-        }
-        process.stderr.write(stderr);
-        throw new CheckError(
-          loaded.error?.code === "ETIMEDOUT"
-            ? `loading bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${LOAD_TIMEOUT_MS / 1000} s.`
-            : `bin '${bin}' (${path}) in ${packed.filename} doesn't load (above): a package it imports that only ` +
-                "devDependencies supplies does that, as does a file the package leaves out, a syntax error, or a " +
-                "dependency's new release (rerun this on main to tell).",
-        );
+      if (!/\bnode\b/.test(first)) {
+        binsNotNode.push(bin);
+        continue;
       }
+      // The hook makes an ES module bin throw once its imports have loaded,
+      // so its own code never runs, and stops a CommonJS bin before it
+      // loads, which is then only parsed; any other failure is the bin's.
+      const hook = join(work, "bin-hook.mjs");
+      const register = join(work, "bin-register.mjs");
+      writeFileSync(hook, HOOK);
+      writeFileSync(register, `import { register } from "node:module";\nregister(${JSON.stringify(pathToFileURL(hook).href)});\n`);
+      const loaded = spawnSync(process.execPath, ["--import", pathToFileURL(register).href, file], {
+        cwd: dir,
+        encoding: "utf8",
+        timeout: LOAD_TIMEOUT_MS,
+        env: { ...process.env, PACK_INSTALLS_ALONE_BIN: pathToFileURL(realpathSync(file)).href },
+      });
+      const stderr = `${loaded.stderr ?? ""}`;
+      if (stderr.includes(LINKED)) {
+        binsLoaded.push(bin);
+        continue;
+      }
+      if (stderr.includes(NOT_MODULE)) {
+        run(process.execPath, ["--check", file], {}, `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`);
+        binsParsed.push(bin);
+        continue;
+      }
+      process.stderr.write(stderr);
+      throw new CheckError(
+        loaded.error?.code === "ETIMEDOUT"
+          ? `loading bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${LOAD_TIMEOUT_MS / 1000} s.`
+          : `bin '${bin}' (${path}) in ${packed.filename} doesn't load (above): a package it imports that only ` +
+              "devDependencies supplies does that, as does a file the package leaves out, a syntax error, or a " +
+              "dependency's new release (rerun this on main to tell).",
+      );
     }
 
     const patterns = roots.filter(([key]) => key.includes("*")).map(([key]) => key);
     console.log(
-      `${packed.filename} (${packed.entryCount} files) installs on its own; every file package.json names is in it` +
+      `${packed.filename} (${files.length} files) installs on its own; every file package.json's main, types, exports and bin name is in it` +
         (loads.length > 0 ? `; loaded ${loads.map(([s, how]) => `'${s}' (${how})`).join(", ")}` : "") +
         (bunLoads.length > 0
           ? bun
@@ -331,8 +332,9 @@ function main() {
             : `; bun targets present, not loaded (bun isn't on PATH): ${bunLoads.map((s) => `'${s}'`).join(", ")}`
           : "") +
         (Object.keys(bins).length > 0 ? `; bins start with '#!': ${Object.keys(bins).join(", ")}` : "") +
-        (binsLoaded.length > 0 ? `; ES module bins' imports load: ${binsLoaded.join(", ")}` : "") +
+        (binsLoaded.length > 0 ? `; ES module bins' static imports load: ${binsLoaded.join(", ")}` : "") +
         (binsParsed.length > 0 ? `; CommonJS bins parse, not loaded: ${binsParsed.join(", ")}` : "") +
+        (binsNotNode.length > 0 ? `; bins whose '#!' line names no node, not loaded: ${binsNotNode.join(", ")}` : "") +
         (patterns.length > 0 ? `; export patterns matched, not loaded: ${patterns.join(", ")}` : "") +
         ".",
     );
