@@ -9,7 +9,7 @@ import { AgentFramework } from '../src/framework.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { InferenceRouter } from '../src/mcpl/inference-router.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
-import { McplTransport, StdioTransport } from '../src/mcpl/transport.js';
+import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { McplResponseSerializationError } from '../src/mcpl/errors.js';
 
@@ -845,23 +845,6 @@ test("an 'error' listener that throws is caught and logged, and the next message
   assert.ok(logged.some((line) => line.includes(`an 'error' listener failed: "error listener exploded"`)), logged.join('\n'));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
   assert.equal(received, true);
-});
-
-test("a failed write to a stdio server's stdin is reported, never thrown", (t) => {
-  const child = Object.assign(new EventEmitter(), { stdin: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null });
-  const rl = new EventEmitter();
-  const transport = new (StdioTransport as any)(child, rl) as StdioTransport;
-  const logged: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(String(args[0])); });
-  const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
-  // With nobody listening on the transport, it's logged.
-  assert.doesNotThrow(() => child.stdin.emit('error', epipe));
-  assert.match(logged[0] ?? '', /stdin failed: "write EPIPE"/);
-  // With a listener, it's the transport's error.
-  const reported: unknown[] = [];
-  transport.on('error', (error) => reported.push(error));
-  child.stdin.emit('error', epipe);
-  assert.deepEqual(reported, [epipe]);
 });
 
 test('a synchronous handler that swallows an encoding failure is reported and answered once', async () => {

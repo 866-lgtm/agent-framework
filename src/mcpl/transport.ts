@@ -19,10 +19,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -30,6 +30,9 @@ export interface TransportCloseInfo {
   code?: number | null;
   signal?: NodeJS.Signals | null;
   reason?: string;
+  /** True when `reason` is the peer's own text, a WebSocket server's close
+   *  reason, rather than the transport's words. */
+  reasonFromPeer?: boolean;
 }
 
 /**
@@ -70,6 +73,16 @@ export abstract class McplTransport extends EventEmitter {
 
   get closed(): boolean {
     return this._closed;
+  }
+
+  /**
+   * The last of what the server wrote to its diagnostic stream: at most its
+   * last {@link STDERR_TAIL_CHARS} UTF-16 code units, never opening inside a
+   * surrogate pair, after a '…' when earlier ones were dropped. A stdio
+   * child's stderr, and '' for a transport that has none.
+   */
+  get stderrTail(): string {
+    return '';
   }
 
   /** Deliver an inbound line, buffering it if nobody is listening yet. */
@@ -168,8 +181,19 @@ export function buildChildEnv(
   return merged;
 }
 
+/** The most of a stdio child's stderr a transport keeps for {@link McplTransport.stderrTail}. */
+export const STDERR_TAIL_CHARS = 2_048;
+
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
+  /** The first error on the child's stdin or stdout, named in the close reason. */
+  private pipeError: Error | undefined;
+  private stderrEnd = '';
+  private stderrCut = false;
+
+  override get stderrTail(): string {
+    return (this.stderrCut ? '…' : '') + this.stderrEnd;
+  }
 
   private constructor(
     private readonly child: ChildProcess,
@@ -179,39 +203,62 @@ export class StdioTransport extends McplTransport {
 
     this.rl.on('line', (line: string) => this.pushLine(line));
 
-    // Stitch stderr chunks into whole lines (a chunk can split a line).
+    // Stitch stderr chunks into whole lines (a chunk can split a line, and a
+    // character's bytes), and keep the stream's last characters for
+    // stderrTail.
     let carry = '';
-    this.child.stderr?.on('data', (chunk: Buffer) => {
-      const text = carry + chunk.toString('utf8');
-      const lines = text.split('\n');
+    const decoder = new StringDecoder('utf8');
+    const received = (text: string) => {
+      const end = this.stderrEnd + text;
+      this.stderrCut ||= end.length > STDERR_TAIL_CHARS;
+      let kept = end.slice(-STDERR_TAIL_CHARS);
+      // A cut between a surrogate pair's halves drops the low half too.
+      if (/^[\uDC00-\uDFFF]/.test(kept) && end.length > STDERR_TAIL_CHARS) kept = kept.slice(1);
+      this.stderrEnd = kept;
+      const lines = (carry + text).split('\n');
       carry = lines.pop() ?? '';
       for (const l of lines) if (l.length > 0) this.pushStderr(l);
+    };
+    this.child.stderr?.on('data', (chunk: Buffer) => received(decoder.write(chunk)));
+    // A last line with no newline is complete once the stream ends.
+    this.child.stderr?.on('end', () => {
+      received(decoder.end());
+      if (carry.length > 0) this.pushStderr(carry);
     });
 
     this.child.on('error', (err) => this.emit('error', err));
-    // A write to a child that has just exited fails asynchronously on its
-    // stdin (EPIPE). Unlistened, that 'error' would end the host; the exit
-    // itself closes the transport, so the write's failure is only reported.
-    this.child.stdin?.on('error', (err) => {
-      if (this.listenerCount('error') > 0) this.emit('error', err);
-      else console.error(`[mcpl] a write to the server's stdin failed: ${logDetail(err.message)}`);
-    });
-    // A read error on the child's stdout or stderr reaches the transport's
-    // 'error' listener if it has one, and is never thrown. The stdout
-    // listener is on the stream itself, since close() closes readline, which
-    // takes its own listener off the stream. While readline is open, its
-    // listener, which came first, re-emits the error on the interface, where
-    // an empty listener absorbs that copy; the stream listener's report is
-    // the only one.
-    const reportReadError = (err: Error) => {
-      if (this.listenerCount('error') > 0) this.emit('error', err);
+    // The child's stdin and stdout carry the protocol, so after an error on
+    // either, a write's EPIPE or a read error, this transport can't reach the
+    // child even if it's still running. The handler sends a running child
+    // SIGTERM, and the exit's close names the error, so the connection handles
+    // it as any other exit. The close is the report: no 'error' is emitted,
+    // nothing is thrown. Nothing here escalates to SIGKILL, so a child that
+    // ignores SIGTERM keeps running, unreported. A child that stops reading
+    // without closing its stdin raises no error: the writes are buffered, and
+    // only request timeouts bound it (McplServerConfig.requestTimeoutMs).
+    const endOnPipeError = (err: Error) => {
+      this.pipeError ??= err;
+      if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
     };
-    this.child.stdout?.on('error', reportReadError);
-    this.rl.on('error', () => { /* readline's copy of a stdout error, reported above */ });
-    this.child.stderr?.on('error', reportReadError);
-    this.child.on('exit', (code, signal) =>
-      this.markClosed({ code, signal, reason: 'child process exited' }),
-    );
+    this.child.stdin?.on('error', endOnPipeError);
+    // On the stream itself, since close() closes readline, which takes its own
+    // listener off the stream. While readline is open, its listener, which
+    // came first, re-emits the error on the interface, where an empty
+    // listener absorbs that copy.
+    this.child.stdout?.on('error', endOnPipeError);
+    this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
+    // stderr carries diagnostics only: a read error on it is reported if
+    // anyone listens and never thrown. It ends nothing once the connection
+    // is wired; during a handshake the listener is the handshake's, which
+    // fails it.
+    this.child.stderr?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    });
+    this.child.on('exit', (code, signal) => this.markClosed({
+      code,
+      signal,
+      reason: this.pipeError ? `child process exited, and its pipe failed with ${this.pipeError.message}` : 'child process exited',
+    }));
   }
 
   /**
@@ -299,9 +346,10 @@ export class WebSocketTransport extends McplTransport {
     });
 
     this.ws.on('error', (err: Error) => this.emit('error', err));
-    this.ws.on('close', (code: number, reason: Buffer) =>
-      this.markClosed({ code, reason: reason?.toString('utf8') || 'websocket closed' }),
-    );
+    this.ws.on('close', (code: number, reason: Buffer) => {
+      const text = reason?.toString('utf8');
+      this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });
+    });
   }
 
   /**
