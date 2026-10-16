@@ -184,6 +184,7 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
     // A one-segment `*` reaches no path denied by default.
     { enabledCapabilities: ['*'] },
     { scopes: { files: { blacklist: ['write:*'] } } },
+    { scopes: { files: { whitelist: [] } } },
     { channelSubscription: 'manual' },
     { toolLifecycle: { maxInputBytes: 1024 } },
     { toolLifecycle: { observe: false } as never },

@@ -302,9 +302,10 @@ three ways:
 - It has no MCPL surface (grant, push, channels, inference requests, feature
   sets). A setting that asks for that surface can't apply, so it is a
   configuration error: `allowHostCommands: true`, an `enabledCapabilities`
-  pattern that names a path denied by default, `channelSubscription` other
-  than `'manual'`, a scope's `whitelist`, a `toolLifecycle` `observe` or
-  `inputs` block, and an `autofetch` bound above its default. A setting
+  pattern that matches a capability denied by default, `channelSubscription:
+  'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
+  `toolLifecycle` `observe` or `inputs` block, and an `autofetch` bound
+  above its default. A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
   `enabledCapabilities`, which are allow-lists, `disabledFeatureSets`,
