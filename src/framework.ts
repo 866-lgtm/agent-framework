@@ -1904,8 +1904,9 @@ export class AgentFramework {
 
   /** Liveness watchdog (fail hard on a wedged main thread). Null unless enabled. */
   private livenessWatchdog: import('./runtime/liveness-watchdog.js').LivenessWatchdog | null = null;
-  /** The frameworks a SIGUSR2 dumps: each from where create() starts its
-   *  watchdog until stop() stops it (joinDiagnostics). */
+  /** The frameworks a SIGUSR2 dumps (joinDiagnostics): each joins in create()
+   *  where the liveness watchdog starts, or would if it isn't enabled, and
+   *  leaves in stop() where the watchdog stops. */
   private static readonly diagnosed = new Set<AgentFramework>();
   private static diagnosticsListenerInstalled = false;
 
@@ -2618,14 +2619,25 @@ export class AgentFramework {
   /**
    * Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
    * (journal) without a restart — for catching the wake-wedge on the running
-   * process. Each framework from create() until stop() prints its own line:
-   * the gate's `inferring` set and buffered-event count (the wedge signature),
-   * active streams, and pending inference requests. With none, one line says
-   * so. One listener serves the process, installed by the first create() and
-   * kept: once a process's last SIGUSR2 listener is removed, the signal's
-   * default action ends the process, and a dump can arrive between one
-   * framework's stop() and the next one's create(), as on a host's session
-   * switch.
+   * process. Each framework prints its own line: the gate's `inferring` set
+   * and buffered-event count (the wedge signature), active streams, and
+   * pending inference requests. A framework joins partway through create(),
+   * once its agents, modules and event gate are built, where the liveness
+   * watchdog starts (or would, when it isn't enabled). It leaves in stop()
+   * where the watchdog stops: after stop() has waited on its streams,
+   * maintenance, event loop and operator operations, so a dump shows what
+   * those waits are on, and before its modules and MCPL servers stop, so a
+   * stop() whose teardown hangs, fails or times out doesn't keep it listed.
+   * With none in the set, one line says no framework is running. A framework
+   * started again after a completed stop() doesn't rejoin; whether that
+   * lifecycle is supported is #315.
+   *
+   * One listener serves the process, installed by the first create() to
+   * reach the join and kept: once a process's last SIGUSR2 listener is
+   * removed, the signal's default action ends the process, and a dump can
+   * arrive between one framework's stop() and the next one's create(), as on
+   * a host's session switch. Until a create() first reaches the join, the
+   * process has no listener, and the default action applies.
    */
   private static joinDiagnostics(framework: AgentFramework): void {
     AgentFramework.diagnosed.add(framework);
