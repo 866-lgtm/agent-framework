@@ -59,14 +59,14 @@ test('past 10,000 held requests, a new one is refused at once with -32000; the h
   requests(REQUESTS);
   assert.equal(held(), REQUESTS);
   assert.deepEqual(answers(), []);
-  requests(2);
-  assert.deepEqual(answers(), [
-    { jsonrpc: '2.0', id: REQUESTS + 1, error: { code: -32000, message: BUSY } },
-    { jsonrpc: '2.0', id: REQUESTS + 2, error: { code: -32000, message: BUSY } },
-  ]);
+  requests(101);
+  assert.equal(answers().length, 101);
+  assert.deepEqual(answers()[0], { jsonrpc: '2.0', id: REQUESTS + 1, error: { code: -32000, message: BUSY } });
+  assert.deepEqual(answers()[100], { jsonrpc: '2.0', id: REQUESTS + 101, error: { code: -32000, message: BUSY } });
   assert.equal(held(), REQUESTS);
   // One line for the first refusal, then one per hundred.
-  assert.deepEqual(logged, [`[mcpl] srv: held-request budget (${REQUESTS}) — refused 1 request(s) with -32000 while the plane is paused`]);
+  assert.deepEqual(logged, [1, 101].map((n) =>
+    `[mcpl] srv: held-request budget (${REQUESTS}) — refused ${n} request(s) with -32000 while the plane is paused`));
   connection.ready();
   assert.equal(delivered.length, REQUESTS);
   assert.deepEqual(delivered.slice(0, 2), [1, 2]);
@@ -74,11 +74,12 @@ test('past 10,000 held requests, a new one is refused at once with -32000; the h
 });
 
 test('notifications are counted apart from held requests: with 10,000 requests held, a notification is still held, and 1,000 notifications are kept, newest last', (t) => {
-  const { connection, delivered, requests, notifications, answers, held } = pausedConnection(t);
+  const { connection, delivered, logged, requests, notifications, answers, held } = pausedConnection(t);
   requests(REQUESTS);
   notifications(NOTIFICATIONS + 1);
   // Nothing refused: notifications don't spend the requests' budget.
   assert.deepEqual(answers(), []);
+  assert.deepEqual(logged, [`[mcpl] srv: buffered-event cap (${NOTIFICATIONS}) — dropped 1 responder-less event(s) while the plane is paused`]);
   // The oldest notification made room for the newest.
   assert.equal(held(), REQUESTS + NOTIFICATIONS);
   connection.ready();
@@ -89,7 +90,7 @@ test('notifications are counted apart from held requests: with 10,000 requests h
 });
 
 test('the budget counts what is held: requests held again by a control-plane flush still count, and an open plane frees the budget for the next pause', (t) => {
-  const { connection, delivered, requests, answers, held } = pausedConnection(t);
+  const { connection, delivered, logged, requests, answers, held } = pausedConnection(t);
   requests(REQUESTS / 2);
   // The control plane opens and the data plane stays paused, as during a
   // reconnect or an awareness drain: every push is held again.
@@ -106,4 +107,24 @@ test('the budget counts what is held: requests held again by a control-plane flu
   requests(REQUESTS);
   assert.equal(answers().length, 1, 'no new refusal');
   assert.equal(held(), REQUESTS);
+  // This pause's first refusal is logged too.
+  logged.length = 0;
+  requests(1);
+  assert.equal(answers().length, 2);
+  assert.deepEqual(logged, [`[mcpl] srv: held-request budget (${REQUESTS}) — refused 1 request(s) with -32000 while the plane is paused`]);
+});
+
+test('a request held again during ready()\'s own flush, when a listener pauses the plane, counts toward the budget', (t) => {
+  const { connection, delivered, requests, answers, held } = pausedConnection(t);
+  // The first push's handler pauses the data plane, as a quiesce begun from
+  // inside a handler would, so the rest of ready()'s snapshot is held again.
+  connection.once('push-event', () => connection.pauseDataPlane());
+  requests(2);
+  connection.ready();
+  assert.deepEqual(delivered, [1]);
+  assert.equal(held(), 1);
+  requests(REQUESTS - 1);
+  assert.deepEqual(answers(), [], 'the one held again and the ones sent since fill the budget exactly');
+  requests(1);
+  assert.deepEqual(answers().map((answer) => [answer.id, answer.error?.code]), [[REQUESTS + 2, -32000]]);
 });

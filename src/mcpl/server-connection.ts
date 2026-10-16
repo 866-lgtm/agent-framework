@@ -304,11 +304,14 @@ export class McplServerConnection extends EventEmitter {
   private static readonly MAX_HELD_NOTIFICATIONS = 1000;
   /** Budget of held requests during a plane pause (#387), counted apart from
    *  notifications: past it, a request is refused at once, never dropped. It
-   *  bounds a server that pipelines requests without waiting for answers,
-   *  while a busy server's ordinary pause, a long quiesce over a busy guild,
-   *  stays under it. */
+   *  bounds a server that pipelines requests without waiting for answers. A
+   *  server that doesn't send a refused request again loses it (discord-mcpl
+   *  doesn't), so the budget sits far above the notifications' cap, to leave
+   *  a busy server's long pause room. */
   private static readonly MAX_HELD_REQUESTS = 10_000;
   private droppedBufferedEvents = 0;
+  /** Requests refused at the budget since the planes last opened (ready()),
+   *  so each pause's first refusal is logged. */
   private refusedHeldRequests = 0;
   /** True while ready()/readyControlPlane() re-emit a buffer snapshot. Items
    *  re-buffering mid-flush were already admitted once — applying the cap to
@@ -387,6 +390,7 @@ export class McplServerConnection extends EventEmitter {
     const dropped = this.droppedBufferedEvents;
     this.droppedBufferedEvents = 0;
     this.heldRequests = 0;
+    this.refusedHeldRequests = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
