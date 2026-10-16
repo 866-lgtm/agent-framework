@@ -5,19 +5,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, type Module } from '../src/index.js';
+import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
-function recordingModule(name: string, stop: () => Promise<void> = async () => {}) {
+function recordingModule(name: string, stop: () => Promise<void> = async () => {}, start: () => Promise<void> = async () => {}) {
   const calls: string[] = [];
   const module: Module = {
     name,
-    async start() { calls.push('start'); },
+    async start() { calls.push('start'); await start(); },
     async stop() { calls.push('stop'); await stop(); },
     async onProcess() { return {}; },
     getTools: () => [],
@@ -37,30 +38,100 @@ function baseConfig(storePath: string) {
     syncIntervalMs: 0, maintenanceIntervalMs: 0 };
 }
 
+/** A release that finished cleanly rejects with create()'s own error, unwrapped. */
+function rejectsWithItsOwnError(creating: Promise<unknown>, message: string | RegExp) {
+  return assert.rejects(creating, (error: unknown) => {
+    assert.ok(error instanceof Error && !(error instanceof AggregateError), `expected create()'s own error, got ${String(error)}`);
+    if (typeof message === 'string') assert.equal(error.message, message);
+    else assert.match(error.message, message);
+    return true;
+  });
+}
+
 // Two servers on one prefix: refused after the modules have started, before
 // any MCPL server is spawned (the reproduction in #389).
 const COLLIDING_SERVERS = [
   { id: 'first', command: process.execPath, args: ['-e', ''], toolPrefix: 'shared' },
   { id: 'second', command: process.execPath, args: ['-e', ''], toolPrefix: 'shared' },
 ];
+const COLLISION = 'MCPL server "second" toolPrefix "shared" collides with server "first"';
 
 test('a create() refused after its modules started stops them and frees its store', async t => {
   const storePath = join(tempDir(t), 'store');
   const { module, calls } = recordingModule('started');
-  await assert.rejects(
+  await rejectsWithItsOwnError(
     AgentFramework.create({ ...baseConfig(storePath), modules: [module], mcplServers: COLLIDING_SERVERS }),
-    /toolPrefix "shared" collides with server "first"/,
+    COLLISION,
   );
   assert.deepEqual(calls, ['start', 'stop']);
   const retried = await AgentFramework.create(baseConfig(storePath));
   await retried.stop();
 });
 
+test('a create() whose module fails to start stops every module it started, that one included', async t => {
+  const storePath = join(tempDir(t), 'store');
+  const first = recordingModule('first');
+  const failing = recordingModule('failing', undefined, async () => { throw new Error('the port is taken'); });
+  await rejectsWithItsOwnError(
+    AgentFramework.create({ ...baseConfig(storePath), modules: [first.module, failing.module] }),
+    'the port is taken',
+  );
+  assert.deepEqual(first.calls, ['start', 'stop']);
+  assert.deepEqual(failing.calls, ['start', 'stop']);
+  const retried = await AgentFramework.create(baseConfig(storePath));
+  await retried.stop();
+});
+
+test('a create() that fails after its MCPL server connected closes the server and frees its store', async t => {
+  const dir = tempDir(t);
+  const outboxPath = join(dir, 'awareness.json');
+  // A pending Discord awareness batch makes startup run the awareness barrier
+  // after the server connects; its second reconciliation fails.
+  const outbox = new DiscordAwarenessOutbox(outboxPath);
+  const batch = outbox.prepare({ agentName: 'assistant', sourceBranch: 'source', targetBranch: 'main',
+    activationPolicy: 'explicit',
+    refs: [{ serverId: 'discord', channelId: 'discord:guild:startup', messageId: 'message-1' }] });
+  assert.ok(batch);
+  outbox.activate(batch.id);
+  const config = {
+    ...baseConfig(join(dir, 'store')),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
+    discordAwarenessOutboxPath: outboxPath,
+    discordAwarenessDeadlineMs: 1_000,
+    mcplServers: [{
+      id: 'discord', command: process.execPath,
+      args: [fileURLToPath(new URL('./fixtures/awareness-barrier-mcpl-server.mjs', import.meta.url))],
+      requestTimeoutMs: 1_000, enabledFeatureSets: ['chat'],
+      env: { STATUS_PATH: join(dir, 'status.jsonl'), LEDGER_PATH: outboxPath },
+    }],
+  };
+  const children = () => process.getActiveResourcesInfo().filter(resource => resource === 'ProcessWrap').length;
+  const before = children();
+  const reconcile = DiscordAwarenessOutbox.prototype.reconcileForBranch;
+  let reconciliations = 0;
+  const injected = t.mock.method(DiscordAwarenessOutbox.prototype, 'reconcileForBranch',
+    function (this: DiscordAwarenessOutbox, ...args: Parameters<typeof reconcile>) {
+      if (++reconciliations === 2) throw new Error('injected reconcile failure');
+      return reconcile.apply(this, args);
+    });
+  await rejectsWithItsOwnError(AgentFramework.create(config),
+    /^Discord awareness accounting failed during .*: injected reconcile failure$/);
+  injected.mock.restore();
+  assert.match(readFileSync(join(dir, 'status.jsonl'), 'utf8'), /"event":"initialized"/,
+    'the MCPL server had finished its handshake before the failure');
+  for (let waits = 0; children() > before; waits++) {
+    assert.ok(waits < 200, 'the MCPL server is still running after create() rejected');
+    await new Promise(done => setTimeout(done, 10));
+  }
+  const retried = await AgentFramework.create(config);
+  await retried.stop();
+});
+
 test('a create() refused before the framework is built frees its store', async t => {
   const storePath = join(tempDir(t), 'store');
-  await assert.rejects(
+  await rejectsWithItsOwnError(
     AgentFramework.create({ ...baseConfig(storePath), timeZone: 'Not/AZone' }),
-    /Invalid IANA time zone/,
+    'Invalid IANA time zone: "Not/AZone"',
   );
   const retried = await AgentFramework.create(baseConfig(storePath));
   await retried.stop();
@@ -72,31 +143,32 @@ test('a failed create() leaves a store the caller owns open, and stops what it s
   t.after(() => { try { store.close(); } finally { rmSync(dir, { recursive: true, force: true }); } });
   const { module, calls } = recordingModule('started');
   const { storePath: _unused, ...config } = baseConfig('');
-  await assert.rejects(
+  await rejectsWithItsOwnError(
     AgentFramework.create({ ...config, store, modules: [module], mcplServers: COLLIDING_SERVERS }),
-    /collides with server "first"/,
+    COLLISION,
   );
   assert.deepEqual(calls, ['start', 'stop']);
   assert.equal(store.isClosed(), false);
-  await assert.rejects(
+  await rejectsWithItsOwnError(
     AgentFramework.create({ ...config, store, timeZone: 'Not/AZone' }),
-    /Invalid IANA time zone/,
+    'Invalid IANA time zone: "Not/AZone"',
   );
   assert.equal(store.isClosed(), false);
   const retried = await AgentFramework.create({ ...config, store });
   await retried.stop();
 });
 
-test('a failed create() whose teardown also fails reports both, and still frees its store', async t => {
+test('a failed create() whose module fails to stop reports both, and still frees its store', async t => {
   const storePath = join(tempDir(t), 'store');
   const { module } = recordingModule('stuck', async () => { throw new Error('the socket would not close'); });
   await assert.rejects(
     AgentFramework.create({ ...baseConfig(storePath), modules: [module], mcplServers: COLLIDING_SERVERS }),
     (error: unknown) => {
       assert.ok(error instanceof AggregateError, `expected an AggregateError, got ${String(error)}`);
-      assert.match(error.message, /^AgentFramework\.create\(\) failed: MCPL server "second" toolPrefix "shared" collides with server "first"/);
-      assert.match(error.message, /the socket would not close/);
-      assert.match(String((error.errors[0] as Error).message), /collides with server "first"/);
+      assert.equal(error.message, `AgentFramework.create() failed: ${COLLISION}. Stopping what it had started ` +
+        `didn't finish, so part of it may still be running: the socket would not close`);
+      assert.equal((error.errors[0] as Error).message, COLLISION);
+      assert.equal(error.errors.length, 2);
       return true;
     },
   );
@@ -104,7 +176,34 @@ test('a failed create() whose teardown also fails reports both, and still frees 
   await retried.stop();
 });
 
-test('a failed create() waits at most 30 s for its release, then says the release did not finish', async t => {
+test('a failed create() whose store fails to close says so, after its own error', async t => {
+  const storePath = join(tempDir(t), 'store');
+  const { module } = recordingModule('stuck', async () => { throw new Error('the socket would not close'); });
+  // The store does close, so the retry below can open it; close() then reports
+  // a failure, as a close whose final sync fails would.
+  const close = JsStore.prototype.close;
+  const failing = t.mock.method(JsStore.prototype, 'close', function (this: JsStore) {
+    failing.mock.restore();
+    close.call(this);
+    throw new Error('the final sync failed');
+  });
+  await assert.rejects(
+    AgentFramework.create({ ...baseConfig(storePath), modules: [module], mcplServers: COLLIDING_SERVERS }),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError, `expected an AggregateError, got ${String(error)}`);
+      assert.equal(error.message, `AgentFramework.create() failed: ${COLLISION}. Stopping what it had started ` +
+        `didn't finish, so part of it may still be running: the socket would not close. Closing its store ` +
+        `failed, so the store may still be locked: the final sync failed`);
+      assert.deepEqual(error.errors.map(e => (e as Error).message),
+        [COLLISION, 'the socket would not close', 'the final sync failed']);
+      return true;
+    },
+  );
+  const retried = await AgentFramework.create(baseConfig(storePath));
+  await retried.stop();
+});
+
+test('a failed create() gives up on a module\'s stop after 30 s, and says what did not finish', async t => {
   const storePath = join(tempDir(t), 'store');
   let release!: () => void;
   const stopping = new Promise<void>(done => { release = done; });
@@ -130,7 +229,8 @@ test('a failed create() waits at most 30 s for its release, then says the releas
   }
   const error = await rejection;
   assert.ok(error instanceof AggregateError, `expected an AggregateError, got ${String(error)}`);
-  assert.match(error.message, /^AgentFramework\.create\(\) failed: MCPL server "second" toolPrefix "shared" collides with server "first"\. Releasing what it had started didn't finish cleanly, so part of it may still be running: Shutdown timed out after 30000 ms; pending: module:hung$/);
+  assert.equal(error.message, `AgentFramework.create() failed: ${COLLISION}. Stopping what it had started ` +
+    `didn't finish, so part of it may still be running: Shutdown timed out after 30000 ms; pending: module:hung`);
   t.mock.timers.reset();
   const retried = await AgentFramework.create(baseConfig(storePath));
   await retried.stop();
@@ -139,7 +239,7 @@ test('a failed create() waits at most 30 s for its release, then says the releas
 // The watchdog's worker kills the whole process once the main thread stops
 // beating for its threshold. One a failed create() left running would kill a
 // process that carried on after the failure.
-test('a failed create() leaves no liveness watchdog to kill the process later', async t => {
+test('a create() refused after it started the watchdog leaves none to kill the process later', async t => {
   const dir = tempDir(t);
   const script = join(dir, 'child.mjs');
   const index = pathToFileURL(join(import.meta.dirname, '../src/index.js')).href;
@@ -147,22 +247,30 @@ test('a failed create() leaves no liveness watchdog to kill the process later', 
   writeFileSync(script, `
     import { AgentFramework } from ${JSON.stringify(index)};
     import { MockMembrane } from ${JSON.stringify(membrane)};
-    const failed = await AgentFramework.create({
+    const refusal = await AgentFramework.create({
       storePath: ${JSON.stringify(join(dir, 'store'))}, membrane: new MockMembrane().asMembrane(),
       agents: [], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       watchdog: { enabled: true, thresholdMs: 2000, action: 'exit' },
       toolResultInlineMaxChars: 1,
-    }).then(() => false, () => true);
-    if (!failed) process.exit(3);
+    }).then(() => 'none', error => error.message);
+    console.error('refused: ' + refusal);
     await new Promise(done => setTimeout(done, 200));
     const end = Date.now() + 5000;
     while (Date.now() < end) {}
     process.exit(0);
   `);
+  // A file, not a pipe: writes to it are synchronous on every platform, so a
+  // killed child's lines are all there.
+  const logPath = join(dir, 'child.log');
+  const log = openSync(logPath, 'w');
   const { code, signal } = await new Promise<{ code: number | null; signal: string | null }>(resolve => {
-    const child = spawn(process.execPath, [script], { stdio: 'ignore' });
+    const child = spawn(process.execPath, [script], { stdio: ['ignore', log, log] });
     const safety = setTimeout(() => child.kill('SIGTERM'), 20_000);
     child.on('exit', (code, signal) => { clearTimeout(safety); resolve({ code, signal }); });
   });
+  closeSync(log);
+  const output = readFileSync(logPath, 'utf8');
+  assert.match(output, /\[liveness-watchdog\] armed/, 'the watchdog started before the refusal');
+  assert.match(output, /refused: FrameworkConfig\.toolResultInlineMaxChars must be a number >= 1000/);
   assert.deepEqual({ code, signal }, { code: 0, signal: null });
 });
