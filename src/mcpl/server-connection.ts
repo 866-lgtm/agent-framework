@@ -277,8 +277,13 @@ export class McplServerConnection extends EventEmitter {
     const dropped = McplServerConnection.PROCESS_EVENTS;
     const kept = held.filter((item) => !dropped.has(item.event));
     if (kept.length < held.length) {
+      // Named by event, with a count, so a dropped request a server was
+      // waiting on, which no answer will now reach, can be told apart.
+      const counts = new Map<string, number>();
+      for (const item of held) if (dropped.has(item.event)) counts.set(item.event, (counts.get(item.event) ?? 0) + 1);
+      const what = [...counts].map(([event, count]) => `${count} ${logValue(event)}`).join(', ');
       console.error(
-        `[mcpl] ${this.id}: dropped ${held.length - kept.length} held message(s) from a transport that closed`,
+        `[mcpl] ${this.id}: dropped ${held.length - kept.length} held message(s) from a transport that closed: ${what}`,
       );
     }
     return kept.map((item) => ({ ...item, kept: true as const }));

@@ -392,6 +392,81 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
   });
 
+  async function keptIncomingSetup() {
+    const grant = () => new CapabilityGrant(new Set(['channels.register', 'channels.incoming']), []);
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    const traces: Array<{ type: string; reason?: unknown }> = [];
+    const admitted: Array<{ messageId?: unknown }> = [];
+    const server = { grant: grant(), async sendChannelsOpen() { return {}; }, async sendChannelsClose() { return {}; } };
+    const registry = new ChannelRegistry(
+      { getServer: () => server } as never,
+      {} as never,
+      (event) => admitted.push(event as { messageId?: unknown }),
+      (event) => traces.push(event),
+    );
+    connection.on('channels-register', (params: unknown, responder: unknown) => {
+      void registry.handleRegister('flaky', params as never, responder as never);
+    });
+    connection.on('channels-incoming', (params: unknown, responder: unknown) => {
+      void registry.handleIncoming('flaky', params as never, responder as never);
+    });
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const register = (id: number) => serverSends({
+      id, method: 'channels/register', params: { channels: [{ id: 'room', type: 'text', direction: 'bidirectional' }] },
+    });
+    const incoming = (id: number, messageId: string) => serverSends({
+      id, method: 'channels/incoming', params: { messages: [{ channelId: 'room', messageId, content: [{ type: 'text', text: 'hello' }] }] },
+    });
+    register(1);
+    incoming(2, 'kept-1');
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    const rejected = () => traces.filter((trace) => trace.type === 'mcpl:channel-incoming-rejected');
+    return { grant, admitted, rejected, register, incoming };
+  }
+
+  it("lets a registration pass what its own transport sent before it, once a kept message is held", async () => {
+    const { grant, admitted, rejected, register, incoming } = await keptIncomingSetup();
+    // The next process sends a message for the channel before it registers it.
+    incoming(3, 'new-1');
+    register(4);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(rejected(), [], 'neither message is refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-1']);
+  });
+
+  it('during a quiesce, admits the registration as the control plane opens and the kept message once the data plane does', async () => {
+    const { grant, admitted, rejected, register } = await keptIncomingSetup();
+    register(3);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.readyControlPlane();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(admitted.length, 0, 'the kept message waits for the data plane');
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(rejected(), []);
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
+  });
+
   it('a transport boundary crossed during a flush holds the rest of the snapshot to the boundary rule', async () => {
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
@@ -420,7 +495,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(seen, ['incoming'], 'nothing after the boundary reached a listener');
     const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
     assert.deepStrictEqual(held, ['push-event'], 'the push is kept, the inference request dropped');
-    assert.ok(logged.some((line) => line.includes('dropped 1 held message(s) from a transport that closed')), logged.join('\n'));
+    assert.ok(logged.some((line) => line.includes('dropped 1 held message(s) from a transport that closed: 1 inference-request')), logged.join('\n'));
     connection = null;
   });
 
@@ -450,6 +525,11 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     connection.ready();
     assert.deepStrictEqual(filters, [], 'the closed transport\'s filter is not admitted under the next grant');
     assert.deepStrictEqual(registrations, [], 'nor is its channel registration');
+    // The planes are open under the new grant: the next process's own are admitted.
+    serverSends({ method: 'tools/observe', params: { rules: [{ tool: 'new-process' }] } });
+    serverSends({ id: 8, method: 'channels/register', params: { channels: [{ id: 'new-room', type: 'text', direction: 'bidirectional' }] } });
+    assert.deepStrictEqual(filters, [{ rules: [{ tool: 'new-process' }] }]);
+    assert.deepStrictEqual(registrations, [{ channels: [{ id: 'new-room', type: 'text', direction: 'bidirectional' }] }]);
   });
 
   it('a close during a reconnect\'s handshake closes the new transport instead of adopting it', async () => {
