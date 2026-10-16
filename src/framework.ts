@@ -20138,7 +20138,26 @@ export class AgentFramework {
       method?: string;
       hadState: boolean;
       hadCheckpoint: boolean;
+      featureSet?: string;
+      key?: string;
+      eventId?: string;
     }) => {
+      // A push/render answered after its timeout, when the batch's fallback
+      // was already materialized: RFC-006's audit records the discarded
+      // result (§5.4 rule 3, §11) where the coalescer records the rest, beside
+      // the batch's render-failed, linked by its eventId.
+      if (info.eventId !== undefined) {
+        this.emitTrace({
+          type: 'mcpl:coalescing',
+          kind: 'late-render',
+          serverId: connection.id,
+          eventId: info.eventId,
+          featureSet: info.featureSet,
+          key: info.key,
+          discarded: true,
+        });
+        return;
+      }
       this.emitTrace({
         type: 'mcpl:orphaned-response',
         serverId: connection.id,

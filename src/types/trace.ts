@@ -312,7 +312,11 @@ export type TraceEvent =
       messageId?: string;
     })
   /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+   *  rendered / revoked / render-cancelled / late-render / render-failed).
+   *  A late-render whose push/render had already timed out, its fallback
+   *  materialized, is recorded by the connection's wiring rather than the
+   *  coalescer: it names `serverId`, `featureSet` and `key` instead of
+   *  `subject`, and its `eventId` links it to the batch's render-failed. */
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
       kind: string;

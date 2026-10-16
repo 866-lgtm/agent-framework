@@ -276,7 +276,7 @@ export class McplServerConnection extends EventEmitter {
   private pendingRequests = new Map<string | number, PendingRequest>();
   /** Metadata retained after selected request deadlines so a late response is
    * observable even though its original promise has already been rejected. */
-  private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
+  private orphanedRequests = new Map<string | number, { method: string; renderParams?: { featureSet: string; key: string; eventId: string } }>();
   private closed = false;
   /** Set by `reconnectAfterFailure()` before it closes a live transport, so
    *  the transport close handler reports that teardown as `byHost: true`. */
@@ -1194,7 +1194,12 @@ export class McplServerConnection extends EventEmitter {
         pending.timer = setTimeout(() => {
           this.pendingRequests.delete(id);
           if (options.surfaceOrphanedResponse) {
-            this.orphanedRequests.set(id, { method, ...(method === 'push/render' ? { renderParams: { featureSet: params.featureSet, key: params.key, eventId: params.eventId } } : {}) });
+            this.orphanedRequests.set(id, {
+              method,
+              ...(method === 'push/render'
+                ? { renderParams: { featureSet: params.featureSet as string, key: params.key as string, eventId: params.eventId as string } }
+                : {}),
+            });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
           reject(new Error(
@@ -1448,10 +1453,11 @@ export class McplServerConnection extends EventEmitter {
       // re-inject either result because the original dispatch context is gone.
       const orphaned = this.orphanedRequests.get(response.id);
       this.orphanedRequests.delete(response.id);
-      if (orphaned?.renderParams) {
-        this.emit('orphaned-render-response', { params: orphaned.renderParams, result: response.result, error: response.error });
-        return; // audit only: a timeout fallback can never be replaced
-      }
+      // A push/render answered after its timeout (RFC-006 §5.3) carries its
+      // subject and eventId, so its discarded result can be recorded beside
+      // its batch's other coalescing records (§11). It is only reported: the
+      // fallback the timeout materialized stands (§5.4 rule 3).
+      const render = orphaned?.renderParams ?? {};
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };
@@ -1461,6 +1467,7 @@ export class McplServerConnection extends EventEmitter {
             method: orphaned?.method,
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
+            ...render,
           });
         }
       } else if (orphaned) {
@@ -1469,6 +1476,7 @@ export class McplServerConnection extends EventEmitter {
           method: orphaned.method,
           hadState: false,
           hadCheckpoint: false,
+          ...render,
         });
       }
       return; // Orphaned response — ignore
