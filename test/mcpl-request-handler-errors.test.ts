@@ -585,7 +585,8 @@ test('a rejection whose reason cannot be printed is reported and answered, with 
 
 test('a request for a method nothing handles is answered -32601; such a notification is ignored', (t) => {
   const { transport } = wireHarness();
-  t.mock.method(console, 'error', () => {});
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 31, method: 'no/such-method' }));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 32, method: ['host/command'] }));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 33, method: 7 }));
@@ -596,16 +597,25 @@ test('a request for a method nothing handles is answered -32601; such a notifica
     [32, -32601, 'Method not found'],
     [33, -32601, 'Method not found'],
   ]);
+  // One line per answered request, naming the method; none for the notification.
+  assert.deepEqual(logged, [
+    "[mcpl] srv: answered -32601 to a request for method no/such-method, which this host doesn't handle",
+    "[mcpl] srv: answered -32601 to a request for a method of type object, which this host doesn't handle",
+    "[mcpl] srv: answered -32601 to a request for a method of type number, which this host doesn't handle",
+  ]);
 });
 
 test('a dispatch failure names the event, the request and what failed', (t) => {
   const { connection, transport, traces } = wireHarness();
-  t.mock.method(console, 'error', () => {});
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   connection.prependListener('channels-list', () => { throw new Error('listener exploded'); });
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 41, method: 'channels/list' }));
   const errors = traces.filter((e) => e.type === 'mcpl:server-error');
   assert.equal(errors.length, 1);
   assert.match(errors[0].error, /inbound dispatch failed for channels-list \(request 41\): listener exploded/);
+  // The stderr line says the same, through log-value.
+  assert.ok(logged.includes('[mcpl] srv: inbound dispatch failed for channels-list (request 41): "listener exploded"'), logged.join('\n'));
 });
 
 test('a manifest refresh that fails is reported as a handler failure', async (t) => {
@@ -735,11 +745,13 @@ test('a rejection no printer can inspect still reaches the trace first', async (
 
 test('a request for an event nothing on the host listens for is answered -32601', (t) => {
   const { connection, transport } = wireHarness();
-  t.mock.method(console, 'error', () => {});
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   connection.removeAllListeners('channels-list');
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 71, method: 'channels/list' }));
   const replies = transport.lines.map((line) => JSON.parse(line));
   assert.deepEqual(replies.map((r) => [r.id, r.error?.code, r.error?.message]), [[71, -32601, 'Method not found']]);
+  assert.deepEqual(logged, ['[mcpl] srv: answered -32601 to channels-list, which nothing on this host handles']);
 });
 
 test("a long handler error is bounded in its trace, and its log line is cut with its length", async (t) => {
