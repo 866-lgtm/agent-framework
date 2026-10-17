@@ -12,6 +12,26 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+**Operators upgrading from 0.22.1:** on a workspace mount over 5000 files, the
+first syncs and catch-up scans after upgrading catch up on what 0.22.1's
+walks, which stopped at 5000 files, never reached, up to the mount's walk cap
+(`walkCap`, 5000 entries unless configured) in each pass. Each pass pushes one
+event for each kind of change it finds, listing every path, and where the
+mount's `wakeOnChange` admits that kind, each event is one message to the
+agent. Going back to 0.22.1 is safe for a store 0.22.2 wrote, with one
+exception: 0.22.1 refuses to create the framework when an agent's persisted
+runtime setting can't be applied, such as a budget no longer above the
+recipe's `maxTokens`, or a budget below the recipe's on a strategy that can't
+prepare a smaller window. 0.22.2 starts with such a setting and logs
+`[agent-settings]` that it stays set but unapplied; reset it with
+`resetAgentRuntimeSettings()` before going back. Under 0.22.1, a coalesced
+message whose content passes 1 MiB with its inline images is refused again,
+and walks stop at 5000 files again. 0.22.1 leaves the walk's place alone, so
+coming forward resumes there, unless 0.22.1 wrote a checkpoint meanwhile,
+which starts each scope's walk at its top. Keep context-manager 0.14.1, which
+0.22.1's `^0.14.0` admits. Not tested: going back under connectome-host rather
+than a bare framework, and a tail or pace kept unapplied.
+
 ## 0.22.1 — 2026-10-14
 
 **Operators upgrading from 0.22.0:** a provider's stated `retry-after` now
