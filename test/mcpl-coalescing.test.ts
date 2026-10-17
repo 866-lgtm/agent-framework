@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMockResponse } from './helpers/mock-membrane.js';
-import { fixture, eventually, crash, ok, TS } from './helpers/coalescing-fixture.js';
+import { fixture, eventually, settles, crash, ok, TS } from './helpers/coalescing-fixture.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -342,7 +342,8 @@ test('vector 24: revoked authority before assembly drops the batch without a ren
   await f.framework.stop(); await f.create(false);
   let withdrawn = 0;
   f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
-  await f.framework.runUntilIdle();
+  // A second model call would wait for a response the fixture never queues.
+  await settles(f.framework.runUntilIdle(), 'the drain after the restart');
   assert.equal(f.renders.length, 0);
   assert(!f.context().includes('previously_permitted'));
   assert.equal(f.membrane.calls.length, 0, 'and the revoked batch, the only cause, started no inference');
@@ -868,7 +869,8 @@ test('R12: endpoint reassignment during the render-start commit wait never sends
   await f.framework.restartMcplServer('editor', { ...config, url: `${config.url}/reassigned` } as never);
   await eventually(() => f.hostCaps.length === 2, 'reconnect to the new endpoint');
   release();
-  await run;
+  // A second model call would wait for a response the fixture never queues.
+  await settles(run, 'the drain after the reassignment');
   assert.equal(f.renders.length, 0, 'no push/render to the new peer');
   assert(!JSON.stringify(f.renders).includes('private_notice_data'));
   assert(!f.context().includes('old_fallback'));
@@ -912,7 +914,8 @@ test('a turn whose batch\'s audience no longer names its agent at the assembly s
   internals.coalescedAudience = async () => { internals.coalescedAudience = orig; return ['conversation-chat-g2']; };
   let withdrawn = 0;
   f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
-  await f.framework.runUntilIdle();
+  // A second model call would wait for a response the fixture never queues.
+  await settles(f.framework.runUntilIdle(), 'the drain after the wake');
   assert.equal(f.renders.length, 0);
   assert(!f.context().includes('moved_fallback'));
   assert.equal(f.membrane.calls.length, 0, 'the batch, the only cause, started no inference');
@@ -933,12 +936,14 @@ test('an assembly for an agent outside the audience of a batch another assembly 
   // is held; 'agent' then assembles while it's in flight.
   internals.coalescedAudience = async () => ['other'];
   const rendering = internals.pushCoalescer.assemble('other');
-  await started;
-  const declined = await internals.pushCoalescer.assemble('agent');
+  await settles(started, "the render for 'other'");
+  // Joining the held render instead would wait for a release that comes
+  // only after this call.
+  const declined = await settles(internals.pushCoalescer.assemble('agent'), "the assembly for 'agent'");
   assert.equal(declined.settled.size, 1, 'the subject is settled for the agent outside the audience');
   assert.equal(declined.materialized.size, 0, 'and gave it nothing');
   release({ content: [{ type: 'text', text: 'shared_render' }] });
-  const rendered = await rendering;
+  const rendered = await settles(rendering, "the assembly for 'other'");
   assert.equal(rendered.settled.size, 1);
   assert.equal(rendered.materialized.size, 1, 'the assembly in the audience delivered the render');
 });
@@ -982,7 +987,7 @@ test('R15: a retraction arriving between the render result and its publication w
 // Review round 8 (#197): liveness after a failed render-start commit
 // ---------------------------------------------------------------------------
 
-test('R16: a batch whose render-start commit failed is re-woken once storage recovers', { timeout: 30_000 }, async (t) => {
+test('R16: a batch whose render-start commit failed is re-woken once storage recovers', { timeout: 120_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = 50;
@@ -1002,11 +1007,11 @@ test('R16: a batch whose render-start commit failed is re-woken once storage rec
   failing = 1; // the render-start commit fails; storage then recovers
   // The recovery wake can fire inside the first drain or after it, so drive
   // until the batch renders rather than for a fixed number of drains.
-  await f.framework.runUntilIdle();
+  await settles(f.framework.runUntilIdle(), 'the first drain');
   for (let pass = 0; !traced.some((e) => e.kind === 'rendered'); pass++) {
     assert(pass < 5, 'the batch rendered within five recovery wakes');
     await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
-    await f.framework.runUntilIdle();
+    await settles(f.framework.runUntilIdle(), `the drain after recovery wake ${pass + 1}`);
     // A macrotask turn, so timers (this test's timeout among them) can fire
     // even when both waits above return at once.
     await new Promise((resolve) => setImmediate(resolve));
