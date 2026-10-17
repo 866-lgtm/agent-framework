@@ -105,8 +105,6 @@ test('a create() that fails after its MCPL server connected closes the server an
       env: { STATUS_PATH: join(dir, 'status.jsonl'), LEDGER_PATH: outboxPath },
     }],
   };
-  const children = () => process.getActiveResourcesInfo().filter(resource => resource === 'ProcessWrap').length;
-  const before = children();
   const reconcile = DiscordAwarenessOutbox.prototype.reconcileForBranch;
   let reconciliations = 0;
   const injected = t.mock.method(DiscordAwarenessOutbox.prototype, 'reconcileForBranch',
@@ -117,10 +115,18 @@ test('a create() that fails after its MCPL server connected closes the server an
   await rejectsWithItsOwnError(AgentFramework.create(config),
     /^Discord awareness accounting failed during .*: injected reconcile failure$/);
   injected.mock.restore();
-  assert.match(readFileSync(join(dir, 'status.jsonl'), 'utf8'), /"event":"initialized"/,
-    'the MCPL server had finished its handshake before the failure');
-  for (let waits = 0; children() > before; waits++) {
-    assert.ok(waits < 200, 'the MCPL server is still running after create() rejected');
+  const initialized = readFileSync(join(dir, 'status.jsonl'), 'utf8').split('\n').filter(Boolean)
+    .map(line => JSON.parse(line) as { event: string; pid?: number })
+    .find(record => record.event === 'initialized');
+  assert.ok(initialized?.pid, 'the MCPL server had finished its handshake before the failure');
+  // Wait on that child itself, with room for a loaded machine: only a child
+  // still running after 10 s fails this.
+  const running = (pid: number) => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+  };
+  for (let waits = 0; running(initialized.pid); waits++) {
+    assert.ok(waits < 1000, 'the MCPL server is still running after create() rejected');
     await new Promise(done => setTimeout(done, 10));
   }
   const retried = await AgentFramework.create(config);
@@ -199,6 +205,31 @@ test('a failed create() whose store fails to close says so, after its own error'
       return true;
     },
   );
+  const retried = await AgentFramework.create(baseConfig(storePath));
+  await retried.stop();
+});
+
+test('a failed create() whose stop fails only at the end says nothing it started is still running', async t => {
+  const storePath = join(tempDir(t), 'store');
+  const { module, calls } = recordingModule('clean');
+  // Once everything it waits on has stopped, stop() closes the store itself.
+  // That close fails without closing, as a close whose final sync fails before
+  // the handle goes would, and the release's own close then succeeds.
+  const failing = t.mock.method(JsStore.prototype, 'close', function (this: JsStore) {
+    failing.mock.restore();
+    throw new Error('the final sync failed');
+  });
+  await assert.rejects(
+    AgentFramework.create({ ...baseConfig(storePath), modules: [module], mcplServers: COLLIDING_SERVERS }),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError, `expected an AggregateError, got ${String(error)}`);
+      assert.equal(error.message, `AgentFramework.create() failed: ${COLLISION}. What it had started stopped, ` +
+        `but finishing the stop failed: the final sync failed`);
+      assert.deepEqual(error.errors.map(e => (e as Error).message), [COLLISION, 'the final sync failed']);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, ['start', 'stop']);
   const retried = await AgentFramework.create(baseConfig(storePath));
   await retried.stop();
 });

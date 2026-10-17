@@ -1611,6 +1611,11 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
+  /** Whether the latest stop() stopped in time everything it waits on with
+   * its deadline (an operator's operations, modules and MCPL servers),
+   * whatever failed after that. create()'s release reads it to say whether
+   * part of what a failed create() started may still be running. */
+  private stopFinishedTeardown = false;
   /** An operator's operations in flight, and the config materializations they
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
@@ -2119,9 +2124,10 @@ export class AgentFramework {
    * Create and start the framework. A create() that fails releases what it
    * had acquired before its error reaches the caller, so that the caller can
    * try again in the same process: the framework it had begun is stopped, as
-   * stop() stops one, but giving up on its modules' and MCPL servers' stops
-   * after 30 s, and a store it opened is closed. A store the caller passed in
-   * is left open.
+   * stop() stops one, but giving up after 30 s on each of stop()'s two cleanup
+   * waits, for an operator's operations already running and then for its
+   * modules and MCPL servers, and a store it opened is closed. A store the
+   * caller passed in is left open.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
@@ -2173,8 +2179,14 @@ export class AgentFramework {
         await framework.stop(FAILED_CREATE_TEARDOWN_TIMEOUT_MS);
       } catch (stopError) {
         failures.push(stopError);
-        unfinished.push('Stopping what it had started didn\'t finish, so part of it may still be running: ' +
-          shutdownErrorMessage(stopError));
+        // A stop can fail after everything it waits on has stopped, as stop()
+        // counts it (an MCPL server once its transport has sent the kill):
+        // finishing a guard's storage work, in its final sync, or closing the
+        // store. The message then doesn't say part of it may still be running.
+        unfinished.push(framework.stopFinishedTeardown
+          ? 'What it had started stopped, but finishing the stop failed: ' + shutdownErrorMessage(stopError)
+          : 'Stopping what it had started didn\'t finish, so part of it may still be running: ' +
+            shutdownErrorMessage(stopError));
       }
     }
     if (ownsStore && !store.isClosed()) {
@@ -2756,6 +2768,7 @@ export class AgentFramework {
   }
 
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
+    this.stopFinishedTeardown = false;
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -2878,6 +2891,7 @@ export class AgentFramework {
     }
 
     const teardownSucceeded = shutdownErrors.length === 0;
+    this.stopFinishedTeardown = teardownSucceeded;
 
     // Those later annotations write nothing, so they finish at once; let them
     // record and edit their stubs before the store closes.
@@ -16949,13 +16963,15 @@ export class AgentFramework {
     try {
       await awarenessBarrier.promise;
     } catch (error) {
-      // Startup cannot fail open on a broken awareness ledger. Disable the
+      // A connect cannot fail open on a broken awareness ledger. Disable the
       // reconnecting stub/connection before propagating the distinct error to
-      // initializeMcpl, which tears down any other servers and aborts create().
+      // the runtime connect or restart that asked for it. (A startup connect
+      // defers awareness and returns before this gate; a startup that fails
+      // ends in create()'s release, which closes its servers.)
       // Ordering matters: awareness accounting settles BEFORE the §5.3
       // policy round-trip below, so an accounting failure aborts with the
       // grant still empty and every buffered event still behind the gate —
-      // a failed startup never reports a released data plane. (The reverse
+      // a failed connect never reports a released data plane. (The reverse
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
       await connection.close().catch(() => {});
