@@ -1630,4 +1630,20 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       runner.dispose();
     }
   });
+
+  it('the time-limit note starts on a line of its own after an interpreter exit, whose text ends without one', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // The interrupt at the limit ends the interpreter, so the exit handler settles the exec.
+      const code = 'import os, signal, time\nsignal.signal(signal.SIGINT, lambda *_: os._exit(3))\ntime.sleep(30)';
+      const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(
+        result.stderr,
+        'python runtime exited unexpectedly (code=3, signal=none)\nscript stopped: it reached its 1s time limit\n',
+      );
+    } finally {
+      runner.dispose();
+    }
+  });
 });

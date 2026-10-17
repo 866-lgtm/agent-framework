@@ -474,8 +474,10 @@ export class PyRunner {
     // and finished its work returns 0, and must not read as stopped.
     if (pending.deadlineMs !== null && result.returnCode !== 0) {
       const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
+      // On a line of its own: the runner's own texts, such as an interpreter's exit, end without a newline.
+      const withNote = (text: string) => (text === '' || text.endsWith('\n') ? text : `${text}\n`) + note;
       // A background script reports its output tail, so the note goes there too.
-      result = { ...result, stderr: result.stderr + note, ...(result.tail !== undefined ? { tail: result.tail + note } : {}) };
+      result = { ...result, stderr: withNote(result.stderr), ...(result.tail !== undefined ? { tail: withNote(result.tail) } : {}) };
     }
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
     if (pending.killTimer) clearTimeout(pending.killTimer);
