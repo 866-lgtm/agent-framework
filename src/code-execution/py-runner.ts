@@ -312,6 +312,10 @@ export class PyRunner {
 
     const child = spawn(this.pythonPath, [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      // The runtime directory, not the host's working directory: a script's
+      // relative paths land here, and go at teardown, rather than beside the
+      // host's .env and data. An absolute path still reaches the host's files.
+      cwd: this.runtimeDir,
       // Set last, over a declared env: the protocol needs both. It writes
       // non-ASCII JSON on piped stdio, which Python before 3.15 on Windows
       // encodes in the ANSI code page unless told otherwise, and a host's

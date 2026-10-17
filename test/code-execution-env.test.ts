@@ -8,6 +8,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { basename, join } from 'node:path';
 
 import { PyRunner } from '../src/index.js';
 import { validateCodeExecutionConfig } from '../src/code-execution/tool-definition.js';
@@ -103,6 +105,22 @@ test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env, s
     const r = await runner.exec(`import os; print(os.environ.get('PYTHONUNBUFFERED'), os.environ.get('PYTHONIOENCODING'))`, []);
     assert.equal(r.returnCode, 0, r.stderr);
     assert.match(r.stdout, /^1 utf-8$/m, r.stdout);
+  } finally {
+    runner.dispose();
+  }
+});
+
+test("the interpreter runs in its own runtime directory, which goes at teardown, not the host's working directory", async () => {
+  const runner = new PyRunner({ onToolCall: async () => '' });
+  try {
+    const r = await runner.exec(`import os; open('scratch.txt', 'w').write('x'); print(os.getcwd())`, []);
+    assert.equal(r.returnCode, 0, r.stderr);
+    const cwd = r.stdout.trim();
+    assert.notEqual(cwd, process.cwd());
+    assert.match(basename(cwd), /^af-pytc-/, cwd);
+    assert.ok(existsSync(join(cwd, 'scratch.txt')), 'a relative path lands in the runtime directory');
+    runner.dispose();
+    assert.ok(!existsSync(cwd), 'the runtime directory goes at teardown, with what the script wrote there');
   } finally {
     runner.dispose();
   }
