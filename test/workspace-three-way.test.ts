@@ -508,7 +508,7 @@ describe('workspace deletes', () => {
 
     env.writeDisk('b.txt', 'edited in the shell');
     const error = await refused(m, 'delete', { path: 'work/b.txt' });
-    assert.match(error, /did not unlink/);
+    assert.match(error, /^The deletion of "work\/b\.txt" is stored in the workspace, so don't send it again\. Its push to disk didn't complete: /);
     assert.equal(env.readDisk('b.txt'), 'edited in the shell', 'the shell edit survives');
   });
 });
@@ -900,7 +900,7 @@ describe('a file tool naming a path passed over by design', () => {
       const m = await env.open({ ignore: [...ignore], autoMaterialize: true });
       await call(m, 'sync', {});
       assert.deepEqual(env.store.treeList(TREE), [], 'a sync without a path passes over all three');
-      assert.equal((await call(m, 'read', { path: `work/${read}` })).content, `     1\t${read} v1\n     2\t`);
+      assert.equal((await call(m, 'read', { path: `work/${read}` })).content, `     1\t${read} v1`);
       await call(m, 'edit', { path: `work/${edit}`, oldString: 'v1', newString: 'v2' });
       assert.equal(env.readDisk(edit), `${edit} v2\n`, 'the edit reached disk');
       assert.equal((await call(m, 'delete', { path: `work/${gone}` })).deleted, true);
@@ -1725,6 +1725,22 @@ describe('restarts and faults', () => {
     const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
     assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
     assert.equal(await contentOf(m, 'a.txt'), 'C');
+  });
+
+  test('a delete of a path the ignore list covers settles its pending adoption first too, since it names the path, and deletes what the workspace then holds', async (t) => {
+    // Since #456 an edit makes a pass of its own; write, delete and
+    // writeBinary settle through settleBeforeMutation's.
+    const env = new Env(t);
+    let m = await pendingAdoption(env);
+    m = await env.restart(m, { ignore: ['a.txt'] });
+    env.writeDisk('a.txt', 'C');
+    await call(m, 'delete', { path: 'work/a.txt' });
+    // The deletion is of disk's C, which the settled adoption took in, so a
+    // materialize of the path that applies deletions carries it to disk.
+    // Settled at the commit instead, from the adoption's B, it would leave C
+    // as a copy disk changed since.
+    await call(m, 'materialize', { path: 'work/a.txt', applyDeletions: true });
+    assert.equal(existsSync(env.disk('a.txt')), false, "disk's C, the copy the deletion took in, is unlinked");
   });
 
   test('a delete settles the pending adoption first, and deletes what the workspace then holds', async (t) => {
@@ -3929,7 +3945,7 @@ describe('the mount boundary', () => {
     const data = await call(m, 'materialize', {});
     const skip = JSON.stringify(data);
     assert.match(skip, /match neither what was being written there nor what disk last agreed with/);
-    assert.match(skip, /pass force to write the workspace copy over it/);
+    assert.match(skip, /check the file, then materialize it with force to overwrite it, or sync this path/);
     assert.equal(env.readDisk('a.txt'), 'v2, cut off');
     await call(m, 'materialize', { force: true });
     assert.equal(env.readDisk('a.txt'), 'v2');
