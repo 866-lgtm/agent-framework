@@ -20,6 +20,13 @@
   takes up, marks its agent inferring again through the new
   `EventGate.onInferenceResumed()`, which, unlike `onInferenceStarted()`,
   leaves a pending self-wake alone.
+- A budget restart or tool-result-guard retry that a provider hold kept
+  from starting, such as a stated wait or an acceleration cooldown, now
+  marks its agent inferring at the event gate when it runs after the hold,
+  as any turn that runs does, so debounced batches wait for its end.
+  Before, the hold ended its turn at the gate, and it ran without it:
+  unless another agent was inferring, the gate delivered debounced batches
+  while it ran, into the message slot residents share.
 - A turn whose retry `stop()` cancels now ends with `inference:aborted`
   after its `inference:failed`, with the reason "a retry waiting while the
   framework was stopping is dropped before it sends anything", and

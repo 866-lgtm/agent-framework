@@ -1621,10 +1621,12 @@ export class EventGate {
   }
 
   /** A turn that continues another (a budget restart, a tool-result-guard
-   *  retry) holds the entry its predecessor kept for it. After a stop(), whose
-   *  dispose() cleared every entry, it takes the entry again. Unlike
-   *  onInferenceStarted it leaves a pending self-wake alone: the logical turn
-   *  that armed it is the one still running. */
+   *  retry) holds the entry its predecessor kept for it, and takes it again
+   *  where that entry ended in between: at a stop(), whose dispose() clears
+   *  every entry, or at a provider hold that kept the turn from starting,
+   *  whose end queues it again. Unlike onInferenceStarted it leaves a
+   *  pending self-wake alone: the logical turn that armed it is the one
+   *  still running. */
   onInferenceResumed(agentName: string): void {
     this.inferring.add(agentName);
   }

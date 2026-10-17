@@ -12075,8 +12075,11 @@ export class AgentFramework {
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates,
-    // and the successor takes it again if a stop() cleared it in between (a
-    // restart left queued, which a start() then takes up).
+    // and the successor takes it again if it ended in between: at a stop()
+    // (a restart left queued, which a start() then takes up), or at a
+    // provider hold that kept the successor from starting (a stated wait at
+    // its last admission check, or a cooldown after its own call failed),
+    // whose end queues it again.
     if (!resumesTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
     } else {
