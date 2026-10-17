@@ -9,3 +9,13 @@
   stayed registered after such a close, and a later `connectMcplServer` of
   its id failed as already registered until `disconnectMcplServer` or
   `restartMcplServer` dropped it.
+- A runtime `connectMcplServer` or `restartMcplServer` whose Discord
+  awareness accounting fails no longer leaves every other MCPL server's data
+  held. The connect paused their data planes behind a gate it never failed
+  or completed, so their pushes, incoming messages and inference requests
+  waited until some other gate completed. It now fails that gate, as a
+  failed reconnect, tools-list reconciliation,
+  `syncDiscordAwarenessMarkers()` or `resume()` already does: each running
+  server is recycled, and its data flows once its reconnect's accounting
+  succeeds. A server without `reconnect: true` is closed for good there, as
+  on those paths. While the host is stopping, the gate is released instead.

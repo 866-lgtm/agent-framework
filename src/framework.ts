@@ -17632,6 +17632,14 @@ export class AgentFramework {
       // connection that's down between retries, such as a stub waiting for
       // its next retry, and a stub left registered would refuse a later
       // connect of its id as already registered.
+      // Then fail the gate, as every other runtime gate does when its
+      // accounting fails. Installing it paused every registered server's
+      // data plane, and left standing it would hold their data until some
+      // other gate completed. While serving, failMcplDataPlaneGate recycles
+      // those servers, so a server without `reconnect: true` stays closed;
+      // while stopping, it releases the gate. It runs after the close, which
+      // has taken this connection out of the registry unless the close
+      // failed.
       // Ordering matters: awareness accounting settles BEFORE the §5.3
       // policy round-trip below, so an accounting failure aborts with the
       // grant still empty and every buffered event still behind the gate —
@@ -17639,6 +17647,7 @@ export class AgentFramework {
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
       await this.mcplServerRegistry.closeServer(connection.id, connection).catch(() => {});
+      await this.failMcplDataPlaneGate(awarenessBarrier, `connect of MCPL server "${config.id}"`, error);
       throw error;
     }
 

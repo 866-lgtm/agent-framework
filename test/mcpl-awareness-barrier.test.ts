@@ -700,10 +700,18 @@ for (const writeMethod of ['recordSuccess', 'recordFailure'] as const) test(
   },
 );
 
-test('a runtime connect whose awareness accounting fails frees the id of the reconnect stub it closed', async () => {
-  mkdirSync(TEST_ROOT, { recursive: true });
-  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-stub-'));
+/**
+ * A framework serving `heartbeat`, then a runtime connect of `discord` whose
+ * first connect fails, so the registry holds a reconnect stub, and whose
+ * awareness accounting then fails (recordFailure throws). Serving another
+ * server brings MCPL up at create(), so the runtime connect is the one that
+ * accounts for the pending work: brought up lazily by that connect, MCPL
+ * would account for it in its own startup barrier first. A failure after
+ * create() stops the framework, so no child outlives the test.
+ */
+async function failRuntimeConnectWhileServing(dir: string, heartbeatOverrides: Partial<McplServerConfig> = {}) {
   const statusPath = join(dir, 'status.jsonl');
+  const heartbeatStatusPath = join(dir, 'heartbeat-status.jsonl');
   const { outboxPath, config } = frameworkConfig(dir, {
     STATUS_PATH: statusPath,
     LEDGER_PATH: join(dir, 'awareness.json'),
@@ -717,24 +725,26 @@ test('a runtime connect whose awareness accounting fails frees the id of the rec
     reconnectMaxIntervalMs: 60_000,
   });
   const discord = config.mcplServers[0]!;
-  // Another server brings MCPL up at create(), so the runtime connect below
-  // is the one that accounts for the pending work. Brought up lazily by that
-  // connect, MCPL would account for it in its own startup barrier first.
   const heartbeat: McplServerConfig = {
     id: 'heartbeat',
     command: process.execPath,
     args: [FIXTURE],
     requestTimeoutMs: 1_000,
-    env: { SERVER_ID: 'heartbeat' },
+    env: {
+      SERVER_ID: 'heartbeat',
+      STATUS_PATH: heartbeatStatusPath,
+      GENERATION_PATH: join(dir, 'heartbeat-generation'),
+    },
     enabledFeatureSets: ['chat'],
+    ...heartbeatOverrides,
   };
-  const prototype = DiscordAwarenessOutbox.prototype as any;
-  const original = prototype.recordFailure;
-  let framework: AgentFramework | undefined;
-
+  const framework = await AgentFramework.create({ ...config, mcplServers: [heartbeat] });
   try {
-    framework = await AgentFramework.create({ ...config, mcplServers: [heartbeat] });
+    const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
+    framework.onTrace((event) => traces.push(event as never));
     preparePending(outboxPath);
+    const prototype = DiscordAwarenessOutbox.prototype as any;
+    const original = prototype.recordFailure;
     prototype.recordFailure = () => { throw new Error('injected recordFailure write failure'); };
     try {
       await assert.rejects(
@@ -749,13 +759,58 @@ test('a runtime connect whose awareness accounting fails frees the id of the rec
       1,
       'the first connect failed, so the registry held a reconnect stub',
     );
+    return { framework, discord, heartbeatStatusPath, traces };
+  } catch (error) {
+    await framework.stop();
+    throw error;
+  }
+}
+
+test('a runtime connect whose awareness accounting fails frees the id of the reconnect stub it closed', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-stub-'));
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failRuntimeConnectWhileServing(dir);
+    framework = failed.framework;
 
     // Connecting the id again reaches the server: a stub left registered
     // would fail this connect as already registered.
-    await framework.connectMcplServer(discord);
+    await framework.connectMcplServer(failed.discord);
     assert.equal(framework.listMcplServers().find((server) => server.id === 'discord')?.connected, true);
   } finally {
-    prototype.recordFailure = original;
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a runtime connect whose awareness accounting fails fails its gate, so a running server is recycled rather than held', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-gate-'));
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failRuntimeConnectWhileServing(dir, {
+      reconnect: true,
+      reconnectIntervalMs: 20,
+      reconnectMaxIntervalMs: 20,
+    });
+    framework = failed.framework;
+    assert.ok(
+      failed.traces.some((trace) => trace.type === 'mcpl:server-error'
+        && trace.serverId === 'heartbeat'
+        && /accounting unhealthy/.test(trace.error ?? '')),
+      'the gate failed for the running server, as a failed gate on the other runtime paths does',
+    );
+
+    // Recycled, the server reconnects, and its data flows once its
+    // reconnect's accounting succeeds: the new process's startup push is
+    // answered.
+    await waitFor('the recycled server\'s startup push answered', () =>
+      records(failed.heartbeatStatusPath).some((record) =>
+        record.generation === 2 && record.event === 'push-response'), 10_000);
+  } finally {
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
   }
