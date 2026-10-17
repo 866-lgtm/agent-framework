@@ -668,8 +668,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     // addMessage notes it as one of the turn's arrivals.
     const open = { engaged: new Set(['chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
     internals.openLogical.set('assistant', open);
+    const errors: string[] = [];
     const error = console.error;
-    console.error = () => {};
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     let written: unknown[];
     try {
       written = internals.readdDrained(
@@ -677,6 +678,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         'test flush',
       );
     } finally { console.error = error; }
+    assert.ok(errors.some((e) => e.includes('test flush: deferred write')
+      && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
+      && e.includes('strategy failed')), errors.join('\n'));
     assert.equal(written.length, 1, 'it counts as written');
     const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
