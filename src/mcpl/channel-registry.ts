@@ -2736,11 +2736,13 @@ export class ChannelRegistry {
   }
 
   /**
-   * The single open executor: record durable desired-open intent, tell the
-   * server to subscribe, mark the live entry open. Every path that opens a
-   * channel — the agent's channel_open tool, delivery into a closed locus,
-   * an explicit send into a closed channel — funnels here, so lifecycle
-   * events, desired state, and live state can never diverge by path.
+   * Record durable desired-open intent, then queue the channel's lifecycle
+   * work (applyDesiredChannelState), which tells the server to subscribe and
+   * marks the live entry open on a receipt for its current target. Every
+   * open the agent or its speech asks for — the channel_open tool, delivery
+   * into a closed locus, an explicit send into a closed channel — comes
+   * here. Reconciliation queues that work directly, as the closes do
+   * (channel_close, a decline, and the close of a substituted channel).
    * Desired state is recorded BEFORE the server round-trip: intent sticks
    * even if the subscribe fails, and reconciliation retries later.
    * Automatic delivery needs open transport, not a change of attention:
