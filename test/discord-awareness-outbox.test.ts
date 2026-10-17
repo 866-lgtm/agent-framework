@@ -213,6 +213,51 @@ test('startup activates nothing: it retires what interrupted surgeries left, and
   });
 }));
 
+test('a long history changes nothing about what is due: an activation and its claims read their own keys and the live work alone', withJournal((outbox, h) => {
+  const deliverAll = (o: DiscordAwarenessOutbox) => {
+    for (let claimed = o.claimDispatch('discord'); claimed; claimed = o.claimDispatch('discord')) {
+      o.recordOutcome(claimed.attempts, 'confirmed');
+    }
+  };
+  // History on other keys: marks delivered, marks cancelled before they went
+  // out, removals delivered, and a mark refused for good. None is due.
+  const delivered = activeBatch(outbox, Array.from({ length: 60 }, (_, i) => ref(`h${i}`)));
+  deliverAll(outbox);
+  outbox.retract(delivered.id);
+  deliverAll(outbox);
+  const cancelled = activeBatch(outbox, Array.from({ length: 40 }, (_, i) => ref(`x${i}`)));
+  outbox.cancel(cancelled.id);
+  activeBatch(outbox, [ref('refused')]);
+  answer(outbox, 'refused', 'failed', { permanent: true, error: 'Unknown Message' });
+  assert.deepEqual(outbox.pendingDispatches('discord'), []);
+
+  // The same batch, activated over that history and over none, queues and
+  // claims the same marks, in the same order.
+  const due = (o: DiscordAwarenessOutbox) => o.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`);
+  const refs = [ref('n3'), ref('n1'), ref('n2', 'c2')];
+  const other = (() => {
+    const dir = mkdtempSync(join(tmpdir(), 'awareness-fresh-'));
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    return { dir, store, outbox: new DiscordAwarenessOutbox(store) };
+  })();
+  try {
+    const withHistory = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2', refs, scope: 'all' })!;
+    const withoutHistory = other.outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2', refs, scope: 'all' })!;
+    assert.equal(outbox.activate(withHistory.id), other.outbox.activate(withoutHistory.id));
+    assert.deepEqual(due(outbox), ['add:n3', 'add:n1', 'add:n2']);
+    assert.deepEqual(due(outbox), due(other.outbox));
+    assert.deepEqual(due(h.reopen()), due(outbox), 'a replay rebuilds what the fold keeps');
+    const claimed = outbox.claimDispatch('discord')!;
+    assert.deepEqual(claimed.dispatch.key, other.outbox.claimDispatch('discord')!.dispatch.key);
+    outbox.recordOutcome(claimed.attempts, 'confirmed');
+    deliverAll(outbox);
+    assert.deepEqual(outbox.pendingDispatches('discord'), []);
+  } finally {
+    other.store.close();
+    rmSync(other.dir, { recursive: true, force: true });
+  }
+}));
+
 test('a dispatch is admitted from the journal as it is now: a cancel during an in-flight request stops the rest', withJournal((outbox) => {
   const batch = activeBatch(outbox, [ref('m1'), ref('m2'), ref('m3')]);
   // A drain computed this list, then sent the first while holding the rest.

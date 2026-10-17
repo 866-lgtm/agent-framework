@@ -612,6 +612,15 @@ interface JournalState {
   batches: Map<string, DiscordAwarenessBatch>;
   /** Operations in request order. */
   ops: Map<string, DiscordAwarenessOp>;
+  /** Each reaction key's operations, in request order, and the key's place
+   *  among keys in the order each was first requested. An operation never
+   *  leaves the history, so this is what keeps a lookup of one key's
+   *  operations from reading every operation ever requested (opsForKey). */
+  byKey: Map<string, { order: number; ops: DiscordAwarenessOp[] }>;
+  /** The keys with an operation whose work hasn't ended (opEnded): the only
+   *  keys a dispatch can come from, so a claim reads what is live rather
+   *  than what is history (pendingDispatches). */
+  liveKeys: Set<string>;
   /** Imported pre-journal evidence, by reaction key. */
   legacy: Map<string, DiscordAwarenessLegacyEvidence[]>;
   /** Retract requests, by request id. */
@@ -1219,22 +1228,19 @@ export class DiscordAwarenessOutbox {
    */
   pendingDispatches(serverId?: string): DiscordAwarenessDispatch[] {
     const state = this.load();
-    const byKey = new Map<string, DiscordAwarenessOp[]>();
-    for (const op of state.ops.values()) {
-      if (serverId !== undefined && op.key.serverId !== serverId) continue;
-      const key = markKey(op.key);
-      const list = byKey.get(key);
-      if (list) list.push(op);
-      else byKey.set(key, [op]);
-    }
-    const dispatches: Array<DiscordAwarenessDispatch & { order: number }> = [];
-    for (const ops of byKey.values()) {
+    const dispatches: Array<DiscordAwarenessDispatch & { order: number; keyOrder: number }> = [];
+    // Only a key with work that hasn't ended can have a dispatch due.
+    for (const key of state.liveKeys) {
+      const { order: keyOrder, ops } = state.byKey.get(key)!;
+      if (serverId !== undefined && ops[0]!.key.serverId !== serverId) continue;
       const head = this.headDispatch(ops);
-      if (head) dispatches.push(head);
+      if (head) dispatches.push({ ...head, keyOrder });
     }
+    // In request order; operations requested together go in the order their
+    // keys were first requested.
     return dispatches
-      .sort((a, b) => a.order - b.order)
-      .map(({ order: _order, ...dispatch }) => dispatch);
+      .sort((a, b) => a.order - b.order || a.keyOrder - b.keyOrder)
+      .map(({ order: _order, keyOrder: _keyOrder, ...dispatch }) => dispatch);
   }
 
   /**
@@ -1369,11 +1375,12 @@ export class DiscordAwarenessOutbox {
       const adds = emptyCounts();
       const removals = emptyCounts();
       const onKeys: DiscordAwarenessOp[] = [];
-      for (const op of state.ops.values()) {
-        if (!keys.has(markKey(op.key))) continue;
-        onKeys.push(op);
-        if (op.action === 'add' && op.cause.batchId === batch.id) adds[this.opStatus(op)]++;
-        if (op.action === 'remove') removals[this.opStatus(op)]++;
+      for (const key of keys) {
+        for (const op of state.byKey.get(key)?.ops ?? []) {
+          onKeys.push(op);
+          if (op.action === 'add' && op.cause.batchId === batch.id) adds[this.opStatus(op)]++;
+          if (op.action === 'remove') removals[this.opStatus(op)]++;
+        }
       }
       const unresolvedAttempts = unresolvedDispatches(onKeys, (op, attempt) => this.attemptUnresolved(op, attempt));
       const evidence = [...state.legacy.values()].flat().filter((entry) => entry.batchId === batch.id);
@@ -1455,8 +1462,7 @@ export class DiscordAwarenessOutbox {
   }
 
   private opsForKey(state: JournalState, key: DiscordAwarenessRef & { emoji: string }): DiscordAwarenessOp[] {
-    const wanted = markKey(key);
-    return [...state.ops.values()].filter((op) => markKey(op.key) === wanted);
+    return [...(state.byKey.get(markKey(key))?.ops ?? [])];
   }
 
   /**
@@ -1635,7 +1641,16 @@ export class DiscordAwarenessOutbox {
 // ---------------------------------------------------------------------------
 
 function emptyState(): JournalState {
-  return { batches: new Map(), ops: new Map(), legacy: new Map(), retracts: new Map(), importedSources: new Set(), position: 0 };
+  return {
+    batches: new Map(),
+    ops: new Map(),
+    byKey: new Map(),
+    liveKeys: new Set(),
+    legacy: new Map(),
+    retracts: new Map(),
+    importedSources: new Set(),
+    position: 0,
+  };
 }
 
 /** Requests in these records that are not recorded superseded with them. */
@@ -1654,6 +1669,10 @@ function addLegacyEvidence(state: JournalState, evidence: DiscordAwarenessLegacy
 /** Apply one entry's records, in order, to the reduced state. Each record
  *  takes the next journal position. */
 function applyRecords(state: JournalState, records: JournalRecord[]): void {
+  // The keys whose operations these records change, whose liveness is
+  // settled once they are all applied.
+  const touched = new Set<string>();
+  const touch = (op: DiscordAwarenessOp | undefined): void => { if (op) touched.add(markKey(op.key)); };
   for (const record of records) {
     const position = ++state.position;
     switch (record.t) {
@@ -1707,7 +1726,7 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
       }
       case 'requested':
         if (!state.ops.has(record.opId)) {
-          state.ops.set(record.opId, {
+          const op: DiscordAwarenessOp = {
             opId: record.opId,
             key: { ...record.key },
             action: record.action,
@@ -1715,16 +1734,24 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
             authorization: authorizationOf(state, record.cause) ?? position,
             requestedAt: record.at,
             attempts: [],
-          });
+          };
+          state.ops.set(record.opId, op);
+          const key = markKey(op.key);
+          const entry = state.byKey.get(key);
+          if (entry) entry.ops.push(op);
+          else state.byKey.set(key, { order: state.byKey.size, ops: [op] });
+          touch(op);
         }
         break;
       case 'op-cancelled': {
         const op = state.ops.get(record.opId);
         if (op && !op.cancelled) op.cancelled = { at: record.at, reason: record.reason };
+        touch(op);
         break;
       }
       case 'dispatching': {
         const op = state.ops.get(record.opId);
+        touch(op);
         if (op && !op.attempts.some((attempt) => attempt.attempt === record.attempt)) {
           op.attempts.push({
             attempt: record.attempt,
@@ -1736,6 +1763,7 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
       }
       case 'outcome': {
         const op = state.ops.get(record.opId);
+        touch(op);
         const attempt = op?.attempts.find((candidate) => candidate.attempt === record.attempt);
         if (attempt && attempt.outcome === undefined) {
           attempt.outcome = record.outcome;
@@ -1783,6 +1811,26 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
         break;
     }
   }
+  for (const key of touched) {
+    if (state.byKey.get(key)!.ops.some((op) => !opEnded(op))) state.liveKeys.add(key);
+    else state.liveKeys.delete(key);
+  }
+}
+
+/**
+ * Whether an operation's work has ended, so its key needs nothing more for
+ * it: it was cancelled or superseded, confirmed, refused for good, or
+ * brought to the bound of unconfirmed attempts. One on the wire, or left
+ * there by a previous process, hasn't ended. headDispatch decides what is
+ * due among the operations that haven't.
+ */
+function opEnded(op: DiscordAwarenessOp): boolean {
+  if (op.cancelled) return true;
+  const last = op.attempts.at(-1);
+  if (!last || last.outcome === undefined || last.outcome === 'not-sent') return false;
+  if (last.outcome === 'confirmed') return true;
+  if (last.outcome === 'failed' && last.permanent) return true;
+  return unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS;
 }
 
 /** The journal position of the act a request carries out. */
