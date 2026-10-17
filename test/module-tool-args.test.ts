@@ -548,18 +548,19 @@ describe('toolArgsProblems', () => {
       ['const', { const: { x: 'a', y: 1 } }],
       ['additionalProperties', { additionalProperties: { type: 'number' } }],
       ['unevaluatedProperties', { unevaluatedProperties: { type: 'number' } }],
+      ['additionalProperties {}', { additionalProperties: {} }],
+      ['additionalProperties true', { additionalProperties: true }],
+      ['unevaluatedProperties true', { unevaluatedProperties: true }],
     ];
     for (const [way, fields] of ways) {
       const schema = { type: 'object', properties: { x: { type: 'string' } }, required: ['x'], ...fields } as unknown as ToolDefinition['inputSchema'];
       // None at all: a key no part of the schema mentions goes unnamed too.
       assert.deepEqual(toolArgsProblems({ y: 1, zz: 1 }, schema), ['needs "x" (a string), and this call gave none'], way);
     }
-    // true or false for additionalProperties or unevaluatedProperties declares no keys, nor does
-    // then or else without if, nor a keyword JSON Schema doesn't have.
+    // false for additionalProperties or unevaluatedProperties takes no other keys, and then or
+    // else without if, or a keyword JSON Schema doesn't have, declares none.
     const noWays: Array<[string, Record<string, unknown>]> = [
-      ['additionalProperties true', { additionalProperties: true }],
       ['additionalProperties false', { additionalProperties: false }],
-      ['unevaluatedProperties true', { unevaluatedProperties: true }],
       ['unevaluatedProperties false', { unevaluatedProperties: false }],
       ['then and else without if', { then: y, else: y }],
       ['a keyword JSON Schema lacks', { 'x-parameters': y }],
@@ -584,6 +585,16 @@ describe('toolArgsProblems', () => {
     } as unknown as ToolDefinition['inputSchema'];
     // Its values aren't checked against the type, a list's known names included.
     assert.deepEqual(toolArgsProblems({ v: 3, w: 4, n: 'x', u: 5, t: 6 }, anyTyped, { values: true }), []);
+    // Its enum still is, alone or in a list.
+    const anyEnum = {
+      type: 'object',
+      properties: { e: { type: 'any', enum: ['a', 'b'] }, f: { type: ['STRING', 'null'], enum: ['c'] } },
+    } as unknown as ToolDefinition['inputSchema'];
+    assert.deepEqual(toolArgsProblems({ e: 'a', f: 'c' }, anyEnum, { values: true }), []);
+    assert.deepEqual(toolArgsProblems({ e: 'z', f: 3 }, anyEnum, { values: true }), [
+      '"e" must be one of "a" or "b", and this call gave "z"',
+      '"f" must be one of "c", and this call gave 3',
+    ]);
     // null is no value for a type the check can't read, unless the declaration names it;
     // a key with no type at all takes it.
     assert.deepEqual(toolArgsProblems({ v: null, n: null, u: null, t: null }, anyTyped), ['needs "v", and this call gave null']);

@@ -111,13 +111,17 @@ const OTHER_KEY_DECLARERS = [
  *  `required`, so that a key in neither isn't one of its parameters. A root
  *  with any keyword in OTHER_KEY_DECLARERS can declare keys another way. A
  *  schema object for `additionalProperties` or `unevaluatedProperties`, `{}`
- *  included, says the root takes keys `properties` doesn't list, as a map's
- *  input does, so a key in neither list may be meant. `true` or `false`
- *  there adds nothing to what a key in neither list means, so it names. */
+ *  included, or `true`, which means the same there, says the root takes keys
+ *  `properties` doesn't list, as a map's input does, so a key in neither list
+ *  may be meant. `false` there says it takes none, so it names. */
 function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
   return !OTHER_KEY_DECLARERS.some((key) => Object.hasOwn(schema, key))
-    && !isMap(schema.additionalProperties)
-    && !isMap(schema.unevaluatedProperties);
+    && !takesOtherKeys(schema.additionalProperties)
+    && !takesOtherKeys(schema.unevaluatedProperties);
+}
+
+function takesOtherKeys(value: unknown): boolean {
+  return value === true || isMap(value);
 }
 
 /**
