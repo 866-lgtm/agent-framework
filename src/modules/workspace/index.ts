@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { NONBLOCK, coveredByIgnore, filesystemTrustsCtime, linkOnTheWay, linkReason, linkRefusal, locateRoot, readPrefix, type LinkFound } from './observe.js';
+import { NONBLOCK, coveredByIgnore, filesystemTrustsCtime, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -232,14 +232,18 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 /**
  * A disk reader's refusal for what linkOnTheWay found on a path's way: the
  * link's reason, as the observations give it, after the path, or the walk's
- * failure as a failure to read.
+ * failure as a failure to read. Its code follows where the link leads, so a
+ * caller choosing advice by code gets advice that fits: `escape` for a link
+ * leading outside the mount, as main gave it, and `symlink` for any other.
  */
 async function linkReadError(mount: { config: { name: string; path: string } }, found: LinkFound, mountPrefixedPath: string): Promise<WorkspaceReadError> {
+  if (!('link' in found)) {
+    return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
+  }
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
-  const reason = await linkReason({ root: mount.config.path, name: mount.config.name }, rootReal, found);
-  return 'link' in found
-    ? new WorkspaceReadError('symlink', `${mountPrefixedPath}: ${reason}`, 'readlink')
-    : new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${reason}`, 'readlink', found.code);
+  const leads = await linkLeads(mount.config.path, rootReal, found.link);
+  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads)}`;
+  return new WorkspaceReadError(leads.kind === 'outside' ? 'escape' : 'symlink', reason, 'readlink');
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -1954,7 +1958,10 @@ export class WorkspaceModule implements Module {
         // link at the path, and for one on its way, which link and the way out.
         return new WorkspaceImageReadError('symlink', err.message);
       case 'escape':
-        return new WorkspaceImageReadError('escape', `Symlink escape detected: ${p}`);
+        // The core reader's own words: "Symlink escape detected: <path>" for a
+        // followed link that resolves outside the mount, and for a link on the
+        // way that leads outside a mount that doesn't follow links, which link.
+        return new WorkspaceImageReadError('escape', err.message);
       case 'changed':
         return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
       case 'not_found':
@@ -2020,7 +2027,8 @@ export class WorkspaceModule implements Module {
   /**
    * Commit a tool's write or delete to the workspace tree, with the branch
    * intent it implies (store origin for a path disk never agreed with; a
-   * tombstone for a deletion), and push it to disk when the mount opts in via
+   * tombstone for a deletion of a copy disk may hold), and push it to disk
+   * when the mount opts in via
    * `autoMaterialize` — required for cross-agent pipelines, since another
    * agent's watcher on the same directory only sees real filesystem events.
    * The push follows materialize's rule: a disk copy that changed since it
@@ -2042,7 +2050,8 @@ export class WorkspaceModule implements Module {
     // The mutation's precondition, enforced here, synchronously with the
     // commit: whatever settleBeforeMutation's pass could or couldn't settle.
     settleAdoptionBeforeMutation(store, this.agreementOrThrow(), { name: mount.config.name, treeStateId: mount.treeStateId }, relativePath);
-    const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
+    const evidence = this.agreementOrThrow().get(mount.config.name, relativePath);
+    const known = evidence !== undefined;
     if (change.kind === 'set') {
       store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
       // A later intent update or disk push can throw; the tree entry is
@@ -2060,11 +2069,25 @@ export class WorkspaceModule implements Module {
       });
     } else {
       store.treeRemove(mount.treeStateId, relativePath);
+      // A deletion whose evidence holds no agreed disk copy (disk last agreed
+      // it had nothing here, or has never agreed with this entry, which the
+      // workspace created) puts the store back at the agreement. Nothing on
+      // disk is the workspace's to unlink, so it records no tombstone and
+      // pushes nothing: it needs no proof of absence, which a path disk
+      // can't show, such as one beneath a symlink the mount doesn't follow,
+      // would never give. Whatever disk holds there is a sync's to observe.
+      // Any other deletion keeps its tombstone, which guards it: a copy disk
+      // agreed with, a push of ours that may have landed (pending or
+      // interrupted), or an entry from before the evidence.
+      let agreed = true;
       intents.update(relativePath, (cur) => {
-        const next = { ...cur, tombstone: { hash: change.previousHash } };
+        agreed = !(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'));
+        const next = agreed ? { ...cur, tombstone: { hash: change.previousHash } } : { ...cur };
+        if (!agreed) delete next.tombstone;
         delete next.origin;
         return next;
       });
+      if (!agreed) return null;
     }
     if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return null;
 

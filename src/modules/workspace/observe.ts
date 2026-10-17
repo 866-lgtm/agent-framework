@@ -222,21 +222,43 @@ export async function linkRefusal(
 }
 
 /**
- * Why a path is refused for what linkOnTheWay found. The link is the
- * subject, with where it leads: for a link to a directory inside the mount,
- * its target, and the setting the mount's host can change; for one leading
- * outside the mount, that it does; for one that can't be resolved, nothing
- * more. Paths are spelled as the tools take them, from the mount's name.
+ * Where a symlink the walk found leads, for its refusal: to a path inside
+ * the mount (mount-relative, and whether it's a directory), outside the
+ * mount, or nowhere it can be resolved to. One realpath and one stat, made
+ * only when refusing.
  */
-export async function linkReason(view: Pick<MountView, 'root' | 'name'>, rootReal: string, found: LinkFound): Promise<string> {
-  const spell = (rel: string) => `"${rel === '' ? view.name : `${view.name}/${rel}`}"`;
-  if (!('link' in found)) return `${UNSURE_PREFIX}${view.name}/${found.unsure}" is a symlink (${found.code})`;
+export type LinkLeads = { kind: 'inside'; target: string; directory: boolean } | { kind: 'outside' } | { kind: 'nowhere' };
+
+export async function linkLeads(root: string, rootReal: string, link: string): Promise<LinkLeads> {
+  const leads = await realpath(join(root, link)).catch(() => null);
+  if (leads === null) return { kind: 'nowhere' };
+  if (!contained(rootReal, leads)) return { kind: 'outside' };
+  const directory = await stat(leads).then((info) => info.isDirectory(), () => false);
+  return { kind: 'inside', target: relative(rootReal, leads).split(sep).join('/'), directory };
+}
+
+/**
+ * Why a path is refused for what linkOnTheWay found, given where a link
+ * leads (linkLeads). The link is the subject, with where it leads: for a
+ * link inside the mount, its target, and for a link to a directory there,
+ * the setting the mount's host can change, which following a link to a file
+ * wouldn't answer; for one leading outside the mount, that it does; for one
+ * that can't be resolved, nothing more. Paths are spelled as the tools take
+ * them, from the mount's name.
+ */
+export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null): string {
+  const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
+  if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${found.code})`;
   const link = `${spell(found.link)} is a symlink`;
-  const leads = await realpath(join(view.root, found.link)).catch(() => null);
-  if (leads === null) return `${link}, which this mount does not follow`;
-  if (!contained(rootReal, leads)) return `${link} leading outside the mount, which this mount does not follow`;
-  const target = relative(rootReal, leads).split(sep).join('/');
-  return `${link} to ${spell(target)}, which this mount does not follow; the mount's host can set followSymlinks: true`;
+  if (leads === null || leads.kind === 'nowhere') return `${link}, which this mount does not follow`;
+  if (leads.kind === 'outside') return `${link} leading outside the mount, which this mount does not follow`;
+  const setting = leads.directory ? "; the mount's host can set followSymlinks: true" : '';
+  return `${link} to ${spell(leads.target)}, which this mount does not follow${setting}`;
+}
+
+/** Why a path is refused for what linkOnTheWay found (linkWords, with where the link leads). */
+export async function linkReason(view: Pick<MountView, 'root' | 'name'>, rootReal: string, found: LinkFound): Promise<string> {
+  return linkWords(view.name, found, 'link' in found ? await linkLeads(view.root, rootReal, found.link) : null);
 }
 
 // ===========================================================================

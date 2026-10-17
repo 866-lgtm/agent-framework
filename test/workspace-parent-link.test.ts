@@ -42,6 +42,15 @@ function linkedReason(target: 'inside' | 'outside'): string {
     : '"work/l" is a symlink leading outside the mount, which this mount does not follow';
 }
 
+/**
+ * The code a disk reader gives a path through the link at "work/l": as on
+ * main, `escape` for a link leading outside the mount, so a caller choosing
+ * advice by code gets the outside advice; `symlink` for one inside it.
+ */
+function linkedCode(target: 'inside' | 'outside'): 'symlink' | 'escape' {
+  return target === 'inside' ? 'symlink' : 'escape';
+}
+
 /** A materialize's refusal before it pushes: the note, and the advice to fix it, with no force. */
 function unverified(path: string, note: string): string {
   return `${path}: cannot verify disk copy (${note}) — fix it and materialize again`;
@@ -208,14 +217,14 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(env.store.treeGet(TREE, 'l/x.txt')?.blobHash, before, 'history holds what it held');
     });
 
-    test(`readFileFromDisk and read_image refuse a path through it as a symlink, naming the link and where it leads (${target})`, async (t) => {
+    test(`readFileFromDisk and read_image refuse a path through it, naming the link and where it leads, with the code for where it leads (${target})`, async (t) => {
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
       const m = await env.open(t);
       const away = env.swapLForLink(target);
       await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
-        assert.equal(err.code, 'symlink');
+        assert.equal(err.code, linkedCode(target));
         assert.equal(err.message, `work/l/x.txt: ${linkedReason(target)}`);
         return true;
       });
@@ -264,7 +273,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       const expected = `work/nope/../l/x.txt: ${linkedReason(target)}`;
       await assert.rejects(m.readFileFromDisk('work/nope/../l/x.txt'), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
-        assert.equal(err.code, 'symlink');
+        assert.equal(err.code, linkedCode(target));
         assert.equal(err.message, expected);
         return true;
       });
@@ -284,6 +293,22 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     symlinkSync(`${env.dir}-beside`, join(env.dir, 'l'));
     const seen = await observePath(env.view(), realpathSync(env.dir), 'l/x.txt');
     assert.equal(shown(seen), `unobserved: ${linkedReason('outside')}`);
+  });
+
+  test('a link to a file inside the mount names its target, and not the setting, which following it wouldn\'t answer', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('file.txt', 'v1\n');
+    symlinkSync(join(env.dir, 'file.txt'), join(env.dir, 'l'));
+    const m = await env.open(t);
+    const reason = '"work/l" is a symlink to "work/file.txt", which this mount does not follow';
+    const seen = await observePath(env.view(), realpathSync(env.dir), 'l/x.txt');
+    assert.equal(shown(seen), `unobserved: ${reason}`);
+    await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
+      assert.ok(err instanceof WorkspaceReadError, String(err));
+      assert.equal(err.code, 'symlink');
+      assert.equal(err.message, `work/l/x.txt: ${reason}`);
+      return true;
+    });
   });
 
   test('a link to the mount\'s root names the mount as its target', async (t) => {
@@ -438,6 +463,74 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.deepEqual((await call(m, 'materialize', { path: 'work/l/x.txt' })).materialized.map((e: { path: string }) => e.path), ['l/x.txt']);
     assert.equal(readFileSync(join(env.dir, 'l/x.txt'), 'utf8'), 'v2\n');
     assert.equal((await m.readFileFromDisk('work/l/x.txt')).bytes.toString(), 'v2\n');
+  });
+});
+
+describe('a deletion whose evidence holds no agreed disk copy', () => {
+  // A push applies what the store changed since disk last agreed. Where the
+  // agreement holds no copy, deleting the entry puts the store back at it,
+  // so nothing on disk is the workspace's to unlink and no proof of absence
+  // is owed, which a path beneath a link the mount doesn't follow could never
+  // give. Before, such a deletion kept a tombstone no tool could clear while
+  // the link stood.
+  const pending = async (m: WorkspaceModule) => {
+    const { pendingChanges, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
+    return { pendingChanges, pendingWorkspaceDeletions };
+  };
+
+  for (const target of ['inside', 'outside'] as const) {
+    test(`a write through the link is refused, deleting the entry clears it, and nothing is pending (${target})`, async (t) => {
+      const env = new Env(t);
+      env.writeDisk('l/x.txt', 'v1\n');
+      const m = await env.open(t, { autoMaterialize: true });
+      const away = env.swapLForLink(target);
+      const write = await m.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/l/new.txt', content: 'new\n' } });
+      assert.equal(write.success, false, 'the write pushed through the link');
+      assert.ok(String(write.error).includes(linkedReason(target)), String(write.error));
+      assert.deepEqual(await pending(m), { pendingChanges: 1, pendingWorkspaceDeletions: 0 }, 'the refused write is owed');
+      assert.deepEqual(await call(m, 'delete', { path: 'work/l/new.txt' }), { path: 'work/l/new.txt', deleted: true });
+      assert.deepEqual(await pending(m), { pendingChanges: 0, pendingWorkspaceDeletions: 0 });
+      const pushed = await call(m, 'materialize', { path: 'work/l/new.txt', applyDeletions: true });
+      assert.deepEqual([pushed.materialized, pushed.deleted ?? [], pushed.skipped ?? []], [[], [], []], JSON.stringify(pushed));
+      assert.equal(existsSync(join(away, 'new.txt')), false, 'nothing appeared behind the link');
+    });
+  }
+
+  test('a file disk last agreed it had deleted, written again and deleted beneath a link, leaves nothing pending', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('l/x.txt', 'v1\n');
+    const m = await env.open(t);
+    await call(m, 'read', { path: 'work/l/x.txt' });
+    await call(m, 'delete', { path: 'work/l/x.txt' });
+    assert.deepEqual((await call(m, 'materialize', { path: 'work/l/x.txt', applyDeletions: true })).deleted.map((e: { path: string }) => e.path), ['l/x.txt']);
+    const away = env.swapLForLink('inside');
+    await call(m, 'write', { path: 'work/l/x.txt', content: 'v2\n' });
+    await call(m, 'delete', { path: 'work/l/x.txt' });
+    assert.deepEqual(await pending(m), { pendingChanges: 0, pendingWorkspaceDeletions: 0 });
+    assert.equal(readFileSync(join(away, 'x.txt'), 'utf8'), 'behind the link\n');
+  });
+
+  test('a deletion of a copy disk agreed with keeps its tombstone beneath a link, and unlinks nothing', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('l/x.txt', 'v1\n');
+    const m = await env.open(t);
+    await call(m, 'read', { path: 'work/l/x.txt' });
+    const away = env.swapLForLink('inside', 'v1\n');
+    await call(m, 'delete', { path: 'work/l/x.txt' });
+    assert.deepEqual(await pending(m), { pendingChanges: 1, pendingWorkspaceDeletions: 1 });
+    const pushed = await call(m, 'materialize', { path: 'work/l/x.txt', applyDeletions: true });
+    assert.deepEqual(pushed.deleted ?? [], []);
+    assert.equal(readFileSync(join(away, 'x.txt'), 'utf8'), 'v1\n', 'the file behind the link stays');
+    assert.deepEqual(await pending(m), { pendingChanges: 1, pendingWorkspaceDeletions: 1 }, 'still guarded');
+  });
+
+  test('a workspace draft disk never agreed with is deleted with nothing pending, on a plain mount too', async (t) => {
+    const env = new Env(t);
+    const m = await env.open(t);
+    await call(m, 'write', { path: 'work/d/new.txt', content: 'draft\n' });
+    assert.deepEqual(await pending(m), { pendingChanges: 1, pendingWorkspaceDeletions: 0 });
+    await call(m, 'delete', { path: 'work/d/new.txt' });
+    assert.deepEqual(await pending(m), { pendingChanges: 0, pendingWorkspaceDeletions: 0 });
   });
 });
 
