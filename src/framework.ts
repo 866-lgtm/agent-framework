@@ -506,10 +506,11 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
 /** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
  *  (empty when addMessage deferred it again; a sharded body's first shard)
- *  and what the store holds of it, as later compiles render it: for a
- *  sharded body, its shards joined. For an entry whose write threw after
- *  storing it, found in the store and counted as written, that is what
- *  landed, which for a sharded body can be its first shards alone. */
+ *  and the content to carry for it: as given, or for a sharded body, its
+ *  shards joined as later compiles render them. For an entry whose write
+ *  threw after storing it, found in the store and counted as written, it is
+ *  what landed, joined the same way, which for a sharded body can be its
+ *  first shards alone. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
@@ -3080,10 +3081,12 @@ export class AgentFramework {
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
     // queued with what follows it for its target, and a memory-only queue
-    // still loses it at exit. An entry for a target no longer registered (a
-    // disposed fork) is left: dropped with a memory-only queue at exit, and
-    // logged and dropped from a persisted one by the boot or resume flush
-    // that meets it.
+    // still loses it at exit. What is queued for an agent leaves with it
+    // (dropDeferredFor), so an entry for a target no longer registered is one
+    // queued after its agent left, or restored at a boot that doesn't
+    // register its agent. It is left: dropped with a memory-only queue at
+    // exit, and logged and dropped from a persisted one by the boot or resume
+    // flush that meets it.
     if (this.deferredMessages.length > 0) {
       const entries = [...this.agents.keys()].flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
@@ -5469,8 +5472,8 @@ export class AgentFramework {
       // order, any without one (a file that predates seq, which is in write
       // order already) or with another value (damage or a hand edit: JSON's
       // 1e400 reads as Infinity). Then it is numbered 1..N in that order, so
-      // the counter starts again from N at every boot and never passes the
-      // largest safe integer, wherever the file's seqs had got to.
+      // the counter starts again from N at every boot, wherever the file's
+      // seqs had got to.
       const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
       const unnumbered = kept.filter((m) => !validSeq(m.seq));
       for (const m of unnumbered) {
@@ -9365,11 +9368,10 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
-            // stored is injected (the round's results go on either way). What
-            // is injected is what the store holds, as later compiles render
-            // it: a sharded body's shards joined, and of a write that threw
-            // after storing, which counts as stored, what landed
-            // (writeDrainedInOrder).
+            // stored is injected (the round's results go on either way). A
+            // sharded body is injected as later compiles render it, its shards
+            // joined, and a write that threw after storing, which counts as
+            // stored, as what landed of it (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -16206,12 +16208,12 @@ export class AgentFramework {
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
-   * entries. Each comes with its content as later compiles render it: as
-   * given, unless the store took it as more than one message (a sharded
-   * body), whose copies are joined (asCompiled), or its write threw after
-   * storing it (above). `onLanded` hears an entry whose write threw after
-   * storing it, with the id it landed under, as soon as it's found: before
-   * the writes after it, so whatever it records keeps their order.
+   * entries. Each comes with its content: as given, unless the store took it
+   * as more than one message (a sharded body), whose copies are returned
+   * joined, as later compiles render them (asCompiled), or its write threw
+   * after storing it (above). `onLanded` hears an entry whose write threw
+   * after storing it, with the id it landed under, as soon as it's found:
+   * before the writes after it, so whatever it records keeps their order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
@@ -16277,7 +16279,7 @@ export class AgentFramework {
         .filter((m) => m.metadata?.deferredWriteId === deferredWriteId)
         .map((m) => ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) }));
     } catch (error) {
-      console.error(`[deferral] could not read ${agent.name}'s store for a deferred write that threw:`, error);
+      console.error(`[deferral] could not read back what deferred write ${deferredWriteId} stored in ${agent.name}'s store:`, error);
       return [];
     }
   }
