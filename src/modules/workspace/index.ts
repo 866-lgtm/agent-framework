@@ -1535,7 +1535,7 @@ export class WorkspaceModule implements Module {
       let committed = false;
       let failure: string | null;
       try {
-        const materializeError = await this.commitToolChange(mount, relativePath,
+        const { refused: materializeError } = await this.commitToolChange(mount, relativePath,
           { kind: 'set', blobHash, size: data.byteLength }, () => { committed = true; });
         failure = materializeError === null ? null
           : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`;
@@ -2038,17 +2038,20 @@ export class WorkspaceModule implements Module {
    * The push follows materialize's rule: a disk copy that changed since it
    * last agreed is not overwritten or unlinked, and the refusal says why.
    *
-   * Returns the reason when the change reached the workspace but not disk, so
-   * callers surface it in the tool result: the autoMaterialize contract is
-   * that disk is the source of truth for downstream agents. The caller holds
-   * the mount's turn and has settled the path first (settleBeforeMutation).
+   * Answers, so callers surface them in the tool result, the reason when the
+   * change reached the workspace but not disk (`refused`): the
+   * autoMaterialize contract is that disk is the source of truth for
+   * downstream agents. And, for a deletion that cleared a conflict naming a
+   * disk file the workspace never took in, that nothing was unlinked
+   * (`note`). The caller holds the mount's turn and has settled the path
+   * first (settleBeforeMutation).
    */
   private async commitToolChange(
     mount: MountState,
     relativePath: string,
     change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
     onCommitted?: () => void,
-  ): Promise<string | null> {
+  ): Promise<{ refused: string | null; note: string | null }> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
     // The mutation's precondition, enforced here, synchronously with the
@@ -2087,23 +2090,33 @@ export class WorkspaceModule implements Module {
       // that may have landed (pending or interrupted), or an entry from
       // before the evidence.
       let agreed = true;
+      let note: string | null = null;
       intents.update(relativePath, (cur) => {
         agreed = !(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'));
-        if (!agreed) return {};
-        const next = { ...cur, tombstone: { hash: change.previousHash } };
-        delete next.origin;
-        return next;
+        if (agreed) {
+          const next = { ...cur, tombstone: { hash: change.previousHash } };
+          delete next.origin;
+          return next;
+        }
+        // A conflict it clears may name a file disk held there, which the
+        // workspace never took in: the answer says that file wasn't unlinked,
+        // where the deletion alone would read as gone from disk.
+        if (cur.conflict?.disk) {
+          note = `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${relativePath} ` +
+            `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync takes in whatever disk holds there`;
+        }
+        return {};
       });
-      if (!agreed) return null;
+      if (!agreed) return { refused: null, note };
     }
-    if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return null;
+    if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return { refused: null, note: null };
 
     const pushed = await this.pushUnlocked(mount, [relativePath], {
       applyDeletions: change.kind === 'remove',
       branchId: store.currentBranch().id,
     });
     const refused = pushed.skipped.find((s) => s.path === relativePath);
-    if (!refused) return null;
+    if (!refused) return { refused: null, note: null };
     this.ctx?.pushEvent({
       type: 'workspace:materialize-failed',
       mount: mount.config.name,
@@ -2111,7 +2124,7 @@ export class WorkspaceModule implements Module {
       op: change.kind === 'set' ? 'write' : 'delete',
       error: refused.reason,
     } as ProcessEvent);
-    return refused.reason;
+    return { refused: refused.reason, note: null };
   }
 
   // ==========================================================================
@@ -2338,7 +2351,7 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
-    const materializeError = await this.withMount(mount, async () => {
+    const { refused: materializeError } = await this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
       const blobHash = store.storeBlob(buffer, 'text/plain');
       return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength });
@@ -2405,7 +2418,7 @@ export class WorkspaceModule implements Module {
 
       const newBuffer = Buffer.from(content, 'utf-8');
       const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
-      const materializeError = await this.commitToolChange(mount, relativePath, {
+      const { refused: materializeError } = await this.commitToolChange(mount, relativePath, {
         kind: 'set',
         blobHash: newBlobHash,
         size: newBuffer.byteLength,
@@ -2444,7 +2457,7 @@ export class WorkspaceModule implements Module {
         return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
       }
 
-      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash });
+      const { refused: materializeError, note } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash });
       if (materializeError) {
         return {
           success: false,
@@ -2456,7 +2469,11 @@ export class WorkspaceModule implements Module {
 
       // Its whole receipt is what it changed: kept in the stub if the guard
       // withholds the result (agent-framework #277).
-      return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
+      return {
+        success: true,
+        data: { path: input.path, deleted: true, ...(note ? { note } : {}) },
+        keepWhenWithheld: ['path', 'deleted', 'note'],
+      };
     });
   }
 
