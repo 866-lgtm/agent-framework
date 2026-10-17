@@ -13766,13 +13766,14 @@ export class AgentFramework {
       // the framework's own record is read first: stop() records 'shutdown'
       // and then calls cancelStream(), which also leaves a reasonless caller
       // record, so the caller record alone would end a shutdown as a user's
-      // stop, marker and all. The caller record is consumed here either way,
-      // by the stream it ended. A shutdown and an operator's quiesce abandon
-      // end through the framework's terminal, as their twins do. A silent
-      // end nobody asked for, or one after endTurn or a budget restart
-      // (whose own paths have settled the turn or handed it on, and which
-      // leave no caller record), keeps the prior behaviour (the finally
-      // still releases the gate).
+      // stop, marker and all. The caller record decides only when the
+      // framework marked nothing. It is collected here only while this
+      // stream still owns the agent; a record left behind is cleared when
+      // the agent's next stream starts. A shutdown and an operator's quiesce
+      // abandon end through the framework's terminal, as their twins do. A
+      // silent end nobody asked for, or one after endTurn or a budget
+      // restart (whose own paths have settled the turn or handed it on),
+      // keeps the prior behaviour (the finally still releases the gate).
       // Greptile on #172, 2026-09-28; Anarchid's review, 2026-10-12.
       if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
         const callerCancel = agent.takeCancel();

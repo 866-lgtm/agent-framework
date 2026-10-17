@@ -9,7 +9,10 @@
   not "the user did it"), and makes no claim about delivery. Callers can pass
   their own provenance — `cancelStream(reason)` / `abortInference(reason)` —
   which the trace and the marker's metadata carry; `abortInference` no longer
-  emits a second `inference:aborted` on top of the stream driver's. This
+  emits a second `inference:aborted` on top of the stream driver's. An
+  ephemeral run that such a cancel ends now rejects with `Stream cancelled`,
+  and the stop's inference-log row reads `Stream cancelled (<reason>)`, where
+  both read `Stream aborted: user` before. This
   holds on both of a stream's cancel twins: a stream implementation that
   reports `cancel()` through `error` rather than `aborted` reaches the same
   terminal (one `inference:aborted`, the marker, no `inference:failed`, no
