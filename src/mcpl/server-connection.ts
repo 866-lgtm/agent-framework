@@ -348,10 +348,14 @@ export class McplServerConnection extends EventEmitter {
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
+    // The cap's drops are counted per pause: this flush ends one, so its line
+    // reports that pause's drops, and the next pause counts (and logs) its own.
+    const dropped = this.droppedBufferedEvents;
+    this.droppedBufferedEvents = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
-        `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
+        `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
     this.flushDepth++;

@@ -383,3 +383,39 @@ test("a server's close reason stays out of the error a pending request is reject
   }
 });
 
+test('the buffered-event cap counts the drops of each pause: a later pause reports its own, and logs its first drop', async () => {
+  // The second pause runs through a control-only flush and a second pause of
+  // the data plane before ready() ends it, and its count covers all of it.
+  const wss = startMockMcplWsServer();
+  await waitListening(wss);
+  const conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS);
+  const lines: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    conn.ready();
+    // A responder-less data-plane event while the data plane is paused is
+    // buffered, and past the cap (1000) the oldest such event is dropped.
+    const pauseAndBuffer = (count: number) => {
+      conn.pauseDataPlane();
+      for (let i = 0; i < count; i++) conn.emit('test-data-event', { i });
+    };
+    pauseAndBuffer(1150);
+    conn.ready();
+    pauseAndBuffer(1050);
+    // Within one pause, neither a control-only flush (a quiesce's) nor
+    // pausing the paused data plane again starts the count over.
+    conn.readyControlPlane();
+    conn.pauseDataPlane();
+    for (let i = 0; i < 25; i++) conn.emit('test-data-event', { late: i });
+    conn.ready();
+  } finally {
+    console.error = consoleError;
+    await conn.close();
+    wss.close();
+  }
+  const flushes = lines.filter((line) => line.includes('buffered event(s) synchronously'));
+  assert.deepEqual(flushes.map((line) => /; (\d+) dropped at cap\)$/.exec(line)?.[1]), ['150', '75']);
+  const dropLogs = lines.filter((line) => line.includes('buffered-event cap'));
+  assert.deepEqual(dropLogs.map((line) => /dropped (\d+) responder-less/.exec(line)?.[1]), ['1', '101', '1']);
+});
