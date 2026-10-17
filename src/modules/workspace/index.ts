@@ -2072,18 +2072,21 @@ export class WorkspaceModule implements Module {
       // A deletion whose evidence holds no agreed disk copy (disk last agreed
       // it had nothing here, or has never agreed with this entry, which the
       // workspace created) puts the store back at the agreement. Nothing on
-      // disk is the workspace's to unlink, so it records no tombstone and
-      // pushes nothing: it needs no proof of absence, which a path disk
-      // can't show, such as one beneath a symlink the mount doesn't follow,
-      // would never give. Whatever disk holds there is a sync's to observe.
-      // Any other deletion keeps its tombstone, which guards it: a copy disk
-      // agreed with, a push of ours that may have landed (pending or
-      // interrupted), or an entry from before the evidence.
+      // disk is the workspace's to unlink, so it pushes nothing, and it
+      // clears the path's whole intent: no tombstone, so it needs no proof of
+      // absence, which a path disk can't show, such as one beneath a symlink
+      // the mount doesn't follow, would never give; and no conflict, which
+      // has nothing left to be about once the workspace has given up its
+      // side. Whatever disk holds there is a sync's to observe, a file the
+      // workspace never saw included. Any other deletion keeps its
+      // tombstone, which guards it: a copy disk agreed with, a push of ours
+      // that may have landed (pending or interrupted), or an entry from
+      // before the evidence.
       let agreed = true;
       intents.update(relativePath, (cur) => {
         agreed = !(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'));
-        const next = agreed ? { ...cur, tombstone: { hash: change.previousHash } } : { ...cur };
-        if (!agreed) delete next.tombstone;
+        if (!agreed) return {};
+        const next = { ...cur, tombstone: { hash: change.previousHash } };
         delete next.origin;
         return next;
       });

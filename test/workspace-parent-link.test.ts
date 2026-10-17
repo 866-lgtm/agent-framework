@@ -524,6 +524,24 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.deepEqual(await pending(m), { pendingChanges: 1, pendingWorkspaceDeletions: 1 }, 'still guarded');
   });
 
+  test('a draft written over a disk file the workspace never saw, then deleted, leaves that file alone and nothing pending', async (t) => {
+    // Its push met a file it never saw (a recorded store-origin-collision).
+    // Deleting the draft gives up the workspace's side, so the conflict has
+    // nothing left to be about: disk's file is a sync's to take in.
+    const env = new Env(t);
+    env.writeDisk('c.txt', 'disk text\n');
+    const m = await env.open(t, { autoMaterialize: true });
+    const write = await m.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/c.txt', content: 'agent text\n' } });
+    assert.equal(write.success, false, 'the draft pushed over a file it never saw');
+    assert.match(String(write.error), /store-origin-collision/);
+    assert.deepEqual(await call(m, 'delete', { path: 'work/c.txt' }), { path: 'work/c.txt', deleted: true });
+    const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
+    assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
+    assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n', 'disk keeps its file');
+    await call(m, 'sync', { path: 'work/c.txt' });
+    assert.match((await call(m, 'read', { path: 'work/c.txt' })).content, /disk text/, 'a sync takes it in');
+  });
+
   test('a workspace draft disk never agreed with is deleted with nothing pending, on a plain mount too', async (t) => {
     const env = new Env(t);
     const m = await env.open(t);
