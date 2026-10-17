@@ -167,7 +167,7 @@ describe('ChannelRegistry.publish outcomes', () => {
   it('treats an error response as unknown, keeping the connector\'s words and data (a partial post may precede it)', async () => {
     const partial = 'Send partially completed. POSTED: part 1 of 2 (message id 111). IN FLIGHT: part 2 of 2.';
     const { registry, seed } = registryWith({
-      discord: { publish: async () => { throw new McplRequestError(`MCPL server "discord" returned error for channels/publish: [-32000] ${partial}`, 'error-response', -32000, { posted: ['111'] }); } },
+      discord: { publish: async () => { throw new McplRequestError(`MCPL server "discord" returned error for channels/publish: [-32000] ${partial}`, 'error-response', { posted: ['111'] }); } },
     });
     seed('discord', 'c', '#c');
     const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
@@ -195,7 +195,7 @@ describe('ChannelRegistry.publish outcomes', () => {
     const failures: unknown[] = [];
     const traces: Array<{ type: string; [key: string]: unknown }> = [];
     const { registry, seed } = registryWith({
-      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', -32000, data); } },
+      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', data); } },
     }, failures, traces);
     seed('discord', 'c', '#c');
     const outcome = await registry.deliverSpeech('agent', 'words', 'c');
@@ -213,7 +213,7 @@ describe('ChannelRegistry.publish outcomes', () => {
     data.self = data;
     const failures: unknown[] = [];
     const { registry, seed } = registryWith({
-      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', -32000, data); } },
+      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', data); } },
     }, failures);
     seed('discord', 'c', '#c');
     const outcome = await registry.deliverSpeech('agent', 'words', 'c');
