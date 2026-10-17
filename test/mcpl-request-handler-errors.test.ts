@@ -1098,7 +1098,7 @@ test("a trace listener that throws a value no printer can inspect is logged as t
     assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one has the trace');
     assert.equal(failureTraces(after).length, 1, 'the listener after the throwing one has it too');
     assert.deepEqual(logged, [
-      'Trace listener error: [object Object]',
+      'Trace listener error: "[object Object]"',
       '[mcpl] srv channels-register handler failed: "register failed"',
     ]);
   } finally {
@@ -1206,8 +1206,9 @@ test('a throw out of the report on the async path is caught by its backstop and 
   const unhandled: unknown[] = [];
   const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
   process.on('unhandledRejection', onUnhandled);
-  // A defect in the report itself: its trace throws.
-  framework.emitTrace = () => { throw new Error('the trace failed'); };
+  // A defect in the report itself: its trace throws, with a text that
+  // would print a second line raw.
+  framework.emitTrace = () => { throw new Error('the trace failed\n[mcpl] srv forged'); };
   try {
     framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
     const reply = responder();
@@ -1216,7 +1217,27 @@ test('a throw out of the report on the async path is caught by its backstop and 
     await settle();
     assert.deepEqual(unhandled, []);
     assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }], 'the reply is sent before the trace');
-    assert.deepEqual(lines, ["[mcpl] srv channels-register: the handler failure's report threw: the trace failed"]);
+    assert.deepEqual(lines, ["[mcpl] srv channels-register: the handler failure's report threw: \"the trace failed\\n[mcpl] srv forged\""]);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('a backstop whose own log line throws leaves nothing unhandled', async (t) => {
+  const { framework, connection } = harness();
+  t.mock.method(console, 'error', () => { throw new Error('the console is gone'); });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  framework.emitTrace = () => { throw new Error('the trace failed'); };
+  try {
+    framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
+    const reply = responder();
+    connection.emit('channels-register', {}, reply);
+    await settle();
+    await settle();
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
   } finally {
     process.off('unhandledRejection', onUnhandled);
   }

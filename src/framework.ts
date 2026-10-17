@@ -15586,11 +15586,12 @@ export class AgentFramework {
         // throwing util.inspect.custom, say). That throw would leave this
         // loop, so the listeners after this one would miss the event and the
         // code that emitted it would get the throw. describeCause never
-        // throws, and a template string isn't inspected.
+        // throws, a template string isn't inspected, and log-value prints
+        // the text as one escaped, bounded line.
         try {
           console.error('Trace listener error:', error);
         } catch {
-          console.error(`Trace listener error: ${describeCause(error)}`);
+          console.error(`Trace listener error: ${logDetail(describeCause(error))}`);
         }
       }
     }
@@ -17616,9 +17617,13 @@ export class AgentFramework {
           // throw would be an unhandled rejection, which ends the host. The
           // report converts and catches what it knows can throw; this
           // backstop catches anything else, a defect in the report itself,
-          // and logs it on a line of its own.
+          // and logs it on a line of its own, printed through log-value as
+          // the report's line is. Nothing catches the backstop, so a failure
+          // of its own log is swallowed.
           void Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
-            console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${describeCause(reportFailure)}`);
+            try {
+              console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${logDetail(describeCause(reportFailure))}`);
+            } catch { /* nothing is left to log it to */ }
           });
         } else succeeded();
       } catch (error) {
