@@ -99,6 +99,20 @@ test('missing files and directories are distinguished', async (t) => {
   await expectRefusal(workspace.readFileFromDisk('work'), 'directory');
 });
 
+test('readBinaryFromDisk answers a file, a missing file, a directory and a file over maxBytes in its own words', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  writeFileSync(join(mountDir, 'a.bin'), Buffer.from([0, 1, 2, 3]));
+  mkdirSync(join(mountDir, 'dir'));
+  const read = await workspace.readBinaryFromDisk('work/a.bin');
+  assert.ok('data' in read, JSON.stringify(read));
+  assert.deepEqual([...read.data], [0, 1, 2, 3]);
+  assert.equal(read.absolutePath, join(mountDir, 'a.bin'));
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/missing.bin'), { error: 'File not found on disk: work/missing.bin' });
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/dir'), { error: 'Not a file: work/dir' });
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 3 }), { error: 'File too large: 4 > 3 bytes' });
+  assert.ok('data' in (await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 4 })), 'a file of exactly maxBytes is read');
+});
+
 test('a FIFO is refused at once by each disk reader, without waiting for a writer', async (t) => {
   if (process.platform === 'win32') {
     t.skip('no FIFOs on Windows');
