@@ -18147,7 +18147,14 @@ export class AgentFramework {
    */
   private dispatchWakeRuleToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
-    const finish = (result: ToolResult) => {
+    // What wake_add_rule's input held that does nothing, checkToolInput's notes and
+    // then the gate's on a rule it saved: a refusal names it too, so the call that
+    // follows doesn't count on it.
+    const ignored: string[] = [];
+    const finish = (given: ToolResult) => {
+      // Where notes follow an error that doesn't end in a stop, it gets one, so each reads as a sentence of its own.
+      const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
+      const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
       this.emitTrace({
         type: result.isError ? 'tool:failed' : 'tool:completed',
         module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
@@ -18180,8 +18187,7 @@ export class AgentFramework {
       // null or "" one is left out, a slip of one is refused, and so is a field
       // of `match`, `rateLimit` or `passiveSample` given on its own, which the
       // rule would otherwise be saved without; any other name is named in the
-      // result's ignoredFields.
-      const ignored: string[] = [];
+      // result's ignoredFields, and in a refusal's text.
       const parameters = AgentFramework.WAKE_RULE_TOOLS[0]!.inputSchema.properties as Record<string, unknown>;
       const input = checkToolInput(
         'wake_add_rule', (call.input ?? {}) as Record<string, unknown>, parameters, ignored, { match: 'the rule matches every event' },

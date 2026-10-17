@@ -393,7 +393,8 @@ test('a write that fails after the copy is kept names the copy', {
   chmodSync(configPath, 0o644);
 
   const keptPath = join(dir, 'gate.json.unreadable-20261015T025905Z');
-  assert.match(thrown, new RegExp(`EACCES.* A copy of what gate\\.json held when it couldn't be used is kept at ${escaped(keptPath)}\\.$`));
+  // The write's error is a sentence of its own before the copy's.
+  assert.match(thrown, new RegExp(`EACCES: permission denied, open '${escaped(configPath)}'\\. A copy of what gate\\.json held when it couldn't be used is kept at ${escaped(keptPath)}\\.$`));
   assert.equal(readFileSync(keptPath, 'utf-8'), BROKEN);
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN, 'the write failed opening gate.json, so it is as it was');
   assert.deepEqual(gate.getStatus().policies.map((p) => p.name), ['mentions'], 'the rules in force stay');

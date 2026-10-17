@@ -1638,6 +1638,29 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
     ),
     inMatch.content,
   );
+  // A refusal names what else the call held that it doesn't take, so the call that follows doesn't count on it:
+  // beside a slip, in the same sentence; beside its own refusal or the gate's, as the note a saved rule gets.
+  const slipAndMore = await call({ name: 'watch', passiveSample: { every: 10 }, pasthrough: true, comment: 'for the launch' });
+  assert.equal(slipAndMore.isError, true);
+  assert.ok(
+    slipAndMore.content.includes(
+      'wake_add_rule has "pasthrough" (did you mean "passthrough"?), which it doesn\'t take, and "comment", which it doesn\'t take, '
+      + `so nothing was saved. Its parameters are ${parameters}.`,
+    ),
+    slipAndMore.content,
+  );
+  const unreadNote = `wake_add_rule has "comment", which it doesn't take, so it does nothing. Its parameters are ${parameters}.`;
+  const typo = await call({ name: 'watch', comment: 'for the launch', behavior: 'deffer' });
+  assert.equal(typo.isError, true);
+  assert.ok(typo.content.endsWith(`${timing} ${unreadNote}`), typo.content);
+  const gateRefuses = await call({ name: 'watch', comment: 'for the launch', match: { tagsAny: 'chat:ambient' }, behavior: 'skip' });
+  assert.equal(gateRefuses.isError, true);
+  assert.ok(gateRefuses.content.startsWith('Policy "watch" wasn\'t saved:'), gateRefuses.content);
+  assert.ok(gateRefuses.content.endsWith(unreadNote), gateRefuses.content);
+  // The gate's refusal of an anchor it doesn't hold ends in "]", and gets a stop before the note.
+  const noAnchor = await call({ name: 'watch', comment: 'for the launch', insertBefore: 'nowhere', behavior: 'always' });
+  assert.equal(noAnchor.isError, true);
+  assert.ok(noAnchor.content.endsWith(`]. ${unreadNote}`), noAnchor.content);
   assert.equal(readFileSync(configPath, 'utf-8'), before, 'none of those refusals saved anything');
   // A rule with a problem is refused by the gate, naming each.
   const wide = await call({ name: 'watch', match: { tagsAny: 'chat:ambient' }, debounceMs: 50 });
@@ -1698,4 +1721,199 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   const over = await call({ name: 'later', behavior: 'defer' });
   assert.equal(over.isError, false, over.content);
   assert.deepEqual(onDisk(configPath).policies, [theirs, { name: 'later', match: {}, behavior: 'defer' }]);
+});
+
+test('"__proto__" in a rule is a field the gate doesn\'t read: it narrows nothing, and is named', (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  // Written as JSON text: in a JavaScript object literal, "__proto__" sets the object's prototype instead.
+  const { gate } = makeGate(dir, {
+    file: '{"default": "skip", "policies": [{"name": "all", "match": {"__proto__": {"source": "slack"}}, "behavior": "always"}]}',
+  });
+
+  assert.equal(gate.probe(event(['chat:ambient'])).trigger, true, 'an event from discord wakes the agent, as the rule matches every event');
+  const said = gate.getStatus().errors[0] ?? '';
+  assert.ok(said.includes(`Policy "all": match has "__proto__", which the gate doesn't read, so it does nothing.`), said);
+  assert.ok(said.includes(everyEvent('Policy "all"')), said);
+});
+
+test('a "" field named like one every object inherits, such as "constructor", is left out with the plain note', (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  const { gate } = makeGate(dir, {
+    file: '{"default": "always", "policies": [{"name": "plain", "constructor": "", "match": {"__proto__": "", "toString": ""}, "behavior": "always"}]}',
+  });
+
+  const said = gate.getStatus().errors[0] ?? '';
+  assert.ok(said.includes(`Policy "plain" has "constructor" as "", so it's left out.`), said);
+  assert.ok(said.includes(`Policy "plain": match has "__proto__" and "toString" as "", so they're left out.`), said);
+});
+
+test('a write clears the state of a rule it leaves out or gives another behavior, as a reload does', (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  const limited = (tokens: number) => ({ name: 'limited', match: { tagsAny: ['chat:ambient'] }, behavior: { rate_limit: { tokens, refillIntervalMs: 3_600_000 } } });
+  const ambient = event(['chat:ambient']);
+  const reload = (gate: EventGate) => {
+    (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+    (gate as unknown as { reloadIfChanged(): void }).reloadIfChanged();
+  };
+
+  // Left out: gate.json is edited to no tokens, and a change is made before a reload reads it.
+  const out = makeGate(dir, { file: { default: 'always', policies: [limited(1)] } });
+  assert.equal(out.gate.evaluate(ambient).trigger, true, 'its one token');
+  assert.equal(out.gate.evaluate(ambient).trigger, false, 'spent');
+  writeFileSync(out.configPath, JSON.stringify({ default: 'always', policies: [limited(0)] }));
+  out.gate.addPolicy(MENTIONS);
+  assert.deepEqual(names(out.gate), ['mentions'], 'the write leaves the rule with no tokens out');
+  // gate.json then gives it five, and the reload takes it for a new rule, with a bucket of its own.
+  writeFileSync(out.configPath, JSON.stringify({ default: 'always', policies: [limited(5), MENTIONS] }));
+  reload(out.gate);
+  assert.equal(out.gate.getStatus().policies.find((p) => p.name === 'limited')?.matchCount, 0, 'and with no counts of the rule it was');
+  assert.equal(out.gate.evaluate(ambient).trigger, true, 'the restored rule starts with its five tokens, not the spent bucket');
+
+  // Given another behavior: gate.json is edited to two tokens, and a change is made before a reload reads it.
+  const changed = makeGate(tempDir(t), { file: { default: 'always', policies: [limited(1)] } });
+  assert.equal(changed.gate.evaluate(ambient).trigger, true, 'its one token');
+  assert.equal(changed.gate.evaluate(ambient).trigger, false, 'spent');
+  writeFileSync(changed.configPath, JSON.stringify({ default: 'always', policies: [limited(2)] }));
+  changed.gate.addPolicy(MENTIONS);
+  assert.deepEqual(behaviors(changed.gate)[0], limited(2).behavior);
+  assert.equal(changed.gate.evaluate(ambient).trigger, true, 'the rule runs on two fresh tokens, not the spent bucket');
+
+  // Left out at a reload, as the write does it: gate.json is edited to drop the spent rule, then to restore it.
+  const reloaded = makeGate(tempDir(t), { file: { default: 'always', policies: [limited(1)] } });
+  assert.equal(reloaded.gate.evaluate(ambient).trigger, true, 'its one token');
+  assert.equal(reloaded.gate.evaluate(ambient).trigger, false, 'spent');
+  writeFileSync(reloaded.configPath, JSON.stringify({ default: 'always', policies: [MENTIONS] }));
+  reload(reloaded.gate);
+  assert.deepEqual(names(reloaded.gate), ['mentions'], 'the reload leaves the rule out');
+  writeFileSync(reloaded.configPath, JSON.stringify({ default: 'always', policies: [limited(1), MENTIONS] }));
+  reload(reloaded.gate);
+  assert.equal(reloaded.gate.getStatus().policies.find((p) => p.name === 'limited')?.matchCount, 0, 'restored with no counts of the rule it was');
+  assert.equal(reloaded.gate.evaluate(ambient).trigger, true, 'and with a token of its own, not the spent bucket');
+});
+
+test('a behavior holding two kinds names the problems of the kind it doesn\'t read too, and loads as before', (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  const both = { debounce: 50, rate_limit: { tokens: 'bad' } };
+  const { gate } = makeGate(dir, { file: { default: 'always', policies: [] } });
+
+  assert.equal(
+    refusal(gate, { behavior: both }),
+    'Policy "r" wasn\'t saved: behavior holds "debounce" and "rate_limit", and a rule has one behavior; '
+      + 'behavior.debounce is 50 ms, under the 100 ms minimum; '
+      + 'behavior.rate_limit.tokens is "bad", where a positive number is needed; '
+      + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.',
+  );
+
+  // gate.json's rule is read as its debounce, as before, and each problem is named, the kind read first.
+  const loaded = makeGate(tempDir(t), { file: { default: 'always', policies: [{ name: 'both', behavior: both }] } });
+  assert.deepEqual(behaviors(loaded.gate), [{ debounce: 100 }]);
+  const said = loaded.gate.getStatus().errors[0] ?? '';
+  assert.ok(
+    said.includes(
+      'Policy "both": behavior holds "debounce" and "rate_limit", and a rule has one behavior, so only its "debounce" is read; '
+      + 'behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms; '
+      + 'behavior.rate_limit.tokens is "bad", where a positive number is needed, which goes unread with the rest of "rate_limit"; '
+      + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed, which goes unread with the rest of "rate_limit".',
+    ),
+    said,
+  );
+
+  // Three, written in another order: debounce is read, then each other kind's problems follow, rate_limit's then passive_sample's.
+  const three = { passive_sample: { every: 0.5 }, rate_limit: { tokens: 'bad' }, debounce: 50 };
+  assert.equal(
+    refusal(gate, { behavior: three }),
+    'Policy "r" wasn\'t saved: behavior holds "debounce", "rate_limit" and "passive_sample", and a rule has one behavior; '
+      + 'behavior.debounce is 50 ms, under the 100 ms minimum; '
+      + 'behavior.rate_limit.tokens is "bad", where a positive number is needed; '
+      + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed; '
+      + 'behavior.passive_sample.every is 0.5, not a whole number.',
+  );
+  const loadedThree = makeGate(tempDir(t), { file: { default: 'always', policies: [{ name: 'three', behavior: three }] } });
+  assert.deepEqual(behaviors(loadedThree.gate), [{ debounce: 100 }]);
+  const saidThree = loadedThree.gate.getStatus().errors[0] ?? '';
+  assert.ok(
+    saidThree.includes(
+      'which goes unread with the rest of "rate_limit"; '
+      + 'behavior.passive_sample.every is 0.5, not a whole number, which goes unread with the rest of "passive_sample".',
+    ),
+    saidThree,
+  );
+});
+
+test('a rule a write removes has its pending debounce batch delivered', (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  const configPath = join(dir, 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ name: 'quiet', match: {}, behavior: { debounce: 60000 } }] }));
+  const wakes: string[] = [];
+  const inForce: string[][] = [];
+  const gate = new EventGate({
+    configPath, emitTrace: () => {}, addMessage: () => '', getAgentNames: () => ['agent'],
+    requestInference: (agent) => { wakes.push(agent); inForce.push(names(gate)); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(MENTION).trigger, false, 'the event waits in the debounce batch');
+
+  assert.equal(gate.removePolicy('quiet'), true);
+  assert.deepEqual(wakes, ['agent'], 'the batch is delivered once the write has removed its rule');
+  assert.deepEqual(inForce, [[]], 'and its rule is out of force when the batch is delivered');
+  assert.deepEqual(names(gate), []);
+});
+
+test("a write that changes a debounce rule sends its batch as the timer would: held while an agent's turn runs", async (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  const configPath = join(dir, 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ name: 'quiet', match: {}, behavior: { debounce: 60000 } }] }));
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, emitTrace: () => {}, addMessage: () => '', getAgentNames: () => ['agent'],
+    requestInference: (agent) => { wakes.push(agent); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(MENTION).trigger, false, 'the event waits in the debounce batch');
+
+  // The agent's turn is the one that calls wake_add_rule.
+  gate.onInferenceStarted('agent');
+  gate.addPolicy({ name: 'quiet', match: {}, behavior: 'always' });
+  assert.deepEqual(wakes, [], 'the batch is held while the turn runs');
+  gate.onInferenceEnded('agent');
+  await new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
+  assert.deepEqual(wakes, ['agent'], 'and sent when it ends');
+});
+
+test("a write clears every rule's state before it sends a batch, and sends each batch on its own, so a delivery that throws leaves nothing behind", (t) => {
+  const dir = tempDir(t);
+  t.mock.method(console, 'error', () => {});
+  const configPath = join(dir, 'gate.json');
+  const quiet = { name: 'quiet', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 60000 } };
+  const limited = { name: 'limited', match: { tagsAny: ['chat:ambient'] }, behavior: { rate_limit: { tokens: 1, refillIntervalMs: 3_600_000 } } };
+  const later = { name: 'later', match: { tagsAny: ['chat:dm'] }, behavior: { debounce: 60000 } };
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet, limited, later] }));
+  // The first delivery can't reach the agent; the next can.
+  let deliveries = 0;
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: (agent) => { wakes.push(agent); },
+    addMessage: () => { if (++deliveries === 1) throw new Error('no agent to deliver to'); return ''; },
+  });
+  t.after(() => gate.dispose());
+  const ambient = event(['chat:ambient']);
+  assert.equal(gate.evaluate(MENTION).trigger, false, "the mention waits in quiet's batch");
+  assert.equal(gate.evaluate(event(['chat:dm'])).trigger, false, "and the DM in later's");
+  assert.equal(gate.evaluate(ambient).trigger, true, "limited's one token");
+  assert.equal(gate.evaluate(ambient).trigger, false, 'spent');
+
+  // gate.json is edited to drop all three, and a change is made before a reload reads it; quiet's batch, sent first, can't be delivered.
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [] }));
+  assert.throws(() => gate.addPolicy(MENTIONS), /no agent to deliver to/);
+  const state = gate as unknown as { rateLimitBuckets: Map<string, unknown>; debounceTimers: Map<string, unknown> };
+  assert.equal(state.rateLimitBuckets.has('limited'), false, "limited's spent bucket is cleared, though quiet's batch came first");
+  assert.equal(state.debounceTimers.has('quiet'), false, "quiet's batch isn't left to be sent again");
+  assert.deepEqual(wakes, ['agent'], "later's batch is still sent");
+  assert.equal(state.debounceTimers.has('later'), false, 'and nothing is left behind');
 });

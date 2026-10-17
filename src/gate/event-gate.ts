@@ -534,7 +534,7 @@ function noteUnread(
  * with what leaving it out does where `means` says), a near-miss of a
  * parameter is refused, naming the one meant, and so is a field of one of its
  * object parameters given on its own, naming that parameter; any other name is
- * noted. Returns the input without what was left out.
+ * noted, or named in that refusal. Returns the input without what was left out.
  */
 export function checkToolInput(
   tool: string, input: Record<string, unknown>, properties: Readonly<Record<string, unknown>>, notes: string[],
@@ -546,9 +546,11 @@ export function checkToolInput(
   const homes = nestedFields(properties);
   const { misplaced, rest } = placedElsewhere(unread, (key) => homes.get(key) ?? []);
   if (slips.length > 0 || misplaced.length > 0) {
+    // Every name it doesn't take is named, so the call that follows the refusal doesn't count on one.
     const has = [
       ...(slips.length > 0 ? [`${slips.map(slipShown).join(' and ')}, ${TOOL_PARAMETERS_TERMS.unread}`] : []),
       ...misplaced.map((m) => `${misplacedShown(m)}, ${TOOL_PARAMETERS_TERMS.unread} here`),
+      ...(rest.length > 0 ? [`${quotedList(rest)}, ${TOOL_PARAMETERS_TERMS.unread}`] : []),
     ];
     throw new Error(
       `${tool} has ${has.join(', and ')}, so nothing was saved. ${TOOL_PARAMETERS_TERMS.listed} ${quotedList(params)}.`,
@@ -561,21 +563,26 @@ export function checkToolInput(
 /**
  * An object's fields as the gate reads them: a null or "" is a field left out,
  * and a note names each "", with what leaving it out does where that's more
- * than setting no constraint (`means`, by field).
+ * than setting no constraint (`means`, by field). Every other field stays an
+ * own field of the copy, "__proto__" included, which JSON gives as one: set by
+ * assignment, it would make its value the copy's prototype, whose fields the
+ * gate would then read as the object's own.
  */
 function withoutEmpty(
   where: string, obj: Record<string, unknown>, notes: string[], means: Readonly<Record<string, string>> = {},
 ): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+  const kept: Array<[string, unknown]> = [];
   const empty: string[] = [];
   for (const [key, value] of Object.entries(obj)) {
     if (value === null || value === undefined) continue;
     if (value === '') empty.push(key);
-    else out[key] = value;
+    else kept.push([key, value]);
   }
+  const out: Record<string, unknown> = Object.fromEntries(kept);
   if (empty.length > 0) {
     const meant = empty.flatMap((key) => {
-      const what = means[key];
+      // An own field only: a name such as "constructor" would find Object.prototype's.
+      const what = Object.hasOwn(means, key) ? means[key] : undefined;
       return what ? [what] : [];
     });
     notes.push(
@@ -747,7 +754,9 @@ const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one 
  * object holding one of the timing kinds. Anything else but a list was read as
  * "always", a rule that wakes on every event it matches, and is read so. Of
  * two kinds or more, "debounce", then "rate_limit", then "passive_sample" was
- * the one read, whatever their order, and is read so. `kind` is the behavior's
+ * the one read, whatever their order, and is read so. Each other kind is read
+ * on its own as well, so that a refusal names its problems too, and a load
+ * reads past them, since it isn't read either way. `kind` is the behavior's
  * kind even where it can't be read, for passthrough's check.
  */
 function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | undefined; kind?: BehaviorKind | undefined } {
@@ -772,9 +781,13 @@ function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | un
   if (kinds.length > 1) {
     r.problems.push({ text: `behavior holds ${quotedList(kinds)}, and a rule has one behavior`, read: `so only its "${kind}" is read` });
   }
-  if (kind === 'debounce') return { behavior: readDebounce(r, b.debounce), kind };
-  if (kind === 'rate_limit') return { behavior: readRateLimit(r, b.rate_limit), kind };
-  return { behavior: readPassiveSample(r, b.passive_sample), kind };
+  const behavior = READ_KIND[kind](r, b[kind]);
+  for (const other of kinds.slice(1)) {
+    const unread: Reader = { where: r.where, file: r.file, problems: [], notes: [] };
+    READ_KIND[other](unread, b[other]);
+    for (const p of unread.problems) r.problems.push({ text: p.text, read: `which goes unread with the rest of "${other}"` });
+  }
+  return { behavior, kind };
 }
 
 /**
@@ -874,6 +887,13 @@ function readPassiveSample(r: Reader, value: unknown): GateBehavior | undefined 
   if (keyBy !== undefined) out.keyBy = keyBy;
   return { passive_sample: out };
 }
+
+/** How each kind of behavior object is read. */
+const READ_KIND: Readonly<Record<(typeof BEHAVIOR_KINDS)[number], (r: Reader, value: unknown) => GateBehavior | undefined>> = {
+  debounce: readDebounce,
+  rate_limit: readRateLimit,
+  passive_sample: readPassiveSample,
+};
 
 /** A timing kind's keyBy: a field name. One of another type was read as none. */
 function readKeyBy(r: Reader, kind: 'rate_limit' | 'passive_sample', value: unknown): string | undefined {
@@ -2037,7 +2057,7 @@ export class EventGate {
     } catch (err) {
       if (!kept) throw err;
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`${msg} A copy of what gate.json held when it couldn't be used is kept at ${kept.keptPath}.`, { cause: err });
+      throw new Error(`${sentence(msg)} A copy of what gate.json held when it couldn't be used is kept at ${kept.keptPath}.`, { cause: err });
     }
   }
 
@@ -2066,6 +2086,49 @@ export class EventGate {
     });
   }
 
+  /**
+   * Clear the state of each rule `was` held in force that `next` leaves out or
+   * gives another behavior: a reload calls it before it puts `next` in force,
+   * a write after. Without this, a rule that came back, or whose tokens 100
+   * became 5 (or keyBy switched, or every 10 became 3), would run on the
+   * buckets and counters of the rule it was. A rule left out loses its stats
+   * (matchCount, lastMatchTimestamp) too; a rule kept keeps them, which are
+   * history, not live state, and one kept with the same behavior keeps all its
+   * state, its denial and fire counts included. Each pending debounce batch is
+   * sent last, as its timer would have sent it, once every rule's state is
+   * cleared, so a delivery that throws leaves no state behind and keeps no
+   * other batch from being sent.
+   */
+  private clearStateFor(was: GateConfig, next: GateConfig): { removed: string[]; cleared: string[] } {
+    const behaviorByName = new Map<string, string>();
+    for (const p of was.policies) behaviorByName.set(p.name, behaviorFingerprint(p.behavior));
+    const nextNames = new Set(next.policies.map((p) => p.name));
+    const removed: string[] = [];
+    for (const name of behaviorByName.keys()) {
+      if (!nextNames.has(name)) {
+        this.clearPolicyState(name);
+        this.stats.delete(name);
+        removed.push(name);
+      }
+    }
+    const cleared: string[] = [];
+    for (const p of next.policies) {
+      const before = behaviorByName.get(p.name);
+      if (before !== undefined && before !== behaviorFingerprint(p.behavior)) {
+        this.clearPolicyState(p.name);
+        cleared.push(p.name);
+      }
+    }
+    // Each batch is sent on its own, as each timer would send it, so one whose
+    // delivery throws doesn't keep the rest; the first error is thrown after.
+    let failed: { err: unknown } | undefined;
+    for (const name of [...removed, ...cleared]) {
+      try { this.fireDebounce(name); } catch (err) { failed ??= { err }; }
+    }
+    if (failed) throw failed.err;
+    return { removed, cleared };
+  }
+
   private reloadIfChanged(): void {
     const now = Date.now();
     if (checkedRecently(now, this.lastReloadCheck)) return;
@@ -2079,38 +2142,7 @@ export class EventGate {
       if (read.state !== 'loaded') return;
       const newConfig = read.config;
 
-      // Capture old policies' behavior fingerprints before any state
-      // mutation — needed to detect kept policies whose parameters changed.
-      const oldBehaviorByName = new Map<string, string>();
-      for (const p of this.config.policies) {
-        oldBehaviorByName.set(p.name, behaviorFingerprint(p.behavior));
-      }
-
-      // Clean up state for REMOVED policies (gone from new config entirely).
-      const newPolicyNames = new Set(newConfig.policies.map(p => p.name));
-      const removedPolicies: string[] = [];
-      for (const oldName of oldBehaviorByName.keys()) {
-        if (!newPolicyNames.has(oldName)) {
-          this.clearPolicyState(oldName, { deliverPendingDebounce: true });
-          this.stats.delete(oldName);
-          removedPolicies.push(oldName);
-        }
-      }
-
-      // Clean up state for KEPT policies whose behavior parameters changed.
-      // Without this, a tokens 100→5 edit (or keyBy switch, or every 10→3,
-      // etc.) wouldn't take effect until existing buckets/counters drained.
-      // Stats are preserved — matchCount is historical, not live state.
-      const stateClearedPolicies: string[] = [];
-      for (const newPolicy of newConfig.policies) {
-        const oldHash = oldBehaviorByName.get(newPolicy.name);
-        if (oldHash === undefined) continue; // new policy, no state to clear
-        const newHash = behaviorFingerprint(newPolicy.behavior);
-        if (oldHash !== newHash) {
-          this.clearPolicyState(newPolicy.name, { deliverPendingDebounce: true });
-          stateClearedPolicies.push(newPolicy.name);
-        }
-      }
+      const { removed: removedPolicies, cleared: stateClearedPolicies } = this.clearStateFor(this.config, newConfig);
 
       this.config = newConfig;
       this.compiledPolicies = this.compilePolicies(newConfig);
@@ -2245,11 +2277,11 @@ export class EventGate {
 
   /**
    * Remove a policy by name from gate.json and clear its live state. Any pending
-   * debounce batch is delivered first (matching reloadIfChanged's removal path,
-   * so buffered events aren't silently dropped). Freshest on-disk config is
-   * re-read first, every other rule is written back as it was written, and a
-   * copy of a gate.json that can't be read or isn't JSON is kept before it's
-   * written over (see addPolicy). Throws, writing nothing, for a gate.json with
+   * debounce batch is sent once the removal is written and in force, as its
+   * timer would have sent it, so buffered events aren't silently dropped
+   * (clearStateFor). Freshest on-disk config is re-read first, every other
+   * rule is written back as it was written, and a copy of a gate.json that
+   * isn't JSON is kept before it's written over (see addPolicy). Throws, writing nothing, for a gate.json with
    * no rule list it could edit, as addPolicy does. Otherwise returns false,
    * writing nothing, if no policy of that name exists, gate.json's own rules
    * included, so one the gate leaves out can be removed by name too. For a
@@ -2265,12 +2297,9 @@ export class EventGate {
     const kept = edit.unreadable !== undefined
       ? { keptPath: this.keepUnreadableConfig(edit.unreadable), reason: edit.unreadable.error }
       : undefined;
+    // The write clears the rule's state once it has succeeded (writeConfig),
+    // so a failed keep or write leaves the rule in force with its state.
     this.writeConfigAfterKeep(edit.top, edit.rules.filter((rule) => nameOf(rule) !== name), kept, edit.remedy);
-    // Only once the write has succeeded, so a failed keep or write leaves the
-    // rule in force with its state: deliver any pending debounce batch, then
-    // drop timers, buckets and counters.
-    this.clearPolicyState(name, { deliverPendingDebounce: true });
-    this.stats.delete(name);
     if (kept) options?.onUnreadableKept?.(kept);
     this.emitTrace({
       type: 'gate:policy-removed',
@@ -2298,7 +2327,11 @@ export class EventGate {
    * nothing. The rules in force are then what the text
    * written reads as, as at a load, so what it still holds that the gate reads
    * past or leaves out stays named; the text is kept as `configText`, so
-   * `reloadIfChanged` doesn't parse it again. Throws if the write fails
+   * `reloadIfChanged` doesn't parse it again. Once the text is written and its
+   * rules are in force, a rule that was in force that it leaves out or gives
+   * another behavior loses its state (clearStateFor), last, since a pending
+   * batch it sends can't be taken back, and a write that fails leaves the
+   * rules in force with their state. Throws if the write fails
    * (disk/permission) — callers surface it as a tool error.
    */
   private writeConfig(top: Record<string, unknown>, rules: unknown[], remedy?: string): void {
@@ -2311,6 +2344,7 @@ export class EventGate {
     }
     mkdirSync(dirname(this.configPath), { recursive: true });
     writeFileSync(this.configPath, text);
+    const was = this.config;
     this.configText = text;
     this.configNote = loadNote(read.sentences);
     this.config = read.config;
@@ -2321,6 +2355,7 @@ export class EventGate {
     this.configUnused = false;
     this.startUnsaved = null;
     this.lastReloadTimestamp = Date.now();
+    this.clearStateFor(was, read.config);
   }
 
   // =========================================================================
@@ -2634,24 +2669,16 @@ export class EventGate {
   }
 
   /**
-   * Clear ALL per-policy state (debounce timer, rate-limit buckets,
-   * passive-sample counters, denial / fire counters) for one policy.
-   * Used by reloadIfChanged when a policy is removed or its behavior
-   * params change. Stats (matchCount, lastMatchTimestamp) are preserved
-   * — those are historical and shouldn't reset on a config edit.
+   * Clear one policy's live state (rate-limit buckets, passive-sample
+   * counters, denial / fire counters) and stop its debounce timer, leaving
+   * its pending batch for fireDebounce to send, as clearStateFor does once
+   * every policy's state is cleared. It leaves stats (matchCount,
+   * lastMatchTimestamp), which are history; clearStateFor deletes a removed
+   * policy's.
    */
-  private clearPolicyState(
-    name: string,
-    options: { deliverPendingDebounce: boolean },
-  ): void {
+  private clearPolicyState(name: string): void {
     const debounce = this.debounceTimers.get(name);
-    if (debounce) {
-      clearTimeout(debounce.timer);
-      if (options.deliverPendingDebounce && debounce.events.length > 0) {
-        this.deliverEvents(debounce.events);
-      }
-      this.debounceTimers.delete(name);
-    }
+    if (debounce) clearTimeout(debounce.timer);
     this.rateLimitBuckets.delete(name);
     this.passiveSampleCounters.delete(name);
     this.rateLimitDenied.delete(name);
