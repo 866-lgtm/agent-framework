@@ -85,15 +85,29 @@ async function boot(prefix: string, make: () => YieldingStream) {
   });
   const traces: TraceEvent[] = [];
   framework.onTrace((t) => { traces.push(t); });
-  framework.start();
-  framework.nudgeAgent('assistant', 'operator');
-  await waitFor(() => membrane.calls.length === 1);
-  const agent = framework.getAgent('assistant')!;
-  await waitFor(() => agent.state.status === 'streaming');
   const teardown = async () => {
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
   };
+  framework.start();
+  framework.nudgeAgent('assistant', 'operator');
+  const streaming = async () => {
+    await waitFor(() => membrane.calls.length === 1);
+    const agent = framework.getAgent('assistant')!;
+    await waitFor(() => agent.state.status === 'streaming');
+    return agent;
+  };
+  // The caller's try/finally starts only once boot() returns, so a setup that
+  // times out tears itself down rather than leave the framework running and
+  // its directory behind.
+  const agent = await streaming().catch(async (error: unknown) => {
+    // A teardown that fails as well is logged, so the setup's failure stays
+    // the one the test reports.
+    await teardown().catch((teardownError: unknown) => {
+      console.error('boot(): teardown after a failed setup failed too:', teardownError);
+    });
+    throw error;
+  });
   return { framework, membrane, agent, traces, teardown };
 }
 
