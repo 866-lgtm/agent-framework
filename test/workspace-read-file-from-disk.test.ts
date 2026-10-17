@@ -177,6 +177,47 @@ test('a FIFO is refused at once by each disk reader, without waiting for a write
   }
 });
 
+test('a FIFO behind a symlink the mount follows is opened without waiting for a writer, and refused', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('no FIFOs on Windows');
+    return;
+  }
+  const { mountDir, workspace } = setup(t, { followSymlinks: true });
+  const fifo = join(mountDir, 'pipe');
+  execFileSync('mkfifo', [fifo]);
+  if (!symlinkOrSkip(t, fifo, join(mountDir, 'pipe-link'))) return;
+  const waited = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('readFileFromDisk still waits on the FIFO after 10 s')), 10_000).unref());
+  try {
+    const err = await expectRefusal(Promise.race([workspace.readFileFromDisk('work/pipe-link'), waited]), 'not_found');
+    assert.equal(err.message, 'Not a regular file: work/pipe-link');
+  } finally {
+    try {
+      closeSync(openSync(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+    } catch {
+      // No reader waits (ENXIO): nothing to release.
+    }
+  }
+});
+
+test("a directory on the way this user can't search is reported as the lookup's own failure, not as a symlink", async (t) => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    t.skip('file modes don\'t keep this user out');
+    return;
+  }
+  const { mountDir, workspace } = setup(t);
+  mkdirSync(join(mountDir, 'a', 'b'), { recursive: true });
+  writeFileSync(join(mountDir, 'a', 'b', 'x.txt'), 'x');
+  chmodSync(join(mountDir, 'a'), 0o600);
+  try {
+    const err = await expectRefusal(workspace.readFileFromDisk('work/a/b/x.txt'), 'not_found');
+    assert.equal(err.errno, 'EACCES');
+    assert.equal(err.stage, 'lstat');
+    assert.equal(err.message, 'Unable to read file: work/a/b/x.txt');
+  } finally {
+    chmodSync(join(mountDir, 'a'), 0o700);
+  }
+});
+
 test('a final-component symlink to an outside file is rejected under the default no-follow policy', async (t) => {
   const { root, mountDir, workspace } = setup(t);
   const outside = join(root, 'outside');
