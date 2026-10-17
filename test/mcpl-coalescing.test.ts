@@ -854,6 +854,10 @@ test("the fixture's reply deadline: a request still unanswered at 3 s fails at 6
     t.mock.timers.reset();
     release?.();
   }
+  // The released commit lets the host finish admitting the batch, and it
+  // answers once it has. Wait for that answer, so the close doesn't take the
+  // channel away from the admission still under way.
+  await f.answered();
 });
 
 test('R11: a retraction during the render-start commit wait is final; the batch is not restored', async (t) => {

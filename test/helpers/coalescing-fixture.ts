@@ -96,6 +96,17 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
     register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
+    /** Waits until the host has answered every request sent, including one
+     *  whose send already failed at its deadline, for up to REPLY_DEADLINE_MS.
+     *  A test that leaves the host still working on a request waits for this
+     *  before it closes, so the close doesn't take away what that work uses. */
+    answered: async () => {
+      const deadline = performance.now() + REPLY_DEADLINE_MS;
+      while (replies.size > 0) {
+        assert(performance.now() < deadline, `the host left ${replies.size} request(s) unanswered for ${REPLY_DEADLINE_MS / 1000} s`);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    },
     /** A coalesced channels/incoming message for platform message `m`. */
     channel: (eventId: string, text: string, flags: Record<string, unknown> = {}, channelId = 'chat', messageId = 'm') => ({
       channelId, messageId, eventId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ['chat:mention'],
