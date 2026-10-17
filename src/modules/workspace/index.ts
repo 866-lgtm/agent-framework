@@ -3422,8 +3422,9 @@ export class WorkspaceModule implements Module {
     const incomplete: Array<{ path: string; reason: string }> = [];
 
     // Lines as read shows them: a CR before a line feed is left out, for
-    // matching as well as display, as ripgrep's --crlf does, so `foo$` finds
-    // a CRLF file's line too, and the line copies into an edit as read's do.
+    // matching as well as display, so `foo$` finds a CRLF file's line, as it
+    // does under ripgrep's --crlf, and the line copies into an edit as read's
+    // do. ripgrep's --crlf still prints the line with its CR.
     const search = (bytes: Buffer): Searched => {
       const { lines, crlfEnds, lfEnds } = fileText(bytes);
       const found: GrepMatch[] = [];
