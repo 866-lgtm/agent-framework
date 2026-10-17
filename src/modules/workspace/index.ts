@@ -2341,11 +2341,12 @@ export class WorkspaceModule implements Module {
             : report?.state === 'disk-missing-provenance-unknown'
               ? `Disk has no copy of this file, and nothing records whether it was deleted there, so the edit ${verb} the workspace's copy.`
               : null;
-        // A mount that doesn't push keeps a conflict until materialize or
-        // sync settles it, so an edit's answer says so, whether it applied or
-        // was refused for the text it found. A stored edit that couldn't
-        // finish leaves it to the push's reason, which names the conflict, or
-        // to ls, which its answer points to.
+        // A conflict the pass found is named when the edit is refused for the
+        // text it found, on either kind of mount, and on a success where the
+        // mount doesn't push, since such a mount keeps the conflict until
+        // materialize or sync settles it. A pushing mount's success met none
+        // (below). A stored edit that couldn't finish leaves it to the push's
+        // reason, which names the conflict, or to ls, which its answer points to.
         const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
         const conflictNote = (where: string): string | null => conflict === null ? null
           : `The path is in conflict with disk (${conflict}): the edit ${where} the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.`;
