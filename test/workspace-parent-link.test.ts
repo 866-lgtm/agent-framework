@@ -71,7 +71,9 @@ class Env {
   }
 
   view(): MountView {
-    return { root: this.dir, name: 'work', followSymlinks: false, maxFileSize: 1 << 20, ignore: [] };
+    // Cast, so the file also compiles against main's MountView, which has no
+    // name, for the run of these tests on main's code.
+    return { root: this.dir, name: 'work', followSymlinks: false, maxFileSize: 1 << 20, ignore: [] } as MountView;
   }
 
   writeDisk(path: string, content: string): void {
