@@ -10,7 +10,7 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, {
-  accessSync, chmodSync, chownSync, constants, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
+  chmodSync, chownSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
   utimesSync, writeFileSync,
 } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -34,16 +34,6 @@ const INCOMING: GateEventInfo = { content: 'x', eventType: 'mcpl:channel-incomin
 const NO_CHMOD = process.platform === 'win32' || process.getuid?.() === 0;
 /** A group this process is in besides its own, which a gate.json can be shared through. */
 const OTHER_GROUP = process.platform === 'win32' ? undefined : process.getgroups?.().find((g) => g !== process.getegid?.());
-/** A file this process can read but whose group it isn't in, such as root's /etc/hosts. */
-const FOREIGN = NO_CHMOD ? undefined : ['/etc/hostname', '/etc/hosts', '/etc/passwd'].find((path) => {
-  try {
-    accessSync(path, constants.R_OK);
-    const file = statSync(path);
-    return file.isFile() && !process.getgroups!().includes(file.gid);
-  } catch {
-    return false;
-  }
-});
 
 function tempDir(t: TestContext): string {
   const dir = mkdtempSync(join(tmpdir(), 'gate-unreadable-'));
@@ -233,23 +223,52 @@ test("a copy takes gate.json's group and bits where chown refuses -1 for its own
 });
 
 test("a copy that can't take gate.json's group stays owner-only", {
-  skip: FOREIGN === undefined ? "needs a file this process can read whose group it isn't in" : false,
+  skip: process.platform === 'win32' ? 'needs POSIX permission bits' : false,
 }, (t) => {
   const dir = tempDir(t);
-  const { gate, configPath } = makeGate(dir);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
   t.mock.method(console, 'error', () => {});
-  // gate.json is a link to a file such as root's /etc/hosts. The copy is kept
-  // directly, not through a change, which would then write through the link.
-  symlinkSync(FOREIGN!, configPath);
-  const keep = gate as unknown as { keepUnreadableConfig(unreadable: { error: string; bytes?: Buffer }): string };
+  writeFileSync(configPath, BROKEN);
+  chmodSync(configPath, 0o640);
+  // chown refuses a group this process isn't in with EPERM.
+  const chown = t.mock.method(fs, 'chownSync', (path: unknown) => {
+    throw Object.assign(new Error(`EPERM: operation not permitted, chown '${String(path)}'`), { code: 'EPERM', syscall: 'chown' });
+  });
+  syncBuiltinESMExports();
+  try {
+    gate.addPolicy({ name: 'ambient', behavior: 'defer' });
+  } finally {
+    chown.mock.restore();
+    syncBuiltinESMExports();
+  }
 
-  const kept = keep.keepUnreadableConfig({ error: 'not JSON', bytes: readFileSync(configPath) });
+  assert.equal(chown.mock.callCount(), 1, 'the copy was to take the group');
+  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
+  assert.equal(copy.mode & 0o777, 0o600, "so it stays owner-only, without gate.json's bits");
+});
 
-  assert.equal(kept, join(dir, 'gate.json.unreadable-20261015T025905Z'));
-  assert.deepEqual(readFileSync(kept), readFileSync(FOREIGN!), 'the copy holds the bytes');
-  const copy = statSync(kept);
-  assert.notEqual(copy.gid, statSync(FOREIGN!).gid, "the copy couldn't take gate.json's group");
-  assert.equal(copy.mode & 0o777, 0o600, 'so it stays owner-only');
+test("a copy of a gate.json that's a link stays owner-only, since a directory on the way to its file may be what closes it", {
+  skip: process.platform === 'win32' ? 'needs a symlink and POSIX permission bits' : false,
+}, (t) => {
+  const dir = tempDir(t);
+  // Its file is open to anyone (0644), inside a directory closed to all but its owner (0700).
+  const closed = join(dir, 'closed');
+  fs.mkdirSync(closed, { mode: 0o700 });
+  const target = join(closed, 'real-gate.json');
+  writeFileSync(target, JSON.stringify(RULES));
+  chmodSync(target, 0o644);
+  const configPath = join(dir, 'gate.json');
+  symlinkSync(target, configPath);
+  const { gate } = makeGate(dir);
+  t.mock.method(console, 'error', () => {});
+  writeFileSync(configPath, BROKEN);
+
+  gate.addPolicy({ name: 'ambient', behavior: 'defer' });
+
+  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
+  assert.equal(copy.mode & 0o777, 0o600, 'the copy beside the link is owner-only');
+  assert.equal(statSync(target).mode & 0o777, 0o644, 'while the file it points to keeps its mode');
+  assert.equal(readFileSync(join(dir, 'gate.json.unreadable-20261015T025905Z'), 'utf-8'), BROKEN, 'and the copy holds what gate.json held');
 });
 
 test('keeping a copy leaves a symlinked gate.json pointing at its file, which keeps its mode and takes the change', {
