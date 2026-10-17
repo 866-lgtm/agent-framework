@@ -44,9 +44,8 @@ export interface MountConfig {
    * Whether to follow symlinks (default: false). Without it, no symlink on a
    * path is followed: not one at the path itself, and not one among the
    * directories on its way beneath the mount's root, wherever it leads. A path
-   * with a symlinked directory on its way is refused naming the link and where
-   * it leads; for a link to a directory inside the mount, the refusal also
-   * names the path through that directory to use instead. A mount root that is
+   * with a symlinked directory on its way is refused naming the link, and for
+   * a link to a directory inside the mount, its target. A mount root that is
    * itself a symlink is still the root. With it, a symlink on a path is
    * followed while what it reaches stays inside the mount. Either way, a
    * listing or a sync's walk descends into no symlinked directory.

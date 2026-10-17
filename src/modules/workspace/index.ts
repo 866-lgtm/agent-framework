@@ -211,12 +211,12 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 
 /**
  * A disk reader's refusal for what linkOnTheWay found on a path's way: the
- * link's reason, as the observations give it but spelled from the mount's
- * name, or the walk's failure as a failure to read.
+ * link's reason, as the observations give it, after the path, or the walk's
+ * failure as a failure to read.
  */
 async function linkReadError(mount: { config: { name: string; path: string } }, found: LinkFound, mountPrefixedPath: string): Promise<WorkspaceReadError> {
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
-  const reason = await linkReason(mount.config.path, rootReal, found, `${mount.config.name}/`);
+  const reason = await linkReason({ root: mount.config.path, name: mount.config.name }, rootReal, found);
   return 'link' in found
     ? new WorkspaceReadError('symlink', `${mountPrefixedPath}: ${reason}`, 'readlink')
     : new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${reason}`, 'readlink', found.code);
@@ -794,6 +794,7 @@ export class WorkspaceModule implements Module {
       name: mount.config.name,
       view: {
         root,
+        name: mount.config.name,
         rootIdentity: this.agreementOrThrow().rootIdentity(mount.config.name),
         followSymlinks: mount.config.followSymlinks === true,
         maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
@@ -1939,6 +1940,11 @@ export class WorkspaceModule implements Module {
         return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
       case 'not_found':
       default:
+        // The core reader's own words for a file that isn't regular, and for
+        // a directory on the way it couldn't ask about.
+        if (err.message.startsWith('Not a regular file') || err.stage === 'readlink') {
+          return new WorkspaceImageReadError('not_found', err.message);
+        }
         if (err.message.startsWith('File not found')) {
           return new WorkspaceImageReadError('not_found', `File not found: ${p}`);
         }

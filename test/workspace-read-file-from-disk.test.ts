@@ -18,6 +18,7 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -147,13 +148,25 @@ test('a FIFO is refused at once by each disk reader, without waiting for a write
     p,
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} still waits on the FIFO after 10 s`)), 10_000).unref()),
   ]);
+  // Nothing opens it: each reader refuses it at its lstat.
+  const fsp = createRequire(import.meta.url)('node:fs/promises') as { open: (...args: any[]) => Promise<any> };
+  const open = fsp.open;
+  let opened = 0;
+  fsp.open = (path: string, ...rest: any[]) => {
+    if (String(path) === fifo) opened++;
+    return open(path, ...rest);
+  };
+  syncBuiltinESMExports();
   try {
     const err = await expectRefusal(within(workspace.readFileFromDisk('work/pipe'), 'readFileFromDisk'), 'not_found');
     assert.equal(err.message, 'Not a regular file: work/pipe');
     const image = await within(workspace.handleToolCall({ id: 'f', name: 'read_image', input: { path: 'work/pipe' } }), 'read_image');
-    assert.equal(image.error, 'Unable to read image file: work/pipe');
+    assert.equal(image.error, 'Not a regular file: work/pipe');
     assert.deepEqual(await within(workspace.readBinaryFromDisk('work/pipe'), 'readBinaryFromDisk'), { error: 'Not a file: work/pipe' });
+    assert.equal(opened, 0, 'no reader opened the FIFO');
   } finally {
+    fsp.open = open;
+    syncBuiltinESMExports();
     // Release any open still waiting for a writer, so a failure ends the
     // test rather than holding the process.
     try {

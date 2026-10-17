@@ -47,6 +47,8 @@ import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-ag
 export interface MountView {
   /** Mount root as configured. */
   root: string;
+  /** The mount's name, which a tool puts before a path in the mount. */
+  name: string;
   /**
    * The root directory disk last agreed under, once the mount has evidence.
    * A root that resolves to any other directory is unavailable.
@@ -135,11 +137,10 @@ function lexicalOf(view: MountView, rel: string): string {
 
 /**
  * What linkOnTheWay found on a path's way beneath the mount's root: a
- * symlink (`link`, mount-relative, with `path`, the path as the lookups
- * resolve it, `.` and `..` taken out), or a directory there the walk
- * couldn't ask (`unsure`, with the errno it got).
+ * symlink (`link`, mount-relative), or a directory there the walk couldn't
+ * ask (`unsure`, with the errno it got).
  */
-export type LinkFound = { link: string; path: string } | { unsure: string; code: string };
+export type LinkFound = { link: string } | { unsure: string; code: string };
 
 const UNSURE_PREFIX = 'cannot tell whether "';
 
@@ -149,7 +150,7 @@ const UNSURE_PREFIX = 'cannot tell whether "';
  * forced push gets past.
  */
 export function isSymlinkRefusal(reason: string): boolean {
-  return reason.includes('which this mount does not follow') || reason.startsWith(UNSURE_PREFIX);
+  return reason === NOT_FOLLOWED || /^"[^"]+" is a symlink[ ,]/.test(reason) || reason.startsWith(UNSURE_PREFIX);
 }
 
 /**
@@ -162,11 +163,12 @@ export function isSymlinkRefusal(reason: string): boolean {
  * so a `..` after a name that isn't there hides nothing beyond it, and the
  * root, which is the configured path whatever it resolves to, is never on the
  * way, even where the path names it on its way back into the mount. Each
- * directory is asked only whether it is a link (readlink, which answers
- * EINVAL for anything else), from the root down. The walk stops where nothing
- * is there or a file is in the way, since nothing beneath is reached through
- * a link; any other answer leaves it unsure of what's beneath, and the path
- * is refused for that.
+ * directory is asked only whether it is a link, by readlink, from the root
+ * down. EINVAL means it isn't, and the walk goes on. Nothing there, a file in
+ * the way, or a directory this user can't search (ENOENT, ENOTDIR, EACCES,
+ * EPERM) ends it with nothing found, since nothing beneath is reached through
+ * a link and the caller's own lookup meets the same answer. Any other answer
+ * leaves it unsure of what's beneath, and the path is refused for that.
  */
 export async function linkOnTheWay(
   view: Pick<MountView, 'root' | 'followSymlinks'>,
@@ -177,17 +179,16 @@ export async function linkOnTheWay(
   const resolved = relative(resolve(view.root), resolve(view.root, rel));
   if (resolved === '' || resolved === '..' || resolved.startsWith(`..${sep}`) || isAbsolute(resolved)) return null;
   const parts = resolved.split(sep);
-  const path = parts.join('/');
   const last = through === 'path' ? parts.length : parts.length - 1;
   for (let i = 1; i <= last; i++) {
     const at = parts.slice(0, i).join('/');
     try {
       await readlink(join(view.root, at));
-      return { link: at, path };
+      return { link: at };
     } catch (err) {
       const code = errno(err);
       if (code === 'EINVAL') continue; // not a link: on to the next directory
-      if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EACCES' || code === 'EPERM') return null;
       return { unsure: at, code: code ?? String(err) };
     }
   }
@@ -222,24 +223,20 @@ export async function linkRefusal(
 
 /**
  * Why a path is refused for what linkOnTheWay found. The link is the
- * subject, with where it leads, and a way out is offered only where one
- * works: for a link to a directory inside the mount, the same path through
- * that directory, or the setting the mount's host can change. A link leading
- * outside the mount, or one that can't be resolved, has none. `prefix`
- * spells the paths for the reader: '' for mount-relative paths, as an
- * observation's are, or the mount's name and '/', as a disk reader's are.
+ * subject, with where it leads: for a link to a directory inside the mount,
+ * its target, and the setting the mount's host can change; for one leading
+ * outside the mount, that it does; for one that can't be resolved, nothing
+ * more. Paths are spelled as the tools take them, from the mount's name.
  */
-export async function linkReason(root: string, rootReal: string, found: LinkFound, prefix = ''): Promise<string> {
-  if (!('link' in found)) return `${UNSURE_PREFIX}${prefix}${found.unsure}" is a symlink (${found.code})`;
-  const link = `"${prefix}${found.link}" is a symlink`;
-  const leads = await realpath(join(root, found.link)).catch(() => null);
+export async function linkReason(view: Pick<MountView, 'root' | 'name'>, rootReal: string, found: LinkFound): Promise<string> {
+  const spell = (rel: string) => `"${rel === '' ? view.name : `${view.name}/${rel}`}"`;
+  if (!('link' in found)) return `${UNSURE_PREFIX}${view.name}/${found.unsure}" is a symlink (${found.code})`;
+  const link = `${spell(found.link)} is a symlink`;
+  const leads = await realpath(join(view.root, found.link)).catch(() => null);
   if (leads === null) return `${link}, which this mount does not follow`;
   if (!contained(rootReal, leads)) return `${link} leading outside the mount, which this mount does not follow`;
-  const spell = (p: string) => (p !== '' ? `"${prefix}${p}"` : prefix === '' ? "the mount's root" : `"${prefix.slice(0, -1)}"`);
   const target = relative(rootReal, leads).split(sep).join('/');
-  const rest = found.path.slice(found.link.length);
-  const instead = target === '' ? rest.slice(1) : `${target}${rest}`;
-  return `${link} to ${spell(target)}, which this mount does not follow: use ${spell(instead)}, or the mount's host can set followSymlinks: true`;
+  return `${link} to ${spell(target)}, which this mount does not follow; the mount's host can set followSymlinks: true`;
 }
 
 // ===========================================================================
@@ -339,13 +336,13 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // A link on the way that can't be resolved, such as a loop, is still a
     // link this mount doesn't follow.
     const found = rel === '' ? null : await linkOnTheWay(view, rel);
-    if (found !== null) return { kind: 'unobserved', reason: await linkReason(view.root, rootReal, found) };
+    if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
     return { kind: 'unobserved', reason: `cannot resolve the directory (${code ?? String(err)})` };
   }
   // A mount that doesn't follow symlinks goes through none on the way to a
   // directory, inside the mount or out of it.
   const found = await linkRefusal(view, rootReal, rel, real);
-  if (found !== null) return { kind: 'unobserved', reason: await linkReason(view.root, rootReal, found) };
+  if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
   if (rel === '') {
     // The root is whatever the configured path names, and it must still be
     // the root the pass was given.
@@ -425,7 +422,7 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
       // A symlink in the way, such as one that leads nowhere, on a mount that
       // doesn't follow symlinks, is named as one.
       const there = view.followSymlinks ? null : await lstat(base.at(parts[i]!)).catch(() => null);
-      if (there?.isSymbolicLink()) return { kind: 'unobserved', reason: await linkReason(view.root, rootReal, { link: childRel, path: rel }) };
+      if (there?.isSymbolicLink()) return { kind: 'unobserved', reason: await linkReason(view, rootReal, { link: childRel }) };
       return { kind: 'unobserved', reason: 'a parent path is not a directory' };
     }
     base = checked;
@@ -482,7 +479,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     if (info.isSymbolicLink()) {
       if (last && target === 'entry') return CHANGED; // present: the link itself
       // A mount that doesn't follow symlinks goes through none on the way.
-      if (!view.followSymlinks) return linkReason(view.root, rootReal, { link: childRel, path: rel });
+      if (!view.followSymlinks) return linkReason(view, rootReal, { link: childRel });
       const located = await locateDir(view, rootReal, childRel);
       if (located.kind !== 'checked') return BENEATH_SYMLINK;
       if (last) return CHANGED; // a directory there after all
@@ -581,7 +578,7 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
   try {
     const parent = await realpath(dirname(join(view.root, relativePath)));
     const found = await linkRefusal(view, rootReal, relativePath, parent, 'parents');
-    if (found !== null) return { reason: await linkReason(view.root, rootReal, found) };
+    if (found !== null) return { reason: await linkReason(view, rootReal, found) };
     return contained(rootReal, parent) ? 'inside' : { reason: OUTSIDE_PARENT };
   } catch (err) {
     const code = errno(err);
@@ -589,7 +586,7 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
     // A link on the way that can't be resolved, such as a loop, is still a
     // link this mount doesn't follow.
     const found = await linkOnTheWay(view, relativePath, 'parents');
-    if (found !== null) return { reason: await linkReason(view.root, rootReal, found) };
+    if (found !== null) return { reason: await linkReason(view, rootReal, found) };
     return { reason: `cannot resolve the parent directory (${code ?? String(err)})` };
   }
 }
@@ -670,7 +667,7 @@ async function openContained(
     if (code === 'ELOOP' && !view.followSymlinks) {
       // The link at the path, or a looping one on its way.
       const found = await linkOnTheWay(view, relativePath, 'parents');
-      return { kind: 'unobserved', reason: found === null ? NOT_FOLLOWED : await linkReason(view.root, rootReal, found) };
+      return { kind: 'unobserved', reason: found === null ? NOT_FOLLOWED : await linkReason(view, rootReal, found) };
     }
     if (code === 'EISDIR') return { kind: 'unobserved', reason: 'a directory' };
     return { kind: 'unobserved', reason: `cannot open (${code ?? String(err)})` };
@@ -686,7 +683,7 @@ async function openContained(
     // check below holds to the descriptor's file, and before what the
     // descriptor holds, so a link gets its own answer whatever it leads to.
     const found = await linkRefusal(view, rootReal, relativePath, real);
-    if (found !== null) return { kind: 'unobserved', reason: await linkReason(view.root, rootReal, found) };
+    if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
     if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
     if (!contained(rootReal, real)) {
       return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
