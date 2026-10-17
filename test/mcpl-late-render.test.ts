@@ -3,10 +3,12 @@
  * has materialized the batch's fallback by then, and the late result is
  * discarded, which RFC-006 §11 asks a host that keeps an audit record to
  * record, linked by eventId. The connection reports it as an orphaned
- * response naming the render's featureSet, key and eventId, and the
- * framework's wiring records it beside the coalescer's other records, as a
- * mcpl:coalescing late-render. orphaned-response is a control-plane event, so
- * a paused data plane neither holds it nor spends a slot of its bound on it.
+ * response naming the render's featureSet, key, eventId and, for a
+ * channel-scoped subject, channelId, with a late JSON-RPC error as `error`,
+ * and the framework's wiring records it beside the coalescer's other records,
+ * as a mcpl:coalescing late-render. orphaned-response is a control-plane
+ * event, so a paused data plane neither holds it nor spends a slot of its
+ * bound on it. A late tool call stays a mcpl:orphaned-response.
  */
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -64,18 +66,25 @@ test('a push/render answered after its timeout is recorded as a discarded late-r
   assert.deepEqual(recorded(), [lateRender]);
 });
 
-test('a late push/render error is recorded as a late-render with its message, and a late null result as a late-render', async (t) => {
+test('a late push/render error is recorded as a late-render with its code and message, and a late null result as a late-render', async (t) => {
   const failed = await timedOutRender(t);
   failed.answerLate({ error: { code: -32603, message: 'render exploded' } });
   assert.deepEqual(failed.orphans, [{
     id: failed.id, method: 'push/render', hadState: false, hadCheckpoint: false, featureSet: 'fs', key: 'k1', eventId: 'e7',
     error: { code: -32603, message: 'render exploded' },
   }]);
-  assert.deepEqual(failed.recorded(), [{ ...lateRender, error: 'render exploded' }]);
+  assert.deepEqual(failed.recorded(), [{ ...lateRender, error: '[-32603] render exploded' }]);
   t.mock.timers.reset();
   const empty = await timedOutRender(t);
   empty.answerLate({ result: null });
   assert.deepEqual(empty.recorded(), [lateRender]);
+});
+
+test("a late error's text is recorded with its control characters replaced, cut to 500 code points", async (t) => {
+  const { answerLate, recorded } = await timedOutRender(t);
+  answerLate({ error: { code: -32603, message: `line one\nline two\u202e${'x'.repeat(600)}` } });
+  const head = '[-32603] line one?line two?';
+  assert.deepEqual(recorded(), [{ ...lateRender, error: `${head}${'x'.repeat(500 - head.length)}…` }]);
 });
 
 test("a channel-scoped push/render answered late names its channel", async (t) => {
@@ -84,15 +93,22 @@ test("a channel-scoped push/render answered late names its channel", async (t) =
   assert.deepEqual(recorded(), [{ ...lateRender, featureSet: '', channelId: 'discord:guild:42' }]);
 });
 
-test('a late answer to a tool call whose deadline passed is still recorded as mcpl:orphaned-response, never as a late-render', async (t) => {
+test('a late answer to a tool call whose deadline passed is still recorded as mcpl:orphaned-response, never as a late-render, with its error when it was one', async (t) => {
   const { connection, transport, recorded } = await timedOutRender(t);
-  const call = connection.sendToolsCallWithDeadline('stuck', {}, 75);
-  const { id } = JSON.parse(transport.lines.at(-1)!) as { id: number };
-  t.mock.timers.tick(75);
-  await assert.rejects(call, /outcome is unknown/);
-  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, result: { content: [] } }));
+  const lateCall = async () => {
+    const call = connection.sendToolsCallWithDeadline('stuck', {}, 75);
+    const { id } = JSON.parse(transport.lines.at(-1)!) as { id: number };
+    t.mock.timers.tick(75);
+    await assert.rejects(call, /outcome is unknown/);
+    return id;
+  };
+  const answered = await lateCall();
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: answered, result: { content: [] } }));
+  const failed = await lateCall();
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: failed, error: { code: -32603, message: 'tool failed' } }));
   assert.deepEqual(recorded(), [
-    { type: 'mcpl:orphaned-response', serverId: 'srv', responseId: id, method: 'tools/call', hadState: false, hadCheckpoint: false },
+    { type: 'mcpl:orphaned-response', serverId: 'srv', responseId: answered, method: 'tools/call', hadState: false, hadCheckpoint: false },
+    { type: 'mcpl:orphaned-response', serverId: 'srv', responseId: failed, method: 'tools/call', hadState: false, hadCheckpoint: false, error: '[-32603] tool failed' },
   ]);
 });
 

@@ -1463,12 +1463,13 @@ export class McplServerConnection extends EventEmitter {
       // re-inject either result because the original dispatch context is gone.
       const orphaned = this.orphanedRequests.get(response.id);
       this.orphanedRequests.delete(response.id);
-      // A push/render answered after its timeout (RFC-006 §5.3) carries the
-      // render's featureSet, key, eventId and, for a channel-scoped subject,
-      // channelId, so its discarded answer can be recorded beside its batch's
-      // other coalescing records (§11). It is only reported: the fallback the
+      // A push/render answered after its timeout (RFC-006 §5.3) is reported
+      // with the render's featureSet, key, eventId and, for a channel-scoped
+      // subject, channelId, kept from its request when the timeout fired, so
+      // its discarded answer can be recorded beside its batch's other
+      // coalescing records (§11). It is only reported: the fallback the
       // timeout materialized stands (§5.4 rule 3). A late JSON-RPC error is
-      // carried as such, so it isn't read as a late result.
+      // passed on as `error`, so its record can be told from a late result's.
       const render = orphaned?.renderParams ?? {};
       const failure = response.error ? { error: { code: response.error.code, message: response.error.message } } : {};
       const result = response.result;
@@ -1481,7 +1482,6 @@ export class McplServerConnection extends EventEmitter {
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
             ...render,
-            ...failure,
           });
         }
       } else if (orphaned) {

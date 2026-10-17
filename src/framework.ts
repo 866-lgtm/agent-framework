@@ -20129,10 +20129,10 @@ export class AgentFramework {
       }
     });
 
-    // A late response to a tools/call that already timed out, carrying
-    // stateful data the server advanced to. The host can't re-inject it (the
-    // dispatch context is gone), but surfacing it makes the checkpoint-tree
-    // divergence greppable instead of a silent drift into stale state.
+    // A late answer to a request the connection keeps track of: a push/render
+    // whose timeout passed, or a tools/call whose mandatory deadline passed
+    // or that carries stateful data the server advanced to. The host can't
+    // re-inject either (the dispatch context is gone), so each is recorded.
     connection.on('orphaned-response', (info: {
       id: string | number;
       method?: string;
@@ -20144,11 +20144,16 @@ export class AgentFramework {
       channelId?: string;
       error?: { code: unknown; message: unknown };
     }) => {
+      // A late JSON-RPC error is recorded as the connection words a live one,
+      // `[code] message`, bounded and with its control characters replaced,
+      // since the server wrote it.
+      const error = info.error === undefined ? {} : {
+        error: boundedForLog(`[${describeCause(info.error.code)}] ${describeCause(info.error.message)}`, 500),
+      };
       // A push/render answered after its timeout, when the batch's fallback
       // was already materialized: RFC-006's audit records the discarded
       // answer (§5.4 rule 3, §11) where the coalescer records the rest, beside
-      // the batch's render-failed, linked by its eventId. A late JSON-RPC
-      // error keeps its message, bounded like the trace fields around it.
+      // the batch's render-failed, linked by its eventId.
       if (info.method === 'push/render') {
         this.emitTrace({
           type: 'mcpl:coalescing',
@@ -20159,10 +20164,13 @@ export class AgentFramework {
           key: info.key,
           ...(info.channelId === undefined ? {} : { channelId: info.channelId }),
           discarded: true,
-          ...(info.error === undefined ? {} : { error: boundedForLog(describeCause(info.error.message), 500) }),
+          ...error,
         });
         return;
       }
+      // A late tools/call answer. Whether it carried state or a checkpoint
+      // makes a checkpoint-tree divergence greppable instead of a silent
+      // drift into stale state.
       this.emitTrace({
         type: 'mcpl:orphaned-response',
         serverId: connection.id,
@@ -20170,6 +20178,7 @@ export class AgentFramework {
         method: info.method,
         hadState: info.hadState,
         hadCheckpoint: info.hadCheckpoint,
+        ...error,
       });
     });
 
