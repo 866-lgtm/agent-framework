@@ -478,9 +478,11 @@ export function extractDiscordAwarenessRefs(
  * out), or `{ scope: 'addressed' | 'all', refs? }` with each ref a Discord
  * address. Anything else is refused, never guessed: a bare scope string (the
  * host/command vocabulary) or a misspelled scope would otherwise skip the
- * scope filter and mark every addressable message. Every entry point that
- * takes a choice checks it with this before it plans or changes anything:
- * the framework's rollback and suppression, and the offline recovery.
+ * scope filter and mark every addressable message. Each entry point that
+ * takes a choice in this form checks it with this before it plans or
+ * changes anything: the framework's rollback and suppression, and the
+ * offline recovery. host/command's undo and hide take the bare scope words
+ * instead and refuse any other, and the recovery CLI parses its --marks.
  */
 export function checkedDiscordAwarenessMarks(marks: unknown): DiscordAwarenessMarks {
   if (marks === undefined || marks === 'none') return 'none';

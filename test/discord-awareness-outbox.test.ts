@@ -2572,30 +2572,44 @@ test('a sync for one server drains only that server', async () => {
 
 test("a legacy ledger whose batches the released readers would have refused can't be imported, and stays to be read again", withJournal((_outbox, h) => {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
-  const batch = {
+  const entry = { ...ref('m1'), desired: false, markerPresent: false, deliveryStatus: 'applied', attempts: 0 };
+  const v2 = {
     id: 'legacy-sup', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'partial', emoji: '💤', createdAt: 1,
-    activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i2' }],
-    refs: [{ ...ref('m1'), desired: false, markerPresent: false, deliveryStatus: 'applied', attempts: 0 }],
+    activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i2' }], refs: [entry],
   };
-  // Each is a field the released readers (0.21.0 to 0.22.2) checked, the
-  // last a ref without the attempts count they wrote. Imported as written,
-  // the first would retire a suppression whose removals a start on its
-  // branch still owes.
-  for (const malformed of [
-    { activationPolicy: 'explicit ' },
-    { status: 'pending ' },
-    { suppressionIntervals: [{ fromId: 'i1' }] },
-    { emoji: 7 },
-    { refs: [{ ...ref('m1'), desired: 'no', markerPresent: false, deliveryStatus: 'applied', attempts: 0 }] },
-    { refs: [{ ...ref('m1'), desired: false, markerPresent: false, deliveryStatus: 'applied' }] },
-  ]) {
-    writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [{ ...batch, ...malformed }] }));
+  const v1 = { id: 'legacy-v1', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', emoji: '💤', createdAt: 1, refs: [ref('m1')] };
+  const without = <T extends object>(value: T, key: string) => Object.fromEntries(Object.entries(value).filter(([k]) => k !== key));
+  // Every field the released readers (0.21.0 to 0.22.2) checked, each made
+  // wrong in turn: a batch's, an interval's, an entry's, and a version 1
+  // batch's and ref's. Imported as written, the first would retire a
+  // suppression whose removals a start on its branch still owes.
+  const refused: Array<[string, unknown]> = [
+    ['activationPolicy', { version: 2, batches: [{ ...v2, activationPolicy: 'explicit ' }] }],
+    ...['id', 'agentName', 'sourceBranch', 'targetBranch', 'emoji'].map((key): [string, unknown] =>
+      [key, { version: 2, batches: [{ ...v2, [key]: 7 }] }]),
+    ['status', { version: 2, batches: [{ ...v2, status: 'pending' }] }],
+    ['createdAt', { version: 2, batches: [{ ...v2, createdAt: '1' }] }],
+    ['refs', { version: 2, batches: [{ ...v2, refs: entry }] }],
+    ['suppressionIntervals', { version: 2, batches: [{ ...v2, suppressionIntervals: 'i1-i2' }] }],
+    ['an interval\'s fromId', { version: 2, batches: [{ ...v2, suppressionIntervals: [{ toId: 'i2' }] }] }],
+    ['an interval\'s toId', { version: 2, batches: [{ ...v2, suppressionIntervals: [{ fromId: 'i1' }] }] }],
+    ...['serverId', 'channelId', 'messageId', 'desired', 'markerPresent', 'deliveryStatus', 'attempts'].map((key): [string, unknown] =>
+      [`an entry's ${key}`, { version: 2, batches: [{ ...v2, refs: [without(entry, key)] }] }]),
+    ['an entry\'s deliveryStatus value', { version: 2, batches: [{ ...v2, refs: [{ ...entry, deliveryStatus: 'sent' }] }] }],
+    ['an entry\'s lastAction', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastAction: 'react' }] }] }],
+    ['an entry\'s lastAttemptAt', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastAttemptAt: '1' }] }] }],
+    ['an entry\'s lastError', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastError: 7 }] }] }],
+    ['a v1 status', { version: 1, batches: [{ ...v1, status: 'active' }] }],
+    ['a v1 ref', { version: 1, batches: [{ ...v1, refs: [without(ref('m1'), 'messageId')] }] }],
+  ];
+  for (const [field, ledger] of refused) {
+    writeFileSync(h.legacyPath, JSON.stringify(ledger));
     const outbox = h.reopen();
-    assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/, JSON.stringify(malformed));
-    assert.equal(existsSync(h.legacyPath), true, 'the ledger stays where it was');
+    assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/, field);
+    assert.equal(existsSync(h.legacyPath), true, `the ledger stays where it was (${field})`);
   }
   // As those releases wrote it, it imports, and the suppression's body stays owed.
-  writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [batch] }));
+  writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [v2] }));
   const outbox = h.reopen();
   assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
 }));

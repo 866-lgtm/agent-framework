@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import { createOfflineRecoveryBranch } from '../src/recovery/offline-branch.js';
+import { OperatorActionError } from '../src/operator-log.js';
 import {
   DISCORD_AWARENESS_RECORD_TYPE,
   DiscordAwarenessOutbox,
@@ -1154,17 +1155,23 @@ test('offline recovery refuses a marks choice the live methods refuse, before an
       cm.close();
       store.close();
     };
-    // A bare scope string (the host/command vocabulary), a misspelled scope,
-    // an unknown scope and refs that aren't a list: each would skip the scope
-    // filter and mark every removed message, ambient ones included.
-    for (const marks of ['addressed', 'all', { scop: 'addressed' }, { scope: 'every' }, { scope: 'addressed', refs: 'm-addressed' }]) {
+    // A bare scope string (the host/command vocabulary), a misspelled scope
+    // and an unknown scope would each skip the scope filter and mark every
+    // removed message, ambient ones included. Refs that aren't a list, or a
+    // ref that isn't an address, aren't a choice either.
+    const malformed = [
+      'addressed', 'all', { scop: 'addressed' }, { scope: 'every' }, { scope: 'addressed', refs: 'm-addressed' },
+      { scope: 'addressed', refs: [{ serverId: 'discord', channelId: 'discord:g1:c1' }] },
+    ];
+    for (const marks of malformed) {
       for (const dryRun of [true, false]) {
         await seed();
         await assert.rejects(
           createOfflineRecoveryBranch({
             storePath, agentName: 'cairn', messageId: 'm-safe', marks: marks as never, dryRun, branchName: 'recovery/cairn/bad',
           }),
-          /marks must be 'none' or \{ scope: 'addressed' \| 'all', refs\? \}/,
+          (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+            && /^marks must be 'none' or \{ scope: 'addressed' \| 'all', refs\? \}/.test(error.message),
           `${JSON.stringify(marks)}${dryRun ? ', dry run' : ''}`,
         );
         readJournal(storePath, (outbox, store) => {

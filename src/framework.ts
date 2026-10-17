@@ -17012,19 +17012,23 @@ export class AgentFramework {
    */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
     this.refuseOperatorAfterStop('awareness sync');
-    return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
+    return this.trackOperatorOperation('awareness:sync', () => {
+      // A pass under way may have nothing left due, so the pass below would
+      // leave its server out. Only an operator's sync waits for it: a
+      // background delivery doesn't take on other occasions' passes.
+      const running = [...this.discordAwarenessDrains]
+        .filter(([serverId]) => onlyServerId === undefined || serverId === onlyServerId)
+        .map(([, drain]) => drain);
+      return Promise.all([this.runDiscordAwarenessSync(onlyServerId), ...running]).then(() => {});
+    });
   }
 
-  /** One delivery pass over every server with due work or a pass under way,
-   *  or only `onlyServerId`'s: drainDiscordAwarenessOutbox joins a running pass. */
+  /** One delivery pass over every server with due work, or only `onlyServerId`'s. */
   private async runDiscordAwarenessSync(onlyServerId?: string): Promise<void> {
-    const serverIds = new Set(
+    const serverIds = [...new Set(
       this.readDiscordAwarenessDispatches(onlyServerId).map((dispatch) => dispatch.key.serverId),
-    );
-    for (const serverId of this.discordAwarenessDrains.keys()) {
-      if (onlyServerId === undefined || serverId === onlyServerId) serverIds.add(serverId);
-    }
-    await Promise.all([...serverIds].map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
+    )];
+    await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
   }
 
   /**
@@ -17288,10 +17292,12 @@ export class AgentFramework {
   /**
    * One pass of drainDiscordAwarenessOutbox. It leaves the registry in the
    * same synchronous step as its last claim, so a registered pass always has
-   * a claim ahead of it: a request that joins it is served by it, and one
-   * made after its last claim starts a new pass. Leaving any later, when its
-   * promise settles, would let a request join a pass that will never claim
-   * again, and that work would stay due until some unrelated trigger.
+   * a claim ahead of it: a request that joins it is served by it, unless its
+   * route goes away or stop() begins first, when the pass stops claiming and
+   * the work stays queued for the next pass. One made after its last claim
+   * starts a new pass. Leaving any later, when its promise settles, would let
+   * a request join a pass that will never claim again, and that work would
+   * stay due until some unrelated trigger.
    */
   private async runDiscordAwarenessDrain(
     serverId: string,

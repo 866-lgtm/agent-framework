@@ -860,25 +860,45 @@ describe('stop() with an operator operation in flight', () => {
     };
     const drain = fw.drainDiscordAwarenessOutbox('srv');
     assert.equal(fw.discordAwarenessDrains.size, 1, 'the pass is registered');
-    let synced = false;
-    const syncing = framework.syncDiscordAwarenessMarkers().then(() => { synced = true; });
-    const other = framework.syncDiscordAwarenessMarkers('other').then(() => 'settled' as const);
+    const settled = new Set<string>();
+    const sync = (server?: string) => framework.syncDiscordAwarenessMarkers(server).then(() => { settled.add(server ?? 'all'); });
+    const syncs = [sync(), sync('srv'), sync('other')];
+    // A sync with nothing to wait for settles in promise jobs alone, so a few
+    // turns of the event loop are enough to see which syncs are waiting.
+    const turns = async () => { for (let turn = 0; turn < 5; turn++) await new Promise<void>((resolve) => { setImmediate(resolve); }); };
     try {
-      // Another server's sync has no pass to wait for.
-      const otherOutcome = await Promise.race([
-        other,
-        new Promise<'waited'>((resolve) => { setTimeout(() => resolve('waited'), 2000); }),
-      ]);
-      assert.equal(otherOutcome, 'settled', "another server's sync doesn't wait for this pass");
-      for (let turn = 0; turn < 20; turn++) await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
-      assert.equal(synced, false, 'the sync waits for the pass');
+      await turns();
+      assert.deepEqual([...settled], ['other'], "only another server's sync settles while the pass is held");
     } finally {
       release();
       await drain;
-      await syncing;
-      await other;
+      await Promise.all(syncs);
     }
-    assert.equal(synced, true);
+    assert.deepEqual([...settled].sort(), ['all', 'other', 'srv']);
+    await framework.stop();
+  });
+
+  it("a background delivery leaves another occasion's running pass to that occasion", async () => {
+    const framework = await create();
+    const fw = framework as unknown as {
+      runDiscordAwarenessDrain(serverId: string, pass: unknown): Promise<unknown>;
+      drainDiscordAwarenessOutbox(serverId: string): Promise<unknown>;
+      discordAwarenessDrains: Map<string, Promise<unknown>>;
+      deliverDiscordAwarenessInBackground(occasion: string, agentName: string): void;
+      opsAlert(kind: string, key: string, text: string): void;
+    };
+    let fail!: (error: Error) => void;
+    fw.runDiscordAwarenessDrain = () => new Promise((_, reject) => { fail = reject; });
+    // The pass's own occasion handles its failure.
+    const drain = fw.drainDiscordAwarenessOutbox('srv').catch(() => {});
+    const alerts: string[] = [];
+    fw.opsAlert = (kind, _key, text) => { alerts.push(`${kind}: ${text}`); };
+    fw.deliverDiscordAwarenessInBackground('hide', 'agent'); // nothing is due
+    fail(new Error('the route went away'));
+    await drain;
+    for (let turn = 0; turn < 5; turn++) await new Promise<void>((resolve) => { setImmediate(resolve); });
+    fw.discordAwarenessDrains.delete('srv'); // as the real pass leaves the registry
+    assert.deepEqual(alerts, [], "the background delivery reported no other occasion's failure");
     await framework.stop();
   });
 

@@ -14,8 +14,9 @@
     the choice, and pass a scope's `refs` back to bind the choice to exactly
     the previewed messages. Any other `marks` value is refused rather than
     guessed (`invalid`, from the two methods). A surface that reacted to
-    `hide`'s `hiddenRefs` itself should stop when the result carries
-    `markers`.
+    `hide`'s `hiddenRefs` itself should leave marking to the framework: a
+    mark it places itself is outside the journal, so nothing can list or
+    cancel it.
   - **Unchanged:** the body change itself (fork, switch, redaction), the
     receipt's `status` values, the emoji (`discordAwarenessEmoji`) and the
     reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord
