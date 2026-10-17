@@ -361,15 +361,22 @@ test('usage totals an earlier release wrote with a null count, or with a byAgent
   seedFrameworkState(storePath, { usage: {
     totals: { inputTokens: null, outputTokens: 500, estimatedCost: { total: null, currency: 'USD' } },
     inferenceCount: 7,
-    byAgent: [null, { agentName: 'agent', usage: { inputTokens: 1000, outputTokens: 500 }, inferenceCount: 7 }],
+    byAgent: [
+      null,
+      { agentName: 'agent', usage: { inputTokens: 1000, outputTokens: 500, estimatedCost: { total: null, currency: 'USD' } }, inferenceCount: 7 },
+      { agentName: 'other', usage: { inputTokens: 10, outputTokens: 5, estimatedCost: { total: '0.25', currency: 'USD' } }, inferenceCount: 1 },
+    ],
   } });
   const f = await AgentFramework.create(config(storePath));
   try {
     const usage = f.getSessionUsage();
     assert.equal(usage.totals.inputTokens, 0);
     assert.equal(usage.totals.outputTokens, 500);
-    assert.deepEqual(usage.totals.estimatedCost, { total: 0, currency: 'USD' });
-    assert.deepEqual(usage.byAgent.map((a) => [a.agentName, a.usage.inputTokens]), [['agent', 1000]]);
+    assert.equal(usage.totals.estimatedCost, undefined, 'a null cost total is an unknown cost');
+    assert.deepEqual(usage.byAgent.map((a) => [a.agentName, a.usage.inputTokens, a.usage.estimatedCost]), [
+      ['agent', 1000, undefined],
+      ['other', 10, undefined],
+    ], "an agent's cost that isn't a finite total is unknown too");
   } finally { await f.stop(); }
 }));
 
@@ -577,11 +584,15 @@ function seedHostManaged(storePath: string, server: string, featureSet: string, 
   } finally { store.close(); }
 }
 
-const hostStateUnreadable = (server: string, featureSet: string): RegExp => new RegExp(
+/** The refusal of a host-managed state read before its server connects, or, with `registration`, when its feature set registers. */
+const hostStateUnreadable = (server: string, featureSet: string, when: 'before-connect' | 'registration' = 'before-connect'): RegExp => new RegExp(
   `^the host-managed state of feature set "${featureSet}" on MCPL server "${server}" \\(mcpl/state/${server}/${featureSet}\\) could not ` +
-  `be read: injected EIO reading mcpl/state/${server}/${featureSet}\\. The server doesn't connect without it, and neither does ` +
-  `create\\(\\) with it configured, since the feature set's next checkpoint would store over it\\. It's unchanged, and the ` +
-  `server connects once it can be read\\.$`,
+  `be read: injected EIO reading mcpl/state/${server}/${featureSet}\\. ` +
+  (when === 'before-connect'
+    ? `Neither create\\(\\) with the server configured nor a connectMcplServer\\(\\) of it goes on without it, since the feature set's ` +
+      `next checkpoint would store over it\\. It's unchanged, and they go on once it can be read\\.$`
+    : `The feature set isn't registered without it, since its next checkpoint would store over it, so the server's connect ` +
+      `fails\\. It's unchanged, and the server's next connect reads it again\\.$`),
 );
 
 test("at boot, a configured server's restored host-managed state that can't be read fails create() before any server connects, and the next boot reads it", async (t) => {
@@ -591,10 +602,12 @@ test("at boot, a configured server's restored host-managed state that can't be r
   await crash(f);
   const storePath = join(f.dir, 'store');
   seedHostManaged(storePath, 'editor', 'doc', { count: 1 });
+  const initializes = f.hostCaps.length;
   const restore = failStoreRead('mcpl/state/editor/doc', 'loadHostState');
   try {
     await rejectsBuild(() => f.create(), hostStateUnreadable('editor', 'doc'));
   } finally { restore(); }
+  assert.equal(f.hostCaps.length, initializes, 'no server connected: the fixture saw no initialize');
   assert.deepEqual(readState(storePath, 'mcpl/state/editor/doc'), { count: 1 }, 'the state is as it was');
   await f.create();
   const checkpoints = (f.framework as unknown as { checkpointManager: CheckpointManager }).checkpointManager;
@@ -650,6 +663,42 @@ test('a host-managed feature set restored from the store has its state read by l
   } finally { store.close(); }
 }));
 
+test("loadHostStates reads only its own server's host-managed trees, and only those with no state in memory", inStoreDir('boot-read-host-state-scope-', async (storePath) => {
+  const noop = () => {};
+  const first = JsStore.openOrCreate({ path: storePath });
+  try {
+    const checkpoints = new CheckpointManager(first, noop);
+    checkpoints.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
+    checkpoints.recordCheckpoint('srv', 'doc', { checkpoint: 'c1', data: { count: 1 } } as never);
+    checkpoints.registerFeatureSet('other', 'doc', { hostState: true, rollback: false });
+    checkpoints.recordCheckpoint('other', 'doc', { checkpoint: 'c1', data: { count: 2 } } as never);
+    // A rollback-only tree keeps no host-managed state.
+    checkpoints.registerFeatureSet('srv', 'undo', { hostState: false, rollback: true });
+  } finally { first.close(); }
+  const store = JsStore.openOrCreate({ path: storePath });
+  // The states loadHostStates reads.
+  const proto = JsStore.prototype as unknown as { getStateJson(this: JsStore, id: string): unknown };
+  const original = proto.getStateJson;
+  const read: string[] = [];
+  proto.getStateJson = function (this: JsStore, id: string) {
+    if (new Error().stack?.includes('loadHostState')) read.push(id);
+    return original.call(this, id);
+  };
+  try {
+    const checkpoints = new CheckpointManager(store, noop);
+    checkpoints.loadHostStates('srv');
+    assert.deepEqual(read, ['mcpl/state/srv/doc'], "only srv's host-managed tree is read");
+    assert.deepEqual(checkpoints.getCurrentState('srv', 'doc'), { count: 1 });
+    assert.equal(checkpoints.getCurrentState('other', 'doc'), undefined, "another server's tree waits for its own connect");
+    // A state already in memory, as a connected server's is, isn't read again.
+    checkpoints.loadHostStates('srv');
+    assert.deepEqual(read, ['mcpl/state/srv/doc'], 'nothing is read a second time');
+  } finally {
+    proto.getStateJson = original;
+    store.close();
+  }
+}));
+
 test("a host-managed feature set's state that can't be read fails loadHostStates for a restored tree, or the registration for a first-time one, naming it, and the next one reads it", inStoreDir('boot-read-host-state-read-', async (storePath) => {
   const noop = () => {};
   const first = JsStore.openOrCreate({ path: storePath });
@@ -675,12 +724,7 @@ test("a host-managed feature set's state that can't be read fails loadHostStates
       const restore = failStoreRead(stateId, 'loadHostState');
       try {
         assert.throws(reads[featureSet], {
-          message: new RegExp(
-            `^the host-managed state of feature set "${featureSet}" on MCPL server "srv" \\(mcpl/state/srv/${featureSet}\\) could not ` +
-            `be read: injected EIO reading mcpl/state/srv/${featureSet}\\. The server doesn't connect without it, and neither does ` +
-            `create\\(\\) with it configured, since the feature set's next checkpoint would store over it\\. It's unchanged, and the ` +
-            `server connects once it can be read\\.$`,
-          ),
+          message: hostStateUnreadable('srv', featureSet, featureSet === 'doc' ? 'before-connect' : 'registration'),
         });
       } finally { restore(); }
       reads[featureSet]();

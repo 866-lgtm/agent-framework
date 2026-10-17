@@ -255,7 +255,7 @@ export class CheckpointManager {
     };
     // Read before the tree is held, so a registration that fails here is
     // made whole by the next one.
-    if (opts.hostState) this.loadHostState(serverId, featureSet, tree);
+    if (opts.hostState) this.loadHostState(serverId, featureSet, tree, 'registration');
     this.trees.set(key, tree);
 
     this.emitTraceFn({
@@ -561,8 +561,15 @@ export class CheckpointManager {
   /** A host-managed feature set's stored state, read into its tree; nothing
    *  stored leaves it unset. A read that fails throws, naming the state:
    *  taken as nothing stored, the next patch would apply to nothing and
-   *  store over it. */
-  private loadHostState(serverId: string, featureSet: string, tree: FeatureSetState): void {
+   *  store over it. `when` says what the refusal stops: a restored tree's
+   *  read comes before its server connects, and a feature set with no tree
+   *  is read when it registers, once its server has connected. */
+  private loadHostState(
+    serverId: string,
+    featureSet: string,
+    tree: FeatureSetState,
+    when: 'before-connect' | 'registration',
+  ): void {
     const stateId = this.stateId(serverId, featureSet);
     try {
       this.store.registerState({ id: stateId, strategy: 'snapshot' });
@@ -575,25 +582,31 @@ export class CheckpointManager {
     } catch (error) {
       throw new Error(
         `the host-managed state of feature set "${featureSet}" on MCPL server "${serverId}" (${stateId}) could not ` +
-          `be read: ${thrownText(error)}. The server doesn't connect without it, and neither does create() with it ` +
-          `configured, since the feature set's next checkpoint would store over it. It's unchanged, and the server ` +
-          `connects once it can be read.`,
+          `be read: ${thrownText(error)}. ` +
+          (when === 'before-connect'
+            ? `Neither create() with the server configured nor a connectMcplServer() of it goes on without it, since ` +
+              `the feature set's next checkpoint would store over it. It's unchanged, and they go on once it can be read.`
+            : `The feature set isn't registered without it, since its next checkpoint would store over it, so the ` +
+              `server's connect fails. It's unchanged, and the server's next connect reads it again.`),
         { cause: error },
       );
     }
     if (existing !== null && existing !== undefined) tree.currentState = existing;
   }
 
-  /** Read the stored state of every host-managed tree held for `serverId`,
-   *  whatever its feature sets declare now. The framework calls it at MCPL's
-   *  start for each configured server and before a runtime connect adds its
-   *  server, so no server connects with a restored tree whose state its next
-   *  checkpoint would store over unread. A server's trees are the keys
-   *  `${serverId}:`, as removeServer finds them. */
+  /** Read the stored state of every host-managed tree held for `serverId`
+   *  with none in memory, whatever its feature sets declare now. The
+   *  framework calls it at MCPL's start for each configured server and
+   *  before a runtime connect adds its server, so no server connects with a
+   *  restored tree whose state its next checkpoint would store over unread.
+   *  A tree whose state is in memory, as a connected server's is, keeps it.
+   *  A server's trees are the keys `${serverId}:`, as removeServer finds
+   *  them. */
   loadHostStates(serverId: string): void {
     const prefix = `${serverId}:`;
     for (const [key, tree] of this.trees) {
-      if (tree.hostState && key.startsWith(prefix)) this.loadHostState(serverId, key.slice(prefix.length), tree);
+      if (!tree.hostState || tree.currentState !== undefined || !key.startsWith(prefix)) continue;
+      this.loadHostState(serverId, key.slice(prefix.length), tree, 'before-connect');
     }
   }
 

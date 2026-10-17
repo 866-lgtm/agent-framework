@@ -13,15 +13,16 @@ function accumulateUsage(
   estimatedCost?: { total: number; currency: string }
 ): void {
   // A provider's usage can lack a count (membrane 0.5.87's Bedrock stream
-  // takes a message_delta's output count as reported), and the cost membrane
-  // computes from it is then NaN; adding either would make the total NaN,
-  // which is stored as null.
+  // takes a message_delta's output count as reported); adding it would make
+  // the total NaN, which is stored as null.
   const count = (n: number): number => (Number.isFinite(n) ? n : 0);
   target.inputTokens += count(tokens.inputTokens);
   target.outputTokens += count(tokens.outputTokens);
   target.cacheCreationTokens += count(tokens.cacheCreationTokens);
   target.cacheReadTokens += count(tokens.cacheReadTokens);
-  if (estimatedCost) {
+  // The cost membrane computes from such a count is NaN: an unknown cost,
+  // which is left out as an absent one is, rather than added as zero.
+  if (estimatedCost && Number.isFinite(estimatedCost.total)) {
     if (!target.estimatedCost) {
       target.estimatedCost = { total: 0, currency: estimatedCost.currency };
     } else if (target.estimatedCost.currency !== estimatedCost.currency) {
@@ -29,17 +30,25 @@ function accumulateUsage(
       target.estimatedCost = undefined;
       return;
     }
-    target.estimatedCost.total += count(estimatedCost.total);
+    target.estimatedCost.total += estimatedCost.total;
   }
 }
 
 function parseUsage(raw: unknown): SessionUsage | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
-  // A count or a cost total stored as null is a NaN total, as JSON stores
-  // one: an earlier release could write it when a provider's usage lacked a
-  // count. It reads as 0, the count that survived it.
+  // A count stored as null is a NaN total, as JSON stores one: an earlier
+  // release could write it when a provider's usage lacked a count. The sum
+  // before it was lost when it became NaN, so it reads as 0.
   const count = (v: unknown): number | undefined => (v === null ? 0 : typeof v === 'number' ? v : undefined);
+  // A cost is kept as a finite total with its currency. Anything else, such
+  // as the null JSON stores for a NaN total, is an unknown cost, as an
+  // absent one is.
+  const cost = o.estimatedCost as { total?: unknown; currency?: unknown } | null | undefined;
+  const estimatedCost = cost && typeof cost === 'object' && typeof cost.total === 'number'
+    && Number.isFinite(cost.total) && typeof cost.currency === 'string'
+    ? { total: cost.total, currency: cost.currency }
+    : undefined;
   const inputTokens = count(o.inputTokens);
   const outputTokens = count(o.outputTokens);
   if (inputTokens === undefined || outputTokens === undefined) return null;
@@ -48,12 +57,7 @@ function parseUsage(raw: unknown): SessionUsage | null {
     outputTokens,
     cacheCreationTokens: typeof o.cacheCreationTokens === 'number' ? o.cacheCreationTokens : 0,
     cacheReadTokens: typeof o.cacheReadTokens === 'number' ? o.cacheReadTokens : 0,
-    estimatedCost: o.estimatedCost && typeof o.estimatedCost === 'object'
-      ? {
-        total: (o.estimatedCost as any).total === null ? 0 : (o.estimatedCost as any).total,
-        currency: (o.estimatedCost as any).currency,
-      }
-      : undefined,
+    estimatedCost,
   };
 }
 

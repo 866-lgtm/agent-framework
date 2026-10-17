@@ -4242,7 +4242,7 @@ export class AgentFramework {
       `the tool-result guards (${FRAMEWORK_STATE_ID}, toolResultGuards) ${problem}. Agent "${agent.name}" isn't ` +
         `created, since without them it would take its recipe's guard` +
         (cause === undefined
-          ? ` and the next guard change would store over them. They're unchanged, and creating it again won't help until they're repaired.`
+          ? ` and the next guard change would store over them. They're unchanged, and creating it again won't help until the host's operator repairs them.`
           : `. They're unchanged, and it's created once they can be read.`),
       cause === undefined ? undefined : { cause },
     );
@@ -16508,11 +16508,13 @@ export class AgentFramework {
     serverConfigs: McplServerConfig[],
     inferenceRouting?: import('./mcpl/types.js').InferenceRoutingPolicy,
   ): Promise<void> {
-    // First, before anything is built: a coalescing state, checkpoint trees
-    // or a configured server's restored host-managed state that can't be
-    // taken refuses here and leaves the subsystem as it was, so a refused
-    // runtime connect leaves nothing for the guards that test
-    // mcplServerRegistry, and a refused boot connects no server.
+    // First, before anything is built: a coalescing state or checkpoint trees
+    // that can't be taken refuse here and leave the subsystem as it was, so a
+    // first connectMcplServer() refused for them leaves nothing for the guards
+    // that test mcplServerRegistry. Each configured server's restored
+    // host-managed state is read here too, so a boot refused for one connects
+    // no server; a runtime connect reads its server's in
+    // runConnectMcplServer, once MCPL is up.
     const coalescing = this.restorePushCoalescer();
     const checkpoints = new CheckpointManager(
       this.store,
@@ -17681,8 +17683,11 @@ export class AgentFramework {
       );
     }
 
-    // The server's restored host-managed state is read before the server is
-    // added, so a read that fails leaves nothing connected.
+    // The server's restored host-managed trees are read before the server is
+    // added, so a read that fails leaves it unconnected; MCPL itself stays
+    // up, even when this connect brought it up. A feature set with no
+    // restored tree, as after a disconnect removed it, is read when it
+    // registers.
     this.checkpointManager?.loadHostStates(config.id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     await this.connectMcplServerInternal(config);
