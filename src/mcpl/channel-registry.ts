@@ -2440,8 +2440,8 @@ export class ChannelRegistry {
         // open it made if the host wants that channel closed.
         const substitute = open ? substitutedChannel(result, channelId) : undefined;
         if (substitute !== undefined) {
-          // Each id prints as every id this module logs does (logValue), so
-          // an odd one can't add a line or a field.
+          // Each id prints through logValue, as the rejection lines' ids do,
+          // so an odd one can't add a line or a field.
           const answered = logValue(substitute.kind === 'other' ? substitute.id : substitute.value);
           console.error(
             `[channel-open-substituted] server=${serverId} requested=${logValue(channelId)} answered=${answered}`,
