@@ -420,7 +420,7 @@ import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import type { McplServerConnection } from './mcpl/server-connection.js';
+import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -16433,15 +16433,17 @@ export class AgentFramework {
         }
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Failed to connect MCPL server "${config.id}":`, err.message);
+        console.error(`Failed to connect MCPL server "${config.id}": ${err.message}${withStderr(err)}`);
         // Reaching this catch means no stub was created, so nothing will
         // retry — except in the edge case where addServer succeeded (with a
         // reconnecting stub) and a later setup step threw; config.reconnect
         // is the best cheap approximation of that.
+        const stderrTail = stderrTailOf(err);
         this.emitTrace({
           type: 'mcpl:server-connect-failed',
           serverId: config.id,
           error: err.message,
+          ...(stderrTail === undefined ? {} : { stderrTail }),
           attempt: 0,
           willRetry: config.reconnect === true,
         });
@@ -17863,20 +17865,22 @@ export class AgentFramework {
     // Surface connect/reconnect failures. Before these traces existed the
     // only receipt was a console.error on the host's own stderr — invisible
     // unless someone ssh'd in and read the process log.
-    connection.on('connect-failed', (params: { error: string; attempt: number }) => {
+    connection.on('connect-failed', (params: { error: string; stderrTail?: string; attempt: number }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
         error: params.error,
+        ...(params.stderrTail === undefined ? {} : { stderrTail: params.stderrTail }),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
     });
-    connection.on('reconnect-failed', (params: { error: string; attempt: number }) => {
+    connection.on('reconnect-failed', (params: { error: string; stderrTail?: string; attempt: number }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
         error: params.error,
+        ...(params.stderrTail === undefined ? {} : { stderrTail: params.stderrTail }),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
@@ -17888,6 +17892,10 @@ export class AgentFramework {
         this.opsAlert(
           'mcpl-down',
           connection.id,
+          // Not the server's stderr (params.stderrTail): the webhook posts
+          // outside the process, and a server's stderr can hold a credential
+          // its configuration gives it, such as a token, which nothing here
+          // redacts.
           `MCPL server unreachable (attempt ${params.attempt}): ${params.error}`,
         );
       }
@@ -17933,7 +17941,7 @@ export class AgentFramework {
     // on it would erase every checkpoint tree on an ordinary host restart while
     // a SIGKILL preserves them. Permanent removal is owned solely by
     // disconnectMcplServer, which deletes the trees explicitly.
-    connection.on('close', (code?: number | null, signal?: string | null) => {
+    connection.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) => {
       this.featureSetManager?.removeServer(connection.id);
       // RFC-008: a closed provider's class hints are stale — on reconnect it
       // may class its tools differently. Until the next tools/list its tools
@@ -17944,6 +17952,9 @@ export class AgentFramework {
         serverId: connection.id,
         code: code ?? null,
         signal: signal ?? null,
+        // The transport's own words only: a WebSocket server's close text
+        // stays off the trace.
+        reason: info?.reason !== undefined && !info.reasonFromPeer ? boundFailureText(info.reason) : null,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
