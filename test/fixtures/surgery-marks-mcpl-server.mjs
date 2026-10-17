@@ -5,6 +5,9 @@
 // long reaction drain. When PROBE_PATH appears, the server sends one
 // inference-bearing channels/incoming request and appends to EVENTS_PATH when
 // the host answers it, so a test can see whether the MCPL data plane was held.
+// It sends that request only once the host has sent notifications/initialized:
+// the host's handshake reads nothing but the answer to its initialize, so a
+// request sent before then would never be answered.
 // When CRASH_PATH appears, the server consumes it and exits, and a server that
 // starts while DOWN_PATH exists exits at once, so a test can take the route
 // down and bring it back while the host reconnects.
@@ -27,6 +30,7 @@ const event = (name, extra = {}) => {
 
 const held = [];
 let probed = false;
+let initialized = false;
 let buf = '';
 
 function answer(message) {
@@ -55,6 +59,7 @@ function handle(message) {
     return;
   }
   if (message.method === 'notifications/initialized') {
+    initialized = true;
     request(100, 'channels/register', {
       channels: [{ id: channelId, type: 'discord', label: 'busy', direction: 'bidirectional' }],
     });
@@ -105,7 +110,7 @@ const timer = setInterval(() => {
   if (held.length > 0 && holdPath && existsSync(holdPath)) {
     for (const message of held.splice(0)) answer(message);
   }
-  if (!probed && probePath && existsSync(probePath)) {
+  if (!probed && initialized && probePath && existsSync(probePath)) {
     probed = true;
     event('probe-sent');
     request(900, 'channels/incoming', {
