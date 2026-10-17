@@ -499,7 +499,7 @@ describe('workspace deletes', () => {
 
     env.writeDisk('b.txt', 'edited in the shell');
     const error = await refused(m, 'delete', { path: 'work/b.txt' });
-    assert.match(error, /^The deletion of "work\/b\.txt" is stored in the workspace, so don't send it again\. Its push to disk was refused: /);
+    assert.match(error, /^The deletion of "work\/b\.txt" is stored in the workspace, so don't send it again\. Its push to disk didn't complete: /);
     assert.equal(env.readDisk('b.txt'), 'edited in the shell', 'the shell edit survives');
   });
 });
@@ -3223,7 +3223,7 @@ describe('the mount boundary', () => {
     const data = await call(m, 'materialize', {});
     const skip = JSON.stringify(data);
     assert.match(skip, /match neither what was being written there nor what disk last agreed with/);
-    assert.match(skip, /pass force to write the workspace copy over it/);
+    assert.match(skip, /materialize it with force to write the workspace copy over it/);
     assert.equal(env.readDisk('a.txt'), 'v2, cut off');
     await call(m, 'materialize', { force: true });
     assert.equal(env.readDisk('a.txt'), 'v2');

@@ -1589,6 +1589,11 @@ export class WorkspaceModule implements Module {
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
   private parsePath(path: string): { mount: MountState; relativePath: string } {
+    // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
+    // store would keep one name and disk another.
+    if (LONE_SURROGATE.test(path)) {
+      throw new Error(`The path ${JSON.stringify(path)} holds a lone UTF-16 surrogate, which UTF-8 can't store, so no file on disk can have that name. Nothing was done.`);
+    }
     const slashIdx = path.indexOf('/');
     const mountName = slashIdx >= 0 ? path.slice(0, slashIdx) : path;
     const relativePath = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
@@ -2127,7 +2132,8 @@ export class WorkspaceModule implements Module {
         data: {
           path: input.path,
           totalLines: lines.length,
-          ...(lines.length > 0
+          // Reading an empty file from its start is reading it whole.
+          ...(startLine > 0
             ? { note: `Line ${startLine + 1} is past the end: the file has ${lines.length} line${lines.length === 1 ? '' : 's'}.` }
             : {}),
           content: '',
@@ -2247,6 +2253,7 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
+    const receipt = { path: input.path, size: buffer.byteLength, hash: hashContent(input.content) };
     let committed = false;
     let refused: string | null;
     try {
@@ -2262,14 +2269,7 @@ export class WorkspaceModule implements Module {
     }
     if (refused !== null) return storedButUnfinished('write', input.path, { refused });
 
-    return {
-      success: true,
-      data: {
-        path: input.path,
-        size: Buffer.byteLength(input.content),
-        hash: hashContent(input.content),
-      },
-    };
+    return { success: true, data: receipt };
   }
 
   private async handleEdit(input: EditInput): Promise<ToolResult> {
@@ -2290,22 +2290,37 @@ export class WorkspaceModule implements Module {
 
     const store = this.getStore();
     let committed = false;
+    let appliedNote: string | null = null;
     try {
       return await this.withMount(mount, async (): Promise<ToolResult> => {
         // The edit applies to the path as disk holds it now: a change on disk
-        // the store hasn't taken is taken in first, by the rule a listing
-        // uses. A write doesn't do this, since it replaces the whole file.
+        // to a file the workspace holds is taken in first, by the rule a
+        // listing uses. The pass settles a pending intent on the path too, as
+        // settleBeforeMutation's would, and the commit enforces the rest
+        // (commitToolChange). A write passes over its path only to settle a
+        // pending intent, since it replaces the whole file.
         const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
         const report = pass.reports.get(relativePath);
-        const tookDisk = pass.ops.some((op) => op.path === relativePath && op.op === 'modified');
-        const fromDisk = tookDisk
-          ? ' Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.'
-          : '';
-        await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
+        const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op);
+        // Which copy the edit used, when it isn't the one the workspace last
+        // agreed on with disk: disk's newer text, or the workspace's copy
+        // because disk's couldn't be read. A file the workspace didn't hold
+        // has no older copy, so taking it in needs no word.
+        const whichCopy = (verb: string): string | null => took('modified')
+          ? `Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit ${verb} that text.`
+          : report?.state === 'unverified'
+            ? `Disk's copy couldn't be checked (${report.note ?? 'not observed'}), so the edit ${verb} the workspace's copy.`
+            : null;
+        const lookedIn = whichCopy('looked in');
+        const suffix = lookedIn !== null ? ` ${lookedIn}` : '';
+        appliedNote = whichCopy('applied to');
 
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
-          return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
+          const error = took('deleted')
+            ? `File not found: ${input.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
+            : this.notInWorkspace(input.path, report);
+          return { success: false, error, isError: true };
         }
 
         const blob = store.getBlob(entry.blobHash);
@@ -2318,25 +2333,25 @@ export class WorkspaceModule implements Module {
           return {
             success: false,
             isError: true,
-            error: `The edit did nothing: ${input.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. A write replaces the whole file, as UTF-8, if that's what you want.${fromDisk}`,
+            error: `The edit did nothing: ${input.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. `
+              + `Read shows each invalid byte sequence as U+FFFD, and a write replaces the whole file as UTF-8, so writing back what read shows puts U+FFFD in their place.${suffix}`,
           };
         }
 
         let content = blob.toString('utf-8');
 
-        // Validate uniqueness
-        if (!input.replaceAll) {
-          const count = content.split(input.oldString).length - 1;
-          if (count === 0) {
-            return { success: false, error: `String not found in ${input.path}.${fromDisk}`, isError: true };
-          }
-          if (count > 1) {
-            return {
-              success: false,
-              error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.${fromDisk}`,
-              isError: true,
-            };
-          }
+        // An edit that would replace nothing is refused, replaceAll or not;
+        // without replaceAll, the text must occur once.
+        const count = content.split(input.oldString).length - 1;
+        if (count === 0) {
+          return { success: false, error: `String not found in ${input.path}.${suffix}`, isError: true };
+        }
+        if (count > 1 && !input.replaceAll) {
+          return {
+            success: false,
+            error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.${suffix}`,
+            isError: true,
+          };
         }
 
         // A replacer function, so that the new text goes in as given: in a
@@ -2353,13 +2368,13 @@ export class WorkspaceModule implements Module {
           size: newBuffer.byteLength,
           mode: entry.mode,
         }, () => { committed = true; });
-        if (refused !== null) return storedButUnfinished('edit', input.path, { refused });
+        if (refused !== null) return storedButUnfinished('edit', input.path, { refused }, appliedNote);
 
         // A mount that doesn't push keeps a conflict until materialize or
         // sync settles it, so the edit says so.
         const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
         const notes = [
-          ...(tookDisk ? ['Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and the edit applied to that text.'] : []),
+          ...(appliedNote !== null ? [appliedNote] : []),
           ...(conflict !== null
             ? [`The path is in conflict with disk (${conflict}): the edit is in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.`]
             : []),
@@ -2375,7 +2390,7 @@ export class WorkspaceModule implements Module {
       });
     } catch (error) {
       if (!committed) throw error;
-      return storedButUnfinished('edit', input.path, { threw: error instanceof Error ? error.message : String(error) });
+      return storedButUnfinished('edit', input.path, { threw: error instanceof Error ? error.message : String(error) }, appliedNote);
     }
   }
 
@@ -3250,26 +3265,28 @@ const LONE_SURROGATE = /\p{Cs}/u;
 
 /**
  * The answer to a write, edit or delete that the workspace stored but
- * couldn't finish: its push to disk was refused, or what follows the tree
+ * couldn't finish: its push to disk didn't complete, or what follows the tree
  * entry threw. It stays an error, since part of the call failed, but it leads
  * with what the caller must know before acting on it: the change is stored,
- * and sending it again could apply it twice. `inChronicle` lets a script tell
- * it from a call that changed nothing, as writeBinary's answer does.
+ * and sending it again could apply it twice. The push's reason says what disk
+ * holds and the way out, as materialize takes it. `inChronicle` says the
+ * call's change is in Chronicle (for a deletion, the file's removal), so a
+ * script can tell it from a call that changed nothing, as writeBinary's
+ * answer does. An edit's note on which copy it applied to comes last.
  */
 function storedButUnfinished(
   tool: 'write' | 'edit' | 'delete',
   path: string,
   outcome: { refused: string } | { threw: string },
+  note: string | null = null,
 ): ToolResult {
   const change = tool === 'delete' ? 'deletion' : tool;
   const stored = `The ${change} of "${path}" is stored in the workspace, so don't send it again`
-    + (tool === 'edit' ? ': a second edit can apply the change twice' : '');
+    + (tool === 'edit' ? ': a second edit can apply the change twice.' : '.');
   const rest = 'refused' in outcome
-    ? `. Its push to disk was refused: ${outcome.refused}. ` + (tool === 'delete'
-      ? 'Until materialize with applyDeletions removes it, disk keeps its copy (ls shows its state).'
-      : 'Until materialize puts it there, disk doesn\'t have it.')
-    : `. The rest of the call failed: ${outcome.threw}.`;
-  return { success: false, isError: true, error: stored + rest, data: { inChronicle: true, path } };
+    ? ` Its push to disk didn't complete: ${outcome.refused}.`
+    : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
+  return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : ''), data: { inChronicle: true, path } };
 }
 
 /**

@@ -341,19 +341,24 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
 }
 
 /**
- * What's in the way, and the way out, when disk's shape keeps a file from
- * being written at its path: no push writes a file over a directory, or below
- * a path that's a file on disk, forced or not (`writeContained`). Null for any
- * other reason, which says its own way out.
+ * What's in the way, and the way out, when disk's shape keeps a push from a
+ * path: no push writes a file over a directory or unlinks one, or reaches a
+ * path below a file or a symlink the walk won't take (`writeContained`,
+ * `unlinkContained`), forced or not. Null for any other reason, which is
+ * passed on as it is.
  */
-function inTheWay(reason: string | undefined): string | null {
+function inTheWay(reason: string | undefined, deletion: boolean): string | null {
   if (reason === 'a directory') {
-    return 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
-      'move or remove that directory on disk and materialize again, or write the file under another path';
+    return deletion
+      ? 'disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk'
+      : 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
+        'move or remove that directory on disk and materialize again, or write the file under another path';
   }
   if (reason === 'a parent path is not a directory') {
-    return 'disk has a file where this path needs a directory, and no push writes below one, forced or not — ' +
-      'move or remove that file on disk and materialize again, or write the file under another path';
+    return deletion
+      ? 'disk has a file or a symlink where this path needs a directory, so disk holds no file here for a push to unlink'
+      : 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
+        'move or remove it on disk and materialize again, or write the file under another path';
   }
   return null;
 }
@@ -1038,6 +1043,10 @@ export async function pushPaths(
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const v = decide(d, s, p, bi, branchId, false);
+    // The ways out a refusal names, as materialize takes them: a deletion
+    // reaches disk only with applyDeletions.
+    const again = s ? 'materialize again' : 'materialize again with applyDeletions';
+    const forced = s ? 'materialize it with force to overwrite it' : 'materialize it with force and applyDeletions to delete it';
     // What the effect may find: what this observation saw, unless forced.
     const expect: Expect = opts.force || d.kind === 'unobserved' || d.kind === 'unhashed'
       ? { kind: 'any' }
@@ -1051,7 +1060,7 @@ export async function pushPaths(
         result.skipped.push({
           path,
           reason: 'stale copy: disk changed since it last agreed with the workspace, which did not — ' +
-            'sync this path to adopt the disk version, or pass force to overwrite it',
+            `sync this path to adopt the disk version, or ${forced}`,
         });
         continue;
       }
@@ -1085,8 +1094,8 @@ export async function pushPaths(
       if (!opts.force) {
         result.skipped.push({
           path,
-          reason: (s ? inTheWay(v.note) : null)
-            ?? `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and materialize again, or pass force to overwrite it`,
+          reason: inTheWay(v.note, !s)
+            ?? `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}, or ${forced}`,
         });
         continue;
       }
@@ -1112,9 +1121,9 @@ export async function pushPaths(
           : kind === 'interrupted'
             ? 'disk holds bytes that match neither what was being written there nor what disk last agreed with ' +
               '(conflict: interrupted), as a write that failed or was cut off partway leaves — check the file, then ' +
-              'pass force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
+              'materialize it with force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
             : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
-              'sync this path to adopt the disk version, or pass force to overwrite it',
+              `sync this path to adopt the disk version, or ${forced}`,
       });
       continue;
     }
@@ -1189,7 +1198,7 @@ export async function pushPaths(
         // exactly what it was, whatever kind that was.
         agreement.restore(mount.name, step.path, step.before);
         recorded = true;
-        const why = (step.kind === 'write' ? inTheWay(failure.message) : null) ?? failure.message;
+        const why = inTheWay(failure.message, step.kind === 'unlink') ?? failure.message;
         result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${why}` });
       } else {
         // No completion: the intent stays pending, and the next observation
