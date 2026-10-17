@@ -20092,11 +20092,17 @@ export class AgentFramework {
         // Same dispatch as a first-class tool call — the module cannot tell
         // which surface the call came through. An in-process caller gets the
         // module's own result; the model's path takes its checked form.
+        //
+        // The result goes where the utils call's does. On the model's path it
+        // is stored or handed to a script as that call's result, so it may be
+        // as long as that call's may (resultMaxCharsFor). An in-process caller
+        // gets it back, and the utils call carries what that caller may take,
+        // if anything does: the puppet's carries the agent's cap, since the
+        // puppet stores the pair under it.
+        const resultMaxChars = options.inProcess ? call.resultMaxChars : this.resultMaxCharsFor(agentName, call.id);
         const utilityCall: ToolCall = {
           id: call.id, name: def.name, input: args, callerAgentName: agentName,
-          // Its result goes where the utils call's does: stored or handed to a
-          // script as that call's result, or used by an in-process caller.
-          ...(options.inProcess ? {} : { resultMaxChars: this.resultMaxCharsFor(agentName, call.id) }),
+          ...(resultMaxChars !== undefined ? { resultMaxChars } : {}),
         };
         return options.inProcess
           ? this.moduleRegistry.handleToolCall(utilityCall)

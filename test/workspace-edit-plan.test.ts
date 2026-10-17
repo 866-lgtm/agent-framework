@@ -47,12 +47,23 @@ test('every edit is matched in the text as read, in any order, never in another 
 test('an occurrence is a position: overlapping occurrences count, and they can\'t each be replaced', () => {
   const [once] = problems('aaa\n', [spec(0, 'aa', 'b')]);
   assert.equal(once!.kind, 'count');
-  assert.deepEqual(once, { ...once, found: 2, expected: 1, overlapping: true, lines: [1, 1] });
+  assert.deepEqual(once, { ...once, found: 2, atLeast: false, expected: 1, overlapping: true, lines: [1, 1] });
   const [all] = problems('aaa\n', [spec(0, 'aa', 'b', 'all')]);
-  assert.deepEqual(all, { ...all, kind: 'count', found: 2, expected: 'all', overlapping: true });
+  assert.deepEqual(all, { ...all, kind: 'count', found: 2, atLeast: false, expected: 'all', overlapping: true });
   // Apart, every one is replaced when asked for.
   assert.equal(plan('aa-aa\n', [spec(0, 'aa', 'b', 2)]).bytes.toString(), 'b-b\n');
   assert.equal(plan('aa-aa\n', [spec(0, 'aa', 'b', 'all')]).bytes.toString(), 'b-b\n');
+});
+
+test('occurrences that overlap stop the count once a refusal has the matches it shows, however long the run', () => {
+  // Compared in full at every position, this is 1,000 times 200,000 comparisons.
+  const [run] = problems(`${' '.repeat(200_000)}\n`, [spec(0, ' '.repeat(1000), 'x', 'all')]);
+  assert.equal(run!.kind, 'count');
+  if (run!.kind !== 'count') return;
+  assert.deepEqual([run.found, run.atLeast, run.overlapping, run.lines.length], [20, true, true, 20]);
+  // Apart, every occurrence is counted, however many.
+  const [apart] = problems('ab '.repeat(30), [spec(0, 'ab', 'x')]);
+  assert.deepEqual(apart, { ...apart, found: 30, atLeast: false, overlapping: false });
 });
 
 test('a count that differs names each matched line once, and a long line as an excerpt around its match', () => {
@@ -81,6 +92,12 @@ test('a thousand edits of one stretch are named as at most a thousand clashes', 
   assert.equal(problems('shared\n', specs).length, 999);
 });
 
+test('each clash names its own line', () => {
+  const text = 'one two\nthree four\nfive six\n';
+  const clashes = problems(text, [spec(0, 'three four', 'X'), spec(1, 'four', 'Y'), spec(2, 'one two', 'Z'), spec(3, 'two', 'W')]);
+  assert.deepEqual(clashes.map((clash) => clash.kind === 'clash' && [clash.edits, clash.line]), [[[2, 3], 1], [[0, 1], 2]]);
+});
+
 test('a miss shows the closest region, numbered, and says how to match', () => {
   const text = Array.from({ length: 20 }, (_, i) => `line ${i + 1} of the file`).join('\n');
   const [miss] = problems(text, [spec(0, '  line 12 of the fyle', 'x')]);
@@ -89,6 +106,9 @@ test('a miss shows the closest region, numbered, and says how to match', () => {
   assert.match(miss.hint, /^Closest region \(line 12, similarity 0\.\d\d\):\n     9\tline 9 of the file\n/);
   assert.match(miss.hint, /    15\tline 15 of the file$/);
   assert.equal(miss.crlf, false);
+  // A first line of one character, such as a closing brace, has nothing to score; the next line does.
+  const [brace] = problems(text, [spec(0, '}\nline 12 of the fyle', 'x')]);
+  assert.match((brace as { hint: string }).hint, /^Closest region \(line 12, similarity 0\.\d\d\):/);
 });
 
 test("one call's misses search at most HINT_MAX_CHARS for closest regions, and a file over it gets none", () => {
@@ -128,7 +148,7 @@ test('a mixed file keeps its mixture: each line end of a replaced span by positi
 test("a match at a CRLF's line end takes its CR along, and an unterminated last line takes the line end before it", () => {
   assert.equal(plan(Buffer.from('a\r\nb\r\n'), [spec(0, 'a\n', 'x\n')]).bytes.toString(), 'x\r\nb\r\n');
   assert.equal(plan(Buffer.from('a\r\nb'), [spec(0, 'b', 'b\nc')]).bytes.toString(), 'a\r\nb\r\nc');
-  assert.equal(plan(Buffer.from('b'), [spec(0, 'b', 'b\nc')]).bytes.toString(), 'b\nc', 'one unterminated line has none to go by');
+  assert.equal(plan(Buffer.from('b'), [spec(0, 'b', 'b\nc')]).bytes.toString(), 'b\nc', 'a file with no CRLF takes the new text as given');
 });
 
 test("only the replaced text changes: a lone CR, and bytes the edits don't name, stay as they were", () => {

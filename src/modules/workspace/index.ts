@@ -43,7 +43,7 @@ import { BranchIntents } from './branch-intent.js';
 import { coveredByIgnore, filesystemTrustsCtime, locateRoot, readPrefix } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
-import { type EditSpec, type FilePlan, HINT_MAX_CHARS, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
+import { type EditSpec, type FilePlan, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
 import { type EditProblem, type EditTool, editList, editReceipt, fitted, refusalText } from './edit-text.js';
 import {
   type MountRuntime,
@@ -1160,7 +1160,7 @@ export class WorkspaceModule implements Module {
         name: 'edit',
         description: 'Edit a file by replacing exact text. oldString must occur exactly once, or with replaceAll at least once, '
           + "and every occurrence is replaced; occurrences that overlap count, but can't each be replaced. "
-          + `A miss shows the closest region, numbered (none for a file over ${HINT_MAX_CHARS.toLocaleString('en-US')} UTF-16 code units), and a count that differs shows the lines that matched. `
+          + 'A miss shows the closest region it finds, numbered, and a count that differs shows the lines that matched. '
           + 'CRLF line ends are matched with LF text and kept, as is a BOM, and straight and curly quotes match as a second chance. '
           + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
           + "A change disk made to the file is taken in first, and the answer says so. The answer shows the changed region, numbered. "
@@ -1178,7 +1178,7 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'edit_many',
-        description: 'Apply several exact edits at once, in one file or across files of one mount, all or none: nothing is stored unless every edit applies. '
+        description: 'Apply several exact edits at once, in one file or across files of one mount, all or none: no edit is stored unless every edit applies. '
           + "Each edit's oldString must occur in its file exactly `occurrences` times (1 when left out), and every one is replaced; "
           + "occurrences that overlap count, but can't each be replaced. "
           + "Each edit is matched in its file as this call reads it, never in another edit's result, so the list's order doesn't matter, "
@@ -1392,9 +1392,10 @@ export class WorkspaceModule implements Module {
       const input = call.input as Record<string, unknown>;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
-        if (call.callerAgentName !== generated.agentName) return {success:false,isError:true,error:'Generated file belongs to another agent'};
-        if (call.name !== 'read') return {success:false,isError:true,error:'Generated file is read-only; edit the presentation configuration instead'};
-        return await this.handleRead(input as unknown as ReadInput, generated.read());
+        if (call.name === 'read' && call.callerAgentName === generated.agentName) {
+          return await this.handleRead(input as unknown as ReadInput, generated.read());
+        }
+        return { success: false, isError: true, error: this.generatedFileRefusal(generated, call.callerAgentName) };
       }
 
       switch (call.name) {
@@ -1402,7 +1403,7 @@ export class WorkspaceModule implements Module {
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
         case 'write': return await this.handleWrite(input as unknown as WriteInput);
         case 'edit': return await this.handleEdit(input as unknown as EditInput, call.resultMaxChars);
-        case 'edit_many': return await this.handleEditMany(input as unknown as EditManyInput, call.resultMaxChars);
+        case 'edit_many': return await this.handleEditMany(input as unknown as EditManyInput, call.resultMaxChars, call.callerAgentName);
         case 'delete': return await this.handleDelete(input as unknown as DeleteInput);
         case 'ls': return await this.handleLs(input as unknown as LsInput);
         case 'glob': return await this.handleGlob(input as unknown as GlobInput);
@@ -2046,11 +2047,12 @@ export class WorkspaceModule implements Module {
 
   /**
    * commitToolChange for several paths of one mount at once, as edit_many
-   * commits its files: every path's precondition is enforced before the first
-   * entry is set, then every entry is set, with no await between, and one push
-   * takes the paths to disk. `onCommitted` is told of each path as its entry
-   * is set. Returns the reason for each path that reached the workspace but
-   * not disk.
+   * commits its files: every path's precondition is enforced before any entry
+   * is set, then every entry is set in one record of the store, which takes
+   * all of them or none, then each path's intent, with no await between, and
+   * one push takes the paths to disk. `onCommitted` is told of each path once
+   * the entries are set. Returns the reason for each path that reached the
+   * workspace but not disk.
    */
   private async commitToolChanges(
     mount: MountState,
@@ -2066,32 +2068,37 @@ export class WorkspaceModule implements Module {
     for (const { path } of changes) {
       settleAdoptionBeforeMutation(store, agreement, { name: mount.config.name, treeStateId: mount.treeStateId }, path);
     }
+    const entry = (change: ToolChange & { kind: 'set' }) => ({ blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+    if (changes.length === 1) {
+      const [{ path, change }] = changes as [{ path: string; change: ToolChange }];
+      if (change.kind === 'set') store.treeSet(mount.treeStateId, path, entry(change));
+      else store.treeRemove(mount.treeStateId, path);
+    } else {
+      // One record for every path, so a store that fails partway sets none.
+      store.treeBatch(mount.treeStateId, changes.map(({ path, change }) => (change.kind === 'set'
+        ? { op: 'set', path, entry: entry(change) }
+        : { op: 'remove', path })));
+    }
+    // A later intent update or disk push can throw; the tree entries are
+    // already set, on the branch current now. If the active branch changes
+    // during the push, that branch's tree has the files and the new one may
+    // not.
+    for (const { path } of changes) onCommitted?.(path);
     for (const { path, change } of changes) {
       const known = agreement.get(mount.config.name, path) !== undefined;
-      if (change.kind === 'set') {
-        store.treeSet(mount.treeStateId, path, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
-        // A later intent update or disk push can throw; the tree entry is
-        // already set, on the branch current now. If the active branch changes
-        // during the push, that branch's tree has the file and the new one may
-        // not.
-        onCommitted?.(path);
-        intents.update(path, (cur) => {
-          const next = { ...cur };
-          delete next.tombstone;
-          // Disk has never agreed with this path: a missing disk copy is a draft
-          // not yet materialized, not a deletion.
-          if (!known) next.origin = 'store';
-          return next;
-        });
-      } else {
-        store.treeRemove(mount.treeStateId, path);
-        onCommitted?.(path);
-        intents.update(path, (cur) => {
+      intents.update(path, (cur) => {
+        if (change.kind === 'remove') {
           const next = { ...cur, tombstone: { hash: change.previousHash } };
           delete next.origin;
           return next;
-        });
-      }
+        }
+        const next = { ...cur };
+        delete next.tombstone;
+        // Disk has never agreed with this path: a missing disk copy is a draft
+        // not yet materialized, not a deletion.
+        if (!known) next.origin = 'store';
+        return next;
+      });
     }
     const refused = new Map<string, string>();
     if (!this.pushesOnCommit(mount)) return refused;
@@ -2381,7 +2388,11 @@ export class WorkspaceModule implements Module {
     }], maxChars);
   }
 
-  private async handleEditMany(input: EditManyInput, maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS): Promise<ToolResult> {
+  private async handleEditMany(
+    input: EditManyInput,
+    maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
+    callerAgentName?: string,
+  ): Promise<ToolResult> {
     if (input.edits.length === 0) {
       return { success: false, isError: true, error: 'The edit_many call did nothing: "edits" is empty. Give at least one edit.' };
     }
@@ -2390,18 +2401,21 @@ export class WorkspaceModule implements Module {
       oldString: edit.oldString,
       newString: edit.newString,
       expected: edit.occurrences ?? 1,
-    })), maxChars);
+    })), maxChars, callerAgentName);
   }
 
   /**
    * A call's edits, all or none, applied to the stored copies of their files:
    * edit's one, or edit_many's in the files of one mount. Each edit is matched
    * in its file's text as this call reads it, never in another edit's result
-   * (edit-plan.ts), and any problem refuses the call, naming every problem
-   * found, with nothing stored.
+   * (edit-plan.ts), and any problem refuses the call with none of its edits
+   * stored: edit names its first problem, and edit_many every problem found.
    *
-   * Each edit's own input is checked first, and each path's mount, before
-   * anything is read; edit refuses at its first problem.
+   * Each edit's own input is checked first, and each path's mount. A problem
+   * there refuses edit at once, before anything is read. edit_many goes on to
+   * settle and plan the rest, so its one refusal names every problem; the
+   * settling is what a read or a listing of its files would take in from
+   * disk, and the refusal says what it took in.
    * Under the mount's turn, one pass settles every path with disk, by the
    * rule a listing uses, so the edits apply to what disk now holds. That pass
    * is the only step that awaits before the commit: every file is then read,
@@ -2411,13 +2425,13 @@ export class WorkspaceModule implements Module {
    * of the stored change.
    *
    * The answer is held to `maxChars`, the length the call's result may have
-   * (ToolCall.resultMaxChars): a refusal's problems keep their first line past
-   * it, and a receipt's regions are named by their lines.
+   * (ToolCall.resultMaxChars), as edit-text.ts describes.
    */
   private async applyEdits(
     tool: EditTool,
     given: Array<{ path: string; oldString: string; newString: string; expected: number | 'all' }>,
     maxChars: number,
+    callerAgentName?: string,
   ): Promise<ToolResult> {
     const refuse = (problems: EditProblem[], notes: string[] = []): ToolResult =>
       ({ success: false, isError: true, error: refusalText(tool, problems, notes, maxChars) });
@@ -2450,12 +2464,12 @@ export class WorkspaceModule implements Module {
 
     // Each path in its mount, before anything is read. Edits of one stored
     // path are one file, planned once from one text, whatever path named it.
-    // edit refuses at its first problem, its input's before its path's.
+    // edit's refusal names its first problem, its input's before its path's.
     const parsed = new Map<string, { mount: MountState; relativePath: string } | Extract<EditProblem, { kind: 'file' }>>();
     const targets = new Map<string, EditTarget>();
     const mounts = new Map<string, MountState>();
     for (const [index, { path }] of given.entries()) {
-      if (!parsed.has(path)) parsed.set(path, this.editablePath(tool, path));
+      if (!parsed.has(path)) parsed.set(path, this.editablePath(tool, path, callerAgentName));
       const where = parsed.get(path)!;
       if ('kind' in where) {
         where.edits.push(index);
@@ -2478,8 +2492,8 @@ export class WorkspaceModule implements Module {
     if (!mount || mounts.size > 1) return refuse(problems);
 
     const store = this.getStore();
-    // The paths whose entries this call set, in the order it set them.
-    const stored: string[] = [];
+    // Whether the commit set the call's entries, all of them at once.
+    let committed = false;
     // What each file's settling took in, for a receipt.
     const applied = new Map<EditTarget, string | null>();
     try {
@@ -2572,7 +2586,8 @@ export class WorkspaceModule implements Module {
               edits: target.edits,
               path: target.path,
               text: `${target.path} would be ${planned.plan.bytes.length.toLocaleString('en-US')} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
-                + `past this mount's maxFileSize of ${maxSize.toLocaleString('en-US')} bytes, so the workspace couldn't keep it.`,
+                + `past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so the workspace couldn't keep it. `
+                + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.",
               whole: false,
             });
             continue;
@@ -2590,8 +2605,8 @@ export class WorkspaceModule implements Module {
         const refused = await this.commitToolChanges(mount, plans.map(({ target, plan, mode }) => ({
           path: target.relativePath,
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
-        })), (path) => { stored.push(path); });
-        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], stored, applied, { refused }, maxChars);
+        })), () => { committed = true; });
+        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { refused }, maxChars);
         return {
           success: true,
           data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
@@ -2602,24 +2617,28 @@ export class WorkspaceModule implements Module {
         };
       });
     } catch (error) {
-      if (!stored.length) throw error;
-      return this.editsStoredButUnfinished(tool, [...targets.values()], stored, applied, { threw: error instanceof Error ? error.message : String(error) }, maxChars);
+      if (!committed) throw error;
+      return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { threw: error instanceof Error ? error.message : String(error) }, maxChars);
     }
   }
 
   /**
    * Where an edit's path is in its mount, or why the call can't edit it: a
-   * path no mount holds, a read-only mount, or for edit_many a generated file,
-   * which edit is refused before it gets here (handleToolCall).
+   * path no mount holds, a read-only mount, or for edit_many a generated file.
+   * edit's generated file is refused before it gets here, by the same rule
+   * (handleToolCall checks a call's `path`, which edit_many's input lacks).
    */
-  private editablePath(tool: EditTool, path: string): { mount: MountState; relativePath: string } | Extract<EditProblem, { kind: 'file' }> {
+  private editablePath(
+    tool: EditTool,
+    path: string,
+    callerAgentName: string | undefined,
+  ): { mount: MountState; relativePath: string } | Extract<EditProblem, { kind: 'file' }> {
     const unusable = (text: string) => ({ kind: 'file' as const, edits: [], path, text, whole: true });
     try {
       const where = this.parsePath(path);
       if (where.mount.config.mode === 'read-only') return unusable(`Mount "${where.mount.config.name}" is read-only`);
-      if (tool === 'edit_many' && this.findGeneratedTextFile(path)) {
-        return unusable(`${path} is a generated file, which is read-only; edit the presentation configuration instead.`);
-      }
+      const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
+      if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
       return where;
     } catch (error) {
       return unusable(error instanceof Error ? error.message : String(error));
@@ -2627,50 +2646,51 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * The answer to edits stored but not finished: disk refused some of their
-   * pushes, or the call failed after it set some entries. It stays an error,
-   * since part of the call failed, and leads with what was stored, which must
-   * not be sent again: a second call can apply those edits twice.
+   * Why a call can't change a generated file: another agent's is that agent's,
+   * and the agent's own is read-only, since it shows the agent's tool
+   * presentation, which set_tool_visibility and set_tool_description change.
+   */
+  private generatedFileRefusal(generated: { agentName: string }, callerAgentName: string | undefined): string {
+    return callerAgentName !== generated.agentName
+      ? 'Generated file belongs to another agent'
+      : 'Generated file is read-only; edit the presentation configuration instead';
+  }
+
+  /**
+   * The answer to edits stored but not finished: the commit set every file's
+   * entry, and then disk refused some of their pushes, or the rest of the call
+   * failed. It stays an error, since part of the call failed, and leads with
+   * what is stored, which must not be sent again: a second call can apply
+   * those edits twice. edit's is the answer write and delete give, one path's;
+   * edit_many's lists the files disk refused, within `maxChars`, and never
+   * says to send the call again.
    */
   private editsStoredButUnfinished(
     tool: EditTool,
     targets: EditTarget[],
-    stored: string[],
     applied: Map<EditTarget, string | null>,
     outcome: { refused: Map<string, string> } | { threw: string },
     maxChars: number,
   ): ToolResult {
     if (tool === 'edit') {
       const [target] = targets;
-      const result = 'refused' in outcome
+      return 'refused' in outcome
         ? storedButUnfinished('edit', target!.path, { refused: outcome.refused.get(target!.relativePath)! }, applied.get(target!) ?? null)
         : storedButUnfinished('edit', target!.path, { threw: outcome.threw }, applied.get(target!) ?? null);
-      return result;
     }
-    const isStored = new Set(stored);
-    const kept = targets.filter((target) => isStored.has(target.relativePath));
-    const lost = targets.filter((target) => !isStored.has(target.relativePath));
-    const head = lost.length === 0
-      ? `Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.`
-      : `The edits of ${kept.length} of this call's ${targets.length} files are stored in the workspace, so don't send the call again: a second call can apply those edits twice. `
-        + 'Send the edits of the files not stored in a call of their own.';
+    const head = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
     const parts: string[] = [];
     if ('refused' in outcome) {
-      parts.push(`Disk took ${kept.length - outcome.refused.size} of the ${kept.length} files. These pushes didn't complete, each with the way to finish it:`);
-      for (const target of kept) {
+      parts.push(`Disk took ${targets.length - outcome.refused.size} of the ${targets.length} files. These pushes didn't complete, each with the way to finish it:`);
+      for (const target of targets) {
         const reason = outcome.refused.get(target.relativePath);
         if (reason !== undefined) parts.push(`${target.path}: ${reason}`);
       }
     } else {
       parts.push(`The rest of the call failed: ${outcome.threw}. ls shows each path's state.`);
-      parts.push(`Stored: ${kept.map((target) => target.path).join(', ')}.`);
-      if (lost.length) parts.push(`Not stored: ${lost.map((target) => target.path).join(', ')}.`);
     }
-    for (const target of kept) {
-      const note = applied.get(target);
-      if (note) parts.push(note);
-    }
-    return { success: false, isError: true, error: fitted(head, parts, maxChars) };
+    const notes = targets.map((target) => applied.get(target)).filter((note): note is string => !!note);
+    return { success: false, isError: true, error: fitted(head, parts, notes, maxChars, 'stored') };
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {

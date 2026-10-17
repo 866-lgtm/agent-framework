@@ -254,7 +254,7 @@ test("an edit applies to disk's text when disk changed and the store didn't, and
     + "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
   writeFileSync(join(dir, 's.txt'), 'v4 twice twice\n');
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'twice', newString: 'x' })),
-    'The edit did nothing: oldString occurs 2 times in work/s.txt (lines 1, 1). '
+    'The edit did nothing: oldString occurs 2 times in work/s.txt (on line 1). '
     + 'Add the text around it to make it unique, or set replaceAll to replace every one.\n     1\tv4 twice twice\n\n'
     + "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
 });
@@ -271,7 +271,7 @@ test('an edit of a draft whose disk copy also changed applies to the draft and n
     "The edit did nothing: oldString isn't in work/k.txt.\nMatch exactly, including whitespace and indentation.\n\n"
     + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'a', newString: 'x' })),
-    'The edit did nothing: oldString occurs 2 times in work/k.txt (lines 1, 1). Add the text around it to make it unique, or set replaceAll to replace every one.\n'
+    'The edit did nothing: oldString occurs 2 times in work/k.txt (on line 1). Add the text around it to make it unique, or set replaceAll to replace every one.\n'
     + '     1\tagent draft\n\n'
     + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
   const edit = await call('edit', { path: 'work/k.txt', oldString: 'draft', newString: 'draft, edited' });

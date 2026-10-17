@@ -1,17 +1,17 @@
 /**
- * What edit and edit_many say: a refusal that names every problem, in edit
- * order, and a receipt that shows each edit's first changed region. Each is
- * held to the length the call's result may have (ToolCall.resultMaxChars), so
- * that closest regions, matched lines and changed regions don't take it past
- * that length. Past it a problem keeps its first line, and a region is named
- * by its lines.
+ * What edit and edit_many say: a refusal that names edit's problem, or each of
+ * edit_many's problems in edit order, and a receipt that shows each edit's
+ * first changed region. What can grow with a call, problems, notes, files and
+ * regions, is held to the length the call's result may have
+ * (ToolCall.resultMaxChars). Past it, a problem keeps its first line, a region
+ * is named by its lines, and the answer's last line counts what it left out.
  *
  * Ported from anima-research/hands-mcp's src/edit.ts, where it words the Edit
  * and EditMany tools' answers.
  */
 
 import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
-import { jsonLength, numbered } from './text.js';
+import { jsonLength, numbered, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
 export type EditTool = 'edit' | 'edit_many';
@@ -33,17 +33,53 @@ export type EditProblem =
   | { kind: 'mounts'; edits: number[]; mounts: string[] }
   | (MatchProblem & { path: string });
 
-/** "edit 3", or "edits 1, 2 and 5", numbered from 1. */
+/** How many runs of edits a list names before it counts the rest. */
+const LISTED_RUNS = 10;
+
+/**
+ * "edit 3", or "edits 1–4, 7 and 9", numbered from 1: three or more edits in a
+ * row as a range, and past LISTED_RUNS of those and single edits, how many
+ * more, so a label stays short whatever the call's size.
+ */
 export function editList(edits: number[]): string {
-  const shown = [...new Set(edits)].sort((a, b) => a - b).map((edit) => edit + 1);
-  if (shown.length === 1) return `edit ${shown[0]}`;
-  return `edits ${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
+  const sorted = [...new Set(edits)].sort((a, b) => a - b).map((edit) => edit + 1);
+  if (sorted.length === 1) return `edit ${sorted[0]}`;
+  const items: string[] = [];
+  let listed = 0;
+  for (let i = 0; i < sorted.length && items.length < LISTED_RUNS;) {
+    let j = i;
+    while (j + 1 < sorted.length && sorted[j + 1] === sorted[j]! + 1) j++;
+    const run = j - i >= 2;
+    items.push(run ? `${sorted[i]}–${sorted[j]}` : `${sorted[i]}`);
+    listed += run ? j - i + 1 : 1;
+    i = run ? j + 1 : i + 1;
+  }
+  const more = sorted.length - listed;
+  if (more > 0) return `edits ${items.join(', ')} and ${more} more`;
+  return items.length === 1 ? `edits ${items[0]}` : `edits ${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
 }
 
-/** Up to SHOWN_MATCHES line numbers, and how many more there are of `count`. */
-export function lineList(lines: number[], count = lines.length): string {
-  const shown = lines.slice(0, SHOWN_MATCHES);
-  return `${shown.join(', ')}${count > shown.length ? `, and ${count - shown.length} more` : ''}`;
+/**
+ * "line 5", "lines 5 and 9", or "lines 5, 9 and 12": each line once, the
+ * first SHOWN_MATCHES of them, and how many more.
+ */
+function onLines(lines: number[]): string {
+  const distinct = [...new Set(lines)];
+  const shown = distinct.slice(0, SHOWN_MATCHES);
+  const more = distinct.length - shown.length;
+  const list = more > 0 ? `${shown.join(', ')} and ${more} more`
+    : shown.length < 2 ? `${shown[0] ?? ''}` : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
+  return `${plural(distinct.length, 'line')} ${list}`;
+}
+
+/**
+ * Where a count's occurrences are: the lines of those shown, each line once,
+ * and whether more occurrences follow them.
+ */
+function countLines(problem: { found: number; atLeast: boolean; lines: number[] }): string {
+  return problem.atLeast || problem.found > problem.lines.length
+    ? `the first ${problem.lines.length} on ${onLines(problem.lines)}`
+    : `on ${onLines(problem.lines)}`;
 }
 
 /** The edit a problem sorts by: its first. */
@@ -67,22 +103,24 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         + `Match exactly, including whitespace and indentation${problem.crlf ? "; the file's CRLF line ends are matched as LF" : ''}.`;
     case 'count': {
       const { found, expected, overlapping } = problem;
-      const where = `${problem.path} (${plural(Math.min(found, problem.lines.length), 'line')} ${lineList(problem.lines, found)})`;
+      const occurs = `oldString occurs ${problem.atLeast ? 'at least ' : ''}${found} ${plural(found, 'time')} in ${problem.path} (${countLines(problem)})`;
       const quotes = problem.quoteNormalized ? ', with straight and curly quotes treated as equal' : '';
       const overlap = overlapping ? ", and they overlap, so they can't each be replaced" : '';
       if (tool === 'edit') {
         const hint = overlapping
           ? 'Add the text around it to single out the text you mean.'
           : 'Add the text around it to make it unique, or set replaceAll to replace every one.';
-        return `oldString occurs ${found} ${plural(found, 'time')} in ${where}${quotes}${overlap}. ${hint}\n${problem.shown}`;
+        return `${occurs}${quotes}${overlap}. ${hint}\n${problem.shown}`;
       }
-      const differs = typeof expected === 'number' && found !== expected;
+      // A count the scan stopped at is a floor, which differs from the one
+      // asked for only where it passes it.
+      const differs = typeof expected === 'number' && (problem.atLeast ? found > expected : found !== expected);
       const hint = overlapping
         ? 'Include more of the text around it to single out the text you mean.'
         : typeof expected === 'number' && found > expected
           ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
           : `Set occurrences to ${found} if those are all.`;
-      return `oldString occurs ${found} ${plural(found, 'time')} in ${where}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${problem.shown}`;
+      return `${occurs}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${problem.shown}`;
     }
     case 'clash': {
       const [a, b] = problem.edits;
@@ -99,31 +137,64 @@ function label(problem: EditProblem): string {
   return `${'edits' in problem ? editList(problem.edits) : editList([problem.edit])}: `;
 }
 
-/** What a refusal keeps aside for its last line, which says what it left out. */
-const TAIL_RESERVE = 240;
+/**
+ * A part's first line past this many UTF-16 code units is cut, so one long
+ * path or text can't take the room the parts after it need.
+ */
+const FIRST_LINE_MAX = 400;
+
+/** What an answer is: a refusal, whose problems the agent answers and sends again, or the answer to edits stored, which mustn't be sent again. */
+export type AnswerKind = 'refusal' | 'stored';
 
 /**
- * Parts joined with blank lines, within `maxChars`: every part's first line
- * while they fit, so a call's problems are each named before any is
- * explained, then, in order, the rest of each part whose rest still fits. A
- * part whose first line doesn't fit is left out with every part after it.
- * The last line says what was left out. Never longer than `maxChars`, unless
- * the head alone is.
+ * The answer's last line: what it left out, and what to do. `cut` parts left
+ * out their details; `problems` and `notes` weren't shown at all.
  */
-export function fitted(head: string, parts: string[], maxChars: number): string {
-  let left = maxChars - head.length - TAIL_RESERVE;
-  const firsts = parts.map((part) => part.split('\n')[0]!);
+function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: number, notes: number): string {
+  const items = [
+    ...(cut ? [`the details of ${cut} of these`] : []),
+    ...(problems ? [kind === 'refusal' ? `${problems} more ${plural(problems, 'problem')}` : `${problems} more`] : []),
+    ...(notes ? [`${notes} ${plural(notes, 'note')} on the files' copies on disk`] : []),
+  ];
+  if (!items.length) return '';
+  const next = kind === 'stored'
+    ? " ls shows each path's state."
+    : problems ? ' Answer the problems shown and send the call again to see the rest.' : '';
+  const list = items.length < 2 ? items[0] : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
+  return `[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.${next}]`;
+}
+
+/**
+ * An answer's head, then its parts joined with blank lines, within
+ * `maxChars`: every part's first line while they fit, each cut at
+ * FIRST_LINE_MAX, so a call's problems are each named before any is
+ * explained, then, in order, the rest of each part whose rest still fits. The
+ * parts are `problems`, then `notes` on what the call's settling with disk
+ * found. A part whose first line doesn't fit is left out with every part
+ * after it. The last line counts what was left out, and for edits stored it
+ * never says to send the call again. Never longer than `maxChars`, unless the
+ * head and the last line alone are: with 1,000 characters, the least a
+ * residence or an agent can set, a refusal names its first problem at least.
+ */
+export function fitted(head: string, problems: string[], notes: string[], maxChars: number, kind: AnswerKind): string {
+  const parts = [...problems, ...notes];
+  // The last line as long as it can be: every count at its most.
+  const reserve = tailText(kind, maxChars, parts.length, problems.length, notes.length).length + 2;
+  let left = maxChars - head.length - reserve;
   const shown: string[] = [];
-  for (const first of firsts) {
-    const cost = first.length + (shown.length ? 2 : 0);
-    if (cost > left) break;
-    left -= cost;
+  for (const part of parts) {
+    const end = part.indexOf('\n');
+    const line = end === -1 ? part : part.slice(0, end);
+    const first = line.length > FIRST_LINE_MAX ? `${line.slice(0, safeCut(line, FIRST_LINE_MAX - 1))}…` : line;
+    // Each part costs the blank line before it too.
+    if (first.length + 2 > left) break;
+    left -= first.length + 2;
     shown.push(first);
   }
-  const dropped = parts.length - shown.length;
   let cut = 0;
   for (const [i, first] of shown.entries()) {
     const rest = parts[i]!.length - first.length;
+    if (rest === 0) continue;
     if (rest > left) {
       cut++;
       continue;
@@ -131,19 +202,18 @@ export function fitted(head: string, parts: string[], maxChars: number): string 
     left -= rest;
     shown[i] = parts[i]!;
   }
-  const tail = [
-    ...(cut ? [`${cut} of these left out their details to keep this answer within ${maxChars.toLocaleString('en-US')} characters.`] : []),
-    ...(dropped ? [`${dropped} more aren't shown, to keep this answer within ${maxChars.toLocaleString('en-US')} characters: answer these and send the call again to see them.`] : []),
-  ];
-  return [head, shown.join('\n\n'), ...(tail.length ? [`[${tail.join(' ')}]`] : [])].filter(Boolean).join('\n\n');
+  const unshownProblems = Math.max(0, problems.length - shown.length);
+  const tail = tailText(kind, maxChars, cut, unshownProblems, parts.length - shown.length - unshownProblems);
+  return [head, ...shown, tail].filter(Boolean).join('\n\n');
 }
 
 /**
- * The refusal that names every problem, in edit order, within `maxChars`.
- * edit names its first problem after "The edit did nothing: ", unless it is
- * a whole sentence already. edit_many counts its problems and labels each
- * with its edits. `notes` follow the problems: what the call's settling with
- * disk took in, which the agent needs whether or not the call stored anything.
+ * The refusal, within `maxChars`. edit names its first problem after "The
+ * edit did nothing: ", unless it is a whole sentence already. edit_many
+ * counts its problems and names each, in edit order, labelled with its edits.
+ * `notes` follow the problems: which copy of a file the edits looked in, and
+ * a conflict with disk, which the agent needs whether or not the call stored
+ * anything.
  */
 export function refusalText(tool: EditTool, problems: EditProblem[], notes: string[], maxChars: number): string {
   const sorted = [...problems].sort((a, b) => firstEdit(a) - firstEdit(b));
@@ -151,10 +221,10 @@ export function refusalText(tool: EditTool, problems: EditProblem[], notes: stri
     const [problem] = sorted;
     const text = problemText(problem!, tool);
     const whole = problem!.kind === 'file' && problem!.whole ? text : `The edit did nothing: ${text}`;
-    return fitted('', [whole, ...notes], maxChars);
+    return fitted('', [whole], notes, maxChars, 'refusal');
   }
-  const head = `The edit_many call did nothing: ${sorted.length} ${plural(sorted.length, 'problem')}.`;
-  return fitted(head, [...sorted.map((problem) => `${label(problem)}${problemText(problem, tool)}`), ...notes], maxChars);
+  const head = `The edit_many call stored none of its edits: ${sorted.length} ${plural(sorted.length, 'problem')}.`;
+  return fitted(head, sorted.map((problem) => `${label(problem)}${problemText(problem, tool)}`), notes, maxChars, 'refusal');
 }
 
 /** Lines from..to of the updated text, and their text's bounds in it. */
@@ -239,16 +309,25 @@ export function lineEndNote(plan: FilePlan): string | null {
   return plan.crlf ? "The file's CRLF line ends are kept." : null;
 }
 
-/** The lines of each edit's replacements after its first, for a receipt. */
+/**
+ * The lines of each edit's replacements after its first, for a receipt: the
+ * first SHOWN_MATCHES edits that made more than one, and how many more did.
+ */
 export function otherReplacements(plan: FilePlan, labelled: boolean): string[] {
   const notes: string[] = [];
   const edits = [...new Set(plan.changes.map((change) => change.edit))].sort((a, b) => a - b);
+  let more = 0;
   for (const edit of edits) {
     const rest = plan.changes.filter((change) => change.edit === edit).slice(1);
     if (!rest.length) continue;
-    const lines = `${plural(rest.length, 'line')} ${lineList(rest.map((change) => change.line))}`;
-    notes.push(labelled ? `Edit ${edit + 1}'s other replacements are at ${lines}.` : `The other replacements are at ${lines}.`);
+    if (notes.length === SHOWN_MATCHES) {
+      more++;
+      continue;
+    }
+    const lines = onLines(rest.map((change) => change.line));
+    notes.push(labelled ? `Edit ${edit + 1}'s other replacements are on ${lines}.` : `The other replacements are on ${lines}.`);
   }
+  if (more) notes.push(`${more} more ${plural(more, 'edit')} made other replacements too.`);
   return notes;
 }
 
@@ -262,7 +341,7 @@ export interface StoredFile {
 /**
  * What a receipt keeps aside for what it adds after its budget is spent: one
  * file's note naming the regions past it (at most SHOWN_MATCHES of them), and
- * the count of files whose regions aren't shown.
+ * the line counting the files whose regions and notes aren't shown.
  */
 const RECEIPT_RESERVE = 600;
 
@@ -271,7 +350,9 @@ const RECEIPT_RESERVE = 600;
  * each edit's first changed region, numbered as read numbers lines, held to
  * `maxChars` as the answer's JSON holds it. Its counts and notes come first;
  * the regions take what is left, and past it a file's regions are named by
- * their lines. edit_many lists its files while they fit and counts the rest.
+ * their lines. edit_many lists its files while they fit, a file whose notes
+ * don't fit without them, and counts the rest. A receipt whose one file's
+ * counts and notes alone pass `maxChars` keeps them, and shows no region.
  */
 export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): Record<string, unknown> {
   const notesOf = ({ plan, notes }: StoredFile): string[] => {
@@ -306,20 +387,28 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     files: listed,
     changed: '',
   };
+  const fits = () => JSON.stringify(data).length <= maxChars - RECEIPT_RESERVE;
+  let notesLeftOut = 0;
   for (const [i, file] of files.entries()) {
     const notes = notesOf(file);
-    listed.push({
+    const entry: Record<string, unknown> = {
       path: file.path,
       size: file.plan.bytes.length,
       replacements: file.plan.changes.length,
       edits: [...new Set(file.plan.changes.map((change) => change.edit + 1))].sort((a, b) => a - b),
-      ...(notes.length ? { note: notes.join(' ') } : {}),
-    });
-    if (JSON.stringify(data).length > maxChars - RECEIPT_RESERVE) {
-      listed.pop();
-      data.filesNotListed = files.length - i;
-      break;
+    };
+    listed.push(notes.length ? { ...entry, note: notes.join(' ') } : entry);
+    if (fits()) continue;
+    if (notes.length) {
+      listed[listed.length - 1] = entry;
+      if (fits()) {
+        notesLeftOut++;
+        continue;
+      }
     }
+    listed.pop();
+    data.filesNotListed = files.length - i;
+    break;
   }
   const budget = { left: maxChars - JSON.stringify(data).length - RECEIPT_RESERVE };
   const sections: string[] = [];
@@ -333,7 +422,11 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     budget.left -= heading;
     sections.push(`${file.path}\n${shownRegions(file.plan, budget, maxChars).join('\n')}`);
   }
-  if (unshown) sections.push(`[${unshown} more ${plural(unshown, "file's", "files'")} changed regions aren't shown, to keep this answer within ${maxChars.toLocaleString('en-US')} characters]`);
+  const left = [
+    ...(unshown ? [`the changed regions of ${unshown} more ${plural(unshown, 'file')}`] : []),
+    ...(notesLeftOut ? [`the notes of ${notesLeftOut} ${plural(notesLeftOut, 'file')}`] : []),
+  ];
+  if (left.length) sections.push(`[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${left.join(' and ')}.]`);
   data.changed = sections.join('\n\n');
   return data;
 }

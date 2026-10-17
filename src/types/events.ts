@@ -232,9 +232,12 @@ export interface ToolCall {
    * agent's inline cap, past which the framework spills the result to a
    * workspace file and sends a preview. For a call from a running
    * code_execution script it is the script's limit, past which the result is
-   * cut. A tool that pages or budgets its answer can stay under it. Set by
-   * the framework dispatch layer; unset when the caller takes the module's
-   * result in process (ModuleContext.callTool, a subagent's executeToolCall).
+   * cut. A tool that pages or budgets its answer can stay under it. The
+   * framework sets it where it dispatches a call whose result it stores or
+   * hands to a script, the operator's puppet call included. A call made in
+   * process (ModuleContext.callTool, executeToolCall) carries what its caller
+   * put on it, usually nothing, and a utility run through `utils` carries
+   * what its `utils` call carried.
    */
   resultMaxChars?: number;
 }

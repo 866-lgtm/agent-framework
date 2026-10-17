@@ -3,7 +3,9 @@
  * caller whole. A model's call gets the agent's inline cap as the store applies
  * it, so a result that long is stored whole and one a character longer isn't.
  * A call from a running script gets the script's limit, and a call for an agent
- * the framework doesn't hold gets the house default.
+ * the framework doesn't hold gets the house default. A call made in process
+ * carries what its caller put on it, and a utility run through `utils` carries
+ * what its `utils` call did.
  */
 
 import { describe, it } from 'node:test';
@@ -154,7 +156,10 @@ describe('ToolCall.resultMaxChars', () => {
       assert.equal(caps.get('call_at'), BOUNDED);
       assert.equal(caps.get('call_past'), BOUNDED);
       assert.equal(stored.get('call_at'), 'x'.repeat(BOUNDED), 'a result of resultMaxChars is stored whole');
-      assert.notEqual(stored.get('call_past'), 'x'.repeat(BOUNDED + 1), 'one character more is not');
+      // This framework has no workspace to spill to, so the store keeps the start.
+      assert.equal(stored.get('call_past'),
+        `${'x'.repeat(BOUNDED)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace, full content not retained]`,
+        'one character more is cut at the cap');
       // A utility run through the utils tool is stored as that call's result.
       assert.equal(caps.get('call_utility'), BOUNDED);
       assert.equal(probe.calls.find((call) => call.id === 'call_utility')?.name, 'peek');
@@ -163,11 +168,15 @@ describe('ToolCall.resultMaxChars', () => {
     }
   });
 
-  it("the admin puppet's call carries the agent's inline cap", async () => {
+  it("the admin puppet's call carries the agent's inline cap, and so does a utility it runs", async () => {
     const { framework, probe, done } = await makeFramework();
     try {
       const { toolUseId } = await framework.puppetToolCall('prime', 'probe--look', {});
       assert.equal(probe.calls.find((call) => call.id === toolUseId)?.resultMaxChars, BOUNDED);
+      const utility = await framework.puppetToolCall('prime', 'utils', { action: 'run', name: 'probe--peek', args: {} });
+      const peek = probe.calls.find((call) => call.id === utility.toolUseId);
+      assert.equal(peek?.name, 'peek');
+      assert.equal(peek?.resultMaxChars, BOUNDED, 'the utility is stored under the cap the puppet stores the pair under');
     } finally {
       await done();
     }
@@ -181,9 +190,25 @@ describe('ToolCall.resultMaxChars', () => {
       };
       const at = await script.handleScriptToolCall('prime', 'probe--look', { over: 0 });
       const past = await script.handleScriptToolCall('prime', 'probe--look', { over: 1 });
-      assert.deepEqual(probe.calls.map((call) => call.resultMaxChars), [SCRIPT_LIMIT, SCRIPT_LIMIT]);
+      await script.handleScriptToolCall('prime', 'utils', { action: 'run', name: 'probe--peek', args: {} });
+      assert.deepEqual(probe.calls.map((call) => [call.name, call.resultMaxChars]),
+        [['look', SCRIPT_LIMIT], ['look', SCRIPT_LIMIT], ['peek', SCRIPT_LIMIT]], 'a utility the script runs carries its limit too');
       assert.equal(at, 'x'.repeat(SCRIPT_LIMIT), 'a result of resultMaxChars reaches the script whole');
-      assert.notEqual(past, 'x'.repeat(SCRIPT_LIMIT + 1), 'one character more is cut');
+      assert.equal(past, `${'x'.repeat(SCRIPT_LIMIT)}\n\n[truncated — original was ${SCRIPT_LIMIT + 1} chars]`, 'one character more is cut at the limit');
+    } finally {
+      await done();
+    }
+  });
+
+  it('a call made in process carries what its caller put on it, and so does a utility it runs', async () => {
+    const { framework, probe, done } = await makeFramework();
+    try {
+      const run = { action: 'run', name: 'probe--peek', args: {} };
+      await framework.executeToolCall({ id: 'bare-look', name: 'probe--look', input: {}, callerAgentName: 'prime' });
+      await framework.executeToolCall({ id: 'bare-utility', name: 'utils', input: run, callerAgentName: 'prime' });
+      await framework.executeToolCall({ id: 'capped-utility', name: 'utils', input: run, callerAgentName: 'prime', resultMaxChars: 1234 });
+      const caps = new Map(probe.calls.map((call) => [call.id, call.resultMaxChars]));
+      assert.deepEqual([...caps.entries()], [['bare-look', undefined], ['bare-utility', undefined], ['capped-utility', 1234]]);
     } finally {
       await done();
     }

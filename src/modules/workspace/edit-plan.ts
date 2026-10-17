@@ -85,22 +85,42 @@ function normalizeQuotes(value: string): string {
   return value.replace(/[‘’‚‛]/g, "'").replace(/[“”„‟]/g, '"');
 }
 
+/** Where an old text occurs in a file: what scan finds. */
+interface Found {
+  /** The first `keep` positions it starts at. */
+  starts: number[];
+  /** How many positions it starts at, or with `atLeast`, how many the scan found before it stopped. */
+  count: number;
+  /** Whether one occurrence starts before the one before it ends. */
+  overlapping: boolean;
+  atLeast: boolean;
+}
+
 /**
  * Where needle starts in haystack: every position, overlapping ones included,
  * so "aa" starts twice in "aaa". The first `keep` positions are kept; `count`
- * is all of them.
+ * is all of them, unless occurrences overlap. Those can't each be replaced, so
+ * the edit is refused whatever their count, and the scan stops once it has
+ * the SHOWN_MATCHES a refusal shows. Otherwise a needle that overlaps itself,
+ * such as a run of spaces, would be compared in full at every position of a
+ * long run of the same, at a cost of the run's length times the needle's.
  */
-function scan(haystack: string, needle: string, keep: number): { starts: number[]; count: number } {
+function scan(haystack: string, needle: string, keep: number): Found {
   const starts: number[] = [];
   let count = 0;
+  let overlapping = false;
   // indexOf finds the empty string at every position, never -1: callers refuse
   // an empty old text, and this keeps any other caller from looping.
-  if (!needle) return { starts, count };
+  if (!needle) return { starts, count, overlapping, atLeast: false };
+  let previous = -Infinity;
   for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+    if (at < previous + needle.length) overlapping = true;
     if (count < keep) starts.push(at);
     count++;
+    previous = at;
+    if (overlapping && count >= SHOWN_MATCHES) return { starts, count, overlapping, atLeast: true };
   }
-  return { starts, count };
+  return { starts, count, overlapping, atLeast: false };
 }
 
 /** The 1-based line of each index (ascending), in one pass over the text. */
@@ -147,8 +167,9 @@ export const HINT_MAX_CHARS = 2 * 1024 * 1024;
 /**
  * What one call's misses may search for their closest regions, in UTF-16 code
  * units of file text, all of them together: as much as one edit's miss may
- * (HINT_MAX_CHARS), so an edit_many call of many misses holds the event loop
- * no longer than one edit could.
+ * (HINT_MAX_CHARS), so the closest-region search of an edit_many call of many
+ * misses holds the event loop no longer than one edit's could. Matching itself
+ * scans each file once per edit, as any edit must.
  */
 export interface HintBudget {
   left: number;
@@ -167,10 +188,12 @@ function closestRegion(value: string, needle: string, budget: HintBudget): strin
     return `(No closest region: this call's other misses used its ${HINT_MAX_CHARS.toLocaleString('en-US')} UTF-16 code units of search; find the text with grep.)`;
   }
   budget.left -= value.length;
+  // The first line with a bigram to score: a line of one character, such as
+  // a closing brace, has none, and no line would score above it.
   const probe = needle
     .split('\n')
     .map((l) => l.trim())
-    .find((l) => l.length > 0) ?? needle;
+    .find((l) => l.length > 1) ?? needle.trim();
   // Dice coefficient over character bigrams: cheap, order-sensitive enough for
   // "closest line".
   const probeGrams = grams(probe);
@@ -244,8 +267,10 @@ export type MatchProblem =
     kind: 'count';
     edit: number;
     expected: number | 'all';
+    /** How many times it occurs, or with `atLeast` how many the scan found before it stopped at an overlap. */
     found: number;
-    /** The lines of its first SHOWN_MATCHES occurrences, and those lines shown. */
+    atLeast: boolean;
+    /** The line of each of its first SHOWN_MATCHES occurrences, and those lines shown, each once. */
     lines: number[];
     shown: string;
     quoteNormalized: boolean;
@@ -308,17 +333,16 @@ export function planFile(
   for (const spec of specs) {
     // Every occurrence when every one is replaced; otherwise enough to replace or to show.
     const keep = spec.expected === 'all' ? Infinity : Math.max(spec.expected, SHOWN_MATCHES);
-    let { starts, count } = scan(value, spec.oldText, keep);
+    let { starts, count, overlapping, atLeast } = scan(value, spec.oldText, keep);
     let normalized = false;
     if (count === 0) {
-      ({ starts, count } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep));
+      ({ starts, count, overlapping, atLeast } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep));
       normalized = count > 0;
     }
     if (count === 0) {
       problems.push({ kind: 'miss', edit: spec.index, hint: closestRegion(value, spec.oldText, hints), crlf });
       continue;
     }
-    const overlapping = starts.some((start, k) => k > 0 && start < starts[k - 1]! + spec.oldText.length);
     if (overlapping || (spec.expected !== 'all' && count !== spec.expected)) {
       const first = starts.slice(0, SHOWN_MATCHES);
       const lines = lineNumbersAt(value, first);
@@ -327,6 +351,7 @@ export function planFile(
         edit: spec.index,
         expected: spec.expected,
         found: count,
+        atLeast,
         lines,
         shown: matchedLines(value, first, lines),
         quoteNormalized: normalized,
@@ -344,6 +369,7 @@ export function planFile(
   spans.sort((a, b) => a.start - b.start || a.spec.index - b.spec.index);
   const named = new Set<number>();
   const pairs = new Set<string>();
+  const clashes: Array<{ edits: [number, number]; at: number; same: boolean }> = [];
   spans.forEach((first, i) => {
     for (let j = i + 1; j < spans.length && spans[j]!.start < first.end; j++) {
       const later = spans[j]!;
@@ -352,14 +378,13 @@ export function planFile(
       if (a === b || named.has(later.spec.index) || pairs.has(`${a} ${b}`)) continue;
       named.add(later.spec.index);
       pairs.add(`${a} ${b}`);
-      problems.push({
-        kind: 'clash',
-        edits: [a, b],
-        line: lineNumbersAt(value, [later.start])[0]!,
-        same: later.start === first.start && later.end === first.end,
-      });
+      clashes.push({ edits: [a, b], at: later.start, same: later.start === first.start && later.end === first.end });
     }
   });
+  // Every clash's line in one pass over the text, rather than a pass each.
+  const clashAts = [...new Set(clashes.map((clash) => clash.at))].sort((x, y) => x - y);
+  const lineAt = new Map(lineNumbersAt(value, clashAts).map((line, k) => [clashAts[k]!, line]));
+  for (const clash of clashes) problems.push({ kind: 'clash', edits: clash.edits, line: lineAt.get(clash.at)!, same: clash.same });
   if (problems.length) return { problems };
 
   const crAt = (lf: number) => {
@@ -369,7 +394,7 @@ export function planFile(
   const endingAt = (lf: number) => (crAt(lf) ? '\r\n' : '\n');
   // The line end after a replaced text that holds none: its line's own, found
   // once per line as the matches ascend, or for an unterminated last line the
-  // file's last one; a file of one unterminated line has none to go by.
+  // file's last one. Only a file with CRLF line ends asks, so it has one.
   let nextLf = -1;
   let lastLf: number | undefined;
   const lineEnding = (start: number) => {
@@ -377,8 +402,7 @@ export function planFile(
       const at = value.indexOf('\n', start);
       nextLf = at === -1 ? Infinity : at;
     }
-    const lf = nextLf !== Infinity ? nextLf : (lastLf ??= value.lastIndexOf('\n'));
-    return lf === -1 ? '\n' : endingAt(lf);
+    return endingAt(nextLf !== Infinity ? nextLf : (lastLf ??= value.lastIndexOf('\n')));
   };
   // The new text's line ends take, by position, the line ends of the text it
   // replaces: the k-th the k-th, any beyond them the last, so a mixed span

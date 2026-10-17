@@ -1,7 +1,7 @@
 /**
  * Lines numbered the way `cat -n` numbers them, with a long one cut, and a
- * string's length as JSON, which a budget for a stored result counts. Read,
- * grep and edit share these.
+ * string's length as JSON, which a budget for a stored result counts. edit's
+ * answers use them.
  */
 
 /** Whether the bytes open with a UTF-8 byte order mark. */
