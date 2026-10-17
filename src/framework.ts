@@ -2,7 +2,10 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -5297,13 +5300,44 @@ export class AgentFramework {
     return landed;
   }
 
-  /** Atomic JSON write for the recovery files (tmp + rename, 0600) — the
-   *  same idiom as the Discord awareness outbox. */
+  /** Atomic, durable JSON write for the recovery files. The document goes to
+   *  a temp file at 0600, which is synced and renamed over the record, and
+   *  the directory is then synced (not on win32), so a crash leaves the
+   *  record as it was or the new one, whole. A failure before the rename
+   *  removes the temp file, leaves the record as it was and throws. A
+   *  directory sync that fails after the rename is logged, not thrown: the
+   *  new record is in place, and the callers go on to record it as written. */
   private writeRecoveryFile(path: string, document: unknown): void {
-    mkdirSync(dirname(path), { recursive: true });
+    const directory = dirname(path);
+    mkdirSync(directory, { recursive: true });
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    try {
+      const fd = openSync(temporary, 'w', 0o600);
+      try {
+        writeFileSync(fd, `${JSON.stringify(document, null, 2)}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, path);
+    } catch (err) {
+      try { unlinkSync(temporary); } catch { /* nothing to remove if it was never made */ }
+      throw err;
+    }
+    if (process.platform === 'win32') return;
+    try {
+      const fd = openSync(directory, 'r');
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch (err) {
+      console.error(
+        `[host-mode] ${path} is in place, but syncing its directory failed, so a crash could still lose this change:`,
+        err,
+      );
+    }
   }
 
   private readRecoveryFile(path: string): unknown {
