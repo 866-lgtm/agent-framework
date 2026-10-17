@@ -4643,15 +4643,19 @@ export class AgentFramework {
       }
       return this.getHostModeStatus();
     }
-    this.quiesced = true;
-    this.quiesceReason = opts?.reason;
-    this.quiescedAt = Date.now();
-    this.lastUnabandonable = [];
+    // The record first, then the flag: a write that fails rejects with the
+    // host still serving, as the stored record says, and a retry isn't taken
+    // by the check above for a quiesce already done, so it writes the record.
+    const since = Date.now();
     this.persistHostMode({
       quiesced: true,
       ...(opts?.reason ? { reason: opts.reason } : {}),
-      since: this.quiescedAt,
+      since,
     });
+    this.quiesced = true;
+    this.quiesceReason = opts?.reason;
+    this.quiescedAt = since;
+    this.lastUnabandonable = [];
     console.error(
       `[host-mode] quiescing${opts?.reason ? ` (${opts.reason})` : ''}: parking wakes, ` +
       `pausing MCPL data planes, draining ${this.activeTurnTokens.size} in-flight turn(s)`,

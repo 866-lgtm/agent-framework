@@ -21,6 +21,7 @@ import type {
 } from '@animalabs/context-manager';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type { StreamEvent, YieldingStream, NormalizedRequest } from '@animalabs/membrane';
+import { JsStore } from '@animalabs/chronicle';
 
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
 import type { TraceEvent } from '../src/types/trace.js';
@@ -260,6 +261,64 @@ test('quiesce persists across restart; resume clears it durably', async () => {
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Run `body` while the host-mode record's write fails: the recovery file's,
+ *  or framework/state's when there's no recovery file. */
+async function withFailingHostModeWrite(body: () => Promise<void>): Promise<void> {
+  const framework = AgentFramework.prototype as unknown as { writeRecoveryFile(path: string, document: unknown): void };
+  const writeFile = framework.writeRecoveryFile;
+  const store = JsStore.prototype as unknown as { setStateJson(this: JsStore, id: string, value: unknown): void };
+  const setState = store.setStateJson;
+  framework.writeRecoveryFile = function (this: unknown, path: string, document: unknown) {
+    if (path.endsWith('host-mode.json')) throw Object.assign(new Error('injected EACCES writing host-mode.json'), { code: 'EACCES' });
+    return writeFile.call(this, path, document);
+  };
+  store.setStateJson = function (this: JsStore, id: string, value: unknown) {
+    if (id === 'framework/state' && new Error().stack?.includes('persistHostMode')) throw new Error('injected EIO writing framework/state');
+    return setState.call(this, id, value);
+  };
+  try {
+    await body();
+  } finally {
+    framework.writeRecoveryFile = writeFile;
+    store.setStateJson = setState;
+  }
+}
+
+test("a quiesce whose host-mode write fails leaves the host serving, as its record says, and the next quiesce writes it", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-write-fails-'));
+    const store = where === 'store only' ? JsStore.openOrCreate({ path: join(dir, 'store') }) : undefined;
+    const config = () => ({
+      ...(store ? { store } : { storePath: join(dir, 'store') }),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+      modules: [],
+    });
+    let framework = await AgentFramework.create(config());
+    try {
+      await withFailingHostModeWrite(async () => {
+        await assert.rejects(framework.quiesce({ reason: 'surgery' }), {
+          message: where === 'store only' ? 'injected EIO writing framework/state' : 'injected EACCES writing host-mode.json',
+        });
+      });
+      const status = framework.getHostModeStatus();
+      assert.equal(status.quiesced, false, `${where}: the host is still serving`);
+      assert.equal(status.reason, undefined, `${where}: no quiesce reason`);
+      (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'after' }]);
+      assert.equal(framework.getHostModeStatus().deferredWrites, 0, `${where}: a context write lands, not deferred`);
+      await framework.quiesce({ reason: 'surgery' });
+      assert.equal(framework.getHostModeStatus().quiesced, true, `${where}: the next quiesce quiesces`);
+      await framework.stop();
+      framework = await AgentFramework.create(config());
+      assert.equal(framework.getHostModeStatus().quiesced, true, `${where}: and its record holds across a restart`);
+    } finally {
+      await framework.stop();
+      store?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
