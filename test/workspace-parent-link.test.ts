@@ -567,13 +567,16 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.equal(write.success, false, 'the draft pushed over a file it never saw');
     assert.match(String(write.error), /store-origin-collision/);
     // Its answer says that file wasn't unlinked, where 'deleted' alone would
-    // read as gone from disk.
-    assert.deepEqual(await call(m, 'delete', { path: 'work/c.txt' }), {
+    // read as gone from disk, and a result the guard withholds keeps it.
+    const deleted = await m.handleToolCall({ id: 'd', name: 'delete', input: { path: 'work/c.txt' } });
+    assert.equal(deleted.success, true, String(deleted.error));
+    assert.deepEqual(deleted.data, {
       path: 'work/c.txt',
       deleted: true,
       note: 'nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in '
         + '(conflict: store-origin-collision), and a sync observes whatever disk holds there',
     });
+    assert.deepEqual(deleted.keepWhenWithheld, ['path', 'deleted', 'note']);
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
     assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n', 'disk keeps its file');
