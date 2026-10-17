@@ -78,7 +78,7 @@ function makeRegistry(
   };
 }
 
-function incoming(channelId: string, text: string, channelName?: string, tags?: string[]) {
+function incoming(channelId: string, text: string, channelName?: string, tags?: string[], threadId?: string) {
   return {
     messages: [{
       channelId,
@@ -87,6 +87,7 @@ function incoming(channelId: string, text: string, channelName?: string, tags?: 
       timestamp: '2026-05-30T00:00:00.000Z',
       content: [{ type: 'text' as const, text }],
       tags,
+      threadId,
       metadata: channelName ? { channelName } : undefined,
     }],
   };
@@ -537,12 +538,15 @@ test('non-conversational markers do not retarget the default publish locus (#157
   const { registry } = makeRegistry(undefined);
   seedRegistered(registry, 'discord', 'chanA');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A', undefined, undefined, 'thread-A'));
 
   for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
     registry.handleIncoming('discord', incoming('chanB', `[${tag}] marker`, undefined, [tag]));
     assert.equal(registry.getDefaultPublishChannel(), 'chanA',
       `a ${tag} marker on chanB must not steal the default publish locus`);
+    const anchor = registry.buildChannelContext()?.incoming;
+    assert.equal(anchor?.messageId, 'm1', `a ${tag} marker leaves the reply anchor's message`);
+    assert.equal(anchor?.threadId, 'thread-A', `a ${tag} marker leaves the reply anchor's thread`);
   }
 
   // A real message still retargets — the skip is tag-scoped, not a freeze.
@@ -556,6 +560,8 @@ test('a marker on a NEVER-conversed channel leaves the locus null, not marker-an
   registry.handleIncoming('discord', incoming('chanB', '[edited] marker', undefined, ['chat:edited']));
   assert.equal(registry.getDefaultPublishChannel(), null,
     'an edit marker alone must not establish a publish locus');
+  assert.equal(registry.buildChannelContext()?.incoming, undefined,
+    'nor a reply anchor');
 });
 
 test('proseTargetFor: one whitespace-free token per channel that resolves back to it', async () => {
