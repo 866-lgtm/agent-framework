@@ -4240,7 +4240,7 @@ export class AgentFramework {
   private adoptToolResultGuard(agent: Agent): void {
     const refuse = (problem: string, cause?: unknown): Error => new Error(
       `the tool-result guards (${FRAMEWORK_STATE_ID}, toolResultGuards) ${problem}. Agent "${agent.name}" isn't ` +
-        `created without them, since it would take its recipe's guard` +
+        `created, since without them it would take its recipe's guard` +
         (cause === undefined
           ? ` and the next guard change would store over them. They're unchanged, and creating it again won't help until they're repaired.`
           : `. They're unchanged, and it's created once they can be read.`),
@@ -5203,8 +5203,7 @@ export class AgentFramework {
       `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) ${problem}. The framework doesn't start without them, ` +
         `since the next deferral would replace the stored queue. ` +
         (file
-          ? `The file is unchanged, and the framework starts once ${cause === undefined ? 'it holds a queue of writes' : 'it can be read'}; ` +
-            `moved aside, the framework reads the queue from ${DEFERRED_WRITES_ID} instead.`
+          ? `The file is unchanged, and the framework starts once ${cause === undefined ? 'it holds a queue of writes' : 'it can be read'}.`
           : cause === undefined
             ? `They're unchanged, and starting again won't help until they're repaired.`
             : `They're unchanged, and the framework starts once they can be read.`),
@@ -6040,8 +6039,7 @@ export class AgentFramework {
       `the host mode (${file ?? `${FRAMEWORK_STATE_ID}, hostMode`}) ${problem}. The framework doesn't start without it, ` +
         `since a host quiesced for maintenance would boot serving. ` +
         (file
-          ? `The file is unchanged, and the framework starts once ${cause === undefined ? 'it holds a host-mode record' : 'it can be read'}; ` +
-            `moved aside, the framework reads host mode from ${FRAMEWORK_STATE_ID} instead.`
+          ? `The file is unchanged, and the framework starts once ${cause === undefined ? 'it holds a host-mode record' : 'it can be read'}.`
           : cause === undefined
             ? `It's unchanged, and starting again won't help until it's repaired.`
             : `It's unchanged, and the framework starts once it can be read.`),
@@ -16510,15 +16508,17 @@ export class AgentFramework {
     serverConfigs: McplServerConfig[],
     inferenceRouting?: import('./mcpl/types.js').InferenceRoutingPolicy,
   ): Promise<void> {
-    // First, before anything is built: a coalescing state or checkpoint trees
-    // that can't be taken refuse here and leave the subsystem as it was, so a
-    // refused runtime connect leaves nothing for the guards that test
-    // mcplServerRegistry.
+    // First, before anything is built: a coalescing state, checkpoint trees
+    // or a configured server's restored host-managed state that can't be
+    // taken refuses here and leaves the subsystem as it was, so a refused
+    // runtime connect leaves nothing for the guards that test
+    // mcplServerRegistry, and a refused boot connects no server.
     const coalescing = this.restorePushCoalescer();
     const checkpoints = new CheckpointManager(
       this.store,
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
     );
+    for (const config of serverConfigs) checkpoints.loadHostStates(config.id);
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager(
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
@@ -17681,6 +17681,9 @@ export class AgentFramework {
       );
     }
 
+    // The server's restored host-managed state is read before the server is
+    // added, so a read that fails leaves nothing connected.
+    this.checkpointManager?.loadHostStates(config.id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     await this.connectMcplServerInternal(config);
     await this.refreshMcplTools();

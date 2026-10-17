@@ -156,13 +156,24 @@ describe('UsageTracker', () => {
   });
 
   it("a usage without a count adds nothing for it, so the totals stay numbers and are stored as numbers", () => {
-    // membrane passes some providers' counts through as reported, so one can be missing.
+    // membrane passes a Bedrock stream's output count through as reported, so
+    // one can be missing, and the cost membrane computes from it is then NaN.
     const { tracker } = createTracker();
-    tracker.onInferenceCompleted('agent', { inputTokens: 100, outputTokens: 50 });
-    tracker.onInferenceCompleted('agent', { inputTokens: undefined as unknown as number, outputTokens: 25 });
+    const cost = (total: number) => ({ total, currency: 'USD' });
+    tracker.onInferenceCompleted('agent', { inputTokens: 100, outputTokens: 50, cacheCreationTokens: 10, cacheReadTokens: 20 }, cost(0.5));
+    tracker.onInferenceCompleted('agent', {
+      inputTokens: undefined as unknown as number,
+      outputTokens: 25,
+      cacheCreationTokens: NaN,
+      cacheReadTokens: NaN,
+    }, cost(NaN));
     const stored = JSON.parse(JSON.stringify(tracker.toJSON()));
     assert.equal(stored.totals.inputTokens, 100);
     assert.equal(stored.totals.outputTokens, 75);
+    assert.equal(stored.totals.cacheCreationTokens, 10);
+    assert.equal(stored.totals.cacheReadTokens, 20);
+    assert.equal(stored.totals.estimatedCost.total, 0.5);
     assert.equal(stored.byAgent[0].usage.inputTokens, 100);
+    assert.equal(stored.byAgent[0].usage.estimatedCost.total, 0.5);
   });
 });

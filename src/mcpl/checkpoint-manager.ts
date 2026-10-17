@@ -242,14 +242,9 @@ export class CheckpointManager {
     opts: { hostState: boolean; rollback: boolean },
   ): void {
     const key = this.key(serverId, featureSet);
-    const held = this.trees.get(key);
-    if (held) {
-      // Already registered, or restored from the store by loadFromStore,
-      // which leaves a host-managed tree's state to be read here: unread,
-      // the next patch would apply to nothing and store over it.
-      if (held.hostState && held.currentState === undefined) this.loadHostState(serverId, featureSet, held);
-      return;
-    }
+    // Already registered, or restored from the store by loadFromStore, whose
+    // host-managed state loadHostStates reads before its server connects.
+    if (this.trees.has(key)) return;
 
     const tree: FeatureSetState = {
       hostState: opts.hostState,
@@ -580,12 +575,26 @@ export class CheckpointManager {
     } catch (error) {
       throw new Error(
         `the host-managed state of feature set "${featureSet}" on MCPL server "${serverId}" (${stateId}) could not ` +
-          `be read: ${thrownText(error)}. The server's connect fails without it, since the feature set's next ` +
-          `checkpoint would store over it. It's unchanged, and the connect succeeds once it can be read.`,
+          `be read: ${thrownText(error)}. The server doesn't connect without it, and neither does create() with it ` +
+          `configured, since the feature set's next checkpoint would store over it. It's unchanged, and the server ` +
+          `connects once it can be read.`,
         { cause: error },
       );
     }
     if (existing !== null && existing !== undefined) tree.currentState = existing;
+  }
+
+  /** Read the stored state of every host-managed tree held for `serverId`,
+   *  whatever its feature sets declare now. The framework calls it at MCPL's
+   *  start for each configured server and before a runtime connect adds its
+   *  server, so no server connects with a restored tree whose state its next
+   *  checkpoint would store over unread. A server's trees are the keys
+   *  `${serverId}:`, as removeServer finds them. */
+  loadHostStates(serverId: string): void {
+    const prefix = `${serverId}:`;
+    for (const [key, tree] of this.trees) {
+      if (tree.hostState && key.startsWith(prefix)) this.loadHostState(serverId, key.slice(prefix.length), tree);
+    }
   }
 
   /** Load checkpoint trees from Chronicle on startup. Nothing stored is no
@@ -629,7 +638,7 @@ export class CheckpointManager {
         hostState: entry.hostState,
         rollback: entry.rollback,
         currentCheckpoint: entry.current,
-        currentState: undefined, // Will be loaded per-feature-set during registerFeatureSet
+        currentState: undefined, // a host-managed tree's state is read by loadHostStates, before its server connects
         nodes,
       });
     }

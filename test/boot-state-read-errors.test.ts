@@ -121,7 +121,7 @@ test("a host-mode file that can't be read fails create(), and the next boot is q
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the host mode \\(${file.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\) could not be read: injected EIO reading host-mode\\.json\\. ` +
       `The framework doesn't start without it, since a host quiesced for maintenance would boot serving\\. ` +
-      `The file is unchanged, and the framework starts once it can be read; moved aside, the framework reads host mode from framework/state instead\\.$`,
+      `The file is unchanged, and the framework starts once it can be read\\.$`,
     ));
   } finally { restore(); }
   assert.equal(readFileSync(file, 'utf8'), before, 'the file is as it was');
@@ -149,7 +149,7 @@ test('a host-mode file that holds no record, text that isn\'t JSON, or a record 
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the host mode \\(.*host-mode\\.json\\) ${holds}\\. The framework doesn't start without it, ` +
       `since a host quiesced for maintenance would boot serving\\. The file is unchanged, and the framework starts once it holds a ` +
-      `host-mode record; moved aside, the framework reads host mode from framework/state instead\\.$`,
+      `host-mode record\\.$`,
     ), content);
     assert.equal(readFileSync(file, 'utf8'), content, `${content}: the file is as it was`);
   }
@@ -165,13 +165,34 @@ test("a recovery file that can't be reached, not only one that won't read, fails
   renameSync(dir, `${dir}.aside`);
   writeFileSync(dir, 'not a directory');
   try {
-    await rejectsBuild(() => AgentFramework.create(withPath()), /^the host mode \(.*host-mode-dir\/host-mode\.json\) could not be read: ENOTDIR\b.*The file is unchanged, and the framework starts once it can be read;/);
+    await rejectsBuild(() => AgentFramework.create(withPath()), /^the host mode \(.*host-mode-dir\/host-mode\.json\) could not be read: ENOTDIR\b.*The file is unchanged, and the framework starts once it can be read\.$/);
   } finally {
     rmSync(dir);
     renameSync(`${dir}.aside`, dir);
   }
   const f = await AgentFramework.create(withPath());
   try { assert.equal(f.getHostModeStatus().quiesced, true); } finally { await f.stop(); }
+}));
+
+test("a deferred-writes file that can't be reached fails create(), and doesn't read as absent", inStoreDir('boot-read-deferred-enotdir-', async (storePath) => {
+  // As for the host-mode file: ENOTDIR from a file where the queue file's directory should be.
+  const dir = join(storePath, '..', 'deferred-dir');
+  const withPath = (): FrameworkConfig => ({ ...config(storePath), deferredWritesPath: join(dir, 'deferred-writes.json') }) as FrameworkConfig;
+  const first = await AgentFramework.create(withPath());
+  try {
+    await first.quiesce({ reason: 'surgery' });
+    (first as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'said during surgery' }]);
+  } finally { await first.stop(); }
+  renameSync(dir, `${dir}.aside`);
+  writeFileSync(dir, 'not a directory');
+  try {
+    await rejectsBuild(() => AgentFramework.create(withPath()), /^the deferred context writes \(.*deferred-dir\/deferred-writes\.json\) could not be read: ENOTDIR\b.*The file is unchanged, and the framework starts once it can be read\.$/);
+  } finally {
+    rmSync(dir);
+    renameSync(`${dir}.aside`, dir);
+  }
+  const f = await AgentFramework.create(withPath());
+  try { assert.equal(f.getHostModeStatus().deferredWrites, 1, 'the next reachable boot restores the queue'); } finally { await f.stop(); }
 }));
 
 test("with no recovery file, a host mode that can't be read from framework/state fails create()", async () => {
@@ -189,8 +210,13 @@ test("with no recovery file, a host mode that can't be read from framework/state
     } finally { restore(); }
     const f = await AgentFramework.create(slotConfig());
     try { assert.equal(f.getHostModeStatus().quiesced, true); } finally { await f.stop(); }
-    store.setStateJson('framework/state', { ...(store.getStateJson('framework/state') as object), hostMode: 'quiesced' });
-    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the host mode \(framework\/state, hostMode\) holds a string, not a host-mode record\. The framework doesn't start without it, since a host quiesced for maintenance would boot serving\. It's unchanged, and starting again won't help until it's repaired\.$/);
+    for (const [hostMode, holds] of [['quiesced', 'holds a string'], [null, 'holds null']] as const) {
+      store.setStateJson('framework/state', { ...(store.getStateJson('framework/state') as object), hostMode });
+      await rejectsBuild(() => AgentFramework.create(slotConfig()), new RegExp(
+        `^the host mode \\(framework/state, hostMode\\) ${holds}, not a host-mode record\\. The framework doesn't start without it, ` +
+        `since a host quiesced for maintenance would boot serving\\. It's unchanged, and starting again won't help until it's repaired\\.$`,
+      ), String(hostMode));
+    }
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -207,7 +233,7 @@ test("a deferred-write queue that can't be read fails create(), and the next boo
   const before = readFileSync(file, 'utf8');
   const restore = failRecoveryRead('deferred-writes.json');
   try {
-    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them, since the next deferral would replace the stored queue\. The file is unchanged, and the framework starts once it can be read; moved aside, the framework reads the queue from framework\/deferred-writes instead\.$/);
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them, since the next deferral would replace the stored queue\. The file is unchanged, and the framework starts once it can be read\.$/);
   } finally { restore(); }
   assert.equal(readFileSync(file, 'utf8'), before, 'the queue is as it was');
   const f = await AgentFramework.create(config(storePath));
@@ -232,8 +258,7 @@ test("a deferred-write queue that isn't a queue, or isn't JSON, fails create(), 
     writeFileSync(file, content);
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them, since the next ` +
-      `deferral would replace the stored queue\\. The file is unchanged, and the framework starts once it holds a queue of writes; ` +
-      `moved aside, the framework reads the queue from framework/deferred-writes instead\\.$`,
+      `deferral would replace the stored queue\\. The file is unchanged, and the framework starts once it holds a queue of writes\\.$`,
     ), content);
     assert.equal(readFileSync(file, 'utf8'), content, `${content}: the file is as it was`);
   }
@@ -332,9 +357,9 @@ test("usage totals that aren't a usage record fail create(), naming what they ar
 }));
 
 test('usage totals an earlier release wrote with a null count, or with a byAgent entry that is not an agent, restore', inStoreDir('boot-read-usage-null-', async (storePath) => {
-  // A NaN total, which a provider's usage without a count made, is stored as null.
+  // A NaN total, which a provider's usage without a count made, is stored as null, and so is a NaN cost.
   seedFrameworkState(storePath, { usage: {
-    totals: { inputTokens: null, outputTokens: 500 },
+    totals: { inputTokens: null, outputTokens: 500, estimatedCost: { total: null, currency: 'USD' } },
     inferenceCount: 7,
     byAgent: [null, { agentName: 'agent', usage: { inputTokens: 1000, outputTokens: 500 }, inferenceCount: 7 }],
   } });
@@ -343,6 +368,7 @@ test('usage totals an earlier release wrote with a null count, or with a byAgent
     const usage = f.getSessionUsage();
     assert.equal(usage.totals.inputTokens, 0);
     assert.equal(usage.totals.outputTokens, 500);
+    assert.deepEqual(usage.totals.estimatedCost, { total: 0, currency: 'USD' });
     assert.deepEqual(usage.byAgent.map((a) => [a.agentName, a.usage.inputTokens]), [['agent', 1000]]);
   } finally { await f.stop(); }
 }));
@@ -402,7 +428,7 @@ test("tool-result guards that can't be read, or that aren't an object, fail crea
   seedFrameworkState(storePath, { toolResultGuards: { agent: true } });
   const restore = failStoreRead('framework/state', 'adoptToolResultGuard');
   try {
-    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the tool-result guards \(framework\/state, toolResultGuards\) could not be read: injected EIO reading framework\/state\. Agent "agent" isn't created without them, since it would take its recipe's guard\. They're unchanged, and it's created once they can be read\.$/);
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the tool-result guards \(framework\/state, toolResultGuards\) could not be read: injected EIO reading framework\/state\. Agent "agent" isn't created, since without them it would take its recipe's guard\. They're unchanged, and it's created once they can be read\.$/);
   } finally { restore(); }
   const f = await AgentFramework.create(config(storePath));
   try { assert.equal(guardOf(f, 'agent'), true, 'the next boot restores the guard'); } finally { await f.stop(); }
@@ -410,7 +436,7 @@ test("tool-result guards that can't be read, or that aren't an object, fail crea
     seedFrameworkState(storePath, { toolResultGuards: guards });
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the tool-result guards \\(framework/state, toolResultGuards\\) are ${are}, not an object of agents' guards\\. Agent "agent" isn't ` +
-      `created without them, since it would take its recipe's guard and the next guard change would store over them\\. They're ` +
+      `created, since without them it would take its recipe's guard and the next guard change would store over them\\. They're ` +
       `unchanged, and creating it again won't help until they're repaired\\.$`,
     ), JSON.stringify(guards));
     assert.deepEqual((readState(storePath, 'framework/state') as { toolResultGuards: unknown }).toolResultGuards, guards);
@@ -537,7 +563,73 @@ test("MCPL checkpoint trees that can't be read, or that aren't checkpoint trees,
   await f.create();
 });
 
-test('a host-managed feature set restored from the store reads its state, so its next patch applies to it', inStoreDir('boot-read-host-state-', async (storePath) => {
+/** A stored host-managed checkpoint tree for `server`'s `featureSet`, holding `state`, as the checkpoint manager stores them. */
+function seedHostManaged(storePath: string, server: string, featureSet: string, state: unknown): void {
+  const store = JsStore.openOrCreate({ path: storePath });
+  try {
+    for (const id of ['mcpl/checkpoints', `mcpl/state/${server}/${featureSet}`]) {
+      try { store.registerState({ id, strategy: 'snapshot' }); } catch (error) { if (!isStateExistsError(error)) throw error; }
+    }
+    store.setStateJson('mcpl/checkpoints', { trees: { [`${server}:${featureSet}`]: {
+      hostState: true, rollback: false, current: 'c1', nodes: { c1: { parent: null, children: [], data: state } },
+    } } });
+    store.setStateJson(`mcpl/state/${server}/${featureSet}`, state);
+  } finally { store.close(); }
+}
+
+const hostStateUnreadable = (server: string, featureSet: string): RegExp => new RegExp(
+  `^the host-managed state of feature set "${featureSet}" on MCPL server "${server}" \\(mcpl/state/${server}/${featureSet}\\) could not ` +
+  `be read: injected EIO reading mcpl/state/${server}/${featureSet}\\. The server doesn't connect without it, and neither does ` +
+  `create\\(\\) with it configured, since the feature set's next checkpoint would store over it\\. It's unchanged, and the ` +
+  `server connects once it can be read\\.$`,
+);
+
+test("at boot, a configured server's restored host-managed state that can't be read fails create() before any server connects, and the next boot reads it", async (t) => {
+  // The fixture declares `doc` with neither hostState nor rollback, so it never
+  // registers with the checkpoint manager: its stored tree is read at MCPL's start.
+  const f = await fixture(); t.after(f.close);
+  await crash(f);
+  const storePath = join(f.dir, 'store');
+  seedHostManaged(storePath, 'editor', 'doc', { count: 1 });
+  const restore = failStoreRead('mcpl/state/editor/doc', 'loadHostState');
+  try {
+    await rejectsBuild(() => f.create(), hostStateUnreadable('editor', 'doc'));
+  } finally { restore(); }
+  assert.deepEqual(readState(storePath, 'mcpl/state/editor/doc'), { count: 1 }, 'the state is as it was');
+  await f.create();
+  const checkpoints = (f.framework as unknown as { checkpointManager: CheckpointManager }).checkpointManager;
+  assert.deepEqual(checkpoints.getCurrentState('editor', 'doc'), { count: 1 }, 'the next boot reads it');
+});
+
+test("at a runtime connect, a restored host-managed state that can't be read fails the connect before the server is added, and the next connect reads it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await crash(f);
+  const storePath = join(f.dir, 'store');
+  seedHostManaged(storePath, 'editor', 'doc', { count: 1 });
+  // With no MCPL servers configured, the subsystem comes up at the first connect.
+  const framework = await AgentFramework.create({
+    storePath, membrane: f.membrane.asMembrane(),
+    agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+  } as unknown as FrameworkConfig);
+  try {
+    const server = { id: 'editor', url: `ws://127.0.0.1:${f.port}`, enabledFeatureSets: ['doc'] } as McplServerConfig;
+    const internals = framework as unknown as {
+      mcplServerRegistry: { getServer(id: string): unknown } | null;
+      checkpointManager: CheckpointManager | null;
+    };
+    const restore = failStoreRead('mcpl/state/editor/doc', 'loadHostState');
+    try {
+      await assert.rejects(framework.connectMcplServer(server), { message: hostStateUnreadable('editor', 'doc') });
+    } finally { restore(); }
+    // The first connect brought MCPL up, and the read failed before the server was added.
+    assert.equal(internals.mcplServerRegistry?.getServer('editor'), null, 'the server was not added');
+    await framework.connectMcplServer(server);
+    assert.ok(internals.mcplServerRegistry?.getServer('editor'), 'the next connect adds it');
+    assert.deepEqual(internals.checkpointManager?.getCurrentState('editor', 'doc'), { count: 1 }, 'and reads its state');
+  } finally { await framework.stop(); }
+});
+
+test('a host-managed feature set restored from the store has its state read by loadHostStates, so its next patch applies to it', inStoreDir('boot-read-host-state-', async (storePath) => {
   const noop = () => {};
   const first = JsStore.openOrCreate({ path: storePath });
   try {
@@ -545,10 +637,12 @@ test('a host-managed feature set restored from the store reads its state, so its
     checkpoints.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
     checkpoints.recordCheckpoint('srv', 'doc', { checkpoint: 'c1', data: { count: 1 } } as never);
   } finally { first.close(); }
-  // A restart: the store opened again, its trees restored, the feature set registered again.
+  // A restart: the store opened again, its trees restored, their states read before the server connects, and the feature set registered again.
   const store = JsStore.openOrCreate({ path: storePath });
   try {
     const checkpoints = new CheckpointManager(store, noop);
+    assert.equal(checkpoints.getCurrentState('srv', 'doc'), undefined, 'restored, the tree holds no state until it is read');
+    checkpoints.loadHostStates('srv');
     checkpoints.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
     assert.deepEqual(checkpoints.getCurrentState('srv', 'doc'), { count: 1 });
     checkpoints.recordCheckpoint('srv', 'doc', { checkpoint: 'c2', parent: 'c1', patch: [{ op: 'add', path: '/other', value: 2 }] } as never);
@@ -556,7 +650,7 @@ test('a host-managed feature set restored from the store reads its state, so its
   } finally { store.close(); }
 }));
 
-test("a host-managed feature set's state that can't be read fails its registration, naming it, and the next registration reads it", inStoreDir('boot-read-host-state-read-', async (storePath) => {
+test("a host-managed feature set's state that can't be read fails loadHostStates for a restored tree, or the registration for a first-time one, naming it, and the next one reads it", inStoreDir('boot-read-host-state-read-', async (storePath) => {
   const noop = () => {};
   const first = JsStore.openOrCreate({ path: storePath });
   try {
@@ -570,21 +664,27 @@ test("a host-managed feature set's state that can't be read fails its registrati
   const store = JsStore.openOrCreate({ path: storePath });
   try {
     const checkpoints = new CheckpointManager(store, noop);
-    // `doc` is a tree restored from the store; `notes` is registered for the first time.
+    // `doc` is a tree restored from the store, read by loadHostStates; `notes`
+    // is registered for the first time, and read by its registration.
+    const reads = {
+      doc: () => checkpoints.loadHostStates('srv'),
+      notes: () => checkpoints.registerFeatureSet('srv', 'notes', { hostState: true, rollback: false }),
+    };
     for (const [featureSet, state] of [['doc', { count: 1 }], ['notes', { count: 3 }]] as const) {
       const stateId = `mcpl/state/srv/${featureSet}`;
       const restore = failStoreRead(stateId, 'loadHostState');
       try {
-        assert.throws(() => checkpoints.registerFeatureSet('srv', featureSet, { hostState: true, rollback: false }), {
+        assert.throws(reads[featureSet], {
           message: new RegExp(
             `^the host-managed state of feature set "${featureSet}" on MCPL server "srv" \\(mcpl/state/srv/${featureSet}\\) could not ` +
-            `be read: injected EIO reading mcpl/state/srv/${featureSet}\\. The server's connect fails without it, since the feature ` +
-            `set's next checkpoint would store over it\\. It's unchanged, and the connect succeeds once it can be read\\.$`,
+            `be read: injected EIO reading mcpl/state/srv/${featureSet}\\. The server doesn't connect without it, and neither does ` +
+            `create\\(\\) with it configured, since the feature set's next checkpoint would store over it\\. It's unchanged, and the ` +
+            `server connects once it can be read\\.$`,
           ),
         });
       } finally { restore(); }
-      checkpoints.registerFeatureSet('srv', featureSet, { hostState: true, rollback: false });
-      assert.deepEqual(checkpoints.getCurrentState('srv', featureSet), state, `${featureSet}: the next registration reads it`);
+      reads[featureSet]();
+      assert.deepEqual(checkpoints.getCurrentState('srv', featureSet), state, `${featureSet}: the next one reads it`);
     }
     // The registration that failed held no tree, so the next one registered it whole, stored tree included.
     const trees = (store.getStateJson('mcpl/checkpoints') as { trees: Record<string, unknown> }).trees;
@@ -592,7 +692,7 @@ test("a host-managed feature set's state that can't be read fails its registrati
   } finally { store.close(); }
 }));
 
-test("at a runtime connect, coalescing receipts that can't be read fail the connect, and the next connect restores them", async (t) => {
+test("at a runtime connect, coalescing state or checkpoint trees that can't be read fail the connect with nothing of MCPL built, and the next connect restores them", async (t) => {
   const f = await fixture(); t.after(f.close);
   const params = f.params('1', 'accepted_before_crash', { deferred: true, data: { k: 'v' } });
   const original = await f.send('push/event', params);

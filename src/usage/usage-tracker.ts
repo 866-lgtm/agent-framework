@@ -12,8 +12,10 @@ function accumulateUsage(
   tokens: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number },
   estimatedCost?: { total: number; currency: string }
 ): void {
-  // A provider's usage can lack a count (membrane passes some through as
-  // reported); adding it would make the total NaN, which is stored as null.
+  // A provider's usage can lack a count (membrane 0.5.87's Bedrock stream
+  // takes a message_delta's output count as reported), and the cost membrane
+  // computes from it is then NaN; adding either would make the total NaN,
+  // which is stored as null.
   const count = (n: number): number => (Number.isFinite(n) ? n : 0);
   target.inputTokens += count(tokens.inputTokens);
   target.outputTokens += count(tokens.outputTokens);
@@ -27,16 +29,16 @@ function accumulateUsage(
       target.estimatedCost = undefined;
       return;
     }
-    target.estimatedCost.total += estimatedCost.total;
+    target.estimatedCost.total += count(estimatedCost.total);
   }
 }
 
 function parseUsage(raw: unknown): SessionUsage | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
-  // A count stored as null is a NaN total, as JSON stores one: an earlier
-  // release could write it when a provider's usage lacked a count. It reads
-  // as 0, the count that survived it.
+  // A count or a cost total stored as null is a NaN total, as JSON stores
+  // one: an earlier release could write it when a provider's usage lacked a
+  // count. It reads as 0, the count that survived it.
   const count = (v: unknown): number | undefined => (v === null ? 0 : typeof v === 'number' ? v : undefined);
   const inputTokens = count(o.inputTokens);
   const outputTokens = count(o.outputTokens);
@@ -47,7 +49,10 @@ function parseUsage(raw: unknown): SessionUsage | null {
     cacheCreationTokens: typeof o.cacheCreationTokens === 'number' ? o.cacheCreationTokens : 0,
     cacheReadTokens: typeof o.cacheReadTokens === 'number' ? o.cacheReadTokens : 0,
     estimatedCost: o.estimatedCost && typeof o.estimatedCost === 'object'
-      ? { total: (o.estimatedCost as any).total, currency: (o.estimatedCost as any).currency }
+      ? {
+        total: (o.estimatedCost as any).total === null ? 0 : (o.estimatedCost as any).total,
+        currency: (o.estimatedCost as any).currency,
+      }
       : undefined,
   };
 }
