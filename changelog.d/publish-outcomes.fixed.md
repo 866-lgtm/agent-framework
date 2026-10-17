@@ -33,3 +33,10 @@
   sent some. `channel_publish` and
   `speak_in_channel` still resolve a channel id by its first registered
   match and post into a closed channel without opening it, as before.
+
+  If you run a connector that answers `channels/publish` with `{}` or no
+  receipt, which earlier versions counted as delivered, every publish
+  through it now reads as unconfirmed. The resident is told of each reply
+  that it wasn't confirmed, and gets an error for each `channel_publish` and
+  `speak_in_channel` call, each saying that sending it again could post it
+  twice. A connector confirms a post by answering `delivered: true`.
