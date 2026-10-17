@@ -10246,14 +10246,20 @@ export class AgentFramework {
 
     // Fallback reaper: a closing fork whose closure inference never ran
     // (request dropped as stale, inference policy veto) would otherwise stay
-    // registered forever. No active stream + no pending request = done.
-    // What is still queued for it goes to its store first, as at the end of
-    // a closure turn (storeDeferredFor), and what can't be stored leaves
-    // with it (disposeConversationAgent).
+    // registered forever. No active stream + no pending request = done. It
+    // is disposed once what is still queued for it can be stored now, so
+    // not while a turn token is held for it (a puppet call's, or a surgery's
+    // reservation) or the host is quiesced: each of those flushes the fork's
+    // queue as it lets go (the puppet's finally, the surgery's release,
+    // resume()), and a later sweep disposes the fork. What is queued goes to
+    // its store first (storeDeferredFor), and what can't be, put back
+    // because its store threw, leaves with the fork (disposeConversationAgent).
     for (const agentName of [...this.closingConversationAgents]) {
       if (
         !this.activeStreams.has(agentName) &&
-        !this.pendingRequests.some((r) => r.agentName === agentName)
+        !this.pendingRequests.some((r) => r.agentName === agentName) &&
+        !this.activeTurnTokens.has(agentName) &&
+        !this.quiesced
       ) {
         this.storeDeferredFor(agentName, `disposal of conversation fork ${agentName}`);
         this.disposeConversationAgent(agentName);

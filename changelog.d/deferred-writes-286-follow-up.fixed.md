@@ -8,12 +8,18 @@
   ephemeral run's, once the run's stream had ended, was dropped by the run's
   own turn-end flush, which runs after the run is deregistered, with a line
   saying its delivery target isn't a registered agent.
-- A closing conversation fork that the fallback reaper disposes, with no
-  stream and no request left for it, as when its closure turn never ran, first
-  has what is still queued for it stored in its own store, past its deferral,
-  as the end of a closure turn and the end of an ephemeral run already do. On
-  a quiesced host it's deferred again and leaves with the fork, as above.
-  Before, nothing stored it, and it stayed queued for the disposed fork.
+- The fallback reaper, which disposes a closing conversation fork with no
+  stream and no request left for it, as when its closure turn never ran, now
+  first stores what is still queued for the fork in the fork's own store, past
+  its deferral, as the end of a closure turn and the end of an ephemeral run
+  do. It waits to dispose the fork until that can be done: not while a turn
+  token is held for it, as a puppet call or a surgery holds one, nor while the
+  host is quiesced. The puppet call's end, the surgery's release and
+  `resume()` each store the fork's queue, and a later sweep disposes it. Only
+  what its store throws on then leaves with the fork, as above. Before, the
+  reaper disposed such a fork while a token was held or the host was quiesced
+  too, nothing stored what was queued for it, and that stayed queued for the
+  disposed fork.
 - Boot recovery numbers the restored deferred-write queue 1, 2, 3, … in the
   order it restores it, and later deferrals are numbered on from there.
   Before, it kept each entry's `seq` and numbered only the entries without a

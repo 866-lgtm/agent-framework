@@ -714,15 +714,19 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
-  it('a write queued for a closing fork whose closure turn never ran is stored in the fork before the reaper disposes it', async () => {
+  /** A fork spawned on `channelId` and closed by the sweep, whose closure
+   *  request is then dropped before it runs, as a stale one is, with a write
+   *  for it deferred meanwhile. Nothing holds it when this returns: no
+   *  stream, no request, no turn token, and the host isn't quiesced. */
+  async function closingForkWithAQueuedWrite(channelId: string) {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
-    framework.pushEvent(incomingEvent({ channelId: 'slack:D7', text: 'hi', channelType: 'im' }));
+    framework.pushEvent(incomingEvent({ channelId, text: 'hi', channelType: 'im' }));
     await framework.runUntilIdle();
-    const fork = 'conversation-slack-D7-g1';
+    const fork = `conversation-${channelId.replace(':', '-')}-g1`;
     const g1 = framework.getAgent(fork)!;
-    assert.ok(g1, 'g1 fork should exist after spawn');
+    assert.ok(g1, 'the fork should exist after spawn');
     const internals = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
       deferredMessages: Array<{ forAgent?: string }>;
@@ -731,17 +735,25 @@ describe('Conversation routing', () => {
       lastConversationSweep: number;
       sweepExpiredConversations(): void;
     };
-    // The sweep closes the fork and queues its closure turn, and the request
-    // is then dropped before it runs, as a stale one is.
-    forceExpiry(framework, 'slack:D7', IDLE_TTL_MS);
+    forceExpiry(framework, channelId, IDLE_TTL_MS);
     internals.sweepExpiredConversations();
     assert.equal(internals.pendingRequests.filter((r) => r.agentName === fork).length, 1, 'the closure turn is queued');
     internals.pendingRequests.splice(0, internals.pendingRequests.length,
       ...internals.pendingRequests.filter((r) => r.agentName !== fork));
-    // A write for the fork that was deferred meanwhile.
     internals.activeTurnTokens.set(fork, 1);
     assert.equal(internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined, { forAgent: fork }), '', 'deferred');
     internals.activeTurnTokens.delete(fork);
+    const sweep = () => {
+      internals.lastConversationSweep = 0;
+      internals.sweepExpiredConversations();
+    };
+    const lastStored = () => JSON.stringify(g1.getContextManager().getAllMessages().at(-1)?.content);
+    const queued = () => internals.deferredMessages.filter((m) => m.forAgent === fork).length;
+    return { framework, fork, g1, internals, sweep, lastStored, queued };
+  }
+
+  it('a write queued for a closing fork whose closure turn never ran is stored in the fork before the reaper disposes it', async () => {
+    const { framework, fork, g1, internals } = await closingForkWithAQueuedWrite('slack:D7');
 
     const errors: string[] = [];
     const error = console.error;
@@ -755,6 +767,47 @@ describe('Conversation routing', () => {
     const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
     assert.ok(stored[stored.length - 1]!.includes('one more thing'), `stored in the fork before it was disposed:\n${stored.join('\n')}`);
     assert.deepEqual(internals.deferredMessages.filter((m) => m.forAgent === fork), [], 'nothing is left queued for the fork');
+    assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
+
+    await framework.stop();
+  });
+
+  it('the reaper leaves a closing fork registered while a turn token is held for it, and disposes it once the token is gone', async () => {
+    const { framework, fork, internals, sweep, lastStored, queued } = await closingForkWithAQueuedWrite('slack:D8');
+    // A token with no stream and no request, as a puppet call holds across
+    // its tool's await and a surgery reserves for every agent.
+    internals.activeTurnTokens.set(fork, 2);
+    sweep();
+    assert.ok(framework.getAgent(fork), 'not disposed while a turn token is held for it');
+    assert.equal(queued(), 1, 'its write is still queued');
+    assert.ok(!lastStored().includes('one more thing'), `not stored under the token:\n${lastStored()}`);
+
+    internals.activeTurnTokens.delete(fork);
+    sweep();
+    assert.equal(framework.getAgent(fork), null, 'disposed once the token is gone');
+    assert.ok(lastStored().includes('one more thing'), `stored in the fork before it was disposed:\n${lastStored()}`);
+    assert.equal(queued(), 0, 'nothing is left queued for the fork');
+
+    await framework.stop();
+  });
+
+  it('the reaper leaves a closing fork registered while the host is quiesced, and disposes it after resume() has stored its write', async () => {
+    const { framework, fork, sweep, lastStored, queued } = await closingForkWithAQueuedWrite('slack:D9');
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await framework.quiesce({ reason: 'test window' });
+      sweep();
+      assert.ok(framework.getAgent(fork), 'not disposed while the host is quiesced');
+      assert.equal(queued(), 1, 'its write is still queued');
+
+      await framework.resume();
+      assert.ok(lastStored().includes('one more thing'), `resume() stored it in the fork:\n${lastStored()}`);
+      sweep();
+      assert.equal(framework.getAgent(fork), null, 'disposed after resume()');
+      assert.equal(queued(), 0, 'nothing is left queued for the fork');
+    } finally { console.error = error; }
     assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
 
     await framework.stop();
