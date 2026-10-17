@@ -261,8 +261,8 @@ test("a deferred-write queue that isn't a queue, or isn't JSON, fails create(), 
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them, since the next ` +
       `deferral would replace the stored queue\\. The file is unchanged, and the framework starts once it holds a queue of writes, ` +
-      `such as \\{"version":1,"pending":\\[\\]\\} for none\\. Removing it doesn't help: without the file, the queue is read from ` +
-      `framework/deferred-writes, which the file's writes don't keep\\.$`,
+      `such as \\{"version":1,"pending":\\[\\]\\} for none\\. Removing it reads the queue from framework/deferred-writes instead, ` +
+      `which the file's writes don't keep, so it restores whatever older queue is there, or none\\.$`,
     ), content);
     assert.equal(readFileSync(file, 'utf8'), content, `${content}: the file is as it was`);
   }

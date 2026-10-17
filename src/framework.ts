@@ -5204,8 +5204,9 @@ export class AgentFramework {
         `since the next deferral would replace the stored queue. ` +
         (file
           ? `The file is unchanged, and the framework starts once ${cause === undefined
-            ? 'it holds a queue of writes, such as {"version":1,"pending":[]} for none. Removing it doesn\'t help: ' +
-              `without the file, the queue is read from ${DEFERRED_WRITES_ID}, which the file's writes don't keep`
+            ? 'it holds a queue of writes, such as {"version":1,"pending":[]} for none. Removing it reads the queue ' +
+              `from ${DEFERRED_WRITES_ID} instead, which the file's writes don't keep, so it restores whatever older ` +
+              `queue is there, or none`
             : 'it can be read'}.`
           : cause === undefined
             ? `They're unchanged, and starting again won't help until they're repaired.`
