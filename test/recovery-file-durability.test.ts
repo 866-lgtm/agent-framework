@@ -131,16 +131,25 @@ test('quiesce syncs the host-mode record\'s temp file before renaming it over th
   });
 });
 
-test('a context write deferred while quiesced syncs the deferred-writes record the same way', async () => {
+test('each context write deferred while quiesced rewrites the deferred-writes record, synced the same way', async () => {
   await withFramework(async (framework, recovery) => {
     await framework.quiesce({ reason: 'test' });
     const add = (framework as unknown as { addMessage(participant: string, content: unknown[]): unknown }).addMessage.bind(framework);
     const record = join(recovery, 'deferred-writes.json');
-    const calls = await recordingFs(async () => { add('user', [{ type: 'text', text: 'held' }]); });
-    assertSyncedAround(calls, record, recovery);
-    assertSyncedAround(calls, record, dirname(recovery));
+    const calls = await recordingFs(async () => {
+      add('user', [{ type: 'text', text: 'held' }]);
+      add('user', [{ type: 'text', text: 'held too' }]);
+    });
+    const renames = calls.flatMap((c, i) => (c.call === 'rename' && c.to === record ? [i] : []));
+    assert.equal(renames.length, 2, `a rewrite for each deferred write: ${JSON.stringify(calls)}`);
+    renames.forEach((_at, k) => {
+      // This rewrite's calls: from the rename before it to the one after.
+      const write = calls.slice(k === 0 ? 0 : renames[k - 1]! + 1, renames[k + 1] ?? calls.length);
+      assertSyncedAround(write, record, recovery);
+      assertSyncedAround(write, record, dirname(recovery));
+    });
     const pending = (JSON.parse(readFileSync(record, 'utf8')) as { pending: Array<{ content: Array<{ text: string }> }> }).pending;
-    assert.deepEqual(pending.map((entry) => entry.content[0]!.text), ['held']);
+    assert.deepEqual(pending.map((entry) => entry.content[0]!.text), ['held', 'held too']);
   });
 });
 
@@ -268,6 +277,25 @@ for (const which of ['directory', 'parent'] as const) {
         message: `syncing ${failing} failed, so ${record} may not survive a crash: EIO: i/o error, fsync`,
         data: { record, directory: failing, code: 'EIO' },
       }]);
+    });
+  });
+}
+
+for (const code of ['EINVAL', 'EBADF'] as const) {
+  test(`directory syncs refused with ${code}, as where the filesystem can't sync a directory, are let go with no ops alert and the new record in place`, async () => {
+    await withFramework(async (framework, recovery) => {
+      const alerts: unknown[] = [];
+      (framework as unknown as { opsAlert: unknown }).opsAlert = (...args: unknown[]) => { alerts.push(args); };
+      const record = join(recovery, 'host-mode.json');
+      const directories = [recovery, dirname(recovery)];
+      const calls = await recordingFs(
+        () => framework.quiesce({ reason: 'test' }),
+        (c) => (c.call === 'fsync' && directories.includes(c.path!) ? fsError(code, 'fsync') : undefined),
+      );
+      for (const directory of directories) assertSyncedAround(calls, record, directory);
+      assertEachClosed(calls, (path) => path !== undefined && directories.includes(path));
+      assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
+      assert.deepEqual(alerts, []);
     });
   });
 }

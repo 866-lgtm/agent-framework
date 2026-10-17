@@ -5361,13 +5361,15 @@ export class AgentFramework {
    *  the directory is synced, for the record's entry in it, and its parent,
    *  for the directory's own entry, which is new when a write, this one or an
    *  earlier one, had to make the directory; levels above are left to the
-   *  filesystem. Directories are synced on POSIX only; win32 syncs the file.
+   *  filesystem. Directories aren't synced on win32, which syncs the file
+   *  alone, or where the filesystem can't sync one (syncRecoveryDirectory).
    *  So a crash leaves the record as it was or the new one, whole. A failure
    *  before the rename removes the temp file, if it was made, and throws an
    *  error saying the record was left as it was, with the original as its
-   *  cause and its code kept. A directory sync that fails is raised as an ops
-   *  alert, not thrown: the new record is in place, and the callers go on to
-   *  record it as written. */
+   *  cause and its code kept. A directory sync that fails, other than where
+   *  the filesystem can't sync one, is raised as an ops alert, not thrown:
+   *  the new record is in place, and the callers go on to record it as
+   *  written. */
   private writeRecoveryFile(path: string, document: unknown): void {
     const directory = dirname(path);
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -5399,14 +5401,20 @@ export class AgentFramework {
   }
 
   /** Syncs the directory a recovery file is in, or that directory's parent,
-   *  so its entries reach the disk; win32 is left out. A failure is raised as
-   *  an ops alert naming the record. */
+   *  so its entries reach the disk. win32 is left out. So is a sync refused
+   *  with EINVAL or EBADF, the answer where the filesystem or system can't
+   *  sync a directory: that refusal would come again on every write, and
+   *  PostgreSQL's fsync_fname_ext lets the same two go. Any other failure is
+   *  raised as an ops alert naming the record. */
   private syncRecoveryDirectory(directory: string, record: string): void {
     if (process.platform === 'win32') return;
     try {
       const fd = openSync(directory, 'r');
       try {
         fsyncSync(fd);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'EBADF') throw err;
       } finally {
         closeSync(fd);
       }
