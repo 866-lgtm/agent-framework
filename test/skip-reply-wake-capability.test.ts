@@ -166,9 +166,11 @@ describe('skip_reply wake capability', () => {
   });
 
   /**
-   * A turn on a host with no EventGate: what reached the channel, and how many
-   * streams it took. `streams` holds each stream's responses: the first
-   * stream's, then a restart's, given to the mock as that stream starts.
+   * A turn on a host with no EventGate: what reached the channel, how many
+   * streams it took, and how many of them reached their last response
+   * (`completed`), rather than ending at a tool's result. `streams` holds each
+   * stream's responses: the first stream's, then a restart's, given to the
+   * mock as that stream starts.
    */
   async function turnWithoutGate(store: string, streams: ReturnType<typeof createMockResponse>[][], maxStreamTokens?: number) {
     const membrane = new MockMembrane();
@@ -178,7 +180,9 @@ describe('skip_reply wake capability', () => {
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', ...(maxStreamTokens ? { maxStreamTokens } : {}) }], modules: [],
     });
     let starts = 0;
+    let completed = 0;
     framework.onTrace((event) => {
+      if (event.type === 'inference:completed') completed++;
       if (event.type !== 'inference:started' || ++starts < 2) return;
       for (const response of streams[starts - 1] ?? []) membrane.pushResponse(response);
     });
@@ -193,25 +197,27 @@ describe('skip_reply wake capability', () => {
       .startAgentStream(agent, { agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
     await framework.runUntilIdle();
     await framework.stop();
-    return { routed, streams: membrane.calls.length };
+    return { routed, streams: membrane.calls.length, completed };
   }
   const send = (id: string): ContentBlock =>
     ({ type: 'tool_use', id, name: 'channel_publish', input: { channelId: 'channel:test', content: 'sent' } } as ContentBlock);
 
   it('a refused wake beside a send in its round leaves the send\'s silence on the rest of the turn', async () => {
-    const { routed } = await turnWithoutGate('beside-send', [[
+    const { routed, completed } = await turnWithoutGate('beside-send', [[
       createMockResponse([send('send-1'), wakeCall('wake-1')] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'after the send' }] as ContentBlock[]),
     ]]);
+    assert.equal(completed, 1, 'the refusal left the turn open, and it went on to its last response');
     assert.deepEqual(routed, []);
   });
 
   it('a send after a refused wake silences the rest of the turn: the refusal\'s saved silence comes back once', async () => {
-    const { routed } = await turnWithoutGate('send-after', [[
+    const { routed, completed } = await turnWithoutGate('send-after', [[
       createMockResponse([wakeCall('wake-1')] as ContentBlock[], 'tool_use'),
       createMockResponse([send('send-1')] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'after the send' }] as ContentBlock[]),
     ]]);
+    assert.equal(completed, 1, 'the refusal left the turn open, and it went on to its last response');
     assert.deepEqual(routed, []);
   });
 
@@ -232,6 +238,7 @@ describe('skip_reply wake capability', () => {
     const plain = await restartedAfter('restart-plain', { type: 'tool_use', id: 'think-2', name: 'think', input: { content: 'a plan' } } as ContentBlock);
     assert.equal(refused.streams, 2, 'the refused round crossed the budget, and the turn restarted');
     assert.equal(plain.streams, 2);
+    assert.deepEqual(plain.routed, ['after the restart'], 'the restarted stream starts from its trigger, unsilenced');
     assert.deepEqual(refused.routed, plain.routed);
   });
 
@@ -299,8 +306,10 @@ describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
     assert.equal(results.length, 0, 'ordinary skip ends at the tool boundary');
   });
 
-  it('C: a wake that isn\'t a finite number of seconds asks for none, so it\'s an ordinary skip', async () => {
-    // A tool input arrives as JSON, so Infinity can come only as text.
+  it('C: a wake that doesn\'t read as a finite number asks for none, so it\'s an ordinary skip', async () => {
+    // JSON reads a number literal past a double's range, such as 1e400, as
+    // Infinity too, but the store can't hold an Infinity in a tool call's
+    // input, so these are strings.
     for (const wake of ['Infinity', 'soon']) {
       const { routed, results } = await runProbe(wake);
       assert.deepEqual(routed, [], `wake_in_seconds: ${String(wake)}`);

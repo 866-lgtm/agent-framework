@@ -42,8 +42,8 @@ export function splitProseSegments(content: readonly ContentBlock[]): string[] {
 }
 
 /**
- * A turn's content without the prose of some of its tool rounds, counted from
- * 0 in the order the turn's tool calls came. A round's prose is its text
+ * A turn's content without the prose of some of its tool rounds, the turn's
+ * rounds counted from 0 in order. A round's prose is its text
  * before its calls, and a round starts at the first block after the previous
  * round's `tool_result` blocks. So a round with no prose still counts, two
  * calls of one round (their `tool_use` blocks come before any result) stay

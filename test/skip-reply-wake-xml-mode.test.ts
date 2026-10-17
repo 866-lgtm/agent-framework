@@ -1,8 +1,8 @@
 /**
  * skip_reply's refused wake in XML tool mode: without an EventGate, a round
  * that calls skip_reply with wake_in_seconds is refused and the turn goes on.
- * That round's prose stays private, and the prose of every other round
- * reaches the channel, in order.
+ * That round's prose stays private, and every other round's prose is
+ * delivered as it would be without the refusal, in order.
  *
  * In XML tool mode, tool-calls events carry no roundContent, so no round is
  * routed live: the turn's prose is delivered at its end, from the turn-end
@@ -18,21 +18,29 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import type { NormalizedRequest, NormalizedResponse, YieldingStream, StreamEvent } from '@animalabs/membrane';
 import type { Module, ModuleContext, ProcessState, ProcessEvent, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 
 type Parsed = { blocks: unknown[]; toolCalls: unknown[]; toolResults: unknown[] };
-const MEMBRANE = join(process.cwd(), 'node_modules/@animalabs/membrane');
+// membrane exports only its entry, so its parser is read beside that entry,
+// found the way this module resolves membrane, wherever the test runs from.
+const TOOL_PARSER = new URL('./utils/tool-parser.js', import.meta.resolve('@animalabs/membrane')).href;
 const parse = async (text: string, startInsideBlock?: string): Promise<Parsed> =>
-  ((await import(pathToFileURL(join(MEMBRANE, 'dist/utils/tool-parser.js')).href)) as { parseAccumulatedIntoBlocks(t: string, o?: unknown): Parsed })
+  ((await import(TOOL_PARSER)) as { parseAccumulatedIntoBlocks(t: string, o?: unknown): Parsed })
     .parseAccumulatedIntoBlocks(text, startInsideBlock ? { startInsideBlock } : undefined);
 
-type Round = { text: string; call: { id: string; name: string; input: Record<string, unknown> }; results: string };
-const raw = (c: Round['call']) => `<function_calls><invoke name="${c.name}">${Object.entries(c.input).map(([k, v]) => `<parameter name="${k}">${String(v)}</parameter>`).join('')}</invoke></function_calls>`;
-const echo = (id: string, text: string): Round => ({ text, call: { id, name: 'test--echo', input: { message: 'x' } }, results: '<function_results><result><stdout>{"echoed":"x"}</stdout></result></function_results>' });
-const refusedWake = (id: string, text: string): Round => ({ text, call: { id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: 60 } }, results: '<function_results><error>refused</error></function_results>' });
+type Call = { id: string; name: string; input: Record<string, unknown> };
+type Round = { text: string; calls: Call[]; results: string };
+const invoke = (c: Call) => `<invoke name="${c.name}">${Object.entries(c.input).map(([k, v]) => `<parameter name="${k}">${String(v)}</parameter>`).join('')}</invoke>`;
+const raw = (calls: Call[]) => `<function_calls>${calls.map(invoke).join('')}</function_calls>`;
+/** A round of test--echo calls, one per id. */
+const echo = (id: string, text: string, ...more: string[]): Round => ({
+  text,
+  calls: [id, ...more].map((callId) => ({ id: callId, name: 'test--echo', input: { message: 'x' } })),
+  results: `<function_results>${[id, ...more].map(() => '<result><stdout>{"echoed":"x"}</stdout></result>').join('')}</function_results>`,
+});
+const refusedWake = (id: string, text: string): Round => ({ text, calls: [{ id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: 60 } }], results: '<function_results><error>refused</error></function_results>' });
 
 class XmlStream implements YieldingStream {
   private events: StreamEvent[] = [];
@@ -52,10 +60,10 @@ class XmlStream implements YieldingStream {
     const before = this.acc + r.text;
     this.events.push({
       type: 'tool-calls',
-      calls: [{ id: r.call.id, name: r.call.name, input: r.call.input }],
-      context: { rawText: raw(r.call), preamble: before, roundPreamble: before.slice(this.roundStart), depth: this.round, previousResults: [], accumulated: before + raw(r.call) },
+      calls: r.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
+      context: { rawText: raw(r.calls), preamble: before, roundPreamble: before.slice(this.roundStart), depth: this.round, previousResults: [], accumulated: before + raw(r.calls) },
     } as StreamEvent);
-    this.acc = before + raw(r.call);
+    this.acc = before + raw(r.calls);
     this.waiting = true;
     this.wake();
   }
@@ -84,7 +92,7 @@ class XmlStream implements YieldingStream {
   cancel(): void { this.done = true; this.events.push({ type: 'aborted', reason: 'user' } as StreamEvent); this.wake(); }
   private wake(): void { if (this.pending) { const r = this.pending; this.pending = null; r(); } }
   get isWaitingForTools() { return this.waiting; }
-  get pendingToolCallIds(): string[] { return this.waiting ? [this.rounds[this.round]!.call.id] : []; }
+  get pendingToolCallIds(): string[] { return this.waiting ? this.rounds[this.round]!.calls.map((c) => c.id) : []; }
   get toolDepth() { return this.round; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     while (true) {
@@ -144,7 +152,7 @@ async function xmlTurn(rounds: Round[], finalText: string, thinking = false) {
   }
 }
 
-describe('skip_reply refused in XML tool mode: its round stays private, and every other round reaches the channel', () => {
+describe('skip_reply refused in XML tool mode: its round stays private, and the others are delivered as without it', () => {
   it('a refused round, then a reply', async () => {
     const r = await xmlTurn([refusedWake('w1', 'REFUSED_PRIVATE')], '\nFINAL_REPLY');
     assert.deepEqual(r.errors, [true], 'the wake was refused and the turn went on');
@@ -192,6 +200,12 @@ describe('skip_reply refused in XML tool mode: its round stays private, and ever
     const r = await xmlTurn([echo('e1', 'ONE'), echo('e2', ''), refusedWake('w1', 'REFUSED_PRIVATE')], '\nTHIRD');
     assert.deepEqual(r.errors, [false, false, true]);
     assert.deepEqual(r.routed, ['ONE', 'THIRD']);
+  });
+
+  it('a round of two calls counts once, so the refused round after it is the one kept private', async () => {
+    const r = await xmlTurn([echo('e1', 'ONE', 'e2'), refusedWake('w1', 'REFUSED_PRIVATE')], '\nFINAL_REPLY');
+    assert.deepEqual(r.errors, [false, true]);
+    assert.deepEqual(r.routed, ['ONE', 'FINAL_REPLY']);
   });
 
   it('a refused round with no prose keeps the next round\'s prose', async () => {
