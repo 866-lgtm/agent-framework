@@ -107,6 +107,8 @@ export {
 
 // Server connection and registry
 export { McplServerConnection } from './server-connection.js';
+export type { McplConnectionCloseInfo } from './server-connection.js';
+export type { TransportCloseInfo } from './transport.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)
@@ -117,6 +119,35 @@ export { ScopeManager, type ElevationHandler } from './scope-manager.js';
 
 // Hook orchestration (beforeInference/afterInference fan-out)
 export { HookOrchestrator } from './hook-orchestrator.js';
+
+export {
+  ToolLifecycleEmitter,
+  parseToolObserveParams,
+  selectFields,
+  boundInput,
+  openingFor,
+  DEFAULT_MAX_INPUT_BYTES,
+  TOOL_OBSERVE_LIMITS,
+  type ToolPhase,
+  type ToolLifecycleParams,
+  type ToolObserveRule,
+  type ToolObserveMatch,
+  type ToolLifecycleConfig,
+  type ToolLifecycleNarrowing,
+} from './tool-lifecycle.js';
+export {
+  TOOL_CLASSES,
+  TOOL_CLASS_META_KEY,
+  DEFAULT_INPUT_CLASSES,
+  BUILTIN_TOOL_CLASSES,
+  parseDeclaredClasses,
+  resolveToolClass,
+  isToolClass,
+  type ToolClass,
+  type ToolClassSource,
+  type EffectiveToolClass,
+} from './tool-classes.js';
+export { globMatch } from './tool-glob.js';
 
 // Push events (Section 9)
 export { PushHandler } from './push-handler.js';
@@ -129,7 +160,9 @@ export { InferenceRouter } from './inference-router.js';
 export { ChannelRegistry } from './channel-registry.js';
 
 // Per-channel conversation routing (fork-per-channel agents)
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './conversation-router.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,

@@ -145,6 +145,10 @@ export interface McplCapabilities {
   /** Server consumes inference/lifecycle notifications (§10.5). */
   inferenceLifecycle?: boolean;
 
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
+
   /** Server supports model/info requests */
   modelInfo?: boolean;
 
@@ -161,6 +165,15 @@ export interface McplCapabilities {
  */
 export interface McplHostCapabilities {
   version: string;
+  /** RFC-006 support, independent of capability grants. */
+  eventCoalescing?: boolean | {
+    pushEvents?: boolean;
+    channelsIncoming?: boolean;
+    deferred?: boolean;
+    channelScopedPush?: boolean;
+    /** Retry-window guarantee in ms (integer ≥ 3,600,000; default 3,600,000). */
+    retryWindowMs?: number;
+  };
   pushEvents?: boolean;
   contextHooks?: {
     beforeInference?: boolean | {
@@ -170,6 +183,10 @@ export interface McplHostCapabilities {
   };
   inferenceRequest?: boolean | { streaming?: boolean };
   inferenceLifecycle?: boolean;
+
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
@@ -212,7 +229,9 @@ export interface McplServerConfig {
   /**
    * Environment variables for the child process. Stdio children do NOT inherit
    * the host environment wholesale: they get a small allowlist (PATH, HOME,
-   * LANG, LC_*, TMPDIR, ... — see CHILD_ENV_ALLOWLIST) plus exactly these.
+   * LANG, LC_*, TMPDIR, TLS CA bundles, and HTTP(S) proxy settings — see
+   * CHILD_ENV_ALLOWLIST) plus exactly these. Proxy URLs can contain credentials.
+   * This limits accidental inheritance; it does not isolate a hostile child.
    */
   env?: Record<string, string>;
 
@@ -263,10 +282,16 @@ export interface McplServerConfig {
    */
   allowHostCommands?: boolean;
 
-  /** Feature sets to enable on connect */
+  /**
+   * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
+   * every declared set is a candidate. `[]`: none. Either way a set is
+   * enabled only if its declared `uses` are recognized capabilities the
+   * grant covers (§6.4) — a set declaring no `uses` stays disabled even when
+   * listed here (logged, and traced as `mcpl:feature-set-disabled`).
+   */
   enabledFeatureSets?: string[];
 
-  /** Feature sets to explicitly disable on connect */
+  /** Feature sets to explicitly disable on connect (wins over enabledFeatureSets). */
   disabledFeatureSets?: string[];
 
   /**
@@ -349,7 +374,11 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. This is the
+   * timeout of every request that names none; the handshake's initialize has
+   * its own. Set 0 to disable. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 
@@ -369,11 +398,15 @@ export interface McplServerConfig {
 
   /**
    * Tool name prefix for this server's tools.
-   * Tools are exposed as `{toolPrefix}:{toolName}`.
+   * Tools are exposed as `{toolPrefix}--{toolName}`.
    *
-   * Default: `mcpl:{id}` (e.g., `mcpl:zk:lobby_start_game`).
+   * Default: `mcpl--{id}` (e.g., `mcpl--zk--lobby_start_game`).
    * Set to the server ID for cleaner names (e.g., `toolPrefix: 'zk'`
-   * gives `zk:lobby_start_game`).
+   * gives `zk--lobby_start_game`).
+   *
+   * Tool-name patterns elsewhere (`toolClassOverrides` keys,
+   * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
+   * `disabledTools` use the bare server-side names.
    *
    * Must not collide with any module name or another server's prefix.
    */
@@ -389,6 +422,17 @@ export interface McplServerConfig {
    *  cumulative per-server byte budget (reference-fetcher.ts defaults apply
    *  when absent). */
   autofetch?: { maxBytes?: number; maxTotalBytes?: number };
+
+  /**
+   * RFC-007 tool lifecycle policy for this server: narrowing for the
+   * `toolLifecycle.observe` and `toolLifecycle.inputs` grants, and the
+   * `input` size bound. Both paths are DENIED BY DEFAULT; stating a key here
+   * (or naming the path in enabledCapabilities) is the explicit grant.
+   * `inputs` without a `tools` or `classes` term delivers no arguments, and
+   * `comms` or unclassed tools never carry arguments whatever it says.
+   * See src/mcpl/tool-lifecycle.ts.
+   */
+  toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
 }
 
 // ============================================================================
@@ -634,6 +678,21 @@ export interface StateRollbackResult {
  * Spec Section 9.1.
  */
 export interface PushEventParams {
+  /** RFC-006 event coalescing (mcpl PR #5, revision 7). */
+  coalesce?: {
+    /** Subject key, 1..256 UTF-8 bytes, opaque to the host. */
+    key: string;
+    /** push/event only: address a registered channel's subject namespace. */
+    channelId?: string;
+    /** push/event only: deferred mode — the host calls push/render at assembly. */
+    deferred?: boolean;
+    /** The subject ceased to exist; `payload.content` is the deletion notice. */
+    retract?: boolean;
+    /** No earlier occurrence of this subject was ever sent (§3.3). */
+    initial?: boolean;
+    /** deferred only; ≤ 4 KiB serialized; server-private, echoed by push/render. */
+    data?: unknown;
+  };
   /** Declaring feature set */
   featureSet: string;
 
@@ -661,6 +720,10 @@ export interface PushEventParams {
  * Spec Section 9.3.
  */
 export interface PushEventResult {
+  coalesce?: {
+    outcome: 'first' | 'replaced' | 'appended' | 'retracted' | 'noted' | 'consumed';
+    priorEventId?: string;
+  };
   /** Whether the event was accepted */
   accepted: boolean;
 
@@ -1097,6 +1160,8 @@ export interface ChannelsPublishResult {
  * Spec Section 14.3.
  */
 export interface ChannelIncomingMessage {
+  eventId?: string;
+  coalesce?: Omit<NonNullable<PushEventParams['coalesce']>, 'channelId' | 'deferred'>;
   /** Channel this message came from */
   channelId: string;
 
@@ -1144,6 +1209,7 @@ export interface ChannelsIncomingResult {
 
 /** Result for a single incoming message. */
 export interface ChannelIncomingMessageResult {
+  coalesce?: PushEventResult['coalesce'];
   messageId: string;
   accepted: boolean;
   conversationId?: string;
@@ -1200,6 +1266,13 @@ export const McplMethod = {
   // Inference lifecycle (Host → Server, Notification) — §10.5, replaces
   // context/afterInference. Metadata only; BEST-EFFORT delivery.
   InferenceLifecycle: 'inference/lifecycle',
+
+  // Tool lifecycle (RFC-007). tools/lifecycle is Host → Server,
+  // Notification, metadata plus (under its own grant) requested argument
+  // fields — never results. tools/observe is Server → Host, Request: the
+  // server's filter over what it is sent (interest, never authority).
+  ToolsLifecycle: 'tools/lifecycle',
+  ToolsObserve: 'tools/observe',
 
   // Server manifest changes (§17). manifestChanged is S→H Notification —
   // an opaque revision plus changed domains, NO payload, deliberately
