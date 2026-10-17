@@ -74,11 +74,16 @@ export interface CodeExecutionConfig {
   /** Max wake_agent() calls per background script (default 100); further
    *  calls raise RuntimeError inside the script. */
   maxWakesPerScript?: number;
-  /** Environment for the python interpreter on top of the operating
-   *  allowlist (see CHILD_ENV_ALLOWLIST); the host's secrets are not passed
-   *  to model-authored code. `${VAR}`-substitute from .env in a recipe. */
+  /** Variables for the python interpreter beyond the operating allowlist it
+   *  inherits (see CHILD_ENV_ALLOWLIST), such as PYTHONPATH. A recipe can
+   *  `${VAR}`-substitute them from .env. Other host variables aren't
+   *  inherited, which limits what model-authored code inherits, not what a
+   *  process running as the same user can read. */
   env?: Record<string, string>;
-  /** Escape hatch: the interpreter inherits the host's whole environment. */
+  /** The interpreter inherits the host's whole environment instead of the
+   *  allowlist: every host variable, provider keys included, reaches
+   *  model-authored code and every subprocess a script starts. Listing what
+   *  scripts need in `env` is the safer route. */
   inheritEnv?: boolean;
 }
 

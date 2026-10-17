@@ -37,7 +37,7 @@ test('a codeExecution.env that is not an object of strings is refused, naming th
   validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', EMPTY: '' } });
 });
 
-test('model-authored python does not see a host secret', async () => {
+test('model-authored python does not inherit a host variable outside the allowlist', async () => {
   const key = 'AF_CODE_EXEC_TEST_HOST_SECRET';
   process.env[key] = 'must-not-leak';
   const runner = new PyRunner({ onToolCall: async () => '' });

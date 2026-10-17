@@ -73,12 +73,18 @@ export interface PyRunnerOptions {
   onToolCall: ScriptToolCallHandler;
   /** Log prefix, typically the agent name. */
   label?: string;
-  /** Extra environment for the interpreter (PYTHONPATH, a venv, …). The
-   *  child gets the same operating allowlist stdio MCPL children get
-   *  (CHILD_ENV_ALLOWLIST + LC_*) plus exactly these — never the host's
-   *  secrets, since the code it runs is the model's. */
+  /** Variables for the interpreter beyond what it inherits, such as
+   *  PYTHONPATH or a venv's. It inherits only what stdio MCPL children do
+   *  (CHILD_ENV_ALLOWLIST and LC_*, CA bundles and proxy variables among
+   *  them, and a proxy URL can carry credentials), then these, then
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING, which the runner sets last.
+   *  Like the allowlist, this limits what the model's code inherits, not
+   *  what a process running as the same user can read. */
   env?: Record<string, string>;
-  /** Escape hatch: pass the host's entire environment, as before. */
+  /** Pass the host's whole environment instead of the allowlist, as before
+   *  `env` existed. That hands every host variable, provider keys included,
+   *  to the model's code and to every subprocess a script starts; listing
+   *  what scripts need in `env` is the safer route. */
   inheritEnv?: boolean;
 }
 
