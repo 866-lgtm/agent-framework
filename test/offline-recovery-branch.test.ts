@@ -408,7 +408,7 @@ test('a failed offline suppression retires its batch once the source is confirme
         storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
         marks: { scope: 'all' }, branchName: 'recovery/cairn/fail',
       }),
-      (error: Error) => /^injected redaction failure; branch recovery\/cairn\/fail is kept for diagnosis: it may be partly suppressed, so don't start on it$/.test(error.message),
+      (error: Error) => /^injected redaction failure; branch recovery\/cairn\/fail is kept for diagnosis: it may be partly suppressed, so don't start on it, and delete it once it has been looked at \(the host API's branch\.delete, once the host runs\), since nothing refuses a switch onto it once its awareness batch is retired; awareness batch \S+ retired, none of its marks sent\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/.test(error.message),
     );
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
 
@@ -442,6 +442,26 @@ test('a failed offline suppression retires its batch once the source is confirme
       }
     }
 
+    // The retirement lands, and only its sync fails: read back, it's
+    // reported retired, with the risk that the sync left.
+    await seed();
+    DiscordAwarenessOutbox.prototype.discard = function (this: DiscordAwarenessOutbox, batchId: string) {
+      discard.call(this, batchId);
+      throw new Error('injected sync failure');
+    };
+    try {
+      await assert.rejects(
+        createOfflineRecoveryBranch({
+          storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
+          marks: { scope: 'all' }, branchName: 'recovery/cairn/fail-synced',
+        }),
+        /; awareness batch \S+ is retired, none of its marks sent, but the journal's sync after its retirement failed \(injected sync failure\): a host or power failure before the store's next sync could lose that record, and the batch would then be prepared again at the next start\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
+      );
+    } finally {
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
+
     // The source can't be confirmed: the batch stays as the unfinished body's record.
     await seed();
     ContextManager.prototype.switchBranch = async function (this: ContextManager, name: string) {
@@ -456,7 +476,7 @@ test('a failed offline suppression retires its batch once the source is confirme
       // One instruction for the kept branch: a start on it finishes the
       // suppression, so it isn't called unsafe to start.
       // The redo starts from the source, which isn't the store's current branch.
-      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent\. To apply its marks, redo it from main, choosing them again: the recovery starts from the store's current branch, which isn't main now, so switch to main first through the host API's branch\.switch, then run the recovery again onto a new --branch with the host stopped$/,
+      /^Error: injected redaction failure; restoring main failed: injected restore failure; branch recovery\/cairn\/fail2 is kept: it may be partly suppressed; awareness batch \S+ kept, since the source branch could not be confirmed: a start on recovery\/cairn\/fail2 finishes its removals and retires it, none of its marks sent\. To apply its marks, redo it from main, choosing them again: the recovery starts from the store's current branch, which isn't main now, so start the host, switch to main through the host API's branch\.switch, stop the host, and run the recovery again onto a new --branch$/,
     );
     assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
   } finally {
@@ -520,7 +540,7 @@ test('an offline suppression whose resume journal could not be closed, or whose 
     assert.equal(unresolved.markers?.status, 'none');
     assert.match(
       unresolved.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); unless its closing record reached the store unseen, it stays prepared, and a start on recovery\/cairn\/close finds its removals applied and closes it$/,
+      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, unless the journal couldn't be read back and its closing record landed anyway; either way, a start on recovery\/cairn\/close finds its removals applied and closes it$/,
     );
     const retired = await recoverWith({ status: 'not-scheduled', error: 'injected activation failure' }, 'none');
     assert.match(
@@ -653,7 +673,7 @@ test('an offline recovery onto a name a pending suppression claims is refused, a
     }
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', branchName: 'unclaimed' }),
-      /^Error: Recovery branch unclaimed can't be made: the Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read \(Corrupt Discord awareness journal entry \S+\), so whether a suppression's pending removals claim that name can't be checked\. Running the recovery again changes nothing until both can be read$/,
+      /^Error: Recovery branch unclaimed can't be made: the Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read \(Corrupt Discord awareness journal entry \S+\), so whether a suppression's pending removals claim that name can't be checked\. Running the recovery again changes nothing until both can be read: an entry a later build wrote stays unreadable, and stops every start too, until a build that reads its format runs, and a corrupt entry, or a pre-journal ledger that can't be read, until it is repaired; each is the host operator's to do$/,
     );
     const after = JsStore.open({ path: storePath });
     try {

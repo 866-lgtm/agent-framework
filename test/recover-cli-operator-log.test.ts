@@ -304,17 +304,21 @@ test("a list or a control on a journal that can't be read is refused, saying run
     // An entry a later build wrote.
     store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { v: 99, records: [] });
     store.close();
-    const refusal = /^\[agent-framework-recover\] The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read \(Discord awareness journal entry \S+ is in format 99, which this build can't read \(it reads format 1\); a later build wrote it\), so nothing is listed or changed\. Running this again changes nothing until both can be read: an entry a later build wrote, a corrupt entry, or a pre-journal ledger that can't be read stays so, and stops the next start too, until a build that reads that entry's format runs, or the entry or the ledger is repaired$/m;
+    const refusal = /^\[agent-framework-recover\] The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read \(Discord awareness journal entry \S+ is in format 99, which this build can't read \(it reads format 1\); a later build wrote it\), so no batch is listed or changed, and running this again lists or changes none until both can be read: an entry a later build wrote stays unreadable, and stops every start too, until a build that reads its format runs, and a corrupt entry, or a pre-journal ledger that can't be read, until it is repaired; each is the host operator's to do$/m;
     const listed = recover(storePath, '--awareness', 'list');
     assert.equal(listed.status, 1);
     assert.match(listed.stderr, refusal);
-    const cancelled = recover(storePath, '--awareness', 'cancel', 'some-batch');
-    assert.equal(cancelled.status, 1);
-    assert.match(cancelled.stderr, refusal);
-    const [refused, ...rest] = operatorLog(storePath);
-    assert.equal(rest.length, 0);
-    assert.equal(refused.kind, 'awareness-cancel');
-    assert.match(refused.error ?? '', /^The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read/);
+    // Every control reads the journal first.
+    for (const control of [['cancel', 'some-batch'], ['retract', 'all'], ['release', 'some-batch']]) {
+      const run = recover(storePath, '--awareness', ...control);
+      assert.equal(run.status, 1, control.join(' '));
+      assert.match(run.stderr, refusal);
+    }
+    const refused = operatorLog(storePath);
+    assert.deepEqual(refused.map((entry) => entry.kind), ['awareness-cancel', 'awareness-retract', 'awareness-release']);
+    for (const entry of refused) {
+      assert.match(entry.error ?? '', /^The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read/);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

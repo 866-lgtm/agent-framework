@@ -7781,11 +7781,24 @@ export class AgentFramework {
     }
     try {
       this.discordAwarenessOutbox.discard(batch.id);
-      return '';
+      return `; awareness batch ${batch.id} retired, none of its marks sent`;
     } catch (error) {
       const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
-      const kept = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, none of its marks ` +
-        'to be sent';
+      // A retirement can land before its durable barrier fails: what the
+      // journal holds decides, as in settleApplied. Undefined: it can't be
+      // read back.
+      let landed: boolean | undefined;
+      try {
+        landed = this.discordAwarenessOutbox.batchStatus(batch.id) === 'discarded';
+      } catch { /* unknown */ }
+      if (landed) {
+        return `; awareness batch ${batch.id} is retired, none of its marks sent, but the journal's sync after its ` +
+          `retirement failed (${detail}): a host or power failure before the store's next sync could lose that ` +
+          'record, and the batch would then be prepared again at the next start';
+      }
+      const kept = `awareness batch ${batch.id} could not be retired (${detail})` + (landed === undefined
+        ? ', and the journal can\'t be read back to tell whether its retirement landed; if it didn\'t, it stays '
+        : '; it stays ') + 'prepared, none of its marks to be sent';
       if (!suppression) return `; ${kept}, until the next start retires it`;
       // A suppression's removals stay pending for its target branch: a start
       // there finishes them, and a start that finds no such branch gives
@@ -7910,7 +7923,7 @@ export class AgentFramework {
         // Record the marks choice before switching Chronicle. If the process
         // dies after the switch but before activate(), the next start retires
         // the batch, none of its marks sent, and its alert names the redo: a
-        // start never completes a surgery's marks. If the fork or switch
+        // start never activates a surgery's marks. If the fork or switch
         // itself throws, the batch is retired here.
         const markerBatch = this.prepareMarkerBatch('Rollback', {
           agentName,
@@ -8339,8 +8352,8 @@ export class AgentFramework {
       'invalid',
       `Branch ${name} is the target of suppression ${batch.id}, whose removals aren't recorded as finished, so it ` +
         `isn't safe to serve from. To give the suppression up, delete ${name}: the next start finds no branch with ` +
-        `that name and gives it up, and until then the name stays claimed. Then redo it from ${batch.sourceBranch} ` +
-        'onto a new name',
+        `that name and gives it up, and until then the name stays claimed. To apply it, switch to ` +
+        `${batch.sourceBranch} and run the suppression again there, onto a new branch name`,
     );
   }
 
@@ -8464,8 +8477,8 @@ export class AgentFramework {
       } else {
         const left = settled.status === 'not-scheduled'
           ? 'it was retired instead, so nothing is left to resume'
-          : 'unless its closing record reached the store unseen, it stays prepared, and a start on this branch ' +
-            'finds its removals applied and closes it';
+          : 'it stays prepared, unless the journal couldn\'t be read back and its closing record landed anyway; ' +
+            'either way, a start on this branch finds its removals applied and closes it';
         const message = `${verb} applied, but its resume journal (awareness batch ${batch.id}, no marks) ` +
           `could not be closed (${settled.error}); ${left}`;
         console.error(`[discord-awareness] agent=${agentName}: ${message}`);
@@ -16393,7 +16406,7 @@ export class AgentFramework {
    * (an interrupted surgery's, or an imported ledger's not known complete),
    * and record each complete. A batch its interrupted surgery left prepared
    * is retired with it, none of its marks sent, and reported with the redo
-   * that applies them (reportRetiredAwareness): a start never completes a
+   * that applies them (reportRetiredAwareness): a start never activates a
    * surgery's marks. An interval whose messages are only partly present
    * can't be finished safely, and stops the start.
    */
@@ -16504,7 +16517,10 @@ export class AgentFramework {
       if (kept.targetBranch === currentBranch) continue;
       console.error(
         `[discord-awareness] startup: suppression ${kept.batchId} of ${kept.agentName} has removals pending for ` +
-          `${kept.targetBranch}, which a start on ${kept.targetBranch} finishes; until then that name is refused`,
+          `${kept.targetBranch}, which only a start on it finishes, and a switch onto it is refused while they're ` +
+          `pending, since a partly suppressed branch isn't safe to serve from. To give the suppression up, delete ` +
+          `${kept.targetBranch} (the host API's branch.delete): the next start finds no branch with that name and ` +
+          'gives it up. Until then that name is refused',
       );
     }
   }
@@ -16540,7 +16556,7 @@ export class AgentFramework {
         agentName,
         `A hide or turn undo of ${agentName} on ${targetBranch} (awareness batch ${batchId}) stands, but its ` +
           `${marks} awareness mark(s) weren't applied: the process ended before they were activated, and a start ` +
-          'never completes a surgery\'s marks. The change itself stands on that branch, so there is nothing to redo',
+          'never activates a surgery\'s marks. The change itself stands on that branch, so there is nothing to redo',
         { data: { batchId, marks }, key: batchId },
       );
       return;
@@ -16549,7 +16565,7 @@ export class AgentFramework {
     const about = `The ${surgery} of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ${batchId})`;
     const redo = `switch to ${sourceBranch}, which still has every message it removed, and redo the ${surgery} there, ` +
       'onto a new branch name';
-    const unmarked = `Its ${marks} awareness mark(s) weren't applied, since a start never completes a surgery's marks. `;
+    const unmarked = `Its ${marks} awareness mark(s) weren't applied, since a start never activates a surgery's marks. `;
     if (retirement.reason === 'branch-gone' && retirement.imported) {
       // A pre-journal ledger's suppression, whose body that ledger may have
       // recorded applied: nothing says it wasn't finished. Its marks are the

@@ -591,10 +591,12 @@ const JOURNAL_FORMAT = 1;
 export const DISCORD_AWARENESS_RECORD_TYPE = 'af:discord-awareness';
 
 /** What ends a refusal to read the journal (load) that an entry or the
- *  pre-journal ledger causes. */
+ *  pre-journal ledger causes: each cause with what ends it, which is the
+ *  host operator's to do. */
 export const DISCORD_AWARENESS_ENTRY_LIFT =
-  'an entry a later build wrote, a corrupt entry, or a pre-journal ledger that can\'t be read stays so, and stops ' +
-  'the next start too, until a build that reads that entry\'s format runs, or the entry or the ledger is repaired';
+  'an entry a later build wrote stays unreadable, and stops every start too, until a build that reads its format ' +
+  'runs, and a corrupt entry, or a pre-journal ledger that can\'t be read, until it is repaired; each is the host ' +
+  'operator\'s to do';
 
 /** What ends a refusal to read the journal (load), whatever its cause, for
  *  a process that may have written to it. */
@@ -875,6 +877,14 @@ export class DiscordAwarenessOutbox {
     return true;
   }
 
+  /** A batch's status as the journal holds it now, or undefined when it
+   *  holds no such batch. Throws when the journal can't be read. A write can
+   *  land before its durable barrier fails, so after a failed discard this
+   *  says whether the retirement is in the journal. */
+  batchStatus(batchId: string): DiscordAwarenessBatch['status'] | undefined {
+    return this.load().batches.get(batchId)?.status;
+  }
+
   /**
    * The suppressions whose body may still be applied on `branch`: batches
    * whose target is exactly that branch, not retired, whose body was never
@@ -906,7 +916,7 @@ export class DiscordAwarenessOutbox {
    * finished its removals. A surgery's leftover (isSurgeryLeftover: still
    * prepared, its surgery interrupted, or held by a pre-release build for
    * its surgery) is retired in the same entry, none of its marks sent: a
-   * restart never completes a surgery's marks. An import's batch keeps its
+   * restart never activates a surgery's marks. An import's batch keeps its
    * marks as they are. Returns whether it was retired.
    */
   completeSuppression(batchId: string): { retired: boolean } {
@@ -1199,13 +1209,15 @@ export class DiscordAwarenessOutbox {
     if (batch.status === 'held' && batch.scope !== 'legacy') {
       // A start treats it as a prepared batch (isSurgeryLeftover).
       const retires = isPendingSuppression(batch)
-        ? `A start on ${batch.targetBranch} finishes its suppression's removals and retires it, and a start that ` +
-          'finds no branch with that name gives them up and retires it, none of its marks sent either way'
+        ? `A start on ${batch.targetBranch} finishes its suppression's removals and retires it, and a switch onto ` +
+          `${batch.targetBranch} is refused while they're pending: from any other branch, delete ` +
+          `${batch.targetBranch} (the host API's branch.delete) to have the next start give them up and retire it. ` +
+          'Either way none of its marks is sent'
         : 'A start retires it, none of its marks sent';
       throw new DiscordAwarenessRefusal(
         `Discord awareness batch ${batchId} is held by a pre-release build for its surgery, not imported from a ` +
-          `pre-journal ledger: only an import is released. ${retires}; to apply them, redo the surgery from its ` +
-          'source onto a new branch name, choosing marks again',
+          `pre-journal ledger: only an import is released. ${retires}. To apply them, switch to ` +
+          `${batch.sourceBranch} and run the surgery again there, onto a new branch name, choosing marks again`,
       );
     }
     if (batch.status !== 'held' || !batch.held) {

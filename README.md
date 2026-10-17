@@ -463,13 +463,12 @@ const result = await framework.rollbackToMessage('cairn', {
   only there. Until a suppression is finished or given up, a rollback, a
   suppression, an offline recovery or the API's `branch.create` refuses its
   branch name, cancelled or not, since a start on a branch made under it
-  would apply those removals there. While the journal can't be read, every
-  new branch name is refused (`failed`), since none can be checked; after a
+  would apply those removals there. While the journal can't be read, each of
+  these refuses every name (`failed`), since none can be checked. After a
   write that failed inside the store, a restart, which reopens the store,
-  ends that, and an entry a later build wrote, a corrupt entry or a
-  pre-journal ledger that can't be read stops the next start too, until a
-  build that reads that entry's format runs, or the entry or the ledger is
-  repaired.
+  ends that; an entry a later build wrote stops the next start too, until a
+  build that reads its format runs, and a corrupt entry or a pre-journal
+  ledger that can't be read, until it is repaired.
 - **Operator controls,** each that changes the journal recorded in the
   operator log (a list or a preview records nothing); once `stop()`
   has begun, cancel, retract and release refuse, like every operator entry

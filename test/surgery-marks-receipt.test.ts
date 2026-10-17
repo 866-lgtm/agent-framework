@@ -674,7 +674,7 @@ describe('surgery and awareness marks', () => {
       assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'the saved redaction landed');
       const [after] = outbox().batches();
       assert.equal(after.suppressionComplete, true);
-      assert.equal(after.status, 'discarded', 'a start never completes a surgery\'s marks');
+      assert.equal(after.status, 'discarded', 'a start never activates a surgery\'s marks');
       assert.deepEqual(outbox().operations(), []);
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-not-scheduled']);
       assert.match(alerts[0]!.message, new RegExp(`^The suppression of resident from ${sourceBranch} onto partial \\(awareness batch ${batch.id}\\) was interrupted; this start finished its removals on partial\\.`));
@@ -826,7 +826,7 @@ describe('surgery and awareness marks', () => {
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-not-scheduled']);
       assert.equal(alerts[0]!.message,
         `The rollback of resident from ${sourceBranch} onto fix-1 (awareness batch ${first.id}) was interrupted. `
-        + 'Its 3 awareness mark(s) weren\'t applied, since a start never completes a surgery\'s marks. '
+        + 'Its 3 awareness mark(s) weren\'t applied, since a start never activates a surgery\'s marks. '
         + `To apply them, switch to ${sourceBranch}, which still has every message it removed, and redo the rollback there, `
         + 'onto a new branch name, with its marks');
     });
@@ -844,7 +844,7 @@ describe('surgery and awareness marks', () => {
     const pendingSuppressionsFor = DiscordAwarenessOutbox.prototype.pendingSuppressionsFor;
     DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = function () { throw new Error('injected unreadable journal'); };
     const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
-      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. Calling again changes nothing until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry a later build wrote, a corrupt entry, or a pre-journal ledger that can't be read stays so, and stops the next start too, until a build that reads that entry's format runs, or the entry or the ledger is repaired$/.test(error.message);
+      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. Calling again changes nothing until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry a later build wrote stays unreadable, and stops every start too, until a build that reads its format runs, and a corrupt entry, or a pre-journal ledger that can't be read, until it is repaired; each is the host operator's to do$/.test(error.message);
     try {
       await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' }), refused);
       await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'fix-2' }), refused);

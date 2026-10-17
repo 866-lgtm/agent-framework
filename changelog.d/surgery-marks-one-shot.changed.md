@@ -34,14 +34,13 @@
   up, a rollback, a suppression, an offline recovery or the API's
   `branch.create` refuses its branch name, cancelled or not, since a start
   on a branch made under it would apply those removals there. While the
-  journal can't be read, every new branch name is refused, since none can be
-  checked; after a write that failed inside the store, a restart, which
-  reopens the store, ends that, and an entry a later build wrote, a corrupt
-  entry or a pre-journal ledger that can't be read stops the next start too,
-  until a build that reads that entry's format runs, or the entry or the
-  ledger is repaired. A `hide` or turn `undo` records its batch and the
-  batch's activation as one journal entry, so a crash never leaves it half
-  recorded.
+  journal can't be read, each of these refuses every name, since none can be
+  checked. After a write that failed inside the store, a restart, which
+  reopens the store, ends that; an entry a later build wrote stops the next
+  start too, until a build that reads its format runs, and a corrupt entry or
+  a pre-journal ledger that can't be read, until it is repaired. A `hide` or
+  turn `undo` records its batch and the batch's activation as one journal
+  entry, so a crash never leaves it half recorded.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch, or the batch a `hide` or turn
   `undo` records after its change) is now written only after that change is

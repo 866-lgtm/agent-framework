@@ -205,8 +205,8 @@ function awareness(options: CliOptions): void {
       } catch (error) {
         throw new Error(
           'The Discord awareness journal, or the pre-journal ledger it imports (--outbox), can\'t be read ' +
-            `(${boundDiscordAwarenessText(errorMessage(error))}), so nothing is listed or changed. Running this again ` +
-            `changes nothing until both can be read: ${DISCORD_AWARENESS_ENTRY_LIFT}`,
+            `(${boundDiscordAwarenessText(errorMessage(error))}), so no batch is listed or changed, and running this ` +
+            `again lists or changes none until both can be read: ${DISCORD_AWARENESS_ENTRY_LIFT}`,
           { cause: error },
         );
       }

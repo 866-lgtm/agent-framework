@@ -3,6 +3,7 @@ import type { SurgeryMarkerReceipt } from '../operator-log.js';
 import { ContextManager } from '@animalabs/context-manager';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
+  DISCORD_AWARENESS_ENTRY_LIFT,
   DiscordAwarenessOutbox,
   boundDiscordAwarenessText,
   defaultDiscordAwarenessOutboxPath,
@@ -230,7 +231,7 @@ export async function createOfflineRecoveryBranch(
         `Recovery branch ${targetBranch} can't be made: the Discord awareness journal, or the pre-journal ledger ` +
           `it imports (--outbox), can't be read (${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}), ` +
           'so whether a suppression\'s pending removals claim that name can\'t be checked. Running the recovery ' +
-          'again changes nothing until both can be read',
+          `again changes nothing until both can be read: ${DISCORD_AWARENESS_ENTRY_LIFT}`,
         { cause: error },
       );
     }
@@ -305,8 +306,8 @@ export async function createOfflineRecoveryBranch(
           // one couldn't put back: a run from there would start from the fork.
           const redoFromSource = batch.refs.length > 0
             ? `. To apply its marks, redo it from ${sourceBranch}, choosing them again: the recovery starts from the ` +
-              `store's current branch, which isn't ${sourceBranch} now, so switch to ${sourceBranch} first through the ` +
-              'host API\'s branch.switch, then run the recovery again onto a new --branch with the host stopped'
+              `store's current branch, which isn't ${sourceBranch} now, so start the host, switch to ${sourceBranch} ` +
+              'through the host API\'s branch.switch, stop the host, and run the recovery again onto a new --branch'
             : '';
           retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: ` +
             (suppression.intervals.length > 0
@@ -315,16 +316,30 @@ export async function createOfflineRecoveryBranch(
         } else {
           try {
             outbox.discard(batch.id);
+            retire = `; awareness batch ${batch.id} retired, none of its marks sent${redo}`;
           } catch (discardError) {
             // None of its marks is ever sent: a start retires it. A
             // suppression's removals stay pending for its target branch: a
             // start there finishes them, and a start that finds no such branch
             // gives them up. Until then, a recovery or surgery onto that name,
-            // from a later process that reads the batch, is refused.
-            const kept = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
+            // from a later process that reads the batch, is refused. A
+            // retirement can land before its durable barrier fails, so what
+            // the journal holds decides, as in the host's retireAfterRestore.
+            const detail = boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
-            )}); it stays prepared, none of its marks to be sent`;
-            if (suppression.intervals.length === 0) {
+            );
+            let landed: boolean | undefined;
+            try {
+              landed = outbox.batchStatus(batch.id) === 'discarded';
+            } catch { /* unknown */ }
+            const kept = `; awareness batch ${batch.id} could not be retired (${detail})` + (landed === undefined
+              ? ', and the journal can\'t be read back to tell whether its retirement landed; if it didn\'t, it stays '
+              : '; it stays ') + 'prepared, none of its marks to be sent';
+            if (landed) {
+              retire = `; awareness batch ${batch.id} is retired, none of its marks sent, but the journal's sync ` +
+                `after its retirement failed (${detail}): a host or power failure before the store's next sync could ` +
+                `lose that record, and the batch would then be prepared again at the next start${redo}`;
+            } else if (suppression.intervals.length === 0) {
               retire = `${kept}, until the next start retires it${redo}`;
             } else {
               let forked = true;
@@ -346,7 +361,9 @@ export async function createOfflineRecoveryBranch(
       const kept = createdBranch === undefined ? ''
         : suppression.intervals.length === 0 ? `; branch ${createdBranch} is kept for diagnosis`
         : batch && !sourceConfirmed ? `; branch ${createdBranch} is kept: it may be partly suppressed`
-        : `; branch ${createdBranch} is kept for diagnosis: it may be partly suppressed, so don't start on it`;
+        : `; branch ${createdBranch} is kept for diagnosis: it may be partly suppressed, so don't start on it, and ` +
+          'delete it once it has been looked at (the host API\'s branch.delete, once the host runs), since nothing ' +
+          'refuses a switch onto it once its awareness batch is retired';
       if (!restore && !retire && !kept) throw error;
       throw new Error(`${failure}${restore}${kept}${retire}`, { cause: error });
     }
@@ -386,8 +403,8 @@ export async function createOfflineRecoveryBranch(
         suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) could not be closed ` +
           `(${settled.error}); ` + (settled.status === 'not-scheduled'
             ? 'it was retired instead, so nothing is left to resume'
-            : 'unless its closing record reached the store unseen, it stays prepared, and a start on ' +
-              `${targetBranch} finds its removals applied and closes it`);
+            : 'it stays prepared, unless the journal couldn\'t be read back and its closing record landed anyway; ' +
+              `either way, a start on ${targetBranch} finds its removals applied and closes it`);
       }
     }
     return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionJournal ? { suppressionJournal } : {}) };
