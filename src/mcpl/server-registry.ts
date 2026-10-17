@@ -42,14 +42,14 @@ export class McplServerRegistry {
       throw new Error(`MCPL server "${config.id}" is already registered`);
     }
 
-    const connection = config.reconnect
+    const connection = config.reconnect === true
       ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
       : await McplServerConnection.connect(config, hostCapabilities);
     this.servers.set(config.id, connection);
 
     // Auto-remove on unexpected close (unless reconnect will re-add)
     connection.on('close', () => {
-      if (!config.reconnect) {
+      if (config.reconnect !== true) {
         this.servers.delete(config.id);
       }
     });
