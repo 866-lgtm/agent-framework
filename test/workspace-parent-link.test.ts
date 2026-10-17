@@ -156,18 +156,24 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(env.store.treeGet(TREE, 'l/x.txt')?.blobHash, before, 'history holds what it held');
     });
 
-    test(`readFileFromDisk refuses a path through it as a symlink, naming the way out (${target})`, async (t) => {
+    test(`readFileFromDisk and read_image refuse a path through it as a symlink, naming the way out (${target})`, async (t) => {
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
       const m = await env.open(t);
       env.swapLForLink(target);
+      const linked = /goes through a symlink at "work\/l", which this mount does not follow: use the path it leads to, or set followSymlinks: true on the mount/;
       await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
         assert.equal(err.code, 'symlink');
-        assert.match(err.message, /goes through a symlink at "work\/l", which this mount does not follow: use the path it leads to, or set followSymlinks: true on the mount/);
+        assert.match(err.message, linked);
         assert.ok(!err.message.includes(env.root), 'the refusal names no absolute path');
         return true;
       });
+      writeFileSync(join(dirname(realpathSync(join(env.dir, 'l', 'x.txt'))), 'img.png'), 'not read');
+      const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
+      assert.equal(image.success, false);
+      assert.match(String(image.error), linked);
+      assert.ok(!String(image.error).includes(env.root), 'the refusal names no absolute path');
     });
 
     test(`a listing of the directory the link stands at says so instead of walking it (${target})`, async (t) => {
@@ -215,13 +221,14 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     const view: MountView = { root: env.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [] };
     const rootReal = realpathSync(env.dir);
     const respell = (real: string) => (real.startsWith(rootReal + sep) ? `${rootReal}${sep}.${real.slice(rootReal.length)}` : real);
+    const reason = (v: { kind: string; reason?: string }) => `${v.kind}${v.reason === undefined ? '' : `: ${v.reason}`}`;
     await withRealpath(respell, async () => {
       const dir = await checkDir(view, rootReal, 'l');
-      assert.equal(dir.kind, 'checked', `checkDir: ${JSON.stringify(dir)}`);
+      assert.equal(dir.kind, 'checked', `checkDir: ${reason(dir)}`);
       const seen = await observePath(view, rootReal, 'l/x.txt');
-      assert.equal(seen.kind, 'file', `observePath: ${JSON.stringify(seen)}`);
+      assert.equal(seen.kind, 'file', `observePath: ${reason(seen)}`);
       const read = await readPath(view, rootReal, 'l/x.txt', 1 << 20);
-      assert.equal(read.kind, 'read', `readPath: ${JSON.stringify({ ...read, bytes: undefined })}`);
+      assert.equal(read.kind, 'read', `readPath: ${reason(read)}`);
     });
   });
 

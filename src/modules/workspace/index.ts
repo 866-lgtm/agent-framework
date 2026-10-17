@@ -1899,7 +1899,9 @@ export class WorkspaceModule implements Module {
       case 'directory':
         return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
       case 'symlink':
-        return new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${p}`);
+        // The core reader's own words: "Symlinks are not allowed: <path>" for a
+        // link at the path, and for one on its way, which link and the way out.
+        return new WorkspaceImageReadError('symlink', err.message);
       case 'escape':
         return new WorkspaceImageReadError('escape', `Symlink escape detected: ${p}`);
       case 'changed':
