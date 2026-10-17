@@ -1443,10 +1443,11 @@ export class McplServerConnection extends EventEmitter {
       // initialize error: the server's code and message can be any JSON
       // value, and one with no primitive form, such as {"toString":1}, would
       // throw here, after the request has left pendingRequests and its timer
-      // is cleared, so it would never settle. The message is the server's
-      // text, so it's bounded as errors.ts says.
+      // is cleared, so it would never settle. Both are the server's text, a
+      // code as much as a message, since a server can send a string, so both
+      // are bounded as errors.ts says.
       pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${describeCause(response.error.code)}] ${boundedForLog(describeCause(response.error.message))}`),
+        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${boundedForLog(describeCause(response.error.code))}] ${boundedForLog(describeCause(response.error.message))}`),
       );
     } else {
       pending.resolve(response.result);

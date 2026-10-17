@@ -40,7 +40,8 @@ export const CHANNEL_OPEN_FAILED = -32024;
 // Error Factories
 // ============================================================================
 
-/** The text of anything thrown or rejected. Never throws, whatever it is: a
+/** The text of any value: anything thrown or rejected, or a value a server
+ *  sent, such as an error answer's code. Never throws, whatever it is: a
  *  null-prototype object, or a message getter or toString that throws. */
 export function describeCause(cause: unknown): string {
   try {

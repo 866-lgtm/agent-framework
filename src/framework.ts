@@ -15582,7 +15582,16 @@ export class AgentFramework {
       try {
         listener(traceEvent);
       } catch (error) {
-        console.error('Trace listener error:', error);
+        // console.error inspects the value, and inspecting can throw (a
+        // throwing util.inspect.custom, say). That throw would leave this
+        // loop, so the listeners after this one would miss the event and the
+        // code that emitted it would get the throw. describeCause never
+        // throws, and a template string isn't inspected.
+        try {
+          console.error('Trace listener error:', error);
+        } catch {
+          console.error(`Trace listener error: ${describeCause(error)}`);
+        }
       }
     }
   }
@@ -17030,8 +17039,9 @@ export class AgentFramework {
 
   /** A refresh handleManifestChanged schedules for itself, after the fetch
    *  floor or behind a fetch in flight. It's contained as the announcement's
-   *  own run is, so a failure other than its fetch's, which the fetch's own
-   *  catch logs, emits mcpl:request-handler-error and a stderr line. */
+   *  own run is. Its fetch's own failure is logged by the fetch's catch, as
+   *  in 0.22.x; any other failure emits mcpl:request-handler-error and a
+   *  stderr line through the containment. */
   private rerunManifestRefresh(
     connection: McplServerConnection,
     announce: { revision?: string; domains?: string[] },
@@ -17524,78 +17534,71 @@ export class AgentFramework {
       // rejected, else the reply write it swallowed, else the reply it
       // tried to send twice. Nothing in here may throw: on the async path
       // it runs as a rejection handler, and an exception there would be an
-      // unhandled rejection, which ends the host.
+      // unhandled rejection, which ends the host. So every text is converted
+      // with describeCause, the internal-error reply's send is caught, and
+      // emitTrace's own catch can't throw.
       const report = (handlerError: { error: unknown } | undefined): void => {
         const primary = handlerError
           ? handlerError.error
           : writeFailed ? writeFailure : new Error('the handler tried to answer a second time after its reply');
         reported = true;
-        try {
-          const message = describeCause(primary);
-          // What the handler's own writes did, before any internal-error
-          // reply sent here.
-          const handlerResponseAttempted = responseAttempted;
-          // A reply write the handler's own attempt failed, read before the
-          // internal-error reply below, whose own failure is responseError.
-          const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
-            ? describeCause(writeFailure) : undefined;
-          let responseError: string | undefined;
-          if (tracked && !responseAttempted) {
-            // The server gets the standard message, not the handler's own
-            // text, which may name internal paths or errors; the trace and
-            // stderr carry the detail. Once the host is stopping (its queue
-            // closed), it gets -32000 with the stop wording alone, the code a
-            // request turned away at stop gets, so it can send it again to
-            // the host's next run. Optional chaining: prototype-built
-            // harnesses leave the queue unset.
-            const stopping = !!this.queue?.isClosed;
-            try {
-              tracked.respondError?.(
-                stopping ? -32000 : -32603,
-                stopping ? 'the host stopped while handling this request' : 'Internal error',
-              );
-            } catch (sendError) {
-              responseError = describeCause(sendError);
-            }
-          }
-          this.emitTrace({
-            type: 'mcpl:request-handler-error',
-            serverId,
-            event,
-            // The trace's type is string | number. Only those are kept, as
-            // the connection's own reports keep them, and a string is
-            // bounded like the texts beside it.
-            requestId: typeof responder?.id === 'number' ? responder.id
-              : typeof responder?.id === 'string' ? boundedForLog(responder.id, 500) : undefined,
-            responseAttempted: handlerResponseAttempted,
-            // The trace's copies are bounded, as data; the log line below
-            // prints each text raw through log-value, which escapes it.
-            error: boundedForLog(message, 500),
-            ...(responseFailure === undefined ? {} : { responseFailure: boundedForLog(responseFailure, 500) }),
-            ...(refused === undefined ? {} : {
-              refusedResponse: refused.kind === 'error' ? { ...refused, message: boundedForLog(refused.message, 500) } : refused,
-            }),
-            ...(responseError === undefined ? {} : { responseError: boundedForLog(responseError, 500) }),
-          });
-          // Keep headless hosts diagnosable even without a trace subscriber.
-          // The handler's text and the server's go through log-value, so a
-          // line stays one line of bounded, escaped text.
-          const tried = refused === undefined ? undefined
-            : refused.kind === 'result' ? 'a result' : `error ${refused.code}: ${refused.message}`;
-          console.error(
-            `[mcpl] ${serverId} ${event} handler failed: ${logDetail(message)}` +
-              (responseFailure === undefined ? '' : ` | its reply write had failed: ${logDetail(responseFailure)}`) +
-              (tried === undefined ? '' : ` | it then tried to answer again with ${logDetail(tried)}`) +
-              (responseError === undefined ? '' : ` | the internal-error reply failed too: ${logDetail(responseError)}`),
-          );
-        } catch (reportError) {
+        const message = describeCause(primary);
+        // What the handler's own writes did, before any internal-error
+        // reply sent here.
+        const handlerResponseAttempted = responseAttempted;
+        // A reply write the handler's own attempt failed, read before the
+        // internal-error reply below, whose own failure is responseError.
+        const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
+          ? describeCause(writeFailure) : undefined;
+        let responseError: string | undefined;
+        if (tracked && !responseAttempted) {
+          // The server gets the standard message, not the handler's own
+          // text, which may name internal paths or errors; the trace and
+          // stderr carry the detail. Once the host is stopping (its queue
+          // closed), it gets -32000 with the stop wording alone, the code a
+          // request turned away at stop gets, so it can send it again to
+          // the host's next run. Optional chaining: prototype-built
+          // harnesses leave the queue unset.
+          const stopping = !!this.queue?.isClosed;
           try {
-            console.error(
-              `[mcpl] ${serverId} ${event} handler failed: ${logDetail(describeCause(primary))}` +
-                ` (and reporting it failed too: ${logDetail(describeCause(reportError))})`,
+            tracked.respondError?.(
+              stopping ? -32000 : -32603,
+              stopping ? 'the host stopped while handling this request' : 'Internal error',
             );
-          } catch { /* stderr itself is gone */ }
+          } catch (sendError) {
+            responseError = describeCause(sendError);
+          }
         }
+        this.emitTrace({
+          type: 'mcpl:request-handler-error',
+          serverId,
+          event,
+          // The trace's type is string | number. Only those are kept, as
+          // the connection's own reports keep them, and a string is
+          // bounded like the texts beside it.
+          requestId: typeof responder?.id === 'number' ? responder.id
+            : typeof responder?.id === 'string' ? boundedForLog(responder.id, 500) : undefined,
+          responseAttempted: handlerResponseAttempted,
+          // The trace's copies are bounded, as data; the log line below
+          // prints each text raw through log-value, which escapes it.
+          error: boundedForLog(message, 500),
+          ...(responseFailure === undefined ? {} : { responseFailure: boundedForLog(responseFailure, 500) }),
+          ...(refused === undefined ? {} : {
+            refusedResponse: refused.kind === 'error' ? { ...refused, message: boundedForLog(refused.message, 500) } : refused,
+          }),
+          ...(responseError === undefined ? {} : { responseError: boundedForLog(responseError, 500) }),
+        });
+        // Keep headless hosts diagnosable even without a trace subscriber.
+        // The handler's text and the server's go through log-value, so a
+        // line stays one line of bounded, escaped text.
+        const tried = refused === undefined ? undefined
+          : refused.kind === 'result' ? 'a result' : `error ${refused.code}: ${refused.message}`;
+        console.error(
+          `[mcpl] ${serverId} ${event} handler failed: ${logDetail(message)}` +
+            (responseFailure === undefined ? '' : ` | its reply write had failed: ${logDetail(responseFailure)}`) +
+            (tried === undefined ? '' : ` | it then tried to answer again with ${logDetail(tried)}`) +
+            (responseError === undefined ? '' : ` | the internal-error reply failed too: ${logDetail(responseError)}`),
+        );
       };
       const failed = (error: unknown): void => report({ error });
       // A handler may swallow a write failure, or answer twice, and still

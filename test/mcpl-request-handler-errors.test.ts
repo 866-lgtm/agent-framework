@@ -752,7 +752,7 @@ test('a server\'s error answer that no template can convert settles the host\'s 
   assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
 });
 
-test('a server\'s error message in the error a host request rejects with is bounded: control, format and line characters replaced, and cut at 200 code points', async () => {
+test('a server\'s error code and message in the error a host request rejects with are bounded: control, format and line characters replaced, and each cut after 200 code points', async () => {
   const transport = new ResponseTransport();
   const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
   connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
@@ -763,6 +763,28 @@ test('a server\'s error message in the error a host request rejects with is boun
   await assert.rejects(fetched, {
     message: `MCPL server "srv" returned error for mcpl/manifest: [-32000] line one?line two?${'x'.repeat(182)}…`,
   });
+  // JSON-RPC's code is an integer, but a server can send a string, and it's
+  // the server's text as much as the message is.
+  const again = connection.sendManifestRequest();
+  const second = JSON.parse(transport.lines.at(-1)!);
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: second.id, error: { code: `E\nx\u202e${'y'.repeat(300)}`, message: 'refused' } }));
+  await assert.rejects(again, {
+    message: `MCPL server "srv" returned error for mcpl/manifest: [E?x?${'y'.repeat(196)}…] refused`,
+  });
+});
+
+test('a throw from the wired tools/list_changed handler is contained, traced and logged as the other handlers\' are', (t) => {
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  framework.handleToolsListChanged = () => { throw new Error('the tool list refresh failed'); };
+  connection.emit('tools-list-changed');
+  const failures = failureTraces(traces);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].event, 'tools-list-changed');
+  assert.equal(failures[0].requestId, undefined);
+  assert.equal(failures[0].error, 'the tool list refresh failed');
+  assert.deepEqual(lines, ['[mcpl] srv tools-list-changed handler failed: "the tool list refresh failed"']);
 });
 
 test('mcpl/manifestChanged and tools/list_changed sent as requests are answered with an empty result as they are admitted, whatever their handlers do', async (t) => {
@@ -1009,10 +1031,10 @@ test('a rejection no printer can inspect still reaches the trace first', async (
   }
 });
 
-test("a trace listener that throws a value no printer can inspect leaves the report's fallback line, and nothing escapes", async (t) => {
+test("a trace listener that throws a value no printer can inspect is logged as text, the listeners after it still get the trace, and nothing escapes", async (t) => {
   const { framework, connection, traces } = harness();
   // Print as console.error does: an argument that isn't a string goes
-  // through util.inspect, so logging the listener's throw throws too.
+  // through util.inspect, so logging the listener's throw raw throws too.
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => {
     logged.push(args.map((arg) => (typeof arg === 'string' ? arg : inspect(arg))).join(' '));
@@ -1021,9 +1043,11 @@ test("a trace listener that throws a value no printer can inspect leaves the rep
   const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
   process.on('unhandledRejection', onUnhandled);
   const hostile = { [inspect.custom]() { throw new Error('inspect refused'); } };
-  const off = framework.onTrace(() => { throw hostile; });
+  const offHostile = framework.onTrace(() => { throw hostile; });
+  const after: any[] = [];
+  const offAfter = framework.onTrace((event: unknown) => after.push(event));
   // The handler's own error can't be put in a template either, so the
-  // fallback line must convert it as the report does.
+  // report must convert it.
   const primary = Object.assign(new Error('register failed'), {
     [Symbol.toPrimitive]() { throw new Error('toPrimitive refused'); },
   });
@@ -1035,13 +1059,15 @@ test("a trace listener that throws a value no printer can inspect leaves the rep
     await settle();
     assert.deepEqual(unhandled, []);
     assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
-    assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one still has the trace');
-    const fallback = logged.filter((line) => line.includes('(and reporting it failed too:'));
-    assert.equal(fallback.length, 1, logged.join('\n'));
-    assert.match(fallback[0], /^\[mcpl\] srv channels-register handler failed: .*register failed.* \(and reporting it failed too: .*inspect refused/);
-    assert.ok(!fallback[0].includes('toPrimitive refused'), fallback[0]);
+    assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one has the trace');
+    assert.equal(failureTraces(after).length, 1, 'the listener after the throwing one has it too');
+    assert.deepEqual(logged, [
+      'Trace listener error: [object Object]',
+      '[mcpl] srv channels-register handler failed: "register failed"',
+    ]);
   } finally {
-    off();
+    offHostile();
+    offAfter();
     process.off('unhandledRejection', onUnhandled);
   }
 });

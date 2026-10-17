@@ -580,14 +580,17 @@ export type TraceEvent =
       event: string;
       /** The request's id when it is a number, or a string id bounded as the
        *  other texts here are: control, format and line-separator characters
-       *  replaced, and cut at 500 code points. Absent for a notification, for
-       *  a request whose id is neither, and for a request form of
-       *  mcpl/manifestChanged or notifications/tools/list_changed, which is
-       *  answered as it's admitted and then handled as the notification is. */
+       *  replaced, and cut after 500 code points, with "…" marking the cut.
+       *  Absent for a notification, for a request whose id is neither, and
+       *  for a request form of mcpl/manifestChanged or
+       *  notifications/tools/list_changed, which is answered as it's admitted
+       *  and then handled as the notification is. */
       requestId?: string | number;
-      /** Whether the handler wrote a reply: true once a reply's write
-       *  returned. A write that throws, as one that can't be encoded does,
-       *  sends nothing. When it's false and the responder
+      /** Whether a reply write of the handler's returned: true once one
+       *  did. On a connection that had already closed, that write dropped
+       *  the reply, as the connection then drops every reply, so nothing
+       *  reached the server. A write that throws, as one that can't be
+       *  encoded does, sends nothing. When it's false and the responder
        *  can send an error reply (it has respondError), the host sent -32603
        *  "Internal error" itself, or -32000 while it stops, unless
        *  `responseError` says that reply failed. A connection that has
