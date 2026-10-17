@@ -976,6 +976,50 @@ test('a retarget of a channel decided open opens the new target; one decided clo
   assert.deepEqual(f.calls.at(-1), { kind: 'close', id: 'y', address: undefined });
 });
 
+for (const decision of ['open', 'tuned-out'] as const) {
+  test(`a retarget while the old target's open is in flight opens the new target when that open fails, for a channel decided ${decision}`, async () => {
+    // Greptile's P1 on #210: the retarget queued nothing, since an operation
+    // was running, and that operation threw on its failed RPC without
+    // reading the new target.
+    const f = fixture();
+    f.held.add('x');
+    const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    await tick();
+    if (decision === 'tuned-out') {
+      f.registry.enterTuneOut('test', 'x', {
+        epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+      }, 'agent-tool');
+    }
+    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    f.held.delete('x');
+    f.pending.shift()!.fail();
+    await f.drain(opening);
+    assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+    assert.equal(f.isOpen(), true);
+    assert.equal(f.registry.getDesiredState('test', 'x'), decision);
+    assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
+  });
+}
+
+test("a retarget while the old target's close is in flight sends nothing more when that close fails", async () => {
+  // As for any retarget of a channel decided closed, the new target is left
+  // unconfirmed for channel_close to close for real.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.calls.length = 0;
+  f.held.add('x');
+  const close = f.tool('close');
+  await tick();
+  await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  f.held.delete('x');
+  f.pending.shift()!.fail();
+  await f.drain(close);
+  assert.equal((await close).success, false);
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close']);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+  assert.equal(f.isOpen(), false);
+});
+
 test("removing a server cancels its queued lifecycle work, even across a re-registration", async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', true)] });

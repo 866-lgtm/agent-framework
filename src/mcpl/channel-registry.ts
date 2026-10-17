@@ -896,8 +896,9 @@ export class ChannelRegistry {
         if (!sameChannelTarget(existing.descriptor, channel)) {
           this.invalidateTransportConfirmation(existing);
           // An operation queued or running for this channel reads its target
-          // again before it confirms anything, so it opens the new one. With
-          // none, a channel decided open (or tuned out) is reconciled here.
+          // again before it confirms anything, and after a failed RPC, so it
+          // opens the new one. With none, a channel decided open (or tuned
+          // out) is reconciled here.
           const desired = this.getDesiredState(serverId, channel.id);
           if ((desired === 'open' || desired === 'tuned-out') &&
               !this.lifecycleOutstanding.has(this.lifecycleKey(serverId, channel.id))) {
@@ -2247,8 +2248,9 @@ export class ChannelRegistry {
         // continually superseded receipts. Bound this whole operation, then
         // release its queue slot and surface the failure to delivery joiners.
         // Its open flag needs no change here: every retry follows a replaced
-        // registration, a retarget (already invalidated), or a receipt for
-        // this very target.
+        // registration, a retarget (already invalidated, whether the old
+        // target's RPC was answered or failed), or a receipt for this very
+        // target.
         if (attempts >= MAX_CHANNEL_LIFECYCLE_ATTEMPTS) {
           const error = new ChannelLifecycleConvergenceError(
             `Channel ${channelId} did not converge after ${attempts} lifecycle attempts; its target or desired state kept changing`,
@@ -2282,6 +2284,15 @@ export class ChannelRegistry {
           if (this.channels.get(channelKey) === entry) {
             if (sameTarget()) this.unconfirmedChannelTargets.add(entry);
             else this.invalidateTransportConfirmation(entry);
+          }
+          // A retarget while this RPC was out queued nothing for the new
+          // target, since handleChanged leaves that to this operation. So a
+          // failure for the old target says nothing about the new one, and a
+          // channel still decided open or tuned out tries its new target,
+          // within the attempt limit.
+          if (this.channels.get(channelKey) === entry && !sameChannelTarget(entry.descriptor, descriptor)) {
+            const now = this.getDesiredState(serverId, channelId);
+            if (now === 'open' || now === 'tuned-out') continue;
           }
           throw error;
         }
