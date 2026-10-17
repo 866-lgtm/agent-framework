@@ -1946,9 +1946,9 @@ test("a write that changes a debounce rule sends its batch as the timer would: h
   assert.deepEqual(wakes, ['agent'], 'and sent when it ends');
 });
 
-test("a write clears every rule's state before it sends a batch, and sends each batch on its own, so a delivery that throws leaves nothing behind", (t) => {
+test("a write clears every rule's state before it sends a batch, and sends each batch on its own; one whose delivery throws is named in the log and dropped, and the change returns as made", (t) => {
   const dir = tempDir(t);
-  t.mock.method(console, 'error', () => {});
+  const logged = t.mock.method(console, 'error', () => {});
   const configPath = join(dir, 'gate.json');
   const quiet = { name: 'quiet', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 60000 } };
   const limited = { name: 'limited', match: { tagsAny: ['chat:ambient'] }, behavior: { rate_limit: { tokens: 1, refillIntervalMs: 3_600_000 } } };
@@ -1970,10 +1970,41 @@ test("a write clears every rule's state before it sends a batch, and sends each 
 
   // gate.json is edited to drop all three, and a change is made before a reload reads it; quiet's batch, sent first, can't be delivered.
   writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [] }));
-  assert.throws(() => gate.addPolicy(MENTIONS), /no agent to deliver to/);
+  assert.deepEqual(gate.addPolicy(MENTIONS), MENTIONS, 'the change returns as made');
+  assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions'], 'it was saved');
+  assert.deepEqual(names(gate), ['mentions'], 'and is in force');
+  assert.deepEqual(
+    logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
+    ['[gate] Policy "quiet": its pending batch couldn\'t be delivered (no agent to deliver to), so its events are dropped'],
+  );
   const state = gate as unknown as { rateLimitBuckets: Map<string, unknown>; debounceTimers: Map<string, unknown> };
   assert.equal(state.rateLimitBuckets.has('limited'), false, "limited's spent bucket is cleared, though quiet's batch came first");
   assert.equal(state.debounceTimers.has('quiet'), false, "quiet's batch isn't left to be sent again");
   assert.deepEqual(wakes, ['agent'], "later's batch is still sent");
   assert.equal(state.debounceTimers.has('later'), false, 'and nothing is left behind');
+});
+
+test("a reload whose pending batch can't be delivered still puts the new rules in force, naming the batch it dropped", (t) => {
+  const dir = tempDir(t);
+  const logged = t.mock.method(console, 'error', () => {});
+  const configPath = join(dir, 'gate.json');
+  const quiet = { name: 'quiet', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 60000 } };
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet] }));
+  const gate = new EventGate({
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: () => {},
+    addMessage: () => { throw new Error('no agent to deliver to'); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(MENTION).trigger, false, "the mention waits in quiet's batch");
+
+  // gate.json is edited to drop the rule, and the reload's delivery of its batch throws.
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [MENTIONS] }));
+  (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(gate.evaluate(MENTION).trigger, true, 'the new rules are in force, so the mention wakes the agent');
+  assert.deepEqual(names(gate), ['mentions']);
+  assert.deepEqual(
+    logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
+    ['[gate] Policy "quiet": its pending batch couldn\'t be delivered (no agent to deliver to), so its events are dropped'],
+  );
+  assert.equal((gate as unknown as { debounceTimers: Map<string, unknown> }).debounceTimers.has('quiet'), false, 'nothing is left behind');
 });

@@ -456,7 +456,7 @@ function fieldNames(
       unread.push(key);
       continue;
     }
-    // closestNames keeps every name isNearMiss accepts, in its order.
+    // closestNames keeps every name decided on above, in its order.
     slips.push({ key, meant: closestNames(key, near, near.length) });
   }
   return { slips, unread };
@@ -2123,8 +2123,9 @@ export class EventGate {
    * history, not live state, and one kept with the same behavior keeps all its
    * state, its denial and fire counts included. Each pending debounce batch is
    * sent last, as its timer would have sent it, once every rule's state is
-   * cleared, so a delivery that throws leaves no state behind and keeps no
-   * other batch from being sent.
+   * cleared. One whose delivery throws is named in the log and dropped, and
+   * the rest are still sent: the write or reload that cleared it has done what
+   * it was for, so its caller hears that it did, and no state is left behind.
    */
   private clearStateFor(was: GateConfig, next: GateConfig): { removed: string[]; cleared: string[] } {
     const behaviorByName = new Map<string, string>();
@@ -2147,12 +2148,14 @@ export class EventGate {
       }
     }
     // Each batch is sent on its own, as each timer would send it, so one whose
-    // delivery throws doesn't keep the rest; the first error is thrown after.
-    let failed: { err: unknown } | undefined;
+    // delivery throws doesn't keep the rest.
     for (const name of [...removed, ...cleared]) {
-      try { this.fireDebounce(name); } catch (err) { failed ??= { err }; }
+      try {
+        this.fireDebounce(name);
+      } catch (err) {
+        console.error(`[gate] Policy "${name}": its pending batch couldn't be delivered (${errorText(err)}), so its events are dropped`);
+      }
     }
-    if (failed) throw failed.err;
     return { removed, cleared };
   }
 
@@ -2358,8 +2361,9 @@ export class EventGate {
    * rules are in force, a rule that was in force that it leaves out or gives
    * another behavior loses its state (clearStateFor), last, since a pending
    * batch it sends can't be taken back, and a write that fails leaves the
-   * rules in force with their state. Throws if the write fails
-   * (disk/permission) — callers surface it as a tool error.
+   * rules in force with their state; a batch that can't be delivered is
+   * logged, not thrown. Throws if the write fails (disk/permission) — callers
+   * surface it as a tool error.
    */
   private writeConfig(top: Record<string, unknown>, rules: unknown[], remedy?: string): void {
     const text = JSON.stringify({ ...top, policies: rules }, null, 2) + '\n';
