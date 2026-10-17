@@ -2053,7 +2053,7 @@ test("stop() over a running ephemeral run settles the run's pending batch before
     const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
       .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
     h.framework.start();
-    await completion;
+    await bounded(completion, 'the run settling');
   } finally { await h.framework.stop(); }
   assert.match(outcome, /^rejected: Framework shutting down/, 'the run ends through the shutdown terminal');
   assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
@@ -2064,6 +2064,61 @@ test("stop() over a running ephemeral run settles the run's pending batch before
     assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
   } finally { await restarted.stop(); }
 });
+
+/** Make a scripted stream report its cancel as an `error` event, or by just
+ *  closing; a MockYieldingStream reports it as `aborted` by itself. */
+function reportCancelAs(stream: MockYieldingStream, shape: 'aborted' | 'error' | 'closes') {
+  if (shape === 'aborted') return;
+  const s = stream as unknown as { cancel: () => void; _done: boolean; events: unknown[]; pendingResolve: null | (() => void) };
+  s.cancel = function (this: typeof s) {
+    this._done = true;
+    if (shape === 'error') this.events.push({ type: 'error', error: new Error('stream cancelled') });
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    resolve?.();
+  };
+}
+
+// A caller's cancel ends the run through settleDeliberateCancel, which leaves
+// the batch to driveStream's finally: its callers leave the stream case with
+// `break` or end after the loop, so that finally runs while the agent is still
+// registered. Pinned for each way the stream reports the cancel.
+for (const how of ['abortInference', 'cancelStream'] as const) {
+  for (const shape of ['aborted', 'error', 'closes'] as const) {
+    const reported = shape === 'closes' ? 'just closes' : `reports the cancel as ${shape === 'error' ? 'an error' : '`aborted`'}`;
+    test(`${how}() over a running ephemeral run settles its pending batch, with a stream that ${reported}`, async () => {
+      const h = await harness([[calls('one')]]);
+      let spills = 0;
+      slowSpill(h.framework, async () => { spills++; });
+      h.membrane.onSubmit = () => {
+        queueMicrotask(() => {
+          reportCancelAs(h.membrane.streams.at(-1)!, shape);
+          if (how === 'abortInference') h.framework.abortInference('ephemeral', 'caller');
+          else h.framework.getAgent('ephemeral')!.cancelStream('caller');
+        });
+      };
+      let outcome = 'pending';
+      try {
+        const created = await h.framework.createEphemeralAgent({
+          name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+        });
+        created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+        const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+          .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+        h.framework.start();
+        await bounded(completion, 'the run settling');
+      } finally { await h.framework.stop(); }
+      assert.match(outcome, /^rejected: Stream cancelled/, "the run ends through the caller's cancel");
+      assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
+      const restarted = await AgentFramework.create(h.base);
+      try {
+        const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+        const settled = audit.filter((r) => r.agentName === 'ephemeral' && r.type === 'withheld').map((r) => r.reason);
+        assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
+      } finally { await restarted.stop(); }
+    });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // #281's review: each withheld result's file is its own, a branch change stops
@@ -3288,6 +3343,55 @@ test('a framework compile from before stop cannot drive after restart', async ()
     // A turn begun after the restart is admitted and drives its stream.
     await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
     await until(() => driven === 1, 'the turn begun after the restart drives');
+  } finally { compile.open(); await starting; await framework.stop(); store.close(); }
+});
+
+test("a dropped turn's cancel record is not read by the next turn's stream: its own error stays a failure", async () => {
+  // The dropped turn calls agent.cancelStream() on a stream no driver iterates,
+  // so the cancel record it leaves is never collected. The next stream's start
+  // clears it; were it left, that stream's genuine error would read it and end
+  // as a deliberate stop instead of a failure.
+  const dir = mkdtempSync(join(tmpdir(), 'guard-dropped-record-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  // The dropped turn's answer, then the next turn's (made to error), then a retry's.
+  const membrane = new ScriptMembrane([[answer()], [answer()], [answer()]]);
+  const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const agent = framework.getAgent('assistant')!;
+  const compile = gate();
+  const entered = gate();
+  const build = agent.buildActivationRequest.bind(agent);
+  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  const stream = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (...args) => {
+    const result = stream(...args);
+    // The first stream iterated is the next turn's: it fails on its own.
+    if (membrane.streams.length === 2) {
+      (result as unknown as { events: unknown[] }).events.unshift({ type: 'error', error: new Error('provider failed') });
+    }
+    return result;
+  };
+  let starting: Promise<void> | undefined;
+  try {
+    const error = console.error;
+    console.error = () => {};
+    try {
+      starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      await entered.opened;
+      await framework.stop();
+      framework.start();
+      compile.open();
+      await starting;
+    } finally { console.error = error; }
+    const events: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') events.push(event.type);
+    });
+    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+    await until(() => events.includes('inference:failed') || events.includes('inference:aborted'), "the next turn's stream ends");
+    assert.ok(events.includes('inference:failed'), `its error takes the failure path: ${JSON.stringify(events)}`);
+    assert.ok(!events.includes('inference:aborted'), `not a deliberate stop: ${JSON.stringify(events)}`);
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
 

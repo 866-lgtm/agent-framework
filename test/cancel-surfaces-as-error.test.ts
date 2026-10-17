@@ -221,3 +221,28 @@ describe('a cancel that the stream reports as `error` is still a deliberate stop
     }
   });
 });
+
+/** Parks until cancel(), then reports it as `aborted` with reason `error`:
+ *  the stream's own word that the call failed, after a caller's cancel. */
+class AbortedWithErrorOnCancelStream extends ErroringOnCancelStream {
+  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await new Promise<void>((resolve) => { (this as unknown as { release: () => void }).release = resolve; });
+    yield { type: 'aborted', reason: 'error' } as StreamEvent;
+  }
+}
+
+describe("the stream's own word decides before a caller's record", () => {
+  it('after a caller\'s cancel, an `aborted` whose reason is `error` stays a failure', async () => {
+    const { framework, agent, traces, teardown } = await boot('cancel-aborted-error-', () => new AbortedWithErrorOnCancelStream());
+    try {
+      agent.cancelStream('operator');
+      await waitFor(() => types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted').length > 0);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.ok(!types(traces, 'inference:aborted').length, `not a deliberate stop: ${JSON.stringify(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'))}`);
+      assert.ok(types(traces, 'inference:exhausted').length > 0, 'the failure pipeline ends it');
+      assert.ok(!contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]')), 'no deliberate-stop marker');
+    } finally {
+      await teardown();
+    }
+  });
+});
