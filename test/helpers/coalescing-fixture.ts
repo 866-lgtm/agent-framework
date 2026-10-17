@@ -17,11 +17,13 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './mock-mem
 export const TS = '2026-09-30T00:00:00Z';
 
 /**
- * How long send() waits for any request's reply. The deadline is a hang
- * guard: it turns a reply that never comes into a failure instead of a hung
- * run, and no assertion rests on it. So it's set wide, and the same for every
- * request: a loaded host's stall needn't be in proportion to a request's
- * work, so a bound sized to the work can still cut off a host that answers.
+ * How long the fixture's waits run before they fail: send() for a request's
+ * reply, answered() for the host's answers, eventually() for its condition.
+ * Each is a hang guard: it turns a wait that never ends into a failure
+ * instead of a hung run, and it isn't a check on how fast the host works. So
+ * it's set wide, and the same for every wait: a loaded host's stall needn't
+ * be in proportion to the work waited on, so a bound sized to the work can
+ * still cut off a host that's getting there.
  */
 export const REPLY_DEADLINE_MS = 60_000;
 
@@ -96,17 +98,13 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
     register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
-    /** Waits until the host has answered every request sent, including one
-     *  whose send already failed at its deadline, for up to REPLY_DEADLINE_MS.
-     *  A test that leaves the host still working on a request waits for this
-     *  before it closes, so the close doesn't take away what that work uses. */
-    answered: async () => {
-      const deadline = performance.now() + REPLY_DEADLINE_MS;
-      while (replies.size > 0) {
-        assert(performance.now() < deadline, `the host left ${replies.size} request(s) unanswered for ${REPLY_DEADLINE_MS / 1000} s`);
-        await new Promise((r) => setTimeout(r, 10));
-      }
-    },
+    /** Waits, as eventually() does, until the host has answered every request
+     *  the test sent through send(), including one whose send already failed
+     *  at its deadline. A test that leaves the host still working on such a
+     *  request waits for this before it closes, so the close doesn't take away
+     *  what that work uses. It polls on setTimeout, so call it with real
+     *  timers. */
+    answered: () => eventually(() => replies.size === 0, "the host's replies to the requests sent"),
     /** A coalesced channels/incoming message for platform message `m`. */
     channel: (eventId: string, text: string, flags: Record<string, unknown> = {}, channelId = 'chat', messageId = 'm') => ({
       channelId, messageId, eventId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ['chat:mention'],
@@ -139,10 +137,11 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   };
 }
 
+/** Waits until `predicate` holds, for up to REPLY_DEADLINE_MS. */
 export async function eventually(predicate: () => boolean, what = 'condition'): Promise<void> {
   // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
-  const deadline = performance.now() + 3000;
-  while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
+  const deadline = performance.now() + REPLY_DEADLINE_MS;
+  while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle within ${REPLY_DEADLINE_MS / 1000} s`); await new Promise((r) => setTimeout(r, 10)); }
 }
 
 
