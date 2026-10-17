@@ -1857,8 +1857,12 @@ for (const who of ['resident', 'conversation agent'] as const) {
   });
 }
 
-test('a budget restart held at the last boundary is inferring at the event gate again when it runs after the wait', async () => {
+test('a budget restart held at the last boundary is inferring at the event gate again when it runs after the wait', async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    // Shorter than the retry's 1 s sleep, as in the tests above: the held
+    // clock keeps it binding when the retry wakes, however late that is.
+    const wait = 400;
     const log = silence();
     // The restart's stream fails to start, with no stated wait, so the error
     // policy retries it after 1 s. A wait recorded while it sleeps holds the
@@ -1892,13 +1896,15 @@ test('a budget restart held at the last boundary is inferring at the event gate 
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-first' }]);
       internal.pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
       await waitFor(fw, () => internal.retryWaitWakers.size > 0, 'the restart asleep before its retry');
-      internal.providerWaits.set('resident', 'zz-model', 2_500, 'zz recorded while the restart slept');
+      internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the restart slept');
       await waitFor(fw, () => membrane.primary >= 2 || internal.providerAccelerationCooldowns.has('resident'),
         'the retry, sent or held');
       assert.equal(membrane.primary, 1, 'the retry is held, not sent');
       assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, [], 'the hold ends the turn at the gate');
 
-      await waitFor(fw, () => membrane.primary >= 2, 'the restart after the wait', 10_000);
+      // The wait passes, and the hold's timer, a real one, queues the restart.
+      clock.pass(wait);
+      await waitFor(fw, () => membrane.primary >= 2, 'the restart after the wait');
       assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['resident'], 'the restart is inferring while it runs');
       release();
       await waitFor(fw, () => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the restart to end');
