@@ -6524,17 +6524,9 @@ export class AgentFramework {
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
-        // turn's end, goes to its store now, past its deferral: once the run
-        // is deregistered, a flush finds no agent to take it and drops it.
-        // The run's namespace stays in the store for investigation, so the
-        // messages stay with it. A quiesced host defers them again instead,
-        // as stop() does. What is still queued then, deferred again or put
-        // back because its store threw, leaves with the run, logged as lost.
-        const queued = this.drainDeferredFor(agent.name);
-        if (queued.length > 0) {
-          this.readdDrained(queued, `end of ephemeral run ${agent.name}`, { bypassDeferral: !this.quiesced });
-          this.ackDeferredWrites();
-        }
+        // turn's end, goes to its store now (storeDeferredFor), and what that
+        // can't store leaves with the run, logged as lost (dropDeferredFor).
+        this.storeDeferredFor(agent.name, `end of ephemeral run ${agent.name}`);
         this.dropDeferredFor(agent.name, `end of ephemeral run ${agent.name}`);
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
@@ -10143,8 +10135,9 @@ export class AgentFramework {
    * agent registered would just grow every agent scan and broadcast filter
    * forever. The fork's context stays in Chronicle for investigation. What
    * is still queued for it leaves with it, logged as lost (dropDeferredFor).
-   * When the end of its closure turn disposes it, that turn's flush has
-   * already stored what it could.
+   * Each caller has first stored what it could: the end of the fork's
+   * closure turn with that turn's flush, and the fallback reaper with
+   * storeDeferredFor.
    */
   private disposeConversationAgent(agentName: string): void {
     this.dropDeferredFor(agentName, `disposal of conversation fork ${agentName}`);
@@ -10252,11 +10245,15 @@ export class AgentFramework {
     // Fallback reaper: a closing fork whose closure inference never ran
     // (request dropped as stale, inference policy veto) would otherwise stay
     // registered forever. No active stream + no pending request = done.
+    // What is still queued for it goes to its store first, as at the end of
+    // a closure turn (storeDeferredFor), and what can't be stored leaves
+    // with it (disposeConversationAgent).
     for (const agentName of [...this.closingConversationAgents]) {
       if (
         !this.activeStreams.has(agentName) &&
         !this.pendingRequests.some((r) => r.agentName === agentName)
       ) {
+        this.storeDeferredFor(agentName, `disposal of conversation fork ${agentName}`);
         this.disposeConversationAgent(agentName);
       }
     }
@@ -16111,6 +16108,24 @@ export class AgentFramework {
     // acknowledge before the write is durable.
     this.handOffDeferredWrites(drained);
     return drained;
+  }
+
+  /**
+   * Before an agent leaves the framework, what is still queued for it goes to
+   * its store, past its deferral: once the agent is gone, a flush finds no
+   * agent to take it and drops it. The agent's namespace stays in the store
+   * for investigation, so the messages stay with it. A quiesced host defers
+   * each entry again instead, as stop() does. Called at an ephemeral run's
+   * deregistration and by the fallback reaper before it disposes a closing
+   * fork; the end of a closure turn has its own flush. What this can't store,
+   * put back because its store threw or deferred again, dropDeferredFor takes
+   * out after it.
+   */
+  private storeDeferredFor(agentName: string, where: string): void {
+    const queued = this.drainDeferredFor(agentName);
+    if (queued.length === 0) return;
+    this.readdDrained(queued, where, { bypassDeferral: !this.quiesced });
+    this.ackDeferredWrites();
   }
 
   /**

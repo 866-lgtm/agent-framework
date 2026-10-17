@@ -711,6 +711,52 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it('a write queued for a closing fork whose closure turn never ran is stored in the fork before the reaper disposes it', async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D7', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const fork = 'conversation-slack-D7-g1';
+    const g1 = framework.getAgent(fork)!;
+    assert.ok(g1, 'g1 fork should exist after spawn');
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+      deferredMessages: Array<{ forAgent?: string }>;
+      pendingRequests: Array<{ agentName: string }>;
+      activeTurnTokens: Map<string, number>;
+      lastConversationSweep: number;
+      sweepExpiredConversations(): void;
+    };
+    // The sweep closes the fork and queues its closure turn, and the request
+    // is then dropped before it runs, as a stale one is.
+    forceExpiry(framework, 'slack:D7', IDLE_TTL_MS);
+    internals.sweepExpiredConversations();
+    assert.equal(internals.pendingRequests.filter((r) => r.agentName === fork).length, 1, 'the closure turn is queued');
+    internals.pendingRequests.splice(0, internals.pendingRequests.length,
+      ...internals.pendingRequests.filter((r) => r.agentName !== fork));
+    // A write for the fork that was deferred meanwhile.
+    internals.activeTurnTokens.set(fork, 1);
+    assert.equal(internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined, { forAgent: fork }), '', 'deferred');
+    internals.activeTurnTokens.delete(fork);
+
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      internals.lastConversationSweep = 0;
+      internals.sweepExpiredConversations();
+    } finally { console.error = error; }
+
+    assert.equal(framework.getAgent(fork), null, 'the reaper disposed it: its closure turn never ran');
+    const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+    assert.ok(stored[stored.length - 1]!.includes('one more thing'), `stored in the fork before it was disposed:\n${stored.join('\n')}`);
+    assert.deepEqual(internals.deferredMessages.filter((m) => m.forAgent === fork), [], 'nothing is left queued for the fork');
+    assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
+
+    await framework.stop();
+  });
+
   it('a closure turn that restarts is disposed by the frame that ends it, after storing what was held for it', async () => {
     const IDLE_TTL_MS = 60_000;
     // One tool, for the closure turn's tool round.
