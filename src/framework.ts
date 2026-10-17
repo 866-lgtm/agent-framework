@@ -8834,24 +8834,37 @@ export class AgentFramework {
             await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars);
 
           // A spill writes to the workspace, and the turn can be stopped
-          // meanwhile: a host's cancelStream, stop() and abortInference cancel
-          // the round's stream at `ready` and leave the agent idle, a quiesce's
-          // abandon cancels it and driveStream resets the agent, and an
-          // ephemeral run's disposal cancels it before deregistering. Each
-          // replaces the `ready` state this boundary began from. The round
-          // then ends here: it isn't resumed, restarted or settled again, and
-          // neither its tool_use nor its results are stored, since its blocks
-          // are stored only below; the stop's teardown deletes them, as when a
-          // stop comes while the round's tools run. A result that spilled
-          // keeps its workspace file, and its images stay in the agent's image
-          // ledger until the ledger evicts them; nothing stored names either.
-          // One tool:result_dropped goes out, for the result being handled,
-          // as at the batch hook's drop above.
+          // meanwhile. A host's cancelStream, stop() and abortInference cancel
+          // the round's stream at `ready` and leave the agent idle, and an
+          // ephemeral run's disposal cancels it before deregistering: each
+          // replaces the `ready` state this boundary began from. A quiesce's
+          // abandon records its cancel, cancels the stream and leaves the
+          // agent's state to driveStream, which resets it once it reads the
+          // stream's end, and that can come after this check. So the round
+          // also ends here when the framework has recorded a cancel of the
+          // stream (this boundary's own, turn_ended and budget_restart, are
+          // set below) and the stream is no longer waiting for these results.
+          // The stream's state is what makes the record this stream's: one
+          // left under the same key by an earlier stream, such as an earlier
+          // agent's of the same name, sits beside a stream still waiting. The
+          // round then isn't resumed, restarted or settled again, and neither
+          // its assistant content (its text, any thinking, its tool_use) nor
+          // its results are stored, since they're stored only below; the
+          // stop's teardown deletes them, as when a stop comes while the
+          // round's tools run. A result that spilled keeps its workspace file,
+          // and the images its results carried stay in the agent's image
+          // ledger until the ledger evicts them, or until stop() or an
+          // ephemeral run's disposal discards the ledger; nothing stored names
+          // either. One tool:result_dropped goes out, for the result being
+          // handled, as at the batch hook's drop above.
           const after = agent.state as AgentState;
-          if (after !== currentState) {
+          const cancelledAs = this.frameworkCancelledStreams.get(`${agent.name}:${agent.streamId}`);
+          const cancelled = cancelledAs !== undefined && currentState.stream?.isWaitingForTools === false;
+          if (after !== currentState || cancelled) {
             console.warn(
               `[framework] Dropping the tool round of agent '${agent.name}' (callId=${event.callId}): ` +
-              `its turn changed while the round's results were prepared (status '${after.status}'), ` +
+              `its turn was stopped while the round's results were prepared (status '${after.status}'` +
+              `${cancelled ? `, stream cancelled: ${cancelledAs}` : ''}), ` +
               `so the round isn't stored and its stream isn't resumed.`,
             );
             this.emitTrace({

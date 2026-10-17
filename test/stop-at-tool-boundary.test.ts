@@ -6,7 +6,9 @@
  * abortInference(), a quiesce's abandon and an ephemeral run's disposal end
  * the turn there as they do while the round's tools run: the stream is
  * cancelled, the round isn't resumed, restarted or stored, and the turn's
- * teardown runs. A round nobody stops is stored whole once its write is done.
+ * teardown runs. A quiesce's abandon does so whether or not driveStream has
+ * read the stream's end before the write returns. A round nobody stops is
+ * stored whole once its write is done.
  */
 
 import { describe, it } from 'node:test';
@@ -25,6 +27,7 @@ import {
   type YieldingStreamOptions,
 } from '@animalabs/membrane';
 import type {
+  ContentBlock,
   EventResponse,
   Module,
   ModuleContext,
@@ -90,15 +93,20 @@ class StreamRecord {
 class StoppableMembrane extends MockMembrane {
   readonly streams: StreamRecord[] = [];
   onResumeAttempt = (): void => {};
+  /** When set, a cancel refuses results at once, as membrane's does, but its
+   *  `aborted` reaches the stream's reader only once this settles. */
+  abortedAfter: Promise<void> | null = null;
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
     const inner = super.streamYielding(request, options);
     const record = new StreamRecord(() => this.onResumeAttempt());
     this.streams.push(record);
+    const abortedAfter = this.abortedAfter;
     return {
       cancel: () => {
         if (record.cancelled) return;
         record.markCancelled();
-        inner.cancel();
+        if (abortedAfter) void abortedAfter.then(() => inner.cancel());
+        else inner.cancel();
       },
       provideToolResults: (...args: unknown[]) => {
         record.markResumeAttempt();
@@ -167,7 +175,12 @@ function scriptedMembrane(): { membrane: RealMembrane; streams: StreamRecord[]; 
   return { membrane, streams, requests, onResumeAttempt };
 }
 
-/** One `fetch` tool whose result is over the inline cap, so it spills. */
+/** A 1×1 PNG. */
+const PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+
+/** One `fetch` tool whose result is over the inline cap, so it spills, and
+ *  carries an image, which the framework retains in the agent's image ledger
+ *  as it prepares the round's results. */
 class OversizedResultModule implements Module {
   readonly name = 'canned';
   private ctx: ModuleContext | null = null;
@@ -177,7 +190,13 @@ class OversizedResultModule implements Module {
     return [{ name: 'fetch', description: 'Returns a large payload.', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    return { success: true, data: { blob: 'x'.repeat(5_000) } };
+    return {
+      success: true,
+      data: [
+        { type: 'text', text: 'x'.repeat(5_000) },
+        { type: 'image', data: PIXEL, mimeType: 'image/png' },
+      ],
+    };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type === 'external-message') {
@@ -194,13 +213,15 @@ class OversizedResultModule implements Module {
   }
 }
 
-/** Holds the round's spill write until `open()`. */
-function holdSpills(workspace: WorkspaceModule): { entered: Promise<void>; written: Promise<void>; open: () => void } {
+/** Holds the round's spill write until `open()`, and keeps each path written. */
+function holdSpills(workspace: WorkspaceModule): { entered: Promise<void>; written: Promise<void>; open: () => void; paths: string[] } {
   const entered = deferred();
   const released = deferred();
   const written = deferred();
+  const paths: string[] = [];
   const write = workspace.writeBinary.bind(workspace);
   workspace.writeBinary = (async (...args: Parameters<typeof write>) => {
+    paths.push(args[0]);
     entered.resolve();
     await released.promise;
     try {
@@ -209,14 +230,36 @@ function holdSpills(workspace: WorkspaceModule): { entered: Promise<void>; writt
       written.resolve();
     }
   }) as typeof workspace.writeBinary;
-  return { entered: entered.promise, written: written.promise, open: () => released.resolve() };
+  return { entered: entered.promise, written: written.promise, open: () => released.resolve(), paths };
 }
 
 /** Each block in a window, in order: its type and its text or call id. */
 function blocksOf(messages: unknown): string[] {
-  return (messages as Array<{ content: Array<{ type: string; id?: string; toolUseId?: string; text?: string }> }>)
-    .flatMap((m) => m.content.map((b) => b.type === 'text' ? `text:${b.text}` : `${b.type}:${b.id ?? b.toolUseId}`));
+  return (messages as Array<{ content: Array<{ type: string; id?: string; toolUseId?: string; text?: string; thinking?: string }> }>)
+    .flatMap((m) => m.content.map((b) =>
+      b.type === 'text' ? `text:${b.text}`
+        : b.type === 'thinking' ? `thinking:${b.thinking}`
+          : `${b.type}:${b.id ?? b.toolUseId}`));
 }
+
+/** The framework's image ledgers, by agent name. */
+function imageLedgers(framework: AgentFramework): Map<string, { refFor(toolCallId: string, blockIndex: number): string | undefined }> {
+  return (framework as unknown as { toolImageLedgers: Map<string, { refFor(toolCallId: string, blockIndex: number): string | undefined }> }).toolImageLedgers;
+}
+
+/** A round with thinking, text and two calls, each of whose results spills. */
+const TWO_CALL_ROUND: ContentBlock[] = [
+  { type: 'thinking', thinking: 'Both payloads are needed.', signature: 'sig-two-calls' } as ContentBlock,
+  { type: 'text', text: 'Fetching both.' },
+  { type: 'tool_use', id: 'call_fetch', name: 'canned--fetch', input: {} },
+  { type: 'tool_use', id: 'call_fetch2', name: 'canned--fetch', input: {} },
+];
+
+/** The blocks of TWO_CALL_ROUND and its results, as a window shows them. */
+const TWO_CALL_BLOCKS = new Set([
+  'thinking:Both payloads are needed.', 'text:Fetching both.',
+  'tool_use:call_fetch', 'tool_use:call_fetch2', 'tool_result:call_fetch', 'tool_result:call_fetch2',
+]);
 
 type Dropped = Extract<TraceEvent, { type: 'tool:result_dropped' }>;
 const isDropped = (t: TraceEvent): t is Dropped => t.type === 'tool:result_dropped';
@@ -238,6 +281,8 @@ interface Boundary {
   /** The round's rows in the agent's window: its tool_use or tool_result. */
   roundRows: () => string[];
   blocks: () => string[];
+  /** What the workspace holds at the round's first spill path. */
+  spilled: () => Promise<string>;
   /** stop(), bounded: a stream left running fails the test. */
   stop: () => Promise<void>;
   cleanup: () => Promise<void>;
@@ -251,6 +296,11 @@ interface HoldOptions {
    *  rather than on the first stream's resume: the mock gives a stream every
    *  response queued when it opens. */
   answerOnNextStream?: boolean;
+  /** The mock's first round, rather than 'Fetching.' and one call. */
+  firstRound?: ContentBlock[];
+  /** The mock's: a cancel's `aborted` reaches driveStream only once this
+   *  settles. */
+  abortedAfter?: Promise<void>;
 }
 
 /** A turn held at its tool boundary: the round's one result is in and is
@@ -274,7 +324,8 @@ async function holdAtToolBoundary(options: HoldOptions = {}): Promise<Boundary> 
   } else {
     const mock = new StoppableMembrane();
     mock.onResumeAttempt = () => decided.resolve();
-    mock.pushResponse(createMockResponse([
+    mock.abortedAfter = options.abortedAfter ?? null;
+    mock.pushResponse(createMockResponse(options.firstRound ?? [
       { type: 'text', text: 'Fetching.' },
       { type: 'tool_use', id: 'call_fetch', name: 'canned--fetch', input: {} },
     ], 'tool_use'));
@@ -340,6 +391,10 @@ async function holdAtToolBoundary(options: HoldOptions = {}): Promise<Boundary> 
     turnEnded: () => framework.getHostModeStatus().activeTurns === 0 && agent.state.status === 'idle',
     roundRows: () => blocks().filter((b) => b.endsWith(':call_fetch')).map((b) => b.split(':')[0]),
     blocks,
+    spilled: async () => {
+      const read = await workspace.readBinary(spills.paths[0]);
+      return 'data' in read ? read.data.toString('utf8') : `(${read.error})`;
+    },
     stop: async () => { await within('stop() to finish', framework.stop()); },
     cleanup: async () => {
       if (cleaned) return;
@@ -377,6 +432,9 @@ describe('a stop at a tool boundary', () => {
       await waitFor('the turn to end', b.turnEnded);
       assert.equal(b.requests(), 1, 'no other request was made');
       assert.deepEqual(b.roundRows(), [], 'the stopped round is not in the window, as for a stop while its tools run');
+      assert.ok(!b.blocks().includes('text:Fetching.'), "nor is the round's text");
+      assert.ok((await b.spilled()).includes('x'.repeat(5_000)), "the spilled result keeps its workspace file");
+      assert.ok(imageLedgers(b.framework).get('prime')?.refFor('call_fetch', 1), "the result's image stays in the agent's image ledger");
       await b.stop();
     } finally {
       await b.cleanup();
@@ -417,6 +475,7 @@ describe('a stop at a tool boundary', () => {
       assert.ok(!b.traces.some((t) => t.type === 'inference:stream_resumed'), 'no inference:stream_resumed');
       droppedOnce(b.traces, 'prime');
       assert.equal(b.requests(), 1, 'no other request was made');
+      assert.equal(imageLedgers(b.framework).size, 0, "stop() discards the image ledgers, the result's image with them");
     } finally {
       await b.cleanup();
     }
@@ -461,6 +520,68 @@ describe('a stop at a tool boundary', () => {
       await waitFor('the turn to end', b.turnEnded);
       assert.equal(b.requests(), 1, 'no restart request was made');
       assert.deepEqual(b.roundRows(), [], 'the abandoned round is not in the window');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
+  for (const overBudget of [false, true]) {
+    it(`a quiesce's abandon ends the round when driveStream reads the stream's end only after the boundary has decided${overBudget ? ', over budget' : ''}`, async () => {
+      // Membrane delivers a cancel's `aborted` at once, so driveStream resets
+      // the agent before the write returns (the test above). This stream's
+      // `aborted` waits until the boundary has decided, so the boundary can't
+      // rely on that order: it reads the framework's record of the abandon.
+      const aborted = deferred();
+      const b = await holdAtToolBoundary({
+        abortedAfter: aborted.promise,
+        ...(overBudget ? { maxStreamTokens: 5, answerOnNextStream: true } : {}),
+      });
+      try {
+        const quiescing = b.framework.quiesce({ timeoutMs: 1_000, abandon: true });
+        await within('the abandon to cancel the stream', b.streams[0].whenCancelled);
+        assert.equal(b.framework.getAgent('prime')!.state.status, 'ready', "driveStream hasn't read the stream's end");
+        await b.release();
+        aborted.resolve();
+        assert.equal((await within('the quiesce to finish', quiescing, 15_000)).quiesced, true);
+
+        assert.equal(b.streams[0].resumeAttempts, 0, 'the round was not resumed');
+        assert.ok(!b.traces.some((t) => t.type === 'inference:stream_restarted'), 'no inference:stream_restarted');
+        assert.deepEqual(
+          b.traces.filter(isDropped).map((t) => [t.agentName, t.callId, t.agentStatus]),
+          [['prime', 'call_fetch', 'ready']],
+          "one tool:result_dropped, for the round's call, before driveStream reset the agent",
+        );
+        await waitFor('the turn to end', b.turnEnded);
+        assert.equal(b.requests(), 1, 'no other request was made');
+        assert.deepEqual(b.roundRows(), [], 'the abandoned round is not in the window');
+        await b.stop();
+      } finally {
+        aborted.resolve();
+        await b.cleanup();
+      }
+    });
+  }
+
+  it("a stopped round of two calls stores none of its thinking, text, calls or results, and one tool:result_dropped names the result handled last", async () => {
+    const b = await holdAtToolBoundary({ firstRound: TWO_CALL_ROUND });
+    try {
+      b.framework.getAgent('prime')!.cancelStream();
+      await b.release();
+
+      assert.equal(b.streams[0].resumeAttempts, 0, 'the round was not resumed');
+      const completed = b.traces
+        .filter((t): t is Extract<TraceEvent, { type: 'tool:completed' }> => t.type === 'tool:completed')
+        .map((t) => t.callId);
+      assert.deepEqual([...completed].sort(), ['call_fetch', 'call_fetch2'], 'both calls ran');
+      assert.deepEqual(
+        b.traces.filter(isDropped).map((t) => t.callId),
+        [completed[completed.length - 1]],
+        'one tool:result_dropped, for the result that made the round ready; the earlier one goes without one',
+      );
+      await waitFor('the turn to end', b.turnEnded);
+      assert.equal(b.requests(), 1, 'no other request was made');
+      assert.deepEqual(b.blocks().filter((x) => TWO_CALL_BLOCKS.has(x)), [], 'nothing of the round is in the window');
       await b.stop();
     } finally {
       await b.cleanup();
@@ -522,6 +643,7 @@ describe('a stop at a tool boundary', () => {
         [],
         'the disposed round is not in its window',
       );
+      assert.equal(imageLedgers(framework).has('worker'), false, "the disposal discards the run's image ledger, the result's image with it");
       await within('stop() to finish', framework.stop());
     } finally {
       spills.open();
@@ -548,6 +670,53 @@ describe('a tool boundary nobody stops', () => {
       assert.equal(blocks[toolUse + 1], 'tool_result:call_fetch', 'its result is stored right after it');
       assert.ok(blocks.indexOf('text:meanwhile') > toolUse + 1, 'the message sent during the write lands after the round');
       assert.equal(b.traces.filter(isDropped).length, 0, 'nothing was dropped');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
+  it('stores a round of two calls whole: its thinking, text and calls, then both results', async () => {
+    const b = await holdAtToolBoundary({ firstRound: TWO_CALL_ROUND });
+    try {
+      await b.release();
+
+      assert.ok(b.traces.some((t) => t.type === 'inference:stream_resumed'), 'the round was resumed');
+      await waitFor('the turn to end', b.turnEnded);
+      const blocks = b.blocks();
+      const start = blocks.indexOf('thinking:Both payloads are needed.');
+      assert.ok(start >= 0, "the round's thinking is stored");
+      assert.deepEqual(
+        blocks.slice(start, start + 4),
+        ['thinking:Both payloads are needed.', 'text:Fetching both.', 'tool_use:call_fetch', 'tool_use:call_fetch2'],
+        'its thinking, text and calls, in order',
+      );
+      assert.deepEqual(blocks.slice(start + 4, start + 6).sort(), ['tool_result:call_fetch', 'tool_result:call_fetch2'], 'then both results');
+      assert.equal(b.traces.filter(isDropped).length, 0, 'nothing was dropped');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
+  it("a cancel recorded under the stream's key that wasn't this stream's drops nothing", async () => {
+    const b = await holdAtToolBoundary();
+    try {
+      // One recorded against an earlier agent of the same name would sit
+      // under this key, since that agent numbered its streams from 1 too.
+      // This stream is still waiting for its results.
+      const agent = b.framework.getAgent('prime')!;
+      (b.framework as unknown as { frameworkCancelledStreams: Map<string, string> })
+        .frameworkCancelledStreams.set(`prime:${agent.streamId}`, 'quiesce_abandoned');
+      await b.release();
+
+      assert.ok(b.traces.some((t) => t.type === 'inference:stream_resumed'), 'the round was resumed');
+      assert.equal(b.traces.filter(isDropped).length, 0, 'nothing was dropped');
+      await waitFor('the turn to end', b.turnEnded);
+      const blocks = b.blocks();
+      const toolUse = blocks.indexOf('tool_use:call_fetch');
+      assert.ok(toolUse >= 0, "the round's tool_use is stored");
+      assert.equal(blocks[toolUse + 1], 'tool_result:call_fetch', 'with its result right after it');
       await b.stop();
     } finally {
       await b.cleanup();

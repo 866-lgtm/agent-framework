@@ -11,14 +11,14 @@
   `true`.
   - **What a host sees:** the stop's own terminal event instead of a turn
     that goes on. The stopped round isn't stored, as when a stop comes
-    while its tools run: neither its tool_use nor its results reach the
-    window. A result that spilled keeps its workspace file, and its images
-    stay in the agent's image ledger until the ledger evicts them.
+    while its tools run: neither its assistant content (its text, any
+    thinking and its tool_use) nor its results reach the window. A result
+    that spilled keeps its workspace file, which nothing stored names.
     `tool:result_dropped` is emitted once, for the result the boundary was
     handling, as for a result whose turn changed while modules caught up
     with the batch. The round's earlier results go with it, without events
     of their own.
-  - **What a reader of the store sees:** a round's tool_use row is stored
-    with its results, after the spill's workspace write, rather than
-    before it. While the write runs, neither is in the window, so the
-    window never holds the tool_use without its results.
+  - **What a reader of the store sees:** a round's assistant row, with its
+    tool_use, is stored with its results, after the spill's workspace
+    write, rather than before it. While the write runs, neither is in the
+    window, so the window never holds the tool_use without its results.
