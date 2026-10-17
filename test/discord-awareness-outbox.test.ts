@@ -2580,10 +2580,12 @@ test("a legacy ledger whose batches the released readers would have refused can'
   const v1 = { id: 'legacy-v1', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', emoji: '💤', createdAt: 1, refs: [ref('m1')] };
   const without = <T extends object>(value: T, key: string) => Object.fromEntries(Object.entries(value).filter(([k]) => k !== key));
   // Every field the released readers (0.6.7 to 0.22.2) checked, each made
-  // wrong in turn: a batch's, an interval's, an entry's, and a version 1
-  // batch's and ref's. Imported as written, the first would retire a
-  // suppression whose removals a start on its branch still owes.
+  // wrong in turn: the document's, a batch's, an interval's, an entry's, and
+  // a version 1 batch's and ref's. Imported as written, the first would
+  // retire a suppression whose removals a start on its branch still owes.
   const refused: Array<[string, unknown]> = [
+    ['version', { version: 3, batches: [v2] }],
+    ['batches', { version: 2, batches: v2 }],
     ['activationPolicy', { version: 2, batches: [{ ...v2, activationPolicy: 'explicit ' }] }],
     ...['id', 'agentName', 'sourceBranch', 'targetBranch', 'emoji'].map((key): [string, unknown] =>
       [key, { version: 2, batches: [{ ...v2, [key]: 7 }] }]),
@@ -2600,7 +2602,12 @@ test("a legacy ledger whose batches the released readers would have refused can'
     ['an entry\'s lastAttemptAt', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastAttemptAt: '1' }] }] }],
     ['an entry\'s lastError', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastError: 7 }] }] }],
     ['a v1 status', { version: 1, batches: [{ ...v1, status: 'active' }] }],
-    ['a v1 ref', { version: 1, batches: [{ ...v1, refs: [without(ref('m1'), 'messageId')] }] }],
+    ...['id', 'agentName', 'sourceBranch', 'targetBranch', 'emoji'].map((key): [string, unknown] =>
+      [`a v1 ${key}`, { version: 1, batches: [{ ...v1, [key]: 7 }] }]),
+    ['a v1 createdAt', { version: 1, batches: [{ ...v1, createdAt: '1' }] }],
+    ['a v1 refs', { version: 1, batches: [{ ...v1, refs: ref('m1') }] }],
+    ...['serverId', 'channelId', 'messageId'].map((key): [string, unknown] =>
+      [`a v1 ref's ${key}`, { version: 1, batches: [{ ...v1, refs: [without(ref('m1'), key)] }] }]),
   ];
   for (const [field, ledger] of refused) {
     writeFileSync(h.legacyPath, JSON.stringify(ledger));
@@ -2608,7 +2615,9 @@ test("a legacy ledger whose batches the released readers would have refused can'
     assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/, field);
     assert.equal(existsSync(h.legacyPath), true, `the ledger stays where it was (${field})`);
   }
-  // As those releases wrote it, it imports, and the suppression's body stays owed.
+  // As those releases wrote them, both import, and the suppression's body stays owed.
+  writeFileSync(h.legacyPath, JSON.stringify({ version: 1, batches: [v1] }));
+  assert.deepEqual(h.reopen().batches().map((b) => b.id), ['legacy-v1']);
   writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [v2] }));
   const outbox = h.reopen();
   assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
