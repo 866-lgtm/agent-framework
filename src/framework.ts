@@ -15132,6 +15132,10 @@ export class AgentFramework {
     return clone;
   }
 
+  /** Writes one inference-log entry. A stream's entries go through its
+   *  driveStream's `logStream`, which gives the stream's usage to one entry
+   *  only; an end that calls this directly for a stream writes a second
+   *  entry for it, and its usage can be counted twice in the log. */
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };

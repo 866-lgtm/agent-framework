@@ -13,9 +13,11 @@
   (`stopReason: 'context_budget'` or `'physical_window'`), without `inference:completed`. A stream
   that errors, aborts or throws after finishing rounds counts them, and its failure entry in the
   inference log carries them. A turn abandoned by an operator quiesce, a stream superseded by a
-  newer one, or one whose agent was disposed, which wrote no entry before, now writes a failure
-  entry naming what ended it and carrying its rounds, and `inferenceCount` counts it, when it had
-  finished a round; one that hadn't has nothing to carry and writes none, as before. Exactly one
+  newer one, one whose agent was disposed, or one that ended with no final response and no other
+  end, which wrote no entry before, now writes a failure entry naming what ended it and carrying
+  its rounds, and `inferenceCount` counts it, when it had finished a round; one that hadn't has
+  nothing to carry and writes none, as before. If the store fails while a stream's end is
+  recorded, the error is reported on stderr and the stream's teardown still runs. Exactly one
   entry of each stream carries its usage, so totals summed from the inference log count each
   stream once, as the session's do. A health snapshot's token totals read the log's newest 1,000
   entries, so with these new entries that window spans fewer turns.
