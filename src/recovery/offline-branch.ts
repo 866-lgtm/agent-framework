@@ -2,6 +2,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { SurgeryMarkerReceipt } from '../operator-log.js';
 import { ContextManager, continuesBody, type BodyShard } from '@animalabs/context-manager';
 import { removeStoredInterval } from '../stored-removal.js';
+import { firstFreeBranchName } from '../branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DISCORD_AWARENESS_ENTRY_LIFT,
@@ -29,6 +30,7 @@ export interface OfflineRecoveryBranchOptions {
   suppressMessageIds?: string[];
   /** Inclusive context-order ranges between Discord message endpoints. */
   suppressRanges?: Array<{ fromMessageId: string; toMessageId: string }>;
+  /** Defaults to `recovery/{agentName}/{ms}`, or with `-2`, `-3`, … appended when the store already holds that name. */
   branchName?: string;
   /** Defaults to the primary-agent namespace `agents/{agentName}`. */
   namespace?: string;
@@ -192,8 +194,9 @@ export async function createOfflineRecoveryBranch(
     const refs = selection.refs;
 
     const sourceBranch = store.currentBranch().name;
-    const targetBranch = options.branchName
-      ?? `recovery/${options.agentName}/${Date.now()}`;
+    const held = new Set(store.listBranches().map((branch) => branch.name));
+    const defaultName = `recovery/${options.agentName}/${Date.now()}`;
+    let targetBranch = options.branchName ?? firstFreeBranchName(defaultName, (name) => held.has(name));
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
@@ -228,6 +231,22 @@ export async function createOfflineRecoveryBranch(
     // checkDiscordAwarenessBranchName refuses the same set). A journal that
     // can't be read can't say which names are claimed, so the recovery is
     // refused, as the host's surgeries are.
+    // A default name such a suppression claims is passed over, as the host's
+    // are (newOperatorBranchName), so it's never refused for a claim. A dry
+    // run doesn't open the journal, and its default name passes over only the
+    // branches the store holds. While the journal can't be read, a claim
+    // counts for nothing here, and the check below refuses the name.
+    if (options.branchName === undefined) {
+      targetBranch = firstFreeBranchName(defaultName, (name) => {
+        if (held.has(name)) return true;
+        try {
+          return outbox.pendingSuppressionsFor(name).length > 0;
+        } catch {
+          return false;
+        }
+      });
+      result.targetBranch = targetBranch;
+    }
     let claimed: ReturnType<DiscordAwarenessOutbox['pendingSuppressionsFor']>;
     try {
       claimed = outbox.pendingSuppressionsFor(targetBranch);
