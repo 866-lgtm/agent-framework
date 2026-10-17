@@ -1,9 +1,40 @@
-// The text helpers the workspace's read, grep and edit share: numbered lines
-// with a long one cut, a BOM's check, and a string's length as JSON, which a
-// page's budget is counted in.
+// The text helpers the workspace's read, grep and edit share: a file's lines as
+// read shows them, numbered lines with a long one cut, a BOM's check, and a
+// string's length as JSON, which a page's budget is counted in.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hasBom, jsonLength, numberedLine, safeCut } from '../src/modules/workspace/text.js';
+import { fileText, hasBom, jsonLength, numberedLine, safeCut } from '../src/modules/workspace/text.js';
+
+test('fileText gives the lines read shows, where each starts, and what the text is', () => {
+  const lines = (text: string | Buffer) => fileText(Buffer.from(text)).lines;
+  assert.deepEqual(lines(''), []);
+  assert.deepEqual(lines('a'), ['a']);
+  assert.deepEqual(lines('a\nb\n'), ['a', 'b']);
+  assert.deepEqual(lines('a\n\n'), ['a', '']);
+  assert.deepEqual(lines('\n'), ['']);
+  assert.deepEqual(lines('a\r\nb\r\n'), ['a', 'b']);
+  assert.deepEqual(lines('a\rb\r\n\r\n'), ['a\rb', '']);
+  assert.deepEqual(lines('a\r'), ['a\r'], 'a CR that ends the text ends no line');
+
+  const crlf = fileText(Buffer.from('one\r\ntwo\nthree'));
+  assert.deepEqual(crlf.starts, [0, 5, 9]);
+  assert.equal(crlf.crlfEnds, 1);
+  assert.equal(crlf.lfEnds, 1);
+  assert.equal(crlf.bom, false);
+  assert.equal(crlf.utf8, true);
+  assert.equal(crlf.raw, 'one\r\ntwo\nthree');
+
+  const bom = fileText(Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x0a, 0x62]));
+  assert.equal(bom.bom, true);
+  assert.deepEqual(bom.lines, ['a', 'b']);
+  assert.deepEqual(bom.starts, [1, 3], 'offsets count the BOM, as character paging does');
+  assert.equal(bom.raw, '\ufeffa\nb');
+  assert.deepEqual(fileText(Buffer.from([0xef, 0xbb, 0xbf])).lines, []);
+
+  const latin1 = fileText(Buffer.from('caf\xe9', 'latin1'));
+  assert.equal(latin1.utf8, false);
+  assert.deepEqual(latin1.lines, ['caf\ufffd']);
+});
 
 test('numberedLine numbers a line as cat -n does, and cuts a long one without splitting a surrogate pair', () => {
   assert.equal(numberedLine('text', 7), '     7\ttext');

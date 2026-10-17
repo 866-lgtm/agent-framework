@@ -1,12 +1,58 @@
+import { isUtf8 } from 'node:buffer';
+
 /**
- * Lines numbered the way `cat -n` numbers them, with a long one cut, and a
- * string's length as JSON, which a budget for a stored result counts. edit's
+ * A stored file's text as read shows it and grep searches it, lines numbered
+ * the way `cat -n` numbers them, with a long one cut, and a string's length
+ * as JSON, which a budget for a stored result counts. Read, grep and edit's
  * answers use them.
  */
 
 /** Whether the bytes open with a UTF-8 byte order mark. */
 export function hasBom(bytes: Uint8Array): boolean {
   return bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+}
+
+export interface FileText {
+  /** The bytes decoded as UTF-8, as character paging reads them: a BOM and every CR kept. */
+  raw: string;
+  /**
+   * Its lines, as read shows them and grep searches them: without the BOM, a
+   * CR before a line feed dropped, and a final line end ending the last line
+   * rather than starting an empty one. So "a\r\nb\r\n" is two lines, and an
+   * empty text has none.
+   */
+  lines: string[];
+  /** Where each line starts in `raw`. */
+  starts: number[];
+  bom: boolean;
+  /** How many line ends were CRLF, and how many a bare LF. */
+  crlfEnds: number;
+  lfEnds: number;
+  /** Whether the bytes are valid UTF-8; where they aren't, `raw` holds U+FFFD. */
+  utf8: boolean;
+}
+
+export function fileText(bytes: Buffer): FileText {
+  const raw = bytes.toString('utf-8');
+  const bom = hasBom(bytes);
+  const lines: string[] = [];
+  const starts: number[] = [];
+  let crlfEnds = 0;
+  let lfEnds = 0;
+  // A BOM decodes to the single code unit U+FEFF.
+  for (let at = bom ? 1 : 0; at < raw.length;) {
+    const lf = raw.indexOf('\n', at);
+    starts.push(at);
+    if (lf === -1) {
+      lines.push(raw.slice(at));
+      break;
+    }
+    const crlf = lf > at && raw.charCodeAt(lf - 1) === 13;
+    if (crlf) crlfEnds++; else lfEnds++;
+    lines.push(raw.slice(at, crlf ? lf - 1 : lf));
+    at = lf + 1;
+  }
+  return { raw, lines, starts, bom, crlfEnds, lfEnds, utf8: isUtf8(bytes) };
 }
 
 /** How long a line read shows before it cuts the line. */

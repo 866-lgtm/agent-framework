@@ -45,6 +45,8 @@ import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
 import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
+import { type FileText, fileText } from './text.js';
+import { DEFAULT_READ_LINE_LIMIT, characterPage, linePage } from './read-page.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -1290,9 +1292,13 @@ export class WorkspaceModule implements Module {
       {
         name: 'read',
         description: 'Read a file from the workspace. Returns content with line numbers. '
-          + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files. '
+          + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files — '
+          + 'and stops sooner where a page would pass the result limit; the note says where to continue. '
+          + 'A line over 2000 characters is cut, with the offsetChars that reads the rest. '
+          + 'CRLF line ends are shown without the CR, and a BOM isn\'t shown; the note says when the file has either, '
+          + 'or isn\'t valid UTF-8. '
           + 'For long lines or spill files, use offsetChars/limitChars instead: returns raw text without '
-          + 'line numbers, with nextOffsetChars (null at EOF). Keep limitChars when continuing. '
+          + 'line numbers, with nextOffsetChars (null at EOF), stopped at the result limit too. Keep limitChars when continuing. '
           + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
         inputSchema: {
           type: 'object' as const,
@@ -1592,16 +1598,19 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: `The ${call.name} call did nothing: ${problem}.` };
       }
       const input = call.input as Record<string, unknown>;
+      // The most of this call's result the framework stores before it spills
+      // the rest into a file; a call it didn't dispatch gets the default.
+      const resultMaxChars = call.resultMaxChars ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
         if (call.name === 'read' && call.callerAgentName === generated.agentName) {
-          return await this.handleRead(input as unknown as ReadInput, generated.read());
+          return await this.handleRead(input as unknown as ReadInput, resultMaxChars, generated.read());
         }
         return { success: false, isError: true, error: this.generatedFileRefusal(generated, call.callerAgentName) };
       }
 
       switch (call.name) {
-        case 'read': return await this.handleRead(input as unknown as ReadInput);
+        case 'read': return await this.handleRead(input as unknown as ReadInput, resultMaxChars);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
         case 'write': return await this.handleWrite(input as unknown as WriteInput);
         case 'edit': return await this.handleEdit(input as unknown as EditInput, call.resultMaxChars);
@@ -2651,100 +2660,42 @@ export class WorkspaceModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleRead(input: ReadInput, generatedContent?: string): Promise<ToolResult> {
+  /**
+   * A read's page, held to `maxChars`, the most the framework stores of this
+   * call's result before it spills the rest into a file.
+   */
+  private async handleRead(input: ReadInput, maxChars: number, generatedContent?: string): Promise<ToolResult> {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
-    const offsetChars = input.offsetChars ?? 0;
-    const limitChars = input.limitChars ?? 2000;
     // Each number is a whole number of at least its schema's minimum by now
     // (inputProblem).
     if (characterPaging && (input.offset !== undefined || input.limit !== undefined)) {
       return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
     }
-    let content = generatedContent;
-    if (content === undefined) {
+    let file: FileText;
+    if (generatedContent === undefined) {
       const { mount, relativePath, path } = await this.parseFilePath(input.path);
       input = { ...input, path };
       const store = this.getStore();
-      const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
+      const found = await this.withMount(mount, async (): Promise<{ bytes: Buffer } | { error: string }> => {
         const report = await this.ensureSynced(mount, relativePath);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) return { error: this.notInWorkspace(input.path, report) };
         const blob = store.getBlob(entry.blobHash);
         if (!blob) return { error: `Blob not found for: ${input.path}` };
-        return { text: blob.toString('utf-8') };
+        return { bytes: blob };
       });
       if ('error' in found) return { success: false, error: found.error, isError: true };
-      content = found.text;
+      file = fileText(found.bytes);
+    } else {
+      file = fileText(Buffer.from(generatedContent, 'utf-8'));
     }
-    if (characterPaging) {
-      const start = Math.min(offsetChars, content.length);
-      const splitsPair = (at: number): boolean =>
-        at > 0 && at < content.length
-        && content.charCodeAt(at - 1) >= 0xd800 && content.charCodeAt(at - 1) <= 0xdbff
-        && content.charCodeAt(at) >= 0xdc00 && content.charCodeAt(at) <= 0xdfff;
-      if (splitsPair(start)) {
-        return { success: false, isError: true, error: 'offsetChars splits a surrogate pair; use nextOffsetChars from the previous page.' };
-      }
-      let end = start + Math.min(limitChars, content.length - start);
-      if (splitsPair(end)) end++;
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          totalChars: content.length,
-          offsetChars: start,
-          nextOffsetChars: end < content.length ? end : null,
-          content: content.slice(start, end),
-        },
-      };
-    }
-    const lines = linesOf(content);
-
-    // Apply offset/limit. An unlimited read of a large file would inject the
-    // whole thing into the turn (a 2MB file ≈ 600k tokens → the request blows
-    // past the model context and 400s), so an omitted limit falls back to a
-    // default cap; the result reports total/from/to so the agent can page.
-    const DEFAULT_READ_LINE_LIMIT = 2000;
-    const startLine = (input.offset ?? 1) - 1; // Convert to 0-indexed
-    if (startLine >= lines.length) {
-      // Nothing to show: an empty file, or an offset past the last line. No
-      // range is claimed, and the line count says where the file ends.
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          totalLines: lines.length,
-          // Reading an empty file from its start is reading it whole.
-          ...(startLine > 0
-            ? { note: `Line ${startLine + 1} is past the end: the file has ${lines.length} line${lines.length === 1 ? '' : 's'}.` }
-            : {}),
-          content: '',
-        },
-      };
-    }
-    const effectiveLimit = input.limit ?? DEFAULT_READ_LINE_LIMIT;
-    const endLine = startLine + effectiveLimit;
-    const slice = lines.slice(startLine, endLine);
-    const truncated = endLine < lines.length;
-
-    // Format with line numbers (cat -n style)
-    const formatted = slice
-      .map((line, i) => `${String(startLine + i + 1).padStart(6)}\t${line}`)
-      .join('\n');
-
-    return {
-      success: true,
-      data: {
-        path: input.path,
-        totalLines: lines.length,
-        fromLine: startLine + 1,
-        toLine: Math.min(endLine, lines.length),
-        ...(truncated
-          ? { note: `Truncated at ${effectiveLimit} lines (file has ${lines.length}). Use offset/limit to read more.` }
-          : {}),
-        content: formatted,
-      },
-    };
+    // An unlimited read of a large file would inject the whole thing into the
+    // turn (a 2MB file ≈ 600k tokens → the request blows past the model
+    // context and 400s), so an omitted limit falls back to a default, and
+    // every page stops at the result limit.
+    return characterPaging
+      ? characterPage(input.path, file, input.offsetChars ?? 0, input.limitChars ?? 2000, maxChars)
+      : linePage(input.path, file, input.offset ?? 1, input.limit ?? DEFAULT_READ_LINE_LIMIT, maxChars);
   }
 
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
