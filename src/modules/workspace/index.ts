@@ -1959,7 +1959,8 @@ export class WorkspaceModule implements Module {
    * Returns the reason when the change reached the workspace but not disk, so
    * callers surface it in the tool result: the autoMaterialize contract is
    * that disk is the source of truth for downstream agents. The caller holds
-   * the mount's turn and has settled the path first (settleBeforeMutation).
+   * the mount's turn and has settled the path first (settleBeforeMutation, or
+   * a pass over the path, as an edit makes).
    */
   private async commitToolChange(
     mount: MountState,
@@ -2309,7 +2310,7 @@ export class WorkspaceModule implements Module {
         const whichCopy = (verb: string): string | null => took('modified')
           ? `Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit ${verb} that text.`
           : report?.state === 'unverified'
-            ? `Disk's copy couldn't be checked (${report.note ?? 'not observed'}), so the edit ${verb} the workspace's copy.`
+            ? `The path couldn't be checked against disk (${report.note ?? 'not observed'}), so the edit ${verb} the workspace's copy.`
             : null;
         const lookedIn = whichCopy('looked in');
         const suffix = lookedIn !== null ? ` ${lookedIn}` : '';
@@ -2317,7 +2318,10 @@ export class WorkspaceModule implements Module {
 
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
-          const error = took('deleted')
+          // A pass also drops a copy disk made binary or too large, which
+          // the disk-only answer describes; only an adopted removal is a
+          // deletion.
+          const error = took('deleted') && report?.state === 'synced'
             ? `File not found: ${input.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
             : this.notInWorkspace(input.path, report);
           return { success: false, error, isError: true };

@@ -60,7 +60,8 @@ test("an edit of a file that isn't valid UTF-8 is refused and changes nothing, a
   const latin1 = Buffer.from('caf\xe9 au lait\n', 'latin1');
   writeFileSync(join(dir, 'latin1.txt'), latin1);
   const refused = errorOf(await call('edit', { path: 'work/latin1.txt', oldString: 'au', newString: 'with' }));
-  assert.match(refused, /^The edit did nothing: work\/latin1\.txt isn't valid UTF-8, so editing it would change bytes outside the text it replaces\./);
+  assert.equal(refused, "The edit did nothing: work/latin1.txt isn't valid UTF-8, so editing it would change bytes outside the text it replaces. "
+    + 'Read shows each invalid byte sequence as U+FFFD, and a write replaces the whole file as UTF-8, so writing back what read shows puts U+FFFD in their place.');
   assert.deepEqual(disk('latin1.txt'), latin1, 'disk keeps every byte');
 
   const written = await call('write', { path: 'work/latin1.txt', content: 'café with milk\n' });
@@ -250,6 +251,9 @@ test("an edit applies to disk's text when disk changed and the store didn't, and
   writeFileSync(join(dir, 's.txt'), 'v3 from another writer\n');
   assert.match(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'LINE', newString: 'x' })),
     /^String not found in work\/s\.txt\. Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text\.$/);
+  writeFileSync(join(dir, 's.txt'), 'v4 twice twice\n');
+  assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'twice', newString: 'x' })),
+    "String found 2 times in work/s.txt. Use replaceAll: true or provide more context. Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
 });
 
 test('an edit of a draft whose disk copy also changed applies to the draft and names the conflict', async (t) => {
@@ -335,7 +339,7 @@ test("an edit whose disk copy can't be checked says it used the workspace's copy
     assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
     rmSync(join(dir, 'u.txt'));
     mkdirSync(join(dir, 'u.txt'));
-    const used = "Disk's copy couldn't be checked (a directory), so the edit applied to the workspace's copy.";
+    const used = "The path couldn't be checked against disk (a directory), so the edit applied to the workspace's copy.";
     const edit = await call('edit', { path: 'work/u.txt', oldString: 'held', newString: 'held, edited' });
     if (autoMaterialize) {
       // Its push meets the directory, and the stored answer carries the note.
@@ -348,7 +352,7 @@ test("an edit whose disk copy can't be checked says it used the workspace's copy
     }
     assert.equal(await stored('u.txt'), 'held, edited\n');
     assert.equal(errorOf(await call('edit', { path: 'work/u.txt', oldString: 'zzz', newString: 'x' })),
-      "String not found in work/u.txt. Disk's copy couldn't be checked (a directory), so the edit looked in the workspace's copy.");
+      "String not found in work/u.txt. The path couldn't be checked against disk (a directory), so the edit looked in the workspace's copy.");
   }
 });
 
@@ -420,8 +424,62 @@ test('a deletion whose disk copy is not a regular file names the materialize tha
   assert.equal(spawnSync('mkfifo', [join(dir, 'q.txt')]).status, 0, 'mkfifo');
   assert.equal(errorOf(await call('delete', { path: 'work/q.txt' })), 'The deletion of "work/q.txt" is stored in the workspace, so don\'t send it again. '
     + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — "
-    + 'fix it and materialize again with applyDeletions, or materialize it with force and applyDeletions to delete it.');
+    + 'fix it and materialize again with applyDeletions.');
   const forced = await call('materialize', { path: 'work/q.txt', force: true, applyDeletions: true });
   assert.equal(forced.success, true, forced.error);
   assert.equal(existsSync(join(dir, 'q.txt')), false, 'the forced materialize unlinked it');
+});
+
+// ---------------------------------------------------------------------------
+// The fix round of the second review (af-ws-fix-r1)
+// ---------------------------------------------------------------------------
+
+test("an edit of a file disk made binary answers the disk-only text, not a deletion", async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'b.txt'), 'text\n');
+  assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
+  writeFileSync(join(dir, 'b.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
+  assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'text', newString: 'x' })),
+    'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+});
+
+test('a deletion of a draft that met a disk file the workspace never saw names applyDeletions', async (t) => {
+  const { dir, call, disk } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'c.txt'), 'disk text\n');
+  // The workspace never read c.txt, so its write is a draft that collides.
+  assert.match(errorOf(await call('write', { path: 'work/c.txt', content: 'agent text\n' })), /conflict: store-origin-collision/);
+  assert.equal(errorOf(await call('delete', { path: 'work/c.txt' })), 'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. '
+    + "Its push to disk didn't complete: disk holds a different copy, and nothing records which is newer (conflict: store-origin-collision) — "
+    + 'sync this path to adopt the disk version, or materialize this path with force and applyDeletions to delete it.');
+  assert.equal(disk('c.txt')!.toString(), 'disk text\n');
+});
+
+test("a forced deletion over a directory says no push unlinks one", async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'gone.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/gone.txt' })).success, true);
+  rmSync(join(dir, 'gone.txt'));
+  mkdirSync(join(dir, 'gone.txt'));
+  assert.match(errorOf(await call('delete', { path: 'work/gone.txt' })), /^The deletion of "work\/gone\.txt" is stored in the workspace/);
+  const forced = await call('materialize', { path: 'work/gone.txt', force: true, applyDeletions: true });
+  assert.match(JSON.stringify(forced.data), /not unlinked: disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk/);
+});
+
+test("a deletion whose parent disk made a file says no push unlinks below it", async (t) => {
+  const { dir, call } = setup(t);
+  mkdirSync(join(dir, 'sub'));
+  writeFileSync(join(dir, 'sub', 'x.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/sub/x.txt' })).success, true);
+  assert.equal((await call('delete', { path: 'work/sub/x.txt' })).success, true);
+  rmSync(join(dir, 'sub'), { recursive: true });
+  writeFileSync(join(dir, 'sub'), 'now a file\n');
+  const pushed = await call('materialize', { path: 'work/sub/x.txt', applyDeletions: true });
+  assert.match(JSON.stringify(pushed.data), /disk has a file or a symlink where this path needs a directory, and no push unlinks below one, forced or not — if something there should go, move or remove it on disk/);
+});
+
+test("a write over a FIFO is told to fix it and materialize again, with no force", async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  assert.equal(spawnSync('mkfifo', [join(dir, 'p.txt')]).status, 0, 'mkfifo');
+  assert.equal(errorOf(await call('write', { path: 'work/p.txt', content: 'x\n' })), 'The write of "work/p.txt" is stored in the workspace, so don\'t send it again. '
+    + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — fix it and materialize again.");
 });

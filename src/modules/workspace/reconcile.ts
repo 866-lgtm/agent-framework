@@ -356,7 +356,8 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
   }
   if (reason === 'a parent path is not a directory') {
     return deletion
-      ? 'disk has a file or a symlink where this path needs a directory, so disk holds no file here for a push to unlink'
+      ? 'disk has a file or a symlink where this path needs a directory, and no push unlinks below one, forced or not — ' +
+        'if something there should go, move or remove it on disk'
       : 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
         'move or remove it on disk and materialize again, or write the file under another path';
   }
@@ -1094,8 +1095,10 @@ export async function pushPaths(
       if (!opts.force) {
         result.skipped.push({
           path,
-          reason: inTheWay(v.note, !s)
-            ?? `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}, or ${forced}`,
+          // Force can't pass most of what keeps disk from being verified (a
+          // symlink the mount doesn't follow, a FIFO for a write), so the
+          // fallback names only the way out that holds for every note.
+          reason: inTheWay(v.note, !s) ?? `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}`,
         });
         continue;
       }
@@ -1117,11 +1120,11 @@ export async function pushPaths(
         path,
         reason: noEvidence
           ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
-            'sync this path to adopt the disk version, or materialize this path with force to overwrite it'
+            `sync this path to adopt the disk version, or materialize this path with force ${s ? 'to overwrite it' : 'and applyDeletions to delete it'}`
           : kind === 'interrupted'
             ? 'disk holds bytes that match neither what was being written there nor what disk last agreed with ' +
               '(conflict: interrupted), as a write that failed or was cut off partway leaves — check the file, then ' +
-              'materialize it with force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
+              `${forced}, or sync this path to adopt the disk copy as it is`
             : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
               `sync this path to adopt the disk version, or ${forced}`,
       });
