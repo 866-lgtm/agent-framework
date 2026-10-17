@@ -304,13 +304,14 @@ three ways:
   configuration error: `allowHostCommands: true`, an `enabledCapabilities`
   pattern that matches a capability denied by default, `channelSubscription:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
-  `toolLifecycle` `observe` or `inputs` block, and an `autofetch` bound
-  above its default. A setting
+  `toolLifecycle` `observe` or `inputs` block, and a
+  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default.
+  A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
   `enabledCapabilities`, which are allow-lists, `disabledFeatureSets`,
   `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
-  'manual'`, `toolLifecycle.maxInputBytes`, an `autofetch` bound at or
+  'manual'`, a `toolLifecycle.maxInputBytes` or an `autofetch` bound at or
   below its default, and `shouldTriggerInference`.
   So a host that puts a deny-list on every server it deploys can deploy a
   modern one.
@@ -329,7 +330,7 @@ reason after the server asked for another round, before its final answer, is
 reported the same way, since the server may already have acted. An MCPL
 server that refuses `2024-11-05` with `-32022` fails with
 `McplProtocolVersionError`, and is not retried. The error names the
-revisions the server says it supports, or its error text when it lists none,
+revisions the server says it supports ("none listed" for an empty list), or its error text when it sends no list,
 and when the list includes `2026-07-28` it says to configure the server with
 `protocol: 'modern'` (stdio) or reach it over http(s).
 

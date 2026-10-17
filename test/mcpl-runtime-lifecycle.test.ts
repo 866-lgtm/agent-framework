@@ -61,6 +61,16 @@ process.stdin.on('data', (c) => {
 /** The framework's inner disconnect, which a restart's own teardown calls
  *  (the public disconnectMcplServer is an operator operation around it). */
 type Inner = { runDisconnectMcplServer(id: string): Promise<void> };
+type Internals = {
+  legacyConnectAborts(): Map<string, AbortController>;
+  mcplServerRegistry: { getServer(id: string): { sendToolsList(): Promise<unknown> } | null } | null;
+};
+
+async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(cond(), `in time: ${what}`);
+}
 
 function serverConfig(id: string, extra?: Record<string, unknown>) {
   return { id, command: process.execPath, args: ['-e', STDIO_SERVER], ...extra };
@@ -434,6 +444,10 @@ for (const when of ['teardown', 'gap', 'connect'] as const) {
       if (when !== 'connect') {
         // Its connect is refused at once, naming the disconnect.
         assert.match(refused!.message, /: MCP server "first" is being disconnected, which ends the restart of "first"$/);
+      } else {
+        // Its connect, under way, is ended by the disconnect, in whichever
+        // phase the disconnect finds it.
+        assert.match(refused!.message, /: MCP server "first" (was not connected: it was disconnected (while connecting|or lost while its tools were being listed)|is being disconnected, which ends the restart of "first")$/);
       }
       assert.equal(await host, 'disconnected', 'the disconnect completed');
       assert.deepEqual(framework.listMcplServers(), [], 'nothing is left of the server');
@@ -489,8 +503,8 @@ for (const ending of ['stop()', 'a disconnect'] as const) {
   test(`${ending} ends a legacy connect stuck in its handshake at once`, async () => {
     await withFramework(true, async (framework) => {
       const connecting = framework.connectMcplServer(SILENT as never).then(() => null, (error: unknown) => error as Error);
-      // The child is up and its initialize sent.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // The connect is in its handshake, which never finishes.
+      await until(() => (framework as unknown as Internals).legacyConnectAborts().has('silent'), 'the connect in its handshake');
       const started = Date.now();
       if (ending === 'stop()') await framework.stop();
       else await framework.disconnectMcplServer('silent');
@@ -510,8 +524,8 @@ for (const silentOn of ['featureSets/update', 'tools/list'] as const) {
     await withFramework(true, async (framework) => {
       const config = serverConfig('late', { env: { SILENT_ON: silentOn }, requestTimeoutMs: 0 });
       const connecting = framework.connectMcplServer(config as never).then(() => null, (error: unknown) => error as Error);
-      // Past the handshake, waiting for the answer that never comes.
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      // Past the handshake, registered, waiting for the answer that never comes.
+      await until(() => !!(framework as unknown as Internals).mcplServerRegistry?.getServer('late'), 'the connect past its handshake');
       const started = Date.now();
       await framework.stop();
       const took = Date.now() - started;
@@ -526,9 +540,13 @@ test("stop() ends a connect whose tool listing waits on another server that stop
   await withFramework(false, async (framework) => {
     // Lists its tools once, at its own connect, and never again.
     await framework.connectMcplServer(serverConfig('quiet', { env: { SILENT_AFTER: 'tools/list:1' }, requestTimeoutMs: 0 }) as never);
+    const quiet = (framework as unknown as Internals).mcplServerRegistry!.getServer('quiet')!;
+    const realList = quiet.sendToolsList.bind(quiet);
+    let asked = false;
+    quiet.sendToolsList = () => { asked = true; return realList(); };
     const connecting = framework.connectMcplServer(serverConfig('late') as never).then(() => null, (error: unknown) => error as Error);
     // The new connect is listing every server's tools, and waits on "quiet".
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await until(() => asked, "the new connect's listing asked quiet");
     const started = Date.now();
     await framework.stop();
     const took = Date.now() - started;

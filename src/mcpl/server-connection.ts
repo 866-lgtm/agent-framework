@@ -758,7 +758,7 @@ export class McplServerConnection extends EventEmitter {
     // WebSocket frame that arrives with the initialize response, or while a
     // failed handshake's close() runs, is such an error.
     const logAfterSettled = (err: Error) => {
-      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${err.message}`);
+      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${redactServerText(err.message, config)}`);
     };
 
     try {
@@ -1290,7 +1290,14 @@ export class McplServerConnection extends EventEmitter {
     }
     if (this.transport) {
       this.hostCloseRequested = true;
-      await this.transport.close();
+      try {
+        await this.transport.close();
+      } catch (error) {
+        // The close couldn't confirm the child exited, so its close event
+        // never came: the next close is not one the host asked for.
+        this.hostCloseRequested = false;
+        throw error;
+      }
       return;
     }
     this.closed = true;
@@ -1416,7 +1423,7 @@ export class McplServerConnection extends EventEmitter {
       // malformed frame from a WebSocket server, is logged here rather than
       // thrown where nothing catches it.
       transport.on('error', (err: Error) => {
-        console.error(`[mcpl] ${this.id}: a transport closed before it served reported an error: ${err.message}`);
+        console.error(`[mcpl] ${this.id}: a transport closed before it served reported an error: ${redactServerText(err.message, config)}`);
       });
       await transport.close().catch((error: unknown) => this.holdUnreaped(transport, errorOf(error)));
       return;

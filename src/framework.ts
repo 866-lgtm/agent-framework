@@ -16592,20 +16592,19 @@ export class AgentFramework {
         const err = error instanceof Error ? error : new Error(String(error));
         const message = redactServerText(err.message, config);
         console.error(`Failed to connect MCPL server "${config.id}":`, message);
-        // Reaching this catch means no stub was created, so nothing will
-        // retry — except in the edge case where addServer succeeded (with a
-        // reconnecting stub) and a later setup step threw; config.reconnect
-        // is the best cheap approximation of that.
+        // Whether anything retries is the registered connection's to say:
+        // usually nothing is left registered, but a legacy connect whose
+        // setup threw after its handshake leaves a reconnecting stub, and a
+        // launch that couldn't be reaped leaves a connection that won't
+        // reconnect. A protocol-version verdict and a refused configuration
+        // never retry.
+        const left = this.modernServers().get(config.id) ?? this.mcplServerRegistry?.getServer(config.id);
         this.emitTrace({
           type: 'mcpl:server-connect-failed',
           serverId: config.id,
           error: message,
           attempt: 0,
-          // A protocol-version verdict is never retried (no common revision;
-          // only configuration can fix it), and neither is a configuration
-          // refused before anything was launched.
-          willRetry: config.reconnect === true && !(error instanceof McplProtocolVersionError)
-            && !(error instanceof McpConfigurationRefusal),
+          willRetry: !!left?.willReconnect,
         });
         // So the server doesn't vanish quietly: alert at once, as the
         // reconnect path does for the same verdict, since no attempt follows.
@@ -17157,9 +17156,10 @@ export class AgentFramework {
     }
   }
 
-  /** The part of a connect that runs holding its id. `displaced`: a
-   *  disconnect has taken the id over and is waiting for this connect. It
-   *  hands back the connection it registered. */
+  /** The part of a connect that runs holding its id, handing back the
+   *  connection it registered. `displaced`: whether a disconnect has taken
+   *  the id over and is waiting for this connect, which a legacy connect asks
+   *  once its handshake is done. */
   private async connectHeldMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
     family: 'legacy' | 'modern',
@@ -17926,8 +17926,9 @@ export class AgentFramework {
    * A disconnect of the id the restart moves the server to (its own id, for
    * a restart under the same id), or a `stop()`, that begins during the
    * restart ends it, as a disconnect ends a connect in flight: the restart
-   * rejects, saying the server is down, and its holds are released. A
-   * restart whose connect fails leaves the server down, configured under the
+   * rejects, saying the server is down, and its holds are released, and the
+   * server isn't left configured, as after any disconnect. A restart whose
+   * connect fails on its own leaves the server down, configured under the
    * new configuration and its id, and holding its tool prefix, as any failed
    * connect does: `listMcplServers()` lists it as not connected, and a
    * restart or a disconnect under that id tries it again or removes it.
@@ -18658,8 +18659,9 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      // `permanent`: reconnecting halted on a launch that couldn't be reaped.
-      // No later attempt will come, so alert now.
+      // `permanent`: reconnecting halted, on a launch that couldn't be
+      // reaped or a protocol-version verdict. No later attempt will come, so
+      // alert now.
       if (params.permanent || params.attempt >= 5) {
         this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
       }
@@ -18683,13 +18685,21 @@ export class AgentFramework {
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
       // Without reconnect a server lost on its own is gone, as the MCPL
-      // registry drops one; its configuration stays listed as disconnected.
+      // registry drops one, once its child's reap is confirmed: until then it
+      // holds the id, so nothing launches beside a child that may still run,
+      // and stop() and a disconnect still reach it. A reap that fails keeps
+      // it registered, holding the id, as a failed disconnect does, for a
+      // disconnect to retry. Its configuration stays listed as disconnected.
       // One the host is closing stays until that teardown is done: whoever
-      // closes it removes it, so the id stays held meanwhile.
-      if (!connection.isClosed && !connection.willReconnect && this.modernServers().get(connection.id) === connection) {
-        this.modernServers().delete(connection.id);
-        // Gone for good: its tools leave the agents' list, as a disconnect's do.
-        this.handleToolsListChanged(connection.id);
+      // closes it removes it.
+      if (!connection.isClosed && !connection.willReconnect) {
+        void connection.lossReaped().then(() => {
+          if (connection.isClosed || this.modernServers().get(connection.id) !== connection) return;
+          if (!connection.holdsUnreapedChild) this.modernServers().delete(connection.id);
+          // Gone for good either way: its tools leave the agents' list, as a
+          // disconnect's do.
+          this.handleToolsListChanged(connection.id);
+        });
       }
     });
   }

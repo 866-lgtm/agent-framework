@@ -22,7 +22,9 @@ import {
   mcplPolicyGrants,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
+import { getEventListeners } from 'node:events';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from '../src/mcpl/reference-fetcher.js';
+import { DEFAULT_MAX_INPUT_BYTES } from '../src/mcpl/tool-lifecycle.js';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { WebSocketTransport, buildWebSocketUrl } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
@@ -158,10 +160,18 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
     [{ toolLifecycle: { inputs: { tools: ['x--*'] } } }, 'toolLifecycle.inputs'],
     [{ autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES + 1 } }, 'autofetch.maxBytes'],
     [{ autofetch: { maxTotalBytes: DEFAULT_MAX_TOTAL_BYTES + 1 } }, 'autofetch.maxTotalBytes'],
+    [{ toolLifecycle: { maxInputBytes: DEFAULT_MAX_INPUT_BYTES + 1 } }, 'toolLifecycle.maxInputBytes'],
   ];
   // Patterns reaching every path denied by default name each. A `*` matches
   // one segment, and counts must agree (capabilityPatternMatches).
   assert.deepEqual(mcplPolicyGrants(modern({ enabledCapabilities: ['*.*', '*.*.*.*'] })), [
+    'enabledCapabilities: contextHooks.beforeInference.inject.system',
+    'enabledCapabilities: toolLifecycle.observe',
+    'enabledCapabilities: toolLifecycle.inputs',
+  ]);
+  // An entry that isn't a string can't be matched, so it's read as asking
+  // for every path denied by default.
+  assert.deepEqual(mcplPolicyGrants(modern({ enabledCapabilities: [42 as never] })), [
     'enabledCapabilities: contextHooks.beforeInference.inject.system',
     'enabledCapabilities: toolLifecycle.observe',
     'enabledCapabilities: toolLifecycle.inputs',
@@ -189,6 +199,7 @@ test('MCPL policy on a modern server is refused where its value grants, and acce
     { scopes: { files: { whitelist: [] } } },
     { channelSubscription: 'manual' },
     { toolLifecycle: { maxInputBytes: 1024 } },
+    { toolLifecycle: { maxInputBytes: DEFAULT_MAX_INPUT_BYTES } },
     { toolLifecycle: { observe: false } as never },
     { autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES, maxTotalBytes: 1 } },
     { shouldTriggerInference: () => false },
@@ -367,6 +378,15 @@ test("an access provider's token is removed once a dial has sent it, in a WebSoc
   assert.ok(!json.includes('ws-0123456789'), json);
   const header = redactServerText('refused: Authorization: Bearer prov-http-0123456789', http);
   assert.ok(!header.includes('prov-http'), header);
+});
+
+test("a dial with an access provider takes its abort listener off the signal once the provider has answered", async () => {
+  // A reconnect loop's signal lives across many dials.
+  const controller = new AbortController();
+  for (let n = 1; n <= 3; n++) {
+    await assert.rejects(WebSocketTransport.open(cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl', accessProvider: async () => `prov-loop-${n}-0123456789` }), controller.signal));
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0, `after dial ${n}`);
+  }
 });
 
 test("a token a dial sends again is the newest, so the oldest of the others goes first", () => {

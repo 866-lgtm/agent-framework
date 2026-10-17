@@ -312,6 +312,18 @@ const STDIO_EXIT_GRACE_MS = 2_000;
 /** Timeout for the WebSocket to reach OPEN before we give up (ms). */
 const WS_OPEN_TIMEOUT_MS = 15_000;
 
+/** `work`, or `signal`'s reason once it aborts, whichever comes first. The
+ *  listener comes off the signal when `work` settles, so a long-lived signal,
+ *  such as a reconnect loop's, doesn't gather one per dial. */
+function raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 export class WebSocketTransport extends McplTransport {
   readonly kind = 'websocket' as const;
 
@@ -355,7 +367,7 @@ export class WebSocketTransport extends McplTransport {
         // provider; whatever the provider does later is ignored.
         const provided = Promise.resolve(config.accessProvider());
         provided.catch(() => { /* a late failure after the dial was abandoned */ });
-        token = (signal ? await Promise.race([provided, rejectOnAbort(signal)]) : await provided) ?? token;
+        token = (signal ? await raceAbort(provided, signal) : await provided) ?? token;
       } catch (err) {
         if (signal?.aborted) throw abandoned();
         // Fall back to the static token (if any) rather than failing the dial
@@ -492,14 +504,6 @@ export function isWebSocketTransport(config: McplServerConfig): boolean {
  * The returned transport is connected at the byte level but has NOT
  * performed the MCPL handshake.
  */
-/** A promise that rejects once `signal` aborts, and never settles otherwise. */
-function rejectOnAbort(signal: AbortSignal): Promise<never> {
-  return new Promise<never>((_resolve, reject) => {
-    if (signal.aborted) reject(signal.reason);
-    else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-  });
-}
-
 export async function openTransport(config: McplServerConfig, signal?: AbortSignal): Promise<McplTransport> {
   const binding = resolveServerBinding(config);
   if (binding.family !== 'legacy') {

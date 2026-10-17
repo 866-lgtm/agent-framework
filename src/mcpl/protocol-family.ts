@@ -24,6 +24,7 @@
  */
 import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
+import { DEFAULT_MAX_INPUT_BYTES } from './tool-lifecycle.js';
 import type { McplServerConfig, ScopeConfig } from './types.js';
 
 /** The one revision the legacy engine offers and accepts. */
@@ -457,7 +458,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 /**
  * The parts of a configuration's MCPL policy whose values grant something,
  * by path, such as `allowHostCommands`, `scopes.<set>.whitelist`,
- * `enabledCapabilities: toolLifecycle.observe` or `autofetch.maxBytes`: each
+ * `enabledCapabilities: toolLifecycle.observe`, `toolLifecycle.maxInputBytes`
+ * or `autofetch.maxBytes`: each
  * asks for behaviour only an MCPL server can have. A modern server has none,
  * so such a value can't apply there, and is refused rather than ignored, so
  * that an operator who chose it learns so.
@@ -468,9 +470,10 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * `enabledCapabilities` patterns that match no path denied by default, since
  * elsewhere it is an allow-list too; `disabledFeatureSets`,
  * `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
- * 'manual'` (the default), `toolLifecycle` with only `maxInputBytes` or
- * with an `observe` or `inputs` that isn't a policy object (which grants
- * nothing), an `autofetch` bound at or below its default, and
+ * 'manual'` (the default), `toolLifecycle` with only a `maxInputBytes` at
+ * or below its default or with an `observe` or `inputs` that isn't a policy
+ * object (which grants nothing), an `autofetch` bound at or below its
+ * default, and
  * `shouldTriggerInference`, which only narrows which channel messages
  * trigger inference. So a host that stamps a deny-list on every server it
  * deploys can deploy a modern one. Empty values grant nothing either.
@@ -500,6 +503,12 @@ export function mcplPolicyGrants(config: McplServerConfig): string[] {
   }
   for (const key of ['observe', 'inputs'] as const) {
     if (isPlainRecord((config.toolLifecycle as Record<string, unknown> | undefined)?.[key])) grants.push(`toolLifecycle.${key}`);
+  }
+  // A larger input bound than the default asks for more than MCPL gives
+  // by default, as an autofetch bound above its default does.
+  const maxInputBytes = (config.toolLifecycle as Record<string, unknown> | undefined)?.maxInputBytes;
+  if (maxInputBytes !== undefined && maxInputBytes !== null && !(typeof maxInputBytes === 'number' && maxInputBytes <= DEFAULT_MAX_INPUT_BYTES)) {
+    grants.push('toolLifecycle.maxInputBytes');
   }
   const bounds = [['maxBytes', DEFAULT_EAGER_FETCH_MAX_BYTES], ['maxTotalBytes', DEFAULT_MAX_TOTAL_BYTES]] as const;
   for (const [key, ceiling] of bounds) {

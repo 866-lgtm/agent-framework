@@ -33,9 +33,9 @@
  *   launch is reaped, so a second child never runs beside the first. A
  *   stdio child that stays alive but silently stops reading its stdin is
  *   no loss the pipes show: each call's deadline is the only bound on it.
- *   A server that shares
- *   no revision with this client is a configuration verdict, as for legacy
- *   (`McplProtocolVersionError`): it is never retried. List-change
+ *   A server that shares no revision with this client is a configuration
+ *   verdict, as for legacy (`McplProtocolVersionError`): it is never
+ *   retried. List-change
  *   awareness is kept while the connection lives: a subscription the server
  *   advertises but that didn't open, or that ended, is reopened. Each connect
  *   is a generation, so a superseded client never touches a newer one.
@@ -451,6 +451,20 @@ export class ModernMcpConnection extends EventEmitter {
     return this.closedByHost;
   }
 
+  /** Whether a child this connection launched couldn't be confirmed exited.
+   *  While it's true the connection owns that child, so whatever registered
+   *  it keeps its id held; close() retries the reap. */
+  get holdsUnreapedChild(): boolean {
+    return this.unreaped.length > 0;
+  }
+
+  /** The reap of a session lost on its own, settled once it's done, whether
+   *  or not it confirmed the child exited (holdsUnreapedChild says which);
+   *  settled at once when no such reap is running. */
+  lossReaped(): Promise<void> {
+    return this.losing?.done ?? Promise.resolve();
+  }
+
   /** A failed generation's cleanup couldn't reap its child: keep owning it,
    *  and halt reconnecting until close() settles it. */
   private holdUnreaped(session: Session, failure: Error): void {
@@ -483,8 +497,10 @@ export class ModernMcpConnection extends EventEmitter {
   /**
    * The first connect. Without `reconnect` a failure throws. With it, the
    * connection keeps retrying in the background, as the legacy engine's
-   * stub does, and reports `connect-failed`. A connection closed before or
-   * during its first connect resolves unconnected. A connection starts once:
+   * stub does, and reports `connect-failed`, unless the failed launch
+   * couldn't be reaped: no retry can come then, so it throws too. A
+   * connection closed before or during its first connect resolves
+   * unconnected. A connection starts once:
    * later calls return the first call's promise, so a second session never
    * opens beside the first.
    */
@@ -503,12 +519,9 @@ export class ModernMcpConnection extends EventEmitter {
         this.reconnectEnabled = false;
         throw error;
       }
-      if (!this.reconnectEnabled) throw error;
-      const halted = this.unreapedFailure();
-      if (halted) {
-        this.emit('connect-failed', { error: `${(error as Error).message}; ${halted}`, attempt: 0, permanent: true });
-        return;
-      }
+      // A launch that couldn't be reaped halts reconnecting, so no retry
+      // will come: the first connect fails, as one without reconnect does.
+      if (!this.reconnectEnabled || this.holdsUnreapedChild) throw error;
       console.error(`MCP server "${this.id}" initial connect failed, will retry:`, redactServerText((error as Error).message, this.config));
       this.reconnectAttempts = 1;
       this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
@@ -728,18 +741,25 @@ export class ModernMcpConnection extends EventEmitter {
     if (session?.generation !== generation) return;
     this.session = null;
     this.cancelRelisten();
-    this.emit('close', { reason });
     // Reap before any reconnect, so a second child never runs beside the
     // first. A transport usually closes once its child has exited, but a
     // loss read from a failed pipe can come while the child still runs
     // (R1-1). A launch that can't be reaped halts reconnecting, as a failed
-    // connect's does.
+    // reconnect's does, and is a permanent failure, as that one is: no
+    // later attempt will come. The reap starts, and is recorded, before
+    // 'close' is emitted, so a listener that throws can't skip it.
     const done = ModernMcpConnection.closeSession(session).then((failure) => {
       if (this.losing?.session === session) this.losing = null;
-      if (failure) this.holdUnreaped(session, failure);
-      else if (this.willReconnect) this.scheduleReconnect();
+      if (failure) {
+        this.holdUnreaped(session, failure);
+        // A close() the host made meanwhile reports the failure itself.
+        if (!this.closedByHost) {
+          this.emit('reconnect-failed', { error: `${reason}; ${this.unreapedFailure()}`, attempt: Math.max(1, this.reconnectAttempts), permanent: true });
+        }
+      } else if (this.willReconnect) this.scheduleReconnect();
     });
     this.losing = { session, done };
+    this.emit('close', { reason });
   }
 
   /** The legacy engine's backoff: doubling from the base interval, capped,
@@ -883,6 +903,9 @@ export class ModernMcpConnection extends EventEmitter {
    * session the host closed while live completes, not on a failed close.
    */
   close(): Promise<void> {
+    // Closed from this call on: a connect or start() in the same turn sees
+    // it, and launches nothing.
+    this.closedByHost = true;
     const previous = this.closing;
     const next = (previous ? previous.catch(() => {}) : Promise.resolve()).then(() => this.closeStep());
     this.closing = next;
@@ -920,7 +943,8 @@ export class ModernMcpConnection extends EventEmitter {
     }
     // The connect's own cleanup, and a lost session's reap, close their
     // generation again, after the close above; each `done` settles once it
-    // has. A child either couldn't reap is this close's failure too.
+    // has. A child that either cleanup couldn't reap is this close's failure
+    // too.
     for (const pending of [opening, losing]) {
       if (!pending) continue;
       await pending.done;

@@ -197,6 +197,8 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
   const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
   const errors: string[] = [];
   connection.on('error', (error: Error) => errors.push(error.message));
+  const failures: Array<{ error: string; permanent?: boolean }> = [];
+  connection.on('reconnect-failed', (failure: { error: string; permanent?: boolean }) => failures.push(failure));
   const line = liveLine(connection);
   const realKill = line.child.kill.bind(line.child);
   line.child.kill = () => true; // signals never arrive: the child outlives both bounds
@@ -208,24 +210,102 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
   line.markClosed({ reason: 'stdio pipe failed' });
   await until(() => errors.some((m) => /Not starting another launch while it may still be running/.test(m)), 'the launch held as unreaped', 8000);
   assert.equal(connection.willReconnect, false);
+  // No later attempt will come, so the halt is a permanent failure, which the
+  // framework raises as an alert.
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0]!.permanent, true);
+  assert.match(failures[0]!.error, /reconnecting is halted/);
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no second launch');
 });
 
+test("a close() during a lost transport's failing reap reports the failure itself, with no reconnect failure beside it (R1-1)", async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  const failures: unknown[] = [];
+  connection.on('reconnect-failed', (failure: unknown) => failures.push(failure));
+  connection.on('error', () => { /* the held launch, reported */ });
+  const line = liveLine(connection);
+  const realKill = line.child.kill.bind(line.child);
+  line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  cleanups.push(async () => {
+    realKill('SIGKILL');
+    await until(() => !alive(line.child.pid), 'the held child killed');
+  });
+  line.markClosed({ reason: 'stdio pipe failed' });
+  // The host closes it while the lost child's reap runs: the close's
+  // rejection is the report, so no permanent failure goes out beside it.
+  await assert.rejects(connection.close());
+  assert.deepEqual(failures, []);
+});
+
+test("a 'close' listener that throws doesn't skip a lost transport's reap (R1-1)", async () => {
+  const log = scratchLog();
+  const connection = await connect('ignore-sigterm', log);
+  const first = wire(log).find((e) => e.event === 'start')!.pid!;
+  cleanups.push(() => { try { process.kill(first, 'SIGKILL'); } catch { /* reaped already */ } });
+  connection.on('close', () => { throw new Error('a listener failed'); });
+  try {
+    liveLine(connection).markClosed({ reason: 'stdio pipe failed' });
+  } catch { /* the listener's own error, wherever it surfaces */ }
+  // The child ignores SIGTERM, so its reap ends with SIGKILL after 2 s.
+  await until(() => !alive(first), "the lost child's reap", 8000);
+});
+
+test('close() marks a connection closed at once, so a start() in the same turn launches nothing', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, '', log], protocol: 'modern' });
+  const closing = connection.close();
+  assert.equal(connection.isClosed, true, 'closed from the call on');
+  await connection.start();
+  await closing;
+  assert.equal(connection.isConnected, false);
+  assert.equal((connection as unknown as { generation: number }).generation, 0, 'no launch began');
+});
+
+/** The pid of each child StdioTransport.spawn starts from here on, from the spawn itself. */
+function spawnedPids(): number[] {
+  const realSpawn = StdioTransport.spawn;
+  const pids: number[] = [];
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (config) => {
+    const transport = await realSpawn.call(StdioTransport, config);
+    pids.push((transport as unknown as { child: { pid: number } }).child.pid);
+    return transport;
+  };
+  cleanups.push(() => { (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn; });
+  return pids;
+}
+
+test("a read error on a stdio child's stdout or stderr is reported through the transport's 'error', never thrown with nothing listening", async () => {
+  const transport = await StdioTransport.spawn({ id: 'pipes', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1 << 30)'] });
+  cleanups.push(() => transport.close());
+  const child = (transport as unknown as { child: import('node:child_process').ChildProcess }).child;
+  assert.doesNotThrow(() => child.stdout!.emit('error', new Error('stdout read failed')), 'stdout, nothing listening');
+  assert.doesNotThrow(() => child.stderr!.emit('error', new Error('stderr read failed')), 'stderr, nothing listening');
+  const errors: string[] = [];
+  transport.on('error', (error: Error) => errors.push(error.message));
+  child.stdout!.emit('error', new Error('stdout read failed'));
+  child.stderr!.emit('error', new Error('stderr read failed'));
+  assert.deepEqual(errors, ['stdout read failed', 'stderr read failed']);
+});
+
 test('close() right after start() ends a modern stdio connect still spawning, without waiting out its discover probe', async () => {
   const log = scratchLog();
+  const pids = spawnedPids();
   const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'hang-discover', log], protocol: 'modern' });
-  const started = connection.start().then(() => null, (error: unknown) => error);
   const began = Date.now();
+  const started = connection.start().then(() => null, (error: unknown) => error);
   await connection.close();
   const tookMs = Date.now() - began;
   assert.ok(tookMs < 5000, `close() took ${tookMs} ms, not the discover probe's 30 s`);
+  // The child may be ended before it can log its start, so its pid comes
+  // from the spawn.
+  assert.equal(pids.length, 1, 'one launch');
+  assert.equal(alive(pids[0]!), false, 'the child is gone once close() resolved');
   await started;
+  const endedMs = Date.now() - began;
+  assert.ok(endedMs < 5000, `the connect ended after ${endedMs} ms, not the discover probe's 30 s`);
   assert.equal(connection.isConnected, false);
-  // The child may have been ended before it could log its start.
-  for (const launch of wire(log).filter((e) => e.event === 'start')) {
-    assert.equal(alive(launch.pid!), false, 'the child is gone once close() resolved');
-  }
 });
 
 test('close() during a reconnect handshake ends the launch it was waiting on, and stops', async () => {

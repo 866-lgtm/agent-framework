@@ -174,7 +174,9 @@ test('a modern connect is refused while a legacy connect for the same id is stil
 test('a disconnect during a legacy handshake ends that connect at once, and removes it whole', async () => {
   await withFramework(async ({ framework, dir }) => {
     const log = join(dir, 'legacy.log');
-    const pending = framework.connectMcplServer(legacy('same', 'slow', log, { SLOW_INIT_MS: '600' }));
+    // The handshake never finishes on its own, so only the disconnect can
+    // end the connect.
+    const pending = framework.connectMcplServer(legacy('same', 'slow', log, { SLOW_INIT_MS: '3600000' }));
     await until(() => launches(log).length === 1, 'the legacy launch, handshaking');
     const disconnecting = framework.disconnectMcplServer('same');
     await assert.rejects(framework.connectMcplServer(legacy('same', 'ok', log)), /"same" is still being disconnected/);
@@ -265,6 +267,114 @@ test('modern: a failed connect whose cleanup cannot reap stays registered until 
     await framework.disconnectMcplServer('m');
     await framework.connectMcplServer(modern('m', '', log));
     assert.equal(status(framework, 'm')?.connected, true);
+  });
+});
+
+test('modern, with reconnect: a failed first connect whose launch cannot be reaped fails, and stays registered until a disconnect confirms the exit', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'raw.jsonl');
+    const reaping = unreapable();
+    // No retry can come beside a launch that may still run, so the connect
+    // fails rather than reporting a server that will never serve.
+    await assert.rejects(
+      framework.connectMcplServer({ ...modern('m', 'reject-discover', log), reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 }),
+      /server\/discover .*; its cleanup also failed: .*could not be reaped\. MCP server "m" stays registered, closed, until its exit is confirmed: disconnect it to retry the reap/,
+    );
+    await assert.rejects(framework.connectMcplServer(modern('m', '', log)), /"m" is already registered \(not connected and not reconnecting/);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(launches(log).length, 1, 'nothing launched beside it');
+
+    await killAndWait(reaping.stuck[0]!);
+    reaping.active = false;
+    await framework.disconnectMcplServer('m');
+    await framework.connectMcplServer(modern('m', '', log));
+    assert.equal(status(framework, 'm')?.connected, true);
+  });
+});
+
+test("at startup, a modern server with reconnect whose first launch can't be reaped is traced as not retrying", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const log = join(dir, 'raw.jsonl');
+  const reaping = unreapable();
+  const traces: Array<{ type: string; serverId?: string; willRetry?: boolean }> = [];
+  const watcher = {
+    name: 'trace-watcher',
+    async start(ctx: { onTrace(listener: (event: unknown) => void): void }) { ctx.onTrace((event) => traces.push(event as never)); },
+    async stop() {},
+    getTools: () => [],
+    handleToolCall: async () => ({ success: false, error: 'no tools', isError: true }),
+    onProcess: async () => ({}),
+  };
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [watcher as never],
+    mcplServers: [{ ...modern('m', 'reject-discover', log), reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 }],
+  });
+  cleanups.push(async () => {
+    for (const stuck of reaping.stuck) await killAndWait(stuck);
+    await framework.stop().catch(() => {});
+  });
+  const failed = traces.find((t) => t.type === 'mcpl:server-connect-failed' && t.serverId === 'm');
+  // No retry can come beside a launch that may still run.
+  assert.equal(failed?.willRetry, false);
+});
+
+/** The stdio line under a modern server's live session, reached from inside,
+ *  to stand for a loss read from a failed pipe while the child still runs. */
+function liveLineOf(framework: AgentFramework, id: string): { markClosed: (info: { reason: string }) => void; child: { pid: number; kill: (signal?: string) => boolean } } {
+  const connection = (framework as unknown as { modernServers(): Map<string, { session: { wire: { inner: { line: unknown } } } | null }> }).modernServers().get(id);
+  assert.ok(connection?.session, 'a live session');
+  return connection.session.wire.inner.line as never;
+}
+
+test('modern, without reconnect: a server lost on its own holds its id until its child is reaped, then leaves', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'raw.jsonl');
+    await framework.connectMcplServer(modern('m', 'ignore-sigterm', log));
+    assert.ok(toolsOf(framework, 'm').length > 0);
+    const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
+    const connection = servers.get('m');
+    const line = liveLineOf(framework, 'm');
+    line.markClosed({ reason: 'stdio pipe failed' });
+    // The child ignores SIGTERM, so its reap takes about 2 s: meanwhile the
+    // id is held, and nothing launches beside the child.
+    assert.equal(servers.get('m'), connection, 'still registered while its reap runs');
+    await assert.rejects(framework.connectMcplServer(modern('m', '', log)), /"m" is already registered/);
+    await until(() => !servers.has('m'), 'gone once its reap is confirmed', 10_000);
+    assert.equal(alive(line.child.pid), false, 'its child had exited');
+    await until(() => toolsOf(framework, 'm').length === 0, 'its tools left the list');
+    assert.equal(launches(log).length, 1, 'nothing launched beside it');
+  });
+});
+
+test("modern, without reconnect: a server lost on its own whose child can't be reaped stays registered, alerts, and its tools leave", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'raw.jsonl');
+    const alerts: string[] = [];
+    framework.onTrace((event) => {
+      const traced = event as { type: string; kind?: string; agentName?: string };
+      if (traced.type === 'ops:alert') alerts.push(`${traced.kind} ${traced.agentName}`);
+    });
+    await framework.connectMcplServer(modern('m', '', log));
+    assert.ok(toolsOf(framework, 'm').length > 0);
+    const line = liveLineOf(framework, 'm');
+    const realKill = line.child.kill.bind(line.child);
+    line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+    cleanups.push(() => { realKill('SIGKILL'); });
+    line.markClosed({ reason: 'stdio pipe failed' });
+    await until(() => alerts.includes('mcpl-down m'), 'the halt raised as an alert', 10_000);
+    await until(() => toolsOf(framework, 'm').length === 0, 'its tools left the list');
+    assert.equal(status(framework, 'm')?.connected, false, 'still registered, not connected');
+    await assert.rejects(framework.connectMcplServer(modern('m', '', log)), /"m" is already registered \(not connected and not reconnecting/);
+    assert.equal(launches(log).length, 1, 'nothing launched beside it');
+
+    realKill('SIGKILL');
+    await until(() => !alive(line.child.pid), 'the held child killed');
+    await framework.disconnectMcplServer('m');
+    assert.equal(status(framework, 'm'), undefined);
   });
 });
 

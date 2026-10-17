@@ -178,6 +178,29 @@ test("a failed handshake's transport logs an error it reports while it closes, r
   );
 });
 
+test("a failed handshake's transport error is logged without the server's credentials", { timeout: 10_000 }, async (t) => {
+  const logged = captureConsoleError(t);
+  const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  t.after(() => new Promise<void>((resolve) => { server.close(() => resolve()); }));
+  await new Promise<void>((resolve) => { server.once('listening', () => resolve()); });
+  server.on('connection', (socket) => {
+    socket.on('message', (data) => {
+      const request = JSON.parse(String(data)) as { id?: number; method?: string };
+      if (request.method !== 'initialize') return;
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'refused by the test server' } }));
+      (socket as unknown as { _socket: Socket })._socket.write(Buffer.from([0x83, 0x00]));
+    });
+  });
+  const { port } = server.address() as AddressInfo;
+  // The frame's error text, "invalid opcode 3", quotes this token.
+  await assert.rejects(McplServerConnection.connect({ id: 'malformed', url: `ws://127.0.0.1:${port}`, token: 'invalid opcode' }, { version: '0.5' }));
+  await waitFor(() => logged.some((line) => line.includes('after the handshake settled')), 'the frame\'s error to be logged');
+  assert.ok(
+    logged.some((line) => line === '[mcpl] malformed: transport error after the handshake settled: Invalid WebSocket frame: redacted 3'),
+    logged.join('\n'),
+  );
+});
+
 /** Settles with the promise's value, or with `fallback` after 5 s, so a test that
  *  waits for something that never comes still reaches its cleanup. */
 async function within<T, F>(promise: Promise<T>, fallback: F): Promise<T | F> {
