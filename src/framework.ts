@@ -6498,7 +6498,7 @@ export class AgentFramework {
         draftIds: {
           type: ['array', 'null'],
           items: { type: 'string' },
-          description: 'read, resend, dismiss: draft ids such as "d-k7x3q", in order. null for list.',
+          description: 'read, resend, dismiss: draft ids such as "d-k7x3qm2", in order. null for list.',
         },
         destination: {
           type: ['string', 'null'],
@@ -11583,7 +11583,7 @@ export class AgentFramework {
     if (present(input.draftIds)) {
       if (action === 'list') return unused('draftIds');
       if (!Array.isArray(input.draftIds) || input.draftIds.some((id) => typeof id !== 'string' || !id.trim())) {
-        return refuse('draftIds must be a list of draft ids such as "d-k7x3q", or null.');
+        return refuse('draftIds must be a list of draft ids such as "d-k7x3qm2", or null.');
       }
       ids = (input.draftIds as string[]).map((id) => id.trim());
       if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');

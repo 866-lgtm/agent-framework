@@ -45,6 +45,14 @@ describe('ProseDraftStore', () => {
     }
   });
 
+  it("the drafts tool's example id has the form newId issues", () => {
+    const tool = (AgentFramework as unknown as {
+      DRAFTS_TOOL: { inputSchema: { properties: { draftIds: { description: string } } } };
+    }).DRAFTS_TOOL;
+    const example = /"(d-[^"]*)"/.exec(tool.inputSchema.properties.draftIds.description)?.[1];
+    assert.match(example ?? '(none)', /^d-[a-z2-9]{7}$/);
+  });
+
   it('replays the journal at reopen: an attempt with no recorded outcome reads as unconfirmed', () => {
     const { dir, store, drafts } = open();
     const path = join(dir, 'store');
@@ -1099,15 +1107,17 @@ describe('held prose drafts, end to end', () => {
           drafts('c', { action: 'list', draftIds: [draft!.id] }),
           drafts('d', { action: 'read', draftIds: ['d-zzzzz'] }),
           drafts('e', { action: 'shout' }),
+          drafts('f', { action: 'read', draftIds: [''] }),
         ], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [noDest, badDest, unused, unknown, badAction] = h.toolResults();
+      const [noDest, badDest, unused, unknown, badAction, badIds] = h.toolResults();
       assert.match(noDest!, /resend needs a destination/);
       assert.match(badDest!, /Destination "#nowhere" did not resolve.*Nothing was sent/);
       assert.match(unused!, /draftIds is not used by action "list"/);
       assert.match(unknown!, /No draft of yours with id d-zzzzz/);
       assert.match(badAction!, /action must be one of/);
+      assert.match(badIds!, /draftIds must be a list of draft ids such as "d-[a-z2-9]{7}", or null/, 'its example has the form newId issues');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
     } finally {
       await h.close();
