@@ -558,10 +558,61 @@ test('a read of a draft whose disk copy also changed shows the draft and names t
   assert.deepEqual((await call('read', { path: 'work/k.txt' })).data, {
     path: 'work/k.txt', totalLines: 1, fromLine: 1, toLine: 1,
     note: "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
-      + "Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.",
+      + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.",
     content: '     1\tagent draft',
   });
   assert.equal(disk('k.txt')!.toString(), 'another writer\n', 'the read left disk as it was');
+});
+
+test("a read of a draft whose disk copy turned binary says a sync keeps disk's copy and gives up the draft, which it does", async (t) => {
+  const { dir, call } = setup(t);
+  writeFileSync(join(dir, 'm.txt'), 'base\n');
+  assert.equal((await call('read', { path: 'work/m.txt' })).success, true);
+  assert.equal((await call('write', { path: 'work/m.txt', content: 'agent draft\n' })).success, true);
+  writeFileSync(join(dir, 'm.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
+  assert.equal(((await call('read', { path: 'work/m.txt' })).data as { note: string }).note,
+    "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
+      + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
+  // The workspace can't hold disk's copy, so the sync takes nothing in: the
+  // draft goes, and disk keeps its bytes.
+  assert.equal((await call('sync', { path: 'work/m.txt' })).success, true);
+  assert.equal(errorOf(await call('read', { path: 'work/m.txt' })),
+    'work/m.txt is on disk but not stored in the workspace (binary or over the size limit).');
+  assert.deepEqual([...readFileSync(join(dir, 'm.txt'))], [0, 1, 2, 0, 255, 0]);
+});
+
+test('a read of a draft whose disk copy was deleted says a sync takes the deletion, and each way out does what it says', async (t) => {
+  const { dir, call, disk } = setup(t);
+  for (const name of ['d.txt', 'e.txt']) {
+    writeFileSync(join(dir, name), 'base\n');
+    assert.equal((await call('read', { path: `work/${name}` })).success, true);
+    assert.equal((await call('write', { path: `work/${name}`, content: 'agent draft\n' })).success, true);
+    rmSync(join(dir, name));
+    assert.deepEqual((await call('read', { path: `work/${name}` })).data, {
+      path: `work/${name}`, totalLines: 1, fromLine: 1, toLine: 1,
+      note: "The path is in conflict with disk (deleted-on-disk): this read shows the workspace's copy. "
+        + "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk.",
+      content: '     1\tagent draft',
+    });
+  }
+  // A conflict recorded before disk deleted the file keeps its kind, and the
+  // note follows what disk holds now.
+  writeFileSync(join(dir, 'f.txt'), 'base\n');
+  assert.equal((await call('read', { path: 'work/f.txt' })).success, true);
+  assert.equal((await call('write', { path: 'work/f.txt', content: 'agent draft\n' })).success, true);
+  writeFileSync(join(dir, 'f.txt'), 'another writer\n');
+  const noteOf = async (path: string) => ((await call('read', { path })).data as { note: string }).note;
+  assert.match(await noteOf('work/f.txt'), /^The path is in conflict with disk \(both-changed\): .*Sync the path to keep disk's copy and give up the workspace's/);
+  rmSync(join(dir, 'f.txt'));
+  assert.equal(await noteOf('work/f.txt'),
+    "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
+      + "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk.");
+  // A sync of the path takes the deletion: the draft goes.
+  assert.equal((await call('sync', { path: 'work/d.txt' })).success, true);
+  assert.equal(errorOf(await call('read', { path: 'work/d.txt' })), 'File not found: work/d.txt');
+  // A forced materialize of the path writes the draft back.
+  assert.equal((await call('materialize', { path: 'work/e.txt', force: true })).success, true);
+  assert.equal(disk('e.txt')!.toString(), 'agent draft\n');
 });
 
 test("a read whose disk copy can't be checked says it shows the workspace's copy", async (t) => {
@@ -589,14 +640,25 @@ test("a read of a file disk lacks, with nothing to say whether disk deleted it, 
   });
 });
 
-test("readBinary takes in disk's change to a file the workspace holds, as read does", async (t) => {
-  const { workspace, dir, call } = setup(t, { autoMaterialize: true });
-  writeFileSync(join(dir, 'b.txt'), 'old\n');
+test("a read of a file disk made binary answers the disk-only text, not a deletion", async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'b.txt'), 'text\n');
   assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
-  writeFileSync(join(dir, 'b.txt'), 'new from another writer\n');
-  const read = await workspace.readBinary('work/b.txt');
+  writeFileSync(join(dir, 'b.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
+  assert.equal(errorOf(await call('read', { path: 'work/b.txt' })),
+    'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+});
+
+test('readBinary serves a binary file the workspace holds as it holds it, though disk changed it', async (t) => {
+  // A settle would drop the held copy, since the tree takes in no binary disk
+  // copy, and readBinary, a reader of binary content, would find nothing.
+  const { workspace, dir } = setup(t, { autoMaterialize: true });
+  const held = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]);
+  assert.equal((await workspace.writeBinary('work/i.png', held, 'image/png')).success, true);
+  writeFileSync(join(dir, 'i.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 9, 9, 9, 9]));
+  const read = await workspace.readBinary('work/i.png');
   assert.ok('data' in read, JSON.stringify(read));
-  assert.equal(read.data.toString(), 'new from another writer\n');
+  assert.deepEqual([...read.data], [...held]);
 });
 
 // ---------------------------------------------------------------------------

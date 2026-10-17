@@ -1295,10 +1295,11 @@ export class WorkspaceModule implements Module {
           + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files — '
           + 'and stops sooner where a page would pass the result limit; the note says where to continue. '
           + 'A line over 2000 characters is cut, with the offsetChars that reads the rest. '
-          + 'CRLF line ends are shown without the CR, and a BOM isn\'t shown; the note says when the file has either, '
+          + 'A line page shows CRLF line ends without the CR, and no BOM; its note says when the file has either, '
           + 'or isn\'t valid UTF-8. '
-          + 'For long lines or spill files, use offsetChars/limitChars instead: returns raw text without '
-          + 'line numbers, with nextOffsetChars (null at EOF), stopped at the result limit too. Keep limitChars when continuing. '
+          + 'For long lines or spill files, use offsetChars/limitChars instead: returns the stored text as it is, '
+          + 'BOM and CRs included, without line numbers, with nextOffsetChars (null at EOF), stopped at the result limit too. '
+          + 'Keep limitChars when continuing. '
           + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
         inputSchema: {
           type: 'object' as const,
@@ -1830,10 +1831,14 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Read a file's raw bytes from a mount (through the Chronicle tree, its path
-   * settled against disk first, as the `read` tool settles it). Public API for
-   * the framework's synthesized `read_image` tool and other peer callers that
-   * need binary content.
+   * Read a file's raw bytes from a mount, through the Chronicle tree, a path
+   * the workspace doesn't hold observed first (ensureSynced). A path it holds
+   * is read as the workspace holds it, not settled as the `read` tool settles
+   * it: the tree takes in no binary disk copy, so a pass over a held binary
+   * file that disk changed would drop the workspace's copy. Public API for
+   * the framework's synthesized `read_image` tool, where the workspace module
+   * doesn't serve read_image itself, and other peer callers that need binary
+   * content.
    */
   async readBinary(
     mountPrefixedPath: string,
@@ -1854,7 +1859,7 @@ export class WorkspaceModule implements Module {
     }
     const store = this.getStore();
     return this.withMount(mount, async () => {
-      await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+      await this.ensureSynced(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
       const blob = store.getBlob(entry.blobHash);
@@ -2624,15 +2629,17 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Before a deletion: a path the workspace doesn't hold is observed under the
-   * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. A path it holds is
-   * left alone, as a write's is: taking disk's change in first would let the
-   * deletion's push remove that change unseen. The pass names the path, as a
-   * file tool names the one it acts on: a path the mount passes over by
-   * design is observed, as a sync naming it would observe it (#276), while a
-   * path in another mount's directory is refused before this, and passed
-   * over by any pass. The caller holds the mount's turn.
+   * Before a deletion, and for readBinary: a path the workspace doesn't hold
+   * is observed under the three-way rule, which ingests a new disk file but
+   * never brings back a workspace deletion or a file absent from this branch.
+   * A path it holds is left alone. For a deletion, as for a write, taking
+   * disk's change in first would let the push remove that change unseen; for
+   * readBinary, a pass would drop a held binary file that disk changed, since
+   * the tree takes in no binary disk copy. The pass names the path, as a file
+   * tool names the one it acts on: a path the mount passes over by design is
+   * observed, as a sync naming it would observe it (#276), while a path in
+   * another mount's directory is refused before this, and passed over by any
+   * pass. The caller holds the mount's turn.
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
     const store = this.getStore();
@@ -4323,8 +4330,16 @@ function whichCopyRead(report: PathReport | undefined, tookChange: boolean): str
     return ['Disk has no copy of this file, and nothing records whether it was deleted there, so this read shows the workspace\'s copy.'];
   }
   if (report?.state === 'conflict') {
-    return [`The path is in conflict with disk (${report.conflict?.kind ?? 'both-changed'}): this read shows the workspace's copy. `
-      + 'Sync the path to take disk\'s copy instead, or materialize it with force to write the workspace\'s over disk\'s.'];
+    const kind = report.conflict?.kind ?? 'both-changed';
+    // A sync takes disk's state as it is now, which a recorded conflict's kind
+    // doesn't follow: where disk has no copy, the sync takes its deletion, and
+    // the workspace's copy goes with it. Where disk has one, the sync keeps it
+    // and gives up the workspace's, taking disk's in only where the workspace
+    // can hold it (not binary or too large).
+    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. `
+      + (report.diskNow === 'absent'
+        ? 'Sync the path to take disk\'s deletion, which removes the workspace\'s copy, or materialize it with force to write the workspace\'s copy back to disk.'
+        : 'Sync the path to keep disk\'s copy and give up the workspace\'s, or materialize it with force to write the workspace\'s over disk\'s.')];
   }
   return [];
 }
