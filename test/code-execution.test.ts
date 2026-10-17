@@ -465,6 +465,40 @@ describe('framework code_execution integration (real python3)', () => {
     }
   });
 
+  it("with codeExecution.inheritEnv: true, a script gets the host's variables beside codeExecution.env", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-envinherit-');
+    const membrane = new MockMembrane();
+    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_env_2', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    process.env[HOST_ONLY] = 'host-value';
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' }, inheritEnv: true },
+    });
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      assert.match(wireResult.content, /declared: from-config host: 'host-value'/, wireResult.content);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('create() refuses a codeExecution.inheritEnv that is not a boolean', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-inherit-');
     try {
@@ -475,7 +509,7 @@ describe('framework code_execution integration (real python3)', () => {
         modules: [new ScriptToolModule()],
         syncIntervalMs: 0,
         codeExecution: { enabled: true, inheritEnv: 'false' as unknown as boolean },
-      }), /codeExecution\.inheritEnv must be true or false, not "false" \(a string\)/);
+      }), /codeExecution\.inheritEnv must be true or false, unquoted, not a string: /);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
@@ -885,6 +919,39 @@ describe('framework background scripts + spill (real python3)', () => {
       }
       assert.match(wakeText, /"declared": "from-config"/, wakeText);
       assert.match(wakeText, /"host": null/, wakeText);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("with codeExecution.inheritEnv: true, a background script gets the host's variables beside codeExecution.env", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgenvinherit-');
+    const membrane = new MockMembrane();
+    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_bgenv_inherit', name: 'code_execution', input: { code: bgCode, background: true } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
+    process.env[HOST_ONLY] = 'host-value';
+    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' }, inheritEnv: true } });
+    try {
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const deadline = Date.now() + 20_000;
+      let wakeText = '';
+      while (Date.now() < deadline && !wakeText) {
+        await new Promise((r) => setTimeout(r, 100));
+        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
+        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
+      }
+      assert.match(wakeText, /"declared": "from-config"/, wakeText);
+      assert.match(wakeText, /"host": "host-value"/, wakeText);
     } finally {
       await framework.stop();
       delete process.env[HOST_ONLY];

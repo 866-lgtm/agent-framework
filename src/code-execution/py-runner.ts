@@ -18,7 +18,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { buildChildEnv } from '../mcpl/transport.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
 import { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
 
@@ -115,6 +115,17 @@ interface PendingExec {
   settled: boolean;
   /** Set once the deadline fired: the result then says the script ran out of time. */
   deadlineMs: number | null;
+}
+
+/**
+ * The interpreter to spawn. A bare name is looked up on PATH. A path with a
+ * separator is resolved against the host's working directory, where it
+ * resolved before the interpreter got a working directory of its own: spawn
+ * would resolve it against the runtime directory instead.
+ */
+function spawnablePath(pythonPath: string): string {
+  const hasSeparator = pythonPath.includes('/') || (process.platform === 'win32' && pythonPath.includes('\\'));
+  return hasSeparator ? resolve(pythonPath) : pythonPath;
 }
 
 export class PyRunner {
@@ -310,7 +321,7 @@ export class PyRunner {
     const runtimePath = join(this.runtimeDir, 'runtime.py');
     writeFileSync(runtimePath, PYTHON_RUNTIME_SOURCE, 'utf8');
 
-    const child = spawn(this.pythonPath, [runtimePath], {
+    const child = spawn(spawnablePath(this.pythonPath), [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       // The runtime directory, not the host's working directory: a script's
       // relative paths land here, and go at teardown, rather than beside the
@@ -530,8 +541,8 @@ export class PyRunner {
       this.reader.close();
       this.reader = null;
     }
-    if (this.child) {
-      const child = this.child;
+    const child = this.child;
+    if (child) {
       this.child = null;
       this.childReady = null;
       this.readyResolver = null;
@@ -545,13 +556,22 @@ export class PyRunner {
         child.kill('SIGKILL');
       }
     }
-    if (this.runtimeDir) {
-      try {
-        rmSync(this.runtimeDir, { recursive: true, force: true });
-      } catch {
-        // temp cleanup is best-effort
-      }
-      this.runtimeDir = null;
+    const dir = this.runtimeDir;
+    this.runtimeDir = null;
+    if (dir) {
+      const remove = (): void => {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // temp cleanup is best-effort
+        }
+      };
+      // The directory is the interpreter's working directory, which Windows
+      // won't remove while the process lives, so it goes once the process
+      // has. A child that never started has no exit to wait for.
+      const running = child !== null && child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+      if (running) child.once('exit', remove);
+      else remove();
     }
   }
 

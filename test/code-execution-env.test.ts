@@ -8,35 +8,61 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
 import { PyRunner } from '../src/index.js';
 import { validateCodeExecutionConfig } from '../src/code-execution/tool-definition.js';
 
-test('a codeExecution.inheritEnv that is not a boolean is refused, so "false" never hands over the host env', () => {
-  for (const inheritEnv of ['false', 'true', null, 0, 1, [], {}]) {
-    assert.throws(() => validateCodeExecutionConfig({ inheritEnv }), /codeExecution\.inheritEnv must be true or false/,
-      JSON.stringify(inheritEnv));
+test('a codeExecution.inheritEnv that is not a boolean is refused by its kind, so "false" never hands over the host env', () => {
+  const kinds: Array<[unknown, string]> = [
+    ['false', 'true or false, unquoted, not a string'], ['true', 'true or false, unquoted, not a string'],
+    [0, 'true or false, not a number'], [1, 'true or false, not a number'],
+    [[], 'true or false, not an array'], [{}, 'true or false, not an object'],
+  ];
+  for (const [inheritEnv, wanted] of kinds) {
+    assert.throws(() => validateCodeExecutionConfig({ inheritEnv }), (err: Error) => {
+      assert.ok(err.message.startsWith(`codeExecution.inheritEnv must be ${wanted}: `), err.message);
+      return true;
+    }, JSON.stringify(inheritEnv));
   }
-  assert.throws(() => validateCodeExecutionConfig({ inheritEnv: 'false' }), /not "false" \(a string\)/);
-  for (const inheritEnv of [undefined, true, false]) validateCodeExecutionConfig({ inheritEnv });
+  // null is how JSON writes "not set".
+  for (const inheritEnv of [undefined, null, true, false]) validateCodeExecutionConfig({ inheritEnv });
 });
 
-test('a codeExecution.env that is not an object of strings is refused, naming the variable but not its value', () => {
-  for (const env of [null, [], 'PYTHONPATH=/opt/lib', 7]) {
-    assert.throws(() => validateCodeExecutionConfig({ env }), /codeExecution\.env must be an object of variable names and string values/,
-      JSON.stringify(env));
-  }
-  for (const value of [8080, true, null, ['x'], { nested: 'y' }]) {
-    assert.throws(() => validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', BAD: value } }), (err: Error) => {
-      assert.match(err.message, /^codeExecution\.env\.BAD must be a string/);
-      assert.ok(!err.message.includes('8080'), err.message);
+test('a codeExecution.env that is not an object of strings is refused, naming the variable and its value\'s kind but not the value', () => {
+  const envKinds: Array<[unknown, string]> = [[[], 'an array'], ['PYTHONPATH=/opt/lib', 'a string'], [7, 'a number'], [new Map(), 'a Map']];
+  for (const [env, kind] of envKinds) {
+    assert.throws(() => validateCodeExecutionConfig({ env }), (err: Error) => {
+      assert.equal(err.message, `codeExecution.env must be an object of variable names and string values, not ${kind}`);
       return true;
-    }, JSON.stringify(value));
+    }, String(kind));
+  }
+  const valueKinds: Array<[unknown, string]> = [[8080, 'a number'], [true, 'a boolean'], [null, 'null'], [undefined, 'undefined'], [['x'], 'an array'], [{ nested: 'y' }, 'an object']];
+  for (const [value, kind] of valueKinds) {
+    assert.throws(() => validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', BAD: value } }), (err: Error) => {
+      assert.equal(err.message, `codeExecution.env.BAD must be a string, not ${kind}: give its value as a string, or leave BAD out`);
+      return true;
+    }, String(kind));
   }
   validateCodeExecutionConfig({ env: {} });
+  validateCodeExecutionConfig({ env: null });
   validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', EMPTY: '' } });
+});
+
+test('a codeExecution.env name spawn could not pass as written, or a value holding NUL, is refused at create', () => {
+  for (const name of ['', 'PYTHONPATH=/opt/lib', 'NU\0L']) {
+    assert.throws(() => validateCodeExecutionConfig({ env: { [name]: 'x' } }), (err: Error) => {
+      assert.equal(err.message, `codeExecution.env has a variable name ${JSON.stringify(name)}, and a name can't be empty or hold '=' or NUL`);
+      return true;
+    }, JSON.stringify(name));
+  }
+  assert.throws(() => validateCodeExecutionConfig({ env: { SECRET: 'sk-\0live' } }), (err: Error) => {
+    assert.equal(err.message, 'codeExecution.env.SECRET holds a NUL character, which no environment variable can carry');
+    return true;
+  });
 });
 
 test('model-authored python does not inherit a host variable outside the allowlist', async () => {
@@ -120,8 +146,33 @@ test("the interpreter runs in its own runtime directory, which goes at teardown,
     assert.match(basename(cwd), /^af-pytc-/, cwd);
     assert.ok(existsSync(join(cwd, 'scratch.txt')), 'a relative path lands in the runtime directory');
     runner.dispose();
+    // It goes once the killed interpreter has exited, which dispose() doesn't wait for.
+    const deadline = Date.now() + 10_000;
+    while (existsSync(cwd) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
     assert.ok(!existsSync(cwd), 'the runtime directory goes at teardown, with what the script wrote there');
   } finally {
     runner.dispose();
+  }
+});
+
+test("a relative pythonPath resolves from the host's working directory, not the interpreter's", async () => {
+  const python = execFileSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).trim();
+  // bin/python under a host directory of its own: a relative path that
+  // doesn't climb to the root, so it finds the interpreter from that
+  // directory and from no other.
+  const hostDir = mkdtempSync(join(tmpdir(), 'pytc-host-'));
+  mkdirSync(join(hostDir, 'bin'));
+  symlinkSync(python, join(hostDir, 'bin', 'python'));
+  const previousCwd = process.cwd();
+  process.chdir(hostDir);
+  const runner = new PyRunner({ onToolCall: async () => '', pythonPath: join('bin', 'python') });
+  try {
+    const r = await runner.exec('print("started")', []);
+    assert.equal(r.returnCode, 0, r.stderr);
+    assert.match(r.stdout, /started/);
+  } finally {
+    runner.dispose();
+    process.chdir(previousCwd);
+    rmSync(hostDir, { recursive: true, force: true });
   }
 });

@@ -78,12 +78,17 @@ export interface CodeExecutionConfig {
    *  inherits (see CHILD_ENV_ALLOWLIST), such as PYTHONPATH. A recipe can
    *  `${VAR}`-substitute them from .env. Other host variables aren't
    *  inherited, which limits what model-authored code inherits, not what a
-   *  process running as the same user can read. */
+   *  process running as the same user can read. The runner sets
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING last, over any value given here,
+   *  since its protocol needs both. The interpreter's working directory is
+   *  its own runtime directory, so a relative path given here, as in
+   *  PYTHONPATH, resolves there: give absolute paths. */
   env?: Record<string, string>;
   /** The interpreter inherits the host's whole environment instead of the
    *  allowlist: every host variable, provider keys included, reaches
    *  model-authored code and every subprocess a script starts. Listing what
-   *  scripts need in `env` is the safer route. */
+   *  scripts need in `env` is the safer route. null counts as not set, and
+   *  `create()` refuses any value but true or false. */
   inheritEnv?: boolean;
 }
 

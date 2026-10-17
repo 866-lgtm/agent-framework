@@ -39,7 +39,9 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +
       'tool results stay in the script, so filter or aggregate large data there and print only ' +
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
-      `calls but is reclaimed after ~${idleMinutes} minutes idle. A tool call that receives no ` +
+      `calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
+      'scratch directory of the interpreter\'s, which goes when it is reclaimed, so a file meant to ' +
+      'outlast the interpreter needs an absolute path. A tool call that receives no ' +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
       `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
       `(at most ${formatLimit(limits.maxMs)}; a background script runs up to ${formatLimit(limits.backgroundMaxMs)}). ` +
@@ -132,20 +134,31 @@ export function validateCodeExecutionConfig(cfg: {
         'it is the most an agent may ask for, and the default is always allowed',
     );
   }
-  if (cfg.inheritEnv !== undefined && typeof cfg.inheritEnv !== 'boolean') {
+  // No refusal shows the value it refuses, only its kind: a substituted
+  // value can be a credential. null counts as not set, as JSON writes that.
+  if (cfg.inheritEnv !== undefined && cfg.inheritEnv !== null && typeof cfg.inheritEnv !== 'boolean') {
+    const wanted = typeof cfg.inheritEnv === 'string' ? 'true or false, unquoted,' : 'true or false,';
     throw new Error(
-      `codeExecution.inheritEnv must be true or false, not ${kindOf(cfg.inheritEnv, true)}: ` +
+      `codeExecution.inheritEnv must be ${wanted} not ${kindOf(cfg.inheritEnv)}: ` +
         "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist",
     );
   }
-  if (cfg.env !== undefined) {
+  if (cfg.env !== undefined && cfg.env !== null) {
     if (!isPlainObject(cfg.env)) {
-      throw new Error(`codeExecution.env must be an object of variable names and string values, not ${kindOf(cfg.env, false)}`);
+      throw new Error(`codeExecution.env must be an object of variable names and string values, not ${kindOf(cfg.env)}`);
     }
     for (const [name, value] of Object.entries(cfg.env)) {
-      // The value isn't shown: it may be a credential.
+      // spawn writes each variable as name=value: a name that is empty or
+      // holds '=' doesn't reach the interpreter as written, and a NUL in a
+      // name or a value makes spawn throw at every start.
+      if (name === '' || name.includes('=') || name.includes('\0')) {
+        throw new Error(`codeExecution.env has a variable name ${JSON.stringify(name)}, and a name can't be empty or hold '=' or NUL`);
+      }
       if (typeof value !== 'string') {
-        throw new Error(`codeExecution.env.${name} must be a string, not ${kindOf(value, false)}: quote it in the config`);
+        throw new Error(`codeExecution.env.${name} must be a string, not ${kindOf(value)}: give its value as a string, or leave ${name} out`);
+      }
+      if (value.includes('\0')) {
+        throw new Error(`codeExecution.env.${name} holds a NUL character, which no environment variable can carry`);
       }
     }
   }
@@ -157,12 +170,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-/** What a configured value is, for an error: its kind, and with `show` a primitive's value too. */
-function kindOf(value: unknown, show: boolean): string {
+/** What kind of value a configuration holds, for an error that names it without showing it. */
+function kindOf(value: unknown): string {
   if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
   if (Array.isArray(value)) return 'an array';
-  const type = typeof value;
-  const kind = type === 'object' ? 'an object' : `a ${type}`;
-  if (!show || type === 'object' || type === 'function') return kind;
-  return `${type === 'string' ? JSON.stringify(value) : String(value)} (${kind})`;
+  if (typeof value !== 'object') return `a ${typeof value}`;
+  if (isPlainObject(value)) return 'an object';
+  const name = (Object.getPrototypeOf(value) as { constructor?: { name?: string } }).constructor?.name;
+  return name ? `a ${name}` : 'an object that isn\'t plain';
 }
