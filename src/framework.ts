@@ -3913,6 +3913,22 @@ export class AgentFramework {
     const durationMs = Date.now() - startTime;
     this.abortAgentScript(agent.name, 'stream cancelled');
     agent.reset();
+    // A stopped turn hands its tool-result batch to no successor, so abandon
+    // the batch here, before the run is settled, as settleFrameworkCancel()
+    // does. driveStream's finally abandons a pending batch too, but only
+    // while the agent is still registered, and for an ephemeral run the
+    // settle below rejects the run's caller, whose own finally deregisters
+    // the agent. The stream cases that reach here leave the switch with
+    // `break`, so the loop waits on the stream once more first: a stream
+    // that waits before it ends, after its terminal event, can let the
+    // deregistration win.
+    if (agent.toolResultGuard.hasPending) {
+      try {
+        agent.toolResultGuard.abandon('aborted');
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${agent.name} failed to record aborted batch:`, error);
+      }
+    }
     this.settleAgent(agent.name, {
       stopReason: 'exhausted',
       speech: '',

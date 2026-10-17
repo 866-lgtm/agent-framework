@@ -2079,15 +2079,44 @@ function reportCancelAs(stream: MockYieldingStream, shape: 'aborted' | 'error' |
   };
 }
 
-// A caller's cancel ends the run through settleDeliberateCancel, which leaves
-// the batch to driveStream's finally: its callers leave the stream case with
-// `break` or end after the loop, so that finally runs while the agent is still
-// registered. Pinned for each way the stream reports the cancel.
+/** Make each stream the membrane hands out wait `ms` after its terminal event
+ *  before it ends, as a stream that cleans up after reporting may. The wait
+ *  is on the pull after the terminal, which a consumer that reads on with
+ *  `next()` makes; one that leaves its loop by `return()` closes the stream
+ *  at once, without it. */
+function waitAfterTerminal(membrane: ScriptMembrane, ms: number) {
+  const make = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (request, options) => {
+    const stream = make(request, options);
+    const events = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<{ type: string }> })[Symbol.asyncIterator] =
+      async function* () {
+        for await (const event of { [Symbol.asyncIterator]: events } as AsyncIterable<{ type: string }>) {
+          yield event;
+          if (event.type === 'complete' || event.type === 'error' || event.type === 'aborted') {
+            await new Promise((r) => setTimeout(r, ms));
+            return;
+          }
+        }
+      };
+    return stream;
+  };
+}
+
+// A caller's cancel ends the run through settleDeliberateCancel, which
+// abandons the batch itself before the settle, as the framework's own stops
+// do: its stream cases leave the switch with `break`, and if the stream waits
+// before it ends, after its terminal event, the run's caller can deregister
+// the agent before driveStream's finally runs. Pinned for each way the stream
+// reports the cancel, and for a stream that waits after reporting it.
 for (const how of ['abortInference', 'cancelStream'] as const) {
-  for (const shape of ['aborted', 'error', 'closes'] as const) {
+  for (const [shape, waits] of [
+    ['aborted', false], ['error', false], ['closes', false], ['aborted', true], ['error', true],
+  ] as const) {
     const reported = shape === 'closes' ? 'just closes' : `reports the cancel as ${shape === 'error' ? 'an error' : '`aborted`'}`;
-    test(`${how}() over a running ephemeral run settles its pending batch, with a stream that ${reported}`, async () => {
+    test(`${how}() over a running ephemeral run settles its pending batch, with a stream that ${reported}${waits ? ' and waits before it ends' : ''}`, async () => {
       const h = await harness([[calls('one')]]);
+      if (waits) waitAfterTerminal(h.membrane, 50);
       let spills = 0;
       slowSpill(h.framework, async () => { spills++; });
       h.membrane.onSubmit = () => {
