@@ -144,6 +144,25 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(readFileSync(join(away, 'x.txt'), 'utf8'), 'v1\n', 'the file behind the link is as it was');
     });
 
+    test(`write, edit and delete on a mount with autoMaterialize report their push refused, and nothing behind the link changes (${target})`, async (t) => {
+      const env = new Env(t);
+      env.writeDisk('l/x.txt', 'v1\n');
+      const m = await env.open(t, { autoMaterialize: true });
+      await call(m, 'read', { path: 'work/l/x.txt' });
+      const away = env.swapLForLink(target, 'v1\n');
+      const refused = async (name: string, input: Record<string, unknown>) => {
+        const res = await m.handleToolCall({ id: name, name, input });
+        assert.equal(res.success, false, `${name} pushed through the link`);
+        assert.match(String(res.error), LINKED, name);
+        assert.doesNotMatch(String(res.error), /pass force/, name);
+      };
+      await refused('write', { path: 'work/l/new.txt', content: 'created\n' });
+      await refused('edit', { path: 'work/l/x.txt', oldString: 'v1', newString: 'v2' });
+      await refused('delete', { path: 'work/l/x.txt' });
+      assert.equal(existsSync(join(away, 'new.txt')), false, 'nothing was created behind the link');
+      assert.equal(readFileSync(join(away, 'x.txt'), 'utf8'), 'v1\n', 'the file behind the link is as it was');
+    });
+
     test(`an explicit sync doesn't read through it, and history keeps its copy (${target})`, async (t) => {
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
