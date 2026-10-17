@@ -67,15 +67,6 @@ export function boundedForLog(text: string, max = 200): string {
   return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');
 }
 
-/** Response encoding failed before the transport was given any bytes. Its
- *  message says why (a BigInt, a circular structure, a throwing toJSON). */
-export class McplResponseSerializationError extends Error {
-  constructor(cause: unknown) {
-    super(`MCPL response could not be serialized: ${boundedForLog(describeCause(cause))}`, { cause });
-    this.name = 'McplResponseSerializationError';
-  }
-}
-
 /**
  * Create a "feature set not enabled" error.
  * Returned when a server sends a message tagged with a feature set

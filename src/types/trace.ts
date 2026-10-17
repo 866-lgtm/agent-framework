@@ -585,9 +585,9 @@ export type TraceEvent =
        *  mcpl/manifestChanged or notifications/tools/list_changed, which is
        *  answered as it's admitted and then handled as the notification is. */
       requestId?: string | number;
-      /** Whether the handler's own reply may have reached the server: true
-       *  once it attempted one, unless the attempt failed while encoding,
-       *  before any bytes were written. When it's false and the responder
+      /** Whether the handler wrote a reply: true once a reply's write
+       *  returned. A write that throws, as one that can't be encoded does,
+       *  sends nothing. When it's false and the responder
        *  can send an error reply (it has respondError), the host sent -32603
        *  "Internal error" itself, or -32000 while it stops, unless
        *  `responseError` says that reply failed. A connection that has

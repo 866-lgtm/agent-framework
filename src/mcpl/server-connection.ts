@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
-import { CAPABILITY_DISABLED, McplResponseSerializationError, boundedForLog, describeCause } from './errors.js';
+import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
 import { logDetail, logValue } from './log-value.js';
 
 import type {
@@ -1453,22 +1453,13 @@ export class McplServerConnection extends EventEmitter {
     }
   }
 
-  /** Keep definite pre-write encoding failures distinct from transport errors. */
-  private serializeResponse(response: JsonRpcResponse): string {
-    try {
-      return JSON.stringify(response);
-    } catch (cause) {
-      throw new McplResponseSerializationError(cause);
-    }
-  }
-
   /**
    * Send a successful JSON-RPC response back to the server.
    */
   private sendResponse(id: string | number, result: unknown): void {
     if (this.closed) return;
     const response: JsonRpcResponse = { jsonrpc: '2.0', id, result };
-    this.transport?.writeLine(this.serializeResponse(response));
+    this.transport?.writeLine(JSON.stringify(response));
   }
 
   /**
@@ -1481,7 +1472,7 @@ export class McplServerConnection extends EventEmitter {
       id,
       error: { code, message, data },
     };
-    this.transport?.writeLine(this.serializeResponse(response));
+    this.transport?.writeLine(JSON.stringify(response));
   }
 
   // ==========================================================================

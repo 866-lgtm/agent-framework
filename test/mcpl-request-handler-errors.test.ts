@@ -11,7 +11,6 @@ import { InferenceRouter } from '../src/mcpl/inference-router.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
-import { McplResponseSerializationError } from '../src/mcpl/errors.js';
 
 function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) {
   const traces: any[] = [];
@@ -131,17 +130,17 @@ test('a synchronous handler throw is contained and answered', async () => {
   assert.match(failureTraces(traces)[0].error, /list failed/);
 });
 
-test('a throwing success response is not retried as an error response', async () => {
+test('a success response whose write throws has sent nothing, so the request gets one internal-error reply', async () => {
   const { framework, connection, traces } = harness();
   framework.channelRegistry = { descriptorsForServer() { return []; } };
   const reply = responder();
-  let writes = 0;
-  reply.respond = () => { writes++; throw new Error('response transport failed'); };
+  let tries = 0;
+  reply.respond = () => { tries++; throw new Error('the result could not be encoded'); };
   assert.doesNotThrow(() => connection.emit('channels-list', {}, reply));
   await settle();
-  assert.equal(writes, 1);
-  assert.equal(reply.errors.length, 0);
-  assert.equal(failureTraces(traces)[0].responseAttempted, true);
+  assert.equal(tries, 1);
+  assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
+  assert.equal(failureTraces(traces)[0].responseAttempted, false);
 });
 
 test('a failed error response is traced without an escaping rejection', async () => {
@@ -175,7 +174,7 @@ test('inference responders retain request IDs and successful handling stays sync
   assert.equal(failureTraces(traces).length, 0);
 });
 
-test('real inference handler cannot turn a failed result write into a second response', async () => {
+test('a real inference handler whose result write throws answers with its own error, its only reply, and the failed write is reported', async () => {
   const { framework, connection, traces } = harness();
   framework.inferenceRouter = new InferenceRouter(
     {
@@ -194,16 +193,19 @@ test('real inference handler cannot turn a failed result write into a second res
   );
   const reply = responder();
   let resultWrites = 0;
-  reply.respond = () => { resultWrites++; throw new Error('partially written result'); };
+  // A write that throws has sent nothing, as when a result can't be encoded.
+  reply.respond = () => { resultWrites++; throw new Error('the result could not be encoded'); };
   connection.emit('inference-request', {
     featureSet: 'test', messages: [{ role: 'user', content: 'hello' }],
   }, reply);
   await settle();
   assert.equal(resultWrites, 1);
-  assert.equal(reply.errors.length, 0, 'the inner inference catch must not send another reply');
+  // The router's own catch answers, as in 0.22.x, and the wrapper sends no
+  // internal-error reply after it.
+  assert.deepEqual(reply.errors, [{ code: -32603, message: 'the result could not be encoded', data: undefined }]);
   const failures = failureTraces(traces);
   assert.equal(failures.length, 1);
-  assert.match(failures[0].error, /partially written result/);
+  assert.match(failures[0].error, /the result could not be encoded/);
   assert.equal(failures[0].responseAttempted, true);
 });
 
@@ -226,22 +228,6 @@ test('a real inference handler whose inference fails answers -32603 with the fai
   assert.deepEqual(failureTraces(traces), []);
 });
 
-test('a swallowed response-write failure still produces a diagnostic', async () => {
-  const { framework, connection, traces } = harness();
-  framework.channelRegistry = {
-    async handleRegister(_server: string, _params: unknown, reply: any) {
-      try { reply.respond({}); } catch { /* Simulate a handler swallowing a transport error. */ }
-    },
-  };
-  const reply = responder();
-  reply.respond = () => { throw new Error('swallowed write failure'); };
-  connection.emit('channels-register', {}, reply);
-  await settle();
-  assert.equal(reply.errors.length, 0);
-  assert.equal(failureTraces(traces).length, 1);
-  assert.match(failureTraces(traces)[0].error, /swallowed write failure/);
-});
-
 test('an error response followed by a handler rejection is not answered again', async () => {
   const { framework, connection, traces } = harness();
   framework.channelRegistry = {
@@ -259,25 +245,12 @@ test('an error response followed by a handler rejection is not answered again', 
   assert.equal(failureTraces(traces)[0].responseAttempted, true);
 });
 
-test('host command response-write failure is traced without a second reply', async () => {
-  const { framework, connection, traces } = harness();
-  framework.handleHostCommand = async () => ({ done: true });
-  const reply = responder();
-  reply.respond = () => { throw new Error('host response failed'); };
-  connection.emit('host-command', {}, reply);
-  await settle();
-  assert.equal(reply.errors.length, 0);
-  assert.match(failureTraces(traces)[0].error, /host response failed/);
-});
-
 class ResponseTransport extends McplTransport {
   constructor() { super(); }
   readonly kind = 'stdio' as const;
   readonly lines: string[] = [];
-  failWrite = false;
   writeLine(line: string): void {
     this.lines.push(line);
-    if (this.failWrite) throw new TypeError('transport failed after a partial write');
   }
   async close(): Promise<void> {}
 }
@@ -317,10 +290,10 @@ for (const kind of ['bigint', 'circular', 'throwing toJSON'] as const) {
     const failures = failureTraces(traces);
     assert.equal(failures.length, 1);
     assert.equal(failures[0].responseAttempted, false);
-    // The encoding failure says why.
-    assert.match(failures[0].error, kind === 'bigint' ? /could not be serialized: .*BigInt/i
-      : kind === 'circular' ? /could not be serialized: .*circular/i
-        : /could not be serialized: snapshot serialization failed/);
+    // JSON.stringify's own message says why.
+    assert.match(failures[0].error, kind === 'bigint' ? /BigInt/
+      : kind === 'circular' ? /circular structure/
+        : /snapshot serialization failed/);
     if (kind === 'throwing toJSON') assert.equal(calls, 1, 'results are encoded only once');
   });
 }
@@ -351,17 +324,7 @@ test('a swallowed pre-write encoding failure still receives a fallback response'
   assert.equal(transport.lines.length, 1);
   assert.equal(JSON.parse(transport.lines[0]!).error.code, -32603);
   assert.equal(failureTraces(traces)[0].responseAttempted, false);
-});
-
-test('a transport write that throws remains single-attempt after serialization', async () => {
-  const { framework, traces, transport, request } = wireHarness();
-  framework.handleHostCommand = async () => ({ maintained: true });
-  transport.failWrite = true;
-  request();
-  await settle();
-  assert.equal(transport.lines.length, 1, 'a possibly partial write must not get a second reply');
-  assert.deepEqual(JSON.parse(transport.lines[0]!).result, { maintained: true });
-  assert.equal(failureTraces(traces)[0].responseAttempted, true);
+  assert.match(failureTraces(traces)[0].error, /BigInt/);
 });
 
 test('post-response failures reach stderr when no trace subscriber is attached', async (t) => {
@@ -515,21 +478,23 @@ test('tools-observe: a synchronous failure is answered with one internal error',
   assert.match(failureTraces(traces)[0].error, /filter store failed/);
 });
 
-test('model-info: a throwing error write is traced without escaping or a second write', async () => {
+test('model-info: an error write that throws has sent nothing, so one internal-error reply is tried, and neither throw escapes', async () => {
   const { connection, traces } = harness();
   const reply = responder();
-  const writes: Array<{ code: number; message: string }> = [];
-  reply.respondError = (code: number, message: string) => { writes.push({ code, message }); throw new Error('response transport failed'); };
+  const tried: Array<{ code: number; message: string }> = [];
+  reply.respondError = (code: number, message: string) => { tried.push({ code, message }); throw new Error('response transport failed'); };
   assert.doesNotThrow(() => connection.emit('model-info', {}, reply));
   await settle();
-  assert.equal(writes.length, 1);
-  assert.equal(writes[0]!.code, -32601);
-  assert.match(writes[0]!.message, /model\/info unavailable/);
+  assert.equal(tried.length, 2);
+  assert.equal(tried[0]!.code, -32601);
+  assert.match(tried[0]!.message, /model\/info unavailable/);
+  assert.deepEqual(tried[1], { code: -32603, message: 'Internal error' });
   const failures = failureTraces(traces);
   assert.equal(failures.length, 1);
-  assert.equal(failures[0].responseAttempted, true);
+  assert.equal(failures[0].responseAttempted, false);
   assert.match(failures[0].error, /response transport failed/);
   assert.equal(failures[0].responseFailure, undefined, 'the write failure is the error itself, not repeated');
+  assert.match(failures[0].responseError, /response transport failed/);
 });
 
 test('a method named after an Object.prototype member is not buffered while the planes are paused', () => {
@@ -561,7 +526,7 @@ test('a handler that swallows an encoding failure and then fails reports its own
   const failures = failureTraces(traces);
   assert.equal(failures.length, 1);
   assert.match(failures[0].error, /db down/);
-  assert.match(failures[0].responseFailure, /could not be serialized: .*BigInt/i);
+  assert.match(failures[0].responseFailure, /BigInt/);
   assert.equal(failures[0].responseAttempted, false);
 });
 
@@ -990,10 +955,10 @@ test('a synchronous handler that swallows an encoding failure is reported and an
   const writes: unknown[] = [];
   listener({}, {
     id: 61,
-    // Encode as the connection does: an encoding failure is typed, and
-    // proves no bytes went out.
+    // Encode before writing, as the connection does, so a reply that can't
+    // be encoded throws with nothing sent.
     respond(result: unknown) {
-      try { JSON.stringify(result); } catch (cause) { throw new McplResponseSerializationError(cause); }
+      JSON.stringify(result);
       writes.push(result);
     },
     respondError(code: number, message: string) { writes.push({ code, message }); },
@@ -1075,16 +1040,26 @@ test("the log line prints a failed reply write and a refused answer raw, and onl
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   framework.channelRegistry = {
     async handleRegister(_server: string, _params: unknown, reply: any) {
+      // The first write throws, sending nothing; the second is written; the
+      // third is refused.
       try { reply.respond({ registered: [] }); } catch { /* swallowed */ }
+      reply.respond({ registered: [] });
       reply.respondError(-32602, 'second\u0007answer');
       throw new Error('handler\u0007failed');
     },
   };
   const reply = responder();
-  reply.respond = () => { throw new Error('write\u0007broke'); };
+  const respond = reply.respond;
+  let first = true;
+  reply.respond = (result: unknown) => {
+    if (first) { first = false; throw new Error('write\u0007broke'); }
+    respond(result);
+  };
   connection.emit('channels-register', {}, reply);
   await settle();
+  assert.equal(reply.errors.length, 0, 'the written answer stands: no internal-error reply follows it');
   const failure = failureTraces(traces)[0];
+  assert.equal(failure.responseAttempted, true);
   assert.equal(failure.error, 'handler?failed');
   assert.equal(failure.responseFailure, 'write?broke');
   assert.deepEqual(failure.refusedResponse, { kind: 'error', code: -32602, message: 'second?answer' });

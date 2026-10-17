@@ -404,7 +404,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
-import { McplResponseSerializationError, boundedForLog, describeCause } from './mcpl/errors.js';
+import { boundedForLog, describeCause } from './mcpl/errors.js';
 import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -17464,15 +17464,19 @@ export class AgentFramework {
     handler: (params: T, responder?: InboundResponder) => void | Promise<void>,
   ): (params: T, responder?: InboundResponder) => void {
     return (params: T, responder?: InboundResponder) => {
-      // Whether a reply's bytes may have reached the transport. Only an
-      // encoding failure proves none did; a transport exception may have
-      // written part of one, so it can't be retried.
+      // Whether the handler wrote a reply. A reply counts once its write
+      // returns: a write that throws has sent nothing, since the connection
+      // encodes a reply before it writes it, and neither transport's write
+      // throws after writing (a stream write reports a failure
+      // asynchronously, and a WebSocket is written only while it's open). A
+      // transport whose write could throw after sending bytes would break
+      // this: the internal-error reply would follow part of a reply.
       let responseAttempted = false;
       // The first reply write that threw, if any, which a handler may have
       // swallowed.
       let writeFailure: unknown;
       let writeFailed = false;
-      // A write the handler tried after a reply was attempted. It's refused
+      // A write the handler tried after a reply was written. It's refused
       // without throwing, so a handler that answers again in its own catch
       // and then rethrows reports its own error; what it tried to send is
       // kept for the report.
@@ -17491,17 +17495,16 @@ export class AgentFramework {
           }
           return;
         }
-        responseAttempted = true;
         try {
           write();
         } catch (error) {
-          if (error instanceof McplResponseSerializationError) responseAttempted = false;
           if (!writeFailed) {
             writeFailed = true;
             writeFailure = error;
           }
           throw error;
         }
+        responseAttempted = true;
       };
       // Only the methods the responder has are wrapped, so a handler that
       // checks for respondError still finds a responder without one, such

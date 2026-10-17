@@ -42,7 +42,6 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { McplResponseSerializationError } from '../src/mcpl/errors.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
@@ -523,26 +522,28 @@ describe('stop() with work still in flight', () => {
     ] as const;
 
     /**
-     * A server's responder, recording each answer.
-     * - throws: respondError records its answer, then throws (the connection is going).
+     * A server's responder, recording each answer it sends, and in `tried`
+     * each error answer asked of it.
+     * - throws: respondError throws, sending nothing (the connection is going).
      * - serializes: respond serializes the result before it records it, as the
-     *   connection's sendResponse does, so a result JSON can't hold throws
-     *   McplResponseSerializationError, which proves nothing was sent.
+     *   connection's sendResponse does, so a result JSON can't hold throws,
+     *   with nothing sent.
      */
     function responder(opts: { throws?: boolean; serializes?: boolean } = {}) {
       const answers: Array<{ result?: unknown; error?: { code: number; message: string } }> = [];
+      const tried: Array<{ code: number; message: string }> = [];
       return {
         id: 7,
         answers,
+        tried,
         respond: (result: unknown) => {
-          if (opts.serializes) {
-            try { JSON.stringify(result); } catch (cause) { throw new McplResponseSerializationError(cause); }
-          }
+          if (opts.serializes) JSON.stringify(result);
           answers.push({ result });
         },
         respondError: (code: number, message: string) => {
-          answers.push({ error: { code, message } });
+          tried.push({ code, message });
           if (opts.throws) throw new Error('the connection is gone');
+          answers.push({ error: { code, message } });
         },
       };
     }
@@ -827,9 +828,16 @@ describe('stop() with work still in flight', () => {
         fw.pushCoalescer = { isRendering: () => true, suspend: () => {}, flush: () => {} };
         const inference = responder({ throws: true });
         connection.emit('inference-request', { messages: [] }, inference);
-        await answered(inference);
+        // A write that throws sent nothing, so the request is answered once
+        // more, as any handler's unanswered failure is; that throws too.
+        await until(() => inference.tried.length >= 2, 'the internal-error answer after the refusal failed');
+        await turn();
 
-        assert.deepEqual(inference.answers, [{ error: { code: -32600, message: 'Cannot request inference while push/render is in progress' } }]);
+        assert.deepEqual(inference.tried, [
+          { code: -32600, message: 'Cannot request inference while push/render is in progress' },
+          { code: -32603, message: 'Internal error' },
+        ]);
+        assert.deepEqual(inference.answers, []);
         assert.deepEqual(rejections, []);
         fw.pushCoalescer = coalescer;
       } finally {
@@ -842,9 +850,13 @@ describe('stop() with work still in flight', () => {
       await framework.stop();
       const push = responder({ throws: true });
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e11', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
-      await answered(push);
+      // The refusal's write threw, sending nothing, so the request is answered
+      // once more with the stop wording a failed handler gets; that throws too.
+      await until(() => push.tried.length >= 2, 'the stop answer after the refusal failed');
+      await turn();
 
-      assert.deepEqual(push.answers, [stopping]);
+      assert.deepEqual(push.tried, [stopping.error, { code: -32000, message: 'the host stopped while handling this request' }]);
+      assert.deepEqual(push.answers, []);
       assert.ok(logged.some((line) => line.includes('push/event from srv refused: the host is stopping')), logged.join('\n'));
       assert.deepEqual(rejections, []);
     });
