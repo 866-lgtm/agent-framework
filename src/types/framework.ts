@@ -424,7 +424,9 @@ export interface InferenceLogEntry {
    *  without one, the provider rounds it finished before it ended. Exactly
    *  one entry of a stream carries it, the one its end wrote; a stream whose
    *  end writes none (a quiesce-abandoned turn, a superseded stream, a
-   *  disposed agent's stream) gets a failure entry that carries it. */
+   *  disposed agent's stream) gets a failure entry that carries it, when it
+   *  had finished a round. One that hadn't has nothing to carry and gets no
+   *  entry. */
   tokenUsage?: {
     input: number;
     output: number;

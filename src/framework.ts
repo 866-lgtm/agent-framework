@@ -1760,7 +1760,8 @@ export class AgentFramework {
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
   private disposedEphemeralFrames: WeakSet<Agent> = new WeakSet();
-  /** Per-agent count of consecutive exhausted inferences (reset on any success).
+  /** Per-agent count of consecutive exhausted inferences, reset when a turn
+   *  completes (inference:completed), not when a call answers mid-turn.
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
@@ -1784,7 +1785,8 @@ export class AgentFramework {
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
-   *  breaker (noteInferenceExhausted). Reset on any successful inference.
+   *  breaker (noteInferenceExhausted). Reset when a turn completes
+   *  (inference:completed).
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
    *  the refusal loop, so the breaker can never shed the whole history. */
   private exhaustionRewinds: Map<string, number> = new Map();
@@ -12195,10 +12197,12 @@ export class AgentFramework {
         }
       : undefined;
     // The stream's billed usage reaches the session totals once, however the
-    // stream ends: a final response's usage where it carries one (completion,
-    // or the guard's abandoned round), else the rounds it finished (a final
-    // response without usage, the boundary ends below, or `finally` for
-    // every other end). Each caller passes the one value it also reports.
+    // stream ends. A completion counts its final response's detailed usage,
+    // and the guard's abandoned round its detailed usage, else the latest
+    // sample, else the response's own. Every other end counts the rounds it
+    // finished: a final response without detailed usage, the boundary ends
+    // below, and `finally` for the rest. Each caller passes the one value it
+    // also reports.
     let usageCounted = false;
     let countedUsage: DetailedUsage | undefined;
     const countUsage = (usage: DetailedUsage | undefined): void => {
@@ -12212,10 +12216,12 @@ export class AgentFramework {
       this.persistUsageState();
     };
     // ...and is carried by exactly one of its inference-log entries, so
-    // log-backed totals agree with the session's. The first entry carries
-    // it (the value the entry names, else the rounds finished so far); no
-    // later entry of this stream carries it again. An end that writes no
-    // entry of its own is logged in `finally`.
+    // totals summed from the log count each stream once, as the session's
+    // do. The first entry that has usage to carry carries it (the value the
+    // entry names, else the rounds finished so far): an entry before it with
+    // none leaves it to the next, and no entry after it carries it again. An
+    // end that writes no entry of its own is logged in `finally`, when it has
+    // rounds to carry.
     let usageLogged = false;
     const logStream = (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>): void => {
       const tokenUsage = usageLogged ? undefined : (entry.tokenUsage ?? tokenUsageOf(latestUsage));
@@ -12964,14 +12970,8 @@ export class AgentFramework {
             const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg)) : [];
 
             const du = response.details?.usage;
-            const tokenUsage = du
-              ? {
-                  input: du.inputTokens,
-                  output: du.outputTokens,
-                  cacheCreation: du.cacheCreationTokens,
-                  cacheRead: du.cacheReadTokens,
-                }
-              : undefined;
+            // A refusal's note carries what completeTurn counts.
+            const tokenUsage = tokenUsageOf(du ?? latestUsage);
 
             // Async completion work may overlap a replacement stream. Recheck
             // physical ownership before any terminal state/settlement side effect.
@@ -13689,27 +13689,34 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
-      // Every end the cases above didn't count (a stream error or abort, a
-      // throw, a superseded generation) still billed the rounds it finished.
-      countUsage(latestUsage);
-      // An end that wrote no entry carrying them (a quiesce-abandoned turn,
-      // a stream superseded by a newer one, a disposed agent's stream) writes
-      // one now, as a failure naming what ended it, so the log carries what
-      // the totals count.
-      if (countedUsage && !usageLogged) {
-        const replaced = this.agents.get(agent.name) !== agent;
-        const superseded = generationLost || agent.streamId !== myStreamId;
-        logStream({
-          success: false,
-          error: unloggedEnd ?? (replaced
-            ? 'Stream abandoned: its agent was disposed or replaced'
-            : superseded
-              ? 'Stream superseded: a newer stream of the agent took over'
-              : 'Stream ended without a final response'),
-          request: compiledRequest ?? { note: 'streaming request' },
-          durationMs: Date.now() - startTime,
-          tokenUsage: tokenUsageOf(countedUsage),
-        });
+      // The accounting writes to the store, and a write that fails must not
+      // skip the teardown after it.
+      try {
+        // Every end the cases above didn't count (a stream error or abort, a
+        // throw, a superseded generation) still billed the rounds it finished.
+        countUsage(latestUsage);
+        // An end that wrote no entry carrying them (a quiesce-abandoned turn,
+        // a stream superseded by a newer one, a disposed agent's stream) writes
+        // one now, as a failure naming what ended it, so the log carries what
+        // the totals count. With no finished round there is nothing to carry,
+        // and no entry is written, as before.
+        if (countedUsage && !usageLogged) {
+          const replaced = this.agents.get(agent.name) !== agent;
+          const superseded = generationLost || agent.streamId !== myStreamId;
+          logStream({
+            success: false,
+            error: unloggedEnd ?? (replaced
+              ? 'Stream abandoned: its agent was disposed or replaced'
+              : superseded
+                ? 'Stream superseded: a newer stream of the agent took over'
+                : 'Stream ended without a final response'),
+            request: compiledRequest ?? { note: 'streaming request' },
+            durationMs: Date.now() - startTime,
+            tokenUsage: tokenUsageOf(countedUsage),
+          });
+        }
+      } catch (error) {
+        console.error(`[usage] agent=${agent.name} could not record a stream's usage at its end: ${describeFailureWithFrames(error)}`);
       }
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
