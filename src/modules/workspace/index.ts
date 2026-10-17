@@ -698,7 +698,11 @@ export class WorkspaceModule implements Module {
    * second. `ensureRunning()` gates on `ctx && mounts-populated`.
    */
   initStore(store: JsStore): void {
-    this.store = store;
+    // Every mount's states are registered before the module takes the store
+    // or any mount, so a registration that fails leaves the module as it was
+    // before the call, knowing no mount, and a later initStore starts clean.
+    const mounts = new Map<string, MountState>();
+    const intents = new Map<string, BranchIntents>();
 
     // Register tree states for each mount: the workspace tree, and the
     // branch-local intent that qualifies it.
@@ -714,7 +718,7 @@ export class WorkspaceModule implements Module {
         });
       }
 
-      const mountState: MountState = {
+      mounts.set(mount.name, {
         config: mount,
         treeStateId,
         intentTreeStateId,
@@ -724,10 +728,13 @@ export class WorkspaceModule implements Module {
         lastMaterializedBranchId: null,
         watcherReadyAt: null,
         watcherError: null,
-      };
-      this.mounts.set(mount.name, mountState);
-      this.intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
+      });
+      intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
     }
+
+    this.store = store;
+    for (const [name, state] of mounts) this.mounts.set(name, state);
+    for (const [name, intent] of intents) this.intents.set(name, intent);
 
     // What disk last agreed with, per mount and path: global records, so a
     // branch switch never rewinds it.

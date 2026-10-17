@@ -47,7 +47,8 @@ export function isStateExistsError(err: unknown): boolean {
 /**
  * Register a state, treating "already exists" as done: a store reopened after
  * a restart already holds it. Every other failure is thrown here, where it
- * happened. Each state the framework registers goes through this.
+ * happened, naming the state, with the store's own error as its cause. Each
+ * state the framework registers goes through this.
  */
 export function ensureStateRegistered(
   store: Pick<JsStore, 'registerState'>,
@@ -56,7 +57,9 @@ export function ensureStateRegistered(
   try {
     store.registerState(registration);
   } catch (error) {
-    if (!isStateExistsError(error)) throw error;
+    if (isStateExistsError(error)) return;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Registering state '${registration.id}' failed: ${reason}`, { cause: error });
   }
 }
 
