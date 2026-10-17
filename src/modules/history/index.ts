@@ -1190,8 +1190,8 @@ export class HistoryModule implements Module {
     }
     if (input.allChannels && input.channelId !== undefined) {
       throw new Error(
-        'Nothing was read: "channelId" and "allChannels" can\'t go together. Leave both out to read around the message ' +
-          'in its own channel, pass "channelId" for another channel, or "allChannels": true for every channel.',
+        'Nothing was read: "channelId" and "allChannels" can\'t go together. Leave out "channelId" to read around the ' +
+          'message in every channel, or leave out both to read around it in its own channel.',
       );
     }
     const before = clampCount(input.before, AROUND_DEFAULT, AROUND_MAX, 'before', 'read');
@@ -1703,7 +1703,8 @@ export class HistoryModule implements Module {
     // before it answered, so its hits on this branch are returned.
     let searchAgainError: string | null = null;
     let onBranch: typeof res.hits = [];
-    for (;;) {
+    // The last answer's hits on this branch, checked as they are now.
+    const check = (): void => {
       droppedOffBranch = 0; droppedStale = 0;
       onBranch = res.hits.filter((h) => {
         const v = keep(h);
@@ -1711,6 +1712,9 @@ export class HistoryModule implements Module {
         else if (v === 'stale') droppedStale++;
         return v === 'ok';
       });
+    };
+    for (;;) {
+      check();
       if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
       k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
       try {
@@ -1719,6 +1723,9 @@ export class HistoryModule implements Module {
         const { reason, mayPass } = failure(e);
         searchAgainError = `searching again for more hits failed: ${reason}. ` +
           (mayPass ? 'Calling again may bring more.' : "Calling again the same way won't change that.");
+        // A message may have been edited, deleted or taken off this branch
+        // while that search waited, so the hits are checked again.
+        check();
         break;
       }
     }

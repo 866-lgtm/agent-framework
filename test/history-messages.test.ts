@@ -356,9 +356,15 @@ test("extract's refusals say which fields go together, and how to read instead",
   );
   assert.equal(
     await refusal(bound(), 'extract', { aroundId: 'm1', channelId: 'c1', allChannels: true }),
-    'Nothing was read: "channelId" and "allChannels" can\'t go together. Leave both out to read around the message '
-      + 'in its own channel, pass "channelId" for another channel, or "allChannels": true for every channel.',
+    'Nothing was read: "channelId" and "allChannels" can\'t go together. Leave out "channelId" to read around the '
+      + 'message in every channel, or leave out both to read around it in its own channel.',
   );
+  // Each way it names reads around the message, in every channel and in its own; a channelId other than its own
+  // is refused, below.
+  for (const [input, channelId] of [[{ aroundId: 'm1', allChannels: true }, null], [{ aroundId: 'm1' }, 'c1']] as const) {
+    const read = await answer<{ anchorId: string; channelId: string | null }>(bound(), 'extract', input);
+    assert.deepEqual([read.anchorId, read.channelId], ['m1', channelId], JSON.stringify(input));
+  }
   assert.equal(
     await refusal(bound(), 'extract', { aroundId: 'sum:s1' }),
     'Nothing was read: "sum:s1" is a compression summary, not a message. history--overview reads summaries; '
@@ -908,6 +914,45 @@ test('a background sync without stats fails on that answer when its budget cuts 
   assert.equal(found.index.lastError, notStats);
   const lines = warned.mock.calls.map((c) => String(c.arguments[0]));
   assert.ok(lines.includes(`[history/semantic] index "test/ns": sync failed (1×, retry in 5s): ${notStats}`), JSON.stringify(lines));
+});
+
+test('when searching again fails, the hits it keeps are checked as they are after that search, not before it', async (t) => {
+  // m1 and m2 are on this branch, and the first search's third hit isn't, so it searches again for more. While
+  // that search waits, m1 is edited and m2 deleted, and the search fails.
+  const texts = new Map([['m1', 'hello'], ['m2', 'hello']]);
+  const s = store();
+  (s as unknown as { getMessage: (id: string) => StoredMessage | null }).getMessage = (id) => {
+    const text = texts.get(id);
+    if (text === undefined) return null;
+    const m = message(id, T, 'c1');
+    (m as unknown as { content: unknown[] }).content = [{ type: 'text', text }];
+    return m;
+  };
+  const hit = (id: string) => ({ id, score: 0.9, ts: T / 1000, channel: 'c1', kind: 'message', level: null, meta: {}, text: 'hello', chars: 5 });
+  const url = await routed(t, (kind, n) => {
+    if (kind !== 'search') return [404, { error: { message: 'no such index' } }];
+    if (n === 0) {
+      return [200, { namespace: 'test/ns', hits: [hit('msg:m1'), hit('msg:m2'), hit('msg:undone')], count_indexed: 3, timing_ms: { embed: 1, search: 1 } }];
+    }
+    texts.set('m1', 'goodbye');
+    texts.delete('m2');
+    return [503, { error: { message: 'overloaded' } }];
+  });
+  const h = new HistoryModule({ semantic: { url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+  t.mock.method(console, 'warn', () => {});
+  h.bind(s);
+  t.after(() => h.stop());
+  const found = await answer<{ hits: Array<{ messageId: string; snippet: string; chars: number }>; index: Record<string, unknown> }>(
+    h, 'semantic_search', { query: 'x', limit: 3 },
+  );
+  // m1 with its text as edited, and m2 gone with the hit off the branch.
+  assert.deepEqual(found.hits.map((x) => [x.messageId, x.snippet, x.chars]), [['m1', 'goodbye', 7]]);
+  assert.equal(found.index.droppedOffBranch, 2);
+  assert.equal(
+    found.index.searchAgainError,
+    'searching again for more hits failed: the semantic index service answered the search request with an error '
+      + '(HTTP 503: overloaded). Calling again may bring more.',
+  );
 });
 
 test('when a third search fails, the hits come back from the second, the last that answered', async (t) => {
