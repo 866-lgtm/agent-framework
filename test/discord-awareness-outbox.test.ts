@@ -2412,7 +2412,9 @@ test('Discord refusals that no retry can change are permanent', () => {
 
 test("retract('all') takes the keys of every batch not retired, every key an add was requested for, and every key an imported ledger recorded, and no other key of a retired batch", withJournal((_outbox, h) => {
   // Imported, never activated, so retired at import: its attempt on m3 is
-  // kept as evidence, and its m4 has none.
+  // kept as evidence, and its m4 has none. 0.22.x attempted only an active
+  // batch's refs, so it couldn't write this ledger: it's constructed, to
+  // reach the imported-evidence source alone.
   const outbox = importLegacyBatch(h, 'old', [{ ...ref('m3'), attempts: 1, lastAction: 'add' } as DiscordAwarenessRef, ref('m4')]);
   activeBatch(outbox, [ref('m1')]);
   const retired = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2', refs: [ref('m2')], scope: 'all' })!;

@@ -1157,9 +1157,14 @@ export class DiscordAwarenessOutbox {
    * Remove this bot's mark (through the configured route) from a batch's refs,
    * or (`all`) from every key of every batch not retired, whether prepared
    * or active, every key an add was requested for, and every key an
-   * imported ledger recorded. A reaction is one per (route,
-   * message, emoji), whichever batches asked for it, so this acts across
-   * batches. A removal is queued for every selected key, whatever history
+   * imported ledger recorded. The last two are the direct record of a mark
+   * that may be on Discord. In every state this journal or agent-framework
+   * 0.22.x writes, each of their keys is also a key of a batch not retired:
+   * an add is requested only with its batch's activation, only a prepared
+   * batch is retired, and 0.22.x attempted only an active batch's refs. They
+   * are kept so that `all` doesn't rest on those rules. A reaction is one
+   * per (route, message, emoji), whichever batches asked for it, so this
+   * acts across batches. A removal is queued for every selected key, whatever history
    * says: history can't establish what is on Discord now, and removing an
    * absent reaction does nothing. It is the latest authorization for those
    * keys: adds not yet ended are superseded, and adds an earlier choice
