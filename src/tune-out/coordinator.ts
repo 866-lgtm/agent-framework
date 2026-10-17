@@ -112,8 +112,24 @@ export class TuneOutCoordinator {
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
     armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
-      this.expiryTimers.delete(key);
-      this.cancel(serverId, channelId, 'duration', 'duration elapsed');
+      try {
+        this.expiryTimers.delete(key);
+        this.cancel(serverId, channelId, 'duration', 'duration elapsed');
+      } catch (err) {
+        this.timerFailed('expiry', serverId, channelId, err);
+      }
+    });
+  }
+
+  /** A timer callback's work threw. Report it rather than throw it into the
+   *  event loop, where an uncaught exception ends the host process. */
+  private timerFailed(timer: 'cadence' | 'wake' | 'expiry', serverId: string, channelId: string, err: unknown): void {
+    this.hooks.emitTrace({
+      type: 'tune-out:timer-failed',
+      timer,
+      serverId,
+      channelId,
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 
@@ -377,14 +393,20 @@ export class TuneOutCoordinator {
     const key = this.key(serverId, channelId);
     const hold = (timer: ReturnType<typeof setTimeout>): void => { this.cadenceTimers.set(key, timer); };
     const tick = () => {
-      const state = this.channelRegistry.getTuneOutState(serverId, channelId);
-      if (!state) return; // cancelled meanwhile
-      const diverted = this.divertedSinceInvocation.get(key) ?? 0;
-      // An empty period needs no turn at all — skip silently.
-      if (diverted > 0) {
-        this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+      try {
+        const state = this.channelRegistry.getTuneOutState(serverId, channelId);
+        if (!state) return; // cancelled meanwhile
+        // The next period is armed before this one's turn, so a turn that
+        // fails can't end the cadence.
+        armAfter(cadenceSeconds * 1000, hold, tick);
+        const diverted = this.divertedSinceInvocation.get(key) ?? 0;
+        // An empty period needs no turn at all — skip silently.
+        if (diverted > 0) {
+          this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+        }
+      } catch (err) {
+        this.timerFailed('cadence', serverId, channelId, err);
       }
-      armAfter(cadenceSeconds * 1000, hold, tick);
     };
     armAfter(cadenceSeconds * 1000, hold, tick);
   }
@@ -417,21 +439,25 @@ export class TuneOutCoordinator {
       return;
     }
     const timer = setTimeout(() => {
-      const entry = this.pendingWakes.get(key);
-      this.pendingWakes.delete(key);
-      // Count ONE durable wake per coalesced invocation.
-      const counted = this.channelRegistry.recordTuneOutWake(serverId, channelId);
-      if (!counted) return; // cancelled inside the window
-      if (counted.wakeCount > counted.params.maxWakes) {
-        this.cancel(
-          serverId,
-          channelId,
-          'tune-out-max-wakes',
-          `wake budget exhausted (${counted.params.maxWakes})`,
-        );
-        return;
+      try {
+        const entry = this.pendingWakes.get(key);
+        this.pendingWakes.delete(key);
+        // Count ONE durable wake per coalesced invocation.
+        const counted = this.channelRegistry.recordTuneOutWake(serverId, channelId);
+        if (!counted) return; // cancelled inside the window
+        if (counted.wakeCount > counted.params.maxWakes) {
+          this.cancel(
+            serverId,
+            channelId,
+            'tune-out-max-wakes',
+            `wake budget exhausted (${counted.params.maxWakes})`,
+          );
+          return;
+        }
+        this.invokeSubconscious(serverId, channelId, 'wake', entry?.count ?? 1);
+      } catch (err) {
+        this.timerFailed('wake', serverId, channelId, err);
       }
-      this.invokeSubconscious(serverId, channelId, 'wake', entry?.count ?? 1);
     }, WAKE_COALESCE_MS);
     this.pendingWakes.set(key, { count: 1, timer });
   }

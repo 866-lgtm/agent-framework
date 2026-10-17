@@ -1,6 +1,7 @@
 /**
- * A tune-out's timers hold any length the resident asks for, and enter()
- * refuses an option it can't use before anything changes (F76).
+ * A tune-out's timers hold any length the resident asks for, enter()
+ * refuses an option it can't use before anything changes, and a timer whose
+ * work throws reports it rather than throwing it into the event loop.
  *
  * Node fires a setTimeout longer than 2^31 - 1 ms (about 24.8 days) almost
  * at once, so a single timer ended a longer tune-out as soon as it began,
@@ -42,6 +43,9 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
   }) as unknown as typeof setTimeout;
 
   let state: { params: TuneOutParams; wakeCount: number } | null = stored ? { params: stored, wakeCount: 0 } : null;
+  /** What addMessage throws on its next call, as a failed store write would; null to succeed. */
+  let addMessageThrows: unknown = null;
+  const traces: Array<Record<string, unknown>> = [];
   const entered: TuneOutParams[] = [];
   /** The source of each cancel that ended a tune-out: 'duration' for an end time. */
   const cancels: string[] = [];
@@ -63,7 +67,14 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
     recordTuneOutWake: () => (state ? { params: state.params, wakeCount: ++state.wakeCount } : null),
   } as unknown as ChannelRegistry;
   const hooks = {
-    addMessage: () => '',
+    addMessage: () => {
+      if (addMessageThrows !== null) {
+        const thrown = addMessageThrows;
+        addMessageThrows = null;
+        throw thrown;
+      }
+      return '';
+    },
     requestInference: (_agent: string, reason: string) => { inferences.push(reason); },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
@@ -73,7 +84,7 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
-    emitTrace: () => {},
+    emitTrace: (event: Record<string, unknown>) => { traces.push(event); },
   } as unknown as TuneOutFrameworkHooks;
   const coordinator = new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
   t.after(() => {
@@ -90,7 +101,13 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
   /** End the tune-out in the registry alone, as a send into the channel or a close does. */
   const endInRegistry = () => { state = null; };
   const active = () => state !== null;
-  return { coordinator, entered, cancels, cadenceTurns, wakeTurns, delays, noTimerPastOne, endInRegistry, active };
+  /** Make addMessage's next call throw `thrown`. */
+  const failNextAddMessage = (thrown: unknown = new Error('store write failed')) => { addMessageThrows = thrown; };
+  const timerFailures = () => traces.filter((e) => e.type === 'tune-out:timer-failed');
+  return {
+    coordinator, entered, cancels, cadenceTurns, wakeTurns, delays, noTimerPastOne, endInRegistry, active,
+    failNextAddMessage, timerFailures,
+  };
 }
 
 it('a duration past one timer ends at its end time and not before', (t) => {
@@ -298,4 +315,54 @@ it('armAt arms a deadline that has passed for the next turn of the loop, with no
   } finally {
     process.off('warning', onWarning);
   }
+});
+
+// A timer callback's work can throw, as a failed store write in a subconscious
+// turn would. Thrown into the event loop, it's an uncaught exception, which
+// ends the host process. Under node:test's mock timers a throw also comes out
+// of tick(), and the mock then runs that callback once more at its next tick,
+// so these tests assert that nothing leaves tick(), not only what comes after.
+
+it("a cadence turn that throws stays in its timer, is reported, and the next period's turn comes", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  h.failNextAddMessage();
+  assert.doesNotThrow(() => t.mock.timers.tick(60_000), "the turn's error stays in the timer");
+  assert.deepEqual(h.timerFailures(), [
+    { type: 'tune-out:timer-failed', timer: 'cadence', serverId: 'disc', channelId: '#a', error: 'store write failed' },
+  ]);
+  assert.deepEqual(h.cadenceTurns(), [], 'the failed turn requested nothing');
+  h.coordinator.onIncoming('disc', '#a', 'm2', undefined);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], "the next period's turn comes");
+});
+
+it('a coalesced wake whose turn throws stays in its timer and is reported', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
+  h.failNextAddMessage();
+  assert.doesNotThrow(() => t.mock.timers.tick(2_000), "the turn's error stays in the timer");
+  assert.deepEqual(h.timerFailures().map((e) => [e.timer, e.error]), [['wake', 'store write failed']]);
+  h.coordinator.onIncoming('disc', '#a', 'm2', ['chat:addressed']);
+  t.mock.timers.tick(2_000);
+  assert.deepEqual(h.wakeTurns(), ['tune-out wake: #a'], "the next wake's turn comes");
+});
+
+it('an end time whose cancel throws stays in its timer and is reported', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
+  h.failNextAddMessage();
+  assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the cancel's error stays in the timer");
+  assert.deepEqual(h.timerFailures().map((e) => [e.timer, e.error]), [['expiry', 'store write failed']]);
+});
+
+it('a throw that is not an Error is reported as its string', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  h.failNextAddMessage('disk full');
+  assert.doesNotThrow(() => t.mock.timers.tick(60_000));
+  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full']);
 });
