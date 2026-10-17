@@ -1009,6 +1009,43 @@ test('a rejection no printer can inspect still reaches the trace first', async (
   }
 });
 
+test("a trace listener that throws a value no printer can inspect leaves the report's fallback line, and nothing escapes", async (t) => {
+  const { framework, connection, traces } = harness();
+  // Print as console.error does: an argument that isn't a string goes
+  // through util.inspect, so logging the listener's throw throws too.
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    logged.push(args.map((arg) => (typeof arg === 'string' ? arg : inspect(arg))).join(' '));
+  });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  const hostile = { [inspect.custom]() { throw new Error('inspect refused'); } };
+  const off = framework.onTrace(() => { throw hostile; });
+  // The handler's own error can't be put in a template either, so the
+  // fallback line must convert it as the report does.
+  const primary = Object.assign(new Error('register failed'), {
+    [Symbol.toPrimitive]() { throw new Error('toPrimitive refused'); },
+  });
+  try {
+    framework.channelRegistry = { async handleRegister() { throw primary; } };
+    const reply = responder();
+    connection.emit('channels-register', {}, reply);
+    await settle();
+    await settle();
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
+    assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one still has the trace');
+    const fallback = logged.filter((line) => line.includes('(and reporting it failed too:'));
+    assert.equal(fallback.length, 1, logged.join('\n'));
+    assert.match(fallback[0], /^\[mcpl\] srv channels-register handler failed: .*register failed.* \(and reporting it failed too: .*inspect refused/);
+    assert.ok(!fallback[0].includes('toPrimitive refused'), fallback[0]);
+  } finally {
+    off();
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
 test('a request for an event nothing on the host listens for is answered -32601', (t) => {
   const { connection, transport } = wireHarness();
   const logged: string[] = [];
