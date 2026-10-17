@@ -153,6 +153,29 @@ test('a reconnect of "false" leaves a dropped server down: nothing retries, and 
   }
 });
 
+test('a server with reconnect: true that drops stays in the registry while it retries, and after it is back', { timeout: 30_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-booleans-'));
+  const flag = join(dir, 'up');
+  writeFileSync(flag, '');
+  const registry = new McplServerRegistry();
+  try {
+    const connection = await registry.addServer(flaky(flag, true), HOST_CAPS);
+    // Listeners run in the order they were added, so the registry's own
+    // 'close' handler has run by the time this one resolves.
+    const closed = new Promise<void>((resolve) => connection.once('close', () => resolve()));
+    const reconnected = new Promise<void>((resolve) => connection.once('reconnect', () => resolve()));
+    connection.ready();
+    connection.sendToolsList().catch(() => {}); // the fixture exits on tools/list, and its flag brings it back
+    await closed;
+    assert.equal(registry.getServer('flaky'), connection, 'kept while its retry is armed');
+    await reconnected;
+    assert.equal(registry.getServer('flaky'), connection, 'still the registered server once it is back');
+  } finally {
+    await registry.closeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a server the host closes leaves the registry, with reconnect: true too, since nothing will bring it back', { timeout: 30_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcpl-booleans-'));
   const flag = join(dir, 'up');

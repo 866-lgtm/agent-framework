@@ -502,10 +502,11 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
  * holds anything but true or false. A config read from JSON can carry a quoted
  * "false" where the type says boolean, and every reader of these settings takes
  * only `true` as on, so the quotes would hide what the value does. null counts
- * as not set, as JSON writes that. `inheritEnv` is checked only for a stdio
- * server, since a WebSocket server never reads it. The error names the server,
- * the setting and the value's kind, not the value, which could be a secret
- * pasted into the wrong field.
+ * as not set, so a generated config that writes an unset setting as null
+ * keeps working. `inheritEnv` is checked only for a stdio server, since a
+ * WebSocket server never reads it. The error names the server, the setting
+ * and the value's kind, not the value, which could be a secret pasted into
+ * the wrong field.
  */
 export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
