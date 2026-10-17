@@ -9,14 +9,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
 import { PyRunner } from '../src/index.js';
 import { validateCodeExecutionConfig } from '../src/code-execution/tool-definition.js';
 
-test('a codeExecution.inheritEnv that is not a boolean is refused by its kind, so "false" never hands over the host env', () => {
+test('a codeExecution.inheritEnv set to anything but true, false or null is refused, naming its kind but not its value', () => {
   const kinds: Array<[unknown, string]> = [
     ['false', 'true or false, unquoted, not a string'], ['true', 'true or false, unquoted, not a string'],
     [0, 'true or false, not a number'], [1, 'true or false, not a number'],
@@ -24,7 +24,8 @@ test('a codeExecution.inheritEnv that is not a boolean is refused by its kind, s
   ];
   for (const [inheritEnv, wanted] of kinds) {
     assert.throws(() => validateCodeExecutionConfig({ inheritEnv }), (err: Error) => {
-      assert.ok(err.message.startsWith(`codeExecution.inheritEnv must be ${wanted}: `), err.message);
+      assert.equal(err.message, `codeExecution.inheritEnv must be ${wanted}: ` +
+        "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist");
       return true;
     }, JSON.stringify(inheritEnv));
   }
@@ -33,7 +34,10 @@ test('a codeExecution.inheritEnv that is not a boolean is refused by its kind, s
 });
 
 test('a codeExecution.env that is not an object of strings is refused, naming the variable and its value\'s kind but not the value', () => {
-  const envKinds: Array<[unknown, string]> = [[[], 'an array'], ['PYTHONPATH=/opt/lib', 'a string'], [7, 'a number'], [new Map(), 'a Map']];
+  const envKinds: Array<[unknown, string]> = [
+    [[], 'an array'], ['PYTHONPATH=/opt/lib', 'a string'], [7, 'a number'], [new Map(), 'a Map'],
+    [Object.create(Object.create(null)), "an object that isn't plain"],
+  ];
   for (const [env, kind] of envKinds) {
     assert.throws(() => validateCodeExecutionConfig({ env }), (err: Error) => {
       assert.equal(err.message, `codeExecution.env must be an object of variable names and string values, not ${kind}`);
@@ -52,10 +56,16 @@ test('a codeExecution.env that is not an object of strings is refused, naming th
   validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', EMPTY: '' } });
 });
 
-test('a codeExecution.env name spawn could not pass as written, or a value holding NUL, is refused at create', () => {
-  for (const name of ['', 'PYTHONPATH=/opt/lib', 'NU\0L']) {
+test('a codeExecution.env name spawn could not pass as written, or a value holding NUL, is refused, showing nothing after an = or NUL', () => {
+  const names: Array<[string, string]> = [
+    ['', 'that is empty'],
+    ['PYTHONPATH=/opt/lib', `starting "PYTHONPATH" that holds '=' or NUL`],
+    ['TOKEN=sk-live-secret', `starting "TOKEN" that holds '=' or NUL`],
+    ['NU\0L', `starting "NU" that holds '=' or NUL`],
+  ];
+  for (const [name, shown] of names) {
     assert.throws(() => validateCodeExecutionConfig({ env: { [name]: 'x' } }), (err: Error) => {
-      assert.equal(err.message, `codeExecution.env has a variable name ${JSON.stringify(name)}, and a name can't be empty or hold '=' or NUL`);
+      assert.equal(err.message, `codeExecution.env has a variable name ${shown}, and a name can't be empty or hold '=' or NUL`);
       return true;
     }, JSON.stringify(name));
   }
@@ -146,9 +156,11 @@ test("the interpreter runs in its own runtime directory, which goes at teardown,
     assert.match(basename(cwd), /^af-pytc-/, cwd);
     assert.ok(existsSync(join(cwd, 'scratch.txt')), 'a relative path lands in the runtime directory');
     runner.dispose();
-    // It goes once the killed interpreter has exited, which dispose() doesn't wait for.
-    const deadline = Date.now() + 10_000;
-    while (existsSync(cwd) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    if (process.platform === 'win32') {
+      // There it goes once the killed interpreter has exited, which dispose() doesn't wait for.
+      const deadline = Date.now() + 10_000;
+      while (existsSync(cwd) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    }
     assert.ok(!existsSync(cwd), 'the runtime directory goes at teardown, with what the script wrote there');
   } finally {
     runner.dispose();
@@ -161,18 +173,87 @@ test("a relative pythonPath resolves from the host's working directory, not the 
   // doesn't climb to the root, so it finds the interpreter from that
   // directory and from no other.
   const hostDir = mkdtempSync(join(tmpdir(), 'pytc-host-'));
-  mkdirSync(join(hostDir, 'bin'));
-  symlinkSync(python, join(hostDir, 'bin', 'python'));
   const previousCwd = process.cwd();
-  process.chdir(hostDir);
-  const runner = new PyRunner({ onToolCall: async () => '', pythonPath: join('bin', 'python') });
+  let runner: PyRunner | undefined;
   try {
+    mkdirSync(join(hostDir, 'bin'));
+    symlinkSync(python, join(hostDir, 'bin', 'python'));
+    process.chdir(hostDir);
+    runner = new PyRunner({ onToolCall: async () => '', pythonPath: join('bin', 'python') });
     const r = await runner.exec('print("started")', []);
     assert.equal(r.returnCode, 0, r.stderr);
     assert.match(r.stdout, /started/);
   } finally {
-    runner.dispose();
+    runner?.dispose();
     process.chdir(previousCwd);
     rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
+/** Run `fn` with os.tmpdir() reading `dir`, as TMPDIR sets it on POSIX. */
+async function withTmpdir<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+}
+
+test('an interpreter that never starts leaves no runtime directory behind', { skip: process.platform === 'win32' }, async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pytc-tmp-'));
+  try {
+    await withTmpdir(tmp, async () => {
+      const runner = new PyRunner({ onToolCall: async () => '', pythonPath: join(tmp, 'no-such-python') });
+      try {
+        const r = await runner.exec('print(1)', []);
+        assert.equal(r.returnCode, 1);
+        assert.match(r.stderr, /Failed to start python runtime/, r.stderr);
+        assert.deepEqual(readdirSync(tmp), [], 'the runtime directory went with the failed start');
+      } finally {
+        runner.dispose();
+      }
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('the interpreter starts from a relative TMPDIR, since its runtime directory is made absolute', { skip: process.platform === 'win32' }, async () => {
+  const hostDir = mkdtempSync(join(tmpdir(), 'pytc-host-'));
+  const previousCwd = process.cwd();
+  try {
+    mkdirSync(join(hostDir, 'tmp'));
+    process.chdir(hostDir);
+    await withTmpdir('tmp', async () => {
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      try {
+        const r = await runner.exec('import os; print(os.getcwd())', []);
+        assert.equal(r.returnCode, 0, r.stderr);
+        assert.match(basename(r.stdout.trim()), /^af-pytc-/, r.stdout);
+      } finally {
+        runner.dispose();
+      }
+    });
+  } finally {
+    process.chdir(previousCwd);
+    rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
+test('a PyRunner built directly passes the host env only for inheritEnv: true, whatever else its options hold', async () => {
+  const key = 'AF_CODE_EXEC_TEST_DIRECT_SECRET';
+  let runner: PyRunner | undefined;
+  try {
+    process.env[key] = 'must-not-leak';
+    runner = new PyRunner({ onToolCall: async () => '', inheritEnv: 'false' as unknown as boolean });
+    const r = await runner.exec(`import os; print(repr(os.environ.get('${key}')))`, []);
+    assert.equal(r.returnCode, 0, r.stderr);
+    assert.match(r.stdout, /^None$/m, r.stdout);
+  } finally {
+    runner?.dispose();
+    delete process.env[key];
   }
 });

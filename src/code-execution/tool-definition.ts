@@ -40,7 +40,7 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'tool results stay in the script, so filter or aggregate large data there and print only ' +
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
       `calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
-      'scratch directory of the interpreter\'s, which goes when it is reclaimed, so a file meant to ' +
+      'scratch directory of the interpreter\'s, which goes whenever it stops or is reclaimed, so a file meant to ' +
       'outlast the interpreter needs an absolute path. A tool call that receives no ' +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
       `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
@@ -117,9 +117,11 @@ export function scriptTimeLimits(opts?: {
 
 /**
  * Refuse a configuration whose time limits contradict each other, or whose
- * interpreter environment would be misread. A recipe's `"inheritEnv": "false"`,
- * or a `${VAR}` substituted as a string, arrives untyped, and any truthy value
- * would hand the interpreter the host's whole environment.
+ * interpreter environment would be misread. A recipe's `"inheritEnv": "true"`,
+ * or a `${VAR}` substituted as a string, arrives untyped, and the runner passes
+ * the host's environment only for `true`, so such a value would quietly keep
+ * the allowlist. Anything but true, false or null is refused, a quoted "false"
+ * included.
  */
 export function validateCodeExecutionConfig(cfg: {
   scriptTimeoutMs?: number;
@@ -151,8 +153,11 @@ export function validateCodeExecutionConfig(cfg: {
       // spawn writes each variable as name=value: a name that is empty or
       // holds '=' doesn't reach the interpreter as written, and a NUL in a
       // name or a value makes spawn throw at every start.
+      // Only what comes before an '=' or NUL is shown: what follows can be a
+      // value pasted into the name.
       if (name === '' || name.includes('=') || name.includes('\0')) {
-        throw new Error(`codeExecution.env has a variable name ${JSON.stringify(name)}, and a name can't be empty or hold '=' or NUL`);
+        const shown = name === '' ? 'that is empty' : `starting ${JSON.stringify(name.split(/[=\0]/, 1)[0])} that holds '=' or NUL`;
+        throw new Error(`codeExecution.env has a variable name ${shown}, and a name can't be empty or hold '=' or NUL`);
       }
       if (typeof value !== 'string') {
         throw new Error(`codeExecution.env.${name} must be a string, not ${kindOf(value)}: give its value as a string, or leave ${name} out`);

@@ -87,8 +87,9 @@ export interface CodeExecutionConfig {
   /** The interpreter inherits the host's whole environment instead of the
    *  allowlist: every host variable, provider keys included, reaches
    *  model-authored code and every subprocess a script starts. Listing what
-   *  scripts need in `env` is the safer route. null counts as not set, and
-   *  `create()` refuses any value but true or false. */
+   *  scripts need in `env` is the safer route. With code execution enabled,
+   *  `create()` refuses any value but true, false or null, which counts as
+   *  not set. */
   inheritEnv?: boolean;
 }
 

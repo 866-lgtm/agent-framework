@@ -163,7 +163,9 @@ export class PyRunner {
     // as options, not a snapshot — the env is rebuilt at every spawn so a
     // respawn after idle reclaim sees current host values, as the old
     // per-spawn `{ ...process.env }` did.
-    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv };
+    // Only true inherits: a direct caller's options aren't checked as
+    // create() checks codeExecution's.
+    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv === true };
   }
 
   get busy(): boolean {
@@ -317,7 +319,9 @@ export class PyRunner {
     }
     this.teardownChild();
 
-    this.runtimeDir = mkdtempSync(join(tmpdir(), 'af-pytc-'));
+    // Absolute, since the interpreter runs in it: from a relative TMPDIR,
+    // runtime.py's path would otherwise resolve against the directory itself.
+    this.runtimeDir = resolve(mkdtempSync(join(tmpdir(), 'af-pytc-')));
     const runtimePath = join(this.runtimeDir, 'runtime.py');
     writeFileSync(runtimePath, PYTHON_RUNTIME_SOURCE, 'utf8');
 
@@ -567,10 +571,12 @@ export class PyRunner {
         }
       };
       // The directory is the interpreter's working directory, which Windows
-      // won't remove while the process lives, so it goes once the process
-      // has. A child that never started has no exit to wait for.
+      // won't remove while the process lives, so there it goes once the
+      // process has. Elsewhere it goes now, so a host that exits right after
+      // this doesn't leave it behind. A child that never started has no exit
+      // to wait for.
       const running = child !== null && child.pid !== undefined && child.exitCode === null && child.signalCode === null;
-      if (running) child.once('exit', remove);
+      if (running && process.platform === 'win32') child.once('exit', remove);
       else remove();
     }
   }

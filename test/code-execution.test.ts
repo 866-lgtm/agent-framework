@@ -439,7 +439,6 @@ describe('framework code_execution integration (real python3)', () => {
       { type: 'tool_use', id: 'call_env_1', name: 'code_execution', input: { code } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
-    process.env[HOST_ONLY] = 'host-value';
     const framework = await AgentFramework.create({
       storePath,
       membrane: membrane.asMembrane(),
@@ -449,6 +448,7 @@ describe('framework code_execution integration (real python3)', () => {
       codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' } },
     });
     try {
+      process.env[HOST_ONLY] = 'host-value';
       const created = await framework.createEphemeralAgent({
         name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
       });
@@ -473,7 +473,6 @@ describe('framework code_execution integration (real python3)', () => {
       { type: 'tool_use', id: 'call_env_2', name: 'code_execution', input: { code } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
-    process.env[HOST_ONLY] = 'host-value';
     const framework = await AgentFramework.create({
       storePath,
       membrane: membrane.asMembrane(),
@@ -483,6 +482,7 @@ describe('framework code_execution integration (real python3)', () => {
       codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' }, inheritEnv: true },
     });
     try {
+      process.env[HOST_ONLY] = 'host-value';
       const created = await framework.createEphemeralAgent({
         name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
       });
@@ -902,9 +902,9 @@ describe('framework background scripts + spill (real python3)', () => {
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
-    process.env[HOST_ONLY] = 'host-value';
     const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' } } });
     try {
+      process.env[HOST_ONLY] = 'host-value';
       framework.start();
       framework.pushEvent({
         type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
@@ -935,9 +935,9 @@ describe('framework background scripts + spill (real python3)', () => {
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
-    process.env[HOST_ONLY] = 'host-value';
     const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' }, inheritEnv: true } });
     try {
+      process.env[HOST_ONLY] = 'host-value';
       framework.start();
       framework.pushEvent({
         type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
