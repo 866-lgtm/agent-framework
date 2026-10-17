@@ -1,8 +1,8 @@
 /**
  * The recovery files (host mode, deferred writes) are written as a temp file
- * synced and renamed over the record, with the directory synced after the
- * rename. These drive both records through the framework, recording the
- * node:fs calls each write makes.
+ * synced and renamed over the record, with the directory and its parent
+ * synced after the rename. These drive both records through the framework,
+ * recording the node:fs calls each write makes.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -110,11 +110,12 @@ function assertSyncedAround(calls: FsCall[], record: string, directory: string):
   );
 }
 
-test('quiesce syncs the host-mode record\'s temp file before renaming it over the record, and the directory after', async () => {
+test('quiesce syncs the host-mode record\'s temp file before renaming it over the record, and the directory and its parent after', async () => {
   await withFramework(async (framework, recovery) => {
     const record = join(recovery, 'host-mode.json');
     const calls = await recordingFs(() => framework.quiesce({ reason: 'test' }));
     assertSyncedAround(calls, record, recovery);
+    assertSyncedAround(calls, record, dirname(recovery));
     assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
   });
 });
@@ -131,21 +132,20 @@ test('a context write deferred while quiesced syncs the deferred-writes record t
   });
 });
 
-test('a write that makes the record\'s directories syncs each into its parent before writing, and no higher', async () => {
+test('a directory a failed write had to make is synced into its parent by the next write', async () => {
   await withFramework(async (framework, _recovery, dir) => {
-    const upper = join(dir, 'a');
-    const lower = join(upper, 'b');
-    const record = join(lower, 'host-mode.json');
-    assert.equal(existsSync(upper), false);
-    const calls = await recordingFs(() => framework.quiesce({ reason: 'test' }));
-    assertSyncedAround(calls, record, lower);
-    const tempOpen = calls.findIndex((c) => c.call === 'open' && isTemporaryOf(record, c.path));
-    const synced = (path: string) => calls.findIndex((c) => c.call === 'fsync' && c.path === path);
-    for (const parent of [upper, dir]) {
-      assert.ok(synced(parent) >= 0 && synced(parent) < tempOpen, `${parent} synced before the temp file is opened: ${JSON.stringify(calls)}`);
-    }
-    assert.equal(synced(dirname(dir)), -1, `${dirname(dir)}, which held no new directory, isn't synced`);
-  }, { hostModePath: (dir) => join(dir, 'a', 'b', 'host-mode.json') });
+    const fresh = join(dir, 'fresh');
+    const record = join(fresh, 'host-mode.json');
+    assert.equal(existsSync(fresh), false);
+    await recordingFs(
+      () => framework.quiesce({ reason: 'first' }).catch(() => undefined),
+      (c) => (c.call === 'fsync' && isTemporaryOf(record, c.path) ? fsError('EIO', 'fsync') : undefined),
+    );
+    assert.equal(existsSync(fresh), true, 'the failed write made the directory');
+    const calls = await recordingFs(() => framework.quiesce({ reason: 'second' }));
+    assertSyncedAround(calls, record, fresh);
+    assertSyncedAround(calls, record, dir);
+  }, { hostModePath: (dir) => join(dir, 'fresh', 'host-mode.json') });
 });
 
 test('a write whose directory can\'t be made says the record was left as it was, and tries to remove no temp file', async () => {
@@ -182,7 +182,7 @@ test('a host-mode record that can\'t be replaced leaves no temp file behind, and
   });
 });
 
-test('a temp file whose sync fails is removed, and the record keeps what it held', async () => {
+test('a quiesce whose temp file can\'t be synced rejects with the host still serving, the record as it was and no temp file', async () => {
   await withFramework(async (framework, recovery) => {
     const record = join(recovery, 'host-mode.json');
     await framework.quiesce({ reason: 'first' });
@@ -196,6 +196,7 @@ test('a temp file whose sync fails is removed, and the record keeps what it held
     assert.ok(error instanceof Error, String(error));
     assert.equal(error.message, `${record} was left as it was: EIO: i/o error, fsync`);
     assert.ok(!calls.some((c) => c.call === 'rename' && c.to === record), `no rename: ${JSON.stringify(calls)}`);
+    assert.equal(framework.getHostModeStatus().quiesced, false, 'the host still serving');
     assert.equal(readFileSync(record, 'utf8'), before);
     assert.deepEqual(readdirSync(recovery).filter((name) => name.endsWith('.tmp')), []);
   });
@@ -218,7 +219,7 @@ test('a temp file that can\'t be removed after a failed write is named in the lo
   });
 });
 
-test('on win32 the temp file is still synced, and the directory is not opened to sync it', async () => {
+test('on win32 the temp file is still synced, and no directory is opened to sync it', async () => {
   await withFramework(async (framework, recovery) => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
@@ -230,7 +231,10 @@ test('on win32 the temp file is still synced, and the directory is not opened to
     }
     const rename = recordRename(calls, join(recovery, 'host-mode.json'));
     assert.ok(calls.some((c, i) => i < rename.at && c.call === 'fsync' && c.path === rename.temporary), JSON.stringify(calls));
-    assert.ok(!calls.some((c) => c.call === 'open' && c.path === recovery), `the directory not opened: ${JSON.stringify(calls)}`);
+    assert.ok(
+      !calls.some((c) => c.call === 'open' && (c.path === recovery || c.path === dirname(recovery))),
+      `neither directory opened: ${JSON.stringify(calls)}`,
+    );
   });
 });
 

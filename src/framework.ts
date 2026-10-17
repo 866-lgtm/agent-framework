@@ -5357,30 +5357,22 @@ export class AgentFramework {
   }
 
   /** Atomic, durable JSON write for the recovery files. The document goes to
-   *  a temp file at 0600, which is synced and renamed over the record, and
-   *  then the directory is synced. A directory this write makes is synced
-   *  into its parent before anything is written to it. Directories are synced
+   *  a temp file at 0600, which is synced and renamed over the record. Then
+   *  the directory is synced, for the record's entry in it, and so is its
+   *  parent, for the directory's own entry, which is new when a write, this
+   *  one or an earlier one, had to make the directory. Directories are synced
    *  on POSIX only; win32 syncs the file. So a crash leaves the record as it
    *  was or the new one, whole. A failure before the rename removes the temp
    *  file, if it was made, and throws an error saying the record was left as
    *  it was, with the original as its cause and its code kept. A directory
-   *  sync that fails is raised as an ops alert, not thrown: after the rename
-   *  the new record is in place, and the callers go on to record it as
-   *  written. */
+   *  sync that fails is raised as an ops alert, not thrown: the new record is
+   *  in place, and the callers go on to record it as written. */
   private writeRecoveryFile(path: string, document: unknown): void {
     const directory = dirname(path);
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     let opened = false;
     try {
-      const made = mkdirSync(directory, { recursive: true });
-      // mkdirSync answers the first directory it made, in the form it was
-      // given: each one it made, up to that one, is a new entry in its parent.
-      if (made !== undefined) {
-        for (let entry = directory; ; entry = dirname(entry)) {
-          this.syncRecoveryDirectory(dirname(entry), path);
-          if (entry === made || dirname(entry) === entry) break;
-        }
-      }
+      mkdirSync(directory, { recursive: true });
       const fd = openSync(temporary, 'w', 0o600);
       opened = true;
       try {
@@ -5402,11 +5394,12 @@ export class AgentFramework {
       throw Object.assign(new Error(`${path} was left as it was: ${cause.message}`, { cause }), cause.code ? { code: cause.code } : {});
     }
     this.syncRecoveryDirectory(directory, path);
+    this.syncRecoveryDirectory(dirname(directory), path);
   }
 
-  /** Syncs a directory a recovery file is in, or one of its new parents, so
-   *  its entries reach the disk; win32 is left out. A failure is raised as an
-   *  ops alert naming the record, since a failing directory sync usually
+  /** Syncs the directory a recovery file is in, or that directory's parent,
+   *  so its entries reach the disk; win32 is left out. A failure is raised as
+   *  an ops alert naming the record, since a failing directory sync usually
    *  means a failing disk. */
   private syncRecoveryDirectory(directory: string, record: string): void {
     if (process.platform === 'win32') return;
