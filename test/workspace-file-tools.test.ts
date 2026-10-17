@@ -520,6 +520,85 @@ test("an edit refused for a workspace copy that isn't valid UTF-8 names the path
     /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .*\n\nThe path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's\.$/);
 });
 
+test("a read shows disk's text when disk changed and the store didn't, and says so", async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'r.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/r.txt' })).success, true);
+  writeFileSync(join(dir, 'r.txt'), 'v2 from another writer\n');
+  const taken = "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and this read shows that text.";
+  assert.deepEqual((await call('read', { path: 'work/r.txt' })).data, {
+    path: 'work/r.txt', totalLines: 1, fromLine: 1, toLine: 1, note: taken, content: '     1\tv2 from another writer',
+  });
+  // That's the workspace's copy now, so the next read has nothing to say.
+  assert.deepEqual((await call('read', { path: 'work/r.txt' })).data, {
+    path: 'work/r.txt', totalLines: 1, fromLine: 1, toLine: 1, content: '     1\tv2 from another writer',
+  });
+  // A character page settles and says so too.
+  writeFileSync(join(dir, 'r.txt'), 'v3\n');
+  assert.deepEqual((await call('read', { path: 'work/r.txt', offsetChars: 0 })).data, {
+    path: 'work/r.txt', totalChars: 3, offsetChars: 0, nextOffsetChars: null, note: taken, content: 'v3\n',
+  });
+});
+
+test('a read of a file disk deleted since the workspace read it says so', async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'g.txt'), 'here\n');
+  assert.equal((await call('read', { path: 'work/g.txt' })).success, true);
+  rmSync(join(dir, 'g.txt'));
+  assert.equal(errorOf(await call('read', { path: 'work/g.txt' })),
+    "File not found: work/g.txt. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.");
+});
+
+test('a read of a draft whose disk copy also changed shows the draft and names the conflict', async (t) => {
+  const { dir, call, disk } = setup(t);
+  writeFileSync(join(dir, 'k.txt'), 'base\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  assert.equal((await call('write', { path: 'work/k.txt', content: 'agent draft\n' })).success, true);
+  writeFileSync(join(dir, 'k.txt'), 'another writer\n');
+  assert.deepEqual((await call('read', { path: 'work/k.txt' })).data, {
+    path: 'work/k.txt', totalLines: 1, fromLine: 1, toLine: 1,
+    note: "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
+      + "Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.",
+    content: '     1\tagent draft',
+  });
+  assert.equal(disk('k.txt')!.toString(), 'another writer\n', 'the read left disk as it was');
+});
+
+test("a read whose disk copy can't be checked says it shows the workspace's copy", async (t) => {
+  const { dir, call } = setup(t);
+  writeFileSync(join(dir, 'u.txt'), 'held\n');
+  assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
+  rmSync(join(dir, 'u.txt'));
+  mkdirSync(join(dir, 'u.txt'));
+  assert.deepEqual((await call('read', { path: 'work/u.txt' })).data, {
+    path: 'work/u.txt', totalLines: 1, fromLine: 1, toLine: 1,
+    note: "The path couldn't be checked against disk (a directory), so this read shows the workspace's copy.",
+    content: '     1\theld',
+  });
+});
+
+test("a read of a file disk lacks, with nothing to say whether disk deleted it, says it shows the workspace's copy", async (t) => {
+  const { store, call } = setup(t);
+  // An entry from before the evidence (as three-way's legacyEntry makes it).
+  const bytes = Buffer.from('legacy line\n');
+  store.treeSet('workspace/work/tree', 'l.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+  assert.deepEqual((await call('read', { path: 'work/l.txt' })).data, {
+    path: 'work/l.txt', totalLines: 1, fromLine: 1, toLine: 1,
+    note: "Disk has no copy of this file, and nothing records whether it was deleted there, so this read shows the workspace's copy.",
+    content: '     1\tlegacy line',
+  });
+});
+
+test("readBinary takes in disk's change to a file the workspace holds, as read does", async (t) => {
+  const { workspace, dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'b.txt'), 'old\n');
+  assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
+  writeFileSync(join(dir, 'b.txt'), 'new from another writer\n');
+  const read = await workspace.readBinary('work/b.txt');
+  assert.ok('data' in read, JSON.stringify(read));
+  assert.equal(read.data.toString(), 'new from another writer\n');
+});
+
 // ---------------------------------------------------------------------------
 // Part 5: smaller texts
 // ---------------------------------------------------------------------------

@@ -1830,9 +1830,10 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Read a file's raw bytes from a mount (through the Chronicle tree, synced
-   * first like the `read` tool). Public API for the framework's synthesized
-   * `read_image` tool and other peer callers that need binary content.
+   * Read a file's raw bytes from a mount (through the Chronicle tree, its path
+   * settled against disk first, as the `read` tool settles it). Public API for
+   * the framework's synthesized `read_image` tool and other peer callers that
+   * need binary content.
    */
   async readBinary(
     mountPrefixedPath: string,
@@ -1853,7 +1854,7 @@ export class WorkspaceModule implements Module {
     }
     const store = this.getStore();
     return this.withMount(mount, async () => {
-      await this.ensureSynced(mount, relativePath);
+      await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
       const blob = store.getBlob(entry.blobHash);
@@ -2623,13 +2624,15 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Before a read: a path the workspace doesn't hold is observed under the
+   * Before a deletion: a path the workspace doesn't hold is observed under the
    * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. The pass names the
-   * path, as a file tool names the one it acts on: a path the mount passes
-   * over by design is observed, as a sync naming it would observe it (#276),
-   * while a path in another mount's directory is refused before this, and
-   * passed over by any pass. The caller holds the mount's turn.
+   * workspace deletion or a file absent from this branch. A path it holds is
+   * left alone, as a write's is: taking disk's change in first would let the
+   * deletion's push remove that change unseen. The pass names the path, as a
+   * file tool names the one it acts on: a path the mount passes over by
+   * design is observed, as a sync naming it would observe it (#276), while a
+   * path in another mount's directory is refused before this, and passed
+   * over by any pass. The caller holds the mount's turn.
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
     const store = this.getStore();
@@ -2674,20 +2677,36 @@ export class WorkspaceModule implements Module {
       return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
     }
     let file: FileText;
+    let notes: string[] = [];
     if (generatedContent === undefined) {
       const { mount, relativePath, path } = await this.parseFilePath(input.path);
       input = { ...input, path };
       const store = this.getStore();
-      const found = await this.withMount(mount, async (): Promise<{ bytes: Buffer } | { error: string }> => {
-        const report = await this.ensureSynced(mount, relativePath);
+      const found = await this.withMount(mount, async (): Promise<{ bytes: Buffer; notes: string[] } | { error: string }> => {
+        // A read shows the path as disk holds it now: a change on disk to a
+        // file the workspace holds is taken in first, by the rule a listing
+        // uses, as an edit's is. Where the stored copy is a draft and disk
+        // changed too, the read shows the draft and names the conflict.
+        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+        const report = pass.reports.get(relativePath);
+        const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op);
         const entry = store.treeGet(mount.treeStateId, relativePath);
-        if (!entry) return { error: this.notInWorkspace(input.path, report) };
+        if (!entry) {
+          // A pass also drops a copy disk made binary or too large, which
+          // the disk-only answer describes; any other drop is disk's deletion.
+          return {
+            error: took('deleted') && report?.state !== 'disk-only'
+              ? `File not found: ${input.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
+              : this.notInWorkspace(input.path, report),
+          };
+        }
         const blob = store.getBlob(entry.blobHash);
         if (!blob) return { error: `Blob not found for: ${input.path}` };
-        return { bytes: blob };
+        return { bytes: blob, notes: whichCopyRead(report, took('modified')) };
       });
       if ('error' in found) return { success: false, error: found.error, isError: true };
       file = fileText(found.bytes);
+      notes = found.notes;
     } else {
       file = fileText(Buffer.from(generatedContent, 'utf-8'));
     }
@@ -2696,8 +2715,8 @@ export class WorkspaceModule implements Module {
     // context and 400s), so an omitted limit falls back to a default, and
     // every page stops at the result limit.
     return characterPaging
-      ? characterPage(input.path, file, input.offsetChars ?? 0, input.limitChars ?? 2000, maxChars)
-      : linePage(input.path, file, input.offset ?? 1, input.limit ?? DEFAULT_READ_LINE_LIMIT, maxChars);
+      ? characterPage(input.path, file, input.offsetChars ?? 0, input.limitChars ?? 2000, maxChars, notes)
+      : linePage(input.path, file, input.offset ?? 1, input.limit ?? DEFAULT_READ_LINE_LIMIT, maxChars, notes);
   }
 
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
@@ -4284,6 +4303,30 @@ function storedButUnfinished(
           : ' Its push to disk didn\'t run, so disk lacks the change until a materialize of the path writes it.')
       : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
   return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : '') };
+}
+
+/**
+ * What a read says about the copy it shows, when that isn't simply the one the
+ * workspace last agreed on with disk: disk's newer text, taken in first; the
+ * workspace's copy, because disk's couldn't be checked or disk has none that
+ * anything accounts for; or a draft in conflict with disk's change. A file
+ * the workspace didn't hold has no older copy, so taking it in needs no word.
+ */
+function whichCopyRead(report: PathReport | undefined, tookChange: boolean): string[] {
+  if (tookChange) {
+    return ['Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and this read shows that text.'];
+  }
+  if (report?.state === 'unverified') {
+    return [`The path couldn't be checked against disk (${report.note ?? 'not observed'}), so this read shows the workspace's copy.`];
+  }
+  if (report?.state === 'disk-missing-provenance-unknown') {
+    return ['Disk has no copy of this file, and nothing records whether it was deleted there, so this read shows the workspace\'s copy.'];
+  }
+  if (report?.state === 'conflict') {
+    return [`The path is in conflict with disk (${report.conflict?.kind ?? 'both-changed'}): this read shows the workspace's copy. `
+      + 'Sync the path to take disk\'s copy instead, or materialize it with force to write the workspace\'s over disk\'s.'];
+  }
+  return [];
 }
 
 /**

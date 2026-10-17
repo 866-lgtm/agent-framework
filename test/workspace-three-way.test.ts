@@ -175,10 +175,17 @@ async function stateOf(m: WorkspaceModule, path: string): Promise<string> {
   return (await entryOf(m, path))?.state ?? 'not listed';
 }
 
-/** The workspace's text for a path, unformatted. */
+/** The workspace's text for a path, unformatted, as a read shows it: after its path is settled against disk. */
 async function contentOf(m: WorkspaceModule, path: string): Promise<string> {
   const data = await call(m, 'read', { path: `work/${path}`, offsetChars: 0, limitChars: 1_000_000 });
   return data.content as string;
+}
+
+/** The text the store holds for a path on the selected branch, read without a pass. */
+function storedOf(env: Env, path: string): string | null {
+  const entry = env.store.treeGet(TREE, path);
+  if (!entry) return null;
+  return env.store.getBlob(entry.blobHash)!.toString('utf-8');
 }
 
 /** Written through the workspace and materialized: S = D = P. */
@@ -564,9 +571,10 @@ describe('a path sync', () => {
     const data = await syncing;
     assert.match(JSON.stringify(data.incomplete), /the selected branch changed before this sync ran/);
     assert.deepEqual(data.results, []);
-    assert.equal(await contentOf(m, 'a.txt'), "other's draft", "other's draft is untouched");
+    // Read from the store: a read would settle the path against disk itself.
+    assert.equal(storedOf(env, 'a.txt'), "other's draft", "other's draft is untouched");
     env.store.switchBranch(main);
-    assert.equal(await contentOf(m, 'a.txt'), 'v1', 'and main took nothing either');
+    assert.equal(storedOf(env, 'a.txt'), 'v1', 'and main took nothing either');
   });
 
   test("lists a deletion it gives up for a disk copy the workspace can't hold, though no workspace entry changes", async (t) => {
@@ -4574,9 +4582,10 @@ describe('fingerprints', () => {
 
     env.writeDisk('f.txt', 'bbbb'); // same size
     utimesSync(env.disk('f.txt'), before.atime, before.mtime);
-    assert.equal(await contentOf(m, 'f.txt'), 'aaaa', 'the read serves the store');
+    // Read from the store, so only the listing's pass looks at disk.
+    assert.equal(storedOf(env, 'f.txt'), 'aaaa', 'nothing has looked at disk yet');
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
-    assert.equal(await contentOf(m, 'f.txt'), 'bbbb', 'utimes restoring mtime: rehashed and adopted');
+    assert.equal(storedOf(env, 'f.txt'), 'bbbb', 'utimes restoring mtime: rehashed and adopted');
 
     await sleep(2100);
     await call(m, 'ls', { path: 'work' });
@@ -4585,11 +4594,11 @@ describe('fingerprints', () => {
     const cp = spawnSync('cp', ['-p', join(env.root, 'src.txt'), env.disk('f.txt')]);
     assert.equal(cp.status, 0, `cp -p: ${cp.stderr}`);
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
-    assert.equal(await contentOf(m, 'f.txt'), 'cccc', 'cp -p: rehashed and adopted');
+    assert.equal(storedOf(env, 'f.txt'), 'cccc', 'cp -p: rehashed and adopted');
 
     env.writeDisk('f.txt', 'dddd'); // just after the last hash
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
-    assert.equal(await contentOf(m, 'f.txt'), 'dddd');
+    assert.equal(storedOf(env, 'f.txt'), 'dddd');
   });
 });
 
@@ -5474,7 +5483,8 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     env.writeDisk('zz/t3.txt', 'changed behind l3');
     await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'l1', 'l2', 'l3', 'zz/t1.txt', 'zz/t2.txt'], 'the third pass took zz/t1.txt and zz/t2.txt');
-    assert.equal(await contentOf(m, 'l3'), 'target zz/t3.txt');
+    // Read from the store: a read of l3 would pass over l3 itself.
+    assert.equal(storedOf(env, 'l3'), 'target zz/t3.txt');
   });
 
   test('a directory proven missing on the after stretch that is an in-mount link on the wrap proves nothing absent', async (t) => {

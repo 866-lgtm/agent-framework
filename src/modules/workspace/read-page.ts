@@ -116,7 +116,7 @@ const splitsPair = (text: string, at: number): boolean =>
  * keep a surrogate pair whole), stopped sooner where its data would pass
  * `maxChars` as JSON.
  */
-export function characterPage(path: string, file: FileText, offsetChars: number, limitChars: number, maxChars: number): ToolResult {
+export function characterPage(path: string, file: FileText, offsetChars: number, limitChars: number, maxChars: number, extraNotes: string[] = []): ToolResult {
   const text = file.raw;
   const start = Math.min(offsetChars, text.length);
   if (splitsPair(text, start)) {
@@ -124,7 +124,7 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   }
   let end = start + Math.min(limitChars, text.length - start);
   if (splitsPair(text, end)) end++;
-  const notes = file.utf8 ? [] : [NOT_UTF8];
+  const notes = [...(file.utf8 ? [] : [NOT_UTF8]), ...extraNotes];
   const stoppedNote = (to: number) =>
     `Stopped at character ${to} to stay within the ${maxChars}-character result limit; continue with offsetChars=${to}.`;
   const page = (to: number, note: string | undefined) => ({
