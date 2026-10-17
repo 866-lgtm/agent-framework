@@ -667,6 +667,16 @@ test('a manifest fetch that fails is only logged, as in 0.22.x: the previous man
   const errors = t.mock.method(console, 'error', () => {});
   framework.manifestRefreshState = new Map();
   framework.mcplServerConfigs = new Map([['srv', { id: 'srv' }]]);
+  // What a refresh changes: the grant, the feature sets, and the manifest it
+  // adopts with its tracking.
+  const changed: string[] = [];
+  const previous = {
+    capabilities: { version: '0.5' },
+    manifestState: { lastValidatedRevision: 'r1', lastFetchedAt: 1 },
+    droppedCapabilities: new Set<string>(),
+  };
+  Object.assign(connection, previous, { establishGrant() { changed.push('grant'); } });
+  framework.featureSetManager = { initializeServer() { changed.push('feature sets'); } };
   (connection as any).sendManifestRequest = async () => { throw new Error('the server is gone'); };
   connection.emit('manifest-changed', { revision: 'r2' });
   await settle();
@@ -674,6 +684,101 @@ test('a manifest fetch that fails is only logged, as in 0.22.x: the previous man
   assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0])), [
     '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): the server is gone',
   ]);
+  assert.deepEqual(changed, []);
+  assert.equal((connection as any).capabilities, previous.capabilities);
+  assert.deepEqual((connection as any).manifestState, { lastValidatedRevision: 'r1', lastFetchedAt: 1 });
+  assert.equal((connection as any).droppedCapabilities, previous.droppedCapabilities);
+});
+
+const manifestFetchFloorMs = (AgentFramework as any).MANIFEST_FETCH_FLOOR_MS as number;
+
+test('a manifest refresh deferred by the fetch floor reports a failure other than its fetch\'s, as the announcement\'s own run does', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 100_000 });
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  // The last refresh completed just now, so this announcement waits out the floor.
+  framework.manifestRefreshState = new Map([['srv', { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
+  framework.mcplServerConfigs = { get() { throw new Error('the deferred refresh failed before its fetch'); } };
+  connection.emit('manifest-changed', { revision: 'r2' });
+  await settle();
+  assert.deepEqual(failureTraces(traces), [], 'nothing has run yet');
+  t.mock.timers.tick(manifestFetchFloorMs);
+  await settle();
+  const failures = failureTraces(traces);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].event, 'manifest-changed');
+  assert.equal(failures[0].requestId, undefined);
+  assert.match(failures[0].error, /the deferred refresh failed before its fetch/);
+  assert.ok(lines.includes('[mcpl] srv manifest-changed handler failed: "the deferred refresh failed before its fetch"'), lines.join('\n'));
+});
+
+test('a manifest refresh queued behind a fetch in flight reports a failure other than its fetch\'s, after the first run\'s failed fetch is only logged', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 100_000 });
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  framework.manifestRefreshState = new Map();
+  let lookups = 0;
+  framework.mcplServerConfigs = {
+    get() {
+      lookups++;
+      if (lookups > 1) throw new Error('the queued refresh failed before its fetch');
+      return { id: 'srv' };
+    },
+  };
+  let failFetch!: (error: Error) => void;
+  (connection as any).sendManifestRequest = () => new Promise((_resolve, reject) => { failFetch = reject; });
+  connection.emit('manifest-changed', { revision: 'r2' });
+  // This one arrives while the first fetch is in flight, so it queues a re-run.
+  connection.emit('manifest-changed', { revision: 'r3' });
+  failFetch(new Error('the server is gone'));
+  await settle();
+  assert.deepEqual(failureTraces(traces), [], 'a failed fetch is only logged');
+  assert.deepEqual(lines, ['[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): the server is gone']);
+  t.mock.timers.tick(manifestFetchFloorMs);
+  await settle();
+  const failures = failureTraces(traces);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].event, 'manifest-changed');
+  assert.match(failures[0].error, /the queued refresh failed before its fetch/);
+  assert.equal(lookups, 2);
+  assert.ok(lines.includes('[mcpl] srv manifest-changed handler failed: "the queued refresh failed before its fetch"'), lines.join('\n'));
+});
+
+test('a server\'s error answer that no template can convert settles the host\'s request: a manifest fetch answered so is logged and leaves no refresh in flight', async (t) => {
+  const transport = new ResponseTransport();
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  const { framework, traces } = harness(connection);
+  connection.ready();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  framework.manifestRefreshState = new Map();
+  framework.mcplServerConfigs = new Map([['srv', { id: 'srv' }]]);
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'mcpl/manifestChanged', params: { revision: 'r2' } }));
+  const fetch = JSON.parse(transport.lines.at(-1)!);
+  assert.equal(fetch.method, 'mcpl/manifest');
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: fetch.id, error: { code: { toString: 1 }, message: { toString: 1 } } }));
+  await settle();
+  assert.deepEqual(lines, [
+    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): MCPL server "srv" returned error for mcpl/manifest: [[object Object]] [object Object]',
+  ]);
+  assert.deepEqual(traces.filter((e) => e.type === 'mcpl:server-error' || e.type === 'mcpl:request-handler-error'), []);
+  assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
+});
+
+test('a server\'s error message in the error a host request rejects with is bounded: control, format and line characters replaced, and cut at 200 code points', async () => {
+  const transport = new ResponseTransport();
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  connection.ready();
+  const fetched = connection.sendManifestRequest();
+  const fetch = JSON.parse(transport.lines.at(-1)!);
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: fetch.id, error: { code: -32000, message: `line one\nline two\u202e${'x'.repeat(300)}` } }));
+  await assert.rejects(fetched, {
+    message: `MCPL server "srv" returned error for mcpl/manifest: [-32000] line one?line two?${'x'.repeat(182)}…`,
+  });
 });
 
 test('mcpl/manifestChanged and tools/list_changed sent as requests are answered with an empty result as they are admitted, whatever their handlers do', async (t) => {
@@ -751,6 +856,17 @@ test('a request-form mcpl/manifestChanged held while the data plane is paused is
   await settle();
   assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 3, result: {} }]);
   assert.deepEqual(refreshed, [{ revision: 'r2' }]);
+});
+
+test('a request-form notifications/tools/list_changed is answered at once while the data plane is paused, since the control plane carries it', (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { connection, transport } = stagedHarness();
+  const seen: unknown[] = [];
+  connection.removeAllListeners('tools-list-changed');
+  connection.on('tools-list-changed', (params: unknown, responder?: unknown) => { seen.push({ params, responder }); });
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'notifications/tools/list_changed', params: { sequence: 9 } }));
+  assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 4, result: {} }]);
+  assert.deepEqual(seen, [{ params: { sequence: 9 }, responder: undefined }]);
 });
 
 test('a request form held at the buffer cap is kept, and answered when its plane opens, while the oldest notifications are dropped', async (t) => {

@@ -643,9 +643,10 @@ export class McplServerConnection extends EventEmitter {
             // describeCause rather than the template's own conversion: the
             // server's `message` can be any JSON value, and one that has no
             // primitive form, such as {"toString":1}, would throw out of this
-            // listener after cleanup() has cleared the timeout, leaving the
-            // handshake to wait forever. It's the server's text in an error's
-            // message, so it's bounded as errors.ts says.
+            // listener after cleanup() has cleared the timeout: an uncaught
+            // exception, which ends a host that doesn't catch them, and a
+            // handshake left to wait forever. It's the server's text in an
+            // error's message, so it's bounded as errors.ts says.
             reject(new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(describeCause(msg.error.message))}`));
             return;
           }
@@ -1438,8 +1439,14 @@ export class McplServerConnection extends EventEmitter {
     if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
+      // describeCause rather than the template's own conversion, as for an
+      // initialize error: the server's code and message can be any JSON
+      // value, and one with no primitive form, such as {"toString":1}, would
+      // throw here, after the request has left pendingRequests and its timer
+      // is cleared, so it would never settle. The message is the server's
+      // text, so it's bounded as errors.ts says.
       pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`),
+        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${describeCause(response.error.code)}] ${boundedForLog(describeCause(response.error.message))}`),
       );
     } else {
       pending.resolve(response.result);

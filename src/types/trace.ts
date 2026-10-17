@@ -571,7 +571,9 @@ export type TraceEvent =
       hint: string;
     })
   | (TraceEventBase & {
-      /** An inbound RPC request/notification handler threw or rejected. */
+      /** An inbound RPC request/notification handler failed: it threw or
+       *  rejected, or it resolved after a reply write of its own failed or
+       *  after it tried to answer a second time. */
       type: 'mcpl:request-handler-error';
       serverId: string;
       /** Connection event name, e.g. channels-register or push-event. */
@@ -580,14 +582,17 @@ export type TraceEvent =
        *  other texts here are: control, format and line-separator characters
        *  replaced, and cut at 500 code points. Absent for a notification, for
        *  a request whose id is neither, and for a request form of
-       *  mcpl/manifestChanged or tools/list_changed, which is answered as
-       *  it's admitted and then handled as the notification is. */
+       *  mcpl/manifestChanged or notifications/tools/list_changed, which is
+       *  answered as it's admitted and then handled as the notification is. */
       requestId?: string | number;
       /** Whether the handler's own reply may have reached the server: true
        *  once it attempted one, unless the attempt failed while encoding,
-       *  before any bytes were written. When it's false and a responder was
-       *  given, the host answered -32603 "Internal error" itself, or -32000
-       *  while it stops, unless `responseError` says that reply failed. */
+       *  before any bytes were written. When it's false and the responder
+       *  can send an error reply (it has respondError), the host sent -32603
+       *  "Internal error" itself, or -32000 while it stops, unless
+       *  `responseError` says that reply failed. A connection that has
+       *  already closed drops that reply, as it drops every reply, with no
+       *  `responseError`. */
       responseAttempted: boolean;
       /** The handler's own error when it threw or rejected; otherwise the
        *  reply write that failed and that it swallowed, or that it tried to

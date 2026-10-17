@@ -16877,7 +16877,7 @@ export class AgentFramework {
           const cur = this.manifestRefreshState.get(connection.id);
           if (cur?.queued && !cur.inFlight) {
             cur.queued = false;
-            void this.handleManifestChanged(connection, announce).catch(() => {});
+            this.rerunManifestRefresh(connection, announce);
           }
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
       }
@@ -17022,10 +17022,22 @@ export class AgentFramework {
       st.lastCompletedAt = Date.now();
       if (st.queued) {
         st.queued = false;
-        setTimeout(() => { void this.handleManifestChanged(connection, announce).catch(() => {}); },
+        setTimeout(() => { this.rerunManifestRefresh(connection, announce); },
           AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
       }
     }
+  }
+
+  /** A refresh handleManifestChanged schedules for itself, after the fetch
+   *  floor or behind a fetch in flight. It's contained as the announcement's
+   *  own run is, so a failure other than its fetch's, which the fetch's own
+   *  catch logs, emits mcpl:request-handler-error and a stderr line. */
+  private rerunManifestRefresh(
+    connection: McplServerConnection,
+    announce: { revision?: string; domains?: string[] },
+  ): void {
+    this.containedInboundHandler(connection.id, 'manifest-changed',
+      (params: { revision?: string; domains?: string[] }) => this.handleManifestChanged(connection, params))(announce);
   }
 
   /**
@@ -17715,7 +17727,8 @@ export class AgentFramework {
     // A notification, contained like every inbound handler. A manifest fetch
     // that fails is caught and logged inside handleManifestChanged, and the
     // previous manifest stands (§17.5); anything else it throws or rejects
-    // with emits mcpl:request-handler-error.
+    // with emits mcpl:request-handler-error, in this run or in a re-run it
+    // schedules (rerunManifestRefresh).
     onRequest('manifest-changed', (params: { revision?: string; domains?: string[] }) =>
       this.handleManifestChanged(connection, params));
 
