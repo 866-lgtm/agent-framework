@@ -1469,7 +1469,9 @@ export class McplServerConnection extends EventEmitter {
       // its discarded answer can be recorded beside its batch's other
       // coalescing records (§11). It is only reported: the fallback the
       // timeout materialized stands (§5.4 rule 3). A late JSON-RPC error is
-      // passed on as `error`, so its record can be told from a late result's.
+      // passed on as `error`, so its record can be told from a late result's,
+      // and so is one beside a result, which JSON-RPC forbids: the live path
+      // rejects such an answer as an error.
       const render = orphaned?.renderParams ?? {};
       const failure = response.error ? { error: { code: response.error.code, message: response.error.message } } : {};
       const result = response.result;
@@ -1482,6 +1484,7 @@ export class McplServerConnection extends EventEmitter {
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
             ...render,
+            ...failure,
           });
         }
       } else if (orphaned) {

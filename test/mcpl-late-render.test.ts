@@ -112,6 +112,21 @@ test('a late answer to a tool call whose deadline passed is still recorded as mc
   ]);
 });
 
+test('a late answer carrying both a result and an error, which JSON-RPC forbids, keeps its error in the record', async (t) => {
+  const { connection, transport, answerLate, recorded } = await timedOutRender(t);
+  const both = { result: { content: [], state: { step: 2 } }, error: { code: -32603, message: 'tool failed' } };
+  answerLate(both);
+  const call = connection.sendToolsCallWithDeadline('stuck', {}, 75);
+  const { id } = JSON.parse(transport.lines.at(-1)!) as { id: number };
+  t.mock.timers.tick(75);
+  await assert.rejects(call, /outcome is unknown/);
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, ...both }));
+  assert.deepEqual(recorded(), [
+    { ...lateRender, error: '[-32603] tool failed' },
+    { type: 'mcpl:orphaned-response', serverId: 'srv', responseId: id, method: 'tools/call', hadState: true, hadCheckpoint: false, error: '[-32603] tool failed' },
+  ]);
+});
+
 test('while the data plane is paused, a late push/render answer is recorded at once and takes no slot', async (t) => {
   const { connection, answerLate, recorded } = await timedOutRender(t);
   // A quiesce or an awareness drain: control traffic flows, data is held.
