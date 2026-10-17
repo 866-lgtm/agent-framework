@@ -21,7 +21,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
-import { armAt } from '../deadline-timer.js';
+import { armAfter, armAt } from '../deadline-timer.js';
 
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
@@ -65,7 +65,8 @@ export interface TuneOutFrameworkHooks {
 
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Each duration's pending expiry step (params.expiresAtMs); cleared on any cancel. */
+  /** Each duration's pending expiry step (params.expiresAtMs); cleared by
+   *  cancel, stop, and the channel's next enter. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
@@ -105,10 +106,14 @@ export class TuneOutCoordinator {
   }
 
   private armExpiry(serverId: string, channelId: string, params: TuneOutParams): void {
-    if (params.expiresAtMs === undefined) return;
     const key = this.key(serverId, channelId);
+    // An earlier tune-out on this channel can end in the registry without
+    // cancel (a send or a close sets the channel's state there), leaving its
+    // end time's step armed. Clear it first, so it can't end this one.
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
+    this.expiryTimers.delete(key);
+    if (params.expiresAtMs === undefined) return;
     armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
       this.expiryTimers.delete(key);
       this.cancel(serverId, channelId, 'duration', 'duration elapsed');
@@ -388,9 +393,9 @@ export class TuneOutCoordinator {
       if (diverted > 0) {
         this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
       }
-      armAt(Date.now() + cadenceSeconds * 1000, hold, tick);
+      armAfter(cadenceSeconds * 1000, hold, tick);
     };
-    armAt(Date.now() + cadenceSeconds * 1000, hold, tick);
+    armAfter(cadenceSeconds * 1000, hold, tick);
   }
 
   private stopCadence(serverId: string, channelId: string): void {

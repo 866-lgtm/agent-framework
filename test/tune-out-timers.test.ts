@@ -8,10 +8,14 @@
  * fire an overflowing timeout early too (Node 24), and the harness records
  * each delay asked of setTimeout, so the timer tests also check that no step
  * is longer than one timer holds, whatever the runtime's mock does.
+ *
+ * The mock runs a tick's due timers with the clock already at the tick's
+ * end, so tests that follow a timer step by step tick to each step's end.
  */
 import { it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/coordinator.js';
+import { armAt } from '../src/deadline-timer.js';
 import type { ChannelRegistry, TuneOutParams } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 
@@ -19,15 +23,17 @@ import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 const ONE_TIMER_MS = 2_147_483_647;
 const DAY_MS = 86_400_000;
 const NOW = Date.UTC(2026, 9, 17);
+const STORED: TuneOutParams = { epochId: 'e1', cadenceSeconds: 1800, backlogCap: 200, maxWakes: 5, startedAtSequence: 1 };
 
 /**
- * A coordinator over an in-memory registry for one channel, `disc` `#a`,
- * with the clock and setTimeout mocked and each delay asked of setTimeout
- * recorded. `stored` is a tune-out the registry already holds, as after a
- * restart.
+ * A coordinator over an in-memory registry for one channel, `disc` `#a`, with
+ * setTimeout mocked and each delay asked of it recorded, and the wall clock
+ * mocked unless `wallClock` is false. `stored` is a tune-out the registry
+ * already holds, as after a restart.
  */
-function harness(t: TestContext, stored?: TuneOutParams) {
-  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: NOW });
+function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = {}) {
+  if (wallClock) t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: NOW });
+  else t.mock.timers.enable({ apis: ['setTimeout'] });
   const mocked = globalThis.setTimeout;
   const delays: number[] = [];
   globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
@@ -80,7 +86,10 @@ function harness(t: TestContext, stored?: TuneOutParams) {
     delays.every((ms) => ms <= ONE_TIMER_MS),
     `no timer longer than one holds (${delays.filter((ms) => !(ms <= ONE_TIMER_MS)).join(', ')})`,
   );
-  return { coordinator, entered, cancels, cadenceTurns, delays, noTimerPastOne };
+  /** End the tune-out in the registry alone, as a send into the channel or a close does. */
+  const endInRegistry = () => { state = null; };
+  const active = () => state !== null;
+  return { coordinator, entered, cancels, cadenceTurns, delays, noTimerPastOne, endInRegistry, active };
 }
 
 it('a duration past one timer ends at its end time and not before', (t) => {
@@ -95,11 +104,20 @@ it('a duration past one timer ends at its end time and not before', (t) => {
   h.noTimerPastOne();
 });
 
-it('a restart with more than one timer left reads the stored end time at each step', (t) => {
-  const h = harness(t, {
-    epochId: 'e1', cadenceSeconds: 1800, backlogCap: 200, maxWakes: 5, startedAtSequence: 1,
-    expiresAtMs: NOW + 30 * DAY_MS,
-  });
+it('a restart with more than one timer left ends the tune-out at its stored end time and not before', (t) => {
+  const h = harness(t, { ...STORED, expiresAtMs: NOW + 30 * DAY_MS });
+  h.coordinator.resumeActiveEpochs();
+  t.mock.timers.tick(ONE_TIMER_MS);
+  assert.deepEqual(h.cancels, [], "still tuned out after one timer's worth");
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS - 1);
+  assert.deepEqual(h.cancels, [], 'still tuned out 1 ms before its stored end');
+  t.mock.timers.tick(1);
+  assert.deepEqual(h.cancels, ['duration'], 'ended once, at its stored end time');
+  h.noTimerPastOne();
+});
+
+it('after a restart, each step reads the stored end time again', (t) => {
+  const h = harness(t, { ...STORED, expiresAtMs: NOW + 30 * DAY_MS });
   h.coordinator.resumeActiveEpochs();
   t.mock.timers.tick(DAY_MS);
   assert.deepEqual(h.cancels, [], 'still tuned out a day after the restart');
@@ -121,30 +139,73 @@ it("a cancel stops the end time's later steps, so a new tune-out on the channel 
   assert.deepEqual(h.cancels, ['agent-tool'], 'only the cancel asked for: the new tune-out runs on');
 });
 
+it("a tune-out that ends in the registry, as a send or a close ends it, leaves no step to end the channel's next one", (t) => {
+  const h = harness(t);
+  // Two days, one timer's worth, so main's single timer shows the same case.
+  assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 2 * 86_400 }, 'agent-tool').ok, true);
+  t.mock.timers.tick(DAY_MS);
+  h.endInRegistry();
+  assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true, 'a new tune-out, until cancelled');
+  t.mock.timers.tick(2 * DAY_MS);
+  assert.deepEqual(h.cancels, [], "the old end time didn't end the new tune-out");
+  assert.equal(h.active(), true);
+});
+
 it("stop clears both timers' pending steps: neither fires after it", (t) => {
   const h = harness(t);
   const opts = { durationSeconds: 30 * 86_400, cadenceSeconds: 30 * 86_400 };
   assert.equal(h.coordinator.enter('disc', '#a', opts, 'agent-tool').ok, true);
   h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
   t.mock.timers.tick(ONE_TIMER_MS);
+  assert.equal(
+    h.delays.filter((ms) => ms === 30 * DAY_MS - ONE_TIMER_MS).length,
+    2,
+    "both timers' second steps are armed when stop runs",
+  );
   h.coordinator.stop();
   t.mock.timers.tick(60 * DAY_MS);
   assert.deepEqual(h.cancels, [], 'no end after stop');
   assert.deepEqual(h.cadenceTurns(), [], 'no cadence turn after stop');
 });
 
-it('a cadence past one timer gives the subconscious one turn at the cadence: none before it, none after a cancel', (t) => {
+it('a cadence past one timer gives the subconscious a turn each period: none before the first, none after a cancel', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 30 * 86_400 }, 'agent-tool').ok, true);
   h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
-  t.mock.timers.tick(30 * DAY_MS - 1);
+  t.mock.timers.tick(ONE_TIMER_MS);
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS - 1);
   assert.deepEqual(h.cadenceTurns(), [], 'no turn before the cadence');
   t.mock.timers.tick(1);
   assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], 'one turn at the cadence');
   h.coordinator.onIncoming('disc', '#a', 'm2', undefined);
+  t.mock.timers.tick(ONE_TIMER_MS);
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS);
+  assert.equal(h.cadenceTurns().length, 2, 'a second turn a period later');
+  h.coordinator.onIncoming('disc', '#a', 'm3', undefined);
   assert.equal(h.coordinator.cancel('disc', '#a', 'agent-tool', 'agent request').ok, true);
+  t.mock.timers.tick(ONE_TIMER_MS);
   t.mock.timers.tick(30 * DAY_MS);
-  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], 'no turn after the cancel');
+  assert.equal(h.cadenceTurns().length, 2, 'no turn after the cancel');
+  h.noTimerPastOne();
+});
+
+it("the cadence counts its period on its timers, so the wall clock doesn't move its turn", (t) => {
+  // Only setTimeout is mocked: the wall clock stands still while the timers run.
+  const h = harness(t, undefined, { wallClock: false });
+  assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  t.mock.timers.tick(1_800_000);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], 'the turn came after the default 1800 s on the timers');
+});
+
+it('a restart re-arms a stored cadence past one timer: the turn comes at the cadence', (t) => {
+  const h = harness(t, { ...STORED, cadenceSeconds: 30 * 86_400 });
+  h.coordinator.resumeActiveEpochs();
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  t.mock.timers.tick(ONE_TIMER_MS);
+  assert.deepEqual(h.cadenceTurns(), [], "no turn after one timer's worth");
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], 'one turn at the cadence');
   h.noTimerPastOne();
 });
 
@@ -197,4 +258,27 @@ it('a numeric string is read as its number, as it was before the refusals', (t) 
     [h.entered[0].expiresAtMs, h.entered[0].cadenceSeconds, h.entered[0].backlogCap, h.entered[0].maxWakes],
     [NOW + 3_600_000, 600, 50, 3],
   );
+});
+
+it('an option below its floor is raised to it, as before', (t) => {
+  const h = harness(t);
+  const below = { durationSeconds: 5, cadenceSeconds: 1, backlogCap: -3, maxWakes: 0 };
+  assert.equal(h.coordinator.enter('disc', '#a', below, 'agent-tool').ok, true);
+  assert.deepEqual(
+    [h.entered[0].expiresAtMs, h.entered[0].cadenceSeconds, h.entered[0].backlogCap, h.entered[0].maxWakes],
+    [NOW + 60_000, 30, 0, 1],
+  );
+});
+
+it('armAt arms a deadline that has passed for the next turn of the loop, with no negative-delay warning', async () => {
+  // Real timers: Node 23 and later warn about a negative delay.
+  const warnings: string[] = [];
+  const onWarning = (w: Error) => { warnings.push(w.name); };
+  process.on('warning', onWarning);
+  try {
+    await new Promise<void>((resolve) => { armAt(Date.now() - 5, () => {}, resolve); });
+    assert.deepEqual(warnings.filter((name) => name === 'TimeoutNegativeWarning'), []);
+  } finally {
+    process.off('warning', onWarning);
+  }
 });

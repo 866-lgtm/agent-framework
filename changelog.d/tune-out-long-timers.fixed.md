@@ -3,11 +3,16 @@
   Before, Node fired the timer almost at once, so such a tune-out ended as
   "duration elapsed" moments after it began, waking the resident with its
   backlog, and such a cadence re-armed about every millisecond, giving the
-  subconscious a turn as soon as anything was diverted, after every restart
-  too. Both timers now re-arm in steps no longer than one timer, each step
-  reading the clock against its deadline; the end time's deadline is the
-  stored one, so a host that runs through it and one that restarts end the
-  tune-out at the same time.
+  subconscious a turn as soon as anything was diverted. Both timers now
+  wait in steps no longer than one timer. The cadence counts its period on
+  those timers, as it did before, so setting the wall clock doesn't move
+  it. The end time reads the wall clock against the stored end at each
+  step, so a host that runs through a long tune-out and one that restarts
+  during it aim at the same end.
+- A tune-out that ends without a cancel, as a send into its channel or a
+  close of the channel ends it, no longer leaves its end time armed to end
+  the channel's next tune-out. Before, when the next tune-out had no
+  `durationSeconds`, the old end time ended it as "duration elapsed".
 - `tune_out` refuses a `durationSeconds`, `cadenceSeconds`, `backlogCap` or
   `maxWakes` that gives no finite number, such as `"abc"`, and a duration
   whose end time is too far off to store, naming the option and saying
@@ -16,5 +21,6 @@
   failed and left the channel diverted with no cadence or end timer until
   the next restart. A numeric string such as `"3600"` is still read as its
   number.
-- A `null` `durationSeconds` now means no end time, as leaving it out does.
-  Before, it gave a tune-out of 60 seconds, the shortest duration.
+- A `null` `durationSeconds` now means the tune-out lasts until cancelled,
+  as leaving it out does. Before, it gave a tune-out of 60 seconds, the
+  shortest duration.
