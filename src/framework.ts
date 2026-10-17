@@ -14898,7 +14898,7 @@ export class AgentFramework {
     });
   }
 
-  /** Abort a running script when the agent's turn dies underneath it. */
+  /** Abort the agent's script, running or still starting, when its turn dies underneath it. */
   private abortAgentScript(agentName: string, reason: string): void {
     const runner = this.codeExecutionRunners.get(agentName);
     if (runner?.busy) {
