@@ -96,12 +96,13 @@ const LOG_FILE_CAP_BYTES = 50_000_000;
 /** How much of a background script's output its result keeps, for the envelope that tells the agent how it ended. */
 const TAIL_CHARS = 4000;
 /**
- * How long an interpreter that exited unexpectedly gets for its last output to
- * arrive when something still holds its output pipes open, such as a command its
- * script left running; otherwise their end says it has all arrived.
+ * How long an interpreter that exited unexpectedly gets for the last of what it
+ * wrote, its output and its messages, to arrive when something still holds its
+ * pipes open, such as a command its script left running; otherwise their end
+ * says it has all arrived.
  */
 const EXIT_OUTPUT_GRACE_MS = 200;
-/** How much of what an interpreter wrote before it failed to start, or crashed, goes into the message and the host's log. */
+/** How much of what an interpreter wrote before it failed to start, or crashed, goes into the message and the host's log, and how much of each piece of output with no script running goes into the log. */
 const LAST_WORDS_CHARS = 2000;
 
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
@@ -119,6 +120,11 @@ function onItsOwnLine(text: string, line: string): string {
   return (text === '' || text.endsWith('\n') ? text : `${text}\n`) + line;
 }
 
+/** Whether the child is still running: not exited, not ended by a signal, and not killed by us. */
+function alive(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null && !child.killed;
+}
+
 /**
  * A background script's journal: the log file the agent can read with its own
  * tools while the script runs, and the tail its result carries.
@@ -129,7 +135,10 @@ class Journal {
   private capped = false;
   tail = '';
 
-  constructor(path: string | null, log: (text: string) => void) {
+  constructor(
+    path: string | null,
+    private readonly log: (text: string) => void,
+  ) {
     if (!path) return;
     try {
       mkdirSync(dirname(path), { recursive: true });
@@ -152,8 +161,10 @@ class Journal {
         writeSync(this.fd, text);
         this.written += bytes;
       }
-    } catch {
+    } catch (err) {
       // A journal that can't be written to still keeps its tail.
+      this.log(`cannot write the log file any more: ${err instanceof Error ? err.message : String(err)}`);
+      this.close();
     }
   }
 
@@ -215,6 +226,10 @@ class OutputStream {
 
   /** Begin an exec's share of the pipe, which its mark ends. */
   begin(mark: Buffer, journal: Journal | null): void {
+    // A character that output with no script running left half-written is
+    // that output's, not this exec's.
+    const left = this.decoder.end();
+    if (left.trim() !== '') this.logIdle(left);
     this.mark = mark;
     this.marked = false;
     this.journal = journal;
@@ -250,7 +265,9 @@ class OutputStream {
     if (this.mark !== null) {
       const at = bytes.indexOf(this.mark);
       if (at < 0) {
-        const hold = Math.min(bytes.length, this.mark.length - 1);
+        // Hold back only an end that could be the mark's start, so a
+        // background script's journal keeps up with its output.
+        const hold = markStartAtEnd(bytes, this.mark);
         this.keep(bytes.subarray(0, bytes.length - hold));
         this.carry = bytes.subarray(bytes.length - hold);
         return;
@@ -265,8 +282,15 @@ class OutputStream {
     if (bytes.length > 0) {
       const text = this.decoder.write(bytes);
       this.lastIdle = (this.lastIdle + text).slice(-LAST_WORDS_CHARS);
-      if (text.trim() !== '') this.log(`${this.name} while no script runs: ${text.trimEnd()}`);
+      if (text.trim() !== '') this.logIdle(text);
     }
+  }
+
+  /** Log output that arrived while no script ran, each piece up to LAST_WORDS_CHARS. */
+  private logIdle(text: string): void {
+    const shown = text.trimEnd();
+    const more = shown.length - LAST_WORDS_CHARS;
+    this.log(`${this.name} while no script runs: ${more > 0 ? `${shown.slice(0, LAST_WORDS_CHARS)} [… ${more} more characters]` : shown}`);
   }
 
   /** Keep what arrived for the running exec. */
@@ -288,12 +312,39 @@ class OutputStream {
   }
 }
 
+/** How many bytes at the end of `bytes` could be the start of `mark`. */
+function markStartAtEnd(bytes: Buffer, mark: Buffer): number {
+  for (let n = Math.min(bytes.length, mark.length - 1); n > 0; n--) {
+    if (bytes.subarray(bytes.length - n).equals(mark.subarray(0, n))) return n;
+  }
+  return 0;
+}
+
+/** Run fn once the readable has ended (at once if it has). */
+function whenReadableEnded(stream: Readable, fn: () => void): void {
+  if (stream.readableEnded || stream.destroyed) {
+    fn();
+    return;
+  }
+  let called = false;
+  const once = () => {
+    if (called) return;
+    called = true;
+    fn();
+  };
+  stream.once('end', once);
+  stream.once('close', once);
+}
+
 /**
- * Run fn once both of an exited interpreter's output pipes have ended, which
- * says the last of what it wrote has arrived, or after EXIT_OUTPUT_GRACE_MS if
- * something, such as a command its script left running, still holds them.
+ * Run fn once an exited interpreter's output pipes and its messages' pipe have
+ * all ended, which says the last of what it wrote has arrived, or else after
+ * EXIT_OUTPUT_GRACE_MS, if something, such as a command its script left
+ * running, still holds them, and one more round of the event loop's reads, so
+ * what had already arrived is read first even when the host's loop was busy
+ * past the grace.
  */
-function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, fn: () => void): void {
+function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, messages: Readable, fn: () => void): void {
   let done = false;
   const finish = () => {
     if (done) return;
@@ -301,8 +352,8 @@ function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, fn: () => v
     clearTimeout(timer);
     fn();
   };
-  const timer = setTimeout(finish, EXIT_OUTPUT_GRACE_MS);
-  stdout.whenEnded(() => stderr.whenEnded(finish));
+  const timer = setTimeout(() => setImmediate(finish), EXIT_OUTPUT_GRACE_MS);
+  stdout.whenEnded(() => stderr.whenEnded(() => whenReadableEnded(messages, finish)));
 }
 
 interface PendingExec {
@@ -513,7 +564,7 @@ export class PyRunner {
   // -------------------------------------------------------------------------
 
   private async ensureChild(): Promise<void> {
-    if (this.child && this.child.exitCode === null && !this.child.killed) {
+    if (this.child && alive(this.child)) {
       return this.childReady ?? Promise.resolve();
     }
     this.teardownChild();
@@ -547,8 +598,10 @@ export class PyRunner {
     // dead or killed is left to its own exit.
     let inputFailed = false;
     const unreachable = (why: string) => {
+      // One the host has torn down already ended its pipe on purpose.
+      if (child !== this.child) return;
       this.log(`write to the python runtime failed: ${why}`);
-      if (child.exitCode === null && !child.killed && child.pid !== undefined) {
+      if (alive(child) && child.pid !== undefined) {
         inputFailed = true;
         child.kill('SIGKILL');
       }
@@ -572,16 +625,16 @@ export class PyRunner {
       const why =
         inputFailed && signal === 'SIGKILL'
           ? "python runtime stopped reading the host's messages, so it was killed and the interpreter restarted " +
-            '(variables from earlier scripts are gone). A script that closes file descriptor 3, where they ' +
-            'arrive, does this.'
+            '(variables from earlier scripts are gone)'
           : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`;
-      // What it wrote last, such as a fatal error's own text, is already on its
-      // way through its output pipes: settle once they've ended, or after a
-      // short grace while a command it started still holds them.
-      afterOutputEnds(stdout, stderr, () => {
+      // What it wrote last, such as a fatal error's own text or an exec's
+      // result, is already on its way through its pipes: settle once they've
+      // ended, or after a short grace while a command it started still holds
+      // them.
+      afterOutputEnds(stdout, stderr, protoOut, () => {
         if (this.pending === pending) {
           const last = this.stopPending(why).trim();
-          this.log(last ? `${why}; the last it wrote: ${last.slice(-LAST_WORDS_CHARS)}` : why);
+          this.log(last ? `${why}; the last it wrote to stderr: ${last.slice(-LAST_WORDS_CHARS)}` : why);
         }
         if (this.child === child) this.teardownChild();
       });
@@ -606,7 +659,7 @@ export class PyRunner {
       const onReady = () => finish(resolve);
       const onExit = () => {
         // Why it ended, such as a traceback, is on its way through its stderr.
-        afterOutputEnds(stdout, stderr, () => {
+        afterOutputEnds(stdout, stderr, protoOut, () => {
           const said = stderr.lastIdle.trim();
           finish(() => reject(new Error(`python runtime exited before becoming ready${said ? `, saying: ${said}` : ''}`)));
         });
@@ -714,22 +767,28 @@ export class PyRunner {
   }
 
   /**
-   * Settle the running exec now: what its script wrote so far, then `why` it
-   * stopped, on a line of its own. Returns what the script wrote to stderr (a
-   * background script's tail), for the host's log.
+   * Settle the running exec now: what its script wrote so far, as far as it
+   * has reached the host, then `why` it stopped, on a line of its own. Output
+   * still in the pipes goes to the host's log. A script that reported before
+   * its interpreter ended keeps its own return code. Returns what the script
+   * wrote to stderr (a background script's tail), for the host's log.
    */
   private stopPending(why: string): string {
     const pending = this.pending;
     if (!pending || pending.settled) return '';
     const stdout = this.out?.take() ?? '';
     const stderr = this.err?.take() ?? '';
+    const returnCode = pending.returnCode ?? 1;
     const journal = pending.journal;
     if (journal) {
+      const tail = journal.tail;
+      // The journal, which the agent reads with its own tools, says why too.
+      journal.write(`${tail === '' || tail.endsWith('\n') ? '' : '\n'}${why}\n`);
       journal.close();
-      this.settlePending({ stdout: '', stderr: why, returnCode: 1, aborted: true, tail: onItsOwnLine(journal.tail, why) });
-      return journal.tail;
+      this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: onItsOwnLine(tail, why) });
+      return tail;
     }
-    this.settlePending({ stdout, stderr: onItsOwnLine(stderr, why), returnCode: 1, aborted: true });
+    this.settlePending({ stdout, stderr: onItsOwnLine(stderr, why), returnCode, aborted: true });
     return stderr;
   }
 
@@ -773,7 +832,7 @@ export class PyRunner {
     const child = this.child;
     const input = this.protoIn;
     const unreachable = this.unreachable;
-    if (!child || !input || child.exitCode !== null || child.killed) return;
+    if (!child || !input || !alive(child)) return;
     try {
       input.write(JSON.stringify(obj) + '\n', (err) => {
         if (err) unreachable?.(err.message);
@@ -793,7 +852,7 @@ export class PyRunner {
    */
   private interruptChild(): void {
     const child = this.child;
-    if (process.platform === 'win32' || !child || child.exitCode !== null || child.killed) return;
+    if (process.platform === 'win32' || !child || !alive(child)) return;
     if (child.pid === undefined) return;
     try {
       process.kill(child.pid, 'SIGINT');
@@ -847,7 +906,7 @@ export class PyRunner {
       // from an abort or dispose on the tick exec was called, signals no
       // child of ours but whatever pid Node's handle held: the host's own
       // process group on Node 20.20.2, another process's pid on 24.19.
-      if (child.exitCode === null && !child.killed && child.pid !== undefined) {
+      if (alive(child) && child.pid !== undefined) {
         child.kill('SIGKILL');
       }
     }

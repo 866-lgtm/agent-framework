@@ -27,15 +27,20 @@
  * runtime's fds 3 (host -> py) and 4 (py -> host), which the runtime makes
  * non-inheritable as it starts, so no command a script runs is given them. fd 0
  * is /dev/null, and fds 1 and 2 are pipes the host reads itself: a script's
- * prints and the output of every command it runs go there in the order
- * written, and what reaches them reaches the host whatever then happens to the
- * interpreter. The host gives each exec what arrived on each stream before
- * that exec's end mark (the exec op's `mark`), which the runtime writes into
- * both streams once the script has returned; each stream is first in, first
- * out, so what the script and the commands it waited for wrote is ahead of
- * it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
+ * prints, line by line, and the output of every command it runs go there in
+ * the order written, and what reaches them reaches the host whatever then
+ * happens to the interpreter. A partial line waits in the script's writer for
+ * its newline, a flush or the exec's end, as Python's stdout does on a
+ * terminal, and a command writing at the same moment as a long write can land
+ * between its parts. The host gives each exec what arrived on each stream
+ * before that exec's end mark (the exec op's `mark`), which the runtime writes
+ * into both streams once the script has returned; each stream is first in,
+ * first out, so what the script and the commands it waited for wrote is ahead
+ * of it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
  * protocol, and the runtime puts them back as the host set them at each
- * exec's start.
+ * exec's start. Its own fds (3 and 4, and its copies of 0, 1 and 2) it checks
+ * at each exec's start and end: one a script closed or replaced ends the
+ * interpreter, saying which (_check_own_fds).
  *
  * Embedded as a TS string because tsc does not copy non-TS assets to dist/;
  * PyRunner materializes it to a temp file at spawn.
@@ -73,6 +78,7 @@ import signal
 import sys
 import threading
 import traceback
+import weakref
 
 CALL_TIMEOUT_S = 270.0
 BACKGROUND = False
@@ -89,6 +95,16 @@ PROTO_OUT = None
 _STD_IN = None
 _STD_OUT = None
 _STD_ERR = None
+
+# The runtime's own fds, as it found them: fd -> (what losing it stops, which
+# fd it is, what it was). A script can close or replace any of them (os.close,
+# os.dup2), so each exec's start and end checks them (_check_own_fds).
+_OWN_FDS = {}
+
+# Every writer the runtime gave a script, which a script can keep past its
+# exec (a logging handler keeps sys.stderr): each exec's end flushes them all,
+# so a partial line goes out in the exec that wrote it.
+_script_writers = weakref.WeakSet()
 
 _send_lock = threading.Lock()
 
@@ -114,9 +130,11 @@ def _start():
         except OSError:
             try:
                 os.write(2, (
-                    "The host's channel didn't reach this Python interpreter (its file descriptors 3 and 4 "
-                    "aren't open): a pythonPath that starts Python through a wrapper must pass fds 3 and 4 on, "
-                    "which a container, or sudo with its default settings, doesn't.\n"
+                    "The host's channel didn't reach this Python interpreter: its file descriptors 3 and 4 "
+                    "aren't open, as when the host's pythonPath starts Python through a wrapper that doesn't "
+                    "pass them on, such as a container, or sudo with its default settings. code_execution "
+                    "can't run scripts here until whoever runs this host changes that, so calling it again "
+                    "fails the same way.\n"
                 ).encode())
             except OSError:
                 pass
@@ -125,6 +143,8 @@ def _start():
     # hold them, or read the host's messages.
     os.set_inheritable(3, False)
     os.set_inheritable(4, False)
+    _own(3, "cannot read the host's messages any more", "fd 3, where they arrive")
+    _own(4, "cannot send the host a message any more", "fd 4, where they go")
     PROTO_IN = open(3, "r", encoding="utf-8", newline="\n")
     PROTO_OUT = open(4, "w", encoding="utf-8", newline="\n")
     _take_std_fds()
@@ -133,18 +153,47 @@ def _start():
 def _take_std_fds():
     global _STD_IN, _STD_OUT, _STD_ERR
     _STD_IN, _STD_OUT, _STD_ERR = os.dup(0), os.dup(1), os.dup(2)
+    _own(_STD_IN, "cannot give scripts their stdin any more", "the runtime's copy of fd 0")
+    _own(_STD_OUT, "cannot reach the output pipes any more", "the runtime's copy of fd 1")
+    _own(_STD_ERR, "cannot reach the output pipes any more", "the runtime's copy of fd 2")
     # A crash's own text goes where the host reads it, a pipe that outlives the
     # process: faulthandler adds a traceback for a segfault or an abort, where
     # CPython alone writes nothing.
     faulthandler.enable(file=_STD_ERR, all_threads=False)
 
 
+def _identity(fd):
+    st = os.fstat(fd)
+    return (st.st_mode, st.st_dev, st.st_ino)
+
+
+def _own(fd, stops, which):
+    _OWN_FDS[fd] = (stops, which, _identity(fd))
+
+
+def _check_own_fds():
+    # A script closed or replaced one of the runtime's own fds: say which and
+    # end, before anything goes to a file that isn't the runtime's any more.
+    for fd, (stops, which, identity) in _OWN_FDS.items():
+        try:
+            same = _identity(fd) == identity
+        except OSError:
+            same = False
+        if not same:
+            _fatal(stops + ": a script closed or replaced " + which)
+
+
 def _diag(text):
-    # A note of the runtime's own for the host's log, through fd 2's copy.
-    try:
-        os.write(_STD_ERR, ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace"))
-    except OSError:
-        pass
+    # A note of the runtime's own for the host's log, through fd 2's copy, or
+    # fd 2 itself if a script closed the copy.
+    data = ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace")
+    for fd in (_STD_ERR, 2):
+        try:
+            if fd is not None:
+                os.write(fd, data)
+                return
+        except OSError:
+            pass
 
 
 def _write_all(fd, data):
@@ -159,8 +208,10 @@ def _script_writer(fd):
     # flush or the end of the exec. It writes to the fd by number, so one an
     # earlier script kept, such as a logging handler's, writes into the exec
     # that's running.
-    return io.TextIOWrapper(io.BufferedWriter(io.FileIO(fd, "w", closefd=False)), encoding="utf-8",
-                            errors="backslashreplace", newline="\n", line_buffering=True)
+    writer = io.TextIOWrapper(io.BufferedWriter(io.FileIO(fd, "w", closefd=False)), encoding="utf-8",
+                              errors="backslashreplace", newline="\n", line_buffering=True)
+    _script_writers.add(writer)
+    return writer
 
 
 def _open_streams():
@@ -181,15 +232,22 @@ def _note(stream, text):
         pass
 
 
-def _end_streams(streams, mark):
-    # Send what the script left in its writers, then end this exec's share of
-    # each stream with its mark: everything the script wrote, and all of every
-    # command it waited for, is ahead of it.
-    for writer in streams:
+def _flush_writers():
+    # Send what the script left in its writers, the ones it kept from earlier
+    # execs too.
+    for writer in list(_script_writers):
+        if writer.closed:
+            continue  # a script closed it, which sent what it held
         try:
             writer.flush()
-        except Exception:
-            pass  # its fd closed or broke under it, so that much can't be sent
+        except Exception as exc:
+            # Its fd closed or broke under it, so that much can't be sent.
+            _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
+
+
+def _write_marks(mark):
+    # End this exec's share of each stream with its mark: everything the
+    # script wrote, and all of every command it waited for, is ahead of it.
     data = mark.encode("utf-8")
     _write_all(_STD_OUT, data)
     _write_all(_STD_ERR, data)
@@ -408,11 +466,11 @@ def handle_init(msg):
 
 async def _run_script(exec_id, code, mark, st):
     global _current_exec_id, _current_exec_task, _stop
+    _check_own_fds()
     try:
-        streams = _open_streams()
+        out, err = _open_streams()
     except OSError as exc:
         _fatal("cannot reach the output pipes any more (" + str(exc) + ")")
-    out, err = streams
     old_out, old_err, old_in = sys.stdout, sys.stderr, sys.stdin
     sys.stdout, sys.stderr = out, err
     sys.stdin = io.StringIO("")  # input() ends at once, as fd 0's /dev/null does for a command
@@ -461,11 +519,14 @@ async def _run_script(exec_id, code, mark, st):
                 fut.cancel()
         _pending_wake_futures.clear()
 
-    # The result first, then the marks: should the result fail to go, the
-    # runtime's word on why still lands in this exec's share of stderr.
+    # What the script left in its writers, then the runtime's own fds, then
+    # the result, then the marks: should the fds be gone or the result fail to
+    # go, the runtime's word on why still lands in this exec's share of stderr.
+    _flush_writers()
+    _check_own_fds()
     send({"op": "exec_result", "id": exec_id, "return_code": return_code})
     try:
-        _end_streams(streams, mark)
+        _write_marks(mark)
     except OSError as exc:
         _fatal("cannot reach the output pipes any more (" + str(exc) + ")")
 
@@ -512,8 +573,13 @@ async def main():
     queue = asyncio.Queue()
 
     def reader():
-        for raw_line in PROTO_IN:
-            loop.call_soon_threadsafe(queue.put_nowait, raw_line)
+        try:
+            for raw_line in PROTO_IN:
+                loop.call_soon_threadsafe(queue.put_nowait, raw_line)
+        except (OSError, ValueError) as exc:
+            # A script closed fd 3 under it, or a file it opened took the
+            # number: nothing more can reach the runtime (_check_own_fds).
+            _fatal("cannot read the host's messages any more (" + str(exc) + ")")
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
     # The reader thread blocks SIGINT (it inherits the mask while it starts),
