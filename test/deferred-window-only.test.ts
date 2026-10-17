@@ -22,8 +22,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type {
   Module,
   ModuleContext,
@@ -43,6 +44,33 @@ interface Interjection {
   participant: string;
   content: ContentBlock[];
 }
+
+/** The installed context-manager's version. Its package's exports don't
+ *  include package.json, so walk up from its entry point to it. */
+function contextManagerVersion(): string {
+  let dir = dirname(fileURLToPath(import.meta.resolve('@animalabs/context-manager')));
+  for (;;) {
+    const file = join(dir, 'package.json');
+    if (existsSync(file)) {
+      const pkg = JSON.parse(readFileSync(file, 'utf8')) as { name?: string; version?: string };
+      if (pkg.name === '@animalabs/context-manager' && pkg.version) return pkg.version;
+    }
+    const up = dirname(dir);
+    if (up === dir) throw new Error("can't find @animalabs/context-manager's package.json");
+    dir = up;
+  }
+}
+
+/** Set, with the reason, when shards can't land before a throw: from
+ *  context-manager 0.15, a sharded write that fails partway removes what it
+ *  wrote. The tests of carrying landed shards pin 0.14.x. */
+const NO_SHARDS_LAND_BEFORE_A_THROW = (() => {
+  const version = contextManagerVersion();
+  const [major, minor] = version.split('.').map(Number);
+  return major! > 0 || minor! >= 15
+    ? `context-manager ${version} removes what a sharded write that fails partway wrote, so no shards land before a throw`
+    : false;
+})();
 
 /** Tools that deliver messages while they run, the way a module or a channel
  *  would while the agent is busy: `move` continues the turn, `halt` ends it. */
@@ -468,16 +496,24 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  /** A store listener that throws once, after the record with this text is
-   *  written: the write throws though its message is stored. */
+  /** The strategy's onNewMessage throws once, synchronously, for the record
+   *  with this text. The manager's own store listener calls it as each record
+   *  is written, so the write throws though its message is stored. A host's
+   *  onMessage listener can't do this on context-manager 0.15, which logs its
+   *  throw and lets the write stand. */
   function throwOnceAfterStoring(framework: AgentFramework, textOf: string): void {
+    const strategy = (framework.getAgent('assistant')!.getContextManager() as unknown as {
+      strategy: { onNewMessage?: (message: { content: ContentBlock[] }, ctx: unknown) => Promise<void> };
+    }).strategy;
+    const onNewMessage = strategy.onNewMessage;
     let thrown = false;
-    framework.getAgent('assistant')!.getContextManager().onMessage((event) => {
-      if (thrown || event.type !== 'add') return;
-      if (!event.message.content.some((b) => (b as { text?: string }).text === textOf)) return;
-      thrown = true;
-      throw new Error('listener failed');
-    });
+    strategy.onNewMessage = function (this: unknown, message, ctx) {
+      if (!thrown && message.content.some((b) => (b as { text?: string }).text === textOf)) {
+        thrown = true;
+        throw new Error('strategy failed');
+      }
+      return onNewMessage ? onNewMessage.call(this, message, ctx) : Promise.resolve();
+    };
   }
 
   it('at a tool boundary, a write that throws after its message is stored counts as stored: injected, and not stored again', async () => {
@@ -507,7 +543,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       'assistant: Done.',
     ], 'stored once, where the stream carried it');
     assert.ok(errors.some((e) => e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
-      && e.includes('listener failed')), errors.join('\n'));
+      && e.includes('strategy failed')), errors.join('\n'));
     await framework.stop();
   });
 
@@ -521,7 +557,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         : null;
   }
 
-  it("at a tool boundary, a sharded body that throws after its first shard: what landed is carried and counts as written, and the rest isn't stored", async () => {
+  it("at a tool boundary, a sharded body that throws after its first shard: what landed is carried and counts as written, and the rest isn't stored", { skip: NO_SHARDS_LAND_BEFORE_A_THROW }, async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Moving.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
@@ -529,7 +565,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     membrane.pushResponse(createMockResponse(text('Done.')));
     const framework = await createFramework();
     shardOn(framework, 'part one');
-    // The listener throws on the first shard's add, which stops the append
+    // The strategy throws on the first shard's add, which stops the append
     // loop before the second shard.
     throwOnceAfterStoring(framework, 'part one');
     module.interjections = [
@@ -552,11 +588,11 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     ], 'the first shard alone, stored once');
     assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
     assert.ok(errors.some((e) => e.includes("threw after 1 shard of its body was stored; what was stored counts as written and isn't stored again")
-      && e.includes('listener failed')), errors.join('\n'));
+      && e.includes('strategy failed')), errors.join('\n'));
     await framework.stop();
   });
 
-  it('at a tool boundary, the shards that landed before a throw are carried as the next compile renders them', async () => {
+  it('at a tool boundary, the shards that landed before a throw are carried as the next compile renders them', { skip: NO_SHARDS_LAND_BEFORE_A_THROW }, async () => {
     // Probe by Ansel-2428: the autobiographical strategy shards a long
     // message on ingest and joins a body's consecutive shards when it
     // compiles, so the boundary must carry what landed in that shape. The
@@ -632,8 +668,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     // addMessage notes it as one of the turn's arrivals.
     const open = { engaged: new Set(['chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
     internals.openLogical.set('assistant', open);
+    const errors: string[] = [];
     const error = console.error;
-    console.error = () => {};
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     let written: unknown[];
     try {
       written = internals.readdDrained(
@@ -641,11 +678,47 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         'test flush',
       );
     } finally { console.error = error; }
+    assert.ok(errors.some((e) => e.includes('test flush: deferred write')
+      && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
+      && e.includes('strategy failed')), errors.join('\n'));
     assert.equal(written.length, 1, 'it counts as written');
     const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
     assert.equal(copies.length, 1, 'stored once');
     assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channelId: 'chan-beta' }], 'and noted as one of the open turn\'s arrivals');
+    await framework.stop();
+  });
+
+  it("writes re-added from the queue are noted for an open turn in the order they landed, one that throws after it's stored among them", async () => {
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'from alpha');
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      openLogical: Map<string, unknown>;
+      readdDrained(entries: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>, where: string): unknown[];
+      remainingArrival(agent: unknown, routing: unknown): string | undefined;
+    };
+    // An open turn engaged with both channels, between its streams: the
+    // earlier write throws after it's stored, and the later one lands.
+    const open = { engaged: new Set(['chan-alpha', 'chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
+    internals.openLogical.set('assistant', open);
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      internals.readdDrained([
+        { id: 'w1', seq: 1, participant: 'Antra', content: text('from alpha'), metadata: { channelId: 'chan-alpha' } },
+        { id: 'w2', seq: 2, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta' } },
+      ], 'test flush');
+    } finally { console.error = error; }
+    assert.equal(errors.filter((e) => e.includes('threw after it was stored')).length, 1, errors.join('\n'));
+    const idOf = (writeId: string) => agent.getContextManager().getAllMessages()
+      .find((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === writeId)!.id;
+    assert.deepEqual(open.arrivals, [
+      { messageId: idOf('w1'), channelId: 'chan-alpha' },
+      { messageId: idOf('w2'), channelId: 'chan-beta' },
+    ]);
+    assert.equal(internals.remainingArrival(agent, open), 'chan-beta', "the turn's newest arrival is the later write's");
     await framework.stop();
   });
 
@@ -672,7 +745,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
     assert.ok(errors.some((e) => e.includes("turn-end flush: deferred write")
       && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
-      && e.includes('listener failed')), errors.join('\n'));
+      && e.includes('strategy failed')), errors.join('\n'));
     await framework.stop(); // stop() lands whatever is still queued
 
     const reopened = await createFramework();
