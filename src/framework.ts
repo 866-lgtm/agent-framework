@@ -17124,7 +17124,7 @@ export class AgentFramework {
     config: import('./mcpl/types.js').McplServerConfig,
     deferAwareness = false,
     claim?: McpRestartClaim,
-  ): Promise<void> {
+  ): Promise<McplServerConnection | ModernMcpConnection> {
     if (this.stopHasBegun()) {
       throw new Error(`MCP server "${config.id}" was not connected: the framework is stopping or stopped`);
     }
@@ -17143,20 +17143,21 @@ export class AgentFramework {
     if (taken) throw new Error(taken);
     const hold = this.holdMcpServerId(config.id, 'connect');
     try {
-      await this.connectHeldMcplServer(config, family, deferAwareness, hold.displaced);
+      return await this.connectHeldMcplServer(config, family, deferAwareness, hold.displaced);
     } finally {
       hold.release();
     }
   }
 
   /** The part of a connect that runs holding its id. `displaced`: a
-   *  disconnect has taken the id over and is waiting for this connect. */
+   *  disconnect has taken the id over and is waiting for this connect. It
+   *  hands back the connection it registered. */
   private async connectHeldMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
     family: 'legacy' | 'modern',
     deferAwareness: boolean,
     displaced: () => boolean,
-  ): Promise<void> {
+  ): Promise<McplServerConnection | ModernMcpConnection> {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
     }
@@ -17191,7 +17192,7 @@ export class AgentFramework {
       }
       if (!failure && !modern.isClosed) {
         this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
-        return;
+        return modern;
       }
       // It failed, or stop() or a disconnect closed it while connecting: it
       // never serves. The connect error is the one to report.
@@ -17303,7 +17304,7 @@ export class AgentFramework {
       // grant now, before staging ever releases.
       await this.registerMcplServerFeatures(config, connection);
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
-      return;
+      return connection;
     }
 
     const awarenessBarrier = this.installMcplDataPlaneGate();
@@ -17336,6 +17337,7 @@ export class AgentFramework {
     this.completeMcplDataPlaneGate(awarenessBarrier);
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+    return connection;
   }
 
   /** Per-connection §17.8 fetch limiter: at most one in-flight fetch, at
@@ -17788,7 +17790,7 @@ export class AgentFramework {
     if (collision) throw new Error(collision);
 
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
-    await this.connectMcplServerInternal(config, false, claim);
+    const connection = await this.connectMcplServerInternal(config, false, claim);
     // A stop() that began during the connect's setup or its tool listing
     // ends the connect: it doesn't wait on a server for a framework that is
     // stopping, and the teardown closes what the connect set up.
@@ -17796,6 +17798,15 @@ export class AgentFramework {
     if (this.stopHasBegun()) throw stopped();
     await this.untilStopBegins(this.refreshMcplTools());
     if (this.stopHasBegun()) throw stopped();
+    // The connect let go of its id once its setup was done, so a disconnect
+    // during the listing wasn't held off. One that has begun, or has removed
+    // what the connect set up, ends the connect, as one during its setup
+    // does: what it set up is going or gone. So does a server lost for good
+    // meanwhile. A restart reports it as its connect's failure.
+    const current = this.modernServers().get(config.id) ?? this.mcplServerRegistry?.getServer(config.id);
+    if (current !== connection || this.mcpServerOps?.get(config.id)?.kind === 'disconnect') {
+      throw new Error(`MCP server "${config.id}" was not connected: it was disconnected or lost while its tools were being listed`);
+    }
     this.emitMcplToolDiff(oldToolNames, config.id);
   }
 

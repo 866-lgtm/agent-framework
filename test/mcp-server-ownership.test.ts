@@ -591,6 +591,54 @@ for (const engine of ['legacy', 'modern'] as const) {
   });
 }
 
+/** Hold modern server `id`'s listings once they've answered, until release(). */
+function holdListings(framework: AgentFramework, id: string): { held: () => number; release: () => void } {
+  const connection = (framework as unknown as { modernServers(): Map<string, { listTools(): Promise<unknown[]> }> }).modernServers().get(id)!;
+  const realList = connection.listTools.bind(connection);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let held = 0;
+  connection.listTools = async () => { const tools = await realList(); held += 1; await gate; return tools; };
+  return { held: () => held, release };
+}
+
+test("a disconnect during a connect's tool listing ends the connect", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('a', '', join(dir, 'raw-a.jsonl')));
+    const a = holdListings(framework, 'a');
+    const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
+    const connecting = framework.connectMcplServer(modern('m', '', join(dir, 'raw-m.jsonl')));
+    await until(() => a.held() > 0, "m's connect, listing tools, waits on a");
+    // The disconnect removes m whole while that listing waits. Its own
+    // refresh then waits on a too, so it's awaited once a answers.
+    const disconnecting = framework.disconnectMcplServer('m');
+    await until(() => !servers.has('m'), 'm is removed');
+    a.release();
+    await assert.rejects(connecting, /MCP server "m" was not connected: it was disconnected or lost while its tools were being listed/);
+    await disconnecting;
+  });
+});
+
+test("a disconnect still under way when a connect's tool listing ends fails the connect", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('a', '', join(dir, 'raw-a.jsonl')));
+    const a = holdListings(framework, 'a');
+    const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
+    // m ignores SIGTERM, so its disconnect stays in flight for ~2 s, holding
+    // the id, with m still registered.
+    const connecting = framework.connectMcplServer(modern('m', 'ignore-sigterm', join(dir, 'raw-m.jsonl')));
+    await until(() => a.held() > 0, "m's connect, listing tools, waits on a");
+    const m = servers.get('m');
+    let disconnected = false;
+    const disconnecting = framework.disconnectMcplServer('m').then(() => { disconnected = true; });
+    a.release();
+    await assert.rejects(connecting, /MCP server "m" was not connected: it was disconnected or lost while its tools were being listed/);
+    assert.equal(disconnected, false, 'the disconnect was still under way');
+    assert.equal(servers.get('m'), m, 'with m still registered');
+    await disconnecting;
+  });
+});
+
 test('a server lost for good, legacy or modern, leaves the tool list', async () => {
   await withFramework(async ({ framework, dir }) => {
     await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
