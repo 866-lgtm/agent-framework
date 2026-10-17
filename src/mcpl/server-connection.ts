@@ -206,9 +206,9 @@ class HandshakeCleanupError extends Error {
  * exited: it may still be running. `connection` owns that launch, closed and
  * not reconnecting. Its close() retries the reap and resolves once the exit
  * is confirmed, so the caller can still clean up, and should start nothing
- * else for this server until then. connect() throws this, the modern
- * engine's ModernMcpConnection.connect() too; connectWithReconnect() returns
- * the connection instead, halted. `cause` is the connect's own failure.
+ * else for this server until then. connect() and connectWithReconnect()
+ * throw this, and the modern engine's ModernMcpConnection.connect() too.
+ * `cause` is the connect's own failure.
  */
 export class McplUnreapedLaunchError<Connection extends { close(): Promise<void> } = McplServerConnection> extends Error {
   constructor(

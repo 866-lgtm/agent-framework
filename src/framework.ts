@@ -16609,7 +16609,8 @@ export class AgentFramework {
         // So the server doesn't vanish quietly: alert at once, since no
         // attempt follows, for what needs the operator. That's a
         // protocol-version verdict, as the reconnect path alerts for one, or
-        // a launch that couldn't be reaped, which only a disconnect retries.
+        // a launch that couldn't be reaped, whose reap nothing retries on its
+        // own.
         if (error instanceof McplProtocolVersionError || left?.holdsUnreapedChild) {
           this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${message}`);
         }
@@ -17119,6 +17120,11 @@ export class AgentFramework {
           `[discord-awareness] could not recycle unhealthy connection ${connection.id}:`,
           closeError instanceof Error ? closeError.message : closeError,
         );
+        // One without reconnect is closed, keeping a child it couldn't
+        // reap, so it won't serve again: its tools leave the agents' list,
+        // as a failed disconnect's do. One with reconnect is its reconnect
+        // loop's to settle, which halts (and refreshes) or serves again.
+        if (!connection.willReconnect) this.handleToolsListChanged(connection.id);
       });
     }));
   }
@@ -18663,10 +18669,10 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      // `permanent`: reconnecting halted, on a launch that couldn't be
-      // reaped or a protocol-version verdict. No later attempt will come, so
-      // alert now, and the server's tools leave the agents' list: it won't
-      // serve again on its own.
+      // `permanent`: no later attempt will come, after a launch that
+      // couldn't be reaped or a protocol-version verdict. Alert now, and the
+      // server's tools leave the agents' list: it won't serve again on its
+      // own.
       if (params.permanent || params.attempt >= 5) {
         this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
       }
