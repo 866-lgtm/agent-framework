@@ -1950,8 +1950,9 @@ export class AgentFramework {
    */
   private deferredScanFrom = new Map<string, number>();
   private deferredMessages: Array<{
-    /** Durable identity for per-message flush acknowledgement: a flush
-     *  interrupted by a crash replays only the messages not yet acked. */
+    /** Durable identity, stamped on the stored message as its
+     *  deferredWriteId: a flush interrupted by a crash replays its batch at
+     *  the next boot, which skips each entry that already landed by it. */
     id: string;
     /** Order stamp (see deferredSeq). */
     seq: number;
@@ -2614,9 +2615,11 @@ export class AgentFramework {
       const hostMode = framework.readHostMode();
       // Deferred writes are recovered REGARDLESS of the mode flag: a crash
       // between a resume's flag clear and the end of its flush must not
-      // strand accepted messages. Per-message acks mean only the remainder
-      // replays. Serving boot with a remainder → flush it right now (no turn
-      // is alive yet, so this is a safe boundary).
+      // strand accepted messages. A flush acknowledges its batch once, after
+      // the chronicle syncs, and boot skips each entry that already landed
+      // (by its deferredWriteId), so only the remainder replays (see
+      // flushDeferredWrites). Serving boot with a remainder → flush it right
+      // now (no turn is alive yet, so this is a safe boundary).
       const restoredWrites = framework.restorePersistedDeferredWrites();
       if (!hostMode?.quiesced && restoredWrites > 0) {
         console.error(
@@ -5113,8 +5116,9 @@ export class AgentFramework {
     try {
       // Flush context writes deferred by the quiesce window (module events,
       // api message.send) — with no turn alive there is no other flush
-      // point. Per-message try/catch and per-message durable ack (see
-      // flushDeferredWrites); nothing here may reach the plane reopen below.
+      // point. Each write is tried on its own, and the batch is acknowledged
+      // once, after the chronicle syncs (see flushDeferredWrites); nothing
+      // here may reach the plane reopen below.
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
     } finally {
