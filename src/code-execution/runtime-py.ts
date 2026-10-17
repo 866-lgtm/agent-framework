@@ -259,15 +259,74 @@ def _resolve(fut, value):
             pass
 
 
+def _brief(value):
+    # A value as a refusal shows it: as written when that is short and copies
+    # as the same value, and otherwise by its type, such as <str>, which fails
+    # loudly if copied rather than sending something else. A long value is
+    # never repr'd whole, and only the built-in types are repr'd at all, so a
+    # subclass's own __repr__ never runs here. The type is compared by
+    # identity and named through type's own descriptor, so a metaclass's
+    # __eq__ or __name__ never runs either.
+    kind = type(value)
+    if kind is float and value != value:
+        return "float('nan')"
+    if kind is float and value in (float('inf'), float('-inf')):
+        return "float('inf')" if value > 0 else "float('-inf')"
+    if value is None or kind is bool or kind is float \
+            or (kind is int and -10 ** 36 < value < 10 ** 36) \
+            or (kind is str and len(value) <= 38):
+        shown = repr(value)
+        if len(shown) <= 40:
+            return shown
+    return "<" + type.__dict__["__name__"].__get__(kind) + ">"
+
+
 def _make_tool_fn(tool_name, py_name):
-    async def tool_fn(args=None):
+    async def tool_fn(*positional, **kwargs):
         global _next_tool_call_id
+        if len(positional) > 1:
+            raise TypeError(
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, such as await " + py_name + "({...}), and this call "
+                "gave it " + str(len(positional)) + " positional arguments"
+            )
+        # args= on its own is the dict, as it has always been. Beside other
+        # keywords it's one of them, since a tool such as utils has a field
+        # of that name, so the suggested dict keeps it.
+        if positional:
+            args = positional[0]
+        elif list(kwargs) == ["args"]:
+            args = kwargs.pop("args")
+        else:
+            args = None
+        if kwargs:
+            if args is not None and not isinstance(args, dict):
+                raise TypeError(
+                    py_name + " wasn't called: a tool function takes one dict of "
+                    "arguments, not keyword arguments, and this call also gave it "
+                    + _brief(args) + ", so put every argument in one dict: await "
+                    + py_name + "({...})"
+                )
+            # The likely intent is plain: the same arguments in one dict.
+            meant = dict(args) if isinstance(args, dict) else {}
+            meant.update(kwargs)
+            # A key is what the agent has to write, so a str key is shown
+            # whole up to 60 characters, as names are elsewhere; a longer one,
+            # or any other key, is shown as a value is.
+            shown = ", ".join((repr(k) if type(k) is str and len(k) <= 60 else _brief(k)) + ": " + _brief(v)
+                              for k, v in meant.items())
+            raise TypeError(
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, not keyword arguments, so write await "
+                + py_name + "({" + shown + "})"
+            )
         if args is None:
             args = {}
         if not isinstance(args, dict):
             raise TypeError(
-                "tool functions take a single dict of arguments, e.g. await "
-                + py_name + "({...})"
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, such as await " + py_name + "({...}), and this call "
+                "gave it " + _brief(args)
             )
         _next_tool_call_id += 1
         call_id = "t" + str(_next_tool_call_id)
