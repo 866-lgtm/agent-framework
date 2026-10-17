@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
-import type { Module, ModuleContext, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
+import type { Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tool-listing-mcpl-server.mjs');
@@ -341,40 +341,47 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 10_000): P
   }
 }
 
-/** A framework with fixture servers, and a call by each path answered as `<server>:<tool>`. */
+/** A framework with fixture servers, and a call by each path answered as the fixture answers it, `<server>:<tool>`. */
 async function live(servers: ReturnType<typeof fixture>[], names: string[]) {
   const h = await framework({ mcplServers: servers });
-  await waitFor(() => names.every((n) => h.fw.getAllTools().some((t) => t.name === n)), 'the listing');
-  const call = async (path: Path, name: string): Promise<string> => {
-    const c: ToolCall = { id: `live-${path}-${name}-${Date.now()}`, name, input: {} };
-    if (path === 'model') {
-      // The model's path answers into the agent's tool round; its trace says where it went.
-      const done = new Promise<string>((resolve) => {
-        const off = h.fw.onTrace((event: TraceEvent) => {
-          const e = event as unknown as { type: string; callId?: string; module?: string; tool?: string; error?: string };
-          if (e.callId !== c.id) return;
-          if (e.type === 'tool:completed') { off(); resolve(`${(e.module ?? '').replace(/^mcpl:/, '')}:${e.tool}`); }
-          if (e.type === 'tool:failed') { off(); resolve(`failed: ${e.error}`); }
-        });
-      });
-      h.internals.dispatchToolCall('assistant', c);
-      return done;
-    }
-    const result = path === 'executeToolCall'
-      ? await h.fw.executeToolCall({ ...c, callerAgentName: 'assistant' })
-      : await h.module.ctx!.callTool(c);
+  const cleanup = async () => {
+    await h.fw.stop();
+    rmSync(h.dir, { recursive: true, force: true });
+  };
+  try {
+    await waitFor(() => names.every((n) => h.fw.getAllTools().some((t) => t.name === n)), 'the listing');
+  } catch (err) {
+    // Setup failed before the caller's try: stop the fixtures and remove the store here.
+    await cleanup();
+    throw err;
+  }
+  // The model's path answers into the agent's tool round, as a tool-result event.
+  const answers = new Map<string, ToolResult>();
+  const push = h.fw.pushEvent.bind(h.fw);
+  h.fw.pushEvent = (event) => {
+    const e = event as { type: string; callId?: string; result?: ToolResult };
+    if (e.type === 'tool-result' && e.callId && e.result) answers.set(e.callId, e.result);
+    push(event);
+  };
+  const answered = (result: ToolResult): string => {
     if (!result.success) return `refused: ${result.error}`;
-    const blocks = result.data as Array<{ text?: string }>;
-    return blocks.map((b) => b.text ?? '').join('');
+    // The model's path joins a text result into a string; the programmatic paths keep its blocks.
+    if (typeof result.data === 'string') return result.data;
+    return (result.data as Array<{ text?: string }>).map((b) => b.text ?? '').join('');
   };
-  return {
-    ...h,
-    call,
-    cleanup: async () => {
-      await h.fw.stop();
-      rmSync(h.dir, { recursive: true, force: true });
-    },
+  let calls = 0;
+  const call = async (path: Path, name: string): Promise<string> => {
+    const c: ToolCall = { id: `live-${++calls}-${path}-${name}`, name, input: {} };
+    if (path === 'model') {
+      h.internals.dispatchToolCall('assistant', c);
+      await waitFor(() => answers.has(c.id), `the model's answer to ${name}`);
+      return answered(answers.get(c.id)!);
+    }
+    return answered(path === 'executeToolCall'
+      ? await h.fw.executeToolCall({ ...c, callerAgentName: 'assistant' })
+      : await h.module.ctx!.callTool(c));
   };
+  return { ...h, call, cleanup };
 }
 
 test('with fixture servers configured at create(), one on the default prefix, every path reaches the server the model\'s call reaches', async () => {
