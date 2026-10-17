@@ -165,10 +165,11 @@ export function isSymlinkRefusal(reason: string): boolean {
  * way, even where the path names it on its way back into the mount. Each
  * directory is asked only whether it is a link, by readlink, from the root
  * down. EINVAL means it isn't, and the walk goes on. Nothing there, a file in
- * the way, or a directory this user can't search (ENOENT, ENOTDIR, EACCES,
- * EPERM) ends it with nothing found, since nothing beneath is reached through
- * a link and the caller's own lookup meets the same answer. Any other answer
- * leaves it unsure of what's beneath, and the path is refused for that.
+ * the way, or a directory this user can't search (ENOENT, ENOTDIR, EACCES)
+ * ends it with nothing found, since nothing beneath is reached through a link
+ * and the caller's own lookup meets the same answer. Any other answer, EPERM
+ * included, leaves it unsure of what's beneath, and the path is refused for
+ * that.
  */
 export async function linkOnTheWay(
   view: Pick<MountView, 'root' | 'followSymlinks'>,
@@ -188,7 +189,7 @@ export async function linkOnTheWay(
     } catch (err) {
       const code = errno(err);
       if (code === 'EINVAL') continue; // not a link: on to the next directory
-      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EACCES' || code === 'EPERM') return null;
+      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EACCES') return null;
       return { unsure: at, code: code ?? String(err) };
     }
   }
@@ -201,8 +202,9 @@ export async function linkOnTheWay(
  * parent it resolved to `real`): the first symlink on its way, or a
  * directory there the walk couldn't ask. Null when the mount follows
  * symlinks, or there's none. Where `real` is the root's canonical path joined
- * with `rel`, nothing beneath the root resolved through a link, and nothing
- * more is asked: that is every path through ordinary directories, at no cost
+ * with what was resolved (`rel`, or with `through` 'parents', its parent),
+ * nothing beneath the root resolved through a link, and nothing more is
+ * asked: that is every path through ordinary directories, at no cost
  * per path. Otherwise each directory is asked in turn (linkOnTheWay), since a
  * name spelled otherwise than disk spells it, on a file system that ignores
  * case or Unicode normalization, also resolves to another string, and isn't
@@ -239,12 +241,14 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
 
 /**
  * Why a path is refused for what linkOnTheWay found, given where a link
- * leads (linkLeads). The link is the subject, with where it leads: for a
- * link inside the mount, its target, and for a link to a directory there,
- * the setting the mount's host can change, which following a link to a file
- * wouldn't answer; for one leading outside the mount, that it does; for one
- * that can't be resolved, nothing more. Paths are spelled as the tools take
- * them, from the mount's name.
+ * leads (linkLeads). For a link, the link is the subject, with where it
+ * leads: for a link inside the mount, its target, and for a link to a
+ * directory there, the setting the mount's host can change (the link stands
+ * among the path's directories, so following a link to a file can't make the
+ * path beneath it exist); for one leading outside the mount, that it does;
+ * for one that can't be resolved, nothing more. For a directory the walk
+ * couldn't ask, which one, and the answer it got. Paths are spelled as the
+ * tools take them, from the mount's name.
  */
 export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;

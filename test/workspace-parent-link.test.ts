@@ -14,6 +14,7 @@
  * still the root.
  */
 
+import { execFileSync } from 'node:child_process';
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -311,6 +312,29 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     });
   });
 
+  test('a disk reader through a link to a FIFO names it without the setting, and through a link to the root names the mount with it', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('x.txt', 'v1\n');
+    symlinkSync(env.dir, join(env.dir, 'r'));
+    const reasons: Array<[string, string]> = [
+      ['work/r/x.txt', 'work/r/x.txt: "work/r" is a symlink to "work", which this mount does not follow; the mount\'s host can set followSymlinks: true'],
+    ];
+    if (process.platform !== 'win32') {
+      execFileSync('mkfifo', [join(env.dir, 'pipe')]);
+      symlinkSync(join(env.dir, 'pipe'), join(env.dir, 'f'));
+      reasons.push(['work/f/x.txt', 'work/f/x.txt: "work/f" is a symlink to "work/pipe", which this mount does not follow']);
+    }
+    const m = await env.open(t);
+    for (const [path, reason] of reasons) {
+      await assert.rejects(m.readFileFromDisk(path), (err: unknown) => {
+        assert.ok(err instanceof WorkspaceReadError, String(err));
+        assert.equal(err.code, 'symlink', path);
+        assert.equal(err.message, reason);
+        return true;
+      });
+    }
+  });
+
   test('a link to the mount\'s root names the mount as its target', async (t) => {
     const env = new Env(t);
     env.writeDisk('x.txt', 'v1\n');
@@ -337,33 +361,41 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     });
   });
 
-  test("a directory on the way the walk can't ask whether it's a symlink refuses the path, rather than letting a link beneath it through", async (t) => {
-    const env = new Env(t);
-    env.writeDisk('elsewhere/x.txt', 'behind the link\n');
-    mkdirSync(join(env.dir, 'a'));
-    symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'a', 'l'));
-    const m = await env.open(t);
-    await call(m, 'write', { path: 'work/a/l/new.txt', content: 'new\n' });
-    const eio = Object.assign(new Error('EIO: i/o error, readlink'), { code: 'EIO' });
-    await withFsPromises('readlink', (readlink) => async (path: string, ...rest: unknown[]) => {
-      if (String(path).endsWith(`${sep}a`)) throw eio;
-      return readlink(path, ...rest);
-    }, async () => {
-      await assert.rejects(m.readFileFromDisk('work/a/l/x.txt'), (err: unknown) => {
-        assert.ok(err instanceof WorkspaceReadError, String(err));
-        assert.equal(err.code, 'not_found');
-        assert.equal(err.errno, 'EIO');
-        assert.equal(err.message, 'Unable to read file: work/a/l/x.txt: cannot tell whether "work/a" is a symlink (EIO)');
-        return true;
+  for (const code of ['EIO', 'EPERM']) {
+    test(`a directory on the way the walk can't ask whether it's a symlink (${code}) refuses the path, rather than letting a link beneath it through`, async (t) => {
+      // EPERM too: only a directory this user can't search (EACCES) ends the
+      // walk, since the caller's own lookup is then refused the same way.
+      const env = new Env(t);
+      env.writeDisk('elsewhere/x.txt', 'behind the link\n');
+      env.writeDisk('elsewhere/img.png', 'not read');
+      mkdirSync(join(env.dir, 'a'));
+      symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'a', 'l'));
+      const m = await env.open(t);
+      await call(m, 'write', { path: 'work/a/l/new.txt', content: 'new\n' });
+      const failure = Object.assign(new Error(`${code}: readlink`), { code });
+      const unsure = `cannot tell whether "work/a" is a symlink (${code})`;
+      await withFsPromises('readlink', (readlink) => async (path: string, ...rest: unknown[]) => {
+        if (String(path).endsWith(`${sep}a`)) throw failure;
+        return readlink(path, ...rest);
+      }, async () => {
+        await assert.rejects(m.readFileFromDisk('work/a/l/x.txt'), (err: unknown) => {
+          assert.ok(err instanceof WorkspaceReadError, String(err));
+          assert.equal(err.code, 'not_found');
+          assert.equal(err.errno, code);
+          assert.equal(err.message, `Unable to read file: work/a/l/x.txt: ${unsure}`);
+          return true;
+        });
+        const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/a/l/img.png' } });
+        assert.equal(image.error, `Unable to read file: work/a/l/img.png: ${unsure}`, 'read_image passes the walk\'s words through');
+        const dir = await checkDir(env.view(), realpathSync(env.dir), 'a/l');
+        assert.equal(shown(dir), `unobserved: ${unsure}`);
+        // A materialize gives the same reason, with the advice to fix it and
+        // try again, and no force, which the push would refuse too.
+        const pushed = await call(m, 'materialize', { path: 'work/a/l/new.txt' });
+        assert.equal(skippedReason(pushed, 'a/l/new.txt'), unverified('a/l/new.txt', unsure));
       });
-      const dir = await checkDir(env.view(), realpathSync(env.dir), 'a/l');
-      assert.equal(shown(dir), 'unobserved: cannot tell whether "work/a" is a symlink (EIO)');
-      // A materialize gives the same reason, with the advice to fix it and
-      // try again, and no force, which the push would refuse too.
-      const pushed = await call(m, 'materialize', { path: 'work/a/l/new.txt' });
-      assert.equal(skippedReason(pushed, 'a/l/new.txt'), unverified('a/l/new.txt', 'cannot tell whether "work/a" is a symlink (EIO)'));
     });
-  });
+  }
 
   test('a symlink on the way that leads nowhere, or loops, is named as one wherever it is met', async (t) => {
     const env = new Env(t);
@@ -540,6 +572,37 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n', 'disk keeps its file');
     await call(m, 'sync', { path: 'work/c.txt' });
     assert.match((await call(m, 'read', { path: 'work/c.txt' })).content, /disk text/, 'a sync takes it in');
+  });
+
+  test('a draft written over a disk file the workspace never saw, with no push, is deleted without touching that file', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('c.txt', 'disk text\n');
+    const m = await env.open(t);
+    await call(m, 'write', { path: 'work/c.txt', content: 'agent text\n' });
+    await call(m, 'delete', { path: 'work/c.txt' });
+    assert.deepEqual(await pending(m), { pendingChanges: 0, pendingWorkspaceDeletions: 0 });
+    assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n');
+    await call(m, 'sync', { path: 'work/c.txt' });
+    assert.match((await call(m, 'read', { path: 'work/c.txt' })).content, /disk text/, 'a sync takes it in');
+  });
+
+  test('a deletion keeps its tombstone where the evidence may hold a copy of ours: an agreed copy, a pending push, or an entry from before the evidence', async (t) => {
+    const env = new Env(t);
+    const m = await env.open(t);
+    const agreement = (m as any).agreement;
+    const blob = (text: string) => env.store.storeBlob(Buffer.from(text), 'text/plain');
+    // A store-origin draft whose P says disk agreed with a copy: a push of
+    // another branch, say, that landed.
+    await call(m, 'write', { path: 'work/agreed.txt', content: 'v1\n' });
+    agreement.set('work', 'agreed.txt', { kind: 'content', hash: env.store.treeGet(TREE, 'agreed.txt')!.blobHash, size: 3 });
+    // A store-origin draft whose push is pending: it may have reached disk.
+    await call(m, 'write', { path: 'work/pushed.txt', content: 'v1\n' });
+    agreement.intend('work', 'pushed.txt', { effect: 'disk', prior: null, expect: { kind: 'content', hash: env.store.treeGet(TREE, 'pushed.txt')!.blobHash }, branchId: env.store.currentBranch().id });
+    // An entry from before the evidence: no P and no origin.
+    env.store.treeSet(TREE, 'legacy.txt', { blobHash: blob('v1\n'), size: 3, mode: 0o644 });
+    for (const path of ['agreed.txt', 'pushed.txt', 'legacy.txt']) await call(m, 'delete', { path: `work/${path}` });
+    const deletions = (m as any).intents.get('work').list().filter(([, bi]: [string, { tombstone?: unknown }]) => bi.tombstone).map(([p]: [string]) => p).sort();
+    assert.deepEqual(deletions, ['agreed.txt', 'legacy.txt', 'pushed.txt']);
   });
 
   test('a workspace draft disk never agreed with is deleted with nothing pending, on a plain mount too', async (t) => {

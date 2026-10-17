@@ -234,7 +234,8 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * link's reason, as the observations give it, after the path, or the walk's
  * failure as a failure to read. Its code follows where the link leads, so a
  * caller choosing advice by code gets advice that fits: `escape` for a link
- * leading outside the mount, as main gave it, and `symlink` for any other.
+ * leading outside the mount, the code of any path that resolves outside it,
+ * and `symlink` for any other.
  */
 async function linkReadError(mount: { config: { name: string; path: string } }, found: LinkFound, mountPrefixedPath: string): Promise<WorkspaceReadError> {
   if (!('link' in found)) {
@@ -1719,8 +1720,9 @@ export class WorkspaceModule implements Module {
    * the *filesystem*, not just the path string:
    *
    * 0. On a mount that does not `followSymlinks`, refuse a path with a symlink
-   *    among the directories on its way beneath the mount's root, as a
-   *    `symlink`, wherever it leads (linkOnTheWay), before anything resolves it.
+   *    among the directories on its way beneath the mount's root, wherever it
+   *    leads (linkOnTheWay), before anything resolves it: as `escape` for a
+   *    link leading outside the mount, and as `symlink` for any other.
    * 1. `lstat` the lexical path — refuse directories; refuse a final-component
    *    symlink when the mount does not `followSymlinks`; refuse anything else
    *    that isn't a regular file, such as a FIFO, without opening it.
@@ -1955,7 +1957,8 @@ export class WorkspaceModule implements Module {
         return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
       case 'symlink':
         // The core reader's own words: "Symlinks are not allowed: <path>" for a
-        // link at the path, and for one on its way, which link and the way out.
+        // link at the path, and for one on its way, which link and its target,
+        // with the setting for a link to a directory.
         return new WorkspaceImageReadError('symlink', err.message);
       case 'escape':
         // The core reader's own words: "Symlink escape detected: <path>" for a
@@ -2026,9 +2029,10 @@ export class WorkspaceModule implements Module {
 
   /**
    * Commit a tool's write or delete to the workspace tree, with the branch
-   * intent it implies (store origin for a path disk never agreed with; a
-   * tombstone for a deletion of a copy disk may hold), and push it to disk
-   * when the mount opts in via
+   * intent it implies: store origin for a path disk never agreed with; for a
+   * deletion, a tombstone, unless the evidence holds no agreed disk copy (P
+   * absent, or no P and store origin), when it clears the path's intent and
+   * pushes nothing. It pushes the change to disk when the mount opts in via
    * `autoMaterialize` — required for cross-agent pipelines, since another
    * agent's watcher on the same directory only sees real filesystem events.
    * The push follows materialize's rule: a disk copy that changed since it
