@@ -5203,7 +5203,10 @@ export class AgentFramework {
       `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) ${problem}. The framework doesn't start without them, ` +
         `since the next deferral would replace the stored queue. ` +
         (file
-          ? `The file is unchanged, and the framework starts once ${cause === undefined ? 'it holds a queue of writes' : 'it can be read'}.`
+          ? `The file is unchanged, and the framework starts once ${cause === undefined
+            ? 'it holds a queue of writes, such as {"version":1,"pending":[]} for none. Removing it doesn\'t help: ' +
+              `without the file, the queue is read from ${DEFERRED_WRITES_ID}, which the file's writes don't keep`
+            : 'it can be read'}.`
           : cause === undefined
             ? `They're unchanged, and starting again won't help until they're repaired.`
             : `They're unchanged, and the framework starts once they can be read.`),
@@ -6039,7 +6042,11 @@ export class AgentFramework {
       `the host mode (${file ?? `${FRAMEWORK_STATE_ID}, hostMode`}) ${problem}. The framework doesn't start without it, ` +
         `since a host quiesced for maintenance would boot serving. ` +
         (file
-          ? `The file is unchanged, and the framework starts once ${cause === undefined ? 'it holds a host-mode record' : 'it can be read'}.`
+          ? `The file is unchanged, and the framework starts once ${cause === undefined
+            ? 'it holds a host-mode record, such as {"version":1,"quiesced":true} to boot quiesced or ' +
+              `{"version":1,"quiesced":false} to serve. Removing it doesn't help: without the file, host mode is read ` +
+              `from ${FRAMEWORK_STATE_ID}, which a quiesce doesn't write, so a quiesced host would boot serving`
+            : 'it can be read'}.`
           : cause === undefined
             ? `It's unchanged, and starting again won't help until it's repaired.`
             : `It's unchanged, and the framework starts once it can be read.`),
