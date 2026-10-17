@@ -225,6 +225,18 @@ export interface ToolCall {
   input: unknown;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
+  /**
+   * How long this call's result may be and still reach its caller whole,
+   * measured as the framework stores it: an error's text, or a success's data
+   * as JSON (a content array as its text). For a model's call it is the
+   * agent's inline cap, past which the framework spills the result to a
+   * workspace file and sends a preview. For a call from a running
+   * code_execution script it is the script's limit, past which the result is
+   * cut. A tool that pages or budgets its answer can stay under it. Set by
+   * the framework dispatch layer; unset when the caller takes the module's
+   * result in process (ModuleContext.callTool, a subagent's executeToolCall).
+   */
+  resultMaxChars?: number;
 }
 
 // ============================================================================

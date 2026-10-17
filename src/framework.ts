@@ -1118,6 +1118,10 @@ const DEFAULT_SYNC_INTERVAL_MS = 1000;
  *  At the deadline its unfinished write is named as such, and later
  *  originals stay in the audit. This bound applies to withheld spills. */
 const WITHHELD_SPILL_DEADLINE_MS = 30_000;
+/** The most of a tool result a running code_execution script receives. The
+ *  script environment is the spill, so this is a protocol bound, not a
+ *  context cap. */
+const SCRIPT_TOOL_RESULT_MAX_CHARS = 5_000_000;
 /** Poll pending context-strategy maintenance independently of user activity. */
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
@@ -14383,7 +14387,8 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName };
+      // The pair is stored under the agent's inline cap, as a model's call is.
+      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName, resultMaxChars: this.resolveToolResultInlineCap(agent).cap };
       const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
       // The pair is stored as a model's call would be, so the result stored,
@@ -15262,7 +15267,7 @@ export class AgentFramework {
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
-    if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
+    if (result.data === undefined || result.data === null) return nonErrorResultText(result, SCRIPT_TOOL_RESULT_MAX_CHARS);
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse) — materialize every referenced payload now, so the stub
@@ -15281,7 +15286,7 @@ export class AgentFramework {
     // Scripts get (nearly) full data — the script environment IS the spill:
     // filtering big results in code is the whole point. 5MB protocol safety
     // cap only; no context-cap truncation, no file spill.
-    return toolResultDataToHistoryString(result.data, 5_000_000);
+    return toolResultDataToHistoryString(result.data, SCRIPT_TOOL_RESULT_MAX_CHARS);
   }
 
   /**
@@ -15498,6 +15503,19 @@ export class AgentFramework {
       source,
       clampedBy: clamped ? 'strategy-bound' : null,
     };
+  }
+
+  /**
+   * A tool call's resultMaxChars: how long its result may be and still reach
+   * its caller whole. A call from a running script resolves to the script,
+   * which takes up to SCRIPT_TOOL_RESULT_MAX_CHARS. Any other call's result
+   * is stored in its agent's context under the agent's inline cap, and a call
+   * for an agent the framework doesn't hold gets the house default.
+   */
+  private resultMaxCharsFor(agentName: string, callId: string): number {
+    if (this.scriptToolWaiters.has(callId)) return SCRIPT_TOOL_RESULT_MAX_CHARS;
+    const agent = this.agents.get(agentName);
+    return agent ? this.resolveToolResultInlineCap(agent).cap : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
   }
 
   private approximateDecodedBase64Bytes(base64: string): number {
@@ -15892,7 +15910,7 @@ export class AgentFramework {
     const startTime = Date.now();
 
     this.moduleRegistry
-      .storableToolCall({ ...call, callerAgentName: agentName })
+      .storableToolCall({ ...call, callerAgentName: agentName, resultMaxChars: this.resultMaxCharsFor(agentName, call.id) })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -20074,7 +20092,12 @@ export class AgentFramework {
         // Same dispatch as a first-class tool call — the module cannot tell
         // which surface the call came through. An in-process caller gets the
         // module's own result; the model's path takes its checked form.
-        const utilityCall = { id: call.id, name: def.name, input: args, callerAgentName: agentName };
+        const utilityCall: ToolCall = {
+          id: call.id, name: def.name, input: args, callerAgentName: agentName,
+          // Its result goes where the utils call's does: stored or handed to a
+          // script as that call's result, or used by an in-process caller.
+          ...(options.inProcess ? {} : { resultMaxChars: this.resultMaxCharsFor(agentName, call.id) }),
+        };
         return options.inProcess
           ? this.moduleRegistry.handleToolCall(utilityCall)
           : this.moduleRegistry.storableToolCall(utilityCall);

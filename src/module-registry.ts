@@ -318,13 +318,9 @@ export class ModuleRegistry {
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity)
-    const moduleCall: ToolCall = {
-      id: call.id,
-      name: toolName,
-      input: call.input,
-      callerAgentName: call.callerAgentName,
-    };
+    // The call as it came, with the un-prefixed name: the caller's identity
+    // and everything else the dispatch set on it reach the module.
+    const moduleCall: ToolCall = { ...call, name: toolName };
 
     try {
       return await module.handleToolCall(moduleCall);
