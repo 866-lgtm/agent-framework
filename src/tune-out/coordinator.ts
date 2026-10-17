@@ -536,10 +536,12 @@ export class TuneOutCoordinator {
         } catch (error) {
           // For the subconscious first: what became of its note, and that a
           // later call may land. The store's own reason follows, for an operator.
+          // The note may set, change or remove a disposition, so what stays in
+          // effect is whatever was there before, if anything.
           return {
             success: false,
             isError: true,
-            error: `The disposition ${JSON.stringify(key)} wasn't recorded, so it isn't in effect. ` +
+            error: `The change to the disposition ${JSON.stringify(key)} wasn't recorded, so the dispositions stay as they were. ` +
               `Noting it again may work once the store can be read and written. The store's error: ${thrownReason(error)}`,
           };
         }

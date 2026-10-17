@@ -129,7 +129,7 @@ describe("the tune-out coordinator's stored dispositions", () => {
   const notRecorded = (key: string, storeError: string) => ({
     success: false,
     isError: true,
-    error: `The disposition ${JSON.stringify(key)} wasn't recorded, so it isn't in effect. ` +
+    error: `The change to the disposition ${JSON.stringify(key)} wasn't recorded, so the dispositions stay as they were. ` +
       `Noting it again may work once the store can be read and written. The store's error: ${storeError}`,
   });
 
