@@ -49,6 +49,14 @@ export interface PersistedUsageState {
   inferenceCount: number;
 }
 
+/** Whether a stored usage record is one the tracker restores: an object whose
+ *  totals are token counts. Its per-agent entries are checked one by one as
+ *  they restore. */
+export function isPersistedUsageState(value: unknown): value is PersistedUsageState {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && parseUsage((value as { totals?: unknown }).totals) !== null;
+}
+
 export class UsageTracker {
   private totals: SessionUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   private byAgent: Map<string, { usage: SessionUsage; inferenceCount: number }> = new Map();
