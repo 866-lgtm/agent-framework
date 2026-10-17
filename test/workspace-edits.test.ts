@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { fitted } from '../src/modules/workspace/edit-text.js';
 import type { ToolResult } from '../src/types/events.js';
 
 function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: number } = {}) {
@@ -280,6 +281,10 @@ test('a generated file is refused by the rule edit refuses it by: the agent\'s o
   assert.equal(errorOf(await as('another', 'edit', edit)), 'Generated file belongs to another agent');
   assert.equal(errorOf(await as('another', 'edit_many', { edits: [edit] })),
     'The edit_many call stored none of its edits: 1 problem.\n\nedit 1: work/tools.md: Generated file belongs to another agent.');
+  // write and delete meet the same refusal, by the same rule.
+  assert.equal(errorOf(await as('agent', 'write', { path: 'work/tools.md', content: 'x' })), readOnly);
+  assert.equal(errorOf(await as('agent', 'delete', { path: 'work/tools.md' })), readOnly);
+  assert.equal(errorOf(await as('another', 'write', { path: 'work/tools.md', content: 'x' })), 'Generated file belongs to another agent');
 });
 
 test("a file that isn't valid UTF-8 is refused, and nothing is stored", async (t) => {
@@ -308,11 +313,28 @@ test('edits disk takes in part are all stored, and the answer names each file di
       { path: 'work/linked.txt', oldString: 'shared', newString: 'SHARED' },
     ],
   }));
-  assert.match(refusal, /^Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice\.\n\nDisk took 1 of the 2 files\. These pushes didn't complete, each with the way to finish it:\n\nwork\/linked\.txt: not written: a file with other hard links/);
+  assert.match(refusal, /^Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice\.\n\nDisk took 1 of the call's 2 files\. This file's push didn't complete:\n\nwork\/linked\.txt: not written: a file with other hard links/);
   assert.equal(await stored('free.txt'), 'FREE\n');
   assert.equal(await stored('linked.txt'), 'SHARED\n');
   assert.equal(disk('free.txt')!.toString(), 'FREE\n');
   assert.equal(disk('linked-too.txt')!.toString(), 'shared\n');
+
+  // The one file of a call, and two files of three.
+  for (const name of ['solo', 'left', 'right']) {
+    await file(`${name}.txt`, `${name}\n`);
+    linkSync(join(dir, `${name}.txt`), join(dir, `${name}-too.txt`));
+  }
+  await file('open.txt', 'open\n');
+  const one = errorOf(await call('edit_many', { edits: [{ path: 'work/solo.txt', oldString: 'solo', newString: 'SOLO' }] }));
+  assert.match(one, /\n\nDisk didn't take the call's one file\. Its push didn't complete:\n\nwork\/solo\.txt: not written: a file with other hard links/);
+  const two = errorOf(await call('edit_many', {
+    edits: [
+      { path: 'work/open.txt', oldString: 'open', newString: 'OPEN' },
+      { path: 'work/left.txt', oldString: 'left', newString: 'LEFT' },
+      { path: 'work/right.txt', oldString: 'right', newString: 'RIGHT' },
+    ],
+  }));
+  assert.match(two, /\n\nDisk took 1 of the call's 3 files\. These files' pushes didn't complete, each with its reason:\n\nwork\/left\.txt: not written: a file with other hard links[^\n]*\n\nwork\/right\.txt: not written: a file with other hard links/);
 });
 
 test('every entry is set in one record: a call that fails after it says every edit is stored, and one that fails in it stores none', async (t) => {
@@ -333,21 +355,33 @@ test('every entry is set in one record: a call that fails after it says every ed
     assert.equal(errorOf(await call('edit_many', edits('a', 'A'))),
       "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
       + "The rest of the call failed: injected intent exception. ls shows each path's state.");
+    // What failed stands for the whole call, so a cap too short for it keeps
+    // it, cut as a problem's first line is.
+    intents.update = () => { throw new Error(`injected ${'long '.repeat(200)}exception`); };
+    const short = errorOf(await call('edit_many', edits('A', 'a'), 200));
+    assert.match(short, /^Every edit of this call is stored[^\n]*\n\nThe rest of the call failed: injected [long ]+…\. ls shows each path's state\.$/);
+    assert.ok(short.length < 600, `${short.length} characters`);
   } finally {
     intents.update = update;
   }
-  assert.equal(await stored('a.txt'), 'A\n');
-  assert.equal(await stored('b.txt'), 'B\n');
+  assert.equal(await stored('a.txt'), 'a\n');
+  assert.equal(await stored('b.txt'), 'b\n');
 
-  // A store that fails as it sets them sets neither.
-  (store as unknown as { treeBatch: () => never }).treeBatch = () => { throw new Error('injected batch failure'); };
+  // A store that fails as it sets them sets neither, and the answer says so,
+  // with what the store said, cut as a problem's first line is.
+  let message = 'injected batch failure';
+  (store as unknown as { treeBatch: () => never }).treeBatch = () => { throw new Error(message); };
   try {
-    assert.equal(errorOf(await call('edit_many', edits('A', 'a'))), 'injected batch failure');
+    assert.equal(errorOf(await call('edit_many', edits('a', 'A'))), 'The edit_many call stored none of its edits: injected batch failure');
+    message = `injected ${'long '.repeat(200)}failure`;
+    const long = errorOf(await call('edit_many', edits('a', 'A')));
+    assert.match(long, /^The edit_many call stored none of its edits: injected [long ]+…$/);
+    assert.ok(long.length < 500, `${long.length} characters`);
   } finally {
     delete (store as unknown as Record<string, unknown>).treeBatch;
   }
-  assert.equal(await stored('a.txt'), 'A\n');
-  assert.equal(await stored('b.txt'), 'B\n');
+  assert.equal(await stored('a.txt'), 'a\n');
+  assert.equal(await stored('b.txt'), 'b\n');
 });
 
 test('every path is checked before any entry is set: a check that fails at the second file stores neither', async (t) => {
@@ -378,7 +412,7 @@ test('every path is checked before any entry is set: a check that fails at the s
         { path: 'work/a.txt', oldString: 'a', newString: 'A' },
         { path: 'work/b.txt', oldString: 'b', newString: 'B' },
       ],
-    })), 'injected barrier failure');
+    })), 'The edit_many call stored none of its edits: injected barrier failure');
   } finally {
     delete (store as unknown as Record<string, unknown>).storeBlob;
     delete (agreement as unknown as Record<string, unknown>).needsBarrier;
@@ -399,6 +433,61 @@ test("a file disk changed is taken in first, and the edits that use it say so", 
   assert.equal(await stored('d.txt'), 'v2 LINE\n');
 });
 
+test("a conflict says what a sync does from what disk holds now, whatever kind was recorded, and the sync does it", async (t) => {
+  const { dir, call, disk } = setup(t);
+  for (const name of ['gone.txt', 'changed-then-gone.txt', 'gone-then-back.txt', 'turned-binary.txt']) {
+    writeFileSync(join(dir, name), 'base\n');
+    assert.equal((await call('read', { path: `work/${name}` })).success, true);
+    assert.equal((await call('write', { path: `work/${name}`, content: 'agent draft\n' })).success, true);
+  }
+  // Disk deletes a file the workspace holds a draft of.
+  rmSync(join(dir, 'gone.txt'));
+  // A listing records each file's conflict as disk then has it, and a
+  // recorded conflict keeps its kind: both-changed while disk deletes the
+  // file, and deleted-on-disk while disk writes it again.
+  writeFileSync(join(dir, 'changed-then-gone.txt'), 'another writer\n');
+  rmSync(join(dir, 'gone-then-back.txt'));
+  assert.equal((await call('ls', { path: 'work' })).success, true);
+  rmSync(join(dir, 'changed-then-gone.txt'));
+  writeFileSync(join(dir, 'gone-then-back.txt'), 'another writer\n');
+  // A disk copy the workspace can't hold.
+  const binary = [0, 1, 2, 0, 255, 0];
+  writeFileSync(join(dir, 'turned-binary.txt'), Buffer.from(binary));
+
+  const deletion = "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk.";
+  const copy = "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.";
+  const one = await call('edit', { path: 'work/gone.txt', oldString: 'agent draft', newString: 'agent edit' });
+  assert.equal(one.success, true, one.error);
+  assert.equal((one.data as { note?: string }).note,
+    `The path is in conflict with disk (deleted-on-disk): the edit is in the workspace's copy. ${deletion}`);
+  // A refusal over the same file says the same.
+  assert.ok(errorOf(await call('edit', { path: 'work/gone.txt', oldString: 'absent', newString: 'x' })).endsWith(deletion));
+  const many = await call('edit_many', {
+    edits: [
+      { path: 'work/changed-then-gone.txt', oldString: 'agent draft', newString: 'agent edit' },
+      { path: 'work/gone-then-back.txt', oldString: 'agent draft', newString: 'agent edit' },
+      { path: 'work/turned-binary.txt', oldString: 'agent draft', newString: 'agent edit' },
+    ],
+  });
+  assert.equal(many.success, true, many.error);
+  assert.deepEqual((many.data as { files: Array<{ note?: string }> }).files.map((file) => file.note), [
+    `work/changed-then-gone.txt is in conflict with disk (both-changed): edit 1 is in the workspace's copy. ${deletion}`,
+    `work/gone-then-back.txt is in conflict with disk (deleted-on-disk): edit 2 is in the workspace's copy. ${copy}`,
+    `work/turned-binary.txt is in conflict with disk (both-changed): edit 3 is in the workspace's copy. ${copy}`,
+  ]);
+  // Each sync does what its note says: it takes the deletion, or keeps disk's
+  // copy and gives up the workspace's, taking in none it can't hold.
+  for (const name of ['gone.txt', 'gone-then-back.txt', 'turned-binary.txt']) {
+    assert.equal((await call('sync', { path: `work/${name}` })).success, true, name);
+  }
+  assert.equal(errorOf(await call('read', { path: 'work/gone.txt' })), 'File not found: work/gone.txt');
+  assert.equal(disk('gone-then-back.txt')!.toString(), 'another writer\n');
+  assert.match(JSON.stringify((await call('read', { path: 'work/gone-then-back.txt' })).data), /another writer/);
+  assert.equal(errorOf(await call('read', { path: 'work/turned-binary.txt' })),
+    'work/turned-binary.txt is on disk but not stored in the workspace (binary or over the size limit).');
+  assert.deepEqual([...disk('turned-binary.txt')!], binary);
+});
+
 test('edit_many names a conflict with disk, and a file disk lacks, for each file it applies to or refuses', async (t) => {
   const { store, dir, call } = setup(t);
   writeFileSync(join(dir, 'k.txt'), 'base\n');
@@ -409,7 +498,7 @@ test('edit_many names a conflict with disk, and a file disk lacks, for each file
   const bytes = Buffer.from('legacy line\n');
   store.treeSet('workspace/work/tree', 'l.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
   const conflict = "work/k.txt is in conflict with disk (both-changed): edit 1 %s the workspace's copy. "
-    + "Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.";
+    + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.";
 
   // A miss in the conflicted file says which copy it looked in.
   assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/k.txt', oldString: 'another', newString: 'x' }] })),
@@ -587,10 +676,22 @@ test('the answer to edits stored, within the cap, lists the files disk refused a
   }
   const answer = errorOf(await call('edit_many', { edits }, 1000));
   assert.ok(answer.length <= 1000, `${answer.length} characters, within 1,000`);
-  assert.match(answer, /^Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice\.\n\nDisk took 0 of the 12 files\./);
+  assert.match(answer, /^Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice\.\n\nDisk took 0 of the call's 12 files\. These files' pushes didn't complete, each with its reason:/);
   assert.match(answer, /\n\nwork\/h0\.txt: not written: a file with other hard links/);
-  assert.match(answer, /\[To keep this answer within 1,000 characters, it leaves out [^\]]*\. ls shows each path's state\.\]$/);
+  const listed = [...answer.matchAll(/^work\/h\d+\.txt: /gm)].length;
+  const left = Number(/\[To keep this answer within 1,000 characters, it leaves out (\d+) more files? disk refused\. ls shows each path's state\.\]$/.exec(answer)?.[1]);
+  assert.equal(listed + left, 12, `${listed} listed and ${left} counted`);
   assert.doesNotMatch(answer, /send the call again to see/);
+});
+
+test("the answer to edits stored points to ls once: in its last line only when that leaves out files disk refused", () => {
+  const stored = 'Every edit of this call is stored.';
+  const notes = ['note one '.repeat(30), 'note two '.repeat(30)];
+  const notesLeft = fitted(`${stored}\n\nThe rest of the call failed: boom. ls shows each path's state.`, [], notes, 300, 'stored');
+  assert.match(notesLeft, /\[To keep this answer within 300 characters, it leaves out 2 notes on the files' copies on disk\.\]$/);
+  assert.equal([...notesLeft.matchAll(/ls shows/g)].length, 1);
+  const filesLeft = fitted(stored, ['work/a.txt: not written '.repeat(12), 'work/b.txt: not written '.repeat(12)], notes, 300, 'stored');
+  assert.match(filesLeft, /it leaves out 2 more files disk refused and 2 notes on the files' copies on disk\. ls shows each path's state\.\]$/);
 });
 
 test("a receipt's notes are bounded, and a file whose notes don't fit is listed without them", async (t) => {

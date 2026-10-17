@@ -146,20 +146,27 @@ const FIRST_LINE_MAX = 400;
 /** What an answer is: a refusal, whose problems the agent answers and sends again, or the answer to edits stored, which mustn't be sent again. */
 export type AnswerKind = 'refusal' | 'stored';
 
+/** A line cut to FIRST_LINE_MAX, as a part's first line is, and as a thrown message is in an answer's head. */
+export function cutLine(line: string): string {
+  return line.length > FIRST_LINE_MAX ? `${line.slice(0, safeCut(line, FIRST_LINE_MAX - 1))}…` : line;
+}
+
 /**
  * The answer's last line: what it left out, and what to do. `cut` parts left
  * out their details; `problems` and `notes` weren't shown at all. A refusal
- * that shows a problem says to answer it and send the call again.
+ * that shows a problem says to answer it and send the call again. For edits
+ * stored, the problems are the files disk refused, and a last line that
+ * leaves some out points to ls.
  */
 function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: number, notes: number, anyShown: boolean): string {
   const items = [
     ...(cut ? [`the details of ${cut} of these`] : []),
-    ...(problems ? [kind === 'refusal' ? `${problems} more ${plural(problems, 'problem')}` : `${problems} more`] : []),
+    ...(problems ? [kind === 'refusal' ? `${problems} more ${plural(problems, 'problem')}` : `${problems} more ${plural(problems, 'file')} disk refused`] : []),
     ...(notes ? [`${notes} ${plural(notes, 'note')} on the files' copies on disk`] : []),
   ];
   if (!items.length) return '';
   const next = kind === 'stored'
-    ? " ls shows each path's state."
+    ? problems ? " ls shows each path's state." : ''
     : problems && anyShown ? ' Answer the problems shown and send the call again to see the rest.' : '';
   const list = items.length < 2 ? items[0] : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
   return `[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.${next}]`;
@@ -170,10 +177,11 @@ function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: num
  * `maxChars`: every part's first line while they fit, each cut at
  * FIRST_LINE_MAX, so a call's problems are each named before any is
  * explained, then, in order, the rest of each part whose rest still fits. The
- * parts are `problems`, then `notes` on what the call's settling with disk
- * found. A part whose first line doesn't fit is left out with every part
- * after it. The last line counts what was left out, and for edits stored it
- * never says to send the call again. Never longer than `maxChars`, unless the
+ * parts are `problems`, for edits stored the files disk refused, then `notes`
+ * on what the call's settling with disk found. A part whose first line
+ * doesn't fit is left out with every part after it. The last line counts
+ * what was left out, and for edits stored it never says to send the call
+ * again. Never longer than `maxChars`, unless the
  * head and the last line alone are: with 1,000 characters, the least a
  * residence or an agent can set, a refusal names its first problem at least.
  */
@@ -186,7 +194,7 @@ export function fitted(head: string, problems: string[], notes: string[], maxCha
   for (const part of parts) {
     const end = part.indexOf('\n');
     const line = end === -1 ? part : part.slice(0, end);
-    const first = line.length > FIRST_LINE_MAX ? `${line.slice(0, safeCut(line, FIRST_LINE_MAX - 1))}…` : line;
+    const first = cutLine(line);
     // Each part costs the blank line before it too.
     if (first.length + 2 > left) break;
     left -= first.length + 2;

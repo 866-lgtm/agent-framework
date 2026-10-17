@@ -44,7 +44,7 @@ import { coveredByIgnore, filesystemTrustsCtime, locateRoot, readPrefix } from '
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
-import { type EditProblem, type EditTool, editList, editReceipt, fitted, refusalText } from './edit-text.js';
+import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -1185,7 +1185,7 @@ export class WorkspaceModule implements Module {
           + "and two edits' matches may touch but not overlap. Matching is edit's. "
           + "A refusal names every problem, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
-          + 'and the answer then says every edit is stored and names each file disk refused, with the way to finish it. '
+          + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
           + "The answer shows each edit's first changed region, numbered, as its length allows.",
         inputSchema: {
           type: 'object' as const,
@@ -2412,10 +2412,13 @@ export class WorkspaceModule implements Module {
    * stored: edit names its first problem, and edit_many every problem found.
    *
    * Each edit's own input is checked first, and each path's mount. A problem
-   * there refuses edit at once, before anything is read. edit_many goes on to
-   * settle and plan the rest, so its one refusal names every problem; the
-   * settling is what a read or a listing of its files would take in from
-   * disk, and the refusal says what it took in.
+   * there refuses edit at once, before anything is read, and edit_many when
+   * its edits name more than one mount, which no one pass settles. Otherwise
+   * edit_many goes on to settle and plan the rest, so its one refusal names
+   * every problem; the settling is what a read or a listing of its files
+   * would take in from disk, and the refusal says what it took in. A failure
+   * before the commit sets the entries stores none of them, and edit_many's
+   * answer to it says so.
    * Under the mount's turn, one pass settles every path with disk, by the
    * rule a listing uses, so the edits apply to what disk now holds. That pass
    * is the only step that awaits before the commit: every file is then read,
@@ -2529,10 +2532,17 @@ export class WorkspaceModule implements Module {
           // made the two copies agree, which settles it, or there was none.
           // Edits stored that couldn't finish leave it to the push's reason,
           // which names the conflict, or to ls, which that answer points to.
+          // What a sync does follows what disk holds now, whatever kind the
+          // conflict was recorded as: where disk has no copy, it takes the
+          // deletion; where disk has one, it keeps disk's copy and gives up
+          // the workspace's, though a copy the workspace can't hold, binary
+          // or past maxFileSize, isn't taken in.
           const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
           const conflictNote = (where: string): string | null => conflict === null ? null
             : `${tool === 'edit' ? 'The path' : target.path} is in conflict with disk (${conflict}): ${subject} ${where} the workspace's copy. `
-              + "Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.";
+              + (report?.diskNow === 'absent'
+                ? "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk."
+                : "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
           applied.set(target, whichCopy('applied to'));
           // The edits make the path the workspace's own change, so a file disk
           // lacked goes back with this call's push, or with the next
@@ -2617,8 +2627,11 @@ export class WorkspaceModule implements Module {
         };
       });
     } catch (error) {
-      if (!committed) throw error;
-      return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { threw: error instanceof Error ? error.message : String(error) }, maxChars);
+      const message = error instanceof Error ? error.message : String(error);
+      if (committed) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { threw: message }, maxChars);
+      // The commit sets every entry in one record or none, so nothing is stored.
+      if (tool === 'edit_many') return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
+      throw error;
     }
   }
 
@@ -2662,8 +2675,8 @@ export class WorkspaceModule implements Module {
    * failed. It stays an error, since part of the call failed, and leads with
    * what is stored, which must not be sent again: a second call can apply
    * those edits twice. edit's is the answer write and delete give, one path's;
-   * edit_many's lists the files disk refused, within `maxChars`, and never
-   * says to send the call again.
+   * edit_many's lists the files disk refused, each with its push's reason,
+   * within `maxChars`, and never says to send the call again.
    */
   private editsStoredButUnfinished(
     tool: EditTool,
@@ -2678,16 +2691,25 @@ export class WorkspaceModule implements Module {
         ? storedButUnfinished('edit', target!.path, { refused: outcome.refused.get(target!.relativePath)! }, applied.get(target!) ?? null)
         : storedButUnfinished('edit', target!.path, { threw: outcome.threw }, applied.get(target!) ?? null);
     }
-    const head = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
+    const stored = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
+    // The head is never cut, so what stands for the whole call goes in it,
+    // and the parts are the files disk refused, each with its push's reason.
+    let head: string;
     const parts: string[] = [];
     if ('refused' in outcome) {
-      parts.push(`Disk took ${targets.length - outcome.refused.size} of the ${targets.length} files. These pushes didn't complete, each with the way to finish it:`);
+      const files = targets.length;
+      const refused = outcome.refused.size;
+      head = `${stored}\n\n${files === 1
+        ? "Disk didn't take the call's one file. Its push didn't complete:"
+        : `Disk took ${files - refused} of the call's ${files} files. ${refused === 1
+          ? "This file's push didn't complete:"
+          : "These files' pushes didn't complete, each with its reason:"}`}`;
       for (const target of targets) {
         const reason = outcome.refused.get(target.relativePath);
         if (reason !== undefined) parts.push(`${target.path}: ${reason}`);
       }
     } else {
-      parts.push(`The rest of the call failed: ${outcome.threw}. ls shows each path's state.`);
+      head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}. ls shows each path's state.`;
     }
     const notes = targets.map((target) => applied.get(target)).filter((note): note is string => !!note);
     return { success: false, isError: true, error: fitted(head, parts, notes, maxChars, 'stored') };
