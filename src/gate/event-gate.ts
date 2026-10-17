@@ -11,7 +11,7 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { chmodSync, chownSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, chownSync, lstatSync, readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
@@ -1957,9 +1957,15 @@ export class EventGate {
     // The copy is no more readable than gate.json: it's created owner-only,
     // then given gate.json's group, and only then its permission bits. A copy
     // that can't take the group (this process isn't in it), or whose
-    // gate.json can't be stat'd, stays owner-only.
+    // gate.json can't be stat'd, stays owner-only. So does the copy of a
+    // gate.json that's a symbolic link: what keeps others out of the file it
+    // points to can be a directory on the way there, and the copy, beside the
+    // link, isn't behind it.
     let gateFile: { gid: number; mode: number } | undefined;
-    try { gateFile = statSync(this.configPath); } catch { /* owner-only */ }
+    try {
+      const file = lstatSync(this.configPath);
+      if (!file.isSymbolicLink()) gateFile = file;
+    } catch { /* owner-only */ }
     for (let n = 1; ; n++) {
       const kept = n === 1 ? base : `${base}-${n}`;
       try {
