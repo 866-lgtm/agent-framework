@@ -349,7 +349,7 @@ test('a WebSocket dial whose connection is closed meanwhile ends at once, not at
   assert.ok(Date.now() - began < 5_000, 'well before the 15 s open timeout');
 });
 
-test("a write to a stdio child that has just exited is reported, never thrown", (t) => {
+test("a write to a stdio child that has just exited is never thrown, and isn't reported as an error: the exit's close names it", (t) => {
   const child = Object.assign(new EventEmitter(), { stdin: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null });
   const rl = new EventEmitter();
   const transport = new (StdioTransport as unknown as new (id: string, c: unknown, r: unknown) => StdioTransport)('legacy', child, rl);
@@ -360,7 +360,11 @@ test("a write to a stdio child that has just exited is reported, never thrown", 
   const reported: unknown[] = [];
   transport.on('error', (error) => reported.push(error));
   child.stdin.emit('error', epipe);
-  assert.deepEqual(reported, [epipe], "it's the transport's error once someone listens");
+  assert.deepEqual(reported, [], "the stdin carries the protocol, so the exit's close reports it");
+  const closed: Array<{ reason?: string }> = [];
+  transport.on('close', (info: { reason?: string }) => closed.push(info));
+  child.emit('exit', 0, null);
+  assert.match(closed[0]?.reason ?? '', /its pipe failed with write EPIPE/);
 });
 
 test('close() during a WebSocket reconnect dial returns promptly, ending the dial', async () => {

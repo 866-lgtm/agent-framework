@@ -53,7 +53,7 @@ export class McplServerRegistry {
     this.adding.add(config.id);
     let connection: McplServerConnection;
     try {
-      connection = config.reconnect
+      connection = config.reconnect === true
         ? await McplServerConnection.connectWithReconnect(config, hostCapabilities, signal)
         : await McplServerConnection.connect(config, hostCapabilities, signal);
     } catch (error) {
@@ -69,11 +69,13 @@ export class McplServerRegistry {
   private register(config: McplServerConfig, connection: McplServerConnection): void {
     this.servers.set(config.id, connection);
 
-    // Auto-remove on unexpected close (unless reconnect will re-add). A
-    // connection that still owns a child it couldn't reap keeps its id, so
+    // Auto-remove on close unless the connection will reconnect. That was
+    // decided once, from `reconnect === true` at connect, and a close() the
+    // host asks for disarms it first, so a server closed for good goes too.
+    // A connection that still owns a child it couldn't reap keeps its id, so
     // nothing launches beside that child; removeServer retries the reap.
     connection.on('close', () => {
-      if (!config.reconnect && this.servers.get(config.id) === connection && !connection.holdsUnreapedChild) {
+      if (!connection.willReconnect && this.servers.get(config.id) === connection && !connection.holdsUnreapedChild) {
         this.servers.delete(config.id);
       }
     });

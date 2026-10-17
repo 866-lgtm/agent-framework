@@ -296,17 +296,22 @@ function spawnedPids(): number[] {
   return pids;
 }
 
-test("a read error on a stdio child's stdout or stderr is reported through the transport's 'error', never thrown with nothing listening", async () => {
+test("a read error on a stdio child's stderr is reported through the transport's 'error', and one on stdout ends the child; neither is thrown with nothing listening", async () => {
   const transport = await StdioTransport.spawn({ id: 'pipes', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1 << 30)'] });
   cleanups.push(() => transport.close());
   const child = (transport as unknown as { child: import('node:child_process').ChildProcess }).child;
-  assert.doesNotThrow(() => child.stdout!.emit('error', new Error('stdout read failed')), 'stdout, nothing listening');
+  const closed = new Promise<{ reason?: string }>((resolve) => { transport.once('close', resolve); });
   assert.doesNotThrow(() => child.stderr!.emit('error', new Error('stderr read failed')), 'stderr, nothing listening');
   const errors: string[] = [];
   transport.on('error', (error: Error) => errors.push(error.message));
-  child.stdout!.emit('error', new Error('stdout read failed'));
   child.stderr!.emit('error', new Error('stderr read failed'));
-  assert.deepEqual(errors, ['stdout read failed', 'stderr read failed']);
+  assert.deepEqual(errors, ['stderr read failed']);
+  // stdout carries the protocol: the child is ended, and its close names
+  // the error instead of an 'error'.
+  assert.doesNotThrow(() => child.stdout!.emit('error', new Error('stdout read failed')), 'stdout');
+  const info = await closed;
+  assert.match(info.reason ?? '', /its pipe failed with stdout read failed/);
+  assert.deepEqual(errors, ['stderr read failed']);
 });
 
 test('close() right after start() ends a modern stdio connect still spawning, without waiting out its discover probe', async () => {

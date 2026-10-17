@@ -245,7 +245,10 @@ export interface McplServerConfig {
   /**
    * Escape hatch: pass the host's entire environment (including secrets) to
    * the stdio child, as older versions did. Only for servers that genuinely
-   * need it. Default false.
+   * need it. Default false. Only `true` turns it on, and null counts as not
+   * set. For a stdio server, `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "false". A
+   * WebSocket server never reads it.
    */
   inheritEnv?: boolean;
 
@@ -304,7 +307,9 @@ export interface McplServerConfig {
    * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
    * grant cannot confer it — only this config, decided by the operator, can
    * (PR #79 review blocker 9). The one legitimate fleet user is
-   * discord-mcpl's slash-command relay.
+   * discord-mcpl's slash-command relay. Only `true` turns it on, and null
+   * counts as not set. `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "true".
    */
   allowHostCommands?: boolean;
 
@@ -377,6 +382,9 @@ export interface McplServerConfig {
    * When true, connect() resolves immediately (with null capabilities) if the
    * server is unavailable, and retries in the background.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   * Only `true` turns it on, and null counts as not set. `create()`,
+   * `connectMcplServer` and `restartMcplServer` refuse any other value, such
+   * as a quoted "false".
    */
   reconnect?: boolean;
 
@@ -400,7 +408,11 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds). A value above
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. This is the
+   * timeout of every request that names none; the handshake's initialize has
+   * its own. Set 0 to disable. Default: 60000 (60 seconds). A value above
    * 2^31−1 is refused: Node runs a longer timer after about 1 ms, so every
    * request would time out at once.
    *

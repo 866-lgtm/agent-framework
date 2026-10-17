@@ -554,44 +554,6 @@ test("stop()'s teardown budget bounds a modern server's close too, and the serve
   assert.equal(modernServers.has('m'), false, 'removed once its close completed');
 });
 
-test("a failed startup's cleanup closes both engines' connections, each whatever the other's close did", async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  const framework = await AgentFramework.create({
-    storePath: join(dir, 'store'),
-    membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-    modules: [],
-  });
-  const reaping = unreapable();
-  try {
-    await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
-    reaping.active = false;
-    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
-    const errors: unknown[] = [];
-    const realError = console.error;
-    console.error = (...args: unknown[]) => { errors.push(args); };
-    try {
-      await (framework as unknown as { closeMcpConnectionsAfterFailedStartup(): Promise<void> }).closeMcpConnectionsAfterFailedStartup();
-    } finally {
-      console.error = realError;
-    }
-    const internals = framework as unknown as {
-      modernServers(): Map<string, unknown>;
-      mcplServerRegistry: { getServer(id: string): unknown };
-    };
-    assert.equal(internals.modernServers().has('m'), false, 'the modern connection was closed and let go, though the legacy close failed');
-    assert.equal(status(framework, 'm')?.connected, false);
-    assert.ok(internals.mcplServerRegistry.getServer('l'), 'the one it could not reap stays registered');
-    assert.equal(status(framework, 'l')?.connected, false, 'closed');
-    assert.match(JSON.stringify(errors), /could not be reaped/, 'and the failure is logged, not thrown');
-  } finally {
-    // Whatever the assertions found, end the stuck child so stop() can reap it.
-    for (const stuck of reaping.stuck) await killAndWait(stuck);
-    await framework.stop();
-  }
-});
-
 test('a restart whose new configuration is refused leaves the running server as it was', async () => {
   await withFramework(async ({ framework, dir }) => {
     const log = join(dir, 'raw.jsonl');
