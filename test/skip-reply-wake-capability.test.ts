@@ -165,6 +165,76 @@ describe('skip_reply wake capability', () => {
     await framework.stop();
   });
 
+  /**
+   * A turn on a host with no EventGate: what reached the channel, and how many
+   * streams it took. `streams` holds each stream's responses: the first
+   * stream's, then a restart's, given to the mock as that stream starts.
+   */
+  async function turnWithoutGate(store: string, streams: ReturnType<typeof createMockResponse>[][], maxStreamTokens?: number) {
+    const membrane = new MockMembrane();
+    for (const response of streams[0] ?? []) membrane.pushResponse(response);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, store), membrane: membrane.asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', ...(maxStreamTokens ? { maxStreamTokens } : {}) }], modules: [],
+    });
+    let starts = 0;
+    framework.onTrace((event) => {
+      if (event.type !== 'inference:started' || ++starts < 2) return;
+      for (const response of streams[starts - 1] ?? []) membrane.pushResponse(response);
+    });
+    const routed: string[] = [];
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      getChannelTools: () => [], resolveLocus: () => 'channel:test',
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
+    }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+    const agent = framework.getAgent('agent')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(agent, { agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
+    await framework.runUntilIdle();
+    await framework.stop();
+    return { routed, streams: membrane.calls.length };
+  }
+  const send = (id: string): ContentBlock =>
+    ({ type: 'tool_use', id, name: 'channel_publish', input: { channelId: 'channel:test', content: 'sent' } } as ContentBlock);
+
+  it('a refused wake beside a send in its round leaves the send\'s silence on the rest of the turn', async () => {
+    const { routed } = await turnWithoutGate('beside-send', [[
+      createMockResponse([send('send-1'), wakeCall('wake-1')] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'after the send' }] as ContentBlock[]),
+    ]]);
+    assert.deepEqual(routed, []);
+  });
+
+  it('a send after a refused wake silences the rest of the turn: the refusal\'s saved silence comes back once', async () => {
+    const { routed } = await turnWithoutGate('send-after', [[
+      createMockResponse([wakeCall('wake-1')] as ContentBlock[], 'tool_use'),
+      createMockResponse([send('send-1')] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'after the send' }] as ContentBlock[]),
+    ]]);
+    assert.deepEqual(routed, []);
+  });
+
+  it('a budget restart after a refused wake starts from its trigger, as after any other round', async () => {
+    // A send silences the rest of its stream; then a round crosses the
+    // stream's budget, and the turn restarts. Whether that round was a refused
+    // wake or a plain tool call, the restarted stream speaks the same: nothing
+    // of the refused call outlives its stream.
+    const restartedAfter = (store: string, second: ContentBlock) => {
+      const overBudget = createMockResponse([{ type: 'text', text: 'this round stays private' }, second] as ContentBlock[], 'tool_use');
+      overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+      return turnWithoutGate(store, [
+        [createMockResponse([send('send-1')] as ContentBlock[], 'tool_use'), overBudget],
+        [createMockResponse([{ type: 'text', text: 'after the restart' }] as ContentBlock[])],
+      ], 20);
+    };
+    const refused = await restartedAfter('restart-refused', wakeCall('wake-2'));
+    const plain = await restartedAfter('restart-plain', { type: 'tool_use', id: 'think-2', name: 'think', input: { content: 'a plan' } } as ContentBlock);
+    assert.equal(refused.streams, 2, 'the refused round crossed the budget, and the turn restarted');
+    assert.equal(plain.streams, 2);
+    assert.deepEqual(refused.routed, plain.routed);
+  });
+
   it('keeps the existing successful end-turn behavior when EventGate exists', async () => {
     const { framework, membrane } = await make(true);
     assert.equal(membrane.lastStream!.receivedToolResults.length, 0,
@@ -236,32 +306,5 @@ describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
       assert.deepEqual(routed, [], `wake_in_seconds: ${String(wake)}`);
       assert.equal(results.length, 0, `wake_in_seconds: ${String(wake)} ends the turn at the tool boundary`);
     }
-  });
-});
-
-// Lifecycle backstop: even if a refused-wake stream exits before its resumed
-// round can consume the one-shot state, teardown/fresh-turn setup clears it.
-describe('refused wake lifecycle cleanup', () => {
-  it('fresh turn setup clears stale saved silence', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'skip-wake-stale-'));
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
-    });
-    const internals = framework as unknown as {
-      refusedSkipReplyWakeRounds: Map<string, boolean>;
-      startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
-    };
-    internals.refusedSkipReplyWakeRounds.set('agent', true);
-    // No provider response is needed: startAgentStream's fresh-turn setup runs
-    // synchronously before driveStream consumes the mock stream.
-    const agent = framework.getAgent('agent')!;
-    const start = internals.startAgentStream(agent, {
-      agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now(),
-    });
-    assert.equal(internals.refusedSkipReplyWakeRounds.has('agent'), false);
-    await framework.stop();
-    await start.catch(() => {});
-    rmSync(dir, { recursive: true, force: true });
   });
 });

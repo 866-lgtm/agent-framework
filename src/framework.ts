@@ -1683,8 +1683,6 @@ export class AgentFramework {
    *  driveStream to clear sticky explicit-send suppression before handling
    *  the next model round. Never affects routing: the turn locus is frozen. */
   private midTurnInputSignals: Set<string> = new Set();
-  /** Refused no-gate self-wake: silence its own round, then restore prior silence. */
-  private refusedSkipReplyWakeRounds: Map<string, boolean> = new Map();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
@@ -11521,7 +11519,6 @@ export class AgentFramework {
         // A framework retry is a new physical stream in the same logical turn.
         this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
       }
-      this.refusedSkipReplyWakeRounds.delete(agent.name);
       this.midTurnInputSignals.delete(agent.name);
     }
 
@@ -11938,6 +11935,11 @@ export class AgentFramework {
     // text by its place, the round's index among this stream's tool rounds.
     const refusedWakeRounds = new Set<number>();
     let toolRounds = 0;
+    // A refused skip_reply silences only its own round: the silence before it,
+    // saved as its round is dispatched, comes back at the next round. It's
+    // this stream's, so a stream that resumes the turn starts from its
+    // trigger, as a retry does.
+    let silenceBeforeRefusal: boolean | undefined;
 
     // Typing indicator: show "<agent> is typing…" for the whole duration of
     // this turn. Started here (paired with the finally below, so it can never
@@ -12041,10 +12043,9 @@ export class AgentFramework {
     const discardGuardHeld = (): void => { guardHeld = []; };
 
     const adoptInjectedRound = (): void => {
-      const silenceBeforeRefusal = this.refusedSkipReplyWakeRounds.get(agent.name);
       if (silenceBeforeRefusal !== undefined) {
-        this.refusedSkipReplyWakeRounds.delete(agent.name);
         turnSilenced = silenceBeforeRefusal;
+        silenceBeforeRefusal = undefined;
       }
       if (!this.midTurnInputSignals.has(agent.name)) return;
       this.midTurnInputSignals.delete(agent.name);
@@ -12234,8 +12235,7 @@ export class AgentFramework {
             const hasRefusedWake = !this.eventGate && event.calls.some((call) =>
               call.name === 'skip_reply' && requestedSelfWakeSeconds(call.input) !== undefined);
             if (hasRefusedWake) {
-              const otherwiseSilenced = turnSilenced || event.calls.some((call) => call.name !== 'skip_reply' && isSilencingTool(call.name));
-              this.refusedSkipReplyWakeRounds.set(agent.name, otherwiseSilenced);
+              silenceBeforeRefusal = turnSilenced || event.calls.some((call) => call.name !== 'skip_reply' && isSilencingTool(call.name));
             }
             if (hasRefusedWake && (!roundContent || roundContent.length === 0)) {
               refusedWakeRounds.add(toolRound);
@@ -13449,7 +13449,6 @@ export class AgentFramework {
       // then re-defers, and the successor's own turn-start flush / boundary
       // injection / teardown delivers the messages at a correct position.
       if (myTurnToken !== undefined && this.activeTurnTokens.get(agent.name) === myTurnToken) {
-        this.refusedSkipReplyWakeRounds.delete(agent.name);
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
       }
