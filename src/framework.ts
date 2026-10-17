@@ -1938,7 +1938,9 @@ export class AgentFramework {
   private unackedDeferredWrites: DeferredWrite[] = [];
   /** Monotonic order stamp for deferred writes: the durable queue is always
    *  written, restored, drained and flushed in `seq` order, whatever the
-   *  pending/un-acked split — a re-deferred entry keeps its place. */
+   *  pending/un-acked split — a re-deferred entry keeps its place. Boot
+   *  recovery numbers the restored queue 1..N in that order, and the stamp
+   *  goes on from N (restorePersistedDeferredWrites). */
   private deferredSeq = 0;
   /**
    * Per target agent: the store's message count when the OLDEST currently
@@ -5457,40 +5459,35 @@ export class AgentFramework {
         seen.add(id);
         kept.push({ ...m, id });
       }
-      // A seq is a positive whole number no larger than
-      // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
-      // An entry without one (a file that predates seq, which is in write
-      // order already) or with any other value (damage or a hand edit:
-      // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
-      // file order, so the counter stays finite and the rest keep their order.
+      // A seq says only where its entry came in arrival order. The queue is
+      // restored in the order the file gives: entries whose seq is a positive
+      // whole number up to Number.MAX_SAFE_INTEGER by seq, then, in file
+      // order, any without one (a file that predates seq, which is in write
+      // order already) or with another value (damage or a hand edit: JSON's
+      // 1e400 reads as Infinity). Then it is numbered 1..N in that order, so
+      // the counter starts again from N at every boot and never passes the
+      // largest safe integer, wherever the file's seqs had got to.
       const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
-      let lastSeq = 0;
-      for (const m of kept) if (validSeq(m.seq)) lastSeq = Math.max(lastSeq, m.seq);
-      let renumbered = 0;
-      const candidates: DeferredWrite[] = kept
-        .map((m) => {
-          if (validSeq(m.seq)) return { ...m, seq: m.seq };
-          renumbered++;
-          if (m.seq !== undefined) {
-            // A value that isn't a number is named by its type: it could be
-            // any size.
-            const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
-            console.error(
-              `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
-              `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
-            );
-          }
-          return { ...m, seq: ++lastSeq };
-        })
-        .sort(bySeq);
-      this.deferredSeq = Math.max(this.deferredSeq, lastSeq);
+      const unnumbered = kept.filter((m) => !validSeq(m.seq));
+      for (const m of unnumbered) {
+        if (m.seq === undefined) continue;
+        // A value that isn't a number is named by its type: it could be
+        // any size.
+        const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
+        console.error(
+          `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
+          `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
+        );
+      }
+      const ordered = [...kept.filter((m) => validSeq(m.seq)).sort((a, b) => (a.seq as number) - (b.seq as number)), ...unnumbered];
       // Exactly-once: a message that landed before its ack was written is
       // already in the store under its deferredWriteId — do not replay it.
       // The scan covers every slot the interrupted batch could occupy (from
       // the receipt's per-agent position), or the whole store when the
       // receipt predates the position field.
-      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
-      const restored = candidates.filter((m) => !landed.has(m.id));
+      const landed = this.landedDeferredWriteIds(new Set(ordered.map((m) => m.id)), scanFrom);
+      const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...m, seq: i + 1 }));
+      this.deferredSeq = Math.max(this.deferredSeq, restored.length);
       if (landed.size > 0) {
         console.error(
           `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
@@ -5501,8 +5498,12 @@ export class AgentFramework {
       this.deferredWritesPersisted = true;
       // Rewrite the durable queue without the already-landed entries so a
       // second interrupted boot does not re-scan them, without the malformed
-      // and repeated ones, and with the seqs given here.
-      if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || renumbered > 0) this.persistDeferredWrites();
+      // and repeated ones, and with a seq for each entry that came without a
+      // valid one, so the next boot doesn't name it again. The numbers given
+      // here aren't a reason to rewrite it: every write of the queue writes
+      // it whole, with them, and a boot before that numbers the same entries
+      // the same way.
+      if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || unnumbered.length > 0) this.persistDeferredWrites();
       return restored.length;
     } catch (err) {
       console.error('[host-mode] failed to restore persisted deferred context writes:', err);

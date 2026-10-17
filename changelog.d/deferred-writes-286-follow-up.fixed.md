@@ -8,3 +8,11 @@
   ephemeral run's, once the run's stream had ended, was dropped by the run's
   own turn-end flush, which runs after the run is deregistered, with a line
   saying its delivery target isn't a registered agent.
+- Boot recovery numbers the restored deferred-write queue 1, 2, 3, … in the
+  order it restores it, and later deferrals are numbered on from there.
+  Before, it kept each entry's `seq` and numbered only the entries without a
+  valid one, after the largest, so the counter went on from the largest valid
+  `seq`: one at `Number.MAX_SAFE_INTEGER`, which boot accepts, gave every
+  later deferral the same `seq`, 2^53. A recovery file whose `seq`s are all
+  valid isn't rewritten at boot for the new numbers; the queue's next write
+  carries them.
