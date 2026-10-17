@@ -3470,7 +3470,9 @@ export class AgentFramework {
     // listener while it prepares or a strategy's tick before that tick's
     // first await, and a stop(), surgery or maintain begun there must find
     // it: stop() and the surgery wait for it, and the maintain joins it
-    // rather than starting a second pass beside it.
+    // rather than starting a second pass beside it. A tick that awaits such a
+    // call waits on its own pass, as a tick already did for a call it made
+    // after its first await.
     let begin!: (body: Promise<void>) => void;
     const pass = new Promise<void>((resolve) => { begin = resolve; });
     this.maintenancePass = pass;
@@ -16150,9 +16152,9 @@ export class AgentFramework {
             ticks++;
           }
           const stopped = ticks >= 8 ? ''
+            : this.agents.get(agentName) !== agent ? ', stopped as the agent was disposed'
             : this.providerAdmissionClosed ? ', stopped as the framework stops'
-            : this.surgeryHold ? ', stopped while a surgery holds the store'
-            : ', stopped as the agent was disposed';
+            : ', stopped while a surgery holds the store';
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks${stopped})`);
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {

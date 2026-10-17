@@ -1978,9 +1978,9 @@ describe('queued context maintenance timer', () => {
     }
   });
 
-  it('an over-budget drain kick takes no tick of a conversation agent disposed while its tick was in flight, and says why it stopped', { timeout: 10_000 }, async () => {
+  it('an over-budget drain kick takes no tick of a conversation agent disposed before its first tick, and names the disposal though a surgery holds the store', { timeout: 10_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-drain-disposed-'));
-    const fork = new GatedCountingStrategy();
+    const forks: GatedCountingStrategy[] = [];
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane,
@@ -1988,33 +1988,55 @@ describe('queued context maintenance timer', () => {
       modules: [],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
-      conversations: { templateAgent: 'trunk', bind: { channel: 'mention' }, strategyFactory: () => fork },
+      conversations: {
+        templateAgent: 'trunk',
+        bind: { channel: 'mention' },
+        strategyFactory: () => { const fork = new GatedCountingStrategy(); forks.push(fork); return fork; },
+      },
     });
     const internals = framework as unknown as {
       createConversationAgent(name: string, channelId: string): Promise<unknown>;
       disposeConversationAgent(name: string): void;
       noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
       overBudgetDrains: Set<Promise<void>>;
+      surgeryHold: { verb: string; agentName: string; since: number } | null;
     };
     (framework as any).opsAlert = () => {};
     const logged: string[] = [];
     const quiet = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     try {
+      // The kick's body runs a microtask later, so each fork is disposed
+      // before the drain's first check.
       await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
       internals.noteInferenceExhausted('trunk-chan-g1', 'compile refused', false, 'over_budget');
-      await waitFor(() => fork.ticks === 1);
+      assert.equal(internals.overBudgetDrains.size, 1, 'a kick was started');
       internals.disposeConversationAgent('trunk-chan-g1');
-      fork.release();
+      // Open the gate, so a drain that did tick shows its count.
+      forks[0]!.release();
       await Promise.all([...internals.overBudgetDrains]);
-      assert.equal(fork.ticks, 1, 'no tick after the agent was disposed');
+      assert.equal(forks[0]!.ticks, 0, 'no tick of the disposed agent');
       assert.ok(
-        logged.some((line) => line.includes('drain kicked for trunk-chan-g1 (OverBudget breaker, 1 ticks, stopped as the agent was disposed)')),
+        logged.some((line) => line.includes('drain kicked for trunk-chan-g1 (OverBudget breaker, 0 ticks, stopped as the agent was disposed)')),
+        logged.join('\n'),
+      );
+      // A surgery for another agent holding the store as well: the log names
+      // the disposal, the agent's own reason.
+      await internals.createConversationAgent('trunk-chan-g2', 'world:chan');
+      internals.noteInferenceExhausted('trunk-chan-g2', 'compile refused', false, 'over_budget');
+      internals.disposeConversationAgent('trunk-chan-g2');
+      internals.surgeryHold = { verb: 'rollback', agentName: 'trunk', since: Date.now() };
+      forks[1]!.release();
+      await Promise.all([...internals.overBudgetDrains]);
+      assert.equal(forks[1]!.ticks, 0, 'no tick of the second disposed agent');
+      assert.ok(
+        logged.some((line) => line.includes('drain kicked for trunk-chan-g2 (OverBudget breaker, 0 ticks, stopped as the agent was disposed)')),
         logged.join('\n'),
       );
     } finally {
       console.error = quiet;
-      fork.release();
+      internals.surgeryHold = null;
+      for (const fork of forks) fork.release();
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
