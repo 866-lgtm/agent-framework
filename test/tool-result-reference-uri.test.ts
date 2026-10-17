@@ -15,6 +15,7 @@ import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
 import { keptWhenWithheld } from '../src/tool-result-guard.js';
+import { classifyBlock } from '../src/mcpl/references.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const SIGNATURE = 'zz-secret-signature';
@@ -23,7 +24,7 @@ const RESOURCE = { type: 'resource', uri: URI, mimeType: 'application/pdf', name
 const UNKNOWN = { type: 'zz-unknown', note: 'zz-kept' };
 const STUB = /\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/;
 const BASE64 = 'aGVsbG8gd29ybGQgaGVsbG8gd29ybGQ=';
-const WITHHELD = '[inline content withheld: nonconformant bulk disposition on inline data]';
+const WITHHELD = '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
 
 function parsed(text: string): unknown {
   return JSON.parse(text);
@@ -50,11 +51,20 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     assert.match((parsed(inside) as [{ attachment: string }])[0].attachment, STUB);
   });
 
-  it('shows a reference that is the whole data as its stub, as text', () => {
+  it('shows a reference that is the whole data as its stub, as text, read as a content array\'s reference is', () => {
     const text = toolResultDataToHistoryString(RESOURCE);
     assert.match(text, STUB);
     assert.ok(!text.startsWith('"'), text);
     assert.ok(!text.includes(SIGNATURE), text);
+    // An image reference that is the whole data starts its line, so it takes
+    // a save_recent_image slot, as one in a content array does.
+    const image = { type: 'image', uri: URI, mimeType: 'image/png', name: 'zz.png' };
+    const whole = toolResultDataToHistoryString(image);
+    assert.match(whole, /^\[ref_[^\]]+\] zz\.png — image\/png/);
+    assert.equal(parseImagePlaceholders(whole).length, 1);
+    assert.equal(parseImagePlaceholders(toolResultDataToHistoryString([image])).length, 1);
+    // Inline data withheld as the whole data is the notice, as text too.
+    assert.equal(toolResultDataToHistoryString({ type: 'image', data: BASE64, mimeType: 'image/png', uri: URI }), WITHHELD);
   });
 
   it('shows media given by uri as a reference too, an image or audio beside a block of another type', () => {
@@ -80,16 +90,22 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     assert.deepEqual(parsed(disposition), [UNKNOWN, WITHHELD]);
   });
 
-  it('withholds inline data beside a uri that is not a string, at any depth and in a content array', () => {
+  it('withholds inline data beside a uri that is not a string where JSON would write it, and leaves the lanes as they were', () => {
     const block = { type: 'image', data: BASE64, mimeType: 'image/png', uri: { href: URI } };
     const nested = toolResultDataToHistoryString({ shot: block, page: 2 });
     assert.ok(!nested.includes(SIGNATURE) && !nested.includes(BASE64), nested);
     assert.deepEqual(parsed(nested), { shot: WITHHELD, page: 2 });
+    // A content array shows no uri, so the image there is a placeholder, as
+    // it is with no uri at all.
     const array = toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, block]);
-    assert.equal(array, `zz-text\n${WITHHELD}`);
-    // A null uri is none, as everywhere: inline data beside it isn't a claim.
+    assert.equal(array, toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, { type: 'image', data: BASE64, mimeType: 'image/png' }]));
+    assert.ok(!array.includes(SIGNATURE), array);
+    assert.deepEqual(classifyBlock(block), { kind: 'inline', contradiction: false });
+    // A null or empty uri is none: inline data beside it isn't a claim.
     const nullUri = { type: 'audio', data: BASE64, mimeType: 'audio/wav', uri: null };
     assert.equal(toolResultDataToHistoryString({ clip: nullUri }), JSON.stringify({ clip: nullUri }));
+    const emptyUri = { type: 'image', data: BASE64, mimeType: 'image/png', uri: '' };
+    assert.equal(toolResultDataToHistoryString({ shot: emptyUri }), JSON.stringify({ shot: emptyUri }));
   });
 
   it('writes inline media that claims no uri or disposition as JSON writes it, as before', () => {
@@ -109,8 +125,9 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     assert.equal(toolResultDataToHistoryString({ a: 1 }), '{"a":1}');
   });
 
-  it('writes a record that only shares a type name, with no uri and no data, as JSON does', () => {
-    // A uri or data that is null or absent is none: nothing here is a reference or bytes.
+  it('writes a record that only shares a type name, with no uri and no string data, as JSON does', () => {
+    // A uri that is null, absent or empty is none, and data that isn't a
+    // string isn't inline data: nothing here is a reference or inline bytes.
     const records = [
       UNKNOWN,
       { type: 'image', uri: null, id: 1, name: 'zz-a' },
@@ -118,6 +135,9 @@ describe('data the serializer doesn\'t read as content blocks', () => {
       { type: 'resource', name: 'zz-cpu', value: 0.5 },
       { type: 'resource', uri: undefined, name: 'zz-c' },
       { type: 'resource', resource: { name: 'zz-d' } },
+      { type: 'resource', uri: '', text: 'zz-e' },
+      { type: 'image', data: [1, 2, 3], mimeType: 'image/png', url: 'https://zz-images.example/a.png' },
+      { type: 'audio', data: { type: 'Buffer', data: [9, 8, 7] }, name: 'zz-f', samples: 3 },
     ];
     assert.equal(toolResultDataToHistoryString(records), JSON.stringify(records));
     assert.equal(toolResultDataToHistoryString({ record: records[1] }), JSON.stringify({ record: records[1] }));
@@ -136,20 +156,18 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     assert.equal(toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, embedded]), `zz-text\n${line}`);
   });
 
-  it('governs media data that is not a string, and a uri that is not a string, failing closed and saying which', () => {
+  it('governs media given a uri that is not a string, failing closed and saying which', () => {
     const text = toolResultDataToHistoryString({
-      bytes: { type: 'image', data: [1, 2, 3], mimeType: 'image/png' },
-      buffer: { type: 'audio', data: { type: 'Buffer', data: [9, 8, 7] } },
       numeric: { type: 'image', uri: 42, name: 'zz-n' },
       both: { type: 'audio', data: [4, 5], uri: 43 },
     });
-    assert.ok(!text.includes('1,2,3') && !text.includes('9,8,7') && !text.includes('4,5'), text);
+    assert.ok(!text.includes('4,5'), text);
     assert.deepEqual(parsed(text), {
-      bytes: "[unrecognized content block: image block whose data isn't a string]",
-      buffer: "[unrecognized content block: audio block whose data isn't a string]",
       numeric: "[unrecognized content block: image block whose uri isn't a string]",
       both: "[unrecognized content block: audio block whose data and uri aren't strings]",
     });
+    // In the lanes, a media block with neither keeps the line it had.
+    assert.deepEqual(classifyBlock({ type: 'image' }), { kind: 'invalid', reason: 'image block with neither data nor uri' });
   });
 
   it("leaves a nested reference's stub out of save_recent_image's inventory, as main left the reference", () => {
@@ -172,7 +190,11 @@ describe('data the serializer doesn\'t read as content blocks', () => {
   it('keeps a withheld result\'s kept fields free of the uri', () => {
     const kept = keptWhenWithheld({ success: true, data: { files: ['zz.txt'], receipt: [UNKNOWN, RESOURCE] }, keepWhenWithheld: ['files', 'receipt'] }, undefined);
     assert.ok(kept !== undefined && !kept.includes(SIGNATURE), kept);
-    assert.match(kept!, /ref_/);
+    assert.match((parsed(kept!) as { receipt: [unknown, string] }).receipt[1], STUB);
+    // Data that is itself a reference keeps its stub, whichever fields are marked.
+    const whole = keptWhenWithheld({ success: true, data: RESOURCE, keepWhenWithheld: ['uri', 'name'] }, undefined);
+    assert.ok(whole !== undefined && !whole.includes(SIGNATURE), whole);
+    assert.match(whole!, STUB);
   });
 });
 
@@ -250,6 +272,18 @@ describe('the wire without the stored copy', () => {
       assert.equal(ids(content as string), ids(expected));
       assert.ok(!(content as string).includes(SIGNATURE), String(content));
     }
+  });
+
+  it('cuts its text at the cap as the stored copy is cut', () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      toMembraneToolResult(callId: string, result: ToolResult, maxChars?: number): { content: unknown; isError: boolean };
+    };
+    const result: ToolResult = { success: true, data: { note: 'zz-'.repeat(200), shot: RESOURCE, more: 'zz-tail' } };
+    const { content } = fw.toMembraneToolResult('zz-call', result, 300);
+    const ids = (s: string) => s.replace(/ref_[A-Za-z0-9_-]+/g, 'ref_ID');
+    assert.equal(ids(content as string), ids(nonErrorResultText(result, 300)));
+    assert.match(content as string, /\n\n\[truncated — original was \d+ chars\]$/);
+    assert.ok(!(content as string).includes(SIGNATURE), String(content));
   });
 });
 

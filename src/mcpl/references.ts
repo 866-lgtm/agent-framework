@@ -89,9 +89,8 @@ export function classifyBlock(block: unknown): BlockClassification {
       const hasUri = typeof block.uri === 'string';
       if (hasData) {
         // Inline form claiming bulk disposition (or smuggling a uri beside
-        // the data, a string or any other value but null) is the vector-2
-        // contradiction: fail closed, withhold.
-        return { kind: 'inline', contradiction: block.disposition !== undefined || (block.uri !== undefined && block.uri !== null) };
+        // the data) is the vector-2 contradiction: fail closed, withhold.
+        return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
       }
       if (hasUri) return parseReferenceFields(block);
       return { kind: 'invalid', reason: `${block.type} block ${mediaWithoutStringReason(block)}` };
@@ -149,7 +148,7 @@ export function isInlineContradiction(block: unknown): boolean {
 }
 
 export const INLINE_WITHHELD_TEXT =
-  '[inline content withheld: nonconformant bulk disposition on inline data]';
+  '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
 
 /**
  * Why a reference counts as expired, or null when it doesn't: its expiresAt
