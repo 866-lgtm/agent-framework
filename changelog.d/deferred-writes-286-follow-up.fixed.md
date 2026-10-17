@@ -16,3 +16,8 @@
   later deferral the same `seq`, 2^53. A recovery file whose `seq`s are all
   valid isn't rewritten at boot for the new numbers; the queue's next write
   carries them.
+- At a tool boundary, a deferred message that the strategy stores as more than
+  one message (a sharded body) is now injected as later compiles render it,
+  its shards joined. Before, it was injected as given, so a body of more than
+  one text block, or with a non-text block after a text block, reached the
+  stream in a different shape from later requests.

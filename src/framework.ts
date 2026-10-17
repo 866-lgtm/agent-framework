@@ -506,10 +506,10 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
 /** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
  *  (empty when addMessage deferred it again; a sharded body's first shard)
- *  and what the store holds of it. For an entry whose write threw after
- *  storing it, found in the store and counted as written, the content is
- *  what landed, as later compiles render it, which for a sharded body can be
- *  its first shards alone. */
+ *  and what the store holds of it, as later compiles render it: for a
+ *  sharded body, its shards joined. For an entry whose write threw after
+ *  storing it, found in the store and counted as written, that is what
+ *  landed, which for a sharded body can be its first shards alone. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
@@ -9373,10 +9373,11 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
-            // stored is injected (the round's results go on either way). A
-            // write that threw after storing counts as stored, and what landed
-            // of it is what's injected, so the request carries what the store
-            // holds (writeDrainedInOrder).
+            // stored is injected (the round's results go on either way). What
+            // is injected is what the store holds, as later compiles render
+            // it: a sharded body's shards joined, and of a write that threw
+            // after storing, which counts as stored, what landed
+            // (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -16190,9 +16191,12 @@ export class AgentFramework {
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
-   * entries. `onLanded` hears an entry whose write threw after storing it,
-   * with the id it landed under, as soon as it's found: before the writes
-   * after it, so whatever it records keeps their order.
+   * entries. Each comes with its content as later compiles render it: as
+   * given, unless the store took it as more than one message (a sharded
+   * body), whose copies are joined (asCompiled), or its write threw after
+   * storing it (above). `onLanded` hears an entry whose write threw after
+   * storing it, with the id it landed under, as soon as it's found: before
+   * the writes after it, so whatever it records keeps their order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
@@ -16212,7 +16216,15 @@ export class AgentFramework {
       const agent = this.deliveryAgent(msg.forAgent);
       const before = agent ? this.storedCountOf(agent) : undefined;
       try {
-        written.set(msg, { id: write(msg), content: msg.content });
+        const id = write(msg);
+        // A body the store took as more than one message (a sharded body) is
+        // returned as later compiles render it: its copies, joined
+        // (asCompiled). The store is read for them only when it grew by more
+        // than one message.
+        const copies = agent && before !== undefined && (this.storedCountOf(agent) ?? before) - before > 1
+          ? this.storedCopiesOf(agent, before, msg.id)
+          : [];
+        written.set(msg, { id, content: copies.length > 1 ? asCompiled(copies) : msg.content });
       } catch (error) {
         const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
         if (landed.length > 0) {
