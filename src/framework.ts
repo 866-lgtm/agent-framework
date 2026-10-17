@@ -1646,6 +1646,12 @@ export class AgentFramework {
    * running; only new turns (wake gate in processInferenceRequests) and MCPL
    * data planes are held. */
   private quiesced = false;
+  /** Whether the host-mode record may say quiesced, as this process last read
+   * or wrote it. quiesce() writes the record before it sets `quiesced`, and
+   * resume() clears `quiesced` before the record, so after a resume whose
+   * clear failed, or a quiesce whose write failed partway, memory can say
+   * serving while the record says quiesced, until a resume() clears it. */
+  private hostModeRecordMayBeQuiesced = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
   private traceListeners: TraceRegistration[] = [];
@@ -2461,6 +2467,7 @@ export class AgentFramework {
         await framework.flushDeferredWrites('boot-recovery');
       }
       if (hostMode?.quiesced) {
+        framework.hostModeRecordMayBeQuiesced = true;
         framework.quiesced = true;
         framework.quiesceReason = hostMode.reason;
         framework.quiescedAt = hostMode.since;
@@ -4644,9 +4651,12 @@ export class AgentFramework {
       return this.getHostModeStatus();
     }
     // The record first, then the flag: a write that fails rejects with the
-    // host still serving, as the stored record says, and a retry isn't taken
-    // by the check above for a quiesce already done, so it writes the record.
+    // host still serving, and a retry isn't taken by the check above for a
+    // quiesce already done, so it writes the record. A write that fails
+    // partway, such as a store write whose sync fails, may still reach the
+    // record, so a later resume() clears it.
     const since = Date.now();
+    this.hostModeRecordMayBeQuiesced = true;
     this.persistHostMode({
       quiesced: true,
       ...(opts?.reason ? { reason: opts.reason } : {}),
@@ -4790,7 +4800,15 @@ export class AgentFramework {
   }
 
   private async runResume(opts?: { force?: boolean }): Promise<HostModeStatus> {
-    if (!this.quiesced) return this.getHostModeStatus();
+    if (!this.quiesced) {
+      // A resume whose record clear failed left memory serving and the record
+      // quiesced: a retry clears the record, rather than answer as if it had.
+      if (this.hostModeRecordMayBeQuiesced) {
+        this.persistHostMode(null);
+        this.hostModeRecordMayBeQuiesced = false;
+      }
+      return this.getHostModeStatus();
+    }
     // A surgery switches or forks the branch while it holds the store, and a
     // manager whose initialization that left pending refuses its settings
     // read: resume once it's done, as the other operator calls do. Checked
@@ -4872,6 +4890,7 @@ export class AgentFramework {
       // flushDeferredWrites); nothing here may reach the plane reopen below.
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
+      this.hostModeRecordMayBeQuiesced = false;
     } finally {
       // Reopen MCPL data planes through the existing barrier funnel — NOT a
       // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
@@ -5849,11 +5868,12 @@ export class AgentFramework {
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
-  /** Persist (or clear, with null) the host quiesce mode. First process-global
-   * key in the framework/state slot: quiesce survives a restart BY DESIGN — a
-   * crash mid-surgery must come back up NOT serving against a half-repaired
-   * store. Resume is always reachable (public method, WS/HTTP, control-plane
-   * host/command), and every quiesced boot logs a loud banner. */
+  /** Persist (or clear, with null) the host quiesce mode: in the recovery file
+   * when there's a path for one, and in framework/state's hostMode otherwise.
+   * Quiesce survives a restart BY DESIGN — a crash mid-surgery must come back
+   * up NOT serving against a half-repaired store. Resume is always reachable
+   * (public method, WS/HTTP, control-plane host/command), and every quiesced
+   * boot logs a loud banner. */
   private persistHostMode(mode: { quiesced: true; reason?: string; since: number } | null): void {
     if (this.hostModePath) {
       // Branch-independent: the recovery file is the record. (`quiesced:
@@ -5882,9 +5902,15 @@ export class AgentFramework {
       if (mode === null) delete state.hostMode;
       else state.hostMode = { ...mode };
       this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+      // Here the store is the record, and the whole feature rests on it
+      // surviving a crash: until the store syncs it isn't durable, so a sync
+      // that fails is a write that failed, and quiesce() or resume() rejects.
+      this.store.sync();
+      return;
     }
-    // The whole feature rests on the flag surviving a crash — close the
-    // window between the write and the next periodic sync.
+    // The recovery file is the record, written above. This sync only narrows
+    // the window for the store's own writes, such as the legacy marker's
+    // removal, so a failure is logged.
     try {
       this.store.sync();
     } catch (err) {
