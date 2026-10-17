@@ -9,10 +9,12 @@
   it. The end time reads the wall clock against the stored end at each
   step, so a host that runs through a long tune-out and one that restarts
   during it aim at the same end.
-- A tune-out that ends without a cancel, as a send into its channel or a
-  close of the channel ends it, no longer leaves its end time armed to end
-  the channel's next tune-out. Before, when the next tune-out had no
-  `durationSeconds`, the old end time ended it as "duration elapsed".
+- A tune-out that ends in the channel registry without a cancel (the send
+  path and the close tool set the channel's state there directly) no
+  longer leaves its timers to act on the channel's next tune-out. Before,
+  when the next tune-out had no `durationSeconds`, the old end time ended
+  it as "duration elapsed", and a wake still in its 2-second coalescing
+  window counted against it and gave the subconscious a turn.
 - `tune_out` refuses a `durationSeconds`, `cadenceSeconds`, `backlogCap` or
   `maxWakes` that gives no finite number, such as `"abc"`, and a duration
   whose end time is too far off to store, naming the option and saying

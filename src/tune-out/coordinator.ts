@@ -65,8 +65,9 @@ export interface TuneOutFrameworkHooks {
 
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Each duration's pending expiry step (params.expiresAtMs); cleared by
-   *  cancel, stop, and the channel's next enter. */
+  /** Each duration's pending expiry step (params.expiresAtMs). stop clears
+   *  it, cancel does while the registry still holds the tune-out, and the
+   *  channel's next enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
@@ -106,14 +107,10 @@ export class TuneOutCoordinator {
   }
 
   private armExpiry(serverId: string, channelId: string, params: TuneOutParams): void {
+    if (params.expiresAtMs === undefined) return;
     const key = this.key(serverId, channelId);
-    // An earlier tune-out on this channel can end in the registry without
-    // cancel (a send or a close sets the channel's state there), leaving its
-    // end time's step armed. Clear it first, so it can't end this one.
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
-    this.expiryTimers.delete(key);
-    if (params.expiresAtMs === undefined) return;
     armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
       this.expiryTimers.delete(key);
       this.cancel(serverId, channelId, 'duration', 'duration elapsed');
@@ -197,6 +194,10 @@ export class TuneOutCoordinator {
       startedAtSequence: this.hooks.currentSequence(),
       ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     };
+    // A tune-out can end in the registry without cancel (a send into the
+    // channel or a close sets its state there), leaving its timers armed:
+    // clear them, so none of them acts on this one.
+    this.clearTimers(serverId, channelId);
     this.channelRegistry.enterTuneOut(serverId, channelId, params, source);
     this.armExpiry(serverId, channelId, params);
 
@@ -232,17 +233,7 @@ export class TuneOutCoordinator {
     if (!ended) {
       return { ok: false, error: `channel ${channelId} is not tuned out` };
     }
-    this.stopCadence(serverId, channelId);
-    const expiry = this.expiryTimers.get(this.key(serverId, channelId));
-    if (expiry) {
-      clearTimeout(expiry);
-      this.expiryTimers.delete(this.key(serverId, channelId));
-    }
-    const pending = this.pendingWakes.get(this.key(serverId, channelId));
-    if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingWakes.delete(this.key(serverId, channelId));
-    }
+    this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
     // Backlog: every message stamped with this epoch, oldest first.
@@ -396,6 +387,19 @@ export class TuneOutCoordinator {
       armAfter(cadenceSeconds * 1000, hold, tick);
     };
     armAfter(cadenceSeconds * 1000, hold, tick);
+  }
+
+  /** Clear a channel's tune-out timers: its cadence, its end time and a wake
+   *  still coalescing. */
+  private clearTimers(serverId: string, channelId: string): void {
+    const key = this.key(serverId, channelId);
+    this.stopCadence(serverId, channelId);
+    const expiry = this.expiryTimers.get(key);
+    if (expiry) clearTimeout(expiry);
+    this.expiryTimers.delete(key);
+    const pending = this.pendingWakes.get(key);
+    if (pending) clearTimeout(pending.timer);
+    this.pendingWakes.delete(key);
   }
 
   private stopCadence(serverId: string, channelId: string): void {

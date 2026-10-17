@@ -5,12 +5,14 @@ const MAX_TIMER_MS = 2_147_483_647;
 type Hold = (timer: ReturnType<typeof setTimeout>) => void;
 
 /**
- * Call `fire` once the wall clock reaches `deadlineMs` (epoch ms), through
- * timers no longer than one holds, so a deadline weeks away fires then rather
- * than at once. Each step reads the wall clock against the deadline and arms
- * the next for what's left, so the steps' own delays don't add up, and a
+ * Call `fire` at `deadlineMs` (epoch ms) by the wall clock, through timers no
+ * longer than one holds, so a deadline weeks away fires then rather than at
+ * once. When a step ends, it reads the wall clock against the deadline and
+ * arms the next for what's left, so the steps' own delays don't add up, and a
  * process that restarts and arms the same stored deadline aims at the same
- * time. `hold` gets each step's timer: clearing the latest one stops the rest.
+ * time. A step's own wait runs on Node's monotonic clock, so a change to the
+ * wall clock during a step is seen when that step ends. `hold` gets each
+ * step's timer: clearing the latest one stops the rest.
  */
 export function armAt(deadlineMs: number, hold: Hold, fire: () => void): void {
   const arm = (): void => {
