@@ -79,9 +79,11 @@ export interface TuneOutFrameworkHooks {
 
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Each duration's pending expiry step (params.expiresAtMs). stop clears
-   *  it, cancel does when it finds the tune-out in the registry, and the
-   *  channel's next accepted enter does in any case. */
+  /** Each duration's pending timer: a step toward its end time
+   *  (params.expiresAtMs), or the retry of an end-time cancel that threw.
+   *  stop clears it, cancel does when it finds the tune-out in the registry,
+   *  the end time does when its cancel finds the tune-out already ended,
+   *  and the channel's next accepted enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();

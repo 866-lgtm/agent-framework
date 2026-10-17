@@ -484,6 +484,8 @@ it('an end time whose cancel throws after the registry ended the tune-out stays 
 });
 
 it('an end time whose registry cancel throws is reported, and the cancel is tried again a minute later', (t) => {
+  // The stand-in's cancel throws before it changes anything, as a registry
+  // that writes its record before it changes memory does when the write fails.
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
   h.failNext('cancelTuneOut');
