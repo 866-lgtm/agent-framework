@@ -67,16 +67,31 @@ test('declared env reaches the interpreter; inheritEnv restores the host env', a
   }
 });
 
-test('the child env is rebuilt per spawn, not snapshotted at construction', async () => {
+test('the child env is built at each spawn: a respawn after idle reclaim sees a value changed since', async () => {
   const key = 'AF_CODE_EXEC_TEST_LATE_VAR';
-  const runner = new PyRunner({ onToolCall: async () => '', inheritEnv: true });
-  process.env[key] = 'set-after-construction';
+  const read = `import os; print(repr(os.environ.get(${JSON.stringify(key)})))`;
+  process.env[key] = 'first';
+  const runner = new PyRunner({ onToolCall: async () => '', inheritEnv: true, idleReclaimMs: 20, label: 'respawn' });
+  // The runner reports its idle reclaim on stderr; wait for that line rather than a guessed delay.
+  const error = console.error;
+  let reclaimed = false;
+  console.error = (...args: unknown[]) => {
+    if (args.map(String).join(' ').includes('[pytc:respawn] reclaiming python interpreter (idle)')) reclaimed = true;
+    else error(...args);
+  };
   try {
-    const r = await runner.exec(`import os; print(repr(os.environ.get(${JSON.stringify(key)})))`, []);
-    assert.equal(r.returnCode, 0, r.stderr);
-    assert.match(r.stdout, /set-after-construction/,
-      `a var set after construction must reach the next spawn: ${r.stdout.trim()}`);
+    const before = await runner.exec(read, []);
+    assert.equal(before.returnCode, 0, before.stderr);
+    assert.match(before.stdout, /'first'/, before.stdout);
+    const deadline = Date.now() + 10_000;
+    while (!reclaimed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(reclaimed, 'the idle interpreter should have been reclaimed');
+    process.env[key] = 'second';
+    const after = await runner.exec(read, []);
+    assert.equal(after.returnCode, 0, after.stderr);
+    assert.match(after.stdout, /'second'/, `the respawned interpreter must see the value set since the first spawn: ${after.stdout.trim()}`);
   } finally {
+    console.error = error;
     runner.dispose();
     delete process.env[key];
   }
