@@ -1598,6 +1598,12 @@ export class ChannelRegistry {
     }
   }
 
+  /**
+   * Each writer appends here before it changes memory, so an append that
+   * throws, as on a full disk, leaves memory as it was: the operation
+   * fails, a retry records it rather than taking a same-state return, and a
+   * restart replays what memory held.
+   */
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
   }
@@ -1703,6 +1709,16 @@ export class ChannelRegistry {
     const recipientNameUnchanged = recipientName === undefined || recipientName === this.dmRecipientNames.get(channelId);
     const isDmUnchanged = isDm === undefined || this.dmClassified.get(channelId) === true;
     if (labelUnchanged && recipientIdUnchanged && recipientNameUnchanged && isDmUnchanged) return;
+    // The log first, as for lifecycle events: an append that throws leaves
+    // the history in memory as it was, so the next sighting records it.
+    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
+      channelId,
+      label,
+      ts: Date.now(),
+      ...(recipientId ? { recipientId } : {}),
+      ...(recipientName ? { recipientName } : {}),
+      ...(isDm ? { isDm } : {}),
+    } satisfies ChannelLabelSightingEvent);
     this.labelHistory.set(channelId, label);
     let seen = this.allLabelsSeen.get(channelId);
     if (!seen) {
@@ -1713,14 +1729,6 @@ export class ChannelRegistry {
     if (recipientId) this.dmRecipientIds.set(channelId, recipientId);
     if (recipientName) this.dmRecipientNames.set(channelId, recipientName);
     if (isDm) this.dmClassified.set(channelId, true);
-    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
-      channelId,
-      label,
-      ts: Date.now(),
-      ...(recipientId ? { recipientId } : {}),
-      ...(recipientName ? { recipientName } : {}),
-      ...(isDm ? { isDm } : {}),
-    } satisfies ChannelLabelSightingEvent);
   }
 
   /**
@@ -1945,7 +1953,6 @@ export class ChannelRegistry {
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
     if (this.desiredStates.get(key)?.state === desired) return;
-    this.desiredStates.set(key, { state: desired, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1954,6 +1961,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: desired, source });
   }
 
   // ==========================================================================
@@ -1973,12 +1981,6 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    this.desiredStates.set(key, {
-      state: 'tuned-out',
-      source,
-      tuneOut: params,
-      wakeCount: 0,
-    });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1987,6 +1989,12 @@ export class ChannelRegistry {
       tuneOut: params,
       source,
       timestamp: new Date().toISOString(),
+    });
+    this.desiredStates.set(key, {
+      state: 'tuned-out',
+      source,
+      tuneOut: params,
+      wakeCount: 0,
     });
   }
 
@@ -2006,7 +2014,6 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
-    this.desiredStates.set(key, { state: nextState, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -2015,6 +2022,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: nextState, source });
     return ended;
   }
 
@@ -2032,16 +2040,17 @@ export class ChannelRegistry {
     const key = this.lifecycleKey(serverId, channelId);
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
-    current.wakeCount = (current.wakeCount ?? 0) + 1;
+    const wakeCount = (current.wakeCount ?? 0) + 1;
     this.appendLifecycleEvent({
       kind: 'tune-out-wake',
       serverId,
       channelId,
       epochId: current.tuneOut.epochId,
-      wakeCount: current.wakeCount,
+      wakeCount,
       timestamp: new Date().toISOString(),
     });
-    return { params: current.tuneOut, wakeCount: current.wakeCount };
+    current.wakeCount = wakeCount;
+    return { params: current.tuneOut, wakeCount };
   }
 
   /** Active tune-out params + wake count for a channel, or null. */
@@ -2116,13 +2125,13 @@ export class ChannelRegistry {
       this.setDesiredState(serverId, channel.id, desired, 'legacy-recipe-migration');
     }
 
-    this.migratedLegacyPolicies.add(serverId);
     this.appendLifecycleEvent({
       kind: 'legacy-policy-migrated',
       serverId,
       source: Array.isArray(policy) ? 'allow-list' : policy,
       timestamp: new Date().toISOString(),
     });
+    this.migratedLegacyPolicies.add(serverId);
   }
 
   /**
