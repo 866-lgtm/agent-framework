@@ -127,6 +127,7 @@ test('a context write deferred while quiesced syncs the deferred-writes record t
     const record = join(recovery, 'deferred-writes.json');
     const calls = await recordingFs(async () => { add('user', [{ type: 'text', text: 'held' }]); });
     assertSyncedAround(calls, record, recovery);
+    assertSyncedAround(calls, record, dirname(recovery));
     const pending = (JSON.parse(readFileSync(record, 'utf8')) as { pending: Array<{ content: Array<{ text: string }> }> }).pending;
     assert.deepEqual(pending.map((entry) => entry.content[0]!.text), ['held']);
   });
@@ -238,20 +239,23 @@ test('on win32 the temp file is still synced, and no directory is opened to sync
   });
 });
 
-test('a directory sync that fails after the rename leaves the new record in place and raises an ops alert naming it', async () => {
-  await withFramework(async (framework, recovery) => {
-    const alerts: Array<{ kind: string; agentName: string; message: string; data?: Record<string, unknown> }> = [];
-    (framework as unknown as { opsAlert: unknown }).opsAlert = (kind: string, agentName: string, message: string, opts?: { data?: Record<string, unknown> }) => {
-      alerts.push({ kind, agentName, message, data: opts?.data });
-    };
-    const record = join(recovery, 'host-mode.json');
-    await recordingFs(() => framework.quiesce({ reason: 'test' }), (c) => (c.call === 'fsync' && c.path === recovery ? fsError('EIO', 'fsync') : undefined));
-    assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
-    assert.deepEqual(alerts, [{
-      kind: 'recovery-sync',
-      agentName: 'framework',
-      message: `syncing ${recovery} failed, so ${record} may not survive a crash: EIO: i/o error, fsync`,
-      data: { record, directory: recovery, code: 'EIO' },
-    }]);
+for (const which of ['directory', 'parent'] as const) {
+  test(`a sync of the record's ${which} that fails after the rename leaves the new record in place and raises an ops alert naming it`, async () => {
+    await withFramework(async (framework, recovery) => {
+      const alerts: Array<{ kind: string; agentName: string; message: string; data?: Record<string, unknown> }> = [];
+      (framework as unknown as { opsAlert: unknown }).opsAlert = (kind: string, agentName: string, message: string, opts?: { data?: Record<string, unknown> }) => {
+        alerts.push({ kind, agentName, message, data: opts?.data });
+      };
+      const record = join(recovery, 'host-mode.json');
+      const failing = which === 'directory' ? recovery : dirname(recovery);
+      await recordingFs(() => framework.quiesce({ reason: 'test' }), (c) => (c.call === 'fsync' && c.path === failing ? fsError('EIO', 'fsync') : undefined));
+      assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
+      assert.deepEqual(alerts, [{
+        kind: 'recovery-sync',
+        agentName: 'framework',
+        message: `syncing ${failing} failed, so ${record} may not survive a crash: EIO: i/o error, fsync`,
+        data: { record, directory: failing, code: 'EIO' },
+      }]);
+    });
   });
-});
+}

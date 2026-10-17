@@ -5358,15 +5358,16 @@ export class AgentFramework {
 
   /** Atomic, durable JSON write for the recovery files. The document goes to
    *  a temp file at 0600, which is synced and renamed over the record. Then
-   *  the directory is synced, for the record's entry in it, and so is its
-   *  parent, for the directory's own entry, which is new when a write, this
-   *  one or an earlier one, had to make the directory. Directories are synced
-   *  on POSIX only; win32 syncs the file. So a crash leaves the record as it
-   *  was or the new one, whole. A failure before the rename removes the temp
-   *  file, if it was made, and throws an error saying the record was left as
-   *  it was, with the original as its cause and its code kept. A directory
-   *  sync that fails is raised as an ops alert, not thrown: the new record is
-   *  in place, and the callers go on to record it as written. */
+   *  the directory is synced, for the record's entry in it, and its parent,
+   *  for the directory's own entry, which is new when a write, this one or an
+   *  earlier one, had to make the directory; levels above are left to the
+   *  filesystem. Directories are synced on POSIX only; win32 syncs the file.
+   *  So a crash leaves the record as it was or the new one, whole. A failure
+   *  before the rename removes the temp file, if it was made, and throws an
+   *  error saying the record was left as it was, with the original as its
+   *  cause and its code kept. A directory sync that fails is raised as an ops
+   *  alert, not thrown: the new record is in place, and the callers go on to
+   *  record it as written. */
   private writeRecoveryFile(path: string, document: unknown): void {
     const directory = dirname(path);
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
