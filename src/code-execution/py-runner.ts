@@ -306,7 +306,11 @@ export class PyRunner {
 
     const child = spawn(this.pythonPath, [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1' },
+      // Set last, over a declared env: the protocol needs both. It writes
+      // non-ASCII JSON on piped stdio, which Python before 3.15 on Windows
+      // encodes in the ANSI code page unless told otherwise, and a host's
+      // own PYTHONUTF8 no longer reaches the interpreter.
+      env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
 

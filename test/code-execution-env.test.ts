@@ -96,3 +96,14 @@ test('the child env is built at each spawn: a respawn after idle reclaim sees a 
     delete process.env[key];
   }
 });
+
+test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env, since the protocol needs both', async () => {
+  const runner = new PyRunner({ onToolCall: async () => '', env: { PYTHONUNBUFFERED: '0', PYTHONIOENCODING: 'latin-1' } });
+  try {
+    const r = await runner.exec(`import os; print(os.environ.get('PYTHONUNBUFFERED'), os.environ.get('PYTHONIOENCODING'))`, []);
+    assert.equal(r.returnCode, 0, r.stderr);
+    assert.match(r.stdout, /^1 utf-8$/m, r.stdout);
+  } finally {
+    runner.dispose();
+  }
+});
