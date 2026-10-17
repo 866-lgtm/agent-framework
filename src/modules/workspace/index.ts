@@ -3193,11 +3193,14 @@ function globToRegex(pattern: string): RegExp {
   let regex = '';
   let i = 0;
   while (i < pattern.length) {
+    // Whether the part that starts here starts a path segment (see
+    // globPartToRegex).
+    const atSegmentStart = i === 0 || pattern[i - 1] === '/';
     if (pattern[i] === '{') {
       const closeIdx = pattern.indexOf('}', i);
       if (closeIdx > i) {
         const alternatives = pattern.slice(i + 1, closeIdx).split(',');
-        regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
+        regex += '(?:' + alternatives.map(a => globPartToRegex(a, atSegmentStart)).join('|') + ')';
         i = closeIdx + 1;
         continue;
       }
@@ -3209,17 +3212,21 @@ function globToRegex(pattern: string): RegExp {
       i++;
     }
     if (chunk) {
-      regex += globPartToRegex(chunk);
+      regex += globPartToRegex(chunk, atSegmentStart);
     }
   }
   return new RegExp(`^${regex}$`);
 }
 
-function globPartToRegex(part: string): string {
-  return part
-    .replace(/[.+^$()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '__DOUBLESTAR__')
-    .replace(/\*/g, '[^/]*')
-    .replace(/__DOUBLESTAR__/g, '.*')
-    .replace(/\?/g, '[^/]');
+// What each glob token becomes. A `**/` at the start of a path segment matches
+// zero or more whole directories, so `src/**/*.ts` also matches `src/main.ts`;
+// any other `**` matches any run of characters.
+const GLOB_TOKENS: Record<string, string> = { '**/': '(?:.*/)?', '**': '.*', '*': '[^/]*', '?': '[^/]' };
+
+// One part of a pattern, between brace groups or inside one. A part that
+// doesn't start a path segment, such as one right after a brace group, reads
+// a `**/` at its start as any run of characters and then a directory.
+function globPartToRegex(part: string, atSegmentStart: boolean): string {
+  return part.replace(/(?<=^|\/)\*\*\/|\*\*|[*?]|[.+^$()|[\]\\]/g, (m, offset: number) =>
+    m === '**/' && offset === 0 && !atSegmentStart ? '.*/' : GLOB_TOKENS[m] ?? `\\${m}`);
 }
