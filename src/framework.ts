@@ -4,7 +4,7 @@ import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradi
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
@@ -742,6 +742,18 @@ const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
+
+/** Why the framework ended a stream at a tool boundary: an endTurn tool
+ *  result, or a context-budget or physical-window restart (the
+ *  `inference:stream_restarted` reasons). It is the stream's inference-log
+ *  stop reason. */
+type StreamBoundaryEnd = 'turn_ended' | 'context_budget' | 'physical_window';
+
+/** The request a boundary-ended stream's inference-log entry records in
+ *  place of its body. A body is the whole compiled context, one blob per
+ *  entry; these ends happen every tool-ended turn and every context-budget
+ *  or physical-window restart. */
+const BOUNDARY_END_REQUEST = { note: 'request body not kept for a stream ended at a tool boundary' };
 
 /** Maximum number of turn checkpoints to keep per agent. */
 const MAX_TURN_CHECKPOINTS = 20;
@@ -1752,6 +1764,16 @@ export class AgentFramework {
    * running; only new turns (wake gate in processInferenceRequests) and MCPL
    * data planes are held. */
   private quiesced = false;
+  /** Whether the host-mode record may say quiesced, as this process last read
+   * or wrote it. quiesce() writes the record before it sets `quiesced`, and
+   * resume() clears `quiesced` before the record, so after a resume whose
+   * clear failed, or a quiesce whose write failed partway, memory can say
+   * serving while the record says quiesced, until a resume() clears it. */
+  private hostModeRecordMayBeQuiesced = false;
+  /** Whether a resume() is between serving and clearing the record: it has
+   * cleared `quiesced` and is flushing the deferred writes, then clearing the
+   * record. A resume() on the serving host leaves the record to it. */
+  private resumeInFlight = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
   private traceListeners: TraceRegistration[] = [];
@@ -1792,6 +1814,14 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+  // The framework ends a stream at a tool boundary from handleProcessEvent:
+  // an endTurn result, or a context-budget or physical-window restart. Each
+  // live stream registers here how to record that end (its usage, its log
+  // entry and, for endTurn, the completed turn), so the record is made where
+  // the decision is taken, before the cancellation's asynchronous teardown
+  // or an ephemeral's disposal. Keyed by the physical stream, so a
+  // successor's record is never touched.
+  private streamBoundaryEnds = new WeakMap<YieldingStream, (end: StreamBoundaryEnd) => void>();
 
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
@@ -1872,7 +1902,8 @@ export class AgentFramework {
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
   private disposedEphemeralFrames: WeakSet<Agent> = new WeakSet();
-  /** Per-agent count of consecutive exhausted inferences (reset on any success).
+  /** Per-agent count of consecutive exhausted inferences, reset when a turn
+   *  completes (inference:completed), not when a call answers mid-turn.
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
@@ -1896,7 +1927,8 @@ export class AgentFramework {
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
-   *  breaker (noteInferenceExhausted). Reset on any successful inference.
+   *  breaker (noteInferenceExhausted). Reset when a turn completes
+   *  (inference:completed).
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
    *  the refusal loop, so the breaker can never shed the whole history. */
   private exhaustionRewinds: Map<string, number> = new Map();
@@ -2623,6 +2655,7 @@ export class AgentFramework {
         await framework.flushDeferredWrites('boot-recovery');
       }
       if (hostMode?.quiesced) {
+        framework.hostModeRecordMayBeQuiesced = true;
         framework.quiesced = true;
         framework.quiesceReason = hostMode.reason;
         framework.quiescedAt = hostMode.since;
@@ -4898,15 +4931,22 @@ export class AgentFramework {
       }
       return this.getHostModeStatus();
     }
-    this.quiesced = true;
-    this.quiesceReason = opts?.reason;
-    this.quiescedAt = Date.now();
-    this.lastUnabandonable = [];
+    // The record first, then the flag: a write that fails rejects with the
+    // host still serving, and a retry isn't taken by the check above for a
+    // quiesce already done, so it writes the record. A write that fails
+    // partway, such as a store write whose sync fails, may still reach the
+    // record, so a later resume() clears it.
+    const since = Date.now();
+    this.hostModeRecordMayBeQuiesced = true;
     this.persistHostMode({
       quiesced: true,
       ...(opts?.reason ? { reason: opts.reason } : {}),
-      since: this.quiescedAt,
+      since,
     });
+    this.quiesced = true;
+    this.quiesceReason = opts?.reason;
+    this.quiescedAt = since;
+    this.lastUnabandonable = [];
     console.error(
       `[host-mode] quiescing${opts?.reason ? ` (${opts.reason})` : ''}: parking wakes, ` +
       `pausing MCPL data planes, draining ${this.activeTurnTokens.size} in-flight turn(s)`,
@@ -5041,7 +5081,20 @@ export class AgentFramework {
   }
 
   private async runResume(opts?: { force?: boolean }): Promise<HostModeStatus> {
-    if (!this.quiesced) return this.getHostModeStatus();
+    if (!this.quiesced) {
+      // A resume whose record clear failed, or a quiesce whose write failed
+      // partway, can leave memory serving and the record quiesced: this
+      // resume clears the record, rather than answer as if it had. It
+      // writes the store, so it waits out a surgery as the clear below does,
+      // and it leaves the record to a resume() still flushing, which clears
+      // it once its flush is done.
+      if (this.hostModeRecordMayBeQuiesced && !this.resumeInFlight) {
+        this.refuseResumeUnderSurgery();
+        this.persistHostMode(null);
+        this.hostModeRecordMayBeQuiesced = false;
+      }
+      return this.getHostModeStatus();
+    }
     // A surgery switches or forks the branch while it holds the store, and a
     // manager whose initialization that left pending refuses its settings
     // read: resume once it's done, as the other operator calls do. Checked
@@ -5116,6 +5169,7 @@ export class AgentFramework {
     this.lastUnabandonable = [];
     this.eventGate?.setQuiesced(false);
 
+    this.resumeInFlight = true;
     try {
       // Flush context writes deferred by the quiesce window (module events,
       // api message.send) — with no turn alive there is no other flush
@@ -5123,7 +5177,9 @@ export class AgentFramework {
       // flushDeferredWrites); nothing here may reach the plane reopen below.
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
+      this.hostModeRecordMayBeQuiesced = false;
     } finally {
+      this.resumeInFlight = false;
       // Reopen MCPL data planes (quiesced is already false). In `finally`
       // so that nothing above can leave the host un-quiesced with every data
       // plane still paused.
@@ -6155,11 +6211,13 @@ export class AgentFramework {
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
-  /** Persist (or clear, with null) the host quiesce mode. First process-global
-   * key in the framework/state slot: quiesce survives a restart BY DESIGN — a
-   * crash mid-surgery must come back up NOT serving against a half-repaired
-   * store. Resume is always reachable (public method, WS/HTTP, control-plane
-   * host/command), and every quiesced boot logs a loud banner. */
+  /** Persist (or clear, with null) the host quiesce mode: in the recovery file
+   * when there's a path for one, and in framework/state's hostMode otherwise.
+   * (A boot with a path reads that legacy hostMode only while no file exists.)
+   * Quiesce survives a restart BY DESIGN — a crash mid-surgery must come back
+   * up NOT serving against a half-repaired store. Resume is always reachable
+   * (public method, WS/HTTP, control-plane host/command), and every quiesced
+   * boot logs a loud banner. */
   private persistHostMode(mode: { quiesced: true; reason?: string; since: number } | null): void {
     if (this.hostModePath) {
       // Branch-independent: the recovery file is the record. (`quiesced:
@@ -6188,9 +6246,17 @@ export class AgentFramework {
       if (mode === null) delete state.hostMode;
       else state.hostMode = { ...mode };
       this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+      // Here the store is the record, and the whole feature rests on it
+      // surviving a crash: until the store syncs it isn't durable, so a sync
+      // that fails fails quiesce() or resume(). The write is already in the
+      // store's log, unsynced, so it can still reach disk, which is why
+      // runQuiesce marks the record as possibly quiesced before it writes.
+      this.store.sync();
+      return;
     }
-    // The whole feature rests on the flag surviving a crash — close the
-    // window between the write and the next periodic sync.
+    // The recovery file is the record, written above. This sync only narrows
+    // the window for the store's own writes, such as the legacy marker's
+    // removal, so a failure is logged.
     try {
       this.store.sync();
     } catch (err) {
@@ -7155,6 +7221,23 @@ export class AgentFramework {
         err instanceof Error ? err.message : err,
       );
     }
+  }
+
+  /**
+   * A turn that ended WITHOUT a refusal (a natural completion that wasn't
+   * one, or a tool-ended turn) ends the rewind episode: the model responded.
+   * Leave the consolidated marker in place as the durable record; just
+   * clear the per-episode counters, and report a forced `/unstick` done.
+   */
+  private endRefusalEpisode(agentName: string): void {
+    if (this.forcedRewind.has(agentName)) {
+      this.finishUnstick(agentName, true);
+    }
+    if (this.refusalRewinds.get(agentName)) {
+      this.refusalRewinds.set(agentName, 0);
+    }
+    this.rewindEpisode.delete(agentName);
+    this.refusalStreak.delete(agentName);
   }
 
   /**
@@ -10049,6 +10132,11 @@ export class AgentFramework {
             // driveStream's finally is the backstop.)
             this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' }, this.turnRouting.get(agent.name));
+            // A successful turn end, recorded as a natural completion's is:
+            // inference:completed with the rounds' usage, then turn_ended.
+            if (currentState.stream) {
+              this.streamBoundaryEnds.get(currentState.stream)?.('turn_ended');
+            }
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
           } else if (overBudget || overPhysical) {
             // Context budget exceeded: break the stream, let compile() compress.
@@ -10060,6 +10148,9 @@ export class AgentFramework {
             // endTurn above).
             if (currentState.stream) {
               this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
+              // Its rounds were billed; the restart opens a fresh stream
+              // with its own usage.
+              this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
             }
             agent.cancelStream();
             this.emitTrace({
@@ -13149,6 +13240,116 @@ export class AgentFramework {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
+    // Membrane's usage events are cumulative across the stream's tool loop,
+    // so the latest is everything the stream has been billed for so far:
+    // the measure of a stream that ends without a final response.
+    let latestUsage: DetailedUsage | undefined;
+    const tokenUsageOf = (usage: DetailedUsage | undefined): InferenceLogEntry['tokenUsage'] => usage
+      ? {
+          input: usage.inputTokens,
+          output: usage.outputTokens,
+          cacheCreation: usage.cacheCreationTokens,
+          cacheRead: usage.cacheReadTokens,
+        }
+      : undefined;
+    // The stream's billed usage reaches the session totals once, however the
+    // stream ends. A completion counts its final response's detailed usage,
+    // and the guard's abandoned round its detailed usage, else the latest
+    // sample, else the response's own. Every other end counts the rounds it
+    // finished: a final response without detailed usage, the boundary ends
+    // below, and `finally` for the rest. Each caller passes the one value it
+    // also reports.
+    let usageCounted = false;
+    let countedUsage: DetailedUsage | undefined;
+    const countUsage = (usage: DetailedUsage | undefined): void => {
+      if (usageCounted) return;
+      usageCounted = true;
+      countedUsage = usage;
+      if (!usage) return;
+      this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
+        ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
+        : undefined);
+      this.persistUsageState();
+    };
+    // ...and is carried by exactly one of its inference-log entries, so
+    // totals summed from the log count each stream once, as the session's
+    // do. The first entry that has usage to carry carries it (the value the
+    // entry names, else the rounds finished so far): an entry before it with
+    // none leaves it to the next, and no entry after it carries it again. An
+    // end that writes no entry of its own is logged in `finally`, when it has
+    // rounds to carry.
+    let usageLogged = false;
+    const logStream = (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>): void => {
+      const tokenUsage = usageLogged ? undefined : (entry.tokenUsage ?? tokenUsageOf(latestUsage));
+      if (tokenUsage) usageLogged = true;
+      this.logInference({
+        timestamp: startTime,
+        agentName: agent.name,
+        requestId,
+        ...entry,
+        tokenUsage,
+      });
+    };
+    // What ended a stream whose end writes no log entry of its own, for the
+    // entry `finally` writes for it.
+    let unloggedEnd: string | undefined;
+    // A turn that ended successfully: with its final response (natural
+    // completion), or without one, when a tool result with endTurn ended it.
+    const completeTurn = (usage: DetailedUsage | undefined, durationMs: number, response?: NormalizedResponse): void => {
+      // The trace, the session totals and the log entry all say the same.
+      const used = usage ?? latestUsage;
+      const tokenUsage = tokenUsageOf(used);
+      this.emitTrace({
+        type: 'inference:completed',
+        agentName: agent.name,
+        durationMs,
+        tokenUsage,
+      });
+      countUsage(used);
+      logStream(response
+        ? {
+            success: true,
+            request: compiledRequest ?? { note: 'streaming request' },
+            response: response.raw ?? { note: 'streaming response' },
+            durationMs,
+            tokenUsage,
+            stopReason: response.stopReason,
+          }
+        : {
+            success: true,
+            request: BOUNDARY_END_REQUEST,
+            response: { note: 'stream ended by tool result' },
+            durationMs,
+            tokenUsage,
+            stopReason: 'turn_ended',
+          });
+    };
+    this.streamBoundaryEnds.set(stream, (end) => {
+      const durationMs = Date.now() - startTime;
+      const turnEnded = end === 'turn_ended';
+      if (turnEnded) this.recordProviderAccelerationRecovery(agent, compiledRequest, end);
+      // The accounting writes to the store, and a write that fails must not
+      // skip what the boundary does after this call: the rest of a turn's
+      // end, or a restart's cancel and its request, and then the event's
+      // dispatch to modules.
+      try {
+        if (turnEnded) {
+          completeTurn(latestUsage, durationMs);
+        } else {
+          countUsage(latestUsage);
+          logStream({
+            success: true,
+            request: BOUNDARY_END_REQUEST,
+            response: { note: 'stream restarted to compress its context' },
+            durationMs,
+            stopReason: end,
+          });
+        }
+      } catch (error) {
+        console.error(`[usage] agent=${agent.name} could not record a stream's usage at its end: ${describeFailureWithFrames(error)}`);
+      }
+      if (turnEnded) this.endRefusalEpisode(agent.name);
+    });
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the
     // physical provider-call boundary (estimator calibration and the
@@ -13688,29 +13889,15 @@ export class AgentFramework {
               proseStream?.reset();
               if (turnProseRouting === 'explicit') proseStream?.retarget(streamRouting.destination);
               if (withheld) {
-                const usage = response.details?.usage ?? response.usage;
-                const tokenUsage = usage ? {
-                  input: usage.inputTokens, output: usage.outputTokens,
-                  cacheCreation: usage.cacheCreationTokens, cacheRead: usage.cacheReadTokens,
-                } : undefined;
-                this.noteRefusal(agent.name, category, tokenUsage);
                 // The abandoned stream was billed (membrane usage here is
                 // cumulative across this physical tool loop): count it before
-                // the retry opens a fresh stream with its own usage.
-                const abandonedUsage = response.details?.usage;
-                if (abandonedUsage) {
-                  this.usageTracker.onInferenceCompleted(agent.name, {
-                    inputTokens: abandonedUsage.inputTokens,
-                    outputTokens: abandonedUsage.outputTokens,
-                    cacheCreationTokens: abandonedUsage.cacheCreationTokens,
-                    cacheReadTokens: abandonedUsage.cacheReadTokens,
-                  }, abandonedUsage.estimatedCost
-                    ? { total: abandonedUsage.estimatedCost.total, currency: abandonedUsage.estimatedCost.currency }
-                    : undefined);
-                  this.persistUsageState();
-                }
-                this.logInference({
-                  timestamp: startTime, agentName: agent.name, requestId,
+                // the retry opens a fresh stream with its own usage. One value
+                // for the count, the log entry and the refusal note.
+                const abandoned: DetailedUsage | undefined = response.details?.usage ?? latestUsage ?? response.usage;
+                const tokenUsage = tokenUsageOf(abandoned);
+                this.noteRefusal(agent.name, category, tokenUsage);
+                countUsage(abandoned);
+                logStream({
                   success: false, error: 'Tool output withheld by the guard',
                   request: compiledRequest ?? {}, response, durationMs, tokenUsage, stopReason: 'refusal',
                 });
@@ -13884,14 +14071,8 @@ export class AgentFramework {
             const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg)) : [];
 
             const du = response.details?.usage;
-            const tokenUsage = du
-              ? {
-                  input: du.inputTokens,
-                  output: du.outputTokens,
-                  cacheCreation: du.cacheCreationTokens,
-                  cacheRead: du.cacheReadTokens,
-                }
-              : undefined;
+            // A refusal's note carries what completeTurn counts.
+            const tokenUsage = tokenUsageOf(du ?? latestUsage);
 
             // Async completion work may overlap a replacement stream. Recheck
             // physical ownership before any terminal state/settlement side effect.
@@ -13919,35 +14100,7 @@ export class AgentFramework {
                     .join('\n'),
             }, streamRouting);
 
-            this.emitTrace({
-              type: 'inference:completed',
-              agentName: agent.name,
-              durationMs,
-              tokenUsage,
-            });
-
-            if (du) {
-              this.usageTracker.onInferenceCompleted(agent.name, {
-                inputTokens: du.inputTokens,
-                outputTokens: du.outputTokens,
-                cacheCreationTokens: du.cacheCreationTokens,
-                cacheReadTokens: du.cacheReadTokens,
-              }, du.estimatedCost ? { total: du.estimatedCost.total, currency: du.estimatedCost.currency } : undefined);
-              this.persistUsageState();
-            }
-
-            // Log inference
-            this.logInference({
-              timestamp: startTime,
-              agentName: agent.name,
-              requestId,
-              success: true,
-              request: compiledRequest ?? { note: 'streaming request' },
-              response: response.raw ?? { note: 'streaming response' },
-              durationMs,
-              tokenUsage,
-              stopReason: response.stopReason,
-            });
+            completeTurn(du, durationMs, response);
 
             // Surface refusals instead of going silently mute: stderr line
             // (headless inference failures are otherwise under-logged) + an
@@ -14055,17 +14208,7 @@ export class AgentFramework {
                 void this.reactToRefusal(agent.name, category);
               }
             } else {
-              // A turn that completed WITHOUT a refusal ends the rewind episode:
-              // the model responded. Leave the consolidated marker in place as
-              // the durable record; just clear the per-episode counters.
-              if (this.forcedRewind.has(agent.name)) {
-                this.finishUnstick(agent.name, true);
-              }
-              if (this.refusalRewinds.get(agent.name)) {
-                this.refusalRewinds.set(agent.name, 0);
-              }
-              this.rewindEpisode.delete(agent.name);
-              this.refusalStreak.delete(agent.name);
+              this.endRefusalEpisode(agent.name);
             }
 
             // Dispatch speech (and thoughts if any)
@@ -14274,10 +14417,7 @@ export class AgentFramework {
               stack: err.stack,
             });
 
-            this.logInference({
-              timestamp: startTime,
-              agentName: agent.name,
-              requestId,
+            logStream({
               success: false,
               error: err.message,
               request: compiledRequest ?? { note: 'streaming request failed' },
@@ -14395,6 +14535,7 @@ export class AgentFramework {
                   this.eventGate?.onInferenceEnded(agent.name);
                 }
                 if (cancelKind === 'quiesce_abandoned') {
+                  unloggedEnd = 'Turn abandoned by operator quiesce';
                   // Operator-initiated cancel during a quiesce drain. Settle
                   // the turn honestly — deliberately NO inference:exhausted:
                   // that trace centrally drives the consecutive-failure
@@ -14464,10 +14605,7 @@ export class AgentFramework {
               // state. Without this, abort-terminated inferences are
               // invisible to forensic queries (only request-side telemetry
               // via llm-calls.jsonl shows them, and only by absence).
-              this.logInference({
-                timestamp: startTime,
-                agentName: agent.name,
-                requestId,
+              logStream({
                 success: false,
                 error: `Stream aborted: ${reason}`,
                 request: compiledRequest ?? { note: 'streaming request aborted' },
@@ -14479,6 +14617,8 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            // Cumulative across the stream's rounds: replace, never sum.
+            latestUsage = event.usage;
             // The stream's accumulated fresh input, which is what the
             // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
@@ -14602,7 +14742,7 @@ export class AgentFramework {
       const durationMs = Date.now() - startTime;
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
         this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
-        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+        logStream({ success: false,
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abortAgentScript(agent.name, 'provider acceleration cooldown');
@@ -14616,7 +14756,7 @@ export class AgentFramework {
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
         this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
-        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+        logStream({ success: false,
           error: `Provider wait: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abortAgentScript(agent.name, 'provider wait');
@@ -14643,10 +14783,7 @@ export class AgentFramework {
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
-      this.logInference({
-        timestamp: startTime,
-        agentName: agent.name,
-        requestId,
+      logStream({
         success: false,
         error: `Stream threw: ${err.message}`,
         request: compiledRequest ?? { note: 'streaming request threw' },
@@ -14657,6 +14794,35 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // The accounting writes to the store, and a write that fails must not
+      // skip the teardown after it.
+      try {
+        // Every end the cases above didn't count (a stream error or abort, a
+        // throw, a superseded generation) still billed the rounds it finished.
+        countUsage(latestUsage);
+        // An end that wrote no entry carrying them (a quiesce-abandoned turn,
+        // a stream superseded by a newer one, a disposed agent's stream) writes
+        // one now, as a failure naming what ended it, so the log carries what
+        // the totals count. With no finished round there is nothing to carry,
+        // and no entry is written, as before.
+        if (countedUsage && !usageLogged) {
+          const replaced = this.agents.get(agent.name) !== agent;
+          const superseded = generationLost || agent.streamId !== myStreamId;
+          logStream({
+            success: false,
+            error: unloggedEnd ?? (replaced
+              ? 'Stream abandoned: its agent was disposed or replaced'
+              : superseded
+                ? 'Stream superseded: a newer stream of the agent took over'
+                : 'Stream ended without a final response'),
+            request: compiledRequest ?? { note: 'streaming request' },
+            durationMs: Date.now() - startTime,
+            tokenUsage: tokenUsageOf(countedUsage),
+          });
+        }
+      } catch (error) {
+        console.error(`[usage] agent=${agent.name} could not record a stream's usage at its end: ${describeFailureWithFrames(error)}`);
+      }
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
         try {
@@ -16072,6 +16238,10 @@ export class AgentFramework {
     return clone;
   }
 
+  /** Writes one inference-log entry. A stream's entries go through its
+   *  driveStream's `logStream`, which gives the stream's usage to one entry
+   *  only; an end that calls this directly for a stream writes a second
+   *  entry for it, and its usage can be counted twice in the log. */
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
@@ -16876,9 +17046,14 @@ export class AgentFramework {
         },
       );
     } else if (event.type === 'inference:completed') {
-      // A successful response — even mid-turn between tool calls — proves the
-      // agent isn't hard-down; clear its consecutive-failure streak (and the
-      // poison-history breaker's rewind budget).
+      // A completed turn, a tool-ended one included, shows the agent can
+      // complete turns: clear its consecutive-failure streak and the
+      // poison-history breaker's rewind budget. A provider call answered
+      // mid-turn (inference:usage) doesn't. The streak exists to catch an
+      // agent that can't complete a turn, and an agent whose every turn has a
+      // first call that answers and a later one that fails is exactly that:
+      // a reset per answered call would keep it below the hard-down
+      // threshold, so neither the alert nor the breaker would come.
       const name = event.agentName as string | undefined;
       if (name && this.consecutiveInferenceFailures.get(name)) {
         this.consecutiveInferenceFailures.set(name, 0);
@@ -17403,7 +17578,7 @@ export class AgentFramework {
    * push event to wake the agent onto the same context.
    *
    * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
-   * sheds per failure episode; the budget resets on any successful inference.
+   * sheds per failure episode; the budget resets when a turn completes.
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
@@ -19976,12 +20151,12 @@ export class AgentFramework {
       .find((e) => e.descriptor.id === channelId);
     let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
     if (!entry) {
-      result = { success: false, error: `unknown channel: ${channelId}`, isError: false };
+      result = { success: false, error: `unknown channel: ${channelId}`, isError: true };
     } else if (input.mode === 'cancel') {
       const r = coordinator.cancel(entry.serverId, channelId, 'agent-tool', 'agent request');
       result = r.ok
         ? { success: true, data: { cancelled: channelId } }
-        : { success: false, error: r.error, isError: false };
+        : { success: false, error: r.error, isError: true };
     } else {
       const r = coordinator.enter(entry.serverId, channelId, {
         cadenceSeconds: input.cadenceSeconds,
@@ -19999,7 +20174,7 @@ export class AgentFramework {
               maxWakes: r.params.maxWakes,
             },
           }
-        : { success: false, error: r.error, isError: false };
+        : { success: false, error: r.error, isError: true };
     }
     this.pushEvent({
       type: 'tool-result',
