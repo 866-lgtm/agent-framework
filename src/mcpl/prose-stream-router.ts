@@ -62,8 +62,10 @@ export class ProseStreamRouter {
       /** Whether speech may be published to this channel now. Text for a
        *  channel it refuses is neither emitted nor kept for outgoing/complete,
        *  so the stream's end can't carry it there should that change before
-       *  the stream ends. Asked as the text is routed. Every channel, when
-       *  left out. */
+       *  the stream ends. Asked as the text is routed, while delivery decides
+       *  when its round is admitted: text refused here stays out of the
+       *  stream even if the channel accepts speech again by then and the
+       *  round posts it. Every channel, when left out. */
       speakable?: (channelId: string) => boolean;
     },
   ) {
