@@ -37,9 +37,10 @@
  * into both streams once the script has returned; each stream is first in,
  * first out, so what the script and the commands it waited for wrote is ahead
  * of it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
- * protocol, and the runtime puts them back as the host set them at each
- * exec's start. Its own fds (3 and 4, and its copies of 0, 1 and 2) it checks
- * at each exec's start and end: one a script closed or replaced ends the
+ * protocol, short of pointing them at the runtime's own fds, and the runtime
+ * puts them back as the host set them at each exec's start. Its own fds (3
+ * and 4, and its copies of 0, 1 and 2) it checks at each exec's start and
+ * end, and fd 4 before each message: one a script closed or replaced ends the
  * interpreter, saying which (_check_own_fds).
  *
  * Embedded as a TS string because tsc does not copy non-TS assets to dist/;
@@ -74,6 +75,7 @@ import inspect
 import io
 import json
 import os
+import select
 import signal
 import sys
 import threading
@@ -82,6 +84,10 @@ import weakref
 
 CALL_TIMEOUT_S = 270.0
 BACKGROUND = False
+
+# A process a script forks has the runtime's state too; at its script's end
+# it leaves, since the exec and its result are the runtime's (_run_script).
+_RUNTIME_PID = os.getpid()
 
 # The protocol's own channel, fds 3 and 4 as the host opened them (_start).
 PROTO_IN = None
@@ -112,11 +118,11 @@ _send_lock = threading.Lock()
 def send(obj):
     line = json.dumps(obj, ensure_ascii=False, default=str)
     with _send_lock:
-        try:
-            PROTO_OUT.write(line + "\n")
-            PROTO_OUT.flush()
-        except OSError as exc:
-            _fatal("cannot send the host a message any more (" + str(exc) + ")")
+        # A script can close or replace fd 4 before a tool call, as well as
+        # before its end, so each message checks it first.
+        _check_own_fd(4)
+        PROTO_OUT.write(line + "\n")
+        PROTO_OUT.flush()
 
 
 def _start():
@@ -171,16 +177,24 @@ def _own(fd, stops, which):
     _OWN_FDS[fd] = (stops, which, _identity(fd))
 
 
-def _check_own_fds():
+def _check_own_fd(fd):
     # A script closed or replaced one of the runtime's own fds: say which and
-    # end, before anything goes to a file that isn't the runtime's any more.
-    for fd, (stops, which, identity) in _OWN_FDS.items():
-        try:
-            same = _identity(fd) == identity
-        except OSError:
-            same = False
-        if not same:
-            _fatal(stops + ": a script closed or replaced " + which)
+    # end, before the runtime writes to a file that isn't its own any more.
+    own = _OWN_FDS.get(fd)
+    if own is None:
+        return
+    stops, which, identity = own
+    try:
+        same = _identity(fd) == identity
+    except OSError:
+        same = False
+    if not same:
+        _fatal(stops + ": a script closed or replaced " + which)
+
+
+def _check_own_fds():
+    for fd in list(_OWN_FDS):
+        _check_own_fd(fd)
 
 
 def _diag(text):
@@ -196,9 +210,36 @@ def _diag(text):
             pass
 
 
+def _write_some(fd, data):
+    # A command can leave the output pipes non-blocking: they're one open file
+    # with the runtime's fds 1 and 2 and its copies. A full pipe then waits for
+    # room, where a bare write would raise BlockingIOError.
+    while True:
+        try:
+            return os.write(fd, data)
+        except BlockingIOError:
+            select.select([], [fd], [])
+
+
 def _write_all(fd, data):
     while data:
-        data = data[os.write(fd, data):]
+        data = data[_write_some(fd, data):]
+
+
+class _FdWriter(io.RawIOBase):
+    # A script's fd 1 or 2 by number (_write_some), which closing never closes.
+    def __init__(self, fd):
+        super().__init__()
+        self._fd = fd
+
+    def writable(self):
+        return True
+
+    def fileno(self):
+        return self._fd
+
+    def write(self, data):
+        return _write_some(self._fd, data)
 
 
 def _script_writer(fd):
@@ -208,7 +249,7 @@ def _script_writer(fd):
     # flush or the end of the exec. It writes to the fd by number, so one an
     # earlier script kept, such as a logging handler's, writes into the exec
     # that's running.
-    writer = io.TextIOWrapper(io.BufferedWriter(io.FileIO(fd, "w", closefd=False)), encoding="utf-8",
+    writer = io.TextIOWrapper(io.BufferedWriter(_FdWriter(fd)), encoding="utf-8",
                               errors="backslashreplace", newline="\n", line_buffering=True)
     _script_writers.add(writer)
     return writer
@@ -255,9 +296,10 @@ def _write_marks(mark):
 
 def _fatal(why):
     # The runtime can't go on, as when a script closed one of the runtime's own
-    # fds under it: say why on fd 2, which the host reads, and end, so the host
-    # settles the exec on the exit with the output that arrived, rather than
-    # waiting out its time limit for a result that can't come.
+    # fds under it: say why through its copy of fd 2, which the host reads
+    # unless a script replaced that too (_diag), and end, so the host settles
+    # the exec on the exit with the output that arrived, rather than waiting
+    # out its time limit for a result that can't come.
     _diag(why + "; exiting")
     os._exit(70)
 
@@ -467,10 +509,7 @@ def handle_init(msg):
 async def _run_script(exec_id, code, mark, st):
     global _current_exec_id, _current_exec_task, _stop
     _check_own_fds()
-    try:
-        out, err = _open_streams()
-    except OSError as exc:
-        _fatal("cannot reach the output pipes any more (" + str(exc) + ")")
+    out, err = _open_streams()
     old_out, old_err, old_in = sys.stdout, sys.stderr, sys.stdin
     sys.stdout, sys.stderr = out, err
     sys.stdin = io.StringIO("")  # input() ends at once, as fd 0's /dev/null does for a command
@@ -519,16 +558,17 @@ async def _run_script(exec_id, code, mark, st):
                 fut.cancel()
         _pending_wake_futures.clear()
 
+    if os.getpid() != _RUNTIME_PID:
+        # A process the script forked ran off the script's end: the exec, its
+        # result and its marks are the runtime's, so it leaves, sending none.
+        os._exit(0)
     # What the script left in its writers, then the runtime's own fds, then
-    # the result, then the marks: should the fds be gone or the result fail to
-    # go, the runtime's word on why still lands in this exec's share of stderr.
+    # the result, then the marks: should the fds be gone, the runtime's word
+    # on why still lands in this exec's share of stderr.
     _flush_writers()
     _check_own_fds()
     send({"op": "exec_result", "id": exec_id, "return_code": return_code})
-    try:
-        _write_marks(mark)
-    except OSError as exc:
-        _fatal("cannot reach the output pipes any more (" + str(exc) + ")")
+    _write_marks(mark)
 
 
 def _dispatch(msg):

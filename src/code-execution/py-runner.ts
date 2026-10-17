@@ -102,6 +102,8 @@ const TAIL_CHARS = 4000;
  * says it has all arrived.
  */
 const EXIT_OUTPUT_GRACE_MS = 200;
+/** How long a message failing to reach an interpreter waits for the interpreter's own exit before the host ends it as one that stopped reading. */
+const UNREACHABLE_GRACE_MS = 200;
 /** How much of what an interpreter wrote before it failed to start, or crashed, goes into the message and the host's log, and how much of each piece of output with no script running goes into the log. */
 const LAST_WORDS_CHARS = 2000;
 
@@ -344,7 +346,7 @@ function whenReadableEnded(stream: Readable, fn: () => void): void {
  * what had already arrived is read first even when the host's loop was busy
  * past the grace.
  */
-function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, messages: Readable, fn: () => void): void {
+function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, messages: Readable | null, fn: () => void): void {
   let done = false;
   const finish = () => {
     if (done) return;
@@ -353,7 +355,7 @@ function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, messages: R
     fn();
   };
   const timer = setTimeout(() => setImmediate(finish), EXIT_OUTPUT_GRACE_MS);
-  stdout.whenEnded(() => stderr.whenEnded(() => whenReadableEnded(messages, finish)));
+  stdout.whenEnded(() => stderr.whenEnded(() => (messages ? whenReadableEnded(messages, finish) : finish())));
 }
 
 interface PendingExec {
@@ -590,21 +592,32 @@ export class PyRunner {
 
     // An interpreter that no longer reads the host's messages, as after a
     // script closes file descriptor 3, could go on running, and every later
-    // message to it is lost: its exec would wait out its time limit. So the
-    // first message that can't reach it ends it, and its exit settles the exec
-    // now. Such a write fails after write() returns: the pipe refuses it, or
-    // has already ended, its far end closed. Its error, which with no listener
-    // would be thrown as an uncaught exception, is heard here too. One already
-    // dead or killed is left to its own exit.
+    // message to it is lost: its exec would wait out its time limit. So when
+    // a message can't reach it, it's ended, and its exit settles the exec. Such
+    // a write fails after write() returns: the pipe refuses it, or has already
+    // ended, its far end closed. Its error, which with no listener would be
+    // thrown as an uncaught exception, is heard here too. An interpreter that
+    // died on its own breaks the pipe the same way, as by dying with a message
+    // unread, and its exit can be seen after the break: so the kill waits
+    // UNREACHABLE_GRACE_MS and one more round of reads, and an interpreter that
+    // exited by then is left to its own exit, which says what happened.
     let inputFailed = false;
+    let killing = false;
     const unreachable = (why: string) => {
       // One the host has torn down already ended its pipe on purpose.
-      if (child !== this.child) return;
-      this.log(`write to the python runtime failed: ${why}`);
-      if (alive(child) && child.pid !== undefined) {
-        inputFailed = true;
-        child.kill('SIGKILL');
-      }
+      if (child !== this.child || killing) return;
+      this.log(`messages to the python runtime failed: ${why}`);
+      killing = true;
+      setTimeout(
+        () =>
+          setImmediate(() => {
+            if (child === this.child && alive(child) && child.pid !== undefined) {
+              inputFailed = true;
+              child.kill('SIGKILL');
+            }
+          }),
+        UNREACHABLE_GRACE_MS,
+      );
     };
     this.unreachable = unreachable;
     protoIn.on('error', (e) => unreachable(e.message));
@@ -619,6 +632,10 @@ export class PyRunner {
       // runtime that failed to start.
       const pending = this.pending;
       if (!pending?.sent) {
+        // One still starting is reported by its exec, as a failed start.
+        if (!pending && this.child === child) {
+          this.log(`python runtime exited while no script ran (code=${exitCode}, signal=${signal ?? 'none'}); the next script starts a new one`);
+        }
         if (this.child === child) this.teardownChild();
         return;
       }
@@ -634,7 +651,9 @@ export class PyRunner {
       afterOutputEnds(stdout, stderr, protoOut, () => {
         if (this.pending === pending) {
           const last = this.stopPending(why).trim();
-          this.log(last ? `${why}; the last it wrote to stderr: ${last.slice(-LAST_WORDS_CHARS)}` : why);
+          // A background script's last output is its journal's, both streams.
+          const what = pending.journal ? 'the last it wrote' : 'the last it wrote to stderr';
+          this.log(last ? `${why}; ${what}: ${last.slice(-LAST_WORDS_CHARS)}` : why);
         }
         if (this.child === child) this.teardownChild();
       });
@@ -659,7 +678,9 @@ export class PyRunner {
       const onReady = () => finish(resolve);
       const onExit = () => {
         // Why it ended, such as a traceback, is on its way through its stderr.
-        afterOutputEnds(stdout, stderr, protoOut, () => {
+        // Its messages' pipe doesn't matter here, and the exit's teardown has
+        // stopped reading it.
+        afterOutputEnds(stdout, stderr, null, () => {
           const said = stderr.lastIdle.trim();
           finish(() => reject(new Error(`python runtime exited before becoming ready${said ? `, saying: ${said}` : ''}`)));
         });
@@ -782,7 +803,8 @@ export class PyRunner {
     const journal = pending.journal;
     if (journal) {
       const tail = journal.tail;
-      // The journal, which the agent reads with its own tools, says why too.
+      // The journal, which the agent reads with its own tools, says why too,
+      // unless it reached its cap.
       journal.write(`${tail === '' || tail.endsWith('\n') ? '' : '\n'}${why}\n`);
       journal.close();
       this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: onItsOwnLine(tail, why) });

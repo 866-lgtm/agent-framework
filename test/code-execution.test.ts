@@ -497,7 +497,7 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       // An unheard write error would fail this test as an uncaught exception.
       await turns();
       // The abort tore the interpreter down, so its failed write isn't news.
-      assert.deepStrictEqual(logged.filter((l) => l.includes('write to the python runtime failed')), []);
+      assert.deepStrictEqual(logged.filter((l) => l.includes('messages to the python runtime failed')), []);
     } finally {
       console.error = consoleError;
       runner.dispose();
@@ -670,6 +670,22 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       else delete (proto as { emit?: unknown }).emit;
       runner.dispose();
       late.done();
+    }
+  });
+
+  it('an interpreter that dies just after its messages stop reaching it reads as its own exit, not as one the host killed', posix, async () => {
+    // It reads the init, closes fd 3 with the exec unread, which breaks the
+    // host's end of it, and kills itself 20 ms later: within the host's grace
+    // for its own exit, so the host doesn't take it for a deaf interpreter.
+    const dies = standIn([`echo '{"op":"ready"}' >&4`, 'read -r init <&3', 'exec 3<&-', 'sleep 0.02', 'kill -9 $$'].join('\n'));
+    const runner = new PyRunner({ pythonPath: dies.path, onToolCall: async () => '' });
+    try {
+      const result = await within(runner.exec('print(1)', []), 'the exit to settle');
+      assert.strictEqual(result.aborted, true);
+      assert.strictEqual(result.stderr, 'python runtime exited unexpectedly (code=null, signal=SIGKILL)');
+    } finally {
+      runner.dispose();
+      dies.done();
     }
   });
 
@@ -900,18 +916,18 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
 
   it('a crash settles without waiting for a command it started that still holds its output', async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
+    let command = 0;
     try {
-      // The interpreter starts first, so the time measured is the crash's own.
-      assert.strictEqual((await runner.exec('pass', [])).returnCode, 0);
-      const started = Date.now();
       const result = await within(
-        runner.exec('import ctypes, subprocess\nsubprocess.Popen(["sleep", "5"])\nctypes.pythonapi.Py_FatalError(b"probe reason")', []),
+        runner.exec('import ctypes, subprocess\nprint(subprocess.Popen(["sleep", "30"]).pid, flush=True)\nctypes.pythonapi.Py_FatalError(b"probe reason")', []),
         'the crash to settle',
       );
-      const took = Date.now() - started;
+      command = Number(result.stdout.trim());
       assert.match(result.stderr, /^Fatal Python error: probe reason\n/);
-      assert.ok(took < 3000, `settled after ${took} ms, not when the command let go of the output, 5 s on`);
+      // Settled while the command still holds the pipes.
+      assert.ok(alive(command), 'the command had ended, so the exec could have waited for it');
     } finally {
+      if (command && alive(command)) process.kill(command, 'SIGKILL');
       runner.dispose();
     }
   });
@@ -964,11 +980,18 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it('an interpreter ended by a signal gets no more signals from the host while its output drains', async () => {
+  it('an interpreter ended by a signal gets no signal from the host once it has been reaped', async () => {
     const kill = process.kill;
-    const sigints: number[] = [];
+    // A pid that kill(pid, 0) no longer finds was reaped, and could be reused.
+    const toReaped: number[] = [];
     process.kill = ((pid: number, signal?: string | number) => {
-      if (signal === 'SIGINT') sigints.push(pid);
+      if (signal === 'SIGINT') {
+        try {
+          kill.call(process, pid, 0);
+        } catch {
+          toReaped.push(pid);
+        }
+      }
       return kill.call(process, pid, signal);
     }) as typeof process.kill;
     const runner = new PyRunner({ onToolCall: async () => '' });
@@ -984,7 +1007,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       ].join('\n');
       const result = await within(runner.exec(code, [], undefined, { deadlineMs: 1000 }), 'the exec to settle');
       assert.match(result.stderr, /^python runtime exited unexpectedly \(code=null, signal=SIGKILL\)\n/);
-      assert.strictEqual(sigints.length, 1, `SIGINTs sent: ${sigints.length}`);
+      assert.deepStrictEqual(toReaped, []);
     } finally {
       process.kill = kill;
       runner.dispose();
@@ -1005,13 +1028,25 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script that closes or replaces one of the runtime's own fds ends the interpreter at once, saying which", async () => {
+  it("a script that closes or replaces one of the runtime's own fds ends the interpreter by the end of that script at the latest, saying which", async () => {
     const rows: [string, string, string, RegExp][] = [
       ["fd 3, the host's messages", 'import os\nprint("closing")\nos.close(3)', 'closing\n', /cannot read the host's messages any more/],
       ["fd 4, the runtime's messages", 'import os\nos.close(4)\nprint("closed")', 'closed\n', /cannot send the host a message any more/],
       [
         'fd 4, replaced',
         'import os\nos.dup2(os.open(os.devnull, os.O_WRONLY), 4)\nprint("replaced")',
+        'replaced\n',
+        /cannot send the host a message any more: a script closed or replaced fd 4, where they go/,
+      ],
+      [
+        'fd 4, replaced by a socket',
+        'import os, socket\na, b = socket.socketpair()\nos.dup2(a.fileno(), 4)\nprint("replaced")',
+        'replaced\n',
+        /cannot send the host a message any more: a script closed or replaced fd 4, where they go/,
+      ],
+      [
+        'fd 4, replaced before a tool call',
+        'import os\nos.dup2(os.open(os.devnull, os.O_WRONLY), 4)\nprint("replaced")\nawait test__echo({})\nprint("called")',
         'replaced\n',
         /cannot send the host a message any more: a script closed or replaced fd 4, where they go/,
       ],
@@ -1035,9 +1070,10 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       ],
     ];
     for (const [what, code, stdout, says] of rows) {
-      const runner = new PyRunner({ onToolCall: async () => '' });
+      const runner = new PyRunner({ onToolCall: async () => 'echoed' });
       try {
-        const result = await within(runner.exec(code, []), what);
+        // A tool call that waited for its reply would take 270 s, past within's 10 s.
+        const result = await within(runner.exec(code, ECHO_TOOLS), what);
         assert.strictEqual(result.aborted, true, what);
         assert.strictEqual(result.stdout, stdout, what);
         assert.match(result.stderr, says, what);
@@ -1061,6 +1097,121 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         result.stderr,
         /cannot read the host's messages any more \(\[Errno 9\] Bad file descriptor\); exiting\npython runtime exited unexpectedly \(code=70, signal=none\)$/,
       );
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a thread a script left running that replaces fd 4 ends the interpreter as the next script starts, before it runs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-thread-'));
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // The thread waits for a file the test makes once the script has returned.
+      const first = await runner.exec(
+        [
+          'import os, threading, time',
+          'def later():',
+          `    while not os.path.exists(${JSON.stringify(join(dir, 'go'))}): time.sleep(0.05)`,
+          '    os.dup2(os.open(os.devnull, os.O_WRONLY), 4)',
+          `    open(${JSON.stringify(join(dir, 'done'))}, "w").close()`,
+          'threading.Thread(target=later, daemon=True).start()',
+          'print("started")',
+        ].join('\n'),
+        [],
+      );
+      assert.strictEqual(first.stdout, 'started\n');
+      writeFileSync(join(dir, 'go'), '');
+      await until(() => existsSync(join(dir, 'done')), 'the thread to replace fd 4');
+      const next = await within(runner.exec('print("ran")', []), 'the next script');
+      assert.strictEqual(next.aborted, true);
+      assert.strictEqual(next.stdout, '');
+      assert.match(next.stderr, /cannot send the host a message any more: a script closed or replaced fd 4, where they go; exiting\n/);
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a process the script forks that runs off the script's end leaves without ending the exec", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // Python 3.12 on warns that the runtime's reader thread makes fork() risky.
+      const result = await within(
+        runner.exec(
+          'import os, warnings\nwarnings.simplefilter("ignore", DeprecationWarning)\npid = os.fork()\nif pid == 0:\n    print("child")\nelse:\n    os.waitpid(pid, 0)\n    print("parent")',
+          [],
+        ),
+        'the exec to settle',
+      );
+      assert.deepStrictEqual(result, { stdout: 'child\nparent\n', stderr: '', returnCode: 0 });
+      assert.strictEqual((await runner.exec('print("next")', [])).stdout, 'next\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a script's ordinary use of fds, its own files, pipes, commands and forks, keeps the interpreter", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const busy = await within(
+        runner.exec(
+          [
+            'import os, subprocess, warnings',
+            'warnings.simplefilter("ignore", DeprecationWarning)  # fork() beside the runtime\'s reader thread',
+            'r, w = os.pipe()',
+            'os.write(w, b"x")',
+            'os.close(r)',
+            'os.close(w)',
+            'with open(os.devnull) as f:',
+            '    f.read()',
+            'subprocess.run(["true"], pass_fds=())',
+            'pid = os.fork()',
+            'if pid == 0:',
+            '    os.closerange(3, 64)',
+            '    os._exit(0)',
+            'os.waitpid(pid, 0)',
+            'kept = 42',
+          ].join('\n'),
+          [],
+        ),
+        'the busy script',
+      );
+      assert.deepStrictEqual(busy, { stdout: '', stderr: '', returnCode: 0 });
+      // The same interpreter, with its variables.
+      assert.strictEqual((await runner.exec('print(kept)', [])).stdout, '42\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an interpreter that exits while no script runs says so in the host log', async () => {
+    await logging(async (logged) => {
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      try {
+        const first = await runner.exec('import os, threading\nthreading.Timer(0.3, os._exit, (5,)).start()\nprint("armed")', []);
+        assert.strictEqual(first.stdout, 'armed\n');
+        await until(
+          () => logged.some((l) => l.endsWith('python runtime exited while no script ran (code=5, signal=none); the next script starts a new one')),
+          'the exit in the log',
+        );
+        assert.strictEqual((await runner.exec('print("fresh")', [])).stdout, 'fresh\n');
+      } finally {
+        runner.dispose();
+      }
+    });
+  });
+
+  it('a script whose output pipe a command left non-blocking still writes all of it', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // fds 1 and 2 are one open file with the runtime's copies, so the flag
+      // reaches the runtime's own writes too, its end marks among them.
+      const result = await within(
+        runner.exec('import os\nos.set_blocking(1, False)\nfor i in range(20000):\n    print("x" * 70)\nprint("end")', []),
+        'the script to finish',
+      );
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.strictEqual(result.stdout, `${`${'x'.repeat(70)}\n`.repeat(20000)}end\n`);
     } finally {
       runner.dispose();
     }
