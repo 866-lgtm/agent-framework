@@ -877,9 +877,24 @@ describe('a reached budget across a restart', () => {
   });
 
   it("what's stored for an agent that isn't a settings record fails create(), naming what it is", async () => {
-    await run(async ({ framework, restart }) => {
+    await run(async ({ framework, restart, config }) => {
       writeRecord(framework(), ['contextBudgetTokens', 60_000] as never);
-      await rejectsBuild(restart, /^the persisted settings of agent "agent" \(framework\/state, agentRuntimeSettings\) can't be restored: what's stored for the agent is an array, not a settings record\. The framework doesn't start without them/);
+      await rejectsBuild(restart, /^the persisted settings of agent "agent" \(framework\/state, agentRuntimeSettings\) can't be restored: what's stored for the agent is an array, not a settings record\. The framework doesn't start without them, since the agent would boot at its recipe's settings and the next settings change would store over them\. They're unchanged, and starting again won't help until they're repaired\.$/);
+      // The refused boots closed their stores, so write the next form through one of the test's own.
+      const store = JsStore.openOrCreate({ path: config().storePath });
+      try {
+        const state = store.getStateJson('framework/state') as { agentRuntimeSettings?: object };
+        store.setStateJson('framework/state', { ...state, agentRuntimeSettings: { ...state.agentRuntimeSettings, agent: null } });
+      } finally { store.close(); }
+      await rejectsBuild(restart, /can't be restored: what's stored for the agent is null, not a settings record\./);
+    });
+  });
+
+  it("a map of agents' settings that isn't an object fails create(), naming what it is", async () => {
+    await run(async ({ framework, restart }) => {
+      const store = framework().getStore();
+      store.setStateJson('framework/state', { ...(store.getStateJson('framework/state') as object), agentRuntimeSettings: 'agent' });
+      await rejectsBuild(restart, /^the persisted settings of agent "agent" \(framework\/state, agentRuntimeSettings\) can't be restored: the map that holds every agent's settings is a string, not an object\. /);
     });
   });
 

@@ -26,6 +26,34 @@ const CHECKPOINTS_STATE_ID = 'mcpl/checkpoints';
 /** Prefix for per-feature-set host-managed state. */
 const STATE_PREFIX = 'mcpl/state';
 
+/** What the refusals below say about MCPL when stored trees or state can't be taken. */
+const MCPL_STOPS = `MCPL doesn't start without them, and neither does create() with MCPL servers configured, ` +
+  `nor a first connectMcplServer()`;
+
+/** A thrown value's text, bounded and never throwing, as framework.ts's thrownText. */
+function thrownText(error: unknown): string {
+  let text: string;
+  try {
+    text = String(error instanceof Error ? error.message : error);
+  } catch {
+    text = '(a value that could not be read)';
+  }
+  return text.length <= 500 ? text : `${text.slice(0, 500)}… (${text.length} characters)`;
+}
+
+/** A stored JSON value's kind, for a refusal that names what it found without its content. */
+function storedKind(value: unknown): string {
+  return value === undefined ? 'missing'
+    : value === null ? 'null'
+      : Array.isArray(value) ? 'an array'
+        : typeof value === 'object' ? 'an object'
+          : `a ${typeof value}`;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
 // ============================================================================
 // Internal types
 // ============================================================================
@@ -214,31 +242,26 @@ export class CheckpointManager {
     opts: { hostState: boolean; rollback: boolean },
   ): void {
     const key = this.key(serverId, featureSet);
-    if (this.trees.has(key)) return; // Already registered (e.g. from loaded state)
+    const held = this.trees.get(key);
+    if (held) {
+      // Already registered, or restored from the store by loadFromStore,
+      // which leaves a host-managed tree's state to be read here: unread,
+      // the next patch would apply to nothing and store over it.
+      if (held.hostState && held.currentState === undefined) this.loadHostState(serverId, featureSet, held);
+      return;
+    }
 
-    this.trees.set(key, {
+    const tree: FeatureSetState = {
       hostState: opts.hostState,
       rollback: opts.rollback,
       currentCheckpoint: null,
       currentState: undefined,
       nodes: new Map(),
-    });
-
-    // Register per-feature-set state slot for host-managed state
-    if (opts.hostState) {
-      const stateId = this.stateId(serverId, featureSet);
-      try {
-        this.store.registerState({ id: stateId, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
-      // Load existing state if any
-      const existing = this.store.getStateJson(stateId);
-      if (existing !== null && existing !== undefined) {
-        const tree = this.trees.get(key)!;
-        tree.currentState = existing;
-      }
-    }
+    };
+    // Read before the tree is held, so a registration that fails here is
+    // made whole by the next one.
+    if (opts.hostState) this.loadHostState(serverId, featureSet, tree);
+    this.trees.set(key, tree);
 
     this.emitTraceFn({
       type: 'mcpl:state_registered',
@@ -540,12 +563,57 @@ export class CheckpointManager {
     this.store.setStateJson(CHECKPOINTS_STATE_ID, serialized);
   }
 
-  /** Load checkpoint tree from Chronicle on startup. */
-  private loadFromStore(): void {
-    const data = this.store.getStateJson(CHECKPOINTS_STATE_ID) as SerializedTrees | null;
-    if (!data?.trees) return;
+  /** A host-managed feature set's stored state, read into its tree; nothing
+   *  stored leaves it unset. A read that fails throws, naming the state:
+   *  taken as nothing stored, the next patch would apply to nothing and
+   *  store over it. */
+  private loadHostState(serverId: string, featureSet: string, tree: FeatureSetState): void {
+    const stateId = this.stateId(serverId, featureSet);
+    try {
+      this.store.registerState({ id: stateId, strategy: 'snapshot' });
+    } catch {
+      // Already registered
+    }
+    let existing: unknown;
+    try {
+      existing = this.store.getStateJson(stateId);
+    } catch (error) {
+      throw new Error(
+        `the host-managed state of feature set "${featureSet}" on MCPL server "${serverId}" (${stateId}) could not ` +
+          `be read: ${thrownText(error)}. The server's connect fails without it, since the feature set's next ` +
+          `checkpoint would store over it. It's unchanged, and the connect succeeds once it can be read.`,
+        { cause: error },
+      );
+    }
+    if (existing !== null && existing !== undefined) tree.currentState = existing;
+  }
 
-    for (const [key, entry] of Object.entries(data.trees)) {
+  /** Load checkpoint trees from Chronicle on startup. Nothing stored is no
+   *  trees. Trees that can't be read, or a stored value that isn't an object
+   *  whose trees is an object, throw: taken as no trees, the next feature set
+   *  registered would store over them. */
+  private loadFromStore(): void {
+    const what = `the MCPL checkpoint trees (${CHECKPOINTS_STATE_ID})`;
+    const stops = `${MCPL_STOPS}, since the next feature set registered would store over them.`;
+    let data: unknown;
+    try {
+      data = this.store.getStateJson(CHECKPOINTS_STATE_ID);
+    } catch (error) {
+      throw new Error(
+        `${what} could not be read: ${thrownText(error)}. ${stops} They're unchanged, and MCPL starts once they can be read.`,
+        { cause: error },
+      );
+    }
+    if (data === null || data === undefined) return;
+    const trees = isObject(data) ? data.trees : undefined;
+    if (!isObject(trees)) {
+      throw new Error(
+        `${what} are ${isObject(data) ? `an object whose trees is ${storedKind(trees)}` : storedKind(data)}, not ` +
+          `checkpoint trees. ${stops} They're unchanged, and starting again won't help until they're repaired.`,
+      );
+    }
+
+    for (const [key, entry] of Object.entries(trees as SerializedTrees['trees'])) {
       const nodes = new Map<string, CheckpointNode>();
       for (const [id, nodeData] of Object.entries(entry.nodes)) {
         nodes.set(id, {

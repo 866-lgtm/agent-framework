@@ -154,4 +154,15 @@ describe('UsageTracker', () => {
     assert.ok(snap.totals.estimatedCost);
     assert.ok(Math.abs(snap.totals.estimatedCost.total - 0.03) < 1e-10);
   });
+
+  it("a usage without a count adds nothing for it, so the totals stay numbers and are stored as numbers", () => {
+    // membrane passes some providers' counts through as reported, so one can be missing.
+    const { tracker } = createTracker();
+    tracker.onInferenceCompleted('agent', { inputTokens: 100, outputTokens: 50 });
+    tracker.onInferenceCompleted('agent', { inputTokens: undefined as unknown as number, outputTokens: 25 });
+    const stored = JSON.parse(JSON.stringify(tracker.toJSON()));
+    assert.equal(stored.totals.inputTokens, 100);
+    assert.equal(stored.totals.outputTokens, 75);
+    assert.equal(stored.byAgent[0].usage.inputTokens, 100);
+  });
 });

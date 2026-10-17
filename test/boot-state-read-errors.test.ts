@@ -16,7 +16,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -28,6 +28,7 @@ import { MockMembrane } from './helpers/mock-membrane.js';
 import { fixture, crash } from './helpers/coalescing-fixture.js';
 import { rejectsBuild } from './helpers/failed-create.js';
 import { isStateExistsError } from '../src/module-registry.js';
+import { CheckpointManager } from '../src/mcpl/checkpoint-manager.js';
 
 /** An I/O error from a store read of `stateId` by the framework's `reader`,
  *  `times` times, as a failing disk would give. */
@@ -120,7 +121,7 @@ test("a host-mode file that can't be read fails create(), and the next boot is q
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the host mode \\(${file.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\) could not be read: injected EIO reading host-mode\\.json\\. ` +
       `The framework doesn't start without it, since a host quiesced for maintenance would boot serving\\. ` +
-      `The file is unchanged; the framework starts once it can be read, or without it once it's moved aside\\.$`,
+      `The file is unchanged, and the framework starts once it can be read; moved aside, the framework reads host mode from framework/state instead\\.$`,
     ));
   } finally { restore(); }
   assert.equal(readFileSync(file, 'utf8'), before, 'the file is as it was');
@@ -132,21 +133,45 @@ test("a host-mode file that can't be read fails create(), and the next boot is q
   } finally { await f.stop(); }
 }));
 
-test('a host-mode file that holds no record, or one whose quiesced is not a boolean, fails create(), naming what it holds', inStoreDir('boot-read-hostmode-form-', async (storePath) => {
+test('a host-mode file that holds no record, text that isn\'t JSON, or a record whose quiesced is not a boolean, fails create(), naming what it holds', inStoreDir('boot-read-hostmode-form-', async (storePath) => {
   await quiescedWithAWrite(storePath);
   const file = join(storePath, 'recovery', 'host-mode.json');
+  const literal = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   for (const [content, holds] of [
-    ['["quiesced"]', 'holds an array, not a host-mode record'],
-    ['null', 'holds null, not a host-mode record'],
-    ['{"version":1,"quiesced":"yes"}', 'is a record whose quiesced is a string, not true or false'],
-    ['{"version":1}', 'is a record whose quiesced is missing, not true or false'],
-  ] as const) {
+    ['["quiesced"]', literal('holds an array, not a host-mode record')],
+    ['null', literal('holds null, not a host-mode record')],
+    ['{"version":1,"quiesced":"yes"}', literal('is a record whose quiesced is a string, not true or false')],
+    ['{"version":1}', literal('is a record whose quiesced is missing, not true or false')],
+    // The parser's own words differ between Node versions.
+    ['{"version":1,"quiesced":tr', "holds text that isn't JSON: .+"],
+  ]) {
     writeFileSync(file, content);
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
-      `^the host mode \\(.*host-mode\\.json\\) ${holds.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\. The framework doesn't start without it`,
+      `^the host mode \\(.*host-mode\\.json\\) ${holds}\\. The framework doesn't start without it, ` +
+      `since a host quiesced for maintenance would boot serving\\. The file is unchanged, and the framework starts once it holds a ` +
+      `host-mode record; moved aside, the framework reads host mode from framework/state instead\\.$`,
     ), content);
     assert.equal(readFileSync(file, 'utf8'), content, `${content}: the file is as it was`);
   }
+}));
+
+test("a recovery file that can't be reached, not only one that won't read, fails create(), and doesn't read as absent", inStoreDir('boot-read-hostmode-enotdir-', async (storePath) => {
+  // A file where the host-mode file's directory should be makes its read fail
+  // with ENOTDIR, an error existsSync answers false for, as it does EACCES.
+  const dir = join(storePath, '..', 'host-mode-dir');
+  const withPath = (): FrameworkConfig => ({ ...config(storePath), hostModePath: join(dir, 'host-mode.json') }) as FrameworkConfig;
+  const first = await AgentFramework.create(withPath());
+  try { await first.quiesce({ reason: 'surgery' }); } finally { await first.stop(); }
+  renameSync(dir, `${dir}.aside`);
+  writeFileSync(dir, 'not a directory');
+  try {
+    await rejectsBuild(() => AgentFramework.create(withPath()), /^the host mode \(.*host-mode-dir\/host-mode\.json\) could not be read: ENOTDIR\b.*The file is unchanged, and the framework starts once it can be read;/);
+  } finally {
+    rmSync(dir);
+    renameSync(`${dir}.aside`, dir);
+  }
+  const f = await AgentFramework.create(withPath());
+  try { assert.equal(f.getHostModeStatus().quiesced, true); } finally { await f.stop(); }
 }));
 
 test("with no recovery file, a host mode that can't be read from framework/state fails create()", async () => {
@@ -165,7 +190,7 @@ test("with no recovery file, a host mode that can't be read from framework/state
     const f = await AgentFramework.create(slotConfig());
     try { assert.equal(f.getHostModeStatus().quiesced, true); } finally { await f.stop(); }
     store.setStateJson('framework/state', { ...(store.getStateJson('framework/state') as object), hostMode: 'quiesced' });
-    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the host mode \(framework\/state, hostMode\) holds a string, not a host-mode record\./);
+    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the host mode \(framework\/state, hostMode\) holds a string, not a host-mode record\. The framework doesn't start without it, since a host quiesced for maintenance would boot serving\. It's unchanged, and starting again won't help until it's repaired\.$/);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -182,7 +207,7 @@ test("a deferred-write queue that can't be read fails create(), and the next boo
   const before = readFileSync(file, 'utf8');
   const restore = failRecoveryRead('deferred-writes.json');
   try {
-    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them, since the next deferral would replace the stored queue\. The file is unchanged; the framework starts once it can be read, or without those writes once it's moved aside\.$/);
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them, since the next deferral would replace the stored queue\. The file is unchanged, and the framework starts once it can be read; moved aside, the framework reads the queue from framework\/deferred-writes instead\.$/);
   } finally { restore(); }
   assert.equal(readFileSync(file, 'utf8'), before, 'the queue is as it was');
   const f = await AgentFramework.create(config(storePath));
@@ -193,21 +218,52 @@ test("a deferred-write queue that can't be read fails create(), and the next boo
   } finally { await f.stop(); }
 }));
 
-test("a deferred-write queue that isn't a queue fails create(), naming what it holds", inStoreDir('boot-read-deferred-form-', async (storePath) => {
+test("a deferred-write queue that isn't a queue, or isn't JSON, fails create(), naming what it holds", inStoreDir('boot-read-deferred-form-', async (storePath) => {
   await quiescedWithAWrite(storePath);
   const file = join(storePath, 'recovery', 'deferred-writes.json');
   for (const [content, holds] of [
     ['"pending"', 'hold a string, not a queue of writes'],
+    ['null', 'hold null, not a queue of writes'],
     ['{"version":2,"pending":{"0":{}}}', 'hold an object whose pending is an object, not a list of writes'],
     ['{"version":2}', 'hold an object whose pending is missing, not a list of writes'],
+    // The parser's own words differ between Node versions.
+    ['{"version":2,', "hold text that isn't JSON: .+"],
   ] as const) {
     writeFileSync(file, content);
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
-      `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them`,
+      `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them, since the next ` +
+      `deferral would replace the stored queue\\. The file is unchanged, and the framework starts once it holds a queue of writes; ` +
+      `moved aside, the framework reads the queue from framework/deferred-writes instead\\.$`,
     ), content);
     assert.equal(readFileSync(file, 'utf8'), content, `${content}: the file is as it was`);
   }
 }));
+
+test("with no recovery file, a deferred-write queue that can't be read, or isn't a queue, fails create()", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'boot-read-deferred-slot-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  // A store passed in, with no recovery paths, keeps the queue in framework/deferred-writes.
+  const slotConfig = () => ({ store, membrane: new MockMembrane().asMembrane(), agents, modules: [] }) as unknown as FrameworkConfig;
+  try {
+    const first = await AgentFramework.create(slotConfig());
+    await first.quiesce({ reason: 'surgery' });
+    (first as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'said during surgery' }]);
+    await first.stop();
+    const queue = store.getStateJson('framework/deferred-writes');
+    const restore = failStoreRead('framework/deferred-writes', 'restorePersistedDeferredWrites');
+    try {
+      await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) could not be read: injected EIO reading framework\/deferred-writes\. The framework doesn't start without them, since the next deferral would replace the stored queue\. They're unchanged, and the framework starts once they can be read\.$/);
+    } finally { restore(); }
+    assert.deepEqual(store.getStateJson('framework/deferred-writes'), queue, 'the queue is as it was');
+    const f = await AgentFramework.create(slotConfig());
+    try { assert.equal(f.getHostModeStatus().deferredWrites, 1); } finally { await f.stop(); }
+    store.setStateJson('framework/deferred-writes', 'pending');
+    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) hold a string, not a queue of writes\. The framework doesn't start without them, since the next deferral would replace the stored queue\. They're unchanged, and starting again won't help until they're repaired\.$/);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("a deferred write whose agent's context can't be scanned fails create(), and the next boot doesn't land it twice", inStoreDir('boot-read-deferred-landed-', async (storePath) => {
   // A write that landed before its ack: in the queue, and in the context with its id.
@@ -259,15 +315,46 @@ test("usage totals that can't be read fail create(), and the next boot restores 
   } finally { await f.stop(); }
 }));
 
-test("usage totals that aren't token counts fail create(), naming what they are", inStoreDir('boot-read-usage-form-', async (storePath) => {
+test("usage totals that aren't a usage record fail create(), naming what they are", inStoreDir('boot-read-usage-form-', async (storePath) => {
   for (const [usage, are] of [
-    [{ totals: 'lots' }, 'are an object without token counts'],
-    [[storedUsage], 'are an array, not token counts'],
+    [{ totals: 'lots' }, "are a record whose totals aren't token counts"],
+    [[storedUsage], 'are an array, not a usage record'],
+    [null, 'are null, not a usage record'],
+    [{ ...storedUsage, byAgent: 'agent' }, "are a record whose byAgent isn't a list"],
   ] as const) {
     seedFrameworkState(storePath, { usage });
-    await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(`^the usage totals \\(framework/state, usage\\) ${are}\\. The framework doesn't start without them`), JSON.stringify(usage));
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
+      `^the usage totals \\(framework/state, usage\\) ${are}\\. The framework doesn't start without them, since the next inference ` +
+      `would store fresh totals over them\\. They're unchanged, and starting again won't help until they're repaired\\.$`,
+    ), JSON.stringify(usage));
     assert.deepEqual((readState(storePath, 'framework/state') as { usage: unknown }).usage, usage);
   }
+}));
+
+test('usage totals an earlier release wrote with a null count, or with a byAgent entry that is not an agent, restore', inStoreDir('boot-read-usage-null-', async (storePath) => {
+  // A NaN total, which a provider's usage without a count made, is stored as null.
+  seedFrameworkState(storePath, { usage: {
+    totals: { inputTokens: null, outputTokens: 500 },
+    inferenceCount: 7,
+    byAgent: [null, { agentName: 'agent', usage: { inputTokens: 1000, outputTokens: 500 }, inferenceCount: 7 }],
+  } });
+  const f = await AgentFramework.create(config(storePath));
+  try {
+    const usage = f.getSessionUsage();
+    assert.equal(usage.totals.inputTokens, 0);
+    assert.equal(usage.totals.outputTokens, 500);
+    assert.deepEqual(usage.byAgent.map((a) => [a.agentName, a.usage.inputTokens]), [['agent', 1000]]);
+  } finally { await f.stop(); }
+}));
+
+test('a framework/state that is not an object fails create(), naming it, and is left as it was', inStoreDir('boot-read-state-root-', async (storePath) => {
+  const seed = JsStore.openOrCreate({ path: storePath });
+  try {
+    seed.registerState({ id: 'framework/state', strategy: 'snapshot' });
+    seed.setStateJson('framework/state', 'usage');
+  } finally { seed.close(); }
+  await rejectsBuild(() => AgentFramework.create(config(storePath)), /^framework\/state holds a string, not an object\. The framework doesn't start on it, since its first write would replace it and everything it keeps, such as the usage totals and each agent's settings\. It's unchanged, and starting again won't help until it's repaired\.$/);
+  assert.equal(readState(storePath, 'framework/state'), 'usage');
 }));
 
 // ---------------------------------------------------------------------------
@@ -303,6 +390,34 @@ test("inline caps that can't be read are logged, boot goes on, and setting one k
 }));
 
 // ---------------------------------------------------------------------------
+// Tool-result guards
+// ---------------------------------------------------------------------------
+
+const guardOf = (f: AgentFramework, name: string): boolean | undefined =>
+  (f.getAgent(name) as unknown as { toolResultGuard: { settingOverride?: boolean } }).toolResultGuard.settingOverride;
+
+test("tool-result guards that can't be read, or that aren't an object, fail create(), naming them, and are left as they were", inStoreDir('boot-read-guards-', async (storePath) => {
+  const first = await AgentFramework.create(config(storePath));
+  await first.stop();
+  seedFrameworkState(storePath, { toolResultGuards: { agent: true } });
+  const restore = failStoreRead('framework/state', 'adoptToolResultGuard');
+  try {
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the tool-result guards \(framework\/state, toolResultGuards\) could not be read: injected EIO reading framework\/state\. Agent "agent" isn't created without them, since it would take its recipe's guard\. They're unchanged, and it's created once they can be read\.$/);
+  } finally { restore(); }
+  const f = await AgentFramework.create(config(storePath));
+  try { assert.equal(guardOf(f, 'agent'), true, 'the next boot restores the guard'); } finally { await f.stop(); }
+  for (const [guards, are] of [['agent', 'a string'], [null, 'null'], [[true], 'an array']] as const) {
+    seedFrameworkState(storePath, { toolResultGuards: guards });
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
+      `^the tool-result guards \\(framework/state, toolResultGuards\\) are ${are}, not an object of agents' guards\\. Agent "agent" isn't ` +
+      `created without them, since it would take its recipe's guard and the next guard change would store over them\\. They're ` +
+      `unchanged, and creating it again won't help until they're repaired\\.$`,
+    ), JSON.stringify(guards));
+    assert.deepEqual((readState(storePath, 'framework/state') as { toolResultGuards: unknown }).toolResultGuards, guards);
+  }
+}));
+
+// ---------------------------------------------------------------------------
 // Coalescing
 // ---------------------------------------------------------------------------
 
@@ -311,9 +426,9 @@ test("coalescing receipts that can't be read fail create(), and the next boot de
   const params = f.params('1', 'accepted_before_crash', { deferred: true, data: { k: 'v' } });
   const original = await f.send('push/event', params);
   await crash(f);
-  const restore = failStoreRead('mcpl/coalescing-recent', 'initializePushCoalescer');
+  const restore = failStoreRead('mcpl/coalescing-recent', 'restorePushCoalescer');
   try {
-    await rejectsBuild(() => f.create(), /^the coalescing receipts since the last snapshot \(mcpl\/coalescing-recent\) could not be read: injected EIO reading mcpl\/coalescing-recent\. MCPL doesn't start without them, since the next coalesced push or message would replace them\. They're unchanged, and MCPL starts once they can be read\.$/);
+    await rejectsBuild(() => f.create(), /^the coalescing receipts since the last snapshot \(mcpl\/coalescing-recent\) could not be read: injected EIO reading mcpl\/coalescing-recent\. MCPL doesn't start without them, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since the next coalesced push or message would replace them\. They're unchanged, and MCPL starts once they can be read\.$/);
   } finally { restore(); }
   await f.create();
   const retry = await f.send('push/event', params);
@@ -328,7 +443,7 @@ test("a coalescing snapshot that can't be read fails create(), and the next boot
   await f.send('push/event', f.params('1', 'pending_before_crash', { deferred: true }));
   (f.framework as unknown as { flushCoalescingSnapshot(): void }).flushCoalescingSnapshot();
   await crash(f);
-  const restore = failStoreRead('mcpl/coalescing', 'initializePushCoalescer');
+  const restore = failStoreRead('mcpl/coalescing', 'restorePushCoalescer');
   try {
     await rejectsBuild(() => f.create(), /^the coalescing receipts and batches \(mcpl\/coalescing\) could not be read: injected EIO reading mcpl\/coalescing\. MCPL doesn't start without them/);
   } finally { restore(); }
@@ -336,6 +451,28 @@ test("a coalescing snapshot that can't be read fails create(), and the next boot
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 1, 'the restored batch was rendered');
   assert.ok(f.lastRequest().includes('document_diff'));
+});
+
+test("coalescing receipts whose delivery an agent's context can't confirm fail create(), and the next boot delivers once", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const params = f.params('1', 'accepted_before_crash', { deferred: true, data: { k: 'v' } });
+  const original = await f.send('push/event', params);
+  await crash(f);
+  // Restoring a receipt asks every agent's context whether its occurrence was delivered.
+  const proto = ContextManager.prototype as unknown as { getAllMessages(this: ContextManager): unknown[] };
+  const real = proto.getAllMessages;
+  proto.getAllMessages = function (this: ContextManager) {
+    if (new Error().stack?.includes('wasPublished')) throw new Error('injected EIO reading the context');
+    return real.call(this);
+  };
+  try {
+    await rejectsBuild(() => f.create(), /^the coalescing receipts since the last snapshot \(mcpl\/coalescing-recent\) can't be checked for occurrences already delivered: agent's context could not be read: injected EIO reading the context\. MCPL doesn't start without that check, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since an occurrence delivered before the restart would be delivered again\. They're unchanged, and MCPL starts once that context can be read\.$/);
+  } finally { proto.getAllMessages = real; }
+  await f.create();
+  const retry = await f.send('push/event', params);
+  assert.deepEqual(retry.result, original.result, 'the receipt survived');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'the accepted work was delivered once');
 });
 
 test("coalescing state this code doesn't read fails create(), naming what it is, and is left as it was", async (t) => {
@@ -346,7 +483,8 @@ test("coalescing state this code doesn't read fails create(), naming what it is,
   const storePath = join(f.dir, 'store');
   const snapshot = readState(storePath, 'mcpl/coalescing') as Record<string, unknown>;
   const cases: Array<[string, string, unknown, string]> = [
-    ['a version 2 snapshot', 'mcpl/coalescing', { ...snapshot, version: 2 }, "receipts and batches \\(mcpl/coalescing\\) are a version 2 snapshot, which this version of agent-framework doesn't read\\. MCPL doesn't start without them, since the next coalesced push or message would replace them\\. They're unchanged, and the version that wrote them reads them\\.$"],
+    ['a version 2 snapshot', 'mcpl/coalescing', { ...snapshot, version: 2 }, "receipts and batches \\(mcpl/coalescing\\) are a version 2 snapshot, which this version of agent-framework doesn't read\\. MCPL doesn't start without them, and neither does create\\(\\) with MCPL servers configured, nor a first connectMcplServer\\(\\), since the next coalesced push or message would replace them\\. They're unchanged, and the version that wrote them reads them\\.$"],
+    ['a snapshot whose version is a string', 'mcpl/coalescing', { ...snapshot, version: '1' }, "receipts and batches \\(mcpl/coalescing\\) are a snapshot whose version is a string, not 1\\. .* They're unchanged, and starting again won't help until they're repaired\\.$"],
     ['a snapshot with no version', 'mcpl/coalescing', { receipts: [], subjects: [] }, 'receipts and batches \\(mcpl/coalescing\\) are an object with no snapshot version\\.'],
     ['a snapshot that is an array', 'mcpl/coalescing', [snapshot], 'receipts and batches \\(mcpl/coalescing\\) are an array with no snapshot version\\.'],
     ['a snapshot restore throws on', 'mcpl/coalescing', { ...snapshot, subjects: 5 }, 'receipts and batches \\(mcpl/coalescing\\) could not be restored: .*\\. MCPL doesn\'t start'],
@@ -366,6 +504,94 @@ test("coalescing state this code doesn't read fails create(), naming what it is,
   }
 });
 
+// ---------------------------------------------------------------------------
+// MCPL checkpoints
+// ---------------------------------------------------------------------------
+
+test("MCPL checkpoint trees that can't be read, or that aren't checkpoint trees, fail create(), and are left as they were", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await crash(f);
+  const storePath = join(f.dir, 'store');
+  const restore = failStoreRead('mcpl/checkpoints', 'loadFromStore');
+  try {
+    await rejectsBuild(() => f.create(), /^the MCPL checkpoint trees \(mcpl\/checkpoints\) could not be read: injected EIO reading mcpl\/checkpoints\. MCPL doesn't start without them, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since the next feature set registered would store over them\. They're unchanged, and MCPL starts once they can be read\.$/);
+  } finally { restore(); }
+  const before = readState(storePath, 'mcpl/checkpoints');
+  for (const [name, value, are] of [
+    ['an object without trees', { tree: {} }, 'an object whose trees is missing'],
+    ['an array', [{ trees: {} }], 'an array'],
+    ['trees that are a string', { trees: 'srv:doc' }, 'an object whose trees is a string'],
+  ] as const) {
+    const store = JsStore.openOrCreate({ path: storePath });
+    store.setStateJson('mcpl/checkpoints', value);
+    store.close();
+    await rejectsBuild(() => f.create(), new RegExp(
+      `^the MCPL checkpoint trees \\(mcpl/checkpoints\\) are ${are}, not checkpoint trees\\. MCPL doesn't start without them, .*` +
+      `They're unchanged, and starting again won't help until they're repaired\\.$`,
+    ), name);
+    assert.deepEqual(readState(storePath, 'mcpl/checkpoints'), value, `${name}: left as it was`);
+  }
+  const reset = JsStore.openOrCreate({ path: storePath });
+  reset.setStateJson('mcpl/checkpoints', before);
+  reset.close();
+  await f.create();
+});
+
+test('a host-managed feature set restored from the store reads its state, so its next patch applies to it', inStoreDir('boot-read-host-state-', async (storePath) => {
+  const noop = () => {};
+  const first = JsStore.openOrCreate({ path: storePath });
+  try {
+    const checkpoints = new CheckpointManager(first, noop);
+    checkpoints.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
+    checkpoints.recordCheckpoint('srv', 'doc', { checkpoint: 'c1', data: { count: 1 } } as never);
+  } finally { first.close(); }
+  // A restart: the store opened again, its trees restored, the feature set registered again.
+  const store = JsStore.openOrCreate({ path: storePath });
+  try {
+    const checkpoints = new CheckpointManager(store, noop);
+    checkpoints.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
+    assert.deepEqual(checkpoints.getCurrentState('srv', 'doc'), { count: 1 });
+    checkpoints.recordCheckpoint('srv', 'doc', { checkpoint: 'c2', parent: 'c1', patch: [{ op: 'add', path: '/other', value: 2 }] } as never);
+    assert.deepEqual(store.getStateJson('mcpl/state/srv/doc'), { count: 1, other: 2 });
+  } finally { store.close(); }
+}));
+
+test("a host-managed feature set's state that can't be read fails its registration, naming it, and the next registration reads it", inStoreDir('boot-read-host-state-read-', async (storePath) => {
+  const noop = () => {};
+  const first = JsStore.openOrCreate({ path: storePath });
+  try {
+    const checkpoints = new CheckpointManager(first, noop);
+    checkpoints.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
+    checkpoints.recordCheckpoint('srv', 'doc', { checkpoint: 'c1', data: { count: 1 } } as never);
+    // A second feature set's state, stored with no tree: its first registration reads it.
+    first.registerState({ id: 'mcpl/state/srv/notes', strategy: 'snapshot' });
+    first.setStateJson('mcpl/state/srv/notes', { count: 3 });
+  } finally { first.close(); }
+  const store = JsStore.openOrCreate({ path: storePath });
+  try {
+    const checkpoints = new CheckpointManager(store, noop);
+    // `doc` is a tree restored from the store; `notes` is registered for the first time.
+    for (const [featureSet, state] of [['doc', { count: 1 }], ['notes', { count: 3 }]] as const) {
+      const stateId = `mcpl/state/srv/${featureSet}`;
+      const restore = failStoreRead(stateId, 'loadHostState');
+      try {
+        assert.throws(() => checkpoints.registerFeatureSet('srv', featureSet, { hostState: true, rollback: false }), {
+          message: new RegExp(
+            `^the host-managed state of feature set "${featureSet}" on MCPL server "srv" \\(mcpl/state/srv/${featureSet}\\) could not ` +
+            `be read: injected EIO reading mcpl/state/srv/${featureSet}\\. The server's connect fails without it, since the feature ` +
+            `set's next checkpoint would store over it\\. It's unchanged, and the connect succeeds once it can be read\\.$`,
+          ),
+        });
+      } finally { restore(); }
+      checkpoints.registerFeatureSet('srv', featureSet, { hostState: true, rollback: false });
+      assert.deepEqual(checkpoints.getCurrentState('srv', featureSet), state, `${featureSet}: the next registration reads it`);
+    }
+    // The registration that failed held no tree, so the next one registered it whole, stored tree included.
+    const trees = (store.getStateJson('mcpl/checkpoints') as { trees: Record<string, unknown> }).trees;
+    assert.ok(trees['srv:notes'], 'the first-time feature set is in the stored trees');
+  } finally { store.close(); }
+}));
+
 test("at a runtime connect, coalescing receipts that can't be read fail the connect, and the next connect restores them", async (t) => {
   const f = await fixture(); t.after(f.close);
   const params = f.params('1', 'accepted_before_crash', { deferred: true, data: { k: 'v' } });
@@ -378,17 +604,90 @@ test("at a runtime connect, coalescing receipts that can't be read fail the conn
   } as unknown as FrameworkConfig);
   try {
     const server = { id: 'editor', url: `ws://127.0.0.1:${f.port}`, enabledFeatureSets: ['doc'] } as McplServerConfig;
-    const restore = failStoreRead('mcpl/coalescing-recent', 'initializePushCoalescer');
-    try {
-      await assert.rejects(framework.connectMcplServer(server), {
-        message: /^the coalescing receipts since the last snapshot \(mcpl\/coalescing-recent\) could not be read: injected EIO reading mcpl\/coalescing-recent\. MCPL doesn't start without them/,
-      });
-    } finally { restore(); }
+    const store = framework.getStore() as unknown as JsStore;
+    const stored = () => ['mcpl/coalescing', 'mcpl/coalescing-recent', 'mcpl/checkpoints'].map((id) => store.getStateJson(id));
+    const before = stored();
+    const internals = framework as unknown as { mcplServerRegistry: unknown; pushCoalescer: unknown; checkpointManager: unknown };
+    for (const [stateId, reader, says] of [
+      ['mcpl/coalescing-recent', 'restorePushCoalescer', 'the coalescing receipts since the last snapshot'],
+      ['mcpl/coalescing', 'restorePushCoalescer', 'the coalescing receipts and batches'],
+      ['mcpl/checkpoints', 'loadFromStore', 'the MCPL checkpoint trees'],
+    ] as const) {
+      const restore = failStoreRead(stateId, reader);
+      try {
+        await assert.rejects(framework.connectMcplServer(server), {
+          message: new RegExp(`^${says} \\(${stateId}\\) could not be read: injected EIO reading ${stateId}\\. MCPL doesn't start without them`),
+        });
+      } finally { restore(); }
+      assert.equal(internals.mcplServerRegistry, null, `${stateId}: nothing of the MCPL subsystem is built`);
+      assert.equal(internals.pushCoalescer, null, `${stateId}: no coalescer is installed`);
+      assert.equal(internals.checkpointManager, null, `${stateId}: no checkpoint manager is installed`);
+      assert.deepEqual(stored(), before, `${stateId}: the stored state is as it was`);
+    }
     await framework.connectMcplServer(server);
     const retry = await f.send('push/event', params);
-    assert.deepEqual(retry.result, original.result, 'the receipt survived the refused connect');
+    assert.deepEqual(retry.result, original.result, 'the receipt survived the refused connects');
   } finally { await framework.stop(); }
 });
+
+test('the forms a release wrote boot as before', inStoreDir('boot-read-release-forms-', async (storePath) => {
+  // As every release from 0.16.0 writes them, with the head's readers: a
+  // resumed host's record, and the queue's cleared and pending forms.
+  const recovery = join(storePath, 'recovery');
+  const first = await AgentFramework.create(config(storePath));
+  await first.stop();
+  mkdirSync(recovery, { recursive: true });
+  const write = (name: string, doc: unknown) => writeFileSync(join(recovery, name), `${JSON.stringify(doc, null, 2)}\n`);
+  const boot = async (check: (f: AgentFramework) => void) => {
+    const f = await AgentFramework.create(config(storePath));
+    try { check(f); } finally { await f.stop(); }
+  };
+  write('host-mode.json', { version: 1, quiesced: false, clearedAt: 1 });
+  write('deferred-writes.json', { version: 1, pending: [] });
+  await boot((f) => {
+    assert.equal(f.getHostModeStatus().quiesced, false);
+    assert.equal(f.getHostModeStatus().deferredWrites, 0);
+  });
+  write('host-mode.json', { version: 1, quiesced: true, reason: 'surgery', since: 1 });
+  write('deferred-writes.json', {
+    version: 2, pending: [{ participant: 'user', content: [{ type: 'text', text: 'queued' }], id: 'w1', seq: 1 }], scanFrom: { agent: 0 },
+  });
+  await boot((f) => {
+    assert.equal(f.getHostModeStatus().quiesced, true);
+    assert.equal(f.getHostModeStatus().reason, 'surgery');
+    assert.equal(f.getHostModeStatus().deferredWrites, 1);
+  });
+}));
+
+test('a store from before the recovery files boots from its slots, as before', inStoreDir('boot-read-pre-file-', async (storePath) => {
+  // A store from before host-mode.json and deferred-writes.json existed keeps
+  // both in the store: framework/state's hostMode, and a bare list of writes.
+  const first = await AgentFramework.create(config(storePath));
+  await first.stop();
+  const store = JsStore.openOrCreate({ path: storePath });
+  try {
+    store.setStateJson('framework/state', { hostMode: { quiesced: true, reason: 'surgery', since: 1 } });
+    store.setStateJson('framework/deferred-writes', [{ participant: 'user', content: [{ type: 'text', text: 'queued' }] }]);
+  } finally { store.close(); }
+  const f = await AgentFramework.create(config(storePath));
+  try {
+    assert.equal(f.getHostModeStatus().quiesced, true);
+    assert.equal(f.getHostModeStatus().deferredWrites, 1);
+  } finally { await f.stop(); }
+}));
+
+test('an agent named like an object property has no settings record or guard unless one is stored for it', inStoreDir('boot-read-settings-own-', async (storePath) => {
+  seedFrameworkState(storePath, {
+    agentRuntimeSettings: { other: { sameRoundThinkTextPolicy: 'private' } },
+    toolResultGuards: { other: true },
+  });
+  const named = { ...config(storePath), agents: [{ name: 'constructor', model: 'test-model', systemPrompt: 'test' }] } as FrameworkConfig;
+  const f = await AgentFramework.create(named);
+  try {
+    assert.ok(f.getAgent('constructor'));
+    assert.equal(guardOf(f, 'constructor'), undefined, 'no inherited guard');
+  } finally { await f.stop(); }
+}));
 
 test('nothing stored reads as empty: a first boot starts serving, with no usage, deferred writes or coalescing history', async (t) => {
   const f = await fixture(); t.after(f.close);
