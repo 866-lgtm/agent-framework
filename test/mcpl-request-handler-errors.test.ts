@@ -1199,6 +1199,29 @@ test('an answer the handler tried after its first, with a code no template can c
   }
 });
 
+test('a throw out of the report on the async path is caught by its backstop and logged on a line of its own, and nothing escapes', async (t) => {
+  const { framework, connection } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  // A defect in the report itself: its trace throws.
+  framework.emitTrace = () => { throw new Error('the trace failed'); };
+  try {
+    framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
+    const reply = responder();
+    connection.emit('channels-register', {}, reply);
+    await settle();
+    await settle();
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }], 'the reply is sent before the trace');
+    assert.deepEqual(lines, ["[mcpl] srv channels-register: the handler failure's report threw: the trace failed"]);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
 test("the log line prints a failed internal-error reply raw, and only the trace's copy is bounded", async (t) => {
   const { framework, connection, traces } = harness();
   const lines: string[] = [];

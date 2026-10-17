@@ -17533,11 +17533,11 @@ export class AgentFramework {
       // Report a failure: the handler's own error when it threw or
       // rejected, else the reply write it swallowed, else the reply it
       // tried to send twice. Nothing in here may throw: on the async path
-      // it runs as a rejection handler, and an exception there would be an
-      // unhandled rejection, which ends the host. So every value it puts in
-      // text, the code of an answer the handler tried again included, is
-      // converted with describeCause, the internal-error reply's send is
-      // caught, and emitTrace's own catch can't throw.
+      // it runs as a rejection handler, where an exception would leave the
+      // report unfinished for the backstop below to log. So every value it
+      // puts in text, the code of an answer the handler tried again
+      // included, is converted with describeCause, the internal-error
+      // reply's send is caught, and emitTrace's own catch can't throw.
       const report = (handlerError: { error: unknown } | undefined): void => {
         const primary = handlerError
           ? handlerError.error
@@ -17611,8 +17611,16 @@ export class AgentFramework {
         // Invoke immediately: control-plane responses must retain their
         // ACK-before-reconcile ordering and data-plane barrier semantics.
         const result = handler(params, tracked);
-        if (result) void Promise.resolve(result).then(succeeded, failed);
-        else succeeded();
+        if (result) {
+          // On this path the report runs as a rejection handler, where a
+          // throw would be an unhandled rejection, which ends the host. The
+          // report converts and catches what it knows can throw; this
+          // backstop catches anything else, a defect in the report itself,
+          // and logs it on a line of its own.
+          void Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
+            console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${describeCause(reportFailure)}`);
+          });
+        } else succeeded();
       } catch (error) {
         failed(error);
       }
