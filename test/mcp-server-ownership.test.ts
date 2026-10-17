@@ -470,13 +470,18 @@ test("a server connected while a refresh waits keeps its own tool prefix, and th
     connection.listTools = async () => { const tools = await realList(); listed = true; await gate; return tools; };
     const refreshing = internals.refreshMcplTools();
     await until(() => listed, "the refresh holds the first server's list");
-    connection.listTools = realList;
+    let lists = 0;
+    connection.listTools = async () => { lists += 1; return realList(); };
     // Connected while the first refresh waits, under a prefix of its own.
     await framework.connectMcplServer({ ...modern('n', '', join(dir, 'raw-n.jsonl')), toolPrefix: 'custom' });
     // The held refresh finishes last, and publishes nothing: the connect's
-    // own refresh, started after it, listed both servers.
+    // own refresh, started after it, listed both servers. So it starts no
+    // other refresh either, since that one has a listing of every server it
+    // listed (a refresh begins listing at once).
+    const listsBefore = lists;
     release();
     await refreshing;
+    assert.equal(lists, listsBefore, 'the dropped refresh started no other');
     const names = framework.getAllTools().map((t) => t.name);
     assert.ok(names.some((n) => n.startsWith('custom--')), names.join(', '));
     assert.ok(!names.some((n) => n.startsWith('mcpl--n--')), names.join(', '));
@@ -507,6 +512,42 @@ test("a refresh in flight when a server restarts under the same id publishes non
     const names = framework.getAllTools().map((t) => t.name);
     assert.deepEqual(toolsOf(framework, 'm'), [], `the old connection's listing isn't published: ${names.join(', ')}`);
     assert.ok(names.some((n) => n.startsWith('second--')), names.join(', '));
+  });
+});
+
+test('a server whose listing a later refresh failed is listed again when the earlier listing is dropped', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
+    assert.ok(toolsOf(framework, 'm').length > 0);
+    const internals = framework as unknown as {
+      modernServers(): Map<string, { listTools(): Promise<unknown[]> }>;
+      refreshMcplTools(): Promise<void>;
+    };
+    const connection = internals.modernServers().get('m')!;
+    const realList = connection.listTools.bind(connection);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let mode: 'hold' | 'refuse' | 'answer' = 'hold';
+    let held = false;
+    connection.listTools = async () => {
+      if (mode === 'refuse') throw new Error('refused while another listing is open');
+      const tools = await realList();
+      if (mode === 'hold') { held = true; await gate; }
+      return tools;
+    };
+    // The first refresh lists m and holds the answer.
+    const first = internals.refreshMcplTools();
+    await until(() => held, 'the first refresh holds its listing of m');
+    // A later refresh, whose request m refuses, publishes first, without m.
+    mode = 'refuse';
+    await internals.refreshMcplTools();
+    assert.deepEqual(toolsOf(framework, 'm'), [], "the later refresh published no listing of m");
+    // The first refresh's listing is older, so it's dropped, and one more
+    // refresh lists m again.
+    mode = 'answer';
+    release();
+    await first;
+    await until(() => toolsOf(framework, 'm').length > 0, "one more refresh brings m's tools back");
   });
 });
 

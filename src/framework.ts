@@ -18759,8 +18759,15 @@ export class AgentFramework {
 
     // A refresh started after this one has published already: it listed
     // every server after this one did, a server replaced by a restart under
-    // the same id included, so this one's listings are older.
-    if (generation < this.mcplToolsRefreshPublished) return;
+    // the same id included, so this one's listings are older. A server this
+    // one listed can still have no listing there, such as one that refused
+    // the later refresh's request. Its tools would stay missing until
+    // something else refreshed, so one more refresh lists it again.
+    if (generation < this.mcplToolsRefreshPublished) {
+      const unlisted = [...listedServers].find((id) => !this.mcplListedServers.has(id));
+      if (unlisted !== undefined) this.handleToolsListChanged(unlisted);
+      return;
+    }
     // A server removed while this refresh awaited its lists (a disconnect,
     // or a server lost for good) publishes nothing: whichever refresh
     // finishes last must not bring back a removed server's tools.
