@@ -491,14 +491,13 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
 /** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
  *  (empty when addMessage deferred it again; a sharded body's first shard)
- *  and what the store holds of it. `afterThrow` marks an entry whose write
- *  threw after storing it, found in the store and counted as written: its
- *  content is what landed, as later compiles render it, which for a sharded
- *  body can be its first shards alone. */
+ *  and what the store holds of it. For an entry whose write threw after
+ *  storing it, found in the store and counted as written, the content is
+ *  what landed, as later compiles render it, which for a sharded body can be
+ *  its first shards alone. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
-  afterThrow?: true;
 }
 
 /** What later compiles render from the store for the copies of one write
@@ -15831,12 +15830,15 @@ export class AgentFramework {
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
-   * entries.
+   * entries. `onLanded` hears an entry whose write threw after storing it,
+   * with the id it landed under, as soon as it's found: before the writes
+   * after it, so whatever it records keeps their order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
     where: string,
     write: (msg: DeferredWrite) => MessageId,
+    onLanded?: (msg: DeferredWrite, id: MessageId) => void,
   ): Map<DeferredWrite, DrainedWrite> {
     const ordered = [...entries].sort(bySeq);
     // An entry's target as addMessage resolves it, keyed by name for the cut.
@@ -15854,8 +15856,9 @@ export class AgentFramework {
       } catch (error) {
         const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
         if (landed.length > 0) {
-          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed), afterThrow: true });
+          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
           this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
+          onLanded?.(msg, landed[0]!.id);
           continue;
         }
         cut.add(target);
@@ -15925,7 +15928,9 @@ export class AgentFramework {
    *  it again, in queue order and cut per target (writeDrainedInOrder). With
    *  `bypassDeferral`, each is stored past its target's deferral (stop()). A
    *  write that threw after storing missed the notes addMessage takes after a
-   *  store, so they're taken here for what landed. */
+   *  store, so they're taken for what landed as soon as it's found, before
+   *  the writes after it: an open turn's arrivals keep the order the writes
+   *  landed in, and its newest stays the newest (remainingArrival). */
   private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
     const bypassFor = (msg: DeferredWrite): string | undefined =>
       opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
@@ -15934,11 +15939,10 @@ export class AgentFramework {
         fromQueue: { id: msg.id, seq: msg.seq },
         ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
         ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
-      }));
-    for (const [msg, w] of written) {
-      const agent = w.afterThrow ? this.deliveryAgent(msg.forAgent) : undefined;
-      if (agent) this.noteStored(agent, msg.metadata, w.id, bypassFor(msg));
-    }
+      }), (msg, id) => {
+      const agent = this.deliveryAgent(msg.forAgent);
+      if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
+    });
     return [...written.keys()];
   }
 

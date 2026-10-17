@@ -689,6 +689,39 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
+  it("writes re-added from the queue are noted for an open turn in the order they landed, one that throws after it's stored among them", async () => {
+    const framework = await createFramework();
+    throwOnceAfterStoring(framework, 'from alpha');
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      openLogical: Map<string, unknown>;
+      readdDrained(entries: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>, where: string): unknown[];
+      remainingArrival(agent: unknown, routing: unknown): string | undefined;
+    };
+    // An open turn engaged with both channels, between its streams: the
+    // earlier write throws after it's stored, and the later one lands.
+    const open = { engaged: new Set(['chan-alpha', 'chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
+    internals.openLogical.set('assistant', open);
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      internals.readdDrained([
+        { id: 'w1', seq: 1, participant: 'Antra', content: text('from alpha'), metadata: { channelId: 'chan-alpha' } },
+        { id: 'w2', seq: 2, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta' } },
+      ], 'test flush');
+    } finally { console.error = error; }
+    assert.equal(errors.filter((e) => e.includes('threw after it was stored')).length, 1, errors.join('\n'));
+    const idOf = (writeId: string) => agent.getContextManager().getAllMessages()
+      .find((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === writeId)!.id;
+    assert.deepEqual(open.arrivals, [
+      { messageId: idOf('w1'), channelId: 'chan-alpha' },
+      { messageId: idOf('w2'), channelId: 'chan-beta' },
+    ]);
+    assert.equal(internals.remainingArrival(agent, open), 'chan-beta', "the turn's newest arrival is the later write's");
+    await framework.stop();
+  });
+
   it('at the turn end, a write that throws after its message is stored is not queued again', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Moving.' },
