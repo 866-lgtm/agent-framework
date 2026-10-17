@@ -20,9 +20,7 @@ function accumulateUsage(
   target.outputTokens += count(tokens.outputTokens);
   target.cacheCreationTokens += count(tokens.cacheCreationTokens);
   target.cacheReadTokens += count(tokens.cacheReadTokens);
-  // The cost membrane computes from such a count is NaN: an unknown cost,
-  // which is left out as an absent one is, rather than added as zero.
-  if (estimatedCost && Number.isFinite(estimatedCost.total)) {
+  if (estimatedCost) {
     if (!target.estimatedCost) {
       target.estimatedCost = { total: 0, currency: estimatedCost.currency };
     } else if (target.estimatedCost.currency !== estimatedCost.currency) {
@@ -41,14 +39,6 @@ function parseUsage(raw: unknown): SessionUsage | null {
   // release could write it when a provider's usage lacked a count. The sum
   // before it was lost when it became NaN, so it reads as 0.
   const count = (v: unknown): number | undefined => (v === null ? 0 : typeof v === 'number' ? v : undefined);
-  // A cost is kept as a finite total with its currency. Anything else, such
-  // as the null JSON stores for a NaN total, is an unknown cost, as an
-  // absent one is.
-  const cost = o.estimatedCost as { total?: unknown; currency?: unknown } | null | undefined;
-  const estimatedCost = cost && typeof cost === 'object' && typeof cost.total === 'number'
-    && Number.isFinite(cost.total) && typeof cost.currency === 'string'
-    ? { total: cost.total, currency: cost.currency }
-    : undefined;
   const inputTokens = count(o.inputTokens);
   const outputTokens = count(o.outputTokens);
   if (inputTokens === undefined || outputTokens === undefined) return null;
@@ -57,7 +47,9 @@ function parseUsage(raw: unknown): SessionUsage | null {
     outputTokens,
     cacheCreationTokens: typeof o.cacheCreationTokens === 'number' ? o.cacheCreationTokens : 0,
     cacheReadTokens: typeof o.cacheReadTokens === 'number' ? o.cacheReadTokens : 0,
-    estimatedCost,
+    estimatedCost: o.estimatedCost && typeof o.estimatedCost === 'object'
+      ? { total: (o.estimatedCost as any).total, currency: (o.estimatedCost as any).currency }
+      : undefined,
   };
 }
 

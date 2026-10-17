@@ -17687,8 +17687,9 @@ export class AgentFramework {
     // added, so a read that fails leaves it unconnected; MCPL itself stays
     // up, even when this connect brought it up. A feature set with no
     // restored tree, as after a disconnect removed it, is read when it
-    // registers.
-    this.checkpointManager?.loadHostStates(config.id);
+    // registers. A server already connected is refused by addServer below,
+    // so its trees are left as they are.
+    if (!this.mcplServerRegistry?.getServer(config.id)) this.checkpointManager?.loadHostStates(config.id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     await this.connectMcplServerInternal(config);
     await this.refreshMcplTools();

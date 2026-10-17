@@ -587,7 +587,7 @@ export class CheckpointManager {
             ? `Neither create() with the server configured nor a connectMcplServer() of it goes on without it, since ` +
               `the feature set's next checkpoint would store over it. It's unchanged, and they go on once it can be read.`
             : `The feature set isn't registered without it, since its next checkpoint would store over it, so the ` +
-              `server's connect fails. It's unchanged, and the server's next connect reads it again.`),
+              `server's connect fails. It's unchanged, and it's read again when the feature set next registers.`),
         { cause: error },
       );
     }

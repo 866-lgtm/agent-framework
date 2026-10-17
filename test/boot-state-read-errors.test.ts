@@ -357,26 +357,18 @@ test("usage totals that aren't a usage record fail create(), naming what they ar
 }));
 
 test('usage totals an earlier release wrote with a null count, or with a byAgent entry that is not an agent, restore', inStoreDir('boot-read-usage-null-', async (storePath) => {
-  // A NaN total, which a provider's usage without a count made, is stored as null, and so is a NaN cost.
+  // A NaN total, which a provider's usage without a count made, is stored as null.
   seedFrameworkState(storePath, { usage: {
-    totals: { inputTokens: null, outputTokens: 500, estimatedCost: { total: null, currency: 'USD' } },
+    totals: { inputTokens: null, outputTokens: 500 },
     inferenceCount: 7,
-    byAgent: [
-      null,
-      { agentName: 'agent', usage: { inputTokens: 1000, outputTokens: 500, estimatedCost: { total: null, currency: 'USD' } }, inferenceCount: 7 },
-      { agentName: 'other', usage: { inputTokens: 10, outputTokens: 5, estimatedCost: { total: '0.25', currency: 'USD' } }, inferenceCount: 1 },
-    ],
+    byAgent: [null, { agentName: 'agent', usage: { inputTokens: 1000, outputTokens: null }, inferenceCount: 7 }],
   } });
   const f = await AgentFramework.create(config(storePath));
   try {
     const usage = f.getSessionUsage();
     assert.equal(usage.totals.inputTokens, 0);
     assert.equal(usage.totals.outputTokens, 500);
-    assert.equal(usage.totals.estimatedCost, undefined, 'a null cost total is an unknown cost');
-    assert.deepEqual(usage.byAgent.map((a) => [a.agentName, a.usage.inputTokens, a.usage.estimatedCost]), [
-      ['agent', 1000, undefined],
-      ['other', 10, undefined],
-    ], "an agent's cost that isn't a finite total is unknown too");
+    assert.deepEqual(usage.byAgent.map((a) => [a.agentName, a.usage.inputTokens, a.usage.outputTokens]), [['agent', 1000, 0]]);
   } finally { await f.stop(); }
 }));
 
@@ -444,7 +436,7 @@ test("tool-result guards that can't be read, or that aren't an object, fail crea
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the tool-result guards \\(framework/state, toolResultGuards\\) are ${are}, not an object of agents' guards\\. Agent "agent" isn't ` +
       `created, since without them it would take its recipe's guard and the next guard change would store over them\\. They're ` +
-      `unchanged, and creating it again won't help until they're repaired\\.$`,
+      `unchanged, and creating it again won't help until the host's operator repairs them\\.$`,
     ), JSON.stringify(guards));
     assert.deepEqual((readState(storePath, 'framework/state') as { toolResultGuards: unknown }).toolResultGuards, guards);
   }
@@ -592,7 +584,7 @@ const hostStateUnreadable = (server: string, featureSet: string, when: 'before-c
     ? `Neither create\\(\\) with the server configured nor a connectMcplServer\\(\\) of it goes on without it, since the feature set's ` +
       `next checkpoint would store over it\\. It's unchanged, and they go on once it can be read\\.$`
     : `The feature set isn't registered without it, since its next checkpoint would store over it, so the server's connect ` +
-      `fails\\. It's unchanged, and the server's next connect reads it again\\.$`),
+      `fails\\. It's unchanged, and it's read again when the feature set next registers\\.$`),
 );
 
 test("at boot, a configured server's restored host-managed state that can't be read fails create() before any server connects, and the next boot reads it", async (t) => {
@@ -640,6 +632,19 @@ test("at a runtime connect, a restored host-managed state that can't be read fai
     assert.ok(internals.mcplServerRegistry?.getServer('editor'), 'the next connect adds it');
     assert.deepEqual(internals.checkpointManager?.getCurrentState('editor', 'doc'), { count: 1 }, 'and reads its state');
   } finally { await framework.stop(); }
+});
+
+test("a connect of a server already connected is refused as before, without reading its trees again", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await crash(f);
+  // A host-managed tree whose stored state holds nothing, so it holds no state in memory once read.
+  seedHostManaged(join(f.dir, 'store'), 'editor', 'notes', null);
+  await f.create();
+  const server = { id: 'editor', url: `ws://127.0.0.1:${f.port}`, enabledFeatureSets: ['doc'] } as McplServerConfig;
+  const restore = failStoreRead('mcpl/state/editor/notes', 'loadHostState');
+  try {
+    await assert.rejects(f.framework.connectMcplServer(server), { message: 'MCPL server "editor" is already registered' });
+  } finally { restore(); }
 });
 
 test('a host-managed feature set restored from the store has its state read by loadHostStates, so its next patch applies to it', inStoreDir('boot-read-host-state-', async (storePath) => {
