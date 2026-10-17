@@ -3272,6 +3272,21 @@ describe('the mount boundary', () => {
     assert.equal(env.readDisk('a.txt'), 'v2');
   });
 
+  test('an interrupted path whose disk copy is deleted since says disk has no copy, and force writes the workspace copy back', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    await call(m, 'write', { path: 'work/a.txt', content: 'v2' });
+    m = await env.fault(m, 'materialize', 'after-intent');
+    env.writeDisk('a.txt', 'v2, cut off');
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.kind, 'interrupted');
+    env.rmDisk('a.txt');
+    const skip = JSON.stringify(await call(m, 'materialize', {}));
+    assert.match(skip, /a\.txt: disk has no copy of this file \(conflict: interrupted\) — sync this path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back"/);
+    await call(m, 'materialize', { force: true });
+    assert.equal(env.readDisk('a.txt'), 'v2');
+  });
+
   test('a refused write puts back whatever evidence the path had, an interrupted one included', async (t) => {
     const env = new Env(t);
     const m = await env.open();

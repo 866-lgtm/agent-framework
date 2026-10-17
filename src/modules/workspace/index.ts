@@ -2350,11 +2350,13 @@ export class WorkspaceModule implements Module {
         const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
         // Where disk has no copy now, whatever the conflict's kind, a sync of
         // the path takes disk's deletion and a forced materialize writes the
-        // workspace's copy back.
+        // workspace's copy back. Where it has one, a sync keeps it and gives
+        // up the workspace's, whether or not the workspace can hold disk's
+        // copy: one it can't hold stays on disk alone.
         const conflictNote = (where: string): string | null => conflict === null ? null
           : `The path is in conflict with disk (${conflict}): the edit ${where} the workspace's copy. ` + (report?.diskNow === 'absent'
             ? "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk."
-            : "Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
+            : "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
         const suffix = [whichCopy('looked in'), conflictNote('looked in')].filter((n) => n !== null).map((n) => ` ${n}`).join('');
         appliedNote = whichCopy('applied to');
 
