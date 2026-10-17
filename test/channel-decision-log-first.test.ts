@@ -52,6 +52,7 @@ function failingStore(path: string) {
     failNext: (choose: (write: Write) => boolean) => {
       chosen = choose;
     },
+    close: () => real.close(),
   };
 }
 
@@ -61,10 +62,17 @@ function withStore(
 ): () => Promise<void> {
   return async () => {
     const dir = mkdtempSync(join(tmpdir(), `${name}-`));
+    let opened: ReturnType<typeof failingStore> | undefined;
     try {
-      await body(failingStore(join(dir, 'store')));
+      opened = failingStore(join(dir, 'store'));
+      await body(opened);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      // Closed before its directory goes, however the test ended.
+      try {
+        opened?.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   };
 }
