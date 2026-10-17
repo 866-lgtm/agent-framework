@@ -5,7 +5,7 @@
     `mcpl/references`, `mcpl/tool-classes`, `mcpl/transport`, `mcpl/types`,
     `modules/workspace/types` and `tune-out/tools`) write string literal
     types with single quotes, as the source does; the types are the same;
-  - source maps: of the 108 `.js.map` files that change, 104 move only
+  - source maps: of the `.js.map` files that change, all but four move only
     columns; in two a generated line maps to other source lines, and in two
     a generated line gains or loses its mapping, so a stack trace can land
     on a different column, and rarely on a different line or none. Of the
