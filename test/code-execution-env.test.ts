@@ -29,7 +29,8 @@ test('a codeExecution.inheritEnv set to anything but true, false or null is refu
       return true;
     }, JSON.stringify(inheritEnv));
   }
-  // null is how JSON writes "not set".
+  // null counts as not set, so a generated config that writes an unset
+  // setting as null keeps working.
   for (const inheritEnv of [undefined, null, true, false]) validateCodeExecutionConfig({ inheritEnv });
 });
 

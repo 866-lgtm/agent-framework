@@ -519,9 +519,11 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
   }
 }
 
-/** The kind of a value that isn't undefined, null or a boolean, as a refusal
- *  names it in place of the value. */
-function kindOf(value: unknown): string {
+/** The kind of a value, as a refusal names it in place of the value, which
+ *  can be a credential. Shared by the MCPL server and codeExecution checks. */
+export function kindOf(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
   if (Array.isArray(value)) return 'an array';
   if (typeof value !== 'object') return `a ${typeof value}`;
   const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;

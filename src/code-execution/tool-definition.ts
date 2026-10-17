@@ -9,6 +9,7 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
+import { kindOf } from '../mcpl/transport.js';
 import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
@@ -138,7 +139,8 @@ export function validateCodeExecutionConfig(cfg: {
   }
   // None of the environment's refusals below shows the value it refuses,
   // at most its kind: a substituted value can be a credential. null counts
-  // as not set, as JSON writes that.
+  // as not set, so a generated config that writes an unset setting as null
+  // keeps working.
   if (cfg.inheritEnv !== undefined && cfg.inheritEnv !== null && typeof cfg.inheritEnv !== 'boolean') {
     const wanted = typeof cfg.inheritEnv === 'string' ? 'true or false, unquoted,' : 'true or false,';
     throw new Error(
@@ -174,15 +176,4 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
-}
-
-/** What kind of value a configuration holds, for an error that names it without showing it. */
-function kindOf(value: unknown): string {
-  if (value === null) return 'null';
-  if (value === undefined) return 'undefined';
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value !== 'object') return `a ${typeof value}`;
-  if (isPlainObject(value)) return 'an object';
-  const name = (Object.getPrototypeOf(value) as { constructor?: { name?: string } }).constructor?.name;
-  return name ? `a ${name}` : 'an object that isn\'t plain';
 }

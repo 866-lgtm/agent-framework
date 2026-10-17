@@ -163,9 +163,7 @@ export class PyRunner {
     // as options, not a snapshot — the env is rebuilt at every spawn so a
     // respawn after idle reclaim sees current host values, as the old
     // per-spawn `{ ...process.env }` did.
-    // Only true inherits: a direct caller's options aren't checked as
-    // create() checks codeExecution's.
-    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv === true };
+    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv };
   }
 
   get busy(): boolean {
