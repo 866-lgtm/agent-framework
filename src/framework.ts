@@ -361,7 +361,7 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
   name: 'utils',
   description:
     'Rarely-used utilities, behind one slot instead of each costing a tool. ' +
-    '"list" names them all with one-liners; "describe" returns one utility\'s full ' +
+    '"list" names the utilities you can use, with one-liners; "describe" returns one utility\'s full ' +
     'input schema; "run" invokes it (args are validated against that schema — a ' +
     'miss bounces back with the schema and the specific error).',
   inputSchema: {
@@ -13044,11 +13044,17 @@ export class AgentFramework {
               (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
             );
 
-            // A refused call doesn't silence: the silence before it, and its
-            // round's other silencing calls, come back at the next round.
-            if (event.calls.some((call) => this.refusesSelfWake(call))) {
-              silenceBeforeRefusal = turnSilenced
-                || event.calls.some((call) => isSilencingTool(call.name) && !this.refusesSelfWake(call));
+            // A refused skip_reply, whether the agent's allowedTools doesn't
+            // name it or this host can't set the wake it asks for, keeps its
+            // own round private and silences nothing after it: the silence
+            // before it, and its round's other permitted silencing calls,
+            // come back at the next round. A refusal withholds the call's
+            // effect, not the model's choice to keep its words private.
+            const refusedSkipReply = (call: ToolCall): boolean => bareToolName(call.name) === 'skip_reply'
+              && (!this.canAgentUseTool(agent.name, call.name) || this.refusesSelfWake(call));
+            if (event.calls.some(refusedSkipReply)) {
+              silenceBeforeRefusal = turnSilenced || event.calls.some((call) =>
+                isSilencingTool(call.name) && this.canAgentUseTool(agent.name, call.name) && !refusedSkipReply(call));
               refusedWakeRounds.add(toolRound);
             }
 
@@ -13075,13 +13081,17 @@ export class AgentFramework {
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
             if (this.channelRegistry) {
-              const roundToolNames = event.calls
-                .filter((c) => this.canAgentUseTool(agent.name, c.name))
-                .map((c) => c.name);
+              // Every call the model made in the round, refused or not: a
+              // skip_reply or think refused still asks for the round's words
+              // to stay private. A refused send posted nothing, so it
+              // silences nothing; a refused skip_reply silences its own
+              // round, and the silence before it comes back at the next.
+              const roundToolNames = event.calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some(isSilencingTool)) {
+              if (event.calls.some((c) => isSilencingTool(c.name)
+                && (this.canAgentUseTool(agent.name, c.name) || bareToolName(c.name) === 'skip_reply'))) {
                 turnSilenced = true;
               }
               if (roundContent && roundContent.length > 0) {

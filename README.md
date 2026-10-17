@@ -73,9 +73,12 @@ Chronicle's audit history.
 
 `allowedTools` is enforced at dispatch for registered agents. Omission or
 `'all'` permits all tools; an explicit list matches exact names, including
-`module--utility` names. A utility's own name permits a direct model, public
-`executeToolCall`, or script call without `utils`. Adding `utils` exposes the
-list/describe/run slot; `run` still requires the named utility grant. The slot
+`module--utility` names. Utilities aren't tools of their own: an agent's model
+and its scripts are offered them only through `utils`, whose `run` checks the
+utility's own name. An agent that should use a utility lists both `utils` and
+`module--utility`. The name alone passes the dispatch check for any call by
+that name, whether the host makes it with `executeToolCall` on the agent's
+behalf or the model or a script makes it without being offered it. The slot
 is hidden when the agent can use no registered utility. If utilities exist
 but none are permitted, `list` returns a failed `ToolResult` with the registered
 and permitted counts and migration advice, and a list containing `utils`

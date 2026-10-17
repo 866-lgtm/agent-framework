@@ -253,7 +253,7 @@ function captureRouting(framework: AgentFramework) {
 for (const fallback of [false, true]) {
   for (const name of ['skip_reply', 'think', 'channel_publish']) {
     for (const permitted of [false, true]) {
-      test(`${fallback ? 'fallback' : 'native'} prose disposition ${permitted ? 'honors permitted' : 'ignores denied'} ${name}`, async () => {
+      test(`${fallback ? 'fallback' : 'native'} prose disposition ${permitted ? 'honors permitted' : 'of a refused'} ${name}`, async () => {
         const h = await harness({ allowedTools: permitted ? [name] : [], sameRoundThinkTextPolicy: 'private' });
         try {
           const routed = captureRouting(h.framework);
@@ -268,8 +268,10 @@ for (const fallback of [false, true]) {
                   if (event.type === 'tool-calls') {
                     yield { ...event, context: { ...event.context, roundContent: undefined } };
                   } else if (event.type === 'complete') {
-                    // Older membrane completion contains the cumulative tool round.
-                    yield { ...event, response: { ...event.response, content: [call, ...event.response.content] } };
+                    // Older membrane completion contains the cumulative tool round:
+                    // its prose, its call and its result, as XML mode parses them.
+                    const round = [{ type: 'text' as const, text: 'Public round prose' }, call, { type: 'tool_result' as const, toolUseId: call.id, content: 'result' }];
+                    yield { ...event, response: { ...event.response, content: [...round, ...event.response.content] } };
                   } else yield event;
                 }
               };
@@ -284,8 +286,17 @@ for (const fallback of [false, true]) {
           if (!permitted) {
             assert.equal(results[0].isError, true);
             assert.match(results[0].content, /not permitted.*allowedTools/);
-            assert.ok(routed.includes('Public trailing prose'), 'denied tools cannot silence trailing public prose');
-            if (!fallback) assert.ok(routed.includes('Public round prose'), 'denied think cannot privatize same-round public prose');
+            assert.ok(routed.includes('Public trailing prose'), 'a refused call silences nothing after its round');
+            if (name === 'channel_publish') {
+              // A refused send posted nothing, so it has nothing to keep from repeating.
+              if (!fallback) assert.ok(routed.includes('Public round prose'), "a refused send's round goes out");
+            } else if (name === 'skip_reply') {
+              // The model's choice to keep its words private holds without the call's effect.
+              assert.ok(!routed.includes('Public round prose'),
+                `a refused skip_reply keeps its own round private${fallback ? ', dropped by its place at turn end' : ''}`);
+            } else if (!fallback) {
+              assert.ok(!routed.includes('Public round prose'), 'a refused think keeps its round private under the private same-round policy');
+            }
           } else if (name === 'think') {
             assert.ok(routed.includes('Public trailing prose'));
             if (!fallback) assert.ok(!routed.includes('Public round prose'), 'permitted private think retains same-round policy');
@@ -296,6 +307,64 @@ for (const fallback of [false, true]) {
       });
     }
   }
+}
+
+
+test("a refused skip_reply beside a refused send keeps its round private, and neither silences what follows", async () => {
+  const h = await harness({ allowedTools: [] });
+  try {
+    const routed = captureRouting(h.framework);
+    h.membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Public round prose' },
+      { type: 'tool_use', id: 'skip', name: 'skip_reply', input: { reason: 'quiet' } },
+      { type: 'tool_use', id: 'send', name: 'channel_publish', input: { content: 'never posted' } },
+    ], 'tool_use'));
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+    h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+    await h.framework.runUntilIdle();
+    const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean }>;
+    assert.deepEqual(results.map((r) => r.isError), [true, true]);
+    assert.ok(!routed.includes('Public round prose'), 'the skip_reply keeps its round private');
+    assert.ok(routed.includes('Public trailing prose'), 'the refused send silences nothing after the round');
+  } finally { await h.close(); }
+});
+
+for (const fallback of [false, true]) {
+  test(`${fallback ? 'fallback' : 'native'}: a skip_reply the list doesn't name, asking for a wake on a host with no EventGate, is refused by the list first, and its round stays private`, async () => {
+    const h = await harness({ allowedTools: [] });
+    try {
+      const routed = captureRouting(h.framework);
+      assert.equal((h.framework as unknown as { eventGate?: unknown }).eventGate ?? undefined, undefined, 'no EventGate');
+      const call = { type: 'tool_use' as const, id: 'wake', name: 'skip_reply', input: { reason: 'later', wake_in_seconds: 60 } };
+      if (fallback) {
+        const streamYielding = h.membrane.streamYielding.bind(h.membrane);
+        h.membrane.streamYielding = (request, options) => {
+          const stream = streamYielding(request, options);
+          const iterate = stream[Symbol.asyncIterator].bind(stream);
+          stream[Symbol.asyncIterator] = async function* () {
+            for await (const event of { [Symbol.asyncIterator]: iterate }) {
+              if (event.type === 'tool-calls') {
+                yield { ...event, context: { ...event.context, roundContent: undefined } };
+              } else if (event.type === 'complete') {
+                const round = [{ type: 'text' as const, text: 'Public round prose' }, call, { type: 'tool_result' as const, toolUseId: call.id, content: 'result' }];
+                yield { ...event, response: { ...event.response, content: [...round, ...event.response.content] } };
+              } else yield event;
+            }
+          };
+          return stream;
+        };
+      }
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      await h.framework.runUntilIdle();
+      const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean; content: string }>;
+      assert.equal(results[0].isError, true);
+      assert.match(results[0].content, /not permitted.*allowedTools/, 'the permission refusal comes first');
+      assert.ok(!routed.includes('Public round prose'), 'its round stays private');
+      assert.ok(routed.includes('Public trailing prose'), 'and silences nothing after it');
+    } finally { await h.close(); }
+  });
 }
 
 for (const name of ['set_tool_visibility', 'set_tool_description']) {
