@@ -146,6 +146,24 @@ test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env, s
   }
 });
 
+test("a script's output that UTF-8 can't encode still returns, each lone surrogate as U+FFFD", async () => {
+  // A result the interpreter failed to send would wait out the script's
+  // deadline, so a short one makes that a failure here rather than a hang.
+  const runner = new PyRunner({ onToolCall: async () => '', scriptTimeoutMs: 15_000 });
+  try {
+    // A filename byte that isn't UTF-8, as os.fsdecode gives it, and a lone
+    // surrogate from a JSON escape, as a tool's result can carry one.
+    const r = await runner.exec(String.raw`import json, os
+print(os.fsdecode(b"\xff"))
+print(json.loads('"\\ud800"'))
+print("after")`, []);
+    assert.equal(r.returnCode, 0, r.stderr);
+    assert.equal(r.stdout, '\ufffd\n\ufffd\nafter\n');
+  } finally {
+    runner.dispose();
+  }
+});
+
 test("the interpreter runs in its own runtime directory, which goes at teardown, not the host's working directory", async () => {
   const runner = new PyRunner({ onToolCall: async () => '' });
   try {
