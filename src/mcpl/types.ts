@@ -416,7 +416,10 @@ export interface McplServerConfig {
    * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
    * `disabledTools` use the bare server-side names.
    *
-   * Must not collide with any module name or another server's prefix.
+   * Must not equal any module name or another server's prefix, nor meet
+   * another server's prefix: two prefixes meet when one is the other
+   * followed by `-`, or begins with the other followed by `--`, as `foo-`
+   * and `foo--bar` each meet `foo` (prefixesMeet, #265).
    */
   toolPrefix?: string;
 
