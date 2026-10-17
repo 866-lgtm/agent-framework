@@ -2103,7 +2103,7 @@ export class WorkspaceModule implements Module {
         // where the deletion alone would read as gone from disk.
         if (cur.conflict?.disk) {
           note = `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${relativePath} ` +
-            `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync takes in whatever disk holds there`;
+            `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`;
         }
         return {};
       });

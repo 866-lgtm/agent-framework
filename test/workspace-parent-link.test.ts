@@ -559,7 +559,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
   test('a draft written over a disk file the workspace never saw, then deleted, leaves that file alone and nothing pending', async (t) => {
     // Its push met a file it never saw (a recorded store-origin-collision).
     // Deleting the draft gives up the workspace's side, so the conflict has
-    // nothing left to be about: disk's file is a sync's to take in.
+    // nothing left to be about: disk's file is a sync's to observe.
     const env = new Env(t);
     env.writeDisk('c.txt', 'disk text\n');
     const m = await env.open(t, { autoMaterialize: true });
@@ -572,7 +572,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
       path: 'work/c.txt',
       deleted: true,
       note: 'nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in '
-        + '(conflict: store-origin-collision), and a sync takes in whatever disk holds there',
+        + '(conflict: store-origin-collision), and a sync observes whatever disk holds there',
     });
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
@@ -598,7 +598,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
       path: 'work/x.txt',
       deleted: true,
       note: 'nothing was unlinked: when last observed, disk held a file at work/x.txt that the workspace never took in '
-        + '(conflict: both-changed), and a sync takes in whatever disk holds there',
+        + '(conflict: both-changed), and a sync observes whatever disk holds there',
     });
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
