@@ -134,11 +134,11 @@ function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
  *   only for the keys the schema requires.
  * - A required key given as `null` has no value, the same as one left out,
  *   unless its declaration admits `null` (a type list naming it, or
- *   `nullable: true`), or declares no type: a key with no declared type takes
+ *   `nullable: true`), or has no `type` at all: a key with no `type` takes
  *   `null` as a value, as it takes any other. One whose `type` the check
- *   can't read, such as `any`, or a list naming one, takes `null` only where
- *   the declaration names it, and its values aren't checked against the
- *   type. An empty string is a value.
+ *   can't read, such as Gemini's `STRING`, or a list naming one, takes
+ *   `null` only where the declaration names it, and its values aren't
+ *   checked against the type. An empty string is a value.
  * - A schema whose `required` isn't a list requires nothing here, and a key
  *   it lists twice is reported once.
  * - Where a required key is missing and the call gave keys the schema

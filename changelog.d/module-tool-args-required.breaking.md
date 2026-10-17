@@ -1,8 +1,8 @@
 - **Module authors:** a module tool's call is refused before its handler
   runs when it lacks a key the tool's `inputSchema` lists in `required` (a
   key given as `null` counts as lacking it, unless its declaration admits
-  `null`, by a type list naming it or `nullable: true`, or it declares no
-  type), or when its input is there but isn't an object. **Who
+  `null`, by a type list naming it or `nullable: true`, or it has no `type`
+  at all), or when its input is there but isn't an object. **Who
   needs to act:** a module whose handler runs without a key its schema
   requires, since calls that leave the key out ran before and are now
   refused. **Migration:** if the key is optional, drop it from `required`
