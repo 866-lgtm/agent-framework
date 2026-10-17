@@ -194,7 +194,7 @@ test('a host-mode record that can\'t be replaced leaves no temp file behind, and
   });
 });
 
-test('a quiesce whose temp file can\'t be synced rejects with the host still serving, the record as it was and no temp file', async () => {
+test('a quiesce whose temp file can\'t be synced closes it and rejects with the host still serving, the record as it was and no temp file', async () => {
   await withFramework(async (framework, recovery) => {
     const record = join(recovery, 'host-mode.json');
     await framework.quiesce({ reason: 'first' });
@@ -208,6 +208,7 @@ test('a quiesce whose temp file can\'t be synced rejects with the host still ser
     assert.ok(error instanceof Error, String(error));
     assert.equal(error.message, `${record} was left as it was: EIO: i/o error, fsync`);
     assert.ok(!calls.some((c) => c.call === 'rename' && c.to === record), `no rename: ${JSON.stringify(calls)}`);
+    assertEachClosed(calls, (path) => isTemporaryOf(record, path));
     assert.equal(framework.getHostModeStatus().quiesced, false, 'the host still serving');
     assert.equal(readFileSync(record, 'utf8'), before);
     assert.deepEqual(readdirSync(recovery).filter((name) => name.endsWith('.tmp')), []);
