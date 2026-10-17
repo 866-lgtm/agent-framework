@@ -148,8 +148,8 @@ export interface SurgeryMarkerFacts {
  *   later one (a reconnect, a tools-list change or the next start) takes
  *   what remains. The record is durable, unless `error` says the journal's
  *   sync after it failed (a hide's or turn undo's batch, or a surgery's
- *   activation): then a host or power failure before the store's next sync
- *   could lose it. If a delivery pass fails, the requests stay
+ *   activation): then an operating system crash or a power failure before
+ *   the store's next sync could lose it. If a delivery pass fails, the requests stay
  *   recorded and the `discord-awareness-delivery` ops alert says so. The
  *   same alert names the requests a pass, or a start, gave up on: refused by
  *   Discord for good, or after three unconfirmed attempts. It is not a

@@ -1165,7 +1165,7 @@ interface HostCommandParams {
    *  Discord messages, `none` (the default), `addressed` or `all`. Any other
    *  value is refused. */
   marks?: string;
-  /** For the `marks` command: `list`, `cancel`, `retract` or `release`. */
+  /** For the `marks` command: `list`, `cancel` or `retract`. */
   action?: string;
   /** For the `marks` command: a batch id; for cancel also a retract request
    *  id; for retract also `all`. */
@@ -7788,8 +7788,9 @@ export class AgentFramework {
       } catch { /* unknown */ }
       if (landed) {
         return `; awareness batch ${batch.id} is retired, none of its marks sent, but the journal's sync after its ` +
-          `retirement failed (${detail}): a host or power failure before the store's next sync could lose that ` +
-          'record, and the batch would then be prepared again at the next start';
+          `retirement failed (${detail}): an operating system crash or a power failure before the store's next sync ` +
+          'could lose that record, and the batch would then be prepared again at the next start' + (suppression
+          ? `, its removals pending for ${batch.targetBranch}` : '');
       }
       const kept = `awareness batch ${batch.id} could not be retired (${detail})` + (landed === undefined
         ? ', and the journal can\'t be read back to tell whether its retirement landed; if it didn\'t, it stays '
@@ -8369,9 +8370,11 @@ export class AgentFramework {
 
   /**
    * Remove this bot's awareness mark, through each ref's configured MCPL
-   * route, from a batch's refs, or from every ref any batch sent an add for
-   * (`all`). The receipt says how many removals were queued and how many
-   * earlier add attempts are unresolved, any of which may land afterwards.
+   * route, from a batch's refs, or (`all`) from every ref of every batch not
+   * retired, every key an add was requested for, and every key an imported
+   * ledger recorded. The receipt says how many removals were queued and how
+   * many earlier add attempts are unresolved, any of which may land
+   * afterwards.
    */
   retractDiscordAwareness(
     target: string | 'all',
@@ -8451,16 +8454,16 @@ export class AgentFramework {
         if (settled.error !== undefined) {
           console.error(
             `[discord-awareness] agent=${agentName}: ${verb} applied, and its resume journal (awareness batch ` +
-              `${batch.id}, no marks) is closed, but the journal's sync after it failed (${settled.error}): a host or ` +
-              'power failure before the store\'s next sync could lose that record, and a start on this branch then ' +
-              'finds its removals applied and closes it',
+              `${batch.id}, no marks) is closed, but the journal's sync after it failed (${settled.error}): an ` +
+              'operating system crash or a power failure before the store\'s next sync could lose that record, and ' +
+              'a start on this branch then finds its removals applied and closes it',
           );
         }
       } else {
         const left = settled.status === 'not-scheduled'
           ? 'it was retired instead, so nothing is left to resume'
           : 'it stays prepared, unless the journal couldn\'t be read back and its closing record landed anyway; ' +
-            'either way, a start on this branch finds its removals applied and closes it';
+            'if it stays prepared, a start on this branch finds its removals applied and closes it';
         const message = `${verb} applied, but its resume journal (awareness batch ${batch.id}, no marks) ` +
           `could not be closed (${settled.error}); ${left}`;
         console.error(`[discord-awareness] agent=${agentName}: ${message}`);
@@ -8490,8 +8493,8 @@ export class AgentFramework {
       if (settled.error !== undefined) {
         console.error(
           `[discord-awareness] ${verb} agent=${agentName}: marker batch ${batchId} is recorded and queued, but the ` +
-            `journal's sync after it failed (${settled.error}): a host or power failure before the store's next sync ` +
-            'could lose it',
+            `journal's sync after it failed (${settled.error}): an operating system crash or a power failure ` +
+            'before the store\'s next sync could lose it',
         );
       }
       return { ...facts, status: 'queued', queued: settled.queued, batchId, ...(settled.error === undefined ? {} : { error: settled.error }) };
@@ -16474,18 +16477,21 @@ export class AgentFramework {
       );
     }
     if (recovered.imported.length > 0) {
-      // This start imported a pre-journal ledger: the work it had still to
-      // do is retired, none of it sent, since nobody chose it. A retract
-      // takes off what that release placed.
+      // This start imported a pre-journal ledger: the work agent-framework
+      // 0.22.x had still to do is retired, none of it sent, since nobody
+      // chose it. A retract of a batch 0.22.x activated takes off what it
+      // placed, and every other mark on that batch's messages.
       this.opsAlert(
         'discord-awareness-import-unsent',
         'host',
-        `The pre-journal awareness ledger is imported, and the marks an earlier release had still to add or ` +
+        `The pre-journal awareness ledger is imported, and the marks agent-framework 0.22.x had still to add or ` +
           'remove won\'t be sent, since nobody chose them: ' +
           recovered.imported.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
             `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
-          '. To take off the marks that release placed, retract each batch through the host command marks ' +
-          '(action retract), or, with the host stopped, agent-framework-recover --awareness retract',
+          '. A batch 0.22.x never activated placed no marks. To take off the marks it placed for a batch it ' +
+          'activated, retract that batch through the host command marks (action retract), or, with the host ' +
+          'stopped, agent-framework-recover --awareness retract: a retract takes off every mark on the batch\'s ' +
+          'messages, whichever batch placed it',
         { data: { batches: recovered.imported } },
       );
     }

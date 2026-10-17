@@ -93,7 +93,7 @@ const retracts = (outbox: DiscordAwarenessOutbox) =>
 /**
  * A pre-journal ledger's batch, prepared unless `extra` says otherwise, with
  * marks, written where the store keeps one and imported by the returned
- * outbox's first read. An import retires one its release never activated,
+ * outbox's first read. An import retires one 0.22.x never activated,
  * unless it is a suppression whose body may be pending, which stays
  * prepared; an active one stays active.
  */
@@ -359,7 +359,7 @@ test('cancelling a batch its surgery has not activated stops every mark; a suppr
   assert.equal(outbox.pendingDispatches('discord').length, 0);
 }));
 
-test('an imported suppression its release never activated keeps its body pending, and a start on its branch finishes and retires it, none of its marks sent', withJournal((_outbox, h) => {
+test('an imported suppression 0.22.x never activated keeps its body pending, and a start on its branch finishes and retires it, none of its marks sent', withJournal((_outbox, h) => {
   const outbox = importLegacyBatch(h, 'legacy-sup', [ref('m1')], {
     targetBranch: 'partial', activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i2' }],
   });
@@ -635,7 +635,7 @@ test('a retry confirming an unknown add never erases the unresolved first attemp
   assert.equal(receipt.unresolvedAddAttempts, 1);
 }));
 
-test('an import retires the work an earlier release had still to do, none of it sent, and the start that imported it names its batches', withJournal((_outbox, h) => {
+test('an import retires the work 0.22.x had still to do, none of it sent, and the start that imported it names its batches', withJournal((_outbox, h) => {
   const outbox = importLegacyBatch(h, 'old-1', [ref('m1'), ref('m2')]);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
   assert.deepEqual(batches(outbox), [], 'a retired batch leaves the view');
@@ -646,7 +646,8 @@ test('an import retires the work an earlier release had still to do, none of it 
   assert.deepEqual(recovered.retired, [], 'its import retired it; no start does');
   // A later process imports nothing, and names nothing.
   assert.deepEqual(h.reopen().recoverAtStartup(() => true).imported, []);
-  // A retract still takes off what the earlier release may have placed.
+  // A retract still takes off every mark on the batch's messages, those
+  // 0.22.x may have placed among them.
   assert.equal(h.reopen().retract('old-1').removalsQueued, 2);
 }));
 
@@ -921,8 +922,8 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify(legacy));
   const outbox = h.reopen();
-  // The operator retracts what the earlier release may have placed, and the
-  // removal lands.
+  // The operator retracts what 0.22.x may have placed, and the removal
+  // lands.
   outbox.retract('restored', 'operator');
   answer(outbox, 'm1', 'confirmed');
   const view = outbox.view();
@@ -1485,8 +1486,8 @@ test('after a failed surgery, retiring its batch says what the journal holds: re
   assert.equal(
     framework.retireAfterRestore(batch, 'main', 'cairn'),
     '; awareness batch f1 is retired, none of its marks sent, but the journal\'s sync after its retirement failed '
-      + '(injected sync failure): a host or power failure before the store\'s next sync could lose that record, and '
-      + 'the batch would then be prepared again at the next start',
+      + '(injected sync failure): an operating system crash or a power failure before the store\'s next sync could lose '
+      + 'that record, and the batch would then be prepared again at the next start, its removals pending for recovery/cairn/f1',
   );
   assert.deepEqual(alerts, [], 'retired: nothing is left unresolved');
   framework.discordAwarenessOutbox = {
@@ -1642,15 +1643,16 @@ test('the start that imports a pre-journal ledger raises one alert naming each b
   assert.deepEqual(alerts, [{
     kind: 'discord-awareness-import-unsent',
     agent: 'host',
-    message: 'The pre-journal awareness ledger is imported, and the marks an earlier release had still to add or remove '
-      + `won't be sent, since nobody chose them: ${named}. To take off the marks that release placed, retract each `
-      + 'batch through the host command marks (action retract), or, with the host stopped, agent-framework-recover '
-      + '--awareness retract',
+    message: 'The pre-journal awareness ledger is imported, and the marks agent-framework 0.22.x had still to add or '
+      + `remove won't be sent, since nobody chose them: ${named}. A batch 0.22.x never activated placed no marks. To `
+      + 'take off the marks it placed for a batch it activated, retract that batch through the host command marks '
+      + '(action retract), or, with the host stopped, agent-framework-recover --awareness retract: a retract takes off '
+      + 'every mark on the batch\'s messages, whichever batch placed it',
   }]);
   assert.deepEqual(logged, [
-    `[discord-awareness] imported ${basename(h.legacyPath)}: 2 batch(es) had marks an earlier release had still to `
-      + `add or remove, and none of them will be sent, since nobody chose them: ${named}. Retracting a batch takes off `
-      + 'the marks that release placed',
+    `[discord-awareness] imported ${basename(h.legacyPath)}: 2 batch(es) had marks agent-framework 0.22.x had still `
+      + `to add or remove, and none of them will be sent, since nobody chose them: ${named}. A batch 0.22.x never `
+      + 'activated placed no marks; retracting a batch takes off every mark on its messages, whichever batch placed it',
   ]);
   assert.equal(framework.discordAwarenessOutbox.pendingDispatches('discord').length, 0, 'nothing was sent');
   assert.deepEqual(
@@ -1734,7 +1736,7 @@ test("a suppression's resume journal closed with a failed sync is logged, and a 
   }
   assert.deepEqual(logged, [
     '[discord-awareness] agent=cairn: suppress applied, and its resume journal (awareness batch s1, no marks) is closed, '
-      + "but the journal's sync after it failed (injected sync failure): a host or power failure before the store's next "
+      + "but the journal's sync after it failed (injected sync failure): an operating system crash or a power failure before the store's next "
       + 'sync could lose that record, and a start on this branch then finds its removals applied and closes it',
   ]);
 });
@@ -2410,7 +2412,7 @@ test('an operator\'s request the journal won\'t carry out is a refusal; a journa
   assert.throws(() => outbox.cancel(batch.id), (error) => !(error instanceof DiscordAwarenessRefusal) && /injected sync failure/.test((error as Error).message));
 }));
 
-test('a version 1 ledger\'s import is recorded as v1', withJournal((_outbox, h) => {
+test('a version 1 ledger\'s import is recorded as v1, and its pending batch, the active one, is imported active with nothing due', withJournal((_outbox, h) => {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify({
     version: 1,
@@ -2420,6 +2422,11 @@ test('a version 1 ledger\'s import is recorded as v1', withJournal((_outbox, h) 
   const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE)
     .flatMap((id) => (JSON.parse(Buffer.from(h.store.getRecord(id)!.payload).toString('utf-8')) as { records: Array<{ t: string; source?: string }> }).records);
   assert.deepEqual(records.filter((record) => record.t === 'import-complete').map((record) => record.source), ['v1']);
+  // v1's `pending` was its active status: the batch stays active, and the
+  // add it had still to send is dropped, never sent.
+  const outbox = h.reopen();
+  assert.deepEqual(outbox.batches().map((batch) => [batch.id, batch.status]), [['v1-batch', 'active']]);
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
 }));
 
 test('a sync for one server drains only that server', async () => {

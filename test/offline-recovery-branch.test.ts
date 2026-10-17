@@ -442,6 +442,27 @@ test('a failed offline suppression retires its batch once the source is confirme
       }
     }
 
+    // Retiring the batch fails, and the journal can't be read back either:
+    // the error says it can't tell whether the retirement landed, and what
+    // stays if it didn't.
+    await seed();
+    const batchStatus = DiscordAwarenessOutbox.prototype.batchStatus;
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    DiscordAwarenessOutbox.prototype.batchStatus = function () { throw new Error('injected unreadable journal'); };
+    try {
+      await assert.rejects(
+        createOfflineRecoveryBranch({
+          storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
+          marks: { scope: 'all' }, branchName: 'recovery/cairn/fail-unread',
+        }),
+        /awareness batch \S+ could not be retired \(injected retire failure\), and the journal can't be read back to tell whether its retirement landed; if it didn't, it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/fail-unread: a start on recovery\/cairn\/fail-unread would finish them there and retire the batch/,
+      );
+    } finally {
+      DiscordAwarenessOutbox.prototype.discard = discard;
+      DiscordAwarenessOutbox.prototype.batchStatus = batchStatus;
+    }
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['prepared'], due: 0 });
+
     // The retirement lands, and only its sync fails: read back, it's
     // reported retired, with the risk that the sync left.
     await seed();
@@ -455,7 +476,7 @@ test('a failed offline suppression retires its batch once the source is confirme
           storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
           marks: { scope: 'all' }, branchName: 'recovery/cairn/fail-synced',
         }),
-        /; awareness batch \S+ is retired, none of its marks sent, but the journal's sync after its retirement failed \(injected sync failure\): a host or power failure before the store's next sync could lose that record, and the batch would then be prepared again at the next start\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
+        /; awareness batch \S+ is retired, none of its marks sent, but the journal's sync after its retirement failed \(injected sync failure\): an operating system crash or a power failure before the store's next sync could lose that record, and the batch would then be prepared again at the next start, its removals pending for recovery\/cairn\/fail-synced\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
       );
     } finally {
       DiscordAwarenessOutbox.prototype.discard = discard;
@@ -540,7 +561,7 @@ test('an offline suppression whose resume journal could not be closed, or whose 
     assert.equal(unresolved.markers?.status, 'none');
     assert.match(
       unresolved.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, unless the journal couldn't be read back and its closing record landed anyway; either way, a start on recovery\/cairn\/close finds its removals applied and closes it$/,
+      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, unless the journal couldn't be read back and its closing record landed anyway; if it stays prepared, a start on recovery\/cairn\/close finds its removals applied and closes it$/,
     );
     const retired = await recoverWith({ status: 'not-scheduled', error: 'injected activation failure' }, 'none');
     assert.match(
@@ -550,7 +571,7 @@ test('an offline suppression whose resume journal could not be closed, or whose 
     const unsynced = await recoverWith({ status: 'queued', queued: 0, error: 'injected sync failure' }, 'none');
     assert.match(
       unsynced.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) is closed, but the journal's sync after it failed \(injected sync failure\): a host or power failure before the store's next sync could lose that record, and a start on recovery\/cairn\/close then finds its removals applied and closes it$/,
+      /^the resume journal \(awareness batch \S+, no marks\) is closed, but the journal's sync after it failed \(injected sync failure\): an operating system crash or a power failure before the store's next sync could lose that record, and a start on recovery\/cairn\/close then finds its removals applied and closes it$/,
     );
     const closed = await recoverWith({ status: 'queued', queued: 0 }, 'none');
     assert.equal(closed.suppressionJournal, undefined, 'a journal closed and synced says nothing');

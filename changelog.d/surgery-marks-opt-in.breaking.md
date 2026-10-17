@@ -41,11 +41,13 @@
 - **Hosts with a JSON awareness ledger:** `discordAwarenessOutboxPath` now
   only names it for import (by default
   `<store>/recovery/discord-awareness-outbox.json`). It is imported once on
-  first use and renamed `.migrated-v2`, and the marks it had still to add or
-  remove are never sent, since nobody chose them. The import names their
-  batches, in a `discord-awareness-import-unsent` ops alert at the host's
-  start or on the CLI's stderr, and a retract of one takes off the marks an
-  earlier release placed. A release before this one doesn't read the
+  first use and renamed `.migrated-v2`, and the marks 0.22.x had still to add
+  or remove are never sent, since nobody chose them. The import names their
+  batches on stderr wherever it runs, and in a
+  `discord-awareness-import-unsent` ops alert at the host's start that
+  imported it. A batch 0.22.x never activated placed no marks; a retract of
+  a batch takes off every mark on its messages, whichever batch placed it.
+  A release before this one doesn't read the
   journal, so a host downgraded after the import starts without it, and
   marks queued since aren't delivered.
 - **Hosts that call `startDiscordAwarenessDelivery()`:** 0.22.1 added it

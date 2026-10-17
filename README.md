@@ -520,13 +520,14 @@ reconciliation state it was; and how many attempt outcomes it leaves
 unrecorded), never as a claim about what is on Discord,
 and an imported `active` suppression is not taken as proof that its body
 completed: startup verifies and resumes its intervals on its branch. The
-work it had still to do is never sent, since nobody chose it: a batch it
-never activated is retired (a suppression whose body may be pending, once a
-start on its branch finishes the body), and pending adds and removals are
-dropped. The import names each batch that had such work, with how many
-adds and removals, in a `discord-awareness-import-unsent` ops alert at the
-host's start, or on stderr when the CLI imports it, and a retract of a batch
-takes off the marks the earlier release placed.
+work agent-framework 0.22.x had still to do is never sent, since nobody
+chose it: a batch it never activated is retired (a suppression whose body
+may be pending, once a start on its branch finishes the body), and pending
+adds and removals are dropped. The import names each batch that had such
+work, with how many adds and removals, on stderr wherever it runs, and in a
+`discord-awareness-import-unsent` ops alert at the host's start that
+imported it. A batch 0.22.x never activated placed no marks; a retract of a
+batch takes off every mark on its messages, whichever batch placed it.
 
 ## Observability
 

@@ -337,8 +337,9 @@ export async function createOfflineRecoveryBranch(
               : '; it stays ') + 'prepared, none of its marks to be sent';
             if (landed) {
               retire = `; awareness batch ${batch.id} is retired, none of its marks sent, but the journal's sync ` +
-                `after its retirement failed (${detail}): a host or power failure before the store's next sync could ` +
-                `lose that record, and the batch would then be prepared again at the next start${redo}`;
+                `after its retirement failed (${detail}): an operating system crash or a power failure before the ` +
+                'store\'s next sync could lose that record, and the batch would then be prepared again at the next ' +
+                `start${suppression.intervals.length > 0 ? `, its removals pending for ${targetBranch}` : ''}${redo}`;
             } else if (suppression.intervals.length === 0) {
               retire = `${kept}, until the next start retires it${redo}`;
             } else {
@@ -395,8 +396,9 @@ export async function createOfflineRecoveryBranch(
         // closes the body's resume journal: say if that record's sync failed.
         if (settled.error !== undefined) {
           suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) is closed, but the ` +
-            `journal's sync after it failed (${settled.error}): a host or power failure before the store's next ` +
-            `sync could lose that record, and a start on ${targetBranch} then finds its removals applied and closes it`;
+            `journal's sync after it failed (${settled.error}): an operating system crash or a power failure before ` +
+            `the store's next sync could lose that record, and a start on ${targetBranch} then finds its removals ` +
+            'applied and closes it';
         }
       } else {
         // If closing it failed, say what's left.
@@ -404,7 +406,7 @@ export async function createOfflineRecoveryBranch(
           `(${settled.error}); ` + (settled.status === 'not-scheduled'
             ? 'it was retired instead, so nothing is left to resume'
             : 'it stays prepared, unless the journal couldn\'t be read back and its closing record landed anyway; ' +
-              `either way, a start on ${targetBranch} finds its removals applied and closes it`);
+              `if it stays prepared, a start on ${targetBranch} finds its removals applied and closes it`);
       }
     }
     return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionJournal ? { suppressionJournal } : {}) };

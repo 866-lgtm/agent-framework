@@ -206,7 +206,9 @@ export type DiscordAwarenessSettlement =
  * - `discarded`: retired, none of its marks to be sent: by its surgery (the
  *   surgery never happened, or its activation could not be recorded), at
  *   startup (its surgery was interrupted, or failed and couldn't retire it),
- *   or at import (an earlier release never activated it).
+ *   or at import (0.22.x never activated it, unless its suppression's body
+ *   may be pending: that one stays prepared until a start on its branch
+ *   finishes the body and retires it).
  */
 export type DiscordAwarenessBatchStatus = 'prepared' | 'active' | 'discarded';
 
@@ -374,7 +376,7 @@ export interface DiscordAwarenessImportedUnsent {
   agentName: string;
   sourceBranch: string;
   targetBranch: string;
-  /** Marks the earlier release had still to add, and to remove. */
+  /** Marks agent-framework 0.22.x had still to add, and to remove. */
   adds: number;
   removals: number;
 }
@@ -546,8 +548,9 @@ type JournalRecord =
       reason: string;
       releaseActions: Array<DiscordAwarenessRef & { emoji: string; action: DiscordAwarenessAction }>;
     }
-  /** A pre-release build of this journal released an imported batch's held
-   *  work: history, since its requests were recorded with it. */
+  /** A pre-release build of this journal released a held batch, a
+   *  surgery's or an import's: history, since its requests were recorded
+   *  with it. */
   | { t: 'released'; at: number; batchId: string; by?: string }
   | { t: 'cancelled'; at: number; batchId: string; by?: string }
   | {
@@ -903,8 +906,8 @@ export class DiscordAwarenessOutbox {
   /**
    * The suppressions whose body may still be applied on `branch`: batches
    * whose target is exactly that branch, not retired, whose body was never
-   * recorded complete or given up (isPendingSuppression), whatever their
-   * status or cancel state. Activation records a surgery's body complete, so
+   * recorded complete or given up (isPendingSuppression), whether prepared
+   * or active, cancelled or not. Activation records a surgery's body complete, so
    * these are a surgery's leftovers (prepared), an imported ledger's
    * batches, since the old ledger could record activation before the
    * redactions were synced, and a batch a pre-release build released without
@@ -929,8 +932,8 @@ export class DiscordAwarenessOutbox {
   /**
    * Record a suppression's body complete, once a start on its branch has
    * finished its removals. A leftover (isSurgeryLeftover: still prepared,
-   * its surgery interrupted, or an import's that an earlier release never
-   * activated) is retired in the same entry, none of its marks sent: a
+   * its surgery interrupted, or an import's that agent-framework 0.22.x
+   * never activated) is retired in the same entry, none of its marks sent: a
    * restart never activates a surgery's marks. An import's active batch
    * keeps its marks as they are. Returns whether it was retired.
    */
@@ -1594,10 +1597,11 @@ export class DiscordAwarenessOutbox {
       if (imported.unsent.length > 0) {
         console.error(
           `[discord-awareness] imported ${basename(this.legacyPath)}: ${imported.unsent.length} batch(es) had marks ` +
-            'an earlier release had still to add or remove, and none of them will be sent, since nobody chose them: ' +
+            'agent-framework 0.22.x had still to add or remove, and none of them will be sent, since nobody chose them: ' +
             imported.unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
               `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
-            '. Retracting a batch takes off the marks that release placed',
+            '. A batch 0.22.x never activated placed no marks; retracting a batch takes off every mark on its ' +
+            'messages, whichever batch placed it',
         );
       }
     }
@@ -1708,8 +1712,9 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
         // batch stays as it was (see the record's type).
         break;
       case 'released': {
-        // A pre-release build's release of an imported batch's held work:
-        // its requests follow in the same entry, under this authorization.
+        // A pre-release build's release of a held batch, a surgery's or an
+        // import's: its requests follow in the same entry, under this
+        // authorization.
         const batch = state.batches.get(record.batchId);
         if (batch && batch.status !== 'discarded' && batch.releaseAuthorization === undefined) {
           batch.status = 'active';
@@ -1820,9 +1825,11 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
 /**
  * Whether an operation's work has ended, so its key needs nothing more for
  * it: it was cancelled or superseded, confirmed, refused for good, or
- * brought to the bound of unconfirmed attempts. One on the wire, or left
- * there by a previous process, hasn't ended. headDispatch decides what is
- * due among the operations that haven't.
+ * brought to the bound of unconfirmed attempts. One not cancelled that is
+ * on the wire, or was left there by a previous process, hasn't ended.
+ * headDispatch decides what is due among the operations that haven't, and
+ * holds a key while any attempt of its, a cancelled one's included, is on
+ * the wire.
  */
 function opEnded(op: DiscordAwarenessOp): boolean {
   if (op.cancelled) return true;
@@ -1877,7 +1884,8 @@ interface LegacyBatch {
  * body may be pending on its branch, which stays prepared, as an
  * interrupted surgery's does, for a start on that branch to finish and
  * retire (see pendingSuppressionsFor). Nothing imported is ever dispatched;
- * a retract takes off what the earlier release placed.
+ * a retract of a batch takes off every mark on its messages, whichever
+ * batch placed it, the marks 0.22.x placed among them.
  *
  * Each batch is imported once. A batch the journal already holds, or a
  * second listing of one in this file, is skipped whole: its evidence would
@@ -1939,7 +1947,7 @@ function importLegacy(
       // deliver: its entries are pending, a prepared one's are not.
       const status = entry.deliveryStatus ?? (raw.status === 'pending' ? 'pending' : 'applied');
       const desired = entry.desired ?? raw.status === 'pending';
-      // What the earlier release had still to do for this ref, retired here.
+      // What 0.22.x had still to do for this ref, retired here.
       if ((!legacyActive || status === 'pending') && (!legacyActive || desired || entry.markerPresent)) {
         if (desired || !legacyActive) adds++;
         else removals++;
@@ -1948,7 +1956,7 @@ function importLegacy(
         records.push({ t: 'legacy-evidence', at, evidence: legacyEvidence(raw.id, key, entry, status) });
       }
     }
-    // A batch the earlier release never activated is retired, unless its
+    // A batch 0.22.x never activated is retired, unless its
     // suppression's body may be pending (isPendingSuppression's test for a
     // batch new to the journal): that one stays prepared for a start on its
     // branch, which finishes the body and retires it.
@@ -2006,7 +2014,7 @@ function legacyEvidence(
 }
 
 /** A batch a start treats as an interrupted surgery's: one still prepared.
- *  An import's batch that an earlier release never activated is one too,
+ *  An import's batch that agent-framework 0.22.x never activated is one too,
  *  when its import kept it for its suppression's body (see importLegacy). */
 function isSurgeryLeftover(batch: DiscordAwarenessBatch): boolean {
   return batch.status === 'prepared';

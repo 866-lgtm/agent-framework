@@ -91,9 +91,10 @@ unless its operatorLogPath puts it elsewhere), with the OS account that ran
 it, whether it was carried out or refused: a log that can't be written says
 so on stderr, and the act stands. A dry run and a list write no entry. A
 list imports a pre-journal ledger if one is present, as the host's next
-start would: the marks it had still to add or remove are never sent, and
-stderr names the batches they belonged to. Retracting a batch takes off
-the marks the earlier release placed. The store must exist: neither
+start would: the marks agent-framework 0.22.x had still to add or remove
+are never sent, and stderr names the batches they belonged to. A batch
+0.22.x never activated placed no marks; retracting a batch takes off every
+mark on its messages, whichever batch placed it. The store must exist: neither
 creates one.
 The agent host must be stopped before running this command.`;
 }
