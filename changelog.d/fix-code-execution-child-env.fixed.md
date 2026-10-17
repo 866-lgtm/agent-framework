@@ -1,7 +1,1 @@
-- The code-execution python interpreter no longer inherits the host
-  environment: it gets the same operating allowlist as stdio MCPL children
-  (#175), plus the runner's declared `env`, with `inheritEnv: true` as the
-  escape hatch — model-authored code can no longer read host secrets via
-  `os.environ`. The child env is rebuilt at every spawn, and on Windows the
-  allowlist matches names case-insensitively (`Path`, `SystemRoot`,
-  `ComSpec` survive with their original spelling).
+- `USERNAME` joins the child-env allowlist, beside `USER` and `LOGNAME`, so a Windows child gets its user's name, as a POSIX one does. Without it, Python's `getpass.getuser()` raises on Windows, in stdio MCPL children and the code-execution interpreter alike.
