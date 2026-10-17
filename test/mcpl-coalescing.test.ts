@@ -901,15 +901,15 @@ test('R13: a retraction during the audience lookup is final; the stale batch is 
   assert(!f.context().includes('document_diff'));
 });
 
-test('a turn whose agent left the batch\'s audience before the assembly starts no inference', async (t) => {
+test('a turn whose batch\'s audience no longer names its agent at the assembly starts no inference', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'moved_fallback', { deferred: true, initial: true }));
   // The admission's wake has looked the audience up; the next lookup is the
-  // assembly's, and it no longer names the agent, as when a conversation
+  // assembly's, and it names another agent instead, as when a conversation
   // fork's channel is bound to a new fork in between.
-  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> };
+  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]>; pushCoalescer: { pendingBatches(): number } };
   const orig = internals.coalescedAudience.bind(internals);
-  internals.coalescedAudience = async () => { internals.coalescedAudience = orig; return []; };
+  internals.coalescedAudience = async () => { internals.coalescedAudience = orig; return ['conversation-chat-g2']; };
   let withdrawn = 0;
   f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
   await f.framework.runUntilIdle();
@@ -917,6 +917,30 @@ test('a turn whose agent left the batch\'s audience before the assembly starts n
   assert(!f.context().includes('moved_fallback'));
   assert.equal(f.membrane.calls.length, 0, 'the batch, the only cause, started no inference');
   assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
+  assert.equal(internals.pushCoalescer.pendingBatches(), 1, 'the batch stays pending');
+});
+
+test('an assembly for an agent outside the audience of a batch another assembly is rendering declines it', async (t) => {
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'other', model: 'test', systemPrompt: 'test' }] }); t.after(f.close);
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  f.renderer(() => { began(); return new Promise((resolve) => { release = resolve; }); });
+  await f.send('push/event', f.params('1', 'shared_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]>; pushCoalescer: { assemble(agent: string): Promise<{ settled: Set<string>; materialized: Set<string> }> } };
+  // From here on the audience is 'other' alone, as when a conversation fork's
+  // channel has moved to a new fork. 'other' freezes the batch and its render
+  // is held; 'agent' then assembles while it's in flight.
+  internals.coalescedAudience = async () => ['other'];
+  const rendering = internals.pushCoalescer.assemble('other');
+  await started;
+  const declined = await internals.pushCoalescer.assemble('agent');
+  assert.equal(declined.settled.size, 1, 'the subject is settled for the agent outside the audience');
+  assert.equal(declined.materialized.size, 0, 'and gave it nothing');
+  release({ content: [{ type: 'text', text: 'shared_render' }] });
+  const rendered = await rendering;
+  assert.equal(rendered.settled.size, 1);
+  assert.equal(rendered.materialized.size, 1, 'the assembly in the audience delivered the render');
 });
 
 test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {
@@ -979,11 +1003,15 @@ test('R16: a batch whose render-start commit failed is re-woken once storage rec
   // The recovery wake can fire inside the first drain or after it, so drive
   // until the batch renders rather than for a fixed number of drains.
   await f.framework.runUntilIdle();
-  while (!traced.some((e) => e.kind === 'rendered')) {
+  for (let pass = 0; !traced.some((e) => e.kind === 'rendered'); pass++) {
+    assert(pass < 5, 'the batch rendered within five recovery wakes');
     await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
     await f.framework.runUntilIdle();
+    // A macrotask turn, so timers (this test's timeout among them) can fire
+    // even when both waits above return at once.
+    await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(f.membrane.calls.length, 1, 'the wake whose render-start commit failed, the only cause, started no inference');
+  assert.equal(f.membrane.calls.length, 1, 'one model call, the recovery turn\'s: the wake whose render-start commit failed, the only cause, started none');
   assert(f.lastRequest().includes('asleep_fallback'), 'the recovery turn delivered the batch');
   const kinds = traced.map((e) => e.kind);
   const order = (...steps: string[]) => kinds.filter((k) => steps.includes(k));
