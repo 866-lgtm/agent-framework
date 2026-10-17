@@ -15,8 +15,9 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { checkDir, confirmAbsent, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
@@ -72,6 +73,20 @@ async function call(m: WorkspaceModule, name: string, input: Record<string, unkn
   const res = await m.handleToolCall({ id: 't', name, input });
   assert.equal(res.success, true, `${name} ${JSON.stringify(input)} failed: ${res.error}`);
   return res.data;
+}
+
+/** Run `fn` with node:fs/promises' realpath answering `respell(answer)`, as the code under test sees it. */
+async function withRealpath<T>(respell: (real: string) => string, fn: () => Promise<T>): Promise<T> {
+  const fsp = createRequire(import.meta.url)('node:fs/promises') as { realpath: (...args: any[]) => Promise<string> };
+  const original = fsp.realpath;
+  fsp.realpath = async (...args: any[]) => respell(await original(...args));
+  syncBuiltinESMExports();
+  try {
+    return await fn();
+  } finally {
+    fsp.realpath = original;
+    syncBuiltinESMExports();
+  }
 }
 
 /** The skipped reason for a path in a materialize's or a sync's result. */
@@ -188,6 +203,27 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.ok(typeof absent === 'string' && exactly.test(absent), `confirmAbsent: ${JSON.stringify(absent)}`);
     });
   }
+
+  test('a path that resolves to another spelling of itself, with no link on its way, is reached by each primitive', async (t) => {
+    // On macOS or Windows, realpath spells a name as disk does, its case or
+    // its Unicode normalization, where the path may spell it otherwise. That
+    // other string is no symlink. Linux has no such spelling, so each answer
+    // beneath the root is respelled here with a `.` after the root, which
+    // still names the same file.
+    const env = new Env(t);
+    env.writeDisk('l/x.txt', 'v1\n');
+    const view: MountView = { root: env.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [] };
+    const rootReal = realpathSync(env.dir);
+    const respell = (real: string) => (real.startsWith(rootReal + sep) ? `${rootReal}${sep}.${real.slice(rootReal.length)}` : real);
+    await withRealpath(respell, async () => {
+      const dir = await checkDir(view, rootReal, 'l');
+      assert.equal(dir.kind, 'checked', `checkDir: ${JSON.stringify(dir)}`);
+      const seen = await observePath(view, rootReal, 'l/x.txt');
+      assert.equal(seen.kind, 'file', `observePath: ${JSON.stringify(seen)}`);
+      const read = await readPath(view, rootReal, 'l/x.txt', 1 << 20);
+      assert.equal(read.kind, 'read', `readPath: ${JSON.stringify({ ...read, bytes: undefined })}`);
+    });
+  });
 
   test('readBinaryFromDisk reads nothing through a link: the file itself leading out, a parent leading out, or a parent inside', async (t) => {
     const env = new Env(t);

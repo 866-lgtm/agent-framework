@@ -158,8 +158,10 @@ export function isLinkedPathReason(reason: string): boolean {
  * anything else), from the root down, so the first one found is reported
  * before anything beneath it is resolved through it. The walk stops where
  * nothing is there or a file is in the way, since nothing beneath is reached
- * through a link. Callers ask before anything resolves the path, so a link
- * gets the same answer wherever it leads.
+ * through a link. A caller asks before it acts on what the path resolves to,
+ * and before it checks containment, so a link gets the same answer wherever
+ * it leads. The observations ask through linkRefusal, which asks this only
+ * when the path resolved to another string than its own.
  */
 export async function linkOnTheWay(view: Pick<MountView, 'root' | 'followSymlinks'>, rel: string): Promise<string | null> {
   if (view.followSymlinks || rel === '') return null;
@@ -177,6 +179,23 @@ export async function linkOnTheWay(view: Pick<MountView, 'root' | 'followSymlink
     }
   }
   return null;
+}
+
+/**
+ * On a mount that doesn't follow symlinks, why the mount-relative `rel`, which
+ * realpath resolved to `real`, is refused: linkedPathReason for the first
+ * symlink on its way. Null when the mount follows symlinks, or none is.
+ * Where `real` is the root's canonical path joined with `rel`, nothing beneath
+ * the root resolved through a link, and nothing more is asked: that is every
+ * path through ordinary directories, at no cost per path. Otherwise each
+ * directory is asked in turn (linkOnTheWay), since a name spelled otherwise
+ * than disk spells it, on a file system that ignores case or Unicode
+ * normalization, also resolves to another string, and isn't a link.
+ */
+async function linkRefusal(view: MountView, rootReal: string, rel: string, real: string): Promise<string | null> {
+  if (view.followSymlinks || rel === '' || real === join(rootReal, rel)) return null;
+  const link = await linkOnTheWay(view, rel);
+  return link === null ? null : linkedPathReason(link);
 }
 
 // ===========================================================================
@@ -266,10 +285,6 @@ async function checkedAt(view: MountView, rel: string, real: string): Promise<Ch
  * directory, either way for confirmAbsent to prove; or not inside the mount.
  */
 async function locateDir(view: MountView, rootReal: string, rel: string): Promise<DirCheck | { kind: 'missing' }> {
-  // A mount that doesn't follow symlinks goes through none on the way to a
-  // directory, inside the mount or out of it.
-  const link = await linkOnTheWay(view, rel);
-  if (link !== null) return { kind: 'unobserved', reason: linkedPathReason(link) };
   const lexical = lexicalOf(view, rel);
   let real: string;
   try {
@@ -279,6 +294,10 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     if (code === 'ENOENT' || code === 'ENOTDIR') return rel === '' ? { kind: 'unobserved', reason: ROOT_UNAVAILABLE } : { kind: 'missing' };
     return { kind: 'unobserved', reason: `cannot resolve the directory (${code ?? String(err)})` };
   }
+  // A mount that doesn't follow symlinks goes through none on the way to a
+  // directory, inside the mount or out of it.
+  const refused = await linkRefusal(view, rootReal, rel, real);
+  if (refused !== null) return { kind: 'unobserved', reason: refused };
   if (rel === '') {
     // The root is whatever the configured path names, and it must still be
     // the root the pass was given.
@@ -501,11 +520,14 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
 /**
  * Where a path's parent directory canonically lies: inside the mount, gone
  * (absence is then proven separately), or somewhere a no-follow open would
- * still reach through — O_NOFOLLOW guards only the final component.
+ * still reach through — O_NOFOLLOW guards only the final component — which
+ * on a mount that doesn't follow symlinks is any symlink on the way.
  */
-async function parentPlacement(rootReal: string, lexical: string): Promise<'inside' | 'gone' | { reason: string }> {
+async function parentPlacement(view: MountView, rootReal: string, relativePath: string): Promise<'inside' | 'gone' | { reason: string }> {
   try {
-    const parent = await realpath(dirname(lexical));
+    const parent = await realpath(dirname(join(view.root, relativePath)));
+    const refused = await linkRefusal(view, rootReal, parentOf(relativePath), parent);
+    if (refused !== null) return { reason: refused };
     return contained(rootReal, parent) ? 'inside' : { reason: OUTSIDE_PARENT };
   } catch (err) {
     const code = errno(err);
@@ -521,10 +543,8 @@ async function parentPlacement(rootReal: string, lexical: string): Promise<'insi
  * only `absent` needs proof beyond the path lookup, and gets it.
  */
 export async function observePath(view: MountView, rootReal: string, relativePath: string): Promise<Observation> {
-  const link = await linkOnTheWay(view, parentOf(relativePath));
-  if (link !== null) return { kind: 'unobserved', reason: linkedPathReason(link) };
   const lexical = join(view.root, relativePath);
-  const placement = await parentPlacement(rootReal, lexical);
+  const placement = await parentPlacement(view, rootReal, relativePath);
   if (placement === 'gone') return absence(view, rootReal, relativePath);
   if (placement !== 'inside') return { kind: 'unobserved', reason: placement.reason };
   let info;
@@ -573,10 +593,6 @@ async function openContained(
   rootReal: string,
   relativePath: string,
 ): Promise<{ handle: FileHandle; info: BigIntStats } | Exclude<Observation, { kind: 'file' }>> {
-  // O_NOFOLLOW guards only the final component: a mount that doesn't follow
-  // symlinks goes through none among the directories on the way either.
-  const link = await linkOnTheWay(view, parentOf(relativePath));
-  if (link !== null) return { kind: 'unobserved', reason: linkedPathReason(link) };
   const lexical = join(view.root, relativePath);
   const noFollow = !view.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number';
   if (!view.followSymlinks && !noFollow) {
@@ -602,6 +618,12 @@ async function openContained(
     if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
     const real = await realpath(lexical).catch(() => null);
     if (real === null) return { kind: 'unobserved', reason: 'the file changed while it was read' };
+    // O_NOFOLLOW guards only the final component: a mount that doesn't
+    // follow symlinks goes through none among the directories on the way
+    // either. Asked of what the path resolved to after the open, which the
+    // check below holds to the descriptor's file.
+    const refused = await linkRefusal(view, rootReal, relativePath, real);
+    if (refused !== null) return { kind: 'unobserved', reason: refused };
     if (!contained(rootReal, real)) {
       return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
     }
