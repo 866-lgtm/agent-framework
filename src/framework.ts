@@ -17474,13 +17474,10 @@ export class AgentFramework {
 
   private completeMcplDataPlaneGate(
     barrier: DiscordAwarenessBarrier,
-    /** A connection to leave paused: one its connect is closing for good. */
-    except?: McplServerConnection,
   ): boolean {
     if (this.discordAwarenessBarrier !== barrier) return false;
     this.discordAwarenessBarrier = null;
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
-      if (connection === except) continue;
       // ready() can synchronously flush a nested list-change notification that
       // installs a newer global generation. Never let this older completion
       // release any remaining server behind that newer gate. (The quiesce
@@ -17685,11 +17682,12 @@ export class AgentFramework {
       // server's data. So close the connection for good through the
       // registry, as the catch above does, then complete the gate rather
       // than fail it: accounting succeeded, so nothing calls for a recycle.
-      // The completion leaves this connection paused: a close that failed
-      // keeps it registered, and no grant was established for it.
+      // A close that fails keeps the connection registered, but a connection
+      // closed for good readies nothing, so this completion, and any later
+      // one, leaves it paused.
       // Every exit of a runtime connect settles the gate it installed.
       await this.closeFailedRuntimeConnect(connection, 'policy registration');
-      this.completeMcplDataPlaneGate(awarenessBarrier, connection);
+      this.completeMcplDataPlaneGate(awarenessBarrier);
       throw error;
     }
     this.completeMcplDataPlaneGate(awarenessBarrier);

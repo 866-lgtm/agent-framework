@@ -843,8 +843,9 @@ test('a runtime connect whose awareness accounting fails fails its gate, so a ru
  * A framework serving `heartbeat`, then a runtime connect of `discord` whose
  * awareness accounting succeeds and whose §5.3 policy registration throws
  * (initializeServer made to throw for it). With `closeFails`, the close that
- * follows rejects once, as a transport close that fails would. Returns the
- * framework with both patches undone; a failure before then stops it.
+ * follows fails once in its transport close, after close() has marked the
+ * connection closed for good, as a real one fails. Returns the framework with
+ * every patch undone; a failure before then stops it.
  */
 async function failPolicyRegistrationWhileServing(dir: string, closeFails: boolean) {
   const { config } = frameworkConfig(dir, {
@@ -866,10 +867,15 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
     const connections = McplServerConnection.prototype as any;
     const close = connections.close;
     let closeFailed = false;
-    connections.close = function (this: McplServerConnection) {
-      if (closeFails && this.id === discord.id && !closeFailed) {
+    connections.close = function (this: any) {
+      if (closeFails && this.id === discord.id && !closeFailed && this.transport) {
         closeFailed = true;
-        return Promise.reject(new Error('injected close failure'));
+        const transport = this.transport;
+        const transportClose = transport.close;
+        transport.close = () => {
+          transport.close = transportClose;
+          return Promise.reject(new Error('injected close failure'));
+        };
       }
       return close.call(this);
     };
@@ -920,7 +926,7 @@ test('a runtime connect whose policy registration throws closes its connection f
   }
 });
 
-test('a runtime connect whose policy registration throws and whose close then fails keeps that connection registered and paused, and logs the close', async (t) => {
+test('a runtime connect whose policy registration throws and whose close then fails keeps that connection registered and paused through later gates, and logs the close', async (t) => {
   mkdirSync(TEST_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-policy-close-'));
   const logged: string[] = [];
@@ -931,11 +937,14 @@ test('a runtime connect whose policy registration throws and whose close then fa
     const failed = await failPolicyRegistrationWhileServing(dir, true);
     framework = failed.framework;
     // A close that fails keeps the entry, so a later disconnect, restart or
-    // shutdown can close it again; the gate's completion leaves it paused,
-    // since no grant was established for it.
-    const refused = failed.registry.getServer(failed.discord.id) as { dataPlaneReady: boolean } | null;
+    // shutdown can close it again. Closed for good, it readies nothing: not
+    // at this connect's completion, and not at a later gate's.
+    const refused = failed.registry.getServer(failed.discord.id) as { dataPlaneReady: boolean; willReconnect: boolean } | null;
     assert.ok(refused, 'the connection whose close failed is still registered');
+    assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
     assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
+    await failed.framework.syncDiscordAwarenessMarkers();
+    assert.equal(refused.dataPlaneReady, false, 'a later gate\'s completion leaves it paused too');
     assert.ok(
       logged.some((line) => line.includes(`could not close MCPL server "${failed.discord.id}" after its policy registration failed`)
         && line.includes('injected close failure')),
@@ -1062,6 +1071,40 @@ test('a control flush that installs a newer generation cannot be released by the
   await newer.promise;
   assert.equal(framework.completeMcplDataPlaneGate(newer), true);
   assert.equal(readyCalls, 1);
+});
+
+test('while the host stops, a failed gate lets out what a running connection held, and nothing of one closed for good', async () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarrier = null;
+  framework.discordAwarenessBarrierGeneration = 0;
+  framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: new Promise(() => {}) });
+  framework.queue = { isClosed: true }; // stop() has closed the queue
+  framework.emitTrace = () => {};
+  const running = Reflect.construct(McplServerConnection, ['running', null, null]) as McplServerConnection;
+  const closing = Reflect.construct(McplServerConnection, ['closing', null, null]) as McplServerConnection;
+  framework.mcplServerRegistry = { getAllServers: () => [running, closing] };
+  const delivered: string[] = [];
+  for (const connection of [running, closing]) {
+    connection.on('stderr', () => delivered.push(`${connection.id} control`));
+    connection.on('held-data', () => delivered.push(`${connection.id} data`));
+  }
+
+  // Each connection holds a control event and a data event behind the gate.
+  const barrier = framework.installMcplDataPlaneGate();
+  for (const connection of [running, closing]) {
+    connection.emit('stderr', 'a line');
+    connection.emit('held-data', {});
+  }
+  assert.deepEqual(delivered, []);
+
+  // closeAll has begun closing one of them: close() closes it for good.
+  await closing.close();
+  framework.releaseMcplDataPlaneGate(barrier);
+  assert.deepEqual(delivered, ['running control'], 'only the running connection lets out its control traffic');
+  await framework.failMcplDataPlaneGate(barrier, 'test sync', new Error('accounting failed'));
+  assert.equal(framework.discordAwarenessBarrier, null, 'the stopping host released the failed gate');
+  assert.deepEqual(delivered, ['running control', 'running data'],
+    'the running connection\'s held data reaches its listeners, and the closed one lets out nothing');
 });
 
 test('overlapping reconnect/list-change generations release only the newest barrier', async () => {
