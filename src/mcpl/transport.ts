@@ -22,7 +22,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { describeCredentialError, redactUrl, resolveServerBinding } from './protocol-family.js';
+import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -367,6 +367,9 @@ export class WebSocketTransport extends McplTransport {
       }
     }
     const url = buildWebSocketUrl(config, token);
+    // A provider's token is in this url, and the query may be re-encoded:
+    // the server's text is recorded with what the dial sent.
+    noteDialSent(config, { url });
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);
@@ -462,10 +465,7 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
     );
   }
   const token = tokenOverride !== undefined ? tokenOverride : config.token;
-  if (token) {
-    parsed.searchParams.set('token', token);
-  }
-  return parsed.toString();
+  return urlAsDialed(parsed, token).toString();
 }
 
 // ---------------------------------------------------------------------------

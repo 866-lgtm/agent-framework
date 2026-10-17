@@ -65,7 +65,7 @@ import {
 
 import { StdioTransport, type McplTransport } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, redactServerText, serverTextRedactor } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, noteDialSent, redactServerText, serverTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -326,7 +326,12 @@ function bearerAuth(config: McplServerConfig): AuthProvider | undefined {
     if (provider) {
       try {
         const fresh = await provider();
-        if (fresh) return fresh;
+        if (fresh) {
+          // Sent in the Authorization header: the server's text is recorded
+          // with it replaced.
+          noteDialSent(config, { token: fresh });
+          return fresh;
+        }
       } catch (error) {
         // Same fallback as the WebSocket dial: use the static token, and let
         // the server refuse a stale credential loudly. The provider's own

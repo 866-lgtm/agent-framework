@@ -16,13 +16,15 @@ import {
   redactServerText,
   credentialRedactor,
   serverCredentialPatterns,
+  serverTextRedactor,
+  noteDialSent,
   describeCredentialError,
   mcplPolicyGrants,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from '../src/mcpl/reference-fetcher.js';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
-import { WebSocketTransport } from '../src/mcpl/transport.js';
+import { WebSocketTransport, buildWebSocketUrl } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const cfg = (c: Partial<McplServerConfig>): McplServerConfig => ({ id: 's', ...c });
@@ -336,6 +338,38 @@ test('both engines admit a configuration through checkServerConfig, which logs i
   } finally {
     console.warn = realWarn;
   }
+});
+
+test("a query credential is removed as the WebSocket dial sends it, the query re-encoded once the token is set", () => {
+  const config = cfg({ url: 'wss://host.example/mcp?password=secret%20key123', token: 'tok-abcdefgh' });
+  const sent = buildWebSocketUrl(config);
+  // The form the server receives, and can echo, as URLSearchParams writes it.
+  assert.ok(sent.includes('password=secret+key123'), sent);
+  const shown = redactServerText(`closed by the server: ${sent}`, config);
+  assert.ok(!shown.includes('key123'), shown);
+  assert.ok(!shown.includes('tok-abcdefgh'), shown);
+});
+
+test("an access provider's token is removed once a dial has sent it, in a WebSocket url or an HTTP header", async () => {
+  const ws = cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl?password=secret%20key123', accessProvider: async () => 'prov-ws-0123456789' });
+  const http = cfg({ id: 'http', url: 'http://127.0.0.1:1/mcp', accessProvider: async () => 'prov-http-0123456789' });
+  // Made before the dial, as the framework makes a connection's.
+  const recorded = serverTextRedactor(ws);
+  assert.ok(recorded('token=prov-ws-0123456789').includes('prov-ws'), 'no dial has sent it yet');
+  // Nothing listens on port 1: each dial fails after sending its credential.
+  await assert.rejects(WebSocketTransport.open(ws));
+  await assert.rejects(ModernMcpConnection.connect(http));
+  const shown = recorded('closed: ws://127.0.0.1:1/mcpl?password=secret+key123&token=prov-ws-0123456789');
+  assert.ok(!shown.includes('prov-ws') && !shown.includes('key123'), shown);
+  const header = redactServerText('refused: Authorization: Bearer prov-http-0123456789', http);
+  assert.ok(!header.includes('prov-http'), header);
+});
+
+test("a configuration keeps only its dials' newest provider tokens", () => {
+  const config = cfg({ id: 'p', url: 'http://127.0.0.1:1/mcp' });
+  for (let n = 0; n <= 16; n++) noteDialSent(config, { token: `prov-token-${String(n).padStart(4, '0')}` });
+  assert.ok(redactServerText('prov-token-0000', config).includes('prov-token-0000'), 'the oldest of 17 is let go');
+  assert.equal(redactServerText('prov-token-0001 prov-token-0016', config), 'redacted redacted');
 });
 
 test('recorded server text removes encoded and decoded URL credentials as exact strings', () => {

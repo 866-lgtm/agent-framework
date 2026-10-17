@@ -94,17 +94,21 @@ export function redactUrl(url: string | undefined): string {
 
 /**
  * Server and transport text as the framework records it, with the strings a
- * server's configuration knows to be credentials replaced:
- * - from the url, as written and decoded: credential-like path segments and
+ * server's configuration knows to be credentials replaced, and those its
+ * dials sent:
+ * - from the url as each dial sends it ({@link urlAsDialed}), and decoded:
+ *   the configured one, and each one dialed with an access provider's token
+ *   ({@link noteDialSent}): credential-like path segments and
  *   query names, credential-shaped or credential-named query values, every
  *   other non-empty parameter as its whole name=value, and a ws:// url's
  *   username and password, its userinfo as one unit before its @ (the
  *   username alone when there's no password), with no length floor, so a
  *   short password goes with its username and a short username alone goes
  *   too, and the Basic credential a WebSocket client sends for that userinfo;
- * - the static token, raw, as JSON encoders write it (JSON.stringify's
- *   escapes, and with its slashes escaped too, as some encoders write them),
- *   and percent- or form-encoded with either case of hex;
+ * - the static token, and each token an access provider handed a dial for
+ *   a header, raw, as JSON encoders write it (JSON.stringify's escapes, and
+ *   with its slashes escaped too, as some encoders write them), and percent-
+ *   or form-encoded with either case of hex;
  * - a stdio server's environment values whose names say they're
  *   credentials, raw, as JSON encoders write them, and percent-encoded with
  *   either case of hex.
@@ -117,11 +121,10 @@ export function redactUrl(url: string | undefined): string {
  * included, and the replacement is never scanned again; text that may come
  * from several servers takes one pass over all their configurations'
  * strings (serverCredentialPatterns), so strings of different servers that
- * overlap are both replaced whole. A credential the
- * configuration doesn't hold, such as the token an access provider fetches
- * or another origin's, is outside it, and so are other encodings of the
- * ones it holds. JSON-RPC answers, and the error a host's own connect
- * raises, pass as they are.
+ * overlap are both replaced whole. A credential neither the configuration
+ * holds nor a dial of it sent, such as another origin's, is outside it, and
+ * so are other encodings of the ones it holds. JSON-RPC answers, and the
+ * error a host's own connect raises, pass as they are.
  */
 export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
   return serverTextRedactor(config)(text);
@@ -129,10 +132,62 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
 
 /**
  * {@link redactServerText} for one configuration, its strings found and its
- * pattern built once: for a connection's records, such as each stderr line.
+ * pattern built once, and again once a dial has sent something new
+ * ({@link noteDialSent}): for a connection's records, such as each stderr
+ * line.
  */
 export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
-  return credentialRedactor(serverCredentialPatterns(config));
+  let built = -1;
+  let redact: (text: unknown) => string = asText;
+  return (text) => {
+    const version = dialsSent.get(config)?.version ?? 0;
+    if (version !== built) {
+      redact = credentialRedactor(serverCredentialPatterns(config));
+      built = version;
+    }
+    return redact(text);
+  };
+}
+
+/**
+ * What a configuration's dials sent that the configuration doesn't hold: the
+ * urls dialed with an access provider's token, and the provider's tokens sent
+ * in a header. Kept by the configuration object the dial read, which is the
+ * one the framework records the server's text with. A provider can hand each
+ * dial a new token, so only the newest are kept.
+ */
+const dialsSent = new WeakMap<object, { readonly urls: string[]; readonly tokens: string[]; version: number }>();
+const DIAL_SENT_KEPT = 16;
+
+/** Note what one dial sent: the url it dialed, or a token it sent in a
+ *  header. That configuration's patterns cover it from then on. */
+export function noteDialSent(config: object, sent: { readonly url?: string; readonly token?: string }): void {
+  let entry = dialsSent.get(config);
+  if (!entry) {
+    entry = { urls: [], tokens: [], version: 0 };
+    dialsSent.set(config, entry);
+  }
+  const kept = entry;
+  const keep = (list: string[], value: string | undefined): void => {
+    if (!value || list.includes(value)) return;
+    list.push(value);
+    if (list.length > DIAL_SENT_KEPT) list.shift();
+    kept.version += 1;
+  };
+  keep(kept.urls, sent.url);
+  keep(kept.tokens, sent.token);
+}
+
+/**
+ * The url a dial sends. A WebSocket dial sets the token as the `token`
+ * parameter, and setting it makes URLSearchParams write the whole query
+ * again, form-encoded (a space as `+`), so the url as sent can differ from
+ * the url as configured. An http(s) dial sends the url as configured.
+ */
+export function urlAsDialed(url: URL, token: string | null | undefined): URL {
+  const dialed = new URL(url);
+  if (token && (dialed.protocol === 'ws:' || dialed.protocol === 'wss:')) dialed.searchParams.set('token', token);
+  return dialed;
 }
 
 /** A string {@link redactServerText} replaces, and the pattern that finds it. */
@@ -179,13 +234,15 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
     standalone(encoded);
     standalone(lowerEscapes(encoded));
   };
-  // The token as sent: raw in a header, and percent- or form-encoded where a
+  // A token as sent: raw in a header, and percent- or form-encoded where a
   // transport puts it in a url.
-  const token = config.token ?? '';
-  withEncoded(token);
-  const formEncoded = new URLSearchParams({ t: token }).toString().slice(2);
-  standalone(formEncoded);
-  standalone(lowerEscapes(formEncoded));
+  const addToken = (token: string): void => {
+    withEncoded(token);
+    const formEncoded = new URLSearchParams({ t: token }).toString().slice(2);
+    standalone(formEncoded);
+    standalone(lowerEscapes(formEncoded));
+  };
+  addToken(config.token ?? '');
   // A stdio server's environment values whose names say they carry a
   // credential: a part of the name that ends with a credential word
   // (GITHUB_TOKEN, API_KEY, PGPASSWORD, ACCESSTOKEN), and not one where the
@@ -195,9 +252,9 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
     // A JavaScript host can pass a value that isn't a string; only strings are derived.
     if (typeof value === 'string' && name.split(/[_\-.]/).some((part) => CREDENTIAL_NAME_PART.test(part))) withEncoded(value);
   }
-  let url: URL | undefined;
-  try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
-  if (url) {
+  // A url as a dial sends it. Nothing quotes the configured url before a
+  // dial, so its form as configured needs no strings of its own.
+  const addUrl = (url: URL): void => {
     for (const segment of url.pathname.split('/')) {
       if (credentialLikeSegment(segment)) {
         standalone(segment);
@@ -242,7 +299,17 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
         standalone(Buffer.from(`${username}:${password}`).toString('base64'));
       }
     }
+  };
+  let url: URL | undefined;
+  try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
+  if (url) addUrl(urlAsDialed(url, config.token));
+  // What the dials sent beyond that: urls dialed with an access provider's
+  // token, and its tokens sent in a header.
+  const sent = dialsSent.get(config);
+  for (const dialed of sent?.urls ?? []) {
+    try { addUrl(new URL(dialed)); } catch { /* a dialed url always parses */ }
   }
+  for (const token of sent?.tokens ?? []) addToken(token);
   const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return [
     ...[...secrets].map(value => ({ value, source: escape(value) })),
