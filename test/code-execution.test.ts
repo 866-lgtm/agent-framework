@@ -427,6 +427,22 @@ async function createFrameworkWithCodeExecution(storePath: string, membrane: Moc
 }
 
 describe('framework code_execution integration (real python3)', () => {
+  it('create() refuses a codeExecution.inheritEnv that is not a boolean', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-inherit-');
+    try {
+      await assert.rejects(AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [],
+        modules: [new ScriptToolModule()],
+        syncIntervalMs: 0,
+        codeExecution: { enabled: true, inheritEnv: 'false' as unknown as boolean },
+      }), /codeExecution\.inheritEnv must be true or false, not "false" \(a string\)/);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('synthesizes the tool only when enabled', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-tools-');
     const membrane = new MockMembrane();

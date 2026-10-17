@@ -113,8 +113,18 @@ export function scriptTimeLimits(opts?: {
   };
 }
 
-/** Refuse a configuration whose time limits contradict each other. */
-export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; maxScriptTimeoutMs?: number }): void {
+/**
+ * Refuse a configuration whose time limits contradict each other, or whose
+ * interpreter environment would be misread. A recipe's `"inheritEnv": "false"`,
+ * or a `${VAR}` substituted as a string, arrives untyped, and any truthy value
+ * would hand the interpreter the host's whole environment.
+ */
+export function validateCodeExecutionConfig(cfg: {
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  env?: unknown;
+  inheritEnv?: unknown;
+}): void {
   const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
   if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
     throw new Error(
@@ -122,4 +132,37 @@ export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; max
         'it is the most an agent may ask for, and the default is always allowed',
     );
   }
+  if (cfg.inheritEnv !== undefined && typeof cfg.inheritEnv !== 'boolean') {
+    throw new Error(
+      `codeExecution.inheritEnv must be true or false, not ${kindOf(cfg.inheritEnv, true)}: ` +
+        "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist",
+    );
+  }
+  if (cfg.env !== undefined) {
+    if (!isPlainObject(cfg.env)) {
+      throw new Error(`codeExecution.env must be an object of variable names and string values, not ${kindOf(cfg.env, false)}`);
+    }
+    for (const [name, value] of Object.entries(cfg.env)) {
+      // The value isn't shown: it may be a credential.
+      if (typeof value !== 'string') {
+        throw new Error(`codeExecution.env.${name} must be a string, not ${kindOf(value, false)}: quote it in the config`);
+      }
+    }
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** What a configured value is, for an error: its kind, and with `show` a primitive's value too. */
+function kindOf(value: unknown, show: boolean): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  const type = typeof value;
+  const kind = type === 'object' ? 'an object' : `a ${type}`;
+  if (!show || type === 'object' || type === 'function') return kind;
+  return `${type === 'string' ? JSON.stringify(value) : String(value)} (${kind})`;
 }

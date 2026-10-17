@@ -10,6 +10,32 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { PyRunner } from '../src/index.js';
+import { validateCodeExecutionConfig } from '../src/code-execution/tool-definition.js';
+
+test('a codeExecution.inheritEnv that is not a boolean is refused, so "false" never hands over the host env', () => {
+  for (const inheritEnv of ['false', 'true', null, 0, 1, [], {}]) {
+    assert.throws(() => validateCodeExecutionConfig({ inheritEnv }), /codeExecution\.inheritEnv must be true or false/,
+      JSON.stringify(inheritEnv));
+  }
+  assert.throws(() => validateCodeExecutionConfig({ inheritEnv: 'false' }), /not "false" \(a string\)/);
+  for (const inheritEnv of [undefined, true, false]) validateCodeExecutionConfig({ inheritEnv });
+});
+
+test('a codeExecution.env that is not an object of strings is refused, naming the variable but not its value', () => {
+  for (const env of [null, [], 'PYTHONPATH=/opt/lib', 7]) {
+    assert.throws(() => validateCodeExecutionConfig({ env }), /codeExecution\.env must be an object of variable names and string values/,
+      JSON.stringify(env));
+  }
+  for (const value of [8080, true, null, ['x'], { nested: 'y' }]) {
+    assert.throws(() => validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', BAD: value } }), (err: Error) => {
+      assert.match(err.message, /^codeExecution\.env\.BAD must be a string/);
+      assert.ok(!err.message.includes('8080'), err.message);
+      return true;
+    }, JSON.stringify(value));
+  }
+  validateCodeExecutionConfig({ env: {} });
+  validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', EMPTY: '' } });
+});
 
 test('model-authored python does not see a host secret', async () => {
   const key = 'AF_CODE_EXEC_TEST_HOST_SECRET';
