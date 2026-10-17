@@ -410,6 +410,17 @@ test('an edit of a draft whose disk copy also changed, on a mount that pushes, n
     + 'sync this path to adopt the disk version, or materialize it with force to overwrite it.');
   assert.equal(await stored('k.txt'), 'agent draft, edited\n');
   assert.equal(disk('k.txt')!.toString(), 'another writer\n');
+
+  // An edit that makes the draft agree with disk settles the conflict as its
+  // push meets it, so its answer names none.
+  const agreed = await call('edit', { path: 'work/k.txt', oldString: 'agent draft, edited', newString: 'another writer' });
+  assert.equal(agreed.success, true, agreed.error);
+  assert.equal((agreed.data as { note?: string }).note, undefined, 'no conflict remains to name');
+  assert.equal(await stored('k.txt'), 'another writer\n');
+  assert.equal(disk('k.txt')!.toString(), 'another writer\n');
+  const after = await call('materialize', { path: 'work/k.txt' });
+  assert.equal(after.success, true, after.error);
+  assert.doesNotMatch(JSON.stringify(after.data), /conflict/, 'and a materialize meets none');
 });
 
 test('an edit that fails after its change is stored, having taken disk\'s change in, says both', async (t) => {
@@ -431,7 +442,7 @@ test('an edit that fails after its change is stored, having taken disk\'s change
   assert.equal(await stored('e.txt'), 'v2 LINE from another writer\n');
 });
 
-test('a deletion whose disk copy is not a regular file names the materialize that unlinks it', async (t) => {
+test('a deletion whose disk copy is not a regular file names the materialize that unlinks it', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'q.txt'), 'v1\n');
   assert.equal((await call('read', { path: 'work/q.txt' })).success, true);
@@ -482,7 +493,7 @@ test("a forced deletion over a directory says no push unlinks one", async (t) =>
   assert.equal(statSync(join(dir, 'gone.txt')).isDirectory(), true, 'the directory stays');
 });
 
-test("a write over a FIFO is told to fix it and materialize again, with no force", async (t) => {
+test("a write over a FIFO is told to fix it and materialize again, with no force", { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   assert.equal(spawnSync('mkfifo', [join(dir, 'p.txt')]).status, 0, 'mkfifo');
   assert.equal(errorOf(await call('write', { path: 'work/p.txt', content: 'x\n' })), 'The write of "work/p.txt" is stored in the workspace, so don\'t send it again. '

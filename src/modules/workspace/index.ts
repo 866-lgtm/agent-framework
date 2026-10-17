@@ -2380,8 +2380,11 @@ export class WorkspaceModule implements Module {
         let content = blob.toString('utf-8');
 
         // An edit that would replace nothing is refused, replaceAll or not;
-        // without replaceAll, the text must occur once.
-        const count = content.split(input.oldString).length - 1;
+        // without replaceAll, the text must occur once, and the refusal says
+        // how often it does. With replaceAll, whether it occurs is enough.
+        const count = input.replaceAll
+          ? Number(content.includes(input.oldString))
+          : content.split(input.oldString).length - 1;
         if (count === 0) {
           return { success: false, error: `String not found in ${input.path}.${suffix}`, isError: true };
         }
@@ -2412,12 +2415,15 @@ export class WorkspaceModule implements Module {
         // The edit makes the path the workspace's own change (commitToolChange),
         // so a file disk lacked goes back with this edit's push, or with the
         // next materialize where the mount doesn't push. A push that didn't
-        // complete answers above, with its reason.
+        // complete answers above, with its reason. One that completed met no
+        // conflict, since this push, unforced, stops at one: the edit made the
+        // two copies agree, which settles it, or there was none. So only a
+        // mount that doesn't push still holds the conflict the pass found.
         const pushes = this.pushesOnCommit(mount);
         const backOnDisk = report?.state === 'disk-missing-provenance-unknown'
           ? `${pushes ? 'Its push put the file back on disk' : 'A materialize of the path puts it back on disk'}; if it was deleted there on purpose, delete it here too.`
           : null;
-        const notes = [appliedNote, backOnDisk, conflictNote('is in')].filter((n): n is string => n !== null);
+        const notes = [appliedNote, backOnDisk, pushes ? null : conflictNote('is in')].filter((n): n is string => n !== null);
         return {
           success: true,
           data: {
