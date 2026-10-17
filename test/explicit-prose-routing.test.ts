@@ -417,10 +417,9 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework, ['false']);
     answerSkipReply(framework);
     const store = draftsOf(framework);
-    const original = store.hold('assistant', [{ text: 'ORIGINAL WORDS', source: { branch: 'main', turn: 0, round: 0, segment: 0 } }], 'bounced').held[0]!;
+    const original = store.hold('assistant', [{ text: 'ORIGINAL WORDS' }], 'bounced').held[0]!;
     const internals = framework as unknown as {
       channelRegistry: { deliverSpeech: (...args: unknown[]) => Promise<unknown> };
-      logicalTurnToolCalls: { get(agent: unknown): { turnToken: number } | undefined };
     };
     const deliver = internals.channelRegistry.deliverSpeech;
     let release!: () => void;
@@ -434,11 +433,9 @@ describe('explicit prose routing', () => {
       return outcome;
     };
     let starts = 0;
-    let firstTurn = 0;
     framework.onTrace((e) => {
       if ((e as { type: string }).type !== 'inference:started') return;
       starts++;
-      if (starts === 1) firstTurn = internals.logicalTurnToolCalls.get(framework.getAgent('assistant')!)!.turnToken;
       if (starts === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere NEW WORDS' }]));
       if (starts >= 3) membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
     });
@@ -473,10 +470,6 @@ describe('explicit prose routing', () => {
       } else {
         // Held after the failure's copy, the next turn's bounce is the latest.
         assert.notEqual(copy.id, original.id);
-        // Arthur-2378's probe: held while turn two runs, the copy keeps the
-        // turn that attempted its words.
-        assert.ok(firstTurn > 0, 'the first turn token was observed');
-        assert.equal(copy.source.turn, firstTurn, "the copy's provenance is the turn that attempted the words");
       }
       assert.equal(store.latestBounce('assistant')?.text, 'NEW WORDS', "the next turn's bounce came after it, and is the latest");
     } finally {
@@ -492,7 +485,7 @@ describe('explicit prose routing', () => {
       stubRegistry(framework, ['throw']);
       const store = draftsOf(framework);
       const original = store.hold('assistant', [{
-        text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 },
+        text: 'earlier words',
       }], 'bounced').held[0]!;
       const gateway = framework as unknown as {
         deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
@@ -519,7 +512,7 @@ describe('explicit prose routing', () => {
         try {
           stubRegistry(framework, [failure]);
           const store = draftsOf(framework);
-          const original = store.hold('assistant', [{ text: 'ORIGINAL WORDS', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced').held[0]!;
+          const original = store.hold('assistant', [{ text: 'ORIGINAL WORDS' }], 'bounced').held[0]!;
           const internals = framework as unknown as {
             channelRegistry: { deliverSpeech: (...args: unknown[]) => Promise<unknown> };
             deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
@@ -544,7 +537,7 @@ describe('explicit prose routing', () => {
           // A newer bounce becomes the latest while the send waits, and the
           // store reloads its projection (as after an ambiguous append), so
           // the draft captured before the send is no longer the stored one.
-          store.hold('assistant', [{ text: 'NEW WORDS', source: { branch: 'main', turn: 2, round: 1, segment: 0 } }], 'bounced');
+          store.hold('assistant', [{ text: 'NEW WORDS' }], 'bounced');
           store.reload();
           assert.notEqual(store.get('assistant', original.id), original, 'the reload replaced the stored draft');
           release();
@@ -567,7 +560,7 @@ describe('explicit prose routing', () => {
     try {
       const routed = stubRegistry(framework);
       const store = draftsOf(framework);
-      store.hold('assistant', [{ text: 'costs $$5, see $& and $1', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced');
+      store.hold('assistant', [{ text: 'costs $$5, see $& and $1' }], 'bounced');
       const gateway = framework as unknown as {
         deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
       };
@@ -584,7 +577,7 @@ describe('explicit prose routing', () => {
       stubRegistry(framework, ['throw']);
       const store = draftsOf(framework);
       const original = store.hold('assistant', [{
-        text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 },
+        text: 'earlier words',
       }], 'bounced').held[0]!;
       const gateway = framework as unknown as {
         deliverProse(a: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
@@ -1794,7 +1787,7 @@ describe('explicit prose routing', () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
     const gateway = framework as unknown as {
-      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; turn: number; notice: 'later' }): void;
+      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -1804,10 +1797,9 @@ describe('explicit prose routing', () => {
       gateway.turnRouting.set('assistant', live);
       // A held round that a later start has overtaken: its envelopes move
       // its own turn's routing, and its drafts are that turn's.
-      gateway.holdSilencedProse(agent, ['>>>#nowhere held words', 'after it'], 'send', false, { routing: queued, turn: 7, notice: 'later' });
+      gateway.holdSilencedProse(agent, ['>>>#nowhere held words', 'after it'], 'send', false, { routing: queued, notice: 'later' });
       assert.equal(queued.hybridHold, 'failed', 'the round that held it records the failed envelope');
       assert.deepEqual(queued.drafts.map((d) => d.text), ['held words', 'after it'], "and holds the round's words as its drafts");
-      assert.deepEqual(draftsOf(framework).open('assistant').map((d) => d.source.turn), [7, 7], "each draft's provenance is the round's turn, not the live one");
       assert.equal(live.hybridHold, undefined, 'the live turn is untouched');
       assert.deepEqual(live.drafts, [], 'and holds no draft of that round');
     } finally {
@@ -1841,7 +1833,7 @@ describe('explicit prose routing', () => {
     try {
       const routed = stubRegistry(framework);
       const store = draftsOf(framework);
-      const original = store.hold('assistant', [{ text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced').held[0]!;
+      const original = store.hold('assistant', [{ text: 'earlier words' }], 'bounced').held[0]!;
       // An attempt with no outcome: the latest bounce may already have been
       // posted, so {{unsent}} refuses it and holds the envelope's words.
       store.beginAttempt('assistant', original.id, { serverId: 'stub', channelId: 'chan-alpha' }, 'unsent-token', false);
@@ -1866,7 +1858,7 @@ describe('explicit prose routing', () => {
       stubRegistry(framework);
       const store = draftsOf(framework);
       const held = store.hold('assistant', Array.from({ length: 11 }, (_, segment) => ({
-        text: `held ${segment}`, source: { branch: 'main', turn: 1, round: 1, segment },
+        text: `held ${segment}`,
       })), 'explicit-send').held;
       const gateway = framework as unknown as { appendProseDeliveryReceipt(agent: unknown, routing: RoutingState): void };
       const routing: RoutingState = routingState({ drafts: held });
@@ -1889,12 +1881,12 @@ describe('explicit prose routing', () => {
       store.hold = ((_agent: string, segments: unknown[]) =>
         ({ held: [], notHeld: { count: segments.length, error: 'the journal refused the write' } })) as typeof store.hold;
       const gateway = framework as unknown as {
-        holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; turn: number; notice: 'later' }): void;
+        holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
         appendProseDeliveryReceipt(agent: unknown, routing: RoutingState): void;
       };
       const agent = framework.getAgent('assistant')!;
       const routing: RoutingState = routingState();
-      gateway.holdSilencedProse(agent, ['first words', 'second words'], 'send', false, { routing, turn: 1, notice: 'later' });
+      gateway.holdSilencedProse(agent, ['first words', 'second words'], 'send', false, { routing, notice: 'later' });
       gateway.appendProseDeliveryReceipt(agent, routing);
       const receipt = context(framework).texts.find((t) => t.startsWith('[delivered]'))!;
       assert.ok(receipt.includes('2 plain-speech segment(s) suppressed and NOT held as drafts (the journal refused the write) — ' +
@@ -1909,7 +1901,7 @@ describe('explicit prose routing', () => {
     try {
       const routed = stubRegistry(framework);
       const store = draftsOf(framework);
-      const original = store.hold('assistant', [{ text: 'earlier words', source: { branch: 'main', turn: 1, round: 1, segment: 0 } }], 'bounced').held[0]!;
+      const original = store.hold('assistant', [{ text: 'earlier words' }], 'bounced').held[0]!;
       store.recordOutcome = (() => { throw new Error('the journal refused the write'); }) as typeof store.recordOutcome;
       const gateway = framework as unknown as { deliverProse(a: unknown, text: string): Promise<void> };
       await gateway.deliverProse(framework.getAgent('assistant')!, '>>#alpha {{unsent}}');

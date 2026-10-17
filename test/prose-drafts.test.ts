@@ -19,7 +19,6 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
-const source = { branch: 'main', turn: 1, round: 1, segment: 0 };
 const dest = (channelId = ROOM) => ({ serverId: 'discord', channelId, label: '#room (Guild One)' });
 
 describe('ProseDraftStore', () => {
@@ -32,7 +31,7 @@ describe('ProseDraftStore', () => {
   it('holds exact words in order, with stable ids, per resident', () => {
     const { dir, store, drafts } = open();
     try {
-      const { held } = drafts.hold('a', [{ text: ' one\n', source }, { text: 'two  ', source: { ...source, segment: 1 } }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: ' one\n' }, { text: 'two  ' }], 'explicit-send');
       assert.equal(held.length, 2);
       assert.match(held[0]!.id, /^d-[a-z2-9]{5}$/);
       assert.notEqual(held[0]!.id, held[1]!.id);
@@ -49,7 +48,7 @@ describe('ProseDraftStore', () => {
   it('replays the journal at reopen: an attempt with no recorded outcome reads as unconfirmed', () => {
     const { dir, store, drafts } = open();
     const path = join(dir, 'store');
-    const { held } = drafts.hold('a', [{ text: 'words', source }, { text: 'more', source }], 'explicit-send');
+    const { held } = drafts.hold('a', [{ text: 'words' }, { text: 'more' }], 'explicit-send');
     drafts.beginAttempt('a', held[0]!.id, dest(), 'resend', false); // the process "dies" here
     const second = drafts.beginAttempt('a', held[1]!.id, dest(), 'resend', false);
     drafts.recordOutcome('a', held[1]!.id, second, { status: 'delivered', messageId: 'm-9', at: 5, destination: dest() });
@@ -70,7 +69,7 @@ describe('ProseDraftStore', () => {
     const { dir, store, drafts } = open();
     try {
       const main = store.currentBranch().name;
-      const { held } = drafts.hold('a', [{ text: 'kept', source }, { text: 'set aside', source }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: 'kept' }, { text: 'set aside' }], 'explicit-send');
       const attempt = drafts.beginAttempt('a', held[0]!.id, dest(), 'resend', false);
       drafts.recordOutcome('a', held[0]!.id, attempt, { status: 'delivered', at: 7, destination: dest() });
       drafts.dismiss('a', held[1]!.id);
@@ -79,7 +78,7 @@ describe('ProseDraftStore', () => {
       drafts.reload();
       assert.equal(draftState(drafts.get('a', held[0]!.id)!), 'delivered', 'a delivered draft stays delivered');
       assert.equal(draftState(drafts.get('a', held[1]!.id)!), 'dismissed', 'a dismissed draft stays dismissed');
-      const later = drafts.hold('a', [{ text: 'held on another branch', source }], 'explicit-send').held[0]!;
+      const later = drafts.hold('a', [{ text: 'held on another branch' }], 'explicit-send').held[0]!;
       store.switchBranch(main);
       drafts.reload();
       assert.equal(draftState(drafts.get('a', later.id)!), 'held', 'a draft is usable from any branch');
@@ -97,7 +96,7 @@ describe('ProseDraftStore', () => {
       let fail = true;
       (store as unknown as { sync: () => void }).sync = () => { if (fail) throw new Error('EIO'); real(); };
       t.mock.method(console, 'error', () => {});
-      const result = drafts.hold('a', [{ text: 'x', source }, { text: 'y', source }], 'explicit-send');
+      const result = drafts.hold('a', [{ text: 'x' }, { text: 'y' }], 'explicit-send');
       // The first record reached the store before its barrier failed: the
       // journal was reconciled, so the projection holds it, and so does the
       // answer. Only the second is reported not held.
@@ -105,7 +104,7 @@ describe('ProseDraftStore', () => {
       assert.deepEqual(result.notHeld, { count: 1, error: 'EIO' });
       assert.deepEqual(drafts.open('a').map((d) => d.text), ['x']);
       fail = false;
-      assert.equal(drafts.hold('a', [{ text: 'z', source }], 'explicit-send').held.length, 1);
+      assert.equal(drafts.hold('a', [{ text: 'z' }], 'explicit-send').held.length, 1);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
@@ -115,7 +114,7 @@ describe('ProseDraftStore', () => {
   it('a draft counts as named while a message that named it is on the branch, newest first', () => {
     const { dir, store, drafts } = open();
     try {
-      const { held } = drafts.hold('a', [{ text: 'one', source }, { text: 'two', source }, { text: 'three', source }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: 'one' }, { text: 'two' }, { text: 'three' }], 'explicit-send');
       const [one, two, three] = held;
       drafts.markNoticed('a', [one!.id, two!.id], 'm-1');
       drafts.markNoticed('a', [two!.id], 'm-2');
@@ -143,16 +142,16 @@ describe('ProseDraftStore', () => {
     const retention = { keepNewest: 2, keepIdleMs: hour, checkpointEvery: 9 };
     let drafts = new ProseDraftStore(store, retention);
     try {
-      const [older] = drafts.hold('a', [{ text: 'an older bounce', source }], 'bounced').held;
-      const [latest] = drafts.hold('a', [{ text: 'the latest bounce', source }], 'bounced').held;
-      const [settled] = drafts.hold('a', [{ text: 'resent long ago', source }], 'explicit-send').held;
+      const [older] = drafts.hold('a', [{ text: 'an older bounce' }], 'bounced').held;
+      const [latest] = drafts.hold('a', [{ text: 'the latest bounce' }], 'bounced').held;
+      const [settled] = drafts.hold('a', [{ text: 'resent long ago' }], 'explicit-send').held;
       const attempt = drafts.beginAttempt('a', settled!.id, dest(), 'resend', false);
       drafts.recordOutcome('a', settled!.id, attempt, { status: 'delivered', messageId: 'm-1', at: Date.now(), destination: dest() });
-      drafts.hold('b', [{ text: "another resident's", source }], 'explicit-send');
+      drafts.hold('b', [{ text: "another resident's" }], 'explicit-send');
       t.mock.timers.tick(2 * hour);
       // Something happens to the older bounce now: it isn't idle.
       drafts.beginAttempt('a', older!.id, dest(), 'resend', false);
-      const newest = drafts.hold('a', [{ text: 'new one', source }, { text: 'new two', source }], 'explicit-send').held;
+      const newest = drafts.hold('a', [{ text: 'new one' }, { text: 'new two' }], 'explicit-send').held;
       // That was the ninth entry: the checkpoint let go of 'a''s idle
       // drafts outside its two newest, the latest bounce among them.
       const kept = () => drafts.open('a').map((d) => d.text);
@@ -183,7 +182,7 @@ describe('ProseDraftStore', () => {
   it('records a notice only after the history holding it is synced (afterCommittedState)', () => {
     const { dir, store, drafts } = open();
     try {
-      const { held } = drafts.hold('a', [{ text: 'x', source }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: 'x' }], 'explicit-send');
       const calls: string[] = [];
       const real = { sync: store.sync.bind(store), appendJson: store.appendJson.bind(store) };
       (store as unknown as { sync: () => void }).sync = () => { calls.push('sync'); real.sync(); };
@@ -201,7 +200,7 @@ describe('ProseDraftStore', () => {
     const { dir, store, drafts } = open();
     try {
       const risky = { draftId: 'd-zzzzz', destination: dest(), at: 1, reason: 'no valid receipt' };
-      const [copy] = drafts.hold('a', [{ text: 'risky words and more', source, inheritedRisk: risky }], 'bounced').held;
+      const [copy] = drafts.hold('a', [{ text: 'risky words and more', inheritedRisk: risky }], 'bounced').held;
       assert.equal(draftState(copy!), 'unconfirmed');
       const failed = drafts.beginAttempt('a', copy!.id, dest(), 'resend', true);
       drafts.recordOutcome('a', copy!.id, failed, { status: 'failed', at: 2, destination: dest() });
@@ -218,9 +217,9 @@ describe('ProseDraftStore', () => {
   it('{{unsent}} is the latest bounce while it is open, latest-wins', () => {
     const { dir, store, drafts } = open();
     try {
-      const first = drafts.hold('a', [{ text: 'first', source }], 'bounced').held[0]!;
-      const second = drafts.hold('a', [{ text: 'second', source }], 'bounced').held[0]!;
-      drafts.hold('a', [{ text: 'not a bounce', source }], 'explicit-send');
+      const first = drafts.hold('a', [{ text: 'first' }], 'bounced').held[0]!;
+      const second = drafts.hold('a', [{ text: 'second' }], 'bounced').held[0]!;
+      drafts.hold('a', [{ text: 'not a bounce' }], 'explicit-send');
       assert.equal(drafts.latestBounce('a')?.id, second.id);
       drafts.dismiss('a', second.id);
       assert.equal(drafts.latestBounce('a'), undefined, 'an older bounce is not substituted');
@@ -642,7 +641,7 @@ describe('held prose drafts, end to end', () => {
     it('hybrid skip_reply unsent ' + (privateThink ? 'stays uninterpreted beside a private think' : 'dismisses the bounce while keeping the round private'), async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid', sameRoundThinkTextPolicy: 'private' }] });
       try {
-        const original = h.store().hold('scout', [{ text: 'held bounce', source }], 'bounced').held[0]!;
+        const original = h.store().hold('scout', [{ text: 'held bounce' }], 'bounced').held[0]!;
         assert.equal(draftState(original), 'held');
         const blocks = [text('>>>skip_reply {{unsent}}'), call('skip1', 'skip_reply', {})];
         if (privateThink) blocks.push(call('think1', 'think', { thought: 'private reasoning' }));
@@ -809,8 +808,8 @@ describe('held prose drafts, end to end', () => {
     try {
       // Held directly, as if the turn that held it died before its receipt;
       // the second also died mid-send, its attempt never resolved.
-      h.store().hold('scout', [{ text: 'orphaned words', source }], 'explicit-send');
-      const midSend = h.store().hold('scout', [{ text: 'half-sent words', source }], 'explicit-send').held[0]!;
+      h.store().hold('scout', [{ text: 'orphaned words' }], 'explicit-send');
+      const midSend = h.store().hold('scout', [{ text: 'half-sent words' }], 'explicit-send').held[0]!;
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
@@ -829,7 +828,7 @@ describe('held prose drafts, end to end', () => {
   it('the catch-up names every draft it marks: the newest eight with their state, the rest by id, and no words', async () => {
     const h = await harness();
     try {
-      const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}`, source }], 'explicit-send').held[0]!);
+      const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}` }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
@@ -1113,7 +1112,7 @@ describe('draft notices and turn-end settlement', () => {
         settleTurnDrafts(agent: unknown, logical: unknown): void;
       };
       const agent = framework.getAgent('scout')!;
-      const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named', source }, { text: 'lost', source }], 'explicit-send').held;
+      const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named' }, { text: 'lost' }], 'explicit-send').held;
       // Only the first draft's notice reached the history.
       const cm = agent.getContextManager();
       const notice = cm.addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
@@ -1156,7 +1155,7 @@ describe('draft notices and turn-end settlement', () => {
   it("the catch-up records a draft a notice already names, rather than naming it again", async () => {
     const t = await catchUpFixture();
     try {
-      const [late, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'late', source }, { text: 'lost', source }], 'bounced').held;
+      const [late, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'late' }, { text: 'lost' }], 'bounced').held;
       // A bounce notice reached the history after its turn's drafts were
       // settled, so nothing recorded it.
       const notice = t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [late!.id] } as never);
@@ -1173,7 +1172,7 @@ describe('draft notices and turn-end settlement', () => {
   it('the catch-up reads notices among the newest 500 messages, and names a draft whose only notice is further back', async () => {
     const t = await catchUpFixture();
     try {
-      const [old, recent] = t.internals.proseDrafts.hold('scout', [{ text: 'old', source }, { text: 'recent', source }], 'bounced').held;
+      const [old, recent] = t.internals.proseDrafts.hold('scout', [{ text: 'old' }, { text: 'recent' }], 'bounced').held;
       // Neither notice was recorded: one now sits 500 messages back, the
       // other among the newest.
       t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [old!.id] } as never);
@@ -1203,14 +1202,14 @@ describe('draft notices and turn-end settlement', () => {
     f.proseDrafts = drafts;
     const routing = h.internals.routingOf('scout');
     try {
-      const old = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, turn: 1, round: 1, notice: 'later' })[0]!;
+      const old = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
       // An attempt whose outcome is unknown (Arthur-2378's second probe): once
       // the draft is let go, nothing says whether it was posted.
       const attempt = drafts.beginAttempt('scout', old.id, dest(), 'resend', false);
       drafts.recordOutcome('scout', old.id, attempt, { status: 'unknown', reason: 'connection lost', at: Date.now(), destination: dest() });
       assert.equal(draftState(drafts.get('scout', old.id)!), 'unconfirmed');
       t.mock.timers.tick(2);
-      const newer = f.holdProseDrafts(h.agent, [{ text: 'later words' }], 'explicit-send', { routing, turn: 1, round: 2, notice: 'later' })[0]!;
+      const newer = f.holdProseDrafts(h.agent, [{ text: 'later words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
       assert.equal(drafts.get('scout', old.id), undefined, 'the journal let the older draft go');
       f.appendProseDeliveryReceipt(h.agent, routing);
       const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
@@ -1231,7 +1230,7 @@ describe('draft notices and turn-end settlement', () => {
     const t = await catchUpFixture();
     const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;
     try {
-      const [waiting, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'waiting', source }, { text: 'lost', source }], 'bounced').held;
+      const [waiting, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'waiting' }, { text: 'lost' }], 'bounced').held;
       // A bounce notice deferred while a turn is alive: not in the history
       // yet, but on its way.
       queue.push({
@@ -1253,7 +1252,7 @@ describe('draft notices and turn-end settlement', () => {
   it("the catch-up leaves the open logical turn's own drafts to its receipt", async () => {
     const t = await catchUpFixture();
     try {
-      const [own, other] = t.internals.proseDrafts.hold('scout', [{ text: 'own', source }, { text: 'other', source }], 'explicit-send').held;
+      const [own, other] = t.internals.proseDrafts.hold('scout', [{ text: 'own' }, { text: 'other' }], 'explicit-send').held;
       // A later start continues this logical turn, whose receipt names its
       // drafts at the turn's end.
       const logical = t.internals.routingOf('scout');
@@ -1293,8 +1292,8 @@ describe('draft identity and risk evidence', () => {
     const t = await setupFramework();
     try {
       (t.internals.proseDrafts as unknown as { newId: (agent: string) => string }).newId = () => 'd-same2';
-      const [mine] = t.internals.proseDrafts.hold('scout', [{ text: 'scout words', source }], 'explicit-send').held;
-      t.internals.proseDrafts.hold('other', [{ text: 'other words', source }], 'explicit-send');
+      const [mine] = t.internals.proseDrafts.hold('scout', [{ text: 'scout words' }], 'explicit-send').held;
+      t.internals.proseDrafts.hold('other', [{ text: 'other words' }], 'explicit-send');
       // Only the OTHER resident's notice for "d-same2" is in the shared history.
       t.framework.getAgent('other')!.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] other: …' }],
         { system: true, kind: 'prose-drafts', draftOwner: 'other', draftIds: ['d-same2'] } as never);
@@ -1311,7 +1310,7 @@ describe('draft identity and risk evidence', () => {
     const t = await setupFramework();
     try {
       const agent = t.framework.getAgent('scout')!;
-      const [original] = t.internals.proseDrafts.hold('scout', [{ text: 'first', source }], 'bounced').held;
+      const [original] = t.internals.proseDrafts.hold('scout', [{ text: 'first' }], 'bounced').held;
       t.internals.proseDrafts.beginAttempt('scout', original!.id, dest(), 'unsent-token', false); // never resolved
       const round = { routing: t.internals.routingOf('scout'), notice: 'later' as const };
       t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel', undefined, '>>', round);
@@ -1375,7 +1374,7 @@ describe('drafts resend ownership', () => {
         await new Promise((r) => setTimeout(r, 2));
       }
     };
-    const [a, b] = internals.proseDrafts.hold('scout', [{ text: 'A words', source }, { text: 'B words', source }], 'explicit-send').held;
+    const [a, b] = internals.proseDrafts.hold('scout', [{ text: 'A words' }, { text: 'B words' }], 'explicit-send').held;
     return {
       dir, framework, internals, pending, say, untilPublishing, a: a!, b: b!,
       close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
@@ -1504,7 +1503,7 @@ describe('drafts resend ownership', () => {
   it('a batch that stops says why for each draft after the stop', async () => {
     const t = await setup();
     try {
-      const [c] = t.internals.proseDrafts.hold('scout', [{ text: 'C words', source }], 'explicit-send').held;
+      const [c] = t.internals.proseDrafts.hold('scout', [{ text: 'C words' }], 'explicit-send').held;
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id, c!.id], destination: 'chan' });
       await t.untilPublishing();
       t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] }));
@@ -1512,7 +1511,7 @@ describe('drafts resend ownership', () => {
       const result = t.say(await batch);
       assert.match(result, new RegExp(`${c!.id}: not attempted \\(${t.b.id} was dismissed while it waited\\)\\.`));
 
-      const [d] = t.internals.proseDrafts.hold('scout', [{ text: 'D words', source }], 'explicit-send').held;
+      const [d] = t.internals.proseDrafts.hold('scout', [{ text: 'D words' }], 'explicit-send').held;
       const again = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [c!.id, d!.id], destination: 'chan' });
       await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
@@ -1539,7 +1538,7 @@ describe('drafts resend ownership', () => {
   it('{{unsent}} of a bounce queued in a resend says so, and holds the envelope\'s words with the risk', async () => {
     const t = await setup();
     try {
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
@@ -1568,7 +1567,7 @@ describe('drafts resend ownership', () => {
     try {
       const agent = t.framework.getAgent('scout')!;
       const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
@@ -1593,7 +1592,7 @@ describe('drafts resend ownership', () => {
   it('>>skip_reply {{unsent}} leaves the latest bounce alone while it is being sent, and tells the resident', async () => {
     const t = await setup();
     try {
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
@@ -1615,7 +1614,7 @@ describe('drafts resend ownership', () => {
   it('a dismissal is refused while an {{unsent}} delivery of that draft is out', async () => {
     const t = await setup();
     try {
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const agent = t.framework.getAgent('scout')!;
       const delivering = t.internals.deliverProse(agent, '>>chan {{unsent}}', { notice: 'later' });
       await t.untilPublishing();
@@ -1816,7 +1815,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
   it('hybrid: the held-draft notice gives a copied, possibly-posted draft its risk and the confirmation it needs', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
-      const original = h.store().hold('scout', [{ text: 'possibly sent', source }], 'bounced').held[0]!;
+      const original = h.store().hold('scout', [{ text: 'possibly sent' }], 'bounced').held[0]!;
       h.store().beginAttempt('scout', original.id, dest(), 'unsent-token', false); // its outcome never recorded
       await h.turn(rounds([text(`plain words\n>>>${ROOM} {{unsent}} and a new line`), explicitSend('s1')]));
       const free = h.drafts().find((d) => d.text === 'plain words')!;

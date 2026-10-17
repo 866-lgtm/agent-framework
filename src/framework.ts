@@ -95,7 +95,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
-import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
+import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
@@ -702,9 +702,6 @@ function freshTurnRouting(): TurnRouting {
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
   routing: TurnRouting;
-  /** The turn token of the stream that built the round, read at driveStream's entry: a held draft's provenance (DraftSource.turn). */
-  turn: number;
-  round?: number;
   notice: 'now' | 'later';
   keepPrivate?: boolean;
 }
@@ -11266,7 +11263,7 @@ export class AgentFramework {
     agent: Agent,
     texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
-    opts: { routing: TurnRouting; turn: number; round?: number; note?: string; notice: 'now' | 'later' },
+    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later' },
   ): Draft[] {
     const segments = texts
       .map((t) => (typeof t === 'string'
@@ -11274,20 +11271,12 @@ export class AgentFramework {
         : { text: t.text, note: t.note ?? opts.note, inheritedRisk: t.inheritedRisk }))
       .filter((t) => t.text.trim().length > 0);
     if (segments.length === 0) return [];
-    const turn = opts.turn;
-    let branch = 'unknown';
-    try {
-      branch = this.store.currentBranch().name;
-    } catch {
-      // provenance only
-    }
     const { held, notHeld } = this.proseDrafts.hold(
       agent.name,
-      segments.map(({ text, note, inheritedRisk }, segment) => ({
+      segments.map(({ text, note, inheritedRisk }) => ({
         text,
         ...(note ? { note } : {}),
         ...(inheritedRisk ? { inheritedRisk } : {}),
-        source: { branch, turn, round: opts.round ?? 0, segment } satisfies DraftSource,
       })),
       reason,
     );
@@ -12261,10 +12250,9 @@ export class AgentFramework {
     round: { notice?: 'now' | 'later'; keepPrivate?: boolean } = {},
   ): Promise<void> {
     // The direct entry delivers as a live round does: under the live turn's
-    // routing and turn token.
+    // routing.
     await this.deliverAdmittedProse(agent, this.admitProse(rawText), {
       routing: this.routingOf(agent.name),
-      turn: this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0,
       notice: round.notice ?? 'later',
       keepPrivate: round.keepPrivate,
     });
@@ -12363,7 +12351,7 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
         'bounced',
-        { routing: round.routing, turn: round.turn, round: round.round, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
+        { routing: round.routing, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
       )[0];
     // A bare {{unsent}} holds nothing new; otherwise say whether the
     // envelope's own words were held, since explicit mode writes no receipt
@@ -12800,7 +12788,7 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(inherited ? { inheritedRisk: inherited } : {}) }],
         'bounced',
-        { routing: round.routing, turn: round.turn, round: round.round, note: reason, notice: 'later' },
+        { routing: round.routing, note: reason, notice: 'later' },
       )[0];
     }
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
@@ -13694,11 +13682,6 @@ export class AgentFramework {
       : (trigger?.reason === 'tool_result_guard_retry' ? this.guardRetryTurnSilenced.get(agent.name) : undefined) ?? null;
     let turnSilenced = silenceCause !== null;
     this.guardRetryTurnSilenced.delete(agent.name);
-    /** Provider rounds of this physical stream, for draft provenance. */
-    let draftRound = 0;
-    /** This stream's turn token, for draft provenance: a round queued here
-     *  keeps it even when its hold runs after a later turn has started. */
-    const draftTurn = this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0;
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -14019,7 +14002,6 @@ export class AgentFramework {
             // from the round it occurs (see SILENCING_TOOLS). Only rounds
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
-            draftRound++;
             if (this.channelRegistry) {
               const roundToolNames = event.calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
@@ -14039,7 +14021,7 @@ export class AgentFramework {
                 const presentsInjections =
                   (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
                 // Queued under this turn's routing, whenever it posts.
-                const holdOpts: ProseRound = { routing: streamRouting, turn: draftTurn, round: draftRound, notice: presentsInjections ? 'now' : 'later' };
+                const holdOpts: ProseRound = { routing: streamRouting, notice: presentsInjections ? 'now' : 'later' };
                 // Routing publishes trimmed segments; held drafts keep the
                 // runs exactly as written.
                 const roundRuns = splitProseRuns(assistantBlocks);
@@ -14578,7 +14560,7 @@ export class AgentFramework {
             if (speechContent.length > 0 && this.channelRegistry) {
               const speechRuns = finalSpeechRuns;
               const speechSegments = finalSpeechSegments;
-              const textOnlyHold: ProseRound = { routing: finalRouting, turn: draftTurn, round: draftRound + 1, notice: 'later' };
+              const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later' };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
@@ -14656,7 +14638,7 @@ export class AgentFramework {
                 : turnSilenced || fallbackCause !== null;
               const trailingCause: 'send' | 'private' | null =
                 silenceCause === 'private' || fallbackCause === 'private' ? 'private' : (silenceCause ?? fallbackCause);
-              const trailingHold: ProseRound = { routing: finalRouting, turn: draftTurn, round: draftRound + 1, notice: 'later' };
+              const trailingHold: ProseRound = { routing: finalRouting, notice: 'later' };
 
               const runs = finalRuns;
               const segments = finalSegments;

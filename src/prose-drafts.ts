@@ -21,9 +21,8 @@
  * typed Chronicle records, which do not follow branch switches: undo,
  * rollback, suppression and branch moves never touch them. A draft written
  * in a turn that is later undone stays usable (the words were genuinely
- * written and held back), and a delivered draft stays delivered. Its
- * originating branch is recorded as provenance only. The notices that name
- * a draft are conversation, so they do follow the branch: a draft counts as
+ * written and held back), and a delivered draft stays delivered. The
+ * notices that name a draft are conversation, so they do follow the branch: a draft counts as
  * named while a message naming it is on the current branch, and one a
  * rollback or branch move has left unnamed is named again.
  *
@@ -60,20 +59,6 @@ export type DraftReason =
   | 'no-destination'
   /** An explicit/hybrid routing prefix was missing, malformed or unresolvable. */
   | 'bounced';
-
-/** Where a draft's words were written. Provenance only: nothing routes by it. */
-export interface DraftSource {
-  /** Chronicle branch current when the words were held. */
-  branch: string;
-  /** The turn token (a process-local counter) of the stream whose round
-   *  wrote the words; a budget restart or a retry has a token of its own. */
-  turn: number;
-  /** Round within this stream; numbering restarts at a budget restart. */
-  round: number;
-  /** Position of these words among those held together, in one hold of a
-   *  round's speech; a bounce holds its words alone, at 0. */
-  segment: number;
-}
 
 export interface DraftAttemptOutcome {
   status: PublishOutcome['status'];
@@ -128,7 +113,6 @@ export interface Draft {
   /** Short context for the resident: the bounce reason, or the competing conversations. */
   note?: string;
   heldAt: number;
-  source: DraftSource;
   attempts: DraftAttempt[];
   dismissedAt?: number;
   /** The messages whose notices named this draft, by id. It counts as named
@@ -365,7 +349,7 @@ export class ProseDraftStore {
    */
   hold(
     agent: string,
-    segments: Array<{ text: string; source: DraftSource; note?: string; inheritedRisk?: InheritedRisk }>,
+    segments: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
     note?: string,
   ): { held: Draft[]; notHeld?: { count: number; error: string } } {
@@ -381,7 +365,6 @@ export class ProseDraftStore {
         ...(segmentNote ? { note: segmentNote } : {}),
         ...(segment.inheritedRisk ? { inheritedRisk: segment.inheritedRisk } : {}),
         heldAt: Date.now(),
-        source: segment.source,
       };
       try {
         this.write({ op: 'held', draft }, true);
