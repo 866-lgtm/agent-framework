@@ -1133,3 +1133,48 @@ test('an anchor at the end of a write that was cut short keeps that partial body
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('offline recovery refuses a marks choice the live methods refuse, before anything is written', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-bad-marks-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const seed = async () => {
+      rmSync(storePath, { recursive: true, force: true });
+      const store = JsStore.openOrCreate({ path: storePath });
+      const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      cm.addMessage('user', [{ type: 'text', text: 'safe' }], {
+        serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe',
+      });
+      cm.addMessage('user', [{ type: 'text', text: 'hey @cairn' }], {
+        serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-addressed', tags: ['chat:addressed', 'chat:mention'],
+      });
+      cm.addMessage('user', [{ type: 'text', text: 'ambient chatter' }], {
+        serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-ambient', tags: ['chat:ambient'],
+      });
+      cm.close();
+      store.close();
+    };
+    // A bare scope string (the host/command vocabulary), a misspelled scope,
+    // an unknown scope and refs that aren't a list: each would skip the scope
+    // filter and mark every removed message, ambient ones included.
+    for (const marks of ['addressed', 'all', { scop: 'addressed' }, { scope: 'every' }, { scope: 'addressed', refs: 'm-addressed' }]) {
+      for (const dryRun of [true, false]) {
+        await seed();
+        await assert.rejects(
+          createOfflineRecoveryBranch({
+            storePath, agentName: 'cairn', messageId: 'm-safe', marks: marks as never, dryRun, branchName: 'recovery/cairn/bad',
+          }),
+          /marks must be 'none' or \{ scope: 'addressed' \| 'all', refs\? \}/,
+          `${JSON.stringify(marks)}${dryRun ? ', dry run' : ''}`,
+        );
+        readJournal(storePath, (outbox, store) => {
+          assert.equal(outbox.batches().length, 0, 'no batch was prepared');
+          assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord');
+          assert.equal(store.listBranches().some((branch) => branch.name === 'recovery/cairn/bad'), false, 'no branch was made');
+        });
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

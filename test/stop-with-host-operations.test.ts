@@ -843,6 +843,45 @@ describe('stop() with an operator operation in flight', () => {
     assert.equal(framework.getStore().isClosed(), true);
   });
 
+  it('an awareness sync waits for a delivery pass already under way, though nothing is left due', async () => {
+    const framework = await create();
+    const fw = framework as unknown as {
+      runDiscordAwarenessDrain(serverId: string, pass: unknown): Promise<unknown>;
+      drainDiscordAwarenessOutbox(serverId: string): Promise<unknown>;
+      discordAwarenessDrains: Map<string, Promise<unknown>>;
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    // A pass whose last request is on the wire: nothing is due, and it ends
+    // when that request is answered.
+    fw.runDiscordAwarenessDrain = async () => {
+      await held;
+      return { status: 'delivered', delivered: 1, failed: 0 };
+    };
+    const drain = fw.drainDiscordAwarenessOutbox('srv');
+    assert.equal(fw.discordAwarenessDrains.size, 1, 'the pass is registered');
+    let synced = false;
+    const syncing = framework.syncDiscordAwarenessMarkers().then(() => { synced = true; });
+    const other = framework.syncDiscordAwarenessMarkers('other').then(() => 'settled' as const);
+    try {
+      // Another server's sync has no pass to wait for.
+      const otherOutcome = await Promise.race([
+        other,
+        new Promise<'waited'>((resolve) => { setTimeout(() => resolve('waited'), 2000); }),
+      ]);
+      assert.equal(otherOutcome, 'settled', "another server's sync doesn't wait for this pass");
+      for (let turn = 0; turn < 20; turn++) await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+      assert.equal(synced, false, 'the sync waits for the pass');
+    } finally {
+      release();
+      await drain;
+      await syncing;
+      await other;
+    }
+    assert.equal(synced, true);
+    await framework.stop();
+  });
+
   it('a branch switch during a live turn is refused, and the branch stays', async () => {
     const framework = await create();
     const api = new ApiServer(framework) as unknown as {

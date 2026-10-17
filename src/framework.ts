@@ -425,6 +425,7 @@ import {
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
+  checkedDiscordAwarenessMarks,
   boundDiscordAwarenessText,
   DISCORD_AWARENESS_READ_LIFT,
   isPermanentDiscordReactionFailure,
@@ -973,31 +974,6 @@ class DefaultInferencePolicy implements InferencePolicy {
 /** The batch scope a publication choice records (`none` for local surgery). */
 function marksScope(marks: DiscordAwarenessMarks | undefined): 'none' | DiscordAwarenessScope {
   return !marks || marks === 'none' ? 'none' : marks.scope;
-}
-
-/**
- * A surgery's marks choice as a caller passes it at runtime: `none` (or left
- * out), or `{ scope: 'addressed' | 'all', refs? }` with each ref a Discord
- * address. Anything else is refused, never guessed: a bare scope string (the
- * host/command vocabulary) or a misspelled scope would otherwise skip the
- * scope filter and mark every addressable message.
- */
-function checkedMarks(marks: unknown): DiscordAwarenessMarks {
-  if (marks === undefined || marks === 'none') return 'none';
-  if (marks && typeof marks === 'object' && !Array.isArray(marks)) {
-    const { scope, refs } = marks as { scope?: unknown; refs?: unknown };
-    const isRef = (ref: unknown) => !!ref && typeof ref === 'object'
-      && typeof (ref as Record<string, unknown>).serverId === 'string'
-      && typeof (ref as Record<string, unknown>).channelId === 'string'
-      && typeof (ref as Record<string, unknown>).messageId === 'string';
-    if ((scope === 'addressed' || scope === 'all') && (refs === undefined || (Array.isArray(refs) && refs.every(isRef)))) {
-      return marks as DiscordAwarenessMarks;
-    }
-  }
-  throw new OperatorActionError(
-    'invalid',
-    `marks must be 'none' or { scope: 'addressed' | 'all', refs? } (got ${boundDiscordAwarenessText(JSON.stringify(marks) ?? String(marks), 200)})`,
-  );
 }
 
 /** A publication choice, summarized for the operator log (refs counted, not listed). */
@@ -6988,9 +6964,9 @@ export class AgentFramework {
       | DiscordAwarenessRetractReceipt;
     hidden?: number;
     /** For `hide`: the Discord (channelId, messageId) of each removed message
-     *  that carried one. Marking is the framework's (see `marks`/`markers`);
-     *  a surface that also reacts itself should do so only when its operator
-     *  chose marks and the framework returned no `markers`. */
+     *  that carried one. Marking is the framework's (see `marks`/`markers`),
+     *  so a surface leaves it to the framework: a mark it placed itself would
+     *  be outside the journal, so nothing could list or cancel it. */
     hiddenRefs?: Array<{ channelId: string; messageId: string }>;
     lastVisible?: { participant?: string; role?: string; preview?: string } | null;
     /** For `unstick`: acknowledges the forced-rewind loop has started; the
@@ -8287,7 +8263,7 @@ export class AgentFramework {
       params: { messageId: opts.messageId, marks: describeMarksChoice(opts.marks) },
     };
     try {
-      const marks = checkedMarks(opts.marks);
+      const marks = checkedDiscordAwarenessMarks(opts.marks);
       const { cm, tailMessageId, messagesRemoved, discarded } = this.planRollback(agentName, opts.messageId);
       const removedRefs = extractDiscordAwarenessRefs(discarded);
       const selection = selectDiscordAwarenessRefs(discarded, marks);
@@ -8440,7 +8416,7 @@ export class AgentFramework {
       params: { messageIds: requestedIds, marks: describeMarksChoice(opts.marks) },
     };
     try {
-      const marks = checkedMarks(opts.marks);
+      const marks = checkedDiscordAwarenessMarks(opts.marks);
       const { cm, ordered, messagesRemoved, targeted } = this.planSuppression(agentName, requestedIds);
       const removedIds = targeted.map((m) => String(m.id));
       const removedRefs = extractDiscordAwarenessRefs(targeted);
@@ -17025,24 +17001,30 @@ export class AgentFramework {
 
   /**
    * Deliver every server's queued awareness operations now (or only
-   * `onlyServerId`'s) and wait for this pass. Like the other operator entry
-   * points, it's refused once stop() has begun, and stop() waits for one
-   * already running. Delivery never gates MCPL traffic or turns: the
-   * framework's own deliveries run in the background
-   * (deliverDiscordAwarenessInBackground). A server that is not connected is
-   * skipped (its work stays queued until it connects).
+   * `onlyServerId`'s) and wait for this pass, and for a pass already under
+   * way on a server, whose last request may still be on the wire with
+   * nothing left due. Like the other operator entry points, it's refused
+   * once stop() has begun, and stop() waits for one already running.
+   * Delivery never gates MCPL traffic or turns: the framework's own
+   * deliveries run in the background (deliverDiscordAwarenessInBackground).
+   * A server that is not connected is skipped (its work stays queued until
+   * it connects).
    */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
     this.refuseOperatorAfterStop('awareness sync');
     return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
   }
 
-  /** One delivery pass over every server with due work, or only `onlyServerId`'s. */
+  /** One delivery pass over every server with due work or a pass under way,
+   *  or only `onlyServerId`'s: drainDiscordAwarenessOutbox joins a running pass. */
   private async runDiscordAwarenessSync(onlyServerId?: string): Promise<void> {
-    const serverIds = [...new Set(
+    const serverIds = new Set(
       this.readDiscordAwarenessDispatches(onlyServerId).map((dispatch) => dispatch.key.serverId),
-    )];
-    await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
+    );
+    for (const serverId of this.discordAwarenessDrains.keys()) {
+      if (onlyServerId === undefined || serverId === onlyServerId) serverIds.add(serverId);
+    }
+    await Promise.all([...serverIds].map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
   }
 
   /**

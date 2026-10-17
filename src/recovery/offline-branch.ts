@@ -8,6 +8,7 @@ import {
   DiscordAwarenessOutbox,
   boundDiscordAwarenessText,
   defaultDiscordAwarenessOutboxPath,
+  checkedDiscordAwarenessMarks,
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
   type DiscordAwarenessMarks,
@@ -91,6 +92,10 @@ export async function createOfflineRecoveryBranch(
   if (count !== undefined && (!Number.isFinite(count) || count < 1)) {
     throw new Error('messages must be a positive integer');
   }
+  // The marks choice is checked as the live methods check it, before the
+  // store is opened: a malformed one would otherwise mark every removed
+  // message.
+  const marks = checkedDiscordAwarenessMarks(options.marks);
 
   // The store must exist: a mistyped path is refused, never created.
   let store: JsStore;
@@ -183,7 +188,6 @@ export async function createOfflineRecoveryBranch(
     );
     carriers = [...carriers, ...suppression.carriers];
     const addressable = extractDiscordAwarenessRefs(carriers, options.discordServerId).length;
-    const marks = options.marks ?? 'none';
     const selection = selectDiscordAwarenessRefs(carriers, marks, options.discordServerId);
     const refs = selection.refs;
 

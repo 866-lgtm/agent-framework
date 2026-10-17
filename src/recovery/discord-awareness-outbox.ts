@@ -3,6 +3,7 @@ import { basename, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import { RecordJournal, type AppendOptions } from '../record-journal.js';
+import { OperatorActionError } from '../operator-log.js';
 
 /**
  * Discord awareness marks: a reaction (💤 by default) that an operator may
@@ -470,6 +471,33 @@ export function extractDiscordAwarenessRefs(
     if (ref) refs.set(refKey(ref), ref);
   }
   return [...refs.values()];
+}
+
+/**
+ * A surgery's marks choice as a caller passes it at runtime: `none` (or left
+ * out), or `{ scope: 'addressed' | 'all', refs? }` with each ref a Discord
+ * address. Anything else is refused, never guessed: a bare scope string (the
+ * host/command vocabulary) or a misspelled scope would otherwise skip the
+ * scope filter and mark every addressable message. Every entry point that
+ * takes a choice checks it with this before it plans or changes anything:
+ * the framework's rollback and suppression, and the offline recovery.
+ */
+export function checkedDiscordAwarenessMarks(marks: unknown): DiscordAwarenessMarks {
+  if (marks === undefined || marks === 'none') return 'none';
+  if (marks && typeof marks === 'object' && !Array.isArray(marks)) {
+    const { scope, refs } = marks as { scope?: unknown; refs?: unknown };
+    const isRef = (ref: unknown) => !!ref && typeof ref === 'object'
+      && typeof (ref as Record<string, unknown>).serverId === 'string'
+      && typeof (ref as Record<string, unknown>).channelId === 'string'
+      && typeof (ref as Record<string, unknown>).messageId === 'string';
+    if ((scope === 'addressed' || scope === 'all') && (refs === undefined || (Array.isArray(refs) && refs.every(isRef)))) {
+      return marks as DiscordAwarenessMarks;
+    }
+  }
+  throw new OperatorActionError(
+    'invalid',
+    `marks must be 'none' or { scope: 'addressed' | 'all', refs? } (got ${boundDiscordAwarenessText(JSON.stringify(marks) ?? String(marks), 200)})`,
+  );
 }
 
 /**
@@ -1879,6 +1907,64 @@ interface LegacyBatch {
 }
 
 /**
+ * Whether a parsed pre-journal ledger is one the released readers accepted
+ * (0.21.0 to 0.22.2 checked these fields alike): version 1, whose batches are
+ * `prepared` or `pending` with plain refs, or version 2, whose batches are
+ * `prepared` or `active`, with an activation policy and suppression
+ * intervals of the shapes they wrote, and refs that are full entries.
+ */
+function isLegacyLedger(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const document = value as { version?: unknown; batches?: unknown };
+  if ((document.version !== 1 && document.version !== 2) || !Array.isArray(document.batches)) return false;
+  const v1 = document.version === 1;
+  return document.batches.every((batch) => {
+    if (!batch || typeof batch !== 'object') return false;
+    const candidate = batch as Record<string, unknown>;
+    return typeof candidate.id === 'string'
+      && (v1
+        ? candidate.status === 'prepared' || candidate.status === 'pending'
+        : candidate.status === 'prepared' || candidate.status === 'active')
+      && typeof candidate.agentName === 'string'
+      && typeof candidate.sourceBranch === 'string'
+      && typeof candidate.targetBranch === 'string'
+      && typeof candidate.emoji === 'string'
+      && typeof candidate.createdAt === 'number'
+      && Array.isArray(candidate.refs)
+      && (v1
+        ? candidate.refs.every((ref: unknown) => !!ref && typeof ref === 'object'
+          && typeof (ref as Record<string, unknown>).serverId === 'string'
+          && typeof (ref as Record<string, unknown>).channelId === 'string'
+          && typeof (ref as Record<string, unknown>).messageId === 'string')
+        : (candidate.activationPolicy === undefined
+          || candidate.activationPolicy === 'target-branch'
+          || candidate.activationPolicy === 'explicit')
+          && (candidate.suppressionIntervals === undefined
+            || (Array.isArray(candidate.suppressionIntervals)
+              && candidate.suppressionIntervals.every((interval: unknown) => !!interval && typeof interval === 'object'
+                && typeof (interval as Record<string, unknown>).fromId === 'string'
+                && typeof (interval as Record<string, unknown>).toId === 'string')))
+          && candidate.refs.every(isLegacyEntry));
+  });
+}
+
+/** Whether a version 2 ledger's ref is an entry as the released readers required it. */
+function isLegacyEntry(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const entry = value as Record<string, unknown>;
+  return typeof entry.serverId === 'string'
+    && typeof entry.channelId === 'string'
+    && typeof entry.messageId === 'string'
+    && typeof entry.desired === 'boolean'
+    && typeof entry.markerPresent === 'boolean'
+    && (entry.deliveryStatus === 'pending' || entry.deliveryStatus === 'applied' || entry.deliveryStatus === 'permanent-failure')
+    && typeof entry.attempts === 'number'
+    && (entry.lastAction === undefined || entry.lastAction === 'add' || entry.lastAction === 'remove')
+    && (entry.lastAttemptAt === undefined || typeof entry.lastAttemptAt === 'number')
+    && (entry.lastError === undefined || typeof entry.lastError === 'string');
+}
+
+/**
  * Translate a version 1 or 2 ledger into journal records, ending with an
  * `import-complete` record carrying the file's hash. Batches keep their ids.
  * What the old ledger recorded about each ref is kept as legacy evidence:
@@ -1904,18 +1990,17 @@ function importLegacy(
   sha256: string,
   journalBatches: ReadonlyMap<string, unknown>,
 ): { records: JournalRecord[]; unsent: DiscordAwarenessImportedUnsent[] } {
-  const document = parsed as { version?: unknown; batches?: unknown };
-  if (!document || (document.version !== 1 && document.version !== 2) || !Array.isArray(document.batches)) {
-    throw new Error(`Invalid Discord awareness ledger ${path}`);
-  }
+  // A ledger the released readers would have refused is refused here too,
+  // never read for a meaning: a malformed field (`activationPolicy:
+  // 'explicit '`) would otherwise retire a suppression whose removals a
+  // start on its branch still owes.
+  if (!isLegacyLedger(parsed)) throw new Error(`Invalid Discord awareness ledger ${path}`);
+  const document = parsed as { version: 1 | 2; batches: unknown[] };
   const at = Date.now();
   const records: JournalRecord[] = [];
   const unsent: DiscordAwarenessImportedUnsent[] = [];
   const imported = new Set<string>();
   for (const raw of document.batches as LegacyBatch[]) {
-    if (!raw || typeof raw.id !== 'string' || !Array.isArray(raw.refs)) {
-      throw new Error(`Invalid Discord awareness ledger ${path}`);
-    }
     if (journalBatches.has(raw.id) || imported.has(raw.id)) continue;
     imported.add(raw.id);
     const legacyActive = raw.status === 'active' || raw.status === 'pending';

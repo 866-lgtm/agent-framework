@@ -103,7 +103,7 @@ function importLegacyBatch(h: Harness, id: string, refs: DiscordAwarenessRef[], 
     version: 2,
     batches: [{
       id, status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: `legacy/${id}`, emoji: '💤', createdAt: 1,
-      refs: refs.map((r) => ({ ...r, desired: false, markerPresent: false, deliveryStatus: 'applied' })),
+      refs: refs.map((r) => ({ attempts: 0, ...r, desired: false, markerPresent: false, deliveryStatus: 'applied' })),
       ...extra,
     }],
   }));
@@ -972,7 +972,7 @@ test('a legacy ledger that cannot be imported refuses every read until it can be
     version: 2,
     batches: [{
       id: 'late', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/late',
-      emoji: '💤', createdAt: 1, refs: [{ ...ref('m1'), desired: true, markerPresent: false, deliveryStatus: 'pending' }],
+      emoji: '💤', createdAt: 1, refs: [{ ...ref('m1'), desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 0 }],
     }],
   }));
   assert.deepEqual(outbox.batches().map((batch) => batch.id), ['late'], 'imported once it can be read');
@@ -1705,15 +1705,15 @@ test('the start that imports a pre-journal ledger raises one alert naming each b
       {
         id: 'never', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1',
         emoji: '💤', createdAt: 1,
-        refs: [ref('m1'), ref('m2')].map((r) => ({ ...r, desired: false, markerPresent: false, deliveryStatus: 'applied' })),
+        refs: [ref('m1'), ref('m2')].map((r) => ({ ...r, desired: false, markerPresent: false, deliveryStatus: 'applied', attempts: 0 })),
       },
       {
         id: 'queued', status: 'active', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2',
         emoji: '💤', createdAt: 2,
         refs: [
-          { ...ref('m3'), desired: true, markerPresent: false, deliveryStatus: 'pending' },
-          { ...ref('m4'), desired: false, markerPresent: true, deliveryStatus: 'pending' },
-          { ...ref('m5'), desired: true, markerPresent: true, deliveryStatus: 'applied' },
+          { ...ref('m3'), desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 0 },
+          { ...ref('m4'), desired: false, markerPresent: true, deliveryStatus: 'pending', attempts: 0 },
+          { ...ref('m5'), desired: true, markerPresent: true, deliveryStatus: 'applied', attempts: 0 },
         ],
       },
     ],
@@ -2352,7 +2352,7 @@ test('a legacy import written but out of this view is not imported again in this
     version: 2,
     batches: [{
       id: 'old', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1',
-      emoji: '💤', createdAt: 1, refs: [{ ...ref('a1'), lastAction: 'add', desired: true, deliveryStatus: 'pending', attempts: 2, lastError: 'did not respond' }],
+      emoji: '💤', createdAt: 1, refs: [{ ...ref('a1'), lastAction: 'add', desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 2, lastError: 'did not respond' }],
     }],
   }));
   const seams = journalSeams(h.store);
@@ -2569,3 +2569,33 @@ test('a sync for one server drains only that server', async () => {
     h.cleanup();
   }
 });
+
+test("a legacy ledger whose batches the released readers would have refused can't be imported, and stays to be read again", withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  const batch = {
+    id: 'legacy-sup', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'partial', emoji: '💤', createdAt: 1,
+    activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i2' }],
+    refs: [{ ...ref('m1'), desired: false, markerPresent: false, deliveryStatus: 'applied', attempts: 0 }],
+  };
+  // Each is a field the released readers (0.21.0 to 0.22.2) checked, the
+  // last a ref without the attempts count they wrote. Imported as written,
+  // the first would retire a suppression whose removals a start on its
+  // branch still owes.
+  for (const malformed of [
+    { activationPolicy: 'explicit ' },
+    { status: 'pending ' },
+    { suppressionIntervals: [{ fromId: 'i1' }] },
+    { emoji: 7 },
+    { refs: [{ ...ref('m1'), desired: 'no', markerPresent: false, deliveryStatus: 'applied', attempts: 0 }] },
+    { refs: [{ ...ref('m1'), desired: false, markerPresent: false, deliveryStatus: 'applied' }] },
+  ]) {
+    writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [{ ...batch, ...malformed }] }));
+    const outbox = h.reopen();
+    assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/, JSON.stringify(malformed));
+    assert.equal(existsSync(h.legacyPath), true, 'the ledger stays where it was');
+  }
+  // As those releases wrote it, it imports, and the suppression's body stays owed.
+  writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [batch] }));
+  const outbox = h.reopen();
+  assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
+}));
