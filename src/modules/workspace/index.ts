@@ -5,6 +5,7 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
+import { isUtf8 } from 'node:buffer';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
@@ -1093,8 +1094,8 @@ export class WorkspaceModule implements Module {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'File path (mount-prefixed, e.g., "project/src/main.ts")' },
-            offset: { type: 'number', description: 'Starting line number (1-indexed)' },
-            limit: { type: 'number', description: 'Maximum number of lines to return (default 2000)' },
+            offset: { type: 'integer', description: 'Starting line number (1-indexed)' },
+            limit: { type: 'integer', description: 'Maximum number of lines to return (default 2000)' },
             offsetChars: { type: 'integer', description: 'Character paging: zero-based UTF-16 offset (default 0); use nextOffsetChars to continue' },
             limitChars: { type: 'integer', description: 'Character paging: code units to return (default 2000), plus at most one to keep a surrogate pair intact. Use the limit suggested by a spill notice.' },
           },
@@ -1194,8 +1195,8 @@ export class WorkspaceModule implements Module {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
             glob: { type: 'string', description: 'Glob pattern to filter files' },
-            contextBefore: { type: 'number', description: 'Context lines before match' },
-            contextAfter: { type: 'number', description: 'Context lines after match' },
+            contextBefore: { type: 'integer', description: 'Context lines before match' },
+            contextAfter: { type: 'integer', description: 'Context lines after match' },
           },
           required: ['pattern'],
         },
@@ -1308,6 +1309,13 @@ export class WorkspaceModule implements Module {
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     try {
+      // Every handler reads its input as its schema describes it; a call
+      // that sends something else is refused here, before anything is read.
+      const schema = this.getTools().find((tool) => tool.name === call.name)?.inputSchema;
+      const problem = schema ? inputProblem(schema, call.input, INPUT_MINIMUMS[call.name]) : null;
+      if (problem !== null) {
+        return { success: false, isError: true, error: `The ${call.name} call did nothing: ${problem}.` };
+      }
       const input = call.input as Record<string, unknown>;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
@@ -1332,7 +1340,7 @@ export class WorkspaceModule implements Module {
           return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
       }
     } catch (err) {
-      return { success: false, error: String(err), isError: true };
+      return { success: false, error: err instanceof Error ? err.message : String(err), isError: true };
     }
   }
 
@@ -1977,6 +1985,7 @@ export class WorkspaceModule implements Module {
       });
     } else {
       store.treeRemove(mount.treeStateId, relativePath);
+      onCommitted?.();
       intents.update(relativePath, (cur) => {
         const next = { ...cur, tombstone: { hash: change.previousHash } };
         delete next.origin;
@@ -2060,15 +2069,10 @@ export class WorkspaceModule implements Module {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
     const offsetChars = input.offsetChars ?? 0;
     const limitChars = input.limitChars ?? 2000;
-    if (characterPaging) {
-      if (input.offset !== undefined || input.limit !== undefined) {
-        return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
-      }
-      if (!Number.isSafeInteger(offsetChars) || offsetChars < 0
-          || !Number.isSafeInteger(limitChars) || limitChars < 1
-          || input.offsetChars === null || input.limitChars === null) {
-        return { success: false, isError: true, error: 'offsetChars must be a non-negative safe integer and limitChars a positive safe integer.' };
-      }
+    // Each number is a whole number of at least its schema's minimum by now
+    // (inputProblem).
+    if (characterPaging && (input.offset !== undefined || input.limit !== undefined)) {
+      return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
     }
     let content = generatedContent;
     if (content === undefined) {
@@ -2107,7 +2111,7 @@ export class WorkspaceModule implements Module {
         },
       };
     }
-    const lines = content.split('\n');
+    const lines = linesOf(content);
 
     // Apply offset/limit. An unlimited read of a large file would inject the
     // whole thing into the turn (a 2MB file ≈ 600k tokens → the request blows
@@ -2115,6 +2119,21 @@ export class WorkspaceModule implements Module {
     // default cap; the result reports total/from/to so the agent can page.
     const DEFAULT_READ_LINE_LIMIT = 2000;
     const startLine = (input.offset ?? 1) - 1; // Convert to 0-indexed
+    if (startLine >= lines.length) {
+      // Nothing to show: an empty file, or an offset past the last line. No
+      // range is claimed, and the line count says where the file ends.
+      return {
+        success: true,
+        data: {
+          path: input.path,
+          totalLines: lines.length,
+          ...(lines.length > 0
+            ? { note: `Line ${startLine + 1} is past the end: the file has ${lines.length} line${lines.length === 1 ? '' : 's'}.` }
+            : {}),
+          content: '',
+        },
+      };
+    }
     const effectiveLimit = input.limit ?? DEFAULT_READ_LINE_LIMIT;
     const endLine = startLine + effectiveLimit;
     const slice = lines.slice(startLine, endLine);
@@ -2213,6 +2232,9 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleWrite(input: WriteInput): Promise<ToolResult> {
+    if (LONE_SURROGATE.test(input.content)) {
+      return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store.' };
+    }
     const { mount, relativePath } = this.parsePath(input.path);
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
@@ -2225,18 +2247,20 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
-    const materializeError = await this.withMount(mount, async () => {
-      await this.settleBeforeMutation(mount, relativePath);
-      const blobHash = store.storeBlob(buffer, 'text/plain');
-      return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength });
-    });
-    if (materializeError) {
-      return {
-        success: false,
-        error: `Wrote to Chronicle but failed to materialize "${input.path}" to disk: ${materializeError}. Downstream agents will not see this change until the next materialize call.`,
-        isError: true,
-      };
+    let committed = false;
+    let refused: string | null;
+    try {
+      refused = await this.withMount(mount, async () => {
+        await this.settleBeforeMutation(mount, relativePath);
+        const blobHash = store.storeBlob(buffer, 'text/plain');
+        return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength },
+          () => { committed = true; });
+      });
+    } catch (error) {
+      if (!committed) throw error;
+      return storedButUnfinished('write', input.path, { threw: error instanceof Error ? error.message : String(error) });
     }
+    if (refused !== null) return storedButUnfinished('write', input.path, { refused });
 
     return {
       success: true,
@@ -2249,71 +2273,110 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleEdit(input: EditInput): Promise<ToolResult> {
+    // Refused before anything is read: an empty oldString matches between
+    // every character, and UTF-8 can't store a lone surrogate.
+    if (input.oldString === '') {
+      return { success: false, isError: true, error: 'The edit did nothing: "oldString" is empty, and an empty string matches between every character. Give the text to replace.' };
+    }
+    for (const field of ['oldString', 'newString'] as const) {
+      if (LONE_SURROGATE.test(input[field])) {
+        return { success: false, isError: true, error: `The edit did nothing: "${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store.` };
+      }
+    }
     const { mount, relativePath } = this.parsePath(input.path);
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
 
     const store = this.getStore();
-    return this.withMount(mount, async (): Promise<ToolResult> => {
-      const report = await this.ensureSynced(mount, relativePath);
-      await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
+    let committed = false;
+    try {
+      return await this.withMount(mount, async (): Promise<ToolResult> => {
+        // The edit applies to the path as disk holds it now: a change on disk
+        // the store hasn't taken is taken in first, by the rule a listing
+        // uses. A write doesn't do this, since it replaces the whole file.
+        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+        const report = pass.reports.get(relativePath);
+        const tookDisk = pass.ops.some((op) => op.path === relativePath && op.op === 'modified');
+        const fromDisk = tookDisk
+          ? ' Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.'
+          : '';
+        await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
 
-      const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) {
-        return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
-      }
-
-      const blob = store.getBlob(entry.blobHash);
-      if (!blob) {
-        return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
-      }
-
-      let content = blob.toString('utf-8');
-
-      // Validate uniqueness
-      if (!input.replaceAll) {
-        const count = content.split(input.oldString).length - 1;
-        if (count === 0) {
-          return { success: false, error: `String not found in ${input.path}`, isError: true };
+        const entry = store.treeGet(mount.treeStateId, relativePath);
+        if (!entry) {
+          return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
         }
-        if (count > 1) {
+
+        const blob = store.getBlob(entry.blobHash);
+        if (!blob) {
+          return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
+        }
+        // Decoding would turn each invalid sequence into U+FFFD, and writing
+        // the text back would change bytes the edit never named.
+        if (!isUtf8(blob)) {
           return {
             success: false,
-            error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.`,
             isError: true,
+            error: `The edit did nothing: ${input.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. A write replaces the whole file, as UTF-8, if that's what you want.${fromDisk}`,
           };
         }
-      }
 
-      content = input.replaceAll
-        ? content.replaceAll(input.oldString, input.newString)
-        : content.replace(input.oldString, input.newString);
+        let content = blob.toString('utf-8');
 
-      const newBuffer = Buffer.from(content, 'utf-8');
-      const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
-      const materializeError = await this.commitToolChange(mount, relativePath, {
-        kind: 'set',
-        blobHash: newBlobHash,
-        size: newBuffer.byteLength,
-        mode: entry.mode,
-      });
-      if (materializeError) {
-        return {
-          success: false,
-          error: `Edited Chronicle but failed to materialize "${input.path}" to disk: ${materializeError}. Downstream agents will not see this change until the next materialize call.`,
-          isError: true,
-        };
-      }
+        // Validate uniqueness
+        if (!input.replaceAll) {
+          const count = content.split(input.oldString).length - 1;
+          if (count === 0) {
+            return { success: false, error: `String not found in ${input.path}.${fromDisk}`, isError: true };
+          }
+          if (count > 1) {
+            return {
+              success: false,
+              error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.${fromDisk}`,
+              isError: true,
+            };
+          }
+        }
 
-      return {
-        success: true,
-        data: {
-          path: input.path,
+        // A replacer function, so that the new text goes in as given: in a
+        // replacement string, $&, $$, $' and $` are patterns.
+        content = input.replaceAll
+          ? content.replaceAll(input.oldString, () => input.newString)
+          : content.replace(input.oldString, () => input.newString);
+
+        const newBuffer = Buffer.from(content, 'utf-8');
+        const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
+        const refused = await this.commitToolChange(mount, relativePath, {
+          kind: 'set',
+          blobHash: newBlobHash,
           size: newBuffer.byteLength,
-        },
-      };
-    });
+          mode: entry.mode,
+        }, () => { committed = true; });
+        if (refused !== null) return storedButUnfinished('edit', input.path, { refused });
+
+        // A mount that doesn't push keeps a conflict until materialize or
+        // sync settles it, so the edit says so.
+        const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
+        const notes = [
+          ...(tookDisk ? ['Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and the edit applied to that text.'] : []),
+          ...(conflict !== null
+            ? [`The path is in conflict with disk (${conflict}): the edit is in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.`]
+            : []),
+        ];
+        return {
+          success: true,
+          data: {
+            path: input.path,
+            size: newBuffer.byteLength,
+            ...(notes.length > 0 ? { note: notes.join(' ') } : {}),
+          },
+        };
+      });
+    } catch (error) {
+      if (!committed) throw error;
+      return storedButUnfinished('edit', input.path, { threw: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
@@ -2323,28 +2386,28 @@ export class WorkspaceModule implements Module {
     }
 
     const store = this.getStore();
-    return this.withMount(mount, async (): Promise<ToolResult> => {
-      const report = await this.ensureSynced(mount, relativePath);
-      await this.settleBeforeMutation(mount, relativePath);
-      const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) {
-        return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
-      }
+    let committed = false;
+    try {
+      return await this.withMount(mount, async (): Promise<ToolResult> => {
+        const report = await this.ensureSynced(mount, relativePath);
+        await this.settleBeforeMutation(mount, relativePath);
+        const entry = store.treeGet(mount.treeStateId, relativePath);
+        if (!entry) {
+          return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
+        }
 
-      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash });
-      if (materializeError) {
-        return {
-          success: false,
-          error: `Removed from Chronicle but did not unlink "${input.path}" from disk: ${materializeError}. ` +
-            'The disk copy stays (ls shows its state) until materialize with applyDeletions removes it.',
-          isError: true,
-        };
-      }
+        const refused = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash },
+          () => { committed = true; });
+        if (refused !== null) return storedButUnfinished('delete', input.path, { refused });
 
-      // Its whole receipt is what it changed: kept in the stub if the guard
-      // withholds the result (agent-framework #277).
-      return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
-    });
+        // Its whole receipt is what it changed: kept in the stub if the guard
+        // withholds the result (agent-framework #277).
+        return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
+      });
+    } catch (error) {
+      if (!committed) throw error;
+      return storedButUnfinished('delete', input.path, { threw: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   private async handleLs(input: LsInput): Promise<ToolResult> {
@@ -2447,7 +2510,8 @@ export class WorkspaceModule implements Module {
     try {
       regex = new RegExp(input.pattern);
     } catch (e) {
-      return { success: false, error: `Invalid regex: ${input.pattern}`, isError: true };
+      // The parser's reason says where the pattern goes wrong.
+      return { success: false, error: `The grep did nothing: ${e instanceof Error ? e.message : String(e)}.`, isError: true };
     }
 
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
@@ -2464,7 +2528,7 @@ export class WorkspaceModule implements Module {
     const incomplete: Array<{ path: string; reason: string }> = [];
 
     const search = (content: string): GrepMatch[] => {
-      const lines = content.split('\n');
+      const lines = linesOf(content);
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -3180,6 +3244,98 @@ function stateView(report: PathReport): Record<string, unknown> {
 // ==========================================================================
 // Utilities
 // ==========================================================================
+
+/** A lone UTF-16 surrogate, which UTF-8 can't store: in `u` mode, a pair is one code point. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/**
+ * The answer to a write, edit or delete that the workspace stored but
+ * couldn't finish: its push to disk was refused, or what follows the tree
+ * entry threw. It stays an error, since part of the call failed, but it leads
+ * with what the caller must know before acting on it: the change is stored,
+ * and sending it again could apply it twice. `inChronicle` lets a script tell
+ * it from a call that changed nothing, as writeBinary's answer does.
+ */
+function storedButUnfinished(
+  tool: 'write' | 'edit' | 'delete',
+  path: string,
+  outcome: { refused: string } | { threw: string },
+): ToolResult {
+  const change = tool === 'delete' ? 'deletion' : tool;
+  const stored = `The ${change} of "${path}" is stored in the workspace, so don't send it again`
+    + (tool === 'edit' ? ': a second edit can apply the change twice' : '');
+  const rest = 'refused' in outcome
+    ? `. Its push to disk was refused: ${outcome.refused}. ` + (tool === 'delete'
+      ? 'Until materialize with applyDeletions removes it, disk keeps its copy (ls shows its state).'
+      : 'Until materialize puts it there, disk doesn\'t have it.')
+    : `. The rest of the call failed: ${outcome.threw}.`;
+  return { success: false, isError: true, error: stored + rest, data: { inChronicle: true, path } };
+}
+
+/**
+ * A text's lines, as read and grep number them: a final line end ends the
+ * last line rather than starting an empty one, so "a\nb\n" is two lines,
+ * and an empty text has none.
+ */
+function linesOf(content: string): string[] {
+  const lines = content.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+/**
+ * The least each tool's whole-number fields may be, beside their schemas,
+ * whose type (membrane's ToolParameter) has no `minimum`.
+ */
+const INPUT_MINIMUMS: Record<string, Record<string, number>> = {
+  read: { offset: 1, limit: 1, offsetChars: 0, limitChars: 1 },
+  grep: { contextBefore: 0, contextAfter: 0 },
+};
+
+/**
+ * Why a tool call's input doesn't fit its tool's schema, or null when it does:
+ * an object, each required field present, and each field its schema calls a
+ * string, a boolean or an integer of that type, an integer at least its
+ * minimum. The workspace's schemas use no other types. Without it, an edit
+ * missing `newString` wrote the word "undefined", and an offset of 1.5
+ * numbered lines 1.5, 2.5 and on. A field the schema doesn't describe is left
+ * to its handler.
+ */
+function inputProblem(
+  schema: { properties?: Record<string, unknown>; required?: string[] },
+  input: unknown,
+  minimums: Record<string, number> = {},
+): string | null {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return 'its input must be an object of the fields its schema lists';
+  }
+  const fields = input as Record<string, unknown>;
+  for (const name of schema.required ?? []) {
+    if (fields[name] === undefined) return `"${name}" is required`;
+  }
+  for (const [name, value] of Object.entries(fields)) {
+    const type = (schema.properties?.[name] as { type?: string } | undefined)?.type;
+    if (value === undefined || type === undefined) continue;
+    const minimum = minimums[name];
+    const fits = type === 'string' ? typeof value === 'string'
+      : type === 'boolean' ? typeof value === 'boolean'
+      : type === 'integer'
+        ? Number.isSafeInteger(value) && (minimum === undefined || (value as number) >= minimum)
+        : true;
+    if (!fits) {
+      const wanted = type === 'string' ? 'a string'
+        : type === 'boolean' ? 'true or false'
+        : minimum === undefined ? 'a whole number' : `a whole number of at least ${minimum}`;
+      const got = value === null ? 'null'
+        : typeof value === 'number' ? String(value)
+        : Array.isArray(value) ? 'an array'
+        : typeof value === 'object' ? 'an object'
+        : `a ${typeof value}`;
+      return `"${name}" must be ${wanted}, not ${got}`;
+    }
+  }
+  return null;
+}
 
 /**
  * Convert a glob pattern to a RegExp.

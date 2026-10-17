@@ -499,7 +499,7 @@ describe('workspace deletes', () => {
 
     env.writeDisk('b.txt', 'edited in the shell');
     const error = await refused(m, 'delete', { path: 'work/b.txt' });
-    assert.match(error, /did not unlink/);
+    assert.match(error, /^The deletion of "work\/b\.txt" is stored in the workspace, so don't send it again\. Its push to disk was refused: /);
     assert.equal(env.readDisk('b.txt'), 'edited in the shell', 'the shell edit survives');
   });
 });

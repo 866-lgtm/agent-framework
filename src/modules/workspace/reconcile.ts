@@ -341,6 +341,24 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
 }
 
 /**
+ * What's in the way, and the way out, when disk's shape keeps a file from
+ * being written at its path: no push writes a file over a directory, or below
+ * a path that's a file on disk, forced or not (`writeContained`). Null for any
+ * other reason, which says its own way out.
+ */
+function inTheWay(reason: string | undefined): string | null {
+  if (reason === 'a directory') {
+    return 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
+      'move or remove that directory on disk and materialize again, or write the file under another path';
+  }
+  if (reason === 'a parent path is not a directory') {
+    return 'disk has a file where this path needs a directory, and no push writes below one, forced or not — ' +
+      'move or remove that file on disk and materialize again, or write the file under another path';
+  }
+  return null;
+}
+
+/**
  * The synchronous precondition of every workspace mutation: evidence owed a
  * barrier is made durable first, and an adoption left pending on the
  * selected branch is settled by the tree before the mutation changes it, and
@@ -1065,7 +1083,11 @@ export async function pushPaths(
     }
     if (v.state === 'unverified') {
       if (!opts.force) {
-        result.skipped.push({ path, reason: `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and materialize again, or pass force to overwrite it` });
+        result.skipped.push({
+          path,
+          reason: (s ? inTheWay(v.note) : null)
+            ?? `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and materialize again, or pass force to overwrite it`,
+        });
         continue;
       }
     }
@@ -1167,7 +1189,8 @@ export async function pushPaths(
         // exactly what it was, whatever kind that was.
         agreement.restore(mount.name, step.path, step.before);
         recorded = true;
-        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${failure.message}` });
+        const why = (step.kind === 'write' ? inTheWay(failure.message) : null) ?? failure.message;
+        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${why}` });
       } else {
         // No completion: the intent stays pending, and the next observation
         // resolves it from whatever disk then holds.
