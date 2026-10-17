@@ -8,7 +8,5 @@
   booleans and arrays other than MCP content arrays are still sent as JSON,
   and MCP content arrays as their blocks.
 
-  A `code_execution` script's tool function returns the same text, so it now
-  gets a string result as it is. A script that ran `json.loads` on such a
-  result to unquote it now gets an error unless the string itself is JSON.
-  `data: ''` is stored as no text, as `data: undefined` already was.
+  For a result without an error, `data: ''` is stored as no text, as
+  `data: undefined` already was.
