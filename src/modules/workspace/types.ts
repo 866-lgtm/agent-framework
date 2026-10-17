@@ -41,13 +41,15 @@ export interface MountConfig {
    */
   ignore?: string[];
   /**
-   * Whether to follow symlinks (default: false). Without it, a symlink is
-   * followed nowhere on a path: neither at the path itself nor among the
-   * directories on its way beneath the mount's root, wherever it leads, and
-   * such a path is refused with the way out (the path the link leads to, or
-   * this setting). A mount root that is itself a symlink is still the root.
-   * With it, a symlink on a path is followed while what it reaches stays
-   * inside the mount; a walk still descends into no symlinked directory.
+   * Whether to follow symlinks (default: false). Without it, no symlink on a
+   * path is followed: not one at the path itself, and not one among the
+   * directories on its way beneath the mount's root, wherever it leads. A path
+   * with a symlinked directory on its way is refused naming the link and where
+   * it leads; for a link to a directory inside the mount, the refusal also
+   * names the path through that directory to use instead. A mount root that is
+   * itself a symlink is still the root. With it, a symlink on a path is
+   * followed while what it reaches stays inside the mount. Either way, a
+   * listing or a sync's walk descends into no symlinked directory.
    */
   followSymlinks?: boolean;
   /** Maximum file size in bytes (default: 5MB) */

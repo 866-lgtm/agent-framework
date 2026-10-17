@@ -58,7 +58,7 @@ import {
   ROOT_REPLACED,
   type Walk,
   fingerprintVouches,
-  isLinkedPathReason,
+  isSymlinkRefusal,
   locateRoot,
   looksBinary,
   observePath,
@@ -1066,9 +1066,9 @@ export async function pushPaths(
     }
     if (v.state === 'unverified') {
       if (!opts.force) {
-        // A path through a symlink the mount doesn't follow gets no further
-        // with force, and its reason names its own way out.
-        const advice = v.note !== undefined && isLinkedPathReason(v.note) ? '' : ' — fix it and materialize again, or pass force to overwrite it';
+        // A symlink the mount doesn't follow, at the path or on its way, gets
+        // no further with force, and its reason says what way out there is.
+        const advice = v.note !== undefined && isSymlinkRefusal(v.note) ? '' : ' — fix it and materialize again, or pass force to overwrite it';
         result.skipped.push({ path, reason: `cannot verify disk copy (${v.note ?? 'not observed'})${advice}` });
         continue;
       }

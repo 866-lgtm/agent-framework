@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { NONBLOCK, coveredByIgnore, filesystemTrustsCtime, linkOnTheWay, locateRoot, parentOf } from './observe.js';
+import { NONBLOCK, coveredByIgnore, filesystemTrustsCtime, linkOnTheWay, linkReason, linkRefusal, locateRoot, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -127,6 +127,7 @@ export type WorkspaceReadErrorCode =
 /** Where in the open sequence a `WorkspaceReadError` originated (diagnostics). */
 export type WorkspaceReadStage =
   | 'parse'
+  | 'readlink'
   | 'lstat'
   | 'realpath_root'
   | 'open'
@@ -206,6 +207,19 @@ function startsWithBytes(buffer: Buffer, prefix: Buffer): boolean {
 
 function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
   return buffer.length > 0 && prefix.subarray(0, buffer.length).equals(buffer);
+}
+
+/**
+ * A disk reader's refusal for what linkOnTheWay found on a path's way: the
+ * link's reason, as the observations give it but spelled from the mount's
+ * name, or the walk's failure as a failure to read.
+ */
+async function linkReadError(mount: { config: { name: string; path: string } }, found: LinkFound, mountPrefixedPath: string): Promise<WorkspaceReadError> {
+  const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
+  const reason = await linkReason(mount.config.path, rootReal, found, `${mount.config.name}/`);
+  return 'link' in found
+    ? new WorkspaceReadError('symlink', `${mountPrefixedPath}: ${reason}`, 'readlink')
+    : new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${reason}`, 'readlink', found.code);
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -1581,13 +1595,12 @@ export class WorkspaceModule implements Module {
       }
     } catch (error) {
       if (tooLarge !== undefined) return { error: tooLarge };
-      // A directory, or a file that isn't regular (the reader's fstat check,
-      // which carries no errno), keeps this reader's own words.
-      if (error instanceof WorkspaceReadError && (error.code === 'directory'
-        || (error.code === 'not_found' && error.stage === 'fstat' && error.errno === undefined))) {
+      // A directory, or a file that isn't regular (the reader's refusal of
+      // one carries no errno), and a missing file keep this reader's words.
+      if (error instanceof WorkspaceReadError && (error.code === 'directory' || (error.code === 'not_found' && error.errno === undefined))) {
         return { error: `Not a file: ${mountPrefixedPath}` };
       }
-      if (error instanceof WorkspaceReadError && error.code === 'not_found' && error.errno === 'ENOENT') {
+      if (error instanceof WorkspaceReadError && error.code === 'not_found' && (error.errno === 'ENOENT' || error.errno === 'ENOTDIR')) {
         return { error: `File not found on disk: ${mountPrefixedPath}` };
       }
       return { error: error instanceof Error ? error.message : String(error) };
@@ -1682,19 +1695,23 @@ export class WorkspaceModule implements Module {
    *    among the directories on its way beneath the mount's root, as a
    *    `symlink`, wherever it leads (linkOnTheWay), before anything resolves it.
    * 1. `lstat` the lexical path — refuse directories; refuse a final-component
-   *    symlink when the mount does not `followSymlinks`.
+   *    symlink when the mount does not `followSymlinks`; refuse anything else
+   *    that isn't a regular file, such as a FIFO, without opening it.
    * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
    *    holds against a symlink swapped in between lstat and open; where it
-   *    doesn't (Windows), re-`lstat` after opening instead.
-   * 3. `realpath` both the mount root and the opened path and require canonical
-   *    containment — this is what catches an *intermediate* symlinked
-   *    directory escaping the mount, and a followed symlink whose target lands
-   *    outside, on every platform (junctions included).
+   *    doesn't (Windows), re-`lstat` after opening instead. `O_NONBLOCK`, so a
+   *    FIFO swapped in meanwhile doesn't wait for a writer.
+   * 3. `realpath` both the mount root and the opened path. On a mount that
+   *    does not `followSymlinks`, refuse it again for a symlinked directory on
+   *    its way, which catches one swapped in since step 0 (linkRefusal). Then
+   *    require canonical containment — this is what catches an *intermediate*
+   *    symlinked directory escaping the mount, and a followed symlink whose
+   *    target lands outside, on every platform (junctions included).
    * 4. Confirm the descriptor and the canonical path are the same inode.
    *
-   * `inspect` runs right after the descriptor is stat'd and before the
-   * containment work, so callers can impose size policy in the same order the
-   * image reader always has. The returned handle is the caller's to close.
+   * `inspect` runs last, after the boundary's checks, so a caller's own check
+   * of the file, such as a size limit, never answers for a file the boundary
+   * refuses. The returned handle is the caller's to close.
    */
   private async openContainedFile(
     mount: MountState,
@@ -1706,17 +1723,13 @@ export class WorkspaceModule implements Module {
     const follow = mount.config.followSymlinks === true;
     const useNoFollow = !follow && typeof fsConstants.O_NOFOLLOW === 'number';
 
-    // Before anything resolves the path: a mount that doesn't follow symlinks
-    // goes through none among the directories on the way, wherever it leads.
-    const link = await linkOnTheWay({ root: mount.config.path, followSymlinks: follow }, parentOf(relativePath));
-    if (link !== null) {
-      throw new WorkspaceReadError(
-        'symlink',
-        `${mountPrefixedPath} goes through a symlink at "${mount.config.name}/${link}", which this mount does not follow: `
-          + 'use the path it leads to, or set followSymlinks: true on the mount',
-        'lstat',
-      );
-    }
+    // Before anything resolves the path, so a link's own answer comes first: a
+    // mount that doesn't follow symlinks goes through none among the
+    // directories on the way, wherever it leads. Asked again of the path's
+    // resolution after the open, below.
+    const linkView = { root: mount.config.path, followSymlinks: follow };
+    const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
+    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath);
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -1734,6 +1747,10 @@ export class WorkspaceModule implements Module {
     if (fileInfo.isSymbolicLink() && !follow) {
       throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'lstat');
     }
+    if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
+      // A FIFO, socket or device is never opened.
+      throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'lstat');
+    }
 
     let realMountRoot: string;
     try {
@@ -1744,8 +1761,8 @@ export class WorkspaceModule implements Module {
 
     let handle: Awaited<ReturnType<typeof open>>;
     try {
-      // O_NONBLOCK: a FIFO opens at once instead of waiting for a writer, and
-      // the regular-file check below refuses it.
+      // O_NONBLOCK: a FIFO swapped in since the lstat opens at once instead of
+      // waiting for a writer, and the regular-file check below refuses it.
       handle = await open(lexicalPath, fsConstants.O_RDONLY | NONBLOCK | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
       const code = errnoOf(err);
@@ -1775,9 +1792,8 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
       }
       if (!fileStat.isFile()) {
-        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
+        throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'fstat');
       }
-      inspect?.(fileStat);
 
       if (!follow && !useNoFollow) {
         let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
@@ -1806,6 +1822,11 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('not_found', `Unable to resolve file: ${mountPrefixedPath}`, 'realpath', code);
       }
 
+      // A directory swapped for a link since the walk above is caught here, by
+      // what the path resolved to after the open.
+      const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
+      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath);
+
       if (!isContainedPath(realMountRoot, realFilePath)) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
@@ -1824,6 +1845,9 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat');
       }
 
+      // The caller's checks of the file, such as a size limit, come after the
+      // boundary's, so they never answer for a file the boundary refuses.
+      inspect?.(fileStat);
       return { handle, fileStat, realFilePath };
     } catch (err) {
       await handle.close();

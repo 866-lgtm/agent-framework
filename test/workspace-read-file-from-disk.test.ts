@@ -108,6 +108,9 @@ test('readBinaryFromDisk answers a file, a missing file, a directory and a file 
   assert.deepEqual([...read.data], [0, 1, 2, 3]);
   assert.equal(read.absolutePath, join(mountDir, 'a.bin'));
   assert.deepEqual(await workspace.readBinaryFromDisk('work/missing.bin'), { error: 'File not found on disk: work/missing.bin' });
+  // A path through a file is missing too, not the system's message with the
+  // absolute path.
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/a.bin/x'), { error: 'File not found on disk: work/a.bin/x' });
   assert.deepEqual(await workspace.readBinaryFromDisk('work/dir'), { error: 'Not a file: work/dir' });
   assert.deepEqual(await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 3 }), { error: 'File too large: 4 > 3 bytes' });
   assert.ok('data' in (await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 4 })), 'a file of exactly maxBytes is read');
@@ -121,14 +124,17 @@ test('a FIFO is refused at once by each disk reader, without waiting for a write
   const { mountDir, workspace } = setup(t);
   const fifo = join(mountDir, 'pipe');
   execFileSync('mkfifo', [fifo]);
+  // The bound only tells an answer from a wait for a writer that never
+  // comes, so it's generous: a slow runner answers well inside it.
   const within = <T>(p: Promise<T>, what: string): Promise<T> => Promise.race([
     p,
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} still waits on the FIFO after 2 s`)), 2000).unref()),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} still waits on the FIFO after 10 s`)), 10_000).unref()),
   ]);
   try {
-    await expectRefusal(within(workspace.readFileFromDisk('work/pipe'), 'readFileFromDisk'), 'not_found');
+    const err = await expectRefusal(within(workspace.readFileFromDisk('work/pipe'), 'readFileFromDisk'), 'not_found');
+    assert.equal(err.message, 'Not a regular file: work/pipe');
     const image = await within(workspace.handleToolCall({ id: 'f', name: 'read_image', input: { path: 'work/pipe' } }), 'read_image');
-    assert.equal(image.success, false);
+    assert.equal(image.error, 'Unable to read image file: work/pipe');
     assert.deepEqual(await within(workspace.readBinaryFromDisk('work/pipe'), 'readBinaryFromDisk'), { error: 'Not a file: work/pipe' });
   } finally {
     // Release any open still waiting for a writer, so a failure ends the

@@ -7,14 +7,16 @@
  * file under another path than the one it named: a deletion's push unlinked
  * the file behind the link, a write created or overwrote one there, and a
  * sync took its bytes in. A link among the parents that leads out of the
- * mount was refused before as well, and now gets the same answer. A mount
- * that follows links keeps following an inside one, and a root that is
- * itself a link is still the root.
+ * mount was refused before as well, and now gets the link's own answer. The
+ * refusal names the link and where it leads, and only for a link to a
+ * directory inside the mount does it offer a way out. A mount that follows
+ * links keeps following an inside one, and a root that is itself a link is
+ * still the root.
  */
 
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
@@ -25,14 +27,28 @@ import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
 const TREE = 'workspace/work/tree';
-const LINKED = /goes through a symlink at "l", which this mount does not follow: use the path it leads to, or set followSymlinks: true on the mount/;
+/** The refusal of a path through the link at "l", wherever it leads. */
+const LINKED = /"l" is a symlink(?: to "elsewhere"| leading outside the mount), which this mount does not follow/;
+
+/**
+ * The refusal of a path through the link at "l", exactly: for a link to
+ * `elsewhere/`, with `via`, the same path through that directory, to use
+ * instead; for one leading out of the mount, with no way out. `prefix`
+ * spells the paths as a disk reader does, from the mount's name.
+ */
+function linkedReason(target: 'inside' | 'outside', via: string, prefix = ''): string {
+  return target === 'inside'
+    ? `"${prefix}l" is a symlink to "${prefix}elsewhere", which this mount does not follow: use "${prefix}${via}", or the mount's host can set followSymlinks: true`
+    : `"${prefix}l" is a symlink leading outside the mount, which this mount does not follow`;
+}
 
 class Env {
   readonly root = mkdtempSync(join(tmpdir(), 'af-ws-parent-link-'));
   readonly dir = join(this.root, 'work');
   store: JsStore;
 
-  constructor(t: TestContext) {
+  constructor(t: TestContext, dir?: string) {
+    if (dir !== undefined) this.dir = dir;
     mkdirSync(this.dir, { recursive: true });
     this.store = JsStore.openOrCreate({ path: join(this.root, 'ws.chronicle') });
     t.after(async () => {
@@ -47,6 +63,10 @@ class Env {
     await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
     t.after(() => m.stop().catch(() => {}));
     return m;
+  }
+
+  view(): MountView {
+    return { root: this.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [] };
   }
 
   writeDisk(path: string, content: string): void {
@@ -75,16 +95,16 @@ async function call(m: WorkspaceModule, name: string, input: Record<string, unkn
   return res.data;
 }
 
-/** Run `fn` with node:fs/promises' realpath answering `respell(answer)`, as the code under test sees it. */
-async function withRealpath<T>(respell: (real: string) => string, fn: () => Promise<T>): Promise<T> {
-  const fsp = createRequire(import.meta.url)('node:fs/promises') as { realpath: (...args: any[]) => Promise<string> };
-  const original = fsp.realpath;
-  fsp.realpath = async (...args: any[]) => respell(await original(...args));
+/** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
+async function withFsPromises<T>(name: 'realpath' | 'readlink' | 'lstat', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+  const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+  const original = fsp[name]!;
+  fsp[name] = make(original);
   syncBuiltinESMExports();
   try {
     return await fn();
   } finally {
-    fsp.realpath = original;
+    fsp[name] = original;
     syncBuiltinESMExports();
   }
 }
@@ -95,6 +115,11 @@ function skippedReason(data: any, path: string): string {
     .find((s) => s.path === path || s.reason.startsWith(`${path}: `));
   assert.ok(entry, `nothing skipped for ${path}: ${JSON.stringify(data)}`);
   return entry.reason;
+}
+
+/** An observation's kind and reason, for an assertion's message. */
+function shown(v: { kind: string; reason?: string }): string {
+  return `${v.kind}${v.reason === undefined ? '' : `: ${v.reason}`}`;
 }
 
 describe('a symlinked parent on a mount that does not follow symlinks', () => {
@@ -128,7 +153,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       }
     });
 
-    test(`an edit is not written through it, forced or not, and the unforced refusal doesn't offer force (${target})`, async (t) => {
+    test(`an edit is not written through it, forced or not, and the unforced refusal names the link and offers no force (${target})`, async (t) => {
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
       const m = await env.open(t);
@@ -136,8 +161,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       await call(m, 'write', { path: 'work/l/x.txt', content: 'v2\n' });
       const away = env.swapLForLink(target, 'v1\n');
       const unforced = skippedReason(await call(m, 'materialize', { path: 'work/l/x.txt' }), 'l/x.txt');
-      assert.match(unforced, LINKED);
-      assert.doesNotMatch(unforced, /pass force/, 'force never takes a path through a link this mount does not follow');
+      assert.equal(unforced, `l/x.txt: cannot verify disk copy (${linkedReason(target, 'elsewhere/x.txt')})`);
       const forced = await call(m, 'materialize', { path: 'work/l/x.txt', force: true });
       assert.deepEqual(forced.materialized, []);
       assert.match(skippedReason(forced, 'l/x.txt'), LINKED);
@@ -175,24 +199,21 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(env.store.treeGet(TREE, 'l/x.txt')?.blobHash, before, 'history holds what it held');
     });
 
-    test(`readFileFromDisk and read_image refuse a path through it as a symlink, naming the way out (${target})`, async (t) => {
+    test(`readFileFromDisk and read_image refuse a path through it as a symlink, naming the link and where it leads (${target})`, async (t) => {
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
       const m = await env.open(t);
-      env.swapLForLink(target);
-      const linked = /goes through a symlink at "work\/l", which this mount does not follow: use the path it leads to, or set followSymlinks: true on the mount/;
+      const away = env.swapLForLink(target);
       await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
         assert.equal(err.code, 'symlink');
-        assert.match(err.message, linked);
-        assert.ok(!err.message.includes(env.root), 'the refusal names no absolute path');
+        assert.equal(err.message, `work/l/x.txt: ${linkedReason(target, 'elsewhere/x.txt', 'work/')}`);
         return true;
       });
-      writeFileSync(join(dirname(realpathSync(join(env.dir, 'l', 'x.txt'))), 'img.png'), 'not read');
+      writeFileSync(join(away, 'img.png'), 'not read');
       const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
       assert.equal(image.success, false);
-      assert.match(String(image.error), linked);
-      assert.ok(!String(image.error).includes(env.root), 'the refusal names no absolute path');
+      assert.equal(image.error, `work/l/img.png: ${linkedReason(target, 'elsewhere/img.png', 'work/')}`);
     });
 
     test(`a listing of the directory the link stands at says so instead of walking it (${target})`, async (t) => {
@@ -202,30 +223,45 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       env.swapLForLink(target);
       const data = await call(m, 'ls', { path: 'work/l', recursive: true });
       assert.deepEqual(data.entries, []);
-      assert.equal(data.incomplete.length, 1);
-      assert.equal(data.incomplete[0].path, 'l');
-      assert.match(data.incomplete[0].reason, LINKED);
+      assert.deepEqual(data.incomplete, [{ path: 'l', reason: linkedReason(target, 'elsewhere') }]);
     });
-  }
 
-  for (const target of ['inside', 'outside'] as const) {
-    test(`each primitive that finds a parent refuses it with the one reason: a directory check, an observation, a read and an absence proof (${target})`, async (t) => {
+    test(`each primitive that finds a parent refuses it with the link's reason, whatever lies behind it (${target})`, async (t) => {
       // Each check sits at the point of use, so each is asked here directly:
       // through the tools, an earlier one usually answers first.
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
-      env.swapLForLink(target);
-      const view: MountView = { root: env.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [] };
+      const away = env.swapLForLink(target);
+      mkdirSync(join(away, 'sub'));
+      const view = env.view();
       const rootReal = realpathSync(env.dir);
-      const exactly = /^the path goes through a symlink at "l", which this mount does not follow: use the path it leads to, or set followSymlinks: true on the mount$/;
       const dir = await checkDir(view, rootReal, 'l');
-      assert.ok(dir.kind === 'unobserved' && exactly.test(dir.reason), `checkDir: ${JSON.stringify(dir)}`);
+      assert.equal(shown(dir), `unobserved: ${linkedReason(target, 'elsewhere')}`, 'checkDir');
       const seen = await observePath(view, rootReal, 'l/x.txt');
-      assert.ok(seen.kind === 'unobserved' && exactly.test(seen.reason), `observePath: ${JSON.stringify(seen)}`);
+      assert.equal(shown(seen), `unobserved: ${linkedReason(target, 'elsewhere/x.txt')}`, 'observePath');
       const read = await readPath(view, rootReal, 'l/x.txt', 1 << 20);
-      assert.ok(read.kind === 'unobserved' && exactly.test(read.reason), `readPath: ${JSON.stringify({ ...read, bytes: undefined })}`);
+      assert.equal(shown(read), `unobserved: ${linkedReason(target, 'elsewhere/x.txt')}`, 'readPath');
+      const readDir = await readPath(view, rootReal, 'l/sub', 1 << 20);
+      assert.equal(shown(readDir), `unobserved: ${linkedReason(target, 'elsewhere/sub')}`, 'readPath of a directory behind the link');
       const absent = await confirmAbsent(view, rootReal, 'l/nothing.txt');
-      assert.ok(typeof absent === 'string' && exactly.test(absent), `confirmAbsent: ${JSON.stringify(absent)}`);
+      assert.equal(absent, linkedReason(target, 'elsewhere/nothing.txt'), 'confirmAbsent');
+    });
+
+    test(`a ".." after a name that isn't there hides no link beyond it (${target})`, async (t) => {
+      const env = new Env(t);
+      env.writeDisk('l/x.txt', 'v1\n');
+      const m = await env.open(t);
+      env.swapLForLink(target);
+      const expected = `work/nope/../l/x.txt: ${linkedReason(target, 'elsewhere/x.txt', 'work/')}`;
+      await assert.rejects(m.readFileFromDisk('work/nope/../l/x.txt'), (err: unknown) => {
+        assert.ok(err instanceof WorkspaceReadError, String(err));
+        assert.equal(err.code, 'symlink');
+        assert.equal(err.message, expected);
+        return true;
+      });
+      assert.deepEqual(await m.readBinaryFromDisk('work/nope/../l/x.txt'), { error: expected });
+      const seen = await observePath(env.view(), realpathSync(env.dir), 'nope/../l/x.txt');
+      assert.equal(shown(seen), `unobserved: ${linkedReason(target, 'elsewhere/x.txt')}`, 'observePath');
     });
   }
 
@@ -237,18 +273,102 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     // still names the same file.
     const env = new Env(t);
     env.writeDisk('l/x.txt', 'v1\n');
-    const view: MountView = { root: env.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [] };
+    const view = env.view();
     const rootReal = realpathSync(env.dir);
     const respell = (real: string) => (real.startsWith(rootReal + sep) ? `${rootReal}${sep}.${real.slice(rootReal.length)}` : real);
-    const reason = (v: { kind: string; reason?: string }) => `${v.kind}${v.reason === undefined ? '' : `: ${v.reason}`}`;
-    await withRealpath(respell, async () => {
-      const dir = await checkDir(view, rootReal, 'l');
-      assert.equal(dir.kind, 'checked', `checkDir: ${reason(dir)}`);
-      const seen = await observePath(view, rootReal, 'l/x.txt');
-      assert.equal(seen.kind, 'file', `observePath: ${reason(seen)}`);
-      const read = await readPath(view, rootReal, 'l/x.txt', 1 << 20);
-      assert.equal(read.kind, 'read', `readPath: ${reason(read)}`);
+    await withFsPromises('realpath', (realpath) => async (...args: any[]) => respell(await realpath(...args)), async () => {
+      assert.equal((await checkDir(view, rootReal, 'l')).kind, 'checked', 'checkDir');
+      assert.equal((await observePath(view, rootReal, 'l/x.txt')).kind, 'file', 'observePath');
+      assert.equal((await readPath(view, rootReal, 'l/x.txt', 1 << 20)).kind, 'read', 'readPath');
     });
+  });
+
+  test("a directory on the way the walk can't ask whether it's a symlink refuses the path, rather than letting a link beneath it through", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('elsewhere/x.txt', 'behind the link\n');
+    mkdirSync(join(env.dir, 'a'));
+    symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'a', 'l'));
+    const m = await env.open(t);
+    const eio = Object.assign(new Error('EIO: i/o error, readlink'), { code: 'EIO' });
+    await withFsPromises('readlink', (readlink) => async (path: string, ...rest: unknown[]) => {
+      if (String(path).endsWith(`${sep}a`)) throw eio;
+      return readlink(path, ...rest);
+    }, async () => {
+      await assert.rejects(m.readFileFromDisk('work/a/l/x.txt'), (err: unknown) => {
+        assert.ok(err instanceof WorkspaceReadError, String(err));
+        assert.equal(err.code, 'not_found');
+        assert.equal(err.errno, 'EIO');
+        assert.equal(err.message, 'Unable to read file: work/a/l/x.txt: cannot tell whether "work/a" is a symlink (EIO)');
+        return true;
+      });
+      const dir = await checkDir(env.view(), realpathSync(env.dir), 'a/l');
+      assert.equal(shown(dir), 'unobserved: cannot tell whether "a" is a symlink (EIO)');
+    });
+  });
+
+  test('a symlink on the way that leads nowhere, or loops, is named as one wherever it is met', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('x.txt', 'v1\n');
+    const m = await env.open(t);
+    await call(m, 'write', { path: 'work/gone/new.txt', content: 'new\n' });
+    await call(m, 'write', { path: 'work/loop/new.txt', content: 'new\n' });
+    symlinkSync(join(env.dir, 'nothing-here'), join(env.dir, 'gone'));
+    symlinkSync('loop', join(env.dir, 'loop'));
+    for (const name of ['gone', 'loop']) {
+      const reason = `"${name}" is a symlink, which this mount does not follow`;
+      const unforced = await call(m, 'materialize', { path: `work/${name}/new.txt` });
+      assert.equal(skippedReason(unforced, `${name}/new.txt`), `${name}/new.txt: cannot verify disk copy (${reason})`, `${name}, unforced`);
+      // Forced, the push makes the directories on the way: the link in the
+      // way is named there too, not taken for a file.
+      const forced = await call(m, 'materialize', { path: `work/${name}/new.txt`, force: true });
+      assert.equal(skippedReason(forced, `${name}/new.txt`), `${name}/new.txt: not written: ${reason}`, `${name}, forced`);
+      await assert.rejects(m.readFileFromDisk(`work/${name}/x.txt`), (err: unknown) => {
+        assert.ok(err instanceof WorkspaceReadError, String(err));
+        assert.equal(err.message, `work/${name}/x.txt: "work/${name}" is a symlink, which this mount does not follow`);
+        return true;
+      });
+    }
+    assert.equal(existsSync(join(env.dir, 'nothing-here')), false, 'nothing was made where the link leads');
+  });
+
+  test('a directory swapped for a link after the walk is caught by the reader after the open', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('l/x.txt', 'v1\n');
+    env.writeDisk('elsewhere/x.txt', 'behind the link\n');
+    const m = await env.open(t);
+    let swapped = false;
+    await withFsPromises('lstat', (lstat) => async (path: string, ...rest: unknown[]) => {
+      // The reader's lstat of the path comes after its walk: the directory
+      // becomes a link between the two.
+      if (!swapped && String(path) === join(env.dir, 'l', 'x.txt')) {
+        swapped = true;
+        renameSync(join(env.dir, 'l'), join(env.dir, 'l-was'));
+        symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'l'));
+      }
+      return lstat(path, ...rest);
+    }, async () => {
+      await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
+        assert.ok(err instanceof WorkspaceReadError, String(err));
+        assert.equal(err.code, 'symlink');
+        assert.equal(err.message, `work/l/x.txt: ${linkedReason('inside', 'elsewhere/x.txt', 'work/')}`);
+        return true;
+      });
+    });
+    assert.equal(swapped, true);
+  });
+
+  test('a symlink at the path itself gets no advice to pass force, which a forced push refuses too', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('f.txt', 'v1\n');
+    env.writeDisk('elsewhere/f.txt', 'behind the link\n');
+    const m = await env.open(t);
+    await call(m, 'read', { path: 'work/f.txt' });
+    await call(m, 'write', { path: 'work/f.txt', content: 'v2\n' });
+    rmSync(join(env.dir, 'f.txt'));
+    symlinkSync(join(env.dir, 'elsewhere', 'f.txt'), join(env.dir, 'f.txt'));
+    assert.equal(skippedReason(await call(m, 'materialize', { path: 'work/f.txt' }), 'f.txt'), 'f.txt: cannot verify disk copy (a symlink, which this mount does not follow)');
+    assert.match(skippedReason(await call(m, 'materialize', { path: 'work/f.txt', force: true }), 'f.txt'), /a symlink, which this mount does not follow/);
+    assert.equal(readFileSync(join(env.dir, 'elsewhere', 'f.txt'), 'utf8'), 'behind the link\n');
   });
 
   test('readBinaryFromDisk reads nothing through a link: the file itself leading out, a parent leading out, or a parent inside', async (t) => {
@@ -261,12 +381,11 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     symlinkSync(outside, join(env.dir, 'out'));
     symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'in'));
     const m = await env.open(t);
-    for (const path of ['work/file-link.txt', 'work/out/secret.txt', 'work/in/x.txt']) {
-      const res = await m.readBinaryFromDisk(path);
-      assert.ok('error' in res, `${path} returned bytes: ${'data' in res ? res.data.toString() : ''}`);
-      assert.match(res.error, /symlink/i, path);
-      assert.ok(!res.error.includes(env.root), `${path}: the error names no absolute path`);
-    }
+    assert.deepEqual(await m.readBinaryFromDisk('work/file-link.txt'), { error: 'Symlinks are not allowed: work/file-link.txt' });
+    assert.deepEqual(await m.readBinaryFromDisk('work/out/secret.txt'), { error: 'work/out/secret.txt: "work/out" is a symlink leading outside the mount, which this mount does not follow' });
+    assert.deepEqual(await m.readBinaryFromDisk('work/in/x.txt'), {
+      error: 'work/in/x.txt: "work/in" is a symlink to "work/elsewhere", which this mount does not follow: use "work/elsewhere/x.txt", or the mount\'s host can set followSymlinks: true',
+    });
   });
 
   test('a regular parent directory is still read and written as before', async (t) => {
@@ -278,6 +397,21 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.deepEqual((await call(m, 'materialize', { path: 'work/l/x.txt' })).materialized.map((e: { path: string }) => e.path), ['l/x.txt']);
     assert.equal(readFileSync(join(env.dir, 'l/x.txt'), 'utf8'), 'v2\n');
     assert.equal((await m.readFileFromDisk('work/l/x.txt')).bytes.toString(), 'v2\n');
+  });
+});
+
+describe('a mount root that is itself a symlink', () => {
+  test('is the root, also where a path names it on its way back into the mount', async (t) => {
+    const holder = mkdtempSync(join(tmpdir(), 'af-ws-parent-link-root-'));
+    t.after(() => rmSync(holder, { recursive: true, force: true }));
+    mkdirSync(join(holder, 'real'));
+    symlinkSync(join(holder, 'real'), join(holder, 'm'));
+    const env = new Env(t, join(holder, 'm'));
+    env.writeDisk('d/x.txt', 'v1\n');
+    const m = await env.open(t);
+    assert.equal((await m.readFileFromDisk('work/d/x.txt')).bytes.toString(), 'v1\n');
+    assert.equal((await m.readFileFromDisk('work/../m/d/x.txt')).bytes.toString(), 'v1\n');
+    assert.equal((await call(m, 'read', { path: 'work/d/x.txt' })).content.includes('v1'), true);
   });
 });
 
@@ -297,5 +431,23 @@ describe('a mount that follows symlinks', () => {
     const m2 = await env2.open(t, { followSymlinks: true });
     env2.swapLForLink('outside');
     await assert.rejects(m2.readFileFromDisk('work/l/x.txt'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'escape');
+  });
+
+  test('readBinaryFromDisk reads through an inside link, and refuses one leading out before its size limit answers', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('l/x.txt', 'v1\n');
+    const m = await env.open(t, { followSymlinks: true });
+    env.swapLForLink('inside');
+    const read = await m.readBinaryFromDisk('work/l/x.txt');
+    assert.ok('data' in read, JSON.stringify(read));
+    assert.equal(read.data.toString(), 'behind the link\n');
+
+    const env2 = new Env(t);
+    env2.writeDisk('l/x.txt', 'v1\n');
+    const m2 = await env2.open(t, { followSymlinks: true });
+    env2.swapLForLink('outside', 'an outside file longer than the limit\n');
+    for (const opts of [{}, { maxBytes: 4 }]) {
+      assert.deepEqual(await m2.readBinaryFromDisk('work/l/x.txt', opts), { error: 'Symlink escape detected: work/l/x.txt' }, JSON.stringify(opts));
+    }
   });
 });
