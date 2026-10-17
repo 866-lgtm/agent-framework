@@ -207,6 +207,25 @@ test('real inference handler cannot turn a failed result write into a second res
   assert.equal(failures[0].responseAttempted, true);
 });
 
+test('a real inference handler whose inference fails answers -32603 with the failure\'s own message, as in 0.22.x, and no handler failure is reported', async () => {
+  const { framework, connection, traces } = harness();
+  framework.inferenceRouter = new InferenceRouter(
+    { async complete() { throw new Error('the provider refused the request'); } } as never,
+    { isInHook: false } as never,
+    { validateInbound() {} } as never,
+    null,
+    (event) => traces.push(event),
+  );
+  const reply = responder();
+  connection.emit('inference-request', {
+    featureSet: 'test', messages: [{ role: 'user', content: 'hello' }],
+  }, reply);
+  await settle();
+  // The router answers the failure itself, so the wrapper sees none.
+  assert.deepEqual(reply.errors, [{ code: -32603, message: 'the provider refused the request', data: undefined }]);
+  assert.deepEqual(failureTraces(traces), []);
+});
+
 test('a swallowed response-write failure still produces a diagnostic', async () => {
   const { framework, connection, traces } = harness();
   framework.channelRegistry = {
