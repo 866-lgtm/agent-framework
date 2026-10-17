@@ -1284,7 +1284,10 @@ async function closedWhileOpening(holdOpen: number) {
 }
 
 test("an open answered after the agent closed the channel during it leaves the channel closed", async () => {
-  const { registry, closeCalls, agent, answer, held } = await closedWhileOpening(1);
+  const { registry, closeCalls, agent, answer, held, setOpenResult } = await closedWhileOpening(1);
+  // The answer declares the channel inbound-only, which lands either way: it
+  // shows the late answer reached the host.
+  setOpenResult({ channel: { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'inbound' } });
   const opening = registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent);
   await held;
   // Registering the channel already sent one close, its reconcile's.
@@ -1295,7 +1298,18 @@ test("an open answered after the agent closed the channel during it leaves the c
   answer();
   await opening;
   assert.equal(registry.getDesiredState('body', 'body:home'), 'closed');
+  assert.equal(registry.inboundOnlyServer('body:home'), 'body', "the late answer's declaration was applied");
   assert.equal(registry.isChannelOpen('body:home'), false, 'the open answered after the close must not record the channel open');
+});
+
+test("a reconcile's open answered while the channel is tuned out is recorded: a tune-out keeps the transport open", async () => {
+  const { registry, home, opens } = await closedWhileOpening(0);
+  assert.equal(registry.isChannelOpen('body:home'), false);
+  (registry as unknown as { setDesiredState(s: string, c: string, state: string, source: string): void })
+    .setDesiredState('body', 'body:home', 'tuned-out', 'agent-tool');
+  await registry.handleChanged('body', { added: [home] } as never);
+  assert.equal(opens(), 1, "the announcement's reconcile opened it");
+  assert.equal(registry.isChannelOpen('body:home'), true);
 });
 
 test("an open answered after the agent closed the channel leaves it closed, though an announcement replaced its entry during the open", async () => {

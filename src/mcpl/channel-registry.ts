@@ -2476,10 +2476,12 @@ export class ChannelRegistry {
 
   /**
    * The single open executor: record durable desired-open intent, tell the
-   * server to subscribe, mark the live entry open. Every path that opens a
-   * channel — the agent's channel_open tool, delivery into a closed locus,
-   * an explicit send into a closed channel — funnels here, so lifecycle
-   * events, desired state, and live state can never diverge by path.
+   * server to subscribe, and hand its answer to applyOpenAnswer, which
+   * records the live entry open unless the host has asked to close it since.
+   * Every open the agent or its speech asks for — the channel_open tool,
+   * delivery into a closed locus, an explicit send into a closed channel —
+   * funnels here; reconcile's reopening sends its own and hands its answer
+   * to applyOpenAnswer too.
    * Desired state is recorded BEFORE the server round-trip: intent sticks
    * even if the subscribe fails, and reconciliation retries later.
    */
