@@ -17627,13 +17627,18 @@ export class AgentFramework {
       // the runtime connect or restart that asked for it. (A startup connect
       // defers awareness and returns before this gate; a startup that fails
       // ends in create()'s release, which closes its servers.)
+      // That close goes through the registry, which drops the entry itself
+      // rather than waiting for a 'close' event: close() emits none for a
+      // connection that's down between retries, such as a stub waiting for
+      // its next retry, and a stub left registered would refuse a later
+      // connect of its id as already registered.
       // Ordering matters: awareness accounting settles BEFORE the §5.3
       // policy round-trip below, so an accounting failure aborts with the
       // grant still empty and every buffered event still behind the gate —
       // a failed connect never reports a released data plane. (The reverse
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
-      await connection.close().catch(() => {});
+      await this.mcplServerRegistry.closeServer(connection.id, connection).catch(() => {});
       throw error;
     }
 
@@ -17797,7 +17802,7 @@ export class AgentFramework {
             ...AgentFramework.policyRefusalFields(receipt),
           });
           if (fallback === 'close') {
-            await connection.close();
+            await this.mcplServerRegistry!.closeServer(connection.id, connection);
             return;
           }
           connection.establishGrant(CapabilityGrant.empty());
@@ -17915,7 +17920,7 @@ export class AgentFramework {
           ...AgentFramework.policyRefusalFields(receipt),
         });
         if (fallback === 'close') {
-          await connection.close();
+          await this.mcplServerRegistry!.closeServer(connection.id, connection);
           return;
         }
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays

@@ -700,6 +700,67 @@ for (const writeMethod of ['recordSuccess', 'recordFailure'] as const) test(
   },
 );
 
+test('a runtime connect whose awareness accounting fails frees the id of the reconnect stub it closed', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-stub-'));
+  const statusPath = join(dir, 'status.jsonl');
+  const { outboxPath, config } = frameworkConfig(dir, {
+    STATUS_PATH: statusPath,
+    LEDGER_PATH: join(dir, 'awareness.json'),
+    GENERATION_PATH: join(dir, 'generation'),
+    FAIL_INITIAL_GENERATION: '1',
+  }, 1_000, {
+    reconnect: true,
+    // A stub waiting a minute for its retry is down between retries when the
+    // accounting failure closes it: the close that emits no 'close'.
+    reconnectIntervalMs: 60_000,
+    reconnectMaxIntervalMs: 60_000,
+  });
+  const discord = config.mcplServers[0]!;
+  // Another server brings MCPL up at create(), so the runtime connect below
+  // is the one that accounts for the pending work. Brought up lazily by that
+  // connect, MCPL would account for it in its own startup barrier first.
+  const heartbeat: McplServerConfig = {
+    id: 'heartbeat',
+    command: process.execPath,
+    args: [FIXTURE],
+    requestTimeoutMs: 1_000,
+    env: { SERVER_ID: 'heartbeat' },
+    enabledFeatureSets: ['chat'],
+  };
+  const prototype = DiscordAwarenessOutbox.prototype as any;
+  const original = prototype.recordFailure;
+  let framework: AgentFramework | undefined;
+
+  try {
+    framework = await AgentFramework.create({ ...config, mcplServers: [heartbeat] });
+    preparePending(outboxPath);
+    prototype.recordFailure = () => { throw new Error('injected recordFailure write failure'); };
+    try {
+      await assert.rejects(
+        framework.connectMcplServer(discord),
+        /awareness accounting failed.*injected recordFailure write failure/i,
+      );
+    } finally {
+      prototype.recordFailure = original;
+    }
+    assert.equal(
+      records(statusPath).filter((record) => record.event === 'initial-connect-failure').length,
+      1,
+      'the first connect failed, so the registry held a reconnect stub',
+    );
+
+    // Connecting the id again reaches the server: a stub left registered
+    // would fail this connect as already registered.
+    await framework.connectMcplServer(discord);
+    assert.equal(framework.listMcplServers().find((server) => server.id === 'discord')?.connected, true);
+  } finally {
+    prototype.recordFailure = original;
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('runtime reconciliation failure recycles the connection and keeps fresh data gated', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-accounting-'));
