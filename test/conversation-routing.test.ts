@@ -705,6 +705,9 @@ describe('Conversation routing', () => {
     assert.equal(framework.getAgent('conversation-slack-D5-g1'), null, 'disposed once its closure turn finished');
     assert.deepEqual(internals.deferredMessages.filter((m) => m.forAgent === 'conversation-slack-D5-g1'), [],
       'nothing is left queued for the fork');
+    assert.ok(errors.some((e) => e.includes('turn-end flush: deferred write ')
+      && e.includes('(alice: text) for conversation-slack-D5-g1 could not be stored; it stays queued')),
+      `the closure turn's flush met the refusal:\n${errors.join('\n')}`);
     assert.ok(errors.some((e) => e.includes('disposal of conversation fork conversation-slack-D5-g1: deferred write ')
       && e.includes('(alice: text) for conversation-slack-D5-g1 is lost: its agent has left the framework')), errors.join('\n'));
 

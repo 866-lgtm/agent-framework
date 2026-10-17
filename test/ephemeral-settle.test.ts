@@ -492,7 +492,11 @@ describe('runEphemeralToCompletion settle signal', () => {
     const internals = framework as unknown as {
       addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: undefined, opts?: { forAgent?: string }): string;
       deferredMessages: Array<{ forAgent?: string }>;
+      deferredWritesPersisted: boolean;
     };
+    // The queue is persisted, as after a boot that restored one, so its
+    // recovery file is written as it changes.
+    internals.deferredWritesPersisted = true;
     tools.duringCall = () => {
       internals.addMessage('worker', [{ type: 'text', text: 'my own words' }], undefined, { forAgent: 'worker' });
       internals.addMessage('Antra', [{ type: 'text', text: 'look left' }], undefined, { forAgent: 'worker' });
@@ -516,6 +520,8 @@ describe('runEphemeralToCompletion settle signal', () => {
         `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
       assert.deepStrictEqual(stored.slice(-2), ['worker: Done.', 'worker: my own words'], 'what could be stored was');
       assert.deepStrictEqual(internals.deferredMessages.filter((m) => m.forAgent === 'worker'), [], 'nothing is left queued for the run');
+      const file = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ forAgent?: string }> };
+      assert.deepStrictEqual(file.pending.filter((m) => m.forAgent === 'worker'), [], 'the recovery file keeps nothing for it');
       assert.ok(errors.some((e) => e.includes('end of ephemeral run worker: deferred write ')
         && e.includes('(Antra: text) for worker is lost: its agent has left the framework')), errors.join('\n'));
       assert.ok(!errors.some((e) => e.includes('delivery target "worker" is not a registered agent')),
