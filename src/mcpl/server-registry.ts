@@ -47,9 +47,11 @@ export class McplServerRegistry {
       : await McplServerConnection.connect(config, hostCapabilities);
     this.servers.set(config.id, connection);
 
-    // Auto-remove on unexpected close (unless reconnect will re-add)
+    // Auto-remove on close unless the connection will reconnect. That was
+    // decided once, from `reconnect === true` at connect, and a close() the
+    // host asks for disarms it first, so a server closed for good goes too.
     connection.on('close', () => {
-      if (config.reconnect !== true) {
+      if (!connection.willReconnect) {
         this.servers.delete(config.id);
       }
     });

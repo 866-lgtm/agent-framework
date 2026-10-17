@@ -192,6 +192,25 @@ test('restartMcplServer refuses such a setting before it disconnects the running
   });
 });
 
+test('restartMcplServer given no config checks the stored one, before it disconnects the running server', async () => {
+  await withFramework(false, async (framework) => {
+    const config: Record<string, unknown> = serverConfig('stored');
+    await framework.connectMcplServer(config as never);
+    // The framework keeps the caller's own config object, so a host that
+    // changes it in place changes what a restart with no new config uses.
+    config.reconnect = 'true';
+    await assert.rejects(
+      framework.restartMcplServer('stored'),
+      /MCPL server "stored" reconnect must be true or false, unquoted, not a string: /,
+    );
+    assert.deepEqual(
+      framework.listMcplServers().map((s) => [s.id, s.connected]),
+      [['stored', true]],
+      'the running server stays connected',
+    );
+  });
+});
+
 test('connectMcplServer hot-connects a network-only (WebSocket) MCPL server', async () => {
   // Minimal in-process MCPL server over WebSocket (same shape as
   // mcpl-ws-transport.test.ts) — no child process involved.

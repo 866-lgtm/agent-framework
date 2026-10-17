@@ -494,7 +494,7 @@ type BooleanSetting = {
 const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
-  allowHostCommands: 'true lets the server send host/command requests, and false or leaving it out refuses them',
+  allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
 };
 
 /**
@@ -525,7 +525,8 @@ function kindOf(value: unknown): string {
   const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
   if (prototype === null || prototype === Object.prototype) return 'an object';
   const name = prototype.constructor?.name;
-  return name ? `a ${name}` : 'an object that isn\'t plain';
+  if (!name) return 'an object that isn\'t plain';
+  return `${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name}`;
 }
 
 /**

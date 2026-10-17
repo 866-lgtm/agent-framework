@@ -19,7 +19,7 @@ import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.j
 const WHAT_TRUE_DOES = {
   inheritEnv: "true passes the server the host's whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables",
   reconnect: "true retries in the background when the server can't be reached or its connection drops, and false or leaving it out doesn't",
-  allowHostCommands: 'true lets the server send host/command requests, and false or leaving it out refuses them',
+  allowHostCommands: "true lets the server run the host's admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them",
 };
 
 const STDIO = { id: 'discord', command: 'discord-mcpl' };
@@ -46,7 +46,11 @@ test('any other value is refused, naming the server, the setting and the kind of
     [1, 'true or false, not a number'],
     [[], 'true or false, not an array'],
     [{}, 'true or false, not an object'],
+    [Object.create(null), 'true or false, not an object'],
     [new Map(), 'true or false, not a Map'],
+    [new (class Item {})(), 'true or false, not an Item'],
+    [Object.create({}), 'true or false, not an Object'],
+    [new (class {})(), "true or false, not an object that isn't plain"],
   ];
   for (const [setting, whatTrueDoes] of Object.entries(WHAT_TRUE_DOES)) {
     for (const [value, wanted] of refused) {
@@ -121,22 +125,68 @@ test('a reconnect that is not true never retries a failed first connect: the fai
   }
 });
 
-test('a reconnect that is not true leaves a dropped server down: nothing retries, and the registry lets it go', async () => {
+test('a reconnect of "false" leaves a dropped server down: nothing retries, and the registry lets it go', { timeout: 30_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcpl-booleans-'));
   const flag = join(dir, 'up');
   writeFileSync(flag, '');
   const registry = new McplServerRegistry();
   try {
     const connection = await registry.addServer(flaky(flag, 'false'), HOST_CAPS);
-    assert.equal(connection.willReconnect, false, 'no retry is armed');
+    const attempts: string[] = [];
+    connection.on('reconnect', () => attempts.push('reconnect'));
+    connection.on('reconnect-failed', () => attempts.push('reconnect-failed'));
     const closed = new Promise<void>((resolve) => connection.on('close', () => resolve()));
     connection.ready();
     connection.sendToolsList().catch(() => {}); // the fixture exits on tools/list
     await closed;
+    // A retry would start reconnectIntervalMs (50 ms, give or take a quarter)
+    // after the drop and respawn the fixture, whose flag file still exists,
+    // ending in 'reconnect' or 'reconnect-failed'. Neither comes within two
+    // seconds, forty intervals.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    assert.deepEqual(attempts, [], 'nothing retried after the drop');
+    assert.equal(connection.willReconnect, false, 'no retry is armed');
     assert.equal(registry.getServer('flaky'), null, 'the registry dropped the closed server');
-    assert.equal(connection.willReconnect, false);
   } finally {
     await registry.closeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a server the host closes leaves the registry, with reconnect: true too, since nothing will bring it back', { timeout: 30_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-booleans-'));
+  const flag = join(dir, 'up');
+  writeFileSync(flag, '');
+  const registry = new McplServerRegistry();
+  try {
+    const connection = await registry.addServer(flaky(flag, true), HOST_CAPS);
+    assert.equal(connection.willReconnect, true, 'a retry is armed while it runs');
+    await connection.close(); // as a policy refusal's "close" fallback does
+    assert.equal(connection.willReconnect, false);
+    assert.equal(registry.getServer('flaky'), null, 'the registry dropped the server the host closed');
+  } finally {
+    await registry.closeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an allowHostCommands that is not true reads as off, at connect and again at a reconnect', { timeout: 30_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-booleans-'));
+  const flag = join(dir, 'up');
+  writeFileSync(flag, '');
+  let connection: McplServerConnection | undefined;
+  try {
+    connection = await McplServerConnection.connect(
+      { ...flaky(flag, true), allowHostCommands: 'true' as unknown as boolean }, HOST_CAPS);
+    assert.equal(connection.allowHostCommands, false, 'off at connect');
+    const live = connection;
+    const reconnected = new Promise<void>((resolve) => live.once('reconnect', () => resolve()));
+    live.ready();
+    live.sendToolsList().catch(() => {}); // the fixture exits on tools/list, and reconnect: true brings it back
+    await reconnected;
+    assert.equal(live.allowHostCommands, false, 'off again after the reconnect');
+  } finally {
+    await connection?.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
