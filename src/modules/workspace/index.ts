@@ -2319,9 +2319,8 @@ export class WorkspaceModule implements Module {
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
           // A pass also drops a copy disk made binary or too large, which
-          // the disk-only answer describes; only an adopted removal is a
-          // deletion.
-          const error = took('deleted') && report?.state === 'synced'
+          // the disk-only answer describes; any other drop is disk's deletion.
+          const error = took('deleted') && report?.state !== 'disk-only'
             ? `File not found: ${input.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
             : this.notInWorkspace(input.path, report);
           return { success: false, error, isError: true };

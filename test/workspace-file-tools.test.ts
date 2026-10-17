@@ -465,18 +465,6 @@ test("a forced deletion over a directory says no push unlinks one", async (t) =>
   assert.match(JSON.stringify(forced.data), /not unlinked: disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk/);
 });
 
-test("a deletion whose parent disk made a file says no push unlinks below it", async (t) => {
-  const { dir, call } = setup(t);
-  mkdirSync(join(dir, 'sub'));
-  writeFileSync(join(dir, 'sub', 'x.txt'), 'v1\n');
-  assert.equal((await call('read', { path: 'work/sub/x.txt' })).success, true);
-  assert.equal((await call('delete', { path: 'work/sub/x.txt' })).success, true);
-  rmSync(join(dir, 'sub'), { recursive: true });
-  writeFileSync(join(dir, 'sub'), 'now a file\n');
-  const pushed = await call('materialize', { path: 'work/sub/x.txt', applyDeletions: true });
-  assert.match(JSON.stringify(pushed.data), /disk has a file or a symlink where this path needs a directory, and no push unlinks below one, forced or not — if something there should go, move or remove it on disk/);
-});
-
 test("a write over a FIFO is told to fix it and materialize again, with no force", async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   assert.equal(spawnSync('mkfifo', [join(dir, 'p.txt')]).status, 0, 'mkfifo');

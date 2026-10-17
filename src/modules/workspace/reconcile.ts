@@ -342,8 +342,8 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
 
 /**
  * What's in the way, and the way out, when disk's shape keeps a push from a
- * path: no push writes a file over a directory or unlinks one, or reaches a
- * path below a file or a symlink the walk won't take (`writeContained`,
+ * path: no push writes a file over a directory or unlinks one, or writes
+ * below a file or a symlink the walk won't take (`writeContained`,
  * `unlinkContained`), forced or not. Null for any other reason, which is
  * passed on as it is.
  */
@@ -354,12 +354,11 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
       : 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
         'move or remove that directory on disk and materialize again, or write the file under another path';
   }
-  if (reason === 'a parent path is not a directory') {
-    return deletion
-      ? 'disk has a file or a symlink where this path needs a directory, and no push unlinks below one, forced or not — ' +
-        'if something there should go, move or remove it on disk'
-      : 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
-        'move or remove it on disk and materialize again, or write the file under another path';
+  // A deletion below a file finds nothing there to unlink, so only a write
+  // meets this one.
+  if (reason === 'a parent path is not a directory' && !deletion) {
+    return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
+      'move or remove it on disk and materialize again, or write the file under another path';
   }
   return null;
 }
