@@ -10355,14 +10355,20 @@ export class AgentFramework {
       const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
       // The inbound source envelope, frozen at acceptance (see the channel
       // lane). A channel-scoped push belongs to the channel its subject names.
+      // Its message and thread are the subject's where its origin leaves them
+      // out, as an edit's may: delivery restores them the same way.
+      const known = c.channelId
+        ? this.pushCoalescer.identity(coalescingSubjectKey(
+            serverId, this.coalescingBinding(serverId), { kind: 'channel', id: c.channelId }, c.key))
+        : undefined;
       const inboundSource: InboundSource = c.channelId
         ? this.channelSource({
             lane: 'push/event',
             coalesced: true,
             serverId,
             channelId: c.channelId,
-            threadId: origin.threadId,
-            messageId: origin.messageId,
+            threadId: str(origin.threadId) ?? known?.threadId,
+            messageId: str(origin.messageId) ?? known?.messageId,
             eventId: params.eventId,
             replyTo: origin.replyTo,
             acceptedAt: event.acceptedAt,
@@ -11556,6 +11562,16 @@ export class AgentFramework {
    *  be dismissed: the batch honours that when it reaches the draft. */
   private draftsSending = new Set<string>();
 
+  /** The drafts tool's answer, wherever the call comes in: a failure the
+   *  handler throws is answered as one. */
+  private draftsToolResult(agentName: string, rawInput: unknown): Promise<ToolResult> {
+    return this.handleDraftsTool(agentName, rawInput).catch((err): ToolResult => ({
+      success: false,
+      error: `drafts failed: ${thrownText(err)}`,
+      isError: true,
+    }));
+  }
+
   /**
    * The resident's `drafts` tool: list, read, resend and dismiss its own held
    * drafts. Private to the calling resident. `resend` is an explicit send:
@@ -11683,9 +11699,12 @@ export class AgentFramework {
         try {
           this.proseDrafts.dismiss(agentName, d.id);
         } catch (err) {
+          // A write that failed after reaching the journal was reconciled
+          // into it, so say what the draft reads as now rather than guess.
+          const now = this.draftStateNow(agentName, d.id);
           return refuse(
-            `${lines.length > 0 ? `${lines.join('\n')}\n` : ''}Could not record dismissing ${d.id}: ` +
-            `${err instanceof Error ? err.message : String(err)}. It is still open.`,
+            `${lines.length > 0 ? `${lines.join('\n')}\n` : ''}Recording the dismissal of ${d.id} failed ` +
+            `(${err instanceof Error ? err.message : String(err)}): it reads as ${now} now.${now === 'dismissed' ? risk : ''}`,
           );
         }
         lines.push(`${d.id}: dismissed (your history keeps the words).${risk}`);
@@ -12568,9 +12587,10 @@ export class AgentFramework {
 
   /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce
    *  draft aside — unless it is being sent right now, which a dismissal
-   *  can't call back: the resident is told instead. So are a dismissal that
-   *  can't be recorded (the draft stays, and `{{unsent}}` still names it)
-   *  and one whose draft may already have been posted. */
+   *  can't call back: the resident is told instead. So are a dismissal whose
+   *  recording fails (with the state the draft reads as after it, and whether
+   *  `{{unsent}}` still names it) and one whose draft may already have been
+   *  posted. */
   private dismissLatestBounce(agent: Agent): void {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return;
@@ -12592,8 +12612,13 @@ export class AgentFramework {
       this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
     } catch (err) {
       console.error(`[drafts] ${agent.name}: could not dismiss ${draft.id}:`, err);
-      tell(`[prose-routing] {{unsent}} is draft ${draft.id}, which could not be set aside ` +
-        `(${err instanceof Error ? err.message : String(err)}): it is still held, and {{unsent}} still names it.`, 'failed-dismiss');
+      // A write that failed after reaching the journal was reconciled into
+      // it, so say what the draft reads as now rather than guess.
+      const now = this.draftStateNow(agent.name, draft.id);
+      const named = this.proseDrafts.latestBounce(agent.name)?.id === draft.id;
+      tell(`[prose-routing] Recording setting aside draft ${draft.id}, which {{unsent}} named, failed ` +
+        `(${err instanceof Error ? err.message : String(err)}): it reads as ${now} now, and {{unsent}} ` +
+        `${named ? 'still names it' : 'names nothing'}.${now === 'dismissed' && risk ? ` Note that ${risk}.` : ''}`, 'failed-dismiss');
       return;
     }
     if (risk) tell(`[prose-routing] Draft ${draft.id} is set aside. Note that ${risk}.`, 'at-risk-dismiss');
@@ -15502,6 +15527,13 @@ export class AgentFramework {
       return this.channelRegistry.handleChannelToolCall(call.name, call.input, origin);
     }
 
+    // drafts: the calling resident's own held drafts. A puppeted call has
+    // agent origin and acts as that resident, as the model's own call does
+    // through dispatchToolCall. A module holds no drafts.
+    if (call.name === 'drafts' && this.channelRegistry && origin.kind === 'agent') {
+      return this.draftsToolResult(origin.agentName, call.input);
+    }
+
     // The utils meta-tool — programmatic callers (code_execution scripts,
     // ephemerals, ModuleContext.callTool) reach utilities the same way the
     // model does.
@@ -16846,12 +16878,7 @@ export class AgentFramework {
     if (enrichedCall.name === 'drafts' && this.channelRegistry) {
       const startedAt = Date.now();
       this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
-      void this.handleDraftsTool(agentName, enrichedCall.input)
-        .catch((err): ToolResult => ({
-          success: false,
-          error: `drafts failed: ${thrownText(err)}`,
-          isError: true,
-        }))
+      void this.draftsToolResult(agentName, enrichedCall.input)
         .then((result) => {
           this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework', result });

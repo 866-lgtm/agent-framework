@@ -384,4 +384,17 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.equal(stored.sourceTimestamp, TS);
     assert.deepEqual(observed, [stored]);
   });
+
+  it("a channel-scoped push edit that names no message takes its subject's message and thread, as its delivery does", async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.register();
+    await f.send('channels/incoming', { messages: [{ ...f.channel('c', 'first_version', { initial: true }), threadId: 'thread' }] });
+    await f.send('push/event', f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' }));
+    await eventually(() => !!sourceOf(f, 'second_version'), 'the edit stored');
+    const stored = sourceOf(f, 'second_version');
+    assert.ok(stored && stored.kind === 'channel');
+    assert.equal(stored.lane, 'push/event');
+    assert.equal(stored.messageId, 'm');
+    assert.equal(stored.threadId, 'thread');
+  });
 });
