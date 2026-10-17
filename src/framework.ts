@@ -17534,9 +17534,10 @@ export class AgentFramework {
       // rejected, else the reply write it swallowed, else the reply it
       // tried to send twice. Nothing in here may throw: on the async path
       // it runs as a rejection handler, and an exception there would be an
-      // unhandled rejection, which ends the host. So every text is converted
-      // with describeCause, the internal-error reply's send is caught, and
-      // emitTrace's own catch can't throw.
+      // unhandled rejection, which ends the host. So every value it puts in
+      // text, the code of an answer the handler tried again included, is
+      // converted with describeCause, the internal-error reply's send is
+      // caught, and emitTrace's own catch can't throw.
       const report = (handlerError: { error: unknown } | undefined): void => {
         const primary = handlerError
           ? handlerError.error
@@ -17592,7 +17593,7 @@ export class AgentFramework {
         // The handler's text and the server's go through log-value, so a
         // line stays one line of bounded, escaped text.
         const tried = refused === undefined ? undefined
-          : refused.kind === 'result' ? 'a result' : `error ${refused.code}: ${refused.message}`;
+          : refused.kind === 'result' ? 'a result' : `error ${describeCause(refused.code)}: ${refused.message}`;
         console.error(
           `[mcpl] ${serverId} ${event} handler failed: ${logDetail(message)}` +
             (responseFailure === undefined ? '' : ` | its reply write had failed: ${logDetail(responseFailure)}`) +
@@ -17821,14 +17822,20 @@ export class AgentFramework {
       // data event cannot pass before the new barrier exists.
       const awarenessBarrier = this.installMcplDataPlaneGate();
       this.releaseMcplDataPlaneGate(awarenessBarrier);
-      this.handleToolsListChanged(connection.id);
-      void awarenessBarrier.promise.then(() => {
-        this.completeMcplDataPlaneGate(awarenessBarrier);
-      }).catch((error) => this.failMcplDataPlaneGate(
-        awarenessBarrier,
-        'tools-list reconciliation',
-        error,
-      ));
+      try {
+        this.handleToolsListChanged(connection.id);
+      } finally {
+        // A throw from the refresh is contained like the handler's; the gate
+        // is still completed when its barrier settles, or failed with it, as
+        // on the way through.
+        void awarenessBarrier.promise.then(() => {
+          this.completeMcplDataPlaneGate(awarenessBarrier);
+        }).catch((error) => this.failMcplDataPlaneGate(
+          awarenessBarrier,
+          'tools-list reconciliation',
+          error,
+        ));
+      }
     });
 
     // Re-establish full server registration on reconnect. The 'close' handler

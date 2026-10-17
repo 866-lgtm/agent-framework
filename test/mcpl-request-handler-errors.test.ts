@@ -787,6 +787,40 @@ test('a throw from the wired tools/list_changed handler is contained, traced and
   assert.deepEqual(lines, ['[mcpl] srv tools-list-changed handler failed: "the tool list refresh failed"']);
 });
 
+test('after a throw from the wired tools/list_changed handler, its data-plane gate is still completed when its barrier settles, or failed with it', async (t) => {
+  const { framework, connection } = harness();
+  t.mock.method(console, 'error', () => {});
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    framework.handleToolsListChanged = () => { throw new Error('the tool list refresh failed'); };
+    const failed: unknown[][] = [];
+    framework.failMcplDataPlaneGate = async (barrier: unknown, what: string, error: unknown) => { failed.push([barrier, what, error]); };
+    // A barrier the data planes wait for, which settles: the gate completes.
+    framework.beginDiscordAwarenessBarrier = () => ({
+      requiresBarrier: true,
+      promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
+    });
+    connection.emit('tools-list-changed');
+    const settling = framework.discordAwarenessBarrier;
+    assert.ok(settling, 'the gate is installed until its barrier settles');
+    await settle();
+    assert.equal(framework.discordAwarenessBarrier, null, 'the gate completed');
+    // One that fails: the gate is failed with it, and its rejection is handled.
+    const accounting = new Error('the awareness accounting failed');
+    framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: Promise.reject(accounting) });
+    connection.emit('tools-list-changed');
+    const failing = framework.discordAwarenessBarrier;
+    await settle();
+    await settle();
+    assert.deepEqual(failed, [[failing, 'tools-list reconciliation', accounting]]);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
 test('mcpl/manifestChanged and tools/list_changed sent as requests are answered with an empty result as they are admitted, whatever their handlers do', async (t) => {
   const { framework, connection, transport, traces } = wireHarness();
   t.mock.method(console, 'error', () => {});
@@ -1042,7 +1076,9 @@ test("a trace listener that throws a value no printer can inspect is logged as t
   const unhandled: unknown[] = [];
   const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
   process.on('unhandledRejection', onUnhandled);
-  const hostile = { [inspect.custom]() { throw new Error('inspect refused'); } };
+  // With no prototype, a template can't convert it either: only
+  // describeCause's text keeps the fallback line from throwing.
+  const hostile = Object.assign(Object.create(null), { [inspect.custom]() { throw new Error('inspect refused'); } });
   const offHostile = framework.onTrace(() => { throw hostile; });
   const after: any[] = [];
   const offAfter = framework.onTrace((event: unknown) => after.push(event));
@@ -1130,6 +1166,37 @@ test("the log line prints a failed reply write and a refused answer raw, and onl
   assert.ok(lines[0]!.includes('handler failed: "handler\\u0007failed"'), lines[0]);
   assert.ok(lines[0]!.includes('its reply write had failed: "write\\u0007broke"'), lines[0]);
   assert.ok(lines[0]!.includes('it then tried to answer again with "error -32602: second\\u0007answer"'), lines[0]);
+});
+
+test('an answer the handler tried after its first, with a code no template can convert, is printed with describeCause\'s text for the code, and nothing escapes', async (t) => {
+  const { framework, connection, traces } = harness();
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  // A code with no prototype: a template throws on it.
+  const code = Object.create(null) as number;
+  try {
+    framework.channelRegistry = {
+      async handleRegister(_server: string, _params: unknown, reply: any) {
+        reply.respond({ registered: [] });
+        reply.respondError(code, 'again');
+        throw new Error('register failed');
+      },
+    };
+    const reply = responder();
+    connection.emit('channels-register', {}, reply);
+    await settle();
+    await settle();
+    assert.deepEqual(unhandled, []);
+    assert.equal(failureTraces(traces).length, 1);
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0]!.includes('handler failed: "register failed"'), lines[0]);
+    assert.ok(lines[0]!.includes('it then tried to answer again with "error [object Object]: again"'), lines[0]);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
 });
 
 test("the log line prints a failed internal-error reply raw, and only the trace's copy is bounded", async (t) => {
