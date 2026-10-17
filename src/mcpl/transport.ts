@@ -56,7 +56,10 @@ export abstract class McplTransport extends EventEmitter {
   private lineBuffer: string[] = [];
   private stderrBuffer: string[] = [];
 
-  protected constructor() {
+  /** The server's id from its config, so a line the transport logs names it.
+   *  The stdio and WebSocket transports always give it; a test's stand-in
+   *  transport may leave it out. */
+  protected constructor(protected readonly serverId?: string) {
     super();
     // Flush buffered inbound lines the moment a consumer subscribes.
     this.on('newListener', (event) => {
@@ -109,7 +112,10 @@ export abstract class McplTransport extends EventEmitter {
    */
   protected reportError(err: Error): void {
     if (this.listenerCount('error') > 0) this.emit('error', err);
-    else console.error(`[mcpl] a ${this.kind} transport error, with nothing listening for it: ${logDetail(err.message)}`);
+    else {
+      const server = this.serverId === undefined ? '' : `${this.serverId}: `;
+      console.error(`[mcpl] ${server}a ${this.kind} transport error, with nothing listening for it: ${logDetail(err.message)}`);
+    }
   }
 
   /** Emit 'close' exactly once. */
@@ -215,8 +221,9 @@ export class StdioTransport extends McplTransport {
   private constructor(
     private readonly child: ChildProcess,
     private readonly rl: ReadlineInterface,
+    serverId: string,
   ) {
-    super();
+    super(serverId);
 
     this.rl.on('line', (line: string) => this.pushLine(line));
 
@@ -308,7 +315,7 @@ export class StdioTransport extends McplTransport {
       });
     });
     const rl = createInterface({ input: child.stdout! });
-    return new StdioTransport(child, rl);
+    return new StdioTransport(child, rl, config.id);
   }
 
   writeLine(json: string): void {
@@ -347,8 +354,8 @@ const WS_OPEN_TIMEOUT_MS = 15_000;
 export class WebSocketTransport extends McplTransport {
   readonly kind = 'websocket' as const;
 
-  private constructor(private readonly ws: WebSocket) {
-    super();
+  private constructor(private readonly ws: WebSocket, serverId: string) {
+    super(serverId);
 
     this.ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
       // MCPL frames are UTF-8 JSON text. A frame MAY contain multiple
@@ -419,7 +426,7 @@ export class WebSocketTransport extends McplTransport {
         settled = true;
         clearTimeout(timer);
         ws.removeAllListeners('error'); // the instance re-attaches its own handlers
-        resolve(new WebSocketTransport(ws));
+        resolve(new WebSocketTransport(ws, config.id));
       });
 
       ws.once('error', (err: Error) => {

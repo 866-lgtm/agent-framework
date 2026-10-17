@@ -80,16 +80,16 @@ test("a transport with nothing listening for 'error' logs its errors, and gives 
   const child = Object.assign(new EventEmitter(), {
     stdin: new EventEmitter(), stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null, signalCode: null,
   });
-  const stdio = new (StdioTransport as any)(child, new EventEmitter()) as StdioTransport;
+  const stdio = new (StdioTransport as any)(child, new EventEmitter(), 'child-srv') as StdioTransport;
   const ws = new EventEmitter();
-  const socket = new (WebSocketTransport as any)(ws) as WebSocketTransport;
+  const socket = new (WebSocketTransport as any)(ws, 'ws-srv') as WebSocketTransport;
   assert.doesNotThrow(() => child.emit('error', new Error('kill EPERM')));
   assert.doesNotThrow(() => child.stderr.emit('error', new Error('read EIO')));
   assert.doesNotThrow(() => ws.emit('error', new Error('Invalid WebSocket frame: invalid opcode 3')));
   assert.deepEqual(logged, [
-    '[mcpl] a stdio transport error, with nothing listening for it: "kill EPERM"',
-    '[mcpl] a stdio transport error, with nothing listening for it: "read EIO"',
-    '[mcpl] a websocket transport error, with nothing listening for it: "Invalid WebSocket frame: invalid opcode 3"',
+    '[mcpl] child-srv: a stdio transport error, with nothing listening for it: "kill EPERM"',
+    '[mcpl] child-srv: a stdio transport error, with nothing listening for it: "read EIO"',
+    '[mcpl] ws-srv: a websocket transport error, with nothing listening for it: "Invalid WebSocket frame: invalid opcode 3"',
   ]);
   const reported: string[] = [];
   stdio.on('error', (error: Error) => reported.push(error.message));
@@ -110,5 +110,5 @@ test('a WebSocket server that sends a malformed frame with its upgrade response 
   assert.equal(probe.error, undefined);
   assert.equal(probe.status, 0, `stdout: ${probe.stdout}\nstderr: ${probe.stderr}`);
   assert.match(probe.stdout, /^refused after \d+ ms: MCPL server "probe" transport closed before handshake completed/m);
-  assert.match(probe.stderr, /\[mcpl\] a websocket transport error, with nothing listening for it: "Invalid WebSocket frame: invalid opcode 3"/);
+  assert.match(probe.stderr, /\[mcpl\] probe: a websocket transport error, with nothing listening for it: "Invalid WebSocket frame: invalid opcode 3"/);
 });

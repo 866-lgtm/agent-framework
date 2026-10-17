@@ -5,8 +5,10 @@
 // when connect() rejects, or "connected"; an 'error' thrown with nothing
 // listening would end the process before it prints either.
 // Mode "answers-close" (the default): the server answers the client's close
-// frame and ends the socket, as most servers do. Mode "silent": it never
-// answers, so the connect waits out a timeout.
+// frame and ends the socket, as most servers do. ws reads nothing more once it
+// has failed the connection, so it's the socket's end, not the answering
+// frame, that ends the wait. Mode "silent": it never answers or ends, so the
+// connect waits out a 30 s timeout, ws's close timeout or the handshake's own.
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { McplServerConnection } from '../../src/mcpl/server-connection.js';
