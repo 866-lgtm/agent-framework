@@ -136,8 +136,9 @@ export function validateCodeExecutionConfig(cfg: {
         'it is the most an agent may ask for, and the default is always allowed',
     );
   }
-  // No refusal shows the value it refuses, only its kind: a substituted
-  // value can be a credential. null counts as not set, as JSON writes that.
+  // None of the environment's refusals below shows the value it refuses,
+  // at most its kind: a substituted value can be a credential. null counts
+  // as not set, as JSON writes that.
   if (cfg.inheritEnv !== undefined && cfg.inheritEnv !== null && typeof cfg.inheritEnv !== 'boolean') {
     const wanted = typeof cfg.inheritEnv === 'string' ? 'true or false, unquoted,' : 'true or false,';
     throw new Error(
