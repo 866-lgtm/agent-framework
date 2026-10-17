@@ -1,0 +1,11 @@
+- The workspace's `edit` matches and replaces through a planner ported from hands-mcp's, and says more when it can't apply:
+  - A miss shows the stretch of the file most like the first line of `oldString` that has text, numbered as `read` numbers lines, and says to match exactly. A file over 2,097,152 UTF-16 code units gets no such region, and the refusal says to find the text with `grep`.
+  - A count other than one, without `replaceAll`, names the lines of up to 20 occurrences and shows each line once, a long one as an excerpt around its match.
+  - Occurrences that overlap one another each count, so "aa" occurs twice in "aaa", and can't each be replaced: an edit whose occurrences overlap is refused, with `replaceAll` too.
+  - An `oldString` with LF line ends matches a file's CRLF ones, and the new text takes, by position, the line ends of the text it replaces. A BOM, a lone CR and every byte outside the replaced text stay as they were. Before, an LF `oldString` missed in a CRLF file, and a CRLF one could mix the file's line ends.
+  - When `oldString` isn't in the file as given, straight and curly quotes are matched as equal, and the answer says so.
+  - `oldString` and `newString` that are the same, once CRLF line ends are read as LF, are refused before anything is read.
+  - An edit that would take a file past its mount's `maxFileSize` is refused, as `write` refuses content past it.
+  - A miss or a count that differs is refused with "The edit did nothing:", where it said "String not found in …" or "String found N times in …".
+- A successful `edit` answers with `replacements` and `changed` beside `path` and `size`: the changed region with two lines on each side, numbered as `read` numbers lines. Its `note` also says, where they apply, that the file's CRLF or mixed line ends were kept, that the text matched with quotes treated as equal, and on which lines `replaceAll`'s other replacements are.
+- `edit`'s answer is held to the call's `resultMaxChars`, so that a closest region or a long receipt doesn't push it past what reaches the agent whole: past it, a refusal's problem keeps only its first line, and the receipt names a region by its lines rather than showing it.

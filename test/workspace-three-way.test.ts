@@ -1059,7 +1059,7 @@ describe('restarts and faults', () => {
     const m = await pendingAdoption(env);
     env.writeDisk('a.txt', 'C');
     const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
-    assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.match(error, /^The edit did nothing: oldString isn't in work\/a\.txt\./, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
     assert.equal(await contentOf(m, 'a.txt'), 'C');
     assert.equal(await stateOf(m, 'a.txt'), 'synced');
   });

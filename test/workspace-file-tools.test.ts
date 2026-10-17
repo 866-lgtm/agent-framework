@@ -249,11 +249,14 @@ test("an edit applies to disk's text when disk changed and the store didn't, and
 
   // Text only the older copy held isn't there to replace, and the refusal says why.
   writeFileSync(join(dir, 's.txt'), 'v3 from another writer\n');
-  assert.match(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'LINE', newString: 'x' })),
-    /^String not found in work\/s\.txt\. Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text\.$/);
+  assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'LINE', newString: 'x' })),
+    "The edit did nothing: oldString isn't in work/s.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+    + "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
   writeFileSync(join(dir, 's.txt'), 'v4 twice twice\n');
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'twice', newString: 'x' })),
-    "String found 2 times in work/s.txt. Use replaceAll: true or provide more context. Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
+    'The edit did nothing: oldString occurs 2 times in work/s.txt (lines 1, 1). '
+    + 'Add the text around it to make it unique, or set replaceAll to replace every one.\n     1\tv4 twice twice\n\n'
+    + "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
 });
 
 test('an edit of a draft whose disk copy also changed applies to the draft and names the conflict', async (t) => {
@@ -265,9 +268,12 @@ test('an edit of a draft whose disk copy also changed applies to the draft and n
 
   // A miss says so too: the text the agent sought may be disk's.
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'another', newString: 'x' })),
-    "String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
+    "The edit did nothing: oldString isn't in work/k.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+    + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'a', newString: 'x' })),
-    "String found 2 times in work/k.txt. Use replaceAll: true or provide more context. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
+    'The edit did nothing: oldString occurs 2 times in work/k.txt (lines 1, 1). Add the text around it to make it unique, or set replaceAll to replace every one.\n'
+    + '     1\tagent draft\n\n'
+    + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
   const edit = await call('edit', { path: 'work/k.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
   assert.equal((edit.data as { note: string }).note,
@@ -284,7 +290,7 @@ test("an edit refused for a workspace copy that isn't valid UTF-8 names the path
   store.treeSet('workspace/work/tree', 'c.txt', { blobHash: store.storeBlob(latin1, 'text/plain'), size: latin1.byteLength, mode: 0o644 });
   writeFileSync(join(dir, 'c.txt'), 'disk copy\n');
   assert.match(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'caf', newString: 'tea' })),
-    /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .* The path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's\.$/);
+    /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .*\n\nThe path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's\.$/);
 });
 
 // ---------------------------------------------------------------------------
@@ -334,7 +340,8 @@ test('a deletion whose path disk has made a directory is not told to write the f
 test('an edit that would replace nothing is refused, with replaceAll too', async (t) => {
   const { dir, call, disk } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'r.txt'), 'abc\n');
-  assert.equal(errorOf(await call('edit', { path: 'work/r.txt', oldString: 'zzz', newString: 'y', replaceAll: true })), 'String not found in work/r.txt.');
+  assert.equal(errorOf(await call('edit', { path: 'work/r.txt', oldString: 'zzz', newString: 'y', replaceAll: true })),
+    "The edit did nothing: oldString isn't in work/r.txt.\nMatch exactly, including whitespace and indentation.");
   assert.equal(disk('r.txt')!.toString(), 'abc\n');
 });
 
@@ -368,7 +375,8 @@ test("an edit whose disk copy can't be checked says it used the workspace's copy
     }
     assert.equal(await stored('u.txt'), 'held, edited\n');
     assert.equal(errorOf(await call('edit', { path: 'work/u.txt', oldString: 'zzz', newString: 'x' })),
-      "String not found in work/u.txt. The path couldn't be checked against disk (a directory), so the edit looked in the workspace's copy.");
+      "The edit did nothing: oldString isn't in work/u.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+      + "The path couldn't be checked against disk (a directory), so the edit looked in the workspace's copy.");
   }
 });
 
