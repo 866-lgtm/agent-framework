@@ -500,6 +500,8 @@ interface DeferredWrite {
   participant: string;
   content: ContentBlock[];
   metadata?: MessageMetadata;
+  /** The agent the entry is for. Absent means the primary: addMessage
+   *  records any other agent it defers a write for. */
   forAgent?: string;
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
@@ -16228,7 +16230,13 @@ export class AgentFramework {
       if (opts?.fromQueue) {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
-      this.deferredMessages.push({ id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      // An entry with no target is the primary's. A write with no target that
+      // went to another agent (on a host with no primary, the first one
+      // registered, such as an ephemeral run) names that agent, so the
+      // agent's flushes and its leaving take the entry as they take a
+      // targeted one.
+      const forAgent = opts?.forAgent ?? (agent.name === this.primaryAgentName ? undefined : agent.name);
+      this.deferredMessages.push({ id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary

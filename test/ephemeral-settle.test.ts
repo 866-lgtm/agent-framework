@@ -65,12 +65,16 @@ class EphemeralToolModule implements Module {
 
 /** A tool that, while its call runs, has `duringCall` run: there, a test
  *  addresses the run as the event gate does, through the framework's
- *  addMessage with `forAgent`. */
+ *  addMessage with `forAgent`, or writes as a module does, through its
+ *  context (`ctx`). */
 class DuringCallToolModule implements Module {
   readonly name = 'test';
+  ctx: ModuleContext | null = null;
   duringCall: (() => void) | null = null;
 
-  async start(_ctx: ModuleContext): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -469,6 +473,52 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.deepStrictEqual(stored.slice(-3), ['worker: Done.', 'worker: my own words', 'Antra: look left'],
         'held to the turn end, and stored after the run\'s last reply');
     } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it("a module's write with no target, which a host with no primary sends to its run, is the run's: stored in its namespace, with nothing left queued once it ends", async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-untargeted-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const tools = new DuringCallToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+    const internals = framework as unknown as { deferredMessages: Array<{ forAgent?: string }> };
+    // While the run's tool call is pending, a module writes with no target,
+    // as its events do. The host has no primary, so the write goes to the
+    // run, its one registered agent, and waits for the run's turn.
+    const returned: string[] = [];
+    tools.duringCall = () => {
+      returned.push(tools.ctx!.addMessage('Antra', [{ type: 'text', text: 'look left' }]));
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    try {
+      const { agent, contextManager } = await createEphemeral(framework, 'worker');
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+      console.error = error;
+      assert.strictEqual(result.speech, 'Done.');
+      assert.deepStrictEqual(returned, [''], 'deferred: the run was waiting on its tool');
+      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
+      const stored = contextManager.getAllMessages().map((m) =>
+        `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
+      assert.strictEqual(stored.filter((s) => s === 'Antra: look left').length, 1,
+        `stored once, in the run's namespace:\n${stored.join('\n')}`);
+      assert.deepStrictEqual(internals.deferredMessages, [], 'nothing is left queued');
+      assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
+    } finally {
+      console.error = error;
       await stopAndRemove(framework, tempDir);
     }
   });

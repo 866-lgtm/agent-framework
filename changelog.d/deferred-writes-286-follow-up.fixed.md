@@ -11,6 +11,13 @@
   once the run's stream had ended, was dropped by the run's own turn-end
   flush, which runs after the run is deregistered, with a line saying its
   delivery target isn't a registered agent.
+- On a host with no primary (`agents: []`), a write with no target goes to
+  the first registered agent, such as an ephemeral run. Deferred, it now names
+  that agent in its queue entry, so it is that agent's as a targeted write is:
+  the agent's own flushes store it, and it leaves with the agent. Before, the
+  entry named no agent, so neither the run's flushes nor its end took it:
+  after the run it was still queued, unstored and not logged as lost, and in
+  the recovery file when the queue was persisted.
 - The fallback reaper, which disposes a closing conversation fork with no
   stream and no request left for it, as when its closure turn never ran, now
   first stores what is still queued for the fork in the fork's own store, past

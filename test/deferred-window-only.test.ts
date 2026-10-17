@@ -331,7 +331,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       pendingAssistantBlocks: Map<string, ContentBlock[]>;
       activeTurnTokens: Map<string, number>;
       activeStreams: Map<string, unknown>;
-      deferredMessages: Array<{ id: string; seq: number; participant: string }>;
+      deferredMessages: Array<{ id: string; seq: number; participant: string; forAgent?: string }>;
       deferredWritesPersisted: boolean;
       drainDeferredFor: (name: string, stopAt?: unknown) => unknown[];
       readdDrained: (entries: unknown[], where: string) => unknown[];
@@ -380,6 +380,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       assert.notEqual(internals.addMessage('Antra', text('targeted'), undefined, { forAgent: 'assistant' }), '', 'stored too');
       internals.pendingAssistantBlocks.set('assistant', otherCycle());
       assert.equal(internals.addMessage('Antra', text('in its own cycle')), '', "deferred: the primary's own cycle is pending");
+      // Its entry names no agent: one with no target is the primary's, as the
+      // recovery file and a boot whose primary was renamed take it.
+      assert.deepEqual(internals.deferredMessages.map((m) => m.forAgent), [undefined], 'a primary-bound entry names no agent');
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
       internals.pendingAssistantBlocks.delete('assistant');
