@@ -664,6 +664,62 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it('a fork whose closure turn ends while the host is quiesced is left to the reaper, which disposes it once resume() has stored its write', async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D6', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const fork = 'conversation-slack-D6-g1';
+    const g1 = framework.getAgent(fork)!;
+    assert.ok(g1, 'g1 fork should exist after spawn');
+
+    forceExpiry(framework, 'slack:D6', IDLE_TTL_MS);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+      deferredMessages: Array<{ forAgent?: string }>;
+      lastConversationSweep: number;
+      sweepExpiredConversations(): void;
+    };
+    // While the closure turn is alive, a write for the fork is deferred to
+    // the turn's end, and an operator quiesces the host, which waits for the
+    // turn to end.
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    let deferred: string | undefined;
+    let quiescing: Promise<unknown> | undefined;
+    membrane.streamYielding = (request, options) => {
+      if (deferred === undefined) {
+        deferred = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined, { forAgent: fork });
+        quiescing = framework.quiesce({ reason: 'test window' });
+      }
+      return streamYielding(request, options);
+    };
+    const lastStored = () => JSON.stringify(g1.getContextManager().getAllMessages().at(-1)?.content);
+    const queued = () => internals.deferredMessages.filter((m) => m.forAgent === fork).length;
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      await quiescing;
+      assert.equal(deferred, '', 'deferred: the closure turn was alive');
+      assert.ok(framework.getAgent(fork), 'not disposed while the host is quiesced');
+      assert.equal(queued(), 1, 'its write is still queued');
+
+      await framework.resume();
+      assert.ok(lastStored().includes('one more thing'), `resume() stored it in the fork:\n${lastStored()}`);
+      internals.lastConversationSweep = 0;
+      internals.sweepExpiredConversations();
+      assert.equal(framework.getAgent(fork), null, 'the reaper disposed it after resume()');
+      assert.equal(queued(), 0, 'nothing is left queued for the fork');
+    } finally { console.error = error; }
+    assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
+
+    await framework.stop();
+  });
+
   it("a write deferred for a fork that its store refuses at the closure turn's end leaves the queue with the fork, logged as lost", async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));

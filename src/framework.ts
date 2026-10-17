@@ -10140,7 +10140,8 @@ export class AgentFramework {
    * is still queued for it leaves with it, logged as lost (dropDeferredFor).
    * Each caller has first stored what it could: the end of the fork's
    * closure turn with that turn's flush, and the fallback reaper with
-   * storeDeferredFor.
+   * storeDeferredFor. Neither calls it while the host is quiesced, when
+   * resume() would store what that leaves queued.
    */
   private disposeConversationAgent(agentName: string): void {
     this.dropDeferredFor(agentName, `disposal of conversation fork ${agentName}`);
@@ -14273,8 +14274,11 @@ export class AgentFramework {
       // frame that ends the turn disposes it, after the flush above, so what
       // was held for the turn's end lands in the fork's store instead of
       // being dropped as addressed to no agent. A frame that hands the turn
-      // to a successor (a guard or budget restart) leaves the fork to it.
-      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+      // to a successor (a guard or budget restart) leaves the fork to it. On
+      // a quiesced host the flush above deferred what was held again, so the
+      // fork is left to the fallback reaper, which disposes it once resume()
+      // has stored it.
+      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name) && !this.quiesced) {
         this.disposeConversationAgent(agent.name);
       }
     }
