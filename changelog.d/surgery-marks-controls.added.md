@@ -1,4 +1,5 @@
-- Operator controls for awareness marks:
+- Operator controls for awareness marks, described in the README's
+  [Live surgery and Discord awareness marks](README.md#live-surgery-and-discord-awareness-marks):
   - `previewSurgeryMarks(agent, { rollbackTo } | { suppress })` shows what a
     surgery would remove and which messages each scope would mark, per
     channel.
@@ -6,54 +7,26 @@
     requests.
   - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
     and retries of a batch's marks, or of a retract's removals, and never
-    removes or undoes anything. Its receipt counts requests in flight or
-    unknown, including earlier attempts later answered, which may still land.
+    removes or undoes anything.
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each message's configured MCPL route, for every
-    selected message, whatever history says. As the latest authorization
-    for those messages, it stops adds that haven't ended and any an earlier
-    choice would request later (a prepared surgery's activation), and
-    cancelling it never revives them. Its receipt discloses earlier add
-    requests whose outcome is unknown and imported history that leaves
-    outcomes unrecorded.
-  - `releaseDiscordAwareness(batch)` queues a held batch: an imported
-    ledger's undelivered work. A batch a pre-release build held for its
-    surgery is held too, and is refused: a start retires it, none of its
-    marks sent, except that one whose suppression's removals are pending on
-    a branch that exists is kept until a start on that branch finishes them.
+    selected message, whatever history says.
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for a
     new branch that a suppression with pending removals names as its
-    target, cancelled or not: a start on a branch with that name would apply
-    them there. The name is free once a start on that branch finishes the
-    suppression, or a start finds no branch with the name and gives the
-    suppression up. Rollback, suppression and the API's `branch.create`
-    check their names with it, the offline recovery checks the same set
-    (`pendingSuppressionsFor`), the API's `branch.switch` and a redo refuse
-    such a target, and a host that creates branches in the store itself
-    calls it first. A turn undo's branch, whose generated name carries its
-    time, isn't checked. While the journal can't be read it refuses every
-    name, and `branch.switch` and a redo refuse every switch (`failed`),
-    each saying why and what ends that.
+    target, since a start on a branch with that name would apply them there.
 
-  Each control that changes the journal (cancel, retract and release) is
-  recorded in the operator log. A request the journal won't
-  carry out (an unknown batch, or one in the wrong state) is refused as
-  `invalid`, and a failure to read or write the journal is `failed`. Once
-  `stop()` has begun, cancel, retract and release refuse with "awareness
-  <verb> refused: the framework is stopping", like every operator entry
-  point; the list still reads the journal. The same
-  controls are available as the `host/command` `marks` verb (`action: list |
-  cancel | retract | release`, `target`) and, with the host stopped, as
-  `agent-framework-recover --awareness list|cancel|retract|release`, which
-  takes only `--store` and `--outbox` and refuses a recovery's options given
-  with it.
+  The same controls are the `host/command` `marks` verb (`action: list |
+  cancel | retract`, `target`) and, with the host stopped,
+  `agent-framework-recover --awareness list|cancel|retract`. Each control
+  that changes the journal is recorded in the operator log, and refuses
+  once `stop()` has begun, like every operator entry point.
 - A turn-based `host/command` `undo` that undoes a turn records one
   `undo-turns` entry in the operator log: the requested turns, the marks
   choice (`none` included) and the receipt, beside the per-turn `undo-turn`
   entries.
 - `agent-framework-recover` records its acts in the store's operator log
   (`<store>/operator-actions.jsonl`), done or refused, with the OS account
-  that ran it: each `--awareness` cancel, retract and release, and each
-  recovery with its marks choice and receipt (kind `recovery`). A list, and
-  a recovery's dry run, record nothing. `--dry-run` with `--awareness` is
-  refused: a control has no preview.
+  that ran it: each `--awareness` cancel and retract, and each recovery with
+  its marks choice and receipt (kind `recovery`). A list, and a recovery's
+  dry run, record nothing. `--dry-run` with `--awareness` is refused: a
+  control has no preview.

@@ -7,13 +7,13 @@
  * reactions on other people's messages):
  * marks are an explicit publication choice (default none); one-shot, so
  * branch moves and restarts never derive operations from branch state; and
- * cancel / retract / release are explicit operator acts whose receipts say
+ * cancel and retract are explicit operator acts whose receipts say
  * what history establishes and what it leaves open.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { JsStore } from '@animalabs/chronicle';
 import {
@@ -91,11 +91,13 @@ const retracts = (outbox: DiscordAwarenessOutbox) =>
   outbox.view().filter((v): v is DiscordAwarenessRetractView => v.kind === 'retract');
 
 /**
- * A held batch, which only an import makes: a pre-journal ledger's prepared
- * batch with marks, written where the store keeps one and imported by the
- * returned outbox's first read.
+ * A pre-journal ledger's batch, prepared unless `extra` says otherwise, with
+ * marks, written where the store keeps one and imported by the returned
+ * outbox's first read. An import retires one its release never activated,
+ * unless it is a suppression whose body may be pending, which stays
+ * prepared; an active one stays active.
  */
-function importHeld(h: Harness, id: string, refs: DiscordAwarenessRef[], extra: Record<string, unknown> = {}) {
+function importLegacyBatch(h: Harness, id: string, refs: DiscordAwarenessRef[], extra: Record<string, unknown> = {}) {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify({
     version: 2,
@@ -106,7 +108,12 @@ function importHeld(h: Harness, id: string, refs: DiscordAwarenessRef[], extra: 
     }],
   }));
   const outbox = h.reopen();
-  assert.equal(outbox.batches().find((batch) => batch.id === id)?.status, 'held');
+  const active = extra.status === 'active' || extra.status === 'pending';
+  const pendingBody = extra.activationPolicy === 'explicit' && Array.isArray(extra.suppressionIntervals);
+  assert.equal(
+    outbox.batches().find((batch) => batch.id === id)?.status,
+    active ? 'active' : pendingBody ? 'prepared' : 'discarded',
+  );
   return outbox;
 }
 
@@ -202,6 +209,7 @@ test('startup activates nothing: it retires what interrupted surgeries left, and
   // A later restart changes nothing, and still keeps the suppression for its branch.
   assert.deepEqual(h.reopen().recoverAtStartup((name) => exists.has(name)), {
     retired: [], pending: [{ batchId: suppression.id, agentName: 'cairn', targetBranch: 'suppress/cairn/1' }], unknownAttempts: 0, givenUp: 0,
+    imported: [],
   });
 }));
 
@@ -306,21 +314,20 @@ test('cancelling a batch its surgery has not activated stops every mark; a suppr
   assert.equal(outbox.pendingDispatches('discord').length, 0);
 }));
 
-test('releasing an imported held suppression\'s marks never certifies or forgets its unfinished body', withJournal((_outbox, h) => {
-  const outbox = importHeld(h, 'legacy-sup', [ref('m1')], {
+test('an imported suppression its release never activated keeps its body pending, and a start on its branch finishes and retires it, none of its marks sent', withJournal((_outbox, h) => {
+  const outbox = importLegacyBatch(h, 'legacy-sup', [ref('m1')], {
     targetBranch: 'partial', activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i2' }],
   });
-  assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
-  const released = outbox.release('legacy-sup', 'operator');
-  assert.equal(released.addsQueued, 1);
-  assert.equal(outbox.batches()[0].status, 'active');
-  assert.equal(outbox.batches()[0].suppressionComplete, undefined);
   // Body recovery still owes the redactions on `partial`.
   assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
-  // An active batch isn't retired when its body is finished: its marks are the operator's.
-  assert.deepEqual(outbox.completeSuppression('legacy-sup'), { retired: false });
-  assert.equal(outbox.batches()[0].status, 'active');
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
+  // Its marks are named as unsent at the start that imported it.
+  assert.deepEqual(outbox.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds, b.removals]), [['legacy-sup', 1, 0]]);
+  assert.deepEqual(outbox.completeSuppression('legacy-sup'), { retired: true });
+  assert.equal(outbox.batches()[0].status, 'discarded');
+  assert.equal(outbox.batches()[0].suppressionComplete, true);
   assert.deepEqual(outbox.pendingSuppressionsFor('partial'), []);
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
 }));
 
 test('retract queues a removal for every selected key, whatever history says, and discloses unresolved requests', withJournal((outbox) => {
@@ -444,28 +451,21 @@ test('authorization order: a retract after a surgery\'s choice wins over that ch
   assert.equal(outbox.activate(f.id), 1);
   assert.ok(due(outbox).includes('add:m1') && !due(outbox).includes('remove:m1'));
 
-  // A release is a new act: it wins over a retract made while the batch was
-  // held. Only an imported batch is held.
-  const held = importHeld(h, 'g', [ref('m6')]);
-  held.retract('g');
-  assert.equal(held.release('g').addsQueued, 1);
-  assert.ok(due(held).includes('add:m6') && !due(held).includes('remove:m6'));
-
   // The body's obligation is not the marks': a suppression whose marks were
   // retracted before activation still records its body complete.
-  const sup = held.prepare({
+  const sup = outbox.prepare({
     agentName: 'cairn', sourceBranch: 'main', targetBranch: 't/s', refs: [ref('m7')], scope: 'all',
     activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }],
   })!;
-  held.retract(sup.id);
-  assert.equal(held.activate(sup.id), 0);
-  const settled = held.batches().find((x) => x.id === sup.id)!;
+  outbox.retract(sup.id);
+  assert.equal(outbox.activate(sup.id), 0);
+  const settled = outbox.batches().find((x) => x.id === sup.id)!;
   assert.equal(settled.status, 'active');
   assert.equal(settled.suppressionComplete, true);
-  assert.deepEqual(held.pendingSuppressionsFor('t/s'), []);
+  assert.deepEqual(outbox.pendingSuppressionsFor('t/s'), []);
 
   // Everything above holds across a restart.
-  assert.deepEqual(due(h.reopen()), due(held));
+  assert.deepEqual(due(h.reopen()), due(outbox));
 }));
 
 test('startup records a retirement only after syncing the store, and nothing when the sync fails', withJournal((outbox, h) => {
@@ -515,7 +515,6 @@ test('startup gives up a pending suppression whose branch doesn\'t exist, and ke
   assert.deepEqual(after.pendingSuppressionsFor('suppress/cairn/gone'), [], 'the name it claimed is free');
   assert.deepEqual(after.pendingSuppressionsFor('suppress/cairn/pending').map((b) => b.id), [pending.id]);
   assert.deepEqual(batches(after).map((view) => view.id), [pending.id], 'a retired batch leaves the view');
-  assert.throws(() => after.release(neverForked.id), /is discarded, not held/);
   assert.deepEqual(after.pendingDispatches('discord'), []);
 }));
 
@@ -591,42 +590,24 @@ test('a retry confirming an unknown add never erases the unresolved first attemp
   assert.equal(receipt.unresolvedAddAttempts, 1);
 }));
 
-test('release queues a held batch\'s recorded operations, explicitly', withJournal((_outbox, h) => {
-  const outbox = importHeld(h, 'held-1', [ref('m1'), ref('m2')]);
+test('an import retires the work an earlier release had still to do, none of it sent, and the start that imported it names its batches', withJournal((_outbox, h) => {
+  const outbox = importLegacyBatch(h, 'old-1', [ref('m1'), ref('m2')]);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
-  const receipt = outbox.release('held-1', 'operator');
-  assert.deepEqual({ adds: receipt.addsQueued, removals: receipt.removalsQueued }, { adds: 2, removals: 0 });
-  assert.equal(outbox.pendingDispatches('discord').length, 2);
-  // A repeated release changes nothing, and its refusal says what settled
-  // the batch, so a replay reads as one.
-  assert.throws(
-    () => outbox.release('held-1'),
-    (error) => error instanceof DiscordAwarenessRefusal
-      && /^Discord awareness batch \S+ is active, not held; it was released at \S+Z by operator$/.test(error.message),
-  );
-  assert.equal(outbox.pendingDispatches('discord').length, 2);
-  // A held batch an operator cancels is settled too: nothing waits for a
-  // release, and it requested nothing.
-  const other = importHeld(h, 'held-2', [ref('m3')]);
-  other.cancel('held-2', 'operator');
-  assert.equal(other.batches().find((b) => b.id === 'held-2')?.status, 'active');
-  assert.throws(
-    () => other.release('held-2'),
-    (error) => error instanceof DiscordAwarenessRefusal
-      && /^Discord awareness batch \S+ is active, not held; it was cancelled at \S+Z by operator$/.test(error.message),
-  );
-  assert.ok(!other.operations().some((op) => op.key.messageId === 'm3'));
-  // A start never holds a surgery's batch, and leaves an imported held one as it is.
-  const third = importHeld(h, 'held-3', [ref('m4')]);
-  third.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/9', refs: [ref('m5')], scope: 'all' });
-  assert.deepEqual(third.recoverAtStartup(() => true).retired.map((r) => r.reason), ['interrupted']);
-  assert.deepEqual(third.batches().filter((b) => b.status === 'held').map((b) => b.id), ['held-3']);
+  assert.deepEqual(batches(outbox), [], 'a retired batch leaves the view');
+  const recovered = outbox.recoverAtStartup(() => true);
+  assert.deepEqual(recovered.imported, [
+    { batchId: 'old-1', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/old-1', adds: 2, removals: 0 },
+  ]);
+  assert.deepEqual(recovered.retired, [], 'its import retired it; no start does');
+  // A later process imports nothing, and names nothing.
+  assert.deepEqual(h.reopen().recoverAtStartup(() => true).imported, []);
+  // A retract still takes off what the earlier release may have placed.
+  assert.equal(h.reopen().retract('old-1').removalsQueued, 2);
 }));
 
-test('a held batch a pre-release build wrote for a surgery is retired at a start, and release refuses it', withJournal((outbox, h) => {
+test('a hold a pre-release build wrote for a surgery\'s batch is read as nothing: a start retires the batch as a prepared one', withJournal((outbox, h) => {
   // A pre-release start held a surgery's prepared batch whose branch wasn't
-  // active, in an entry without a format field. Held and release belong to
-  // an import alone.
+  // active, in an entry without a format field.
   const rollback = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/old', refs: [ref('m1'), ref('m2')], scope: 'all' })!;
   const suppression = outbox.prepare({
     agentName: 'cairn', sourceBranch: 'main', targetBranch: 'recovery/cairn/old', refs: [ref('m3')], scope: 'all',
@@ -639,19 +620,7 @@ test('a held batch a pre-release build wrote for a surgery is retired at a start
     }] });
   }
   const held = h.reopen();
-  assert.deepEqual(held.batches().map((b) => [b.id, b.status]), [[rollback.id, 'held'], [suppression.id, 'held']]);
-  // Before any start, as the offline CLI could:
-  assert.throws(
-    () => held.release(rollback.id),
-    (error) => error instanceof DiscordAwarenessRefusal
-      && /^Discord awareness batch \S+ is held by a pre-release build for its surgery, not imported from a pre-journal ledger: only an import is released\. A start retires it, none of its marks sent\. To apply them, switch to main and run the surgery again there, onto a new branch name, choosing marks again$/.test(error.message),
-  );
-  // A suppression's is retired only once its removals are finished, or given up.
-  assert.throws(
-    () => held.release(suppression.id),
-    (error) => error instanceof DiscordAwarenessRefusal
-      && /^Discord awareness batch \S+ is held by a pre-release build for its surgery, not imported from a pre-journal ledger: only an import is released\. A start on recovery\/cairn\/old finishes its suppression's removals and retires it, and a switch onto recovery\/cairn\/old is refused while they're pending: from any other branch, delete recovery\/cairn\/old \(the host API's branch\.delete\) to have the next start give them up and retire it\. Either way none of its marks is sent\. To apply them, switch to main and run the surgery again there, onto a new branch name, choosing marks again$/.test(error.message),
-  );
+  assert.deepEqual(held.batches().map((b) => [b.id, b.status]), [[rollback.id, 'prepared'], [suppression.id, 'prepared']]);
   assert.equal(held.pendingDispatches('discord').length, 0, 'nothing was queued');
   // A start retires the rollback's, and keeps the suppression's while its
   // removals are pending for a branch that exists.
@@ -664,13 +633,38 @@ test('a held batch a pre-release build wrote for a surgery is retired at a start
   assert.deepEqual(h.reopen().batches().map((b) => [b.id, b.status]), [[rollback.id, 'discarded'], [suppression.id, 'discarded']]);
 }));
 
-test('an imported held or active suppression whose branch is gone keeps its marks, and its retirement says so', withJournal((_outbox, h) => {
+test('a release a pre-release build recorded is history: its batch is active, and the request it queued stays due', withJournal((outbox, h) => {
+  // An import's batch a pre-release build held and then released, in
+  // entries without a format field.
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/old', refs: [ref('m1')], scope: 'all' })!;
+  h.store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { records: [{
+    t: 'held', at: 2, batchId: batch.id, reason: 'queued by an earlier release',
+    releaseActions: [{ ...ref('m1'), emoji: '💤', action: 'add' }],
+  }] });
+  h.store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { records: [
+    { t: 'released', at: 3, batchId: batch.id, by: 'operator' },
+    { t: 'requested', at: 3, opId: 'op-released', key: { ...ref('m1'), emoji: '💤' }, action: 'add', cause: { kind: 'release', batchId: batch.id } },
+  ] });
+  const after = h.reopen();
+  assert.equal(after.batches()[0].status, 'active');
+  assert.deepEqual(after.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`), ['add:m1']);
+  // A start leaves it as it is.
+  assert.deepEqual(after.recoverAtStartup(() => true).retired, []);
+  assert.equal(h.reopen().batches()[0].status, 'active');
+}));
+
+test('an imported suppression whose branch is gone is given up, with nothing sent, and its retirement says it was imported', withJournal((_outbox, h) => {
   const extra = { activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }] };
-  const outbox = importHeld(h, 'held-gone', [ref('m1')], extra);
+  importLegacyBatch(h, 'never-gone', [ref('m1')], extra);
+  const outbox = importLegacyBatch(h, 'active-gone', [ref('m2')], { ...extra, status: 'active' });
   const recovered = outbox.recoverAtStartup(() => false);
-  assert.deepEqual(recovered.retired.map((r) => [r.batchId, r.reason, r.marks, r.imported]), [['held-gone', 'branch-gone', 0, 'held']]);
-  // Its marks are still the operator's to release.
-  assert.equal(h.reopen().release('held-gone').addsQueued, 1);
+  assert.deepEqual(recovered.retired.map((r) => [r.batchId, r.reason, r.marks, r.imported]), [
+    ['never-gone', 'branch-gone', 0, true],
+    ['active-gone', 'branch-gone', 0, true],
+  ]);
+  const after = h.reopen();
+  assert.deepEqual(after.batches().map((b) => [b.id, b.status]), [['never-gone', 'discarded'], ['active-gone', 'active']]);
+  assert.equal(after.pendingDispatches('discord').length, 0);
 }));
 
 test('a suppression interval with a policy other than explicit is not a pending suppression', withJournal((outbox) => {
@@ -685,32 +679,29 @@ test('a suppression interval with a policy other than explicit is not a pending 
   assert.deepEqual(recovered.retired.map((r) => r.reason), ['interrupted']);
 }));
 
-test('the framework\'s release, retract and cancel each record their act in the operator log, done or refused', withJournal(async (_outbox, h) => {
-  const outbox = importHeld(h, 'held-log', [ref('m1')]);
+test('the framework\'s retract and cancel each record their act in the operator log, done or refused', withJournal(async (outbox) => {
+  const batch = activeBatch(outbox, [ref('m1')]);
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.discordAwarenessOutbox = outbox;
   framework.deliverDiscordAwarenessInBackground = () => {};
   const logged: Array<Record<string, any>> = [];
   framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
   const requester = { via: 'test', name: 'op' };
-  let released: unknown;
   let retracted: unknown;
   let cancelled: unknown;
   await muted(async () => {
-    released = framework.releaseDiscordAwareness('held-log', { requester });
-    retracted = framework.retractDiscordAwareness('held-log', { requester });
-    cancelled = framework.cancelDiscordAwareness('held-log', { requester });
-    assert.throws(() => framework.releaseDiscordAwareness('held-log', { requester }),
-      (error) => error instanceof Error && (error as { code?: string }).code === 'invalid' && /is active, not held/.test(error.message));
+    retracted = framework.retractDiscordAwareness(batch.id, { requester });
+    cancelled = framework.cancelDiscordAwareness(batch.id, { requester });
+    assert.throws(() => framework.retractDiscordAwareness('no-such-batch', { requester }),
+      (error) => error instanceof Error && (error as { code?: string }).code === 'invalid' && /not found/.test(error.message));
   });
   assert.deepEqual(logged.map((entry) => [entry.kind, entry.agent, entry.requester, entry.params]), [
-    ['awareness-release', '*', requester, { batchId: 'held-log' }],
-    ['awareness-retract', '*', requester, { target: 'held-log' }],
-    ['awareness-cancel', '*', requester, { target: 'held-log' }],
-    ['awareness-release', '*', requester, { batchId: 'held-log' }],
+    ['awareness-retract', '*', requester, { target: batch.id }],
+    ['awareness-cancel', '*', requester, { target: batch.id }],
+    ['awareness-retract', '*', requester, { target: 'no-such-batch' }],
   ]);
-  assert.deepEqual(logged.slice(0, 3).map((entry) => entry.result), [released, retracted, cancelled].map((receipt) => ({ ...(receipt as object) })));
-  assert.match(logged[3].error, /is active, not held/, 'a refused act is recorded with its refusal');
+  assert.deepEqual(logged.slice(0, 2).map((entry) => entry.result), [retracted, cancelled].map((receipt) => ({ ...(receipt as object) })));
+  assert.match(logged[2].error, /not found/, 'a refused act is recorded with its refusal');
 }));
 
 test('settleActivation says what the journal will do when activation cannot be recorded', withJournal((outbox) => {
@@ -805,7 +796,7 @@ test('an entry in a format this build can\'t read stops the reader; one written 
   assert.throws(() => h.reopen().batches(), /is in format 2, which this build can't read \(it reads format 1\)/);
 }));
 
-test('v2 import keeps what the old ledger recorded as evidence, holds pending work, and happens once', withJournal((_outbox, h) => {
+test('v2 import keeps what the old ledger recorded as evidence, retires pending work unsent, and happens once', withJournal((_outbox, h) => {
   const entry = (messageId: string, fields: Record<string, unknown>) => ({ ...ref(messageId), lastAction: 'add', ...fields });
   const legacy = {
     version: 2,
@@ -849,8 +840,11 @@ test('v2 import keeps what the old ledger recorded as evidence, holds pending wo
     // u1: its one outcome unrecorded; g3: two earlier attempts unrecorded.
     outcomesUnrecorded: 3,
   });
-  assert.equal(views.get('pending-batch')!.status, 'held');
-  assert.equal(views.get('pending-batch')!.held!.releaseActions, 1);
+  // Its pending add is retired, never sent, and named at the start that
+  // imported it.
+  assert.equal(views.get('pending-batch')!.status, 'active');
+  assert.deepEqual(outbox.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds, b.removals]), [['pending-batch', 1, 0]]);
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
 
   // Retract carries out the act for every ref and discloses what history leaves open.
   const receipt = outbox.retract('dd34b043', 'operator');
@@ -882,22 +876,21 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify(legacy));
   const outbox = h.reopen();
-  // The operator releases the held add, it lands, and then they retract it.
-  outbox.release('restored', 'operator');
-  answer(outbox, 'm1', 'confirmed');
+  // The operator retracts what the earlier release may have placed, and the
+  // removal lands.
   outbox.retract('restored', 'operator');
+  answer(outbox, 'm1', 'confirmed');
   const view = outbox.view();
   const operations = outbox.operations();
 
   // A byte-different copy of the same ledger (pretty-printed, as a backup
   // may be) is put back at the old path: it is moved aside and changes
-  // nothing. Before, the batch read as held again, with its evidence
-  // doubled, and a second release would have re-added the retracted mark.
+  // nothing. Before, the batch was imported again, with its evidence
+  // doubled.
   writeFileSync(h.legacyPath, JSON.stringify(legacy, null, 2));
   const restored = h.reopen();
   assert.deepEqual(restored.view(), view);
   assert.deepEqual(restored.operations(), operations);
-  assert.throws(() => restored.release('restored'), /is active, not held/);
   assert.equal(existsSync(h.legacyPath), false);
   // Each copy is retired where it can be read again: the first keeps its
   // name, and the later one is kept beside it rather than over it.
@@ -907,15 +900,16 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
   assert.equal(readFileSync(join(h.dir, 'recovery', retired()[1]), 'utf8'), JSON.stringify(legacy, null, 2));
 
   // A file that also holds a batch the journal has never seen imports that
-  // batch alone, once even if the file lists it twice, held like any import.
+  // batch alone, once even if the file lists it twice, its pending work
+  // retired like any import's.
   writeFileSync(h.legacyPath, JSON.stringify({
     version: 2,
     batches: [pending('restored', 'm1'), pending('later', 'm2'), pending('later', 'm2')],
   }));
   const widened = h.reopen();
   const later = batches(widened).find((v) => v.id === 'later')!;
-  assert.equal(later.status, 'held');
-  assert.equal(later.held!.releaseActions, 1);
+  assert.equal(later.status, 'active');
+  assert.deepEqual(widened.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds]), [['later', 1]]);
   assert.deepEqual(later.legacy, { entries: 1, lastAddConfirmed: 0, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
   assert.deepEqual(widened.view().filter((v) => v.id !== 'later'), view);
   assert.deepEqual(widened.operations(), operations);
@@ -964,16 +958,21 @@ test('legacy evidence reads outcomes from the old writer\'s lastError, never fro
   const outbox = h.reopen();
   const [view] = batches(outbox);
   assert.deepEqual(view.legacy, { entries: 2, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
-  assert.equal(view.status, 'held', "the old writer's pending removal is held for release");
+  // The old writer's pending removal is retired, never sent, and named.
+  assert.equal(view.status, 'active');
+  assert.deepEqual(outbox.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds, b.removals]), [['reconciled', 0, 1]]);
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
 
-  // The released removal's own requests are disclosed by cancel, like adds.
-  assert.equal(outbox.release('reconciled').removalsQueued, 1);
+  // A retract takes the mark off, and its own requests are disclosed when
+  // it is cancelled; the batch's cancel discloses what the evidence leaves
+  // unrecorded.
+  const { requestId } = outbox.retract('reconciled');
   answer(outbox, 'c1', 'unknown');
   answer(outbox, 'c1', 'confirmed');
-  const receipt = outbox.cancel('reconciled');
+  const receipt = outbox.cancel(requestId);
   assert.equal(receipt.unresolvedAttempts, 1, 'the unknown removal attempt may still land');
   assert.equal(receipt.confirmed, 1);
-  assert.equal(receipt.legacyOutcomesUnrecorded, 1);
+  assert.equal(outbox.cancel('reconciled').legacyOutcomesUnrecorded, 1);
 }));
 
 test('an imported active suppression is not proof its body completed: startup still verifies its intervals', withJournal((_outbox, h) => {
@@ -1043,7 +1042,7 @@ test('framework drain classifies outcomes from what reached the server', async (
         if (args.messageId === 'm2') return { isError: true, content: [{ type: 'text', text: 'Unknown Message' }] };
         if (args.messageId === 'm3') throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent');
         if (args.messageId === 'm4') throw new McplRequestError('did not respond', 'no-response');
-        if (args.messageId === 'm6') throw new McplRequestError('Internal error', 'error-response', -32603);
+        if (args.messageId === 'm6') throw new McplRequestError('Internal error', 'error-response');
         if (args.messageId === 'm7') throw new TypeError('transport went away');
         return { content: [{ type: 'text', text: 'Reaction applied' }] };
       },
@@ -1340,28 +1339,33 @@ test('a pre-release in-place batch whose marks were cancelled is retired with a 
   ]);
 }));
 
-test('an imported suppression given up for its gone branch is alerted in its own words, which keep its marks', () => {
+test('an imported batch is reported in its own words: a suppression given up for its gone branch alerts, and a retirement is only logged', () => {
   const alerts: Array<{ kind: string; message: string; key?: string }> = [];
+  const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.opsAlert = (kind: string, _agent: string, message: string, opts?: { key?: string }) => { alerts.push({ kind, message, key: opts?.key }); };
-  const base = { agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/x', marks: 0, suppression: true, reason: 'branch-gone' as const };
-  framework.reportRetiredAwareness({ ...base, batchId: 'held-x', imported: 'held' });
-  framework.reportRetiredAwareness({ ...base, batchId: 'active-x', imported: 'active' });
+  const base = { agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/x', marks: 0, suppression: true, imported: true };
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    framework.reportRetiredAwareness({ ...base, batchId: 'gone-x', reason: 'branch-gone' });
+    framework.reportRetiredAwareness({ ...base, batchId: 'done-x', reason: 'interrupted' }, { finished: true });
+    framework.reportRetiredAwareness({ ...base, batchId: 'old-x', suppression: false, targetBranch: 'main', reason: 'interrupted' });
+  } finally {
+    console.error = error;
+  }
   assert.deepEqual(alerts, [
     {
       kind: 'discord-awareness-suppression-unfinished',
-      message: 'The imported suppression of cairn from main onto legacy/x (awareness batch held-x) is given up: legacy/x '
-        + "doesn't exist, and its removals apply only there, so they can't be checked or resumed. Its marks stay held: "
-        + 'release or cancel them through the host command marks (action release or cancel), or, with the host stopped, '
-        + 'agent-framework-recover --awareness release or cancel',
-      key: 'held-x',
+      message: 'The imported suppression of cairn from main onto legacy/x (awareness batch gone-x) is given up: legacy/x '
+        + "doesn't exist, and its removals apply only there, so they can't be checked or resumed. Its marks stay as the "
+        + 'import left them',
+      key: 'gone-x',
     },
-    {
-      kind: 'discord-awareness-suppression-unfinished',
-      message: 'The imported suppression of cairn from main onto legacy/x (awareness batch active-x) is given up: legacy/x '
-        + "doesn't exist, and its removals apply only there, so they can't be checked or resumed. Its marks stay as they were",
-      key: 'active-x',
-    },
+  ]);
+  assert.deepEqual(logged, [
+    '[discord-awareness] imported awareness batch done-x of cairn is retired; this start finished its removals on legacy/x',
+    '[discord-awareness] imported awareness batch old-x of cairn is retired',
   ]);
 });
 
@@ -1407,7 +1411,7 @@ test('each kind of retirement alert a start raises reaches the ops webhook for t
       // surgery's unapplied marks.
       framework.reportRetiredAwareness({ ...agent, batchId: `inplace-${n}`, targetBranch: 'main', marks: 1, suppression: false, reason: 'interrupted' });
       framework.reportRetiredAwareness({ ...agent, batchId: `gone-${n}`, targetBranch: `suppress/cairn/${n}`, marks: 1, suppression: true, reason: 'branch-gone' });
-      framework.reportRetiredAwareness({ ...agent, batchId: `imported-${n}`, targetBranch: `legacy/${n}`, marks: 0, suppression: true, reason: 'branch-gone', imported: 'held' });
+      framework.reportRetiredAwareness({ ...agent, batchId: `imported-${n}`, targetBranch: `legacy/${n}`, marks: 0, suppression: true, reason: 'branch-gone', imported: true });
       framework.reportRetiredAwareness({ ...agent, batchId: `interrupted-${n}`, targetBranch: `rollback/cairn/${n}`, marks: 1, suppression: false, reason: 'interrupted' });
     }
   } finally {
@@ -1514,14 +1518,14 @@ test("a start logs each suppression whose removals stay pending for another bran
   // branch's own, which this start resumes.
   const there = suppression('main', 'recovery/cairn/1', 'i1');
   suppression('old', 'main', 'i2');
-  // An imported ledger's held one, for a branch that exists.
-  importHeld(h, 'held-x', [ref('m1')], { activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i3', toId: 'i3' }] });
+  // An imported ledger's, for a branch that exists.
+  importLegacyBatch(h, 'legacy-x', [ref('m1')], { activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i3', toId: 'i3' }] });
   const logged: string[] = [];
   const alerts: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.discordAwarenessOutbox = h.reopen();
   framework.store = {
-    listBranches: () => ['main', 'old', 'recovery/cairn/1', 'legacy/held-x'].map((name) => ({ name })),
+    listBranches: () => ['main', 'old', 'recovery/cairn/1', 'legacy/legacy-x'].map((name) => ({ name })),
     currentBranch: () => ({ name: 'main' }),
   };
   framework.opsAlert = (kind: string) => { alerts.push(kind); };
@@ -1538,15 +1542,72 @@ test("a start logs each suppression whose removals stay pending for another bran
       + 'a start on it finishes, and a switch onto it is refused while they\'re pending, since a partly suppressed branch '
       + 'isn\'t safe to serve from. To give the suppression up, delete recovery/cairn/1 (the host API\'s branch.delete): '
       + 'the next start finds no branch with that name and gives it up. Until then that name is refused',
-    '[discord-awareness] startup: suppression held-x of cairn has removals pending for legacy/held-x, which only a '
+    '[discord-awareness] startup: suppression legacy-x of cairn has removals pending for legacy/legacy-x, which only a '
       + 'start on it finishes, and a switch onto it is refused while they\'re pending, since a partly suppressed branch '
-      + 'isn\'t safe to serve from. To give the suppression up, delete legacy/held-x (the host API\'s branch.delete): '
+      + 'isn\'t safe to serve from. To give the suppression up, delete legacy/legacy-x (the host API\'s branch.delete): '
       + 'the next start finds no branch with that name and gives it up. Until then that name is refused',
   ].sort());
+  // The import was an earlier process's, so this start names nothing.
   assert.deepEqual(alerts, [], 'nothing was retired or given up');
 }));
 
-test('a held batch a pre-release build wrote for a surgery stays held when cancelled, and a start handles it as a cancelled prepared one', withJournal((outbox, h) => {
+test('the start that imports a pre-journal ledger raises one alert naming each batch whose undelivered marks it retired', withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 2,
+    batches: [
+      {
+        id: 'never', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1',
+        emoji: '💤', createdAt: 1,
+        refs: [ref('m1'), ref('m2')].map((r) => ({ ...r, desired: false, markerPresent: false, deliveryStatus: 'applied' })),
+      },
+      {
+        id: 'queued', status: 'active', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2',
+        emoji: '💤', createdAt: 2,
+        refs: [
+          { ...ref('m3'), desired: true, markerPresent: false, deliveryStatus: 'pending' },
+          { ...ref('m4'), desired: false, markerPresent: true, deliveryStatus: 'pending' },
+          { ...ref('m5'), desired: true, markerPresent: true, deliveryStatus: 'applied' },
+        ],
+      },
+    ],
+  }));
+  const alerts: Array<{ kind: string; agent: string; message: string }> = [];
+  const logged: string[] = [];
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessOutbox = h.reopen();
+  framework.store = { listBranches: () => [{ name: 'main' }], currentBranch: () => ({ name: 'main' }) };
+  framework.opsAlert = (kind: string, agent: string, message: string) => { alerts.push({ kind, agent, message }); };
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    framework.reconcileDiscordAwarenessAtStartup();
+  } finally {
+    console.error = error;
+  }
+  const named = 'batch never (cairn, main to rollback/cairn/1): 2 to add, 0 to remove; '
+    + 'batch queued (cairn, main to rollback/cairn/2): 1 to add, 1 to remove';
+  assert.deepEqual(alerts, [{
+    kind: 'discord-awareness-import-unsent',
+    agent: 'host',
+    message: 'The pre-journal awareness ledger is imported, and the marks an earlier release had still to add or remove '
+      + `won't be sent, since nobody chose them: ${named}. To take off the marks that release placed, retract each `
+      + 'batch through the host command marks (action retract), or, with the host stopped, agent-framework-recover '
+      + '--awareness retract',
+  }]);
+  assert.deepEqual(logged, [
+    `[discord-awareness] imported ${basename(h.legacyPath)}: 2 batch(es) had marks an earlier release had still to `
+      + `add or remove, and none of them will be sent, since nobody chose them: ${named}. Retracting a batch takes off `
+      + 'the marks that release placed',
+  ]);
+  assert.equal(framework.discordAwarenessOutbox.pendingDispatches('discord').length, 0, 'nothing was sent');
+  assert.deepEqual(
+    h.reopen().batches().map((b) => [b.id, b.status]),
+    [['never', 'discarded'], ['queued', 'active']],
+  );
+}));
+
+test('a surgery\'s batch a pre-release build held, then cancelled, is handled at a start as a cancelled prepared one', withJournal((outbox, h) => {
   const rollback = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/old', refs: [ref('m1')], scope: 'all' })!;
   const suppression = outbox.prepare({
     agentName: 'cairn', sourceBranch: 'main', targetBranch: 'recovery/cairn/old', refs: [ref('m2')], scope: 'all',
@@ -1561,7 +1622,7 @@ test('a held batch a pre-release build wrote for a surgery stays held when cance
   const held = h.reopen();
   held.cancel(rollback.id, 'operator');
   held.cancel(suppression.id, 'operator');
-  assert.deepEqual(h.reopen().batches().map((b) => [b.id, b.status, !!b.cancelled]), [[rollback.id, 'held', true], [suppression.id, 'held', true]]);
+  assert.deepEqual(h.reopen().batches().map((b) => [b.id, b.status, !!b.cancelled]), [[rollback.id, 'prepared', true], [suppression.id, 'prepared', true]]);
   // A start retires the rollback's, with no marks to apply, and keeps the
   // suppression's while its removals are pending on a branch that exists.
   const recovered = h.reopen().recoverAtStartup((name) => name === 'recovery/cairn/old');
@@ -1881,7 +1942,7 @@ test('host/command hide takes the store reservation and marks only on request, t
       assert.equal(marked.markers.queued, 1);
       const [dispatch] = h.outbox.pendingDispatches('discord');
       assert.deepEqual(dispatch.key, { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1', emoji: '🫥' });
-      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
+      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
       // Each hide that removed messages records its marks choice and the
       // receipt it returned; the refused one records nothing.
       const hides = logged.filter((entry) => entry.kind === 'hide');
@@ -2006,7 +2067,7 @@ test('an applied change\'s batch that failed before reaching the store is not sc
     assert.equal(result.markers.status, 'not-scheduled');
     const fresh = new DiscordAwarenessOutbox(h.store);
     assert.equal(fresh.batches().length, 0, 'nothing was recorded');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
     assert.equal(fresh.pendingDispatches('discord').length, 0);
     assert.match(result.markers.error, /recording the batch failed: injected sync failure/);
     assert.deepEqual(alerts, ['discord-awareness-not-scheduled']);
@@ -2032,7 +2093,7 @@ test('an applied change\'s batch that reached the store before its barrier faile
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
     assert.deepEqual(alerts, []);
   } finally {
     h.cleanup();
@@ -2052,7 +2113,7 @@ test('an applied change\'s batch is one entry with its activation: once it lands
     const [batch] = fresh.batches();
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
     assert.deepEqual(alerts, []);
   } finally {
@@ -2098,7 +2159,7 @@ test('an applied change\'s batch written but out of this view of the store is un
     const [batch] = fresh.batches();
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
   } finally {
     h.cleanup();
@@ -2293,7 +2354,6 @@ test('an operator\'s request the journal won\'t carry out is a refusal; a journa
   const batch = activeBatch(outbox, [ref('m1')]);
   assert.throws(() => outbox.cancel('no-such-batch'), DiscordAwarenessRefusal);
   assert.throws(() => outbox.retract('no-such-batch'), DiscordAwarenessRefusal);
-  assert.throws(() => outbox.release(batch.id), (error) => error instanceof DiscordAwarenessRefusal && /is active, not held/.test(error.message));
   seams.fail('sync', 'before', () => true);
   assert.throws(() => outbox.cancel(batch.id), (error) => !(error instanceof DiscordAwarenessRefusal) && /injected sync failure/.test((error as Error).message));
 }));

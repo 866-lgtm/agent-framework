@@ -31,7 +31,7 @@ interface CliOptions {
   outboxPath?: string;
   emoji?: string;
   marks: 'none' | 'addressed' | 'all';
-  awareness?: { verb: 'list' | 'cancel' | 'retract' | 'release'; target?: string };
+  awareness?: { verb: 'list' | 'cancel' | 'retract'; target?: string };
   dryRun: boolean;
   /** Every option given, as typed, so a combination can be refused rather
    *  than some of it ignored. */
@@ -44,7 +44,7 @@ const AWARENESS_OPTIONS = new Set(['--store', '--outbox', '--awareness']);
 function usage(): string {
   return `Usage:
   agent-framework-recover --store <path> --agent <name> <anchor> [options]
-  agent-framework-recover --store <path> --awareness <list|cancel ID|retract ID|all|release ID>
+  agent-framework-recover --store <path> --awareness <list|cancel ID|retract ID|all>
                               (cancel takes a batch id or a retract request id)
 
 Creates and activates a Chronicle recovery branch while the normal host is
@@ -74,26 +74,27 @@ Options:
   --help                      Show this help
 
 Awareness journal (host stopped):
-  --awareness list            Each batch: scope, counts by status, holds
+  --awareness list            Each batch: scope, counts by status
   --awareness cancel <ID>     Stop further sends of a batch's marks, or of a
                               retract's removals (never undoes anything)
   --awareness retract <ID|all>
                               Queue removal of this bot's marks (through each
                               ref's configured MCPL route) on a batch's refs,
                               or on every ref an add was ever sent for
-  --awareness release <ID>    Queue a held batch's recorded operations (an
-                              imported ledger's undelivered work)
   Each acts at once: inspect first with --awareness list. The awareness verbs
   take only --store and --outbox; anything else is refused.
 
 Queued work is delivered when the host next connects to the Discord server.
-Each recovery, and each cancel, retract or release, is recorded, best-effort,
+Each recovery, and each cancel or retract, is recorded, best-effort,
 in <store>/operator-actions.jsonl (where the host keeps its operator log,
 unless its operatorLogPath puts it elsewhere), with the OS account that ran
 it, whether it was carried out or refused: a log that can't be written says
 so on stderr, and the act stands. A dry run and a list write no entry. A
 list imports a pre-journal ledger if one is present, as the host's next
-start would. The store must exist: neither creates one.
+start would: the marks it had still to add or remove are never sent, and
+stderr names the batches they belonged to. Retracting a batch takes off
+the marks the earlier release placed. The store must exist: neither
+creates one.
 The agent host must be stopped before running this command.`;
 }
 
@@ -147,10 +148,10 @@ function parseArgs(args: string[]): CliOptions {
         const verb = value();
         if (verb === 'list') {
           options.awareness = { verb };
-        } else if (verb === 'cancel' || verb === 'retract' || verb === 'release') {
+        } else if (verb === 'cancel' || verb === 'retract') {
           options.awareness = { verb, target: value() };
         } else {
-          throw new Error('--awareness must be list, cancel <ID>, retract <ID|all> or release <ID>');
+          throw new Error('--awareness must be list, cancel <ID> or retract <ID|all>');
         }
         break;
       }
@@ -221,14 +222,12 @@ function awareness(options: CliOptions): void {
       kind: `awareness-${verb}`,
       agent: '*',
       requester: cliRequester(),
-      params: verb === 'release' ? { batchId: target } : { target },
+      params: { target },
     };
     let result: object;
     try {
       view();
-      result = verb === 'cancel' ? outbox.cancel(target!, by)
-        : verb === 'retract' ? outbox.retract(target!, by)
-        : outbox.release(target!, by);
+      result = verb === 'cancel' ? outbox.cancel(target!, by) : outbox.retract(target!, by);
     } catch (error) {
       recordOperatorAction(options.storePath!, { ...logBase, error: errorMessage(error) });
       throw error;

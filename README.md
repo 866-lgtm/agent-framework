@@ -176,7 +176,7 @@ If the branch is made but the marks can't be recorded, the output's `markers`
 says so and the branch stands. Like a live surgery, the recovery (with its
 marks choice and receipt) is recorded in the store's operator log,
 `operator-actions.jsonl`, with the OS account that ran it; so is each
-`--awareness` cancel, retract and release. A dry run and a list record
+`--awareness` cancel and retract. A dry run and a list record
 nothing. The store must exist: a path that holds none is refused, never
 created.
 Portal and other non-Discord records are ignored.
@@ -223,9 +223,8 @@ normal agent host must be stopped while this command has the Chronicle store
 open.
 
 With the host stopped, the same command inspects and controls the awareness
-journal: `--awareness list`, `--awareness cancel <batch|retract-request>`,
-`--awareness retract <batch|all>` and `--awareness release <batch>` behave as
-the live controls described below. They take only `--store` and `--outbox`,
+journal: `--awareness list`, `--awareness cancel <batch|retract-request>` and
+`--awareness retract <batch|all>` behave as the live controls described below. They take only `--store` and `--outbox`,
 and refuse a recovery's options given with them.
 
 For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. When the awareness ledger exists but can't be read, a runtime connect reads it first and refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart refuses before it stops the running child. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
@@ -425,8 +424,7 @@ const result = await framework.rollbackToMessage('cairn', {
   which may come after the server acted, counts as unanswered.
 - **Marks are one-shot.** Switching branches, a redo and restarts never
   request a mark or a removal of their own: what goes out is what a surgery,
-  a hide or turn undo (the marks chosen for it), a release or a retract
-  recorded, and a start's delivery sends what of that hasn't gone out. The
+  a hide or turn undo (the marks chosen for it) or a retract recorded, and a start's delivery sends what of that hasn't gone out. The
   journal is an append-only history of requests and their attempts, kept as
   typed records in the Chronicle store: it survives rollbacks, branch
   deletion and a killed process, and lives with its store. Each request is
@@ -438,7 +436,7 @@ const result = await framework.rollbackToMessage('cairn', {
   its latest answer. Between opposite requests for one reaction, the later
   *authorization* wins, whenever each request was created: a surgery's adds
   carry the moment of its marks choice, even when activation comes later, so
-  a retract made in between prevails; a release is a new act. A record that
+  a retract made in between prevails. A record that
   certifies a body change (an activation, a completed suppression, a
   retirement, or the batch a hide or turn undo records after its change) is
   written only after that change is synced. A journal write the store took
@@ -471,7 +469,7 @@ const result = await framework.rollbackToMessage('cairn', {
   ledger that can't be read, until it is repaired.
 - **Operator controls,** each that changes the journal recorded in the
   operator log (a list or a preview records nothing); once `stop()`
-  has begun, cancel, retract and release refuse, like every operator entry
+  has begun, cancel and retract refuse, like every operator entry
   point:
   - `listDiscordAwareness()` lists batches and retract requests;
   - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
@@ -480,20 +478,14 @@ const result = await framework.rollbackToMessage('cairn', {
     including earlier attempts later answered, any of which may still land;
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
-    of the batch (or of every batch that isn't retired, whether prepared,
-    held or active, and every message an imported ledger recorded), whatever
+    of the batch (or of every batch that isn't retired, whether prepared or
+    active, and every message an imported ledger recorded), whatever
     history says: removing an absent reaction does nothing. As the latest
     authorization for those messages, it stops adds that haven't ended and
     any an earlier choice would request later (a prepared batch's
-    activation); cancelling it never revives them. A held batch released
-    after it is a new act, whose adds go out. Its receipt discloses earlier
+    activation); cancelling it never revives them. Its receipt discloses earlier
     add requests whose outcome is unknown (an unknown removal can't bring a
     mark back) and imported history that leaves outcomes unrecorded;
-  - `releaseDiscordAwareness(batch)` queues a held batch: an imported
-    ledger's undelivered work. A batch a pre-release build held for its
-    surgery is held too, and is refused: a start retires it, none of its
-    marks sent, except that one whose suppression's removals are pending on
-    a branch that exists is kept until a start on that branch finishes them;
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
     a new branch that a suppression with pending removals names as its
     target, cancelled or not, since a start on a branch with that name
@@ -514,8 +506,8 @@ const result = await framework.rollbackToMessage('cairn', {
   (default `none`; any other value is refused) and return `markers`. Each
   holds the store like every surgery, so it is refused while any agent
   sharing the store is mid-turn. The `marks` verb takes `action: 'list'
-  | 'cancel' | 'retract' | 'release'` with a `target` (a batch id; for cancel
-  also a retract request id; for retract also `all`).
+  | 'cancel' | 'retract'` with a `target` (a batch id; for cancel also a
+  retract request id; for retract also `all`).
 
 A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
 store, or `discordAwarenessOutboxPath`) is imported once on first use and the
@@ -527,8 +519,14 @@ establishes; the old writer's delivery status, labelled as the
 reconciliation state it was; and how many attempt outcomes it leaves
 unrecorded), never as a claim about what is on Discord,
 and an imported `active` suppression is not taken as proof that its body
-completed: startup verifies and resumes its intervals on its branch. Its
-undelivered work is held for an explicit release.
+completed: startup verifies and resumes its intervals on its branch. The
+work it had still to do is never sent, since nobody chose it: a batch it
+never activated is retired (a suppression whose body may be pending, once a
+start on its branch finishes the body), and pending adds and removals are
+dropped. The import names each batch that had such work, with how many
+adds and removals, in a `discord-awareness-import-unsent` ops alert at the
+host's start, or on stderr when the CLI imports it, and a retract of a batch
+takes off the marks the earlier release placed.
 
 ## Observability
 

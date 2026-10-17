@@ -425,7 +425,6 @@ import {
   type DiscordAwarenessCancelReceipt,
   type DiscordAwarenessMarks,
   type DiscordAwarenessPrepareInput,
-  type DiscordAwarenessReleaseReceipt,
   type DiscordAwarenessRetractReceipt,
   type DiscordAwarenessRetirement,
   type DiscordAwarenessScope,
@@ -6672,8 +6671,7 @@ export class AgentFramework {
     awareness?:
       | DiscordAwarenessView[]
       | DiscordAwarenessCancelReceipt
-      | DiscordAwarenessRetractReceipt
-      | DiscordAwarenessReleaseReceipt;
+      | DiscordAwarenessRetractReceipt;
     hidden?: number;
     /** For `hide`: the Discord (channelId, messageId) of each removed message
      *  that carried one. Marking is the framework's (see `marks`/`markers`);
@@ -6735,11 +6733,8 @@ export class AgentFramework {
           case 'retract':
             if (!target) return { ok: false, error: 'marks retract needs target (a batch id, or all)' };
             return { ok: true, awareness: this.retractDiscordAwareness(target, by) };
-          case 'release':
-            if (!target) return { ok: false, error: 'marks release needs target (a held batch id)' };
-            return { ok: true, awareness: this.releaseDiscordAwareness(target, by) };
           default:
-            return { ok: false, error: 'marks needs action list, cancel, retract or release' };
+            return { ok: false, error: 'marks needs action list, cancel or retract' };
         }
       } catch (error) {
         return {
@@ -8389,19 +8384,6 @@ export class AgentFramework {
     return receipt;
   }
 
-  /** Release a held batch (an imported ledger's undelivered work): queue its
-   *  recorded operations, explicitly. */
-  releaseDiscordAwareness(
-    batchId: string,
-    opts: { requester?: OperatorRequester; note?: string } = {},
-  ): DiscordAwarenessReleaseReceipt {
-    this.refuseOperatorAfterStop('awareness release');
-    const receipt = this.awarenessOperatorAction('awareness-release', { batchId }, opts, () =>
-      this.discordAwarenessOutbox.release(batchId, describeRequester(opts.requester)));
-    this.deliverDiscordAwarenessInBackground('release', 'operator');
-    return receipt;
-  }
-
   private awarenessOperatorAction<T extends object>(
     kind: string,
     params: Record<string, unknown>,
@@ -8599,7 +8581,7 @@ export class AgentFramework {
    * start delivers what is due.
    */
   private deliverDiscordAwarenessInBackground(
-    occasion: 'rollback' | 'suppress' | 'hide' | 'undo' | 'retract' | 'release' | 'startup' | 'connect' | 'list-change' | 'reconnect',
+    occasion: 'rollback' | 'suppress' | 'hide' | 'undo' | 'retract' | 'startup' | 'connect' | 'list-change' | 'reconnect',
     agentName: string,
   ): void {
     if (this.stopHasBegun()) {
@@ -16444,13 +16426,16 @@ export class AgentFramework {
           agentName: batch.agentName,
           sourceBranch: batch.sourceBranch,
           targetBranch: batch.targetBranch,
-          marks: batch.cancelled ? 0 : batch.refs.length,
+          // An import's undelivered marks were reported as its import
+          // retired them.
+          marks: batch.cancelled || batch.scope === 'legacy' ? 0 : batch.refs.length,
           suppression: true,
           reason: 'interrupted',
+          ...(batch.scope === 'legacy' ? { imported: true } : {}),
         }, { finished: true });
       } else {
-        // An imported ledger's held or active batch (completeSuppression
-        // retires every other one): its marks are the operator's, as they were.
+        // An imported ledger's active batch (completeSuppression retires
+        // every other one): its marks stay as they were.
         console.error(`[discord-awareness] completed suppression body ${batch.id} (marks ${batch.status})`);
       }
     }
@@ -16486,6 +16471,22 @@ export class AgentFramework {
         `[discord-awareness] startup: retired ${recovered.retired.length - gone} batch(es) a surgery or an in-place ` +
           `change left unfinished, none of their marks sent; gave up ${gone} suppression(s) whose branch doesn't ` +
           `exist; recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
+      );
+    }
+    if (recovered.imported.length > 0) {
+      // This start imported a pre-journal ledger: the work it had still to
+      // do is retired, none of it sent, since nobody chose it. A retract
+      // takes off what that release placed.
+      this.opsAlert(
+        'discord-awareness-import-unsent',
+        'host',
+        `The pre-journal awareness ledger is imported, and the marks an earlier release had still to add or ` +
+          'remove won\'t be sent, since nobody chose them: ' +
+          recovered.imported.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
+            `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
+          '. To take off the marks that release placed, retract each batch through the host command marks ' +
+          '(action retract), or, with the host stopped, agent-framework-recover --awareness retract',
+        { data: { batches: recovered.imported } },
       );
     }
     this.logPendingDiscordSuppressions(recovered.pending, this.store.currentBranch().name);
@@ -16540,6 +16541,25 @@ export class AgentFramework {
    */
   private reportRetiredAwareness(retirement: DiscordAwarenessRetirement, opts: { finished?: boolean } = {}): void {
     const { batchId, agentName, sourceBranch, targetBranch, marks } = retirement;
+    if (retirement.imported) {
+      // A pre-journal ledger's batch: its import retired and reported the
+      // work it had still to do. A suppression's body that ledger may have
+      // recorded applied: nothing says it wasn't finished.
+      if (retirement.reason === 'branch-gone') {
+        this.opsAlert(
+          'discord-awareness-suppression-unfinished',
+          agentName,
+          `The imported suppression of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ` +
+            `${batchId}) is given up: ${targetBranch} doesn't exist, and its removals apply only there, so they ` +
+            'can\'t be checked or resumed. Its marks stay as the import left them',
+          { data: { batchId, imported: true }, key: batchId },
+        );
+        return;
+      }
+      const body = opts.finished ? `; this start finished its removals on ${targetBranch}` : '';
+      console.error(`[discord-awareness] imported awareness batch ${batchId} of ${agentName} is retired${body}`);
+      return;
+    }
     if (!retirement.suppression && sourceBranch === targetBranch) {
       // An in-place change (a hide, a turn undo) left between its batch and
       // its activation, as a pre-release build's two appends could: the
@@ -16566,23 +16586,6 @@ export class AgentFramework {
     const redo = `switch to ${sourceBranch}, which still has every message it removed, and redo the ${surgery} there, ` +
       'onto a new branch name';
     const unmarked = `Its ${marks} awareness mark(s) weren't applied, since a start never activates a surgery's marks. `;
-    if (retirement.reason === 'branch-gone' && retirement.imported) {
-      // A pre-journal ledger's suppression, whose body that ledger may have
-      // recorded applied: nothing says it wasn't finished. Its marks are the
-      // operator's, and stay as the ledger left them.
-      this.opsAlert(
-        'discord-awareness-suppression-unfinished',
-        agentName,
-        `The imported suppression of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ` +
-          `${batchId}) is given up: ${targetBranch} doesn't exist, and its removals apply only there, so they can't be ` +
-          'checked or resumed. ' + (retirement.imported === 'held'
-            ? 'Its marks stay held: release or cancel them through the host command marks (action release or ' +
-              'cancel), or, with the host stopped, agent-framework-recover --awareness release or cancel'
-            : 'Its marks stay as they were'),
-        { data: { batchId, imported: retirement.imported }, key: batchId },
-      );
-      return;
-    }
     if (retirement.reason === 'branch-gone') {
       this.opsAlert(
         'discord-awareness-suppression-unfinished',

@@ -103,10 +103,6 @@ export class McplRequestError extends Error {
   constructor(
     message: string,
     readonly outcome: 'not-sent' | 'error-response' | 'no-response',
-    readonly code?: number,
-    /** The JSON-RPC error's `data`, verbatim, when the server supplied one
-     *  (e.g. which parts of a multi-part send were posted). */
-    readonly data?: unknown,
   ) {
     super(message);
     this.name = 'McplRequestError';
@@ -1436,8 +1432,6 @@ export class McplServerConnection extends EventEmitter {
         new McplRequestError(
           `MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`,
           'error-response',
-          typeof response.error.code === 'number' ? response.error.code : undefined,
-          (response.error as { data?: unknown }).data,
         ),
       );
     } else {

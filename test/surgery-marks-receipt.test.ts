@@ -701,7 +701,6 @@ describe('surgery and awareness marks', () => {
     assert.equal(after.id, batch.id);
     assert.equal(after.status, 'discarded', 'retired: none of its messages were removed');
     assert.ok(cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'its message is still there');
-    assert.throws(() => framework.releaseDiscordAwareness(batch.id), /is discarded, not held/);
     assert.equal(outbox().operations().length, 0);
   });
 

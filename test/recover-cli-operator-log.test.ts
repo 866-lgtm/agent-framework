@@ -4,8 +4,8 @@
  * The live surfaces record every operator mutation (who asked, from where,
  * what it did) in `<store>/operator-actions.jsonl`. The CLI acts on the same
  * store while the host is stopped: an offline recovery, which can choose to
- * publish awareness marks, and the awareness controls (cancel, retract,
- * release). Each is recorded the same way, done or refused, so the history
+ * publish awareness marks, and the awareness controls (cancel and retract).
+ * Each is recorded the same way, done or refused, so the history
  * says who chose to publish or stop marks whichever surface they used. A dry
  * run and a list change nothing and record nothing.
  */
@@ -77,11 +77,11 @@ test('the offline awareness controls record each act in the operator log, done o
       'the retract\'s removals are in the journal',
     );
 
-    const refused = recover(storePath, '--awareness', 'release', batch.id);
-    assert.equal(refused.status, 1, 'releasing a batch that is not held is refused');
+    const refused = recover(storePath, '--awareness', 'retract', 'no-such-batch');
+    assert.equal(refused.status, 1, 'retracting a batch that does not exist is refused');
 
     const entries = operatorLog(storePath);
-    assert.deepEqual(entries.map((entry) => entry.kind), ['awareness-cancel', 'awareness-retract', 'awareness-release']);
+    assert.deepEqual(entries.map((entry) => entry.kind), ['awareness-cancel', 'awareness-retract', 'awareness-retract']);
     for (const entry of entries) {
       assert.equal(entry.agent, '*');
       assert.equal(entry.requester?.via, 'cli');
@@ -92,9 +92,9 @@ test('the offline awareness controls record each act in the operator log, done o
     assert.deepEqual(entries[0].result, receipt);
     assert.deepEqual(entries[1].params, { target: 'all' });
     assert.equal(entries[1].result?.removalsQueued, 2);
-    assert.deepEqual(entries[2].params, { batchId: batch.id });
+    assert.deepEqual(entries[2].params, { target: 'no-such-batch' });
     assert.equal(entries[2].result, undefined);
-    assert.match(entries[2].error ?? '', /is active, not held/);
+    assert.match(entries[2].error ?? '', /not found/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -119,29 +119,15 @@ test('--dry-run with an awareness control is refused before the store opens: not
       agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all',
     })!;
     outbox.activate(active.id);
-    // Only an import holds a batch: a pre-journal ledger's undelivered work.
-    const legacyPath = join(storePath, 'recovery', 'discord-awareness-outbox.json');
-    mkdirSync(join(storePath, 'recovery'), { recursive: true });
-    writeFileSync(legacyPath, JSON.stringify({
-      version: 2,
-      batches: [{
-        id: 'held-1', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/interrupted',
-        emoji: '💤', createdAt: 1, refs: [{ ...ref('m2'), desired: false, markerPresent: false, deliveryStatus: 'applied' }],
-      }],
-    }));
-    new DiscordAwarenessOutbox(store, { legacyPath }).batches();
-    const held = { id: 'held-1' };
     store.close();
     const before = journal();
-    const heldView = before.view.find((v) => v.id === held.id);
-    assert.equal(heldView?.kind === 'batch' ? heldView.status : undefined, 'held');
 
-    for (const control of [['cancel', active.id], ['retract', 'all'], ['release', held.id]]) {
+    for (const control of [['cancel', active.id], ['retract', 'all']]) {
       const run = recover(storePath, '--awareness', ...control, '--dry-run');
       assert.equal(run.status, 1, `${control[0]} --dry-run is refused`);
       assert.match(run.stderr, /--dry-run previews a recovery; it does not apply to --awareness/);
     }
-    assert.deepEqual(journal(), before, 'nothing was cancelled, retracted or released');
+    assert.deepEqual(journal(), before, 'nothing was cancelled or retracted');
     assert.deepEqual(operatorLog(storePath), [], 'and nothing was recorded');
 
     const missing = join(dir, 'no-such-store');
@@ -258,7 +244,7 @@ test('a mistyped marks choice, an awareness verb it doesn\'t know, and --awarene
     assert.match(typo.stderr, /--marks must be none, addressed or all/);
     const unknownVerb = recover(storePath, '--awareness', 'purge');
     assert.equal(unknownVerb.status, 1);
-    assert.match(unknownVerb.stderr, /--awareness must be list, cancel <ID>, retract <ID\|all> or release <ID>/);
+    assert.match(unknownVerb.stderr, /--awareness must be list, cancel <ID> or retract <ID\|all>/);
     const storeless = spawnSync(process.execPath, [CLI, '--awareness', 'list'], { encoding: 'utf8' });
     assert.equal(storeless.status, 1);
     assert.match(storeless.stderr, /--awareness needs --store/);
@@ -309,13 +295,13 @@ test("a list or a control on a journal that can't be read is refused, saying run
     assert.equal(listed.status, 1);
     assert.match(listed.stderr, refusal);
     // Every control reads the journal first.
-    for (const control of [['cancel', 'some-batch'], ['retract', 'all'], ['release', 'some-batch']]) {
+    for (const control of [['cancel', 'some-batch'], ['retract', 'all']]) {
       const run = recover(storePath, '--awareness', ...control);
       assert.equal(run.status, 1, control.join(' '));
       assert.match(run.stderr, refusal);
     }
     const refused = operatorLog(storePath);
-    assert.deepEqual(refused.map((entry) => entry.kind), ['awareness-cancel', 'awareness-retract', 'awareness-release']);
+    assert.deepEqual(refused.map((entry) => entry.kind), ['awareness-cancel', 'awareness-retract']);
     for (const entry of refused) {
       assert.match(entry.error ?? '', /^The Discord awareness journal, or the pre-journal ledger it imports \(--outbox\), can't be read/);
     }

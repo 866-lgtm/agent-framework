@@ -64,11 +64,9 @@ const rejectsWith = async (promise: Promise<unknown>, outcome: McplRequestError[
   return caught as McplRequestError;
 };
 
-test('an error response is error-response, with its code and data kept', async () => {
+test('an error response is error-response, and the message is unchanged', async () => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   const err = await rejectsWith(connection.sendToolsCall('fail', {}), 'error-response');
-  assert.equal(err.code, -32001);
-  assert.deepEqual(err.data, { posted: ['111'] });
   assert.match(err.message, /returned error for tools\/call: \[-32001\] POSTED: part 1 of 2/);
 });
 

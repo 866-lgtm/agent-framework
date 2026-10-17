@@ -507,7 +507,6 @@ describe('stop() with an operator operation in flight', () => {
     ['awareness sync', (f) => f.syncDiscordAwarenessMarkers()],
     ['awareness cancel', (f) => f.cancelDiscordAwareness('no-such-batch')],
     ['awareness retract', (f) => f.retractDiscordAwareness('all')],
-    ['awareness release', (f) => f.releaseDiscordAwareness('no-such-batch')],
   ];
   for (const [verb, call] of lateCalls) {
     it(verb + ' is refused during teardown and after stop(), with no writes and no operator log', async () => {
