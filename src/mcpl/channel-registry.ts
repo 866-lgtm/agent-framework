@@ -60,18 +60,6 @@ class ChannelLifecycleCancelledError extends Error {}
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
 /**
- * A server-chosen channel id for a host log line: as it is when it's a short
- * token of visible ASCII, as composite ids such as `discord:g1:c1` are, and
- * otherwise only described, so an odd id can't add a line or a field.
- */
-function plainIdForLog(id: unknown): string {
-  if (typeof id === 'string' && /^[\x21-\x7e]{1,200}$/.test(id)) return id;
-  return typeof id === 'string'
-    ? `(not a plain id: a ${[...id].length}-character string)`
-    : `(not a plain id: ${id === null ? 'null' : typeof id})`;
-}
-
-/**
  * What a channels/open answer says about which channel the server opened:
  * its `channel.id`, or else the `channelId` of a history item. Each is
  * evidence. A string other than the requested id names another channel (ids
@@ -2452,9 +2440,11 @@ export class ChannelRegistry {
         // open it made if the host wants that channel closed.
         const substitute = open ? substitutedChannel(result, channelId) : undefined;
         if (substitute !== undefined) {
-          const answered = plainIdForLog(substitute.kind === 'other' ? substitute.id : substitute.value);
+          // Each id prints as every id this module logs does (logValue), so
+          // an odd one can't add a line or a field.
+          const answered = logValue(substitute.kind === 'other' ? substitute.id : substitute.value);
           console.error(
-            `[channel-open-substituted] server=${serverId} requested=${plainIdForLog(channelId)} answered=${answered}`,
+            `[channel-open-substituted] server=${serverId} requested=${logValue(channelId)} answered=${answered}`,
           );
           this.emitTraceFn({ type: 'mcpl:channel-open-substituted', serverId, channelId, answeredFor: answered });
           // A malformed id names nothing registered here, so there is

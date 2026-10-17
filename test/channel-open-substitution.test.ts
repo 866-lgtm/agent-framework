@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { logValue } from '../src/mcpl/log-value.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -193,25 +194,16 @@ test('a substituted answer on a receipt made stale by retargeting is retried, no
     'and the channel it opened instead is still closed again');
 });
 
-test('odd ids are described in the log line, never printed raw', async () => {
+test("the substitution line and its trace print each id as the module's other log lines do, an odd one escaped", async () => {
   const forged = 'y\n[channel-open-substituted] server=other requested=x answered=x';
   const f = fixture(() => ({ channel: { ...descriptor('y'), id: forged } }));
   await f.registry.handleChanged('test', { added: [descriptor('x')] });
   const { lines } = await capturingErrors(() => f.openX());
   const logged = lines.filter((l) => l.includes('channel-open-substituted'));
-  assert.deepEqual(logged, [
-    `[channel-open-substituted] server=test requested=x answered=(not a plain id: a ${forged.length}-character string)`,
-  ]);
-  assert.equal(f.substituted()[0]?.answeredFor, `(not a plain id: a ${forged.length}-character string)`,
-    'the trace records the same bounded form, not the raw value');
-});
-
-test('an odd id is measured in characters, not UTF-16 units', async () => {
-  const f = fixture(() => ({ channel: { ...descriptor('y'), id: 'y\u{1F600}' } }));
-  await f.registry.handleChanged('test', { added: [descriptor('x')] });
-  const { lines } = await capturingErrors(() => f.openX());
-  assert.deepEqual(lines.filter((l) => l.includes('channel-open-substituted')),
-    ['[channel-open-substituted] server=test requested=x answered=(not a plain id: a 2-character string)']);
+  assert.deepEqual(logged, [`[channel-open-substituted] server=test requested=x answered=${logValue(forged)}`]);
+  const answered = logged[0]!.slice(logged[0]!.indexOf(' answered=') + ' answered='.length);
+  assert.doesNotMatch(answered, /[\n =]/, 'the forged id adds no line, field or value of its own');
+  assert.equal(f.substituted()[0]?.answeredFor, logValue(forged), 'the trace records the same escaped form');
 });
 
 test('an answer whose channel id is not a string fails the open, and closes nothing', async () => {
@@ -227,7 +219,7 @@ test('an answer whose channel id is not a string fails the open, and closes noth
     assert.equal(result.success, false);
     assert.match(String(result.error), /with a channel id that is not a string/);
     assert.equal(f.isOpen('x'), false);
-    assert.match(String(f.substituted()[0]?.answeredFor), /^\(not a plain id: (number|boolean)\)$/);
+    assert.match(String(f.substituted()[0]?.answeredFor), /^(5|false)$/, 'logValue prints a non-string id as its JSON text');
     assert.deepEqual(f.calls, [{ kind: 'open', id: 'x' }], 'nothing registered by that id to close');
   }
 });
