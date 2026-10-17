@@ -518,6 +518,37 @@ describe('held prose drafts, end to end', () => {
     });
   }
 
+  it("native tool mode: beside a refused wake, a module's skip_reply after a send keeps the later prose private", async () => {
+    // An unrefused plain skip_reply ends the turn, so the saved silence's
+    // 'private' over 'send' decides something only for a call whose bare name
+    // is skip_reply but whose full name isn't, here one named like a module's
+    // tool: it silences by that name, as main reads any `--skip_reply`, and
+    // neither ends the turn nor is refused. In XML tool mode the turn-end scan
+    // reads the whole turn's calls, so this case doesn't turn on the saved
+    // silence there.
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([
+          text('Private, beside the refused wake.'),
+          call('w1', 'skip_reply', { reason: 'later', wake_in_seconds: 60 }),
+          call('m1', 'tools--skip_reply', {}),
+        ], 'tool_use'),
+        createMockResponse([text('After the wake.')]),
+      ]);
+      assert.ok(h.toolResults().some((r) => /no wake was set/.test(r)), 'the wake was refused, and the turn went on');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
+      assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply or a private think)`,
+        'the refused round and the round after it stay private');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('disabled mode stays draft-free: its narration is private by configuration', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'disabled' }] });
     try {
