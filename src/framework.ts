@@ -17251,6 +17251,10 @@ export class AgentFramework {
             `replaces the framework's protective default`,
         );
       }
+      // Only a stdio server's configuration is copied, and its launch notes
+      // nothing. A dialing configuration stays the object the framework
+      // records the server's text with, since each dial notes what it sent
+      // against the object it read (noteDialSent).
       connectionConfig = { ...config };
       Object.defineProperty(connectionConfig, 'env', {
         enumerable: true,
