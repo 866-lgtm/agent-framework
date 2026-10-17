@@ -5816,7 +5816,12 @@ export class AgentFramework {
     }
     const out: Record<string, number> = {};
     for (const [name, value] of Object.entries(data?.toolResultInlineCaps ?? {})) {
-      const n = Number(value);
+      // Number() throws for an object it can't make a primitive of, such as
+      // {"toString":null}: that entry is invalid like any other, and dropped.
+      let n = Number.NaN;
+      try {
+        n = Number(value);
+      } catch { /* not a number: dropped below */ }
       if (Number.isFinite(n) && n >= 1000) {
         out[name] = Math.floor(n);
       } else {

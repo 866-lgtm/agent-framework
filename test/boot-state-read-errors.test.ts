@@ -418,6 +418,28 @@ test("inline caps that can't be read are logged, boot goes on, and setting one k
   assert.deepEqual((readState(storePath, 'framework/state') as { toolResultInlineCaps: unknown }).toolResultInlineCaps, { agent: 5000, other: 2000 });
 }));
 
+test("a stored inline cap that can't become a number is dropped, loudly, and the others apply", inStoreDir('boot-read-caps-entry-', async (storePath) => {
+  // Number() throws for an object it can't make a primitive of.
+  seedFrameworkState(storePath, { toolResultInlineCaps: { agent: { toString: null }, other: 5000 } });
+  const twoAgents = { ...config(storePath), agents: [...agents, { name: 'other', model: 'test-model', systemPrompt: 'test' }] } as FrameworkConfig;
+  const log = quietErrors();
+  let f: AgentFramework;
+  try {
+    f = await AgentFramework.create(twoAgents);
+  } finally { log.restore(); }
+  try {
+    assert.ok(
+      log.lines.some((l) => l.includes(`[agent-settings] dropping invalid persisted tool_result_inline_max_chars for 'agent': {"toString":null}`)),
+      log.lines.join('\n'),
+    );
+    const settings = (f as unknown as {
+      collectAgentSettingsExtensions(): Map<string, { get(agentName: string): Record<string, unknown> }>;
+    }).collectAgentSettingsExtensions().get('_framework')!;
+    assert.equal(settings.get('agent').tool_result_inline_max_chars, null);
+    assert.equal(settings.get('other').tool_result_inline_max_chars, 5000);
+  } finally { await f.stop(); }
+}));
+
 // ---------------------------------------------------------------------------
 // Tool-result guards
 // ---------------------------------------------------------------------------
