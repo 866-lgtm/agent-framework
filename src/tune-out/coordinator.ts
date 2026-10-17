@@ -78,7 +78,7 @@ export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Each duration's pending expiry step (params.expiresAtMs). stop clears
    *  it, cancel does when it finds the tune-out in the registry, and the
-   *  channel's next enter does in any case. */
+   *  channel's next accepted enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
@@ -136,7 +136,7 @@ export class TuneOutCoordinator {
    *  than throw it into the event loop, where an uncaught exception ends the
    *  host process. */
   private timerFailed(timer: 'cadence' | 'wake' | 'expiry', serverId: string, channelId: string, err: unknown): void {
-    console.error(`[tune-out] the ${timer} timer for ${channelId} failed:`, err);
+    console.error(`[tune-out] the ${timer} timer for ${channelId} on ${serverId} failed:`, err);
     this.hooks.emitTrace({
       type: 'tune-out:timer-failed',
       timer,
@@ -388,11 +388,12 @@ export class TuneOutCoordinator {
         intent: 'suppressed-tuned-out',
       });
     } catch (err) {
+      console.error(`[tune-out] acknowledging ${messageId} in ${channelId} on ${serverId} failed:`, err);
       this.hooks.emitTrace({
         type: 'tune-out:ack-failed',
         serverId,
         channelId,
-        error: (err as Error).message,
+        error: describeThrown(err),
       });
     }
   }

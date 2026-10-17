@@ -19,6 +19,7 @@ import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/
 import { armAt } from '../src/deadline-timer.js';
 import type { ChannelRegistry, TuneOutParams } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 
 /** The longest delay one setTimeout holds. */
 const ONE_TIMER_MS = 2_147_483_647;
@@ -30,9 +31,14 @@ const STORED: TuneOutParams = { epochId: 'e1', cadenceSeconds: 1800, backlogCap:
  * A coordinator over an in-memory registry for one channel, `disc` `#a`, with
  * setTimeout mocked and each delay asked of it recorded, and the wall clock
  * mocked unless `wallClock` is false. `stored` is a tune-out the registry
- * already holds, as after a restart.
+ * already holds, as after a restart. `servers` is the MCPL server registry,
+ * by default one with no servers.
  */
-function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = {}) {
+function harness(
+  t: TestContext,
+  stored?: TuneOutParams,
+  { wallClock = true, servers = { getServer: () => undefined } as unknown as McplServerRegistry } = {},
+) {
   if (wallClock) t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: NOW });
   else t.mock.timers.enable({ apis: ['setTimeout'] });
   const mocked = globalThis.setTimeout;
@@ -97,7 +103,7 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
     allowChannelSpeech: () => false,
     emitTrace: (event: Record<string, unknown>) => { traces.push(event); },
   } as unknown as TuneOutFrameworkHooks;
-  const coordinator = new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
+  const coordinator = new TuneOutCoordinator(registry, servers, hooks);
   t.after(() => {
     coordinator.stop();
     globalThis.setTimeout = mocked;
@@ -118,11 +124,12 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
     thrown: unknown = new Error('store write failed'),
   ) => { throwsNext.set(step, thrown); };
   const timerFailures = () => traces.filter((e) => e.type === 'tune-out:timer-failed');
+  const ackFailures = () => traces.filter((e) => e.type === 'tune-out:ack-failed');
   /** The arguments of each line written to stderr. */
   const stderrLines = () => stderr.mock.calls.map((c) => c.arguments as unknown[]);
   return {
     coordinator, entered, cancels, cadenceTurns, wakeTurns, delays, noTimerPastOne, endInRegistry, active,
-    failNext, timerFailures, notices, stderrLines,
+    failNext, timerFailures, ackFailures, notices, stderrLines,
   };
 }
 
@@ -363,7 +370,34 @@ it('a timer failure is written to stderr with the error', (t) => {
   const thrown = new Error('store write failed');
   h.failNext('addMessage', thrown);
   t.mock.timers.tick(60_000);
-  assert.deepEqual(h.stderrLines(), [['[tune-out] the cadence timer for #a failed:', thrown]]);
+  assert.deepEqual(h.stderrLines(), [['[tune-out] the cadence timer for #a on disc failed:', thrown]]);
+});
+
+it('after a turn, the count starts again: a quiet period gives no turn, and the next notice counts only new messages', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  h.coordinator.onIncoming('disc', '#a', 'm2', undefined);
+  t.mock.timers.tick(60_000);
+  assert.match(h.notices.at(-1) ?? '', /— 2 diverted messages since your last look\]$/);
+  t.mock.timers.tick(60_000);
+  assert.equal(h.cadenceTurns().length, 1, 'no turn for a quiet period after a turn');
+  h.coordinator.onIncoming('disc', '#a', 'm3', undefined);
+  t.mock.timers.tick(60_000);
+  assert.equal(h.cadenceTurns().length, 2);
+  assert.match(h.notices.at(-1) ?? '', /— 1 diverted message since your last look\]$/);
+});
+
+it("a wake turn that throws leaves its message for the next cadence turn", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
+  h.failNext();
+  t.mock.timers.tick(2_000);
+  assert.deepEqual(h.wakeTurns(), [], 'the wake turn failed');
+  t.mock.timers.tick(58_000);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], 'the cadence turn comes');
+  assert.match(h.notices.at(-1) ?? '', /— 1 diverted message since your last look\]$/);
 });
 
 it("a cadence tick that finds the tune-out ended in the registry arms nothing and gives no turn", (t) => {
@@ -407,6 +441,33 @@ it("a coalesced wake whose count can't be recorded stays in its timer and is rep
   assert.doesNotThrow(() => t.mock.timers.tick(2_000), "the error stays in the timer");
   assert.deepEqual(h.timerFailures(), [failure('wake')]);
   assert.deepEqual(h.wakeTurns(), [], 'no turn for the wake it could not count');
+});
+
+it('a coalesced wake for a tune-out the registry ended in its window gives no turn and reports nothing', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
+  h.endInRegistry();
+  t.mock.timers.tick(2_000);
+  assert.deepEqual(h.wakeTurns(), []);
+  assert.deepEqual(h.timerFailures(), []);
+});
+
+it('a failed acknowledgement is written to stderr and traced, whatever it rejects with', async (t) => {
+  const servers = {
+    getServer: () => ({
+      grant: new CapabilityGrant(new Set(['channels.acknowledge']), []),
+      sendChannelsAcknowledge: async () => { throw undefined; },
+    }),
+  } as unknown as McplServerRegistry;
+  const h = harness(t, undefined, { servers });
+  assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.ackFailures(), [
+    { type: 'tune-out:ack-failed', serverId: 'disc', channelId: '#a', error: 'undefined' },
+  ]);
+  assert.deepEqual(h.stderrLines(), [['[tune-out] acknowledging m1 in #a on disc failed:', undefined]]);
 });
 
 it('an end time whose cancel throws stays in its timer and is reported', (t) => {
