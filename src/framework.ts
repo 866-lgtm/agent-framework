@@ -16679,6 +16679,14 @@ export class AgentFramework {
     };
   }
 
+  /** Whether a server's connection still serves it, or is reconnecting to
+   *  it. One the host is closing or has closed doesn't, and neither does one
+   *  lost for good, whose reconnecting has stopped. */
+  private static mcpConnectionServes(connection: McplServerConnection | ModernMcpConnection): boolean {
+    if (connection instanceof ModernMcpConnection && connection.isClosed) return false;
+    return connection.isConnected || connection.willReconnect;
+  }
+
   /**
    * A connect whose failed launch couldn't be confirmed exited. Its
    * connection stays registered, closed, and holds the id, so nothing
@@ -17799,12 +17807,16 @@ export class AgentFramework {
     await this.untilStopBegins(this.refreshMcplTools());
     if (this.stopHasBegun()) throw stopped();
     // The connect let go of its id once its setup was done, so a disconnect
-    // during the listing wasn't held off. One that has begun, or has removed
-    // what the connect set up, ends the connect, as one during its setup
-    // does: what it set up is going or gone. So does a server lost for good
-    // meanwhile. A restart reports it as its connect's failure.
-    const current = this.modernServers().get(config.id) ?? this.mcplServerRegistry?.getServer(config.id);
-    if (current !== connection || this.mcpServerOps?.get(config.id)?.kind === 'disconnect') {
+    // during the listing wasn't held off. A disconnect under way ends the
+    // connect, as one during its setup does, and so does a connection that
+    // no longer serves: closed by a disconnect, its child reaped or not, or
+    // lost for good. Whatever removed or replaced the connection closed it
+    // first, since an id has one owner at a time. A connection the server
+    // closed that is reconnecting still serves. A disconnect takes the id
+    // before its close marks the connection, a turn later for a legacy one,
+    // so a disconnect under way is asked of as well. A restart reports the
+    // connect's failure as its own.
+    if (this.mcpServerOps?.get(config.id)?.kind === 'disconnect' || !AgentFramework.mcpConnectionServes(connection)) {
       throw new Error(`MCP server "${config.id}" was not connected: it was disconnected or lost while its tools were being listed`);
     }
     this.emitMcplToolDiff(oldToolNames, config.id);
@@ -18009,15 +18021,15 @@ export class AgentFramework {
    * meanwhile, both have their credentials replaced.
    */
   private everyServerRedactor(): (text: unknown) => string {
-    const snapshot = [...this.mcplServerConfigs.values()].flatMap(config => serverCredentialPatterns(config));
+    const snapshot = [...this.mcplServerConfigs.values()];
     // The configurations present when the operation began, then those present
     // now: a server removed meanwhile and one connected meanwhile are both
-    // covered. One pass over all their strings, so a secret that begins
+    // covered, each with what its dials have sent by the time the text is
+    // recorded. One pass over all their strings, so a secret that begins
     // another server's longer one can't cut that one short.
-    return (text) => credentialRedactor([
-      ...snapshot,
-      ...[...this.mcplServerConfigs.values()].flatMap(config => serverCredentialPatterns(config)),
-    ])(text);
+    return (text) => credentialRedactor(
+      [...new Set([...snapshot, ...this.mcplServerConfigs.values()])].flatMap(config => serverCredentialPatterns(config)),
+    )(text);
   }
 
   /** Why a connect for this id is refused, or null when the id is free. One
@@ -18790,17 +18802,23 @@ export class AgentFramework {
     }
 
     // A listing counts only while the session it came from is still its
-    // server's live one. A server removed while this refresh awaited its
-    // lists (a disconnect, or a server lost for good) contributes nothing,
-    // so whichever refresh finishes last can't bring back its tools. Nor
-    // does one whose connection closed after its listing began: the close
-    // forgot its class hints as stale (RFC-008), and its reconnect lists the
-    // new session. Asked of the same listing the refresh began from, now.
-    const live = new Set<string>([
-      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => server.id),
-      ...this.modernServers().keys(),
+    // server's live one, asked of the servers there now. A server removed
+    // while this refresh awaited its lists (a disconnect, or a server lost
+    // for good) contributes nothing, so whichever refresh finishes last
+    // can't bring back its tools. Nor does one whose connection no longer
+    // serves: the host is closing it or failed to reap it, or it was lost
+    // for good. Nor does one whose connection closed after its listing
+    // began, even if it has reconnected since: the close forgot its class
+    // hints as stale (RFC-008), and its reconnect lists the new session.
+    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([
+      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const),
+      ...this.modernServers(),
     ]);
-    const over = new Set([...listedServers].filter((serverId) => !live.has(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
+    const serving = (serverId: string): boolean => {
+      const connection = connections.get(serverId);
+      return !!connection && AgentFramework.mcpConnectionServes(connection);
+    };
+    const over = new Set([...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
         if (!over.has(serverId)) continue;
@@ -18810,11 +18828,11 @@ export class AgentFramework {
       }
       for (const serverId of over) listedServers.delete(serverId);
     }
-    // A refresh started after this one has published already: it listed
-    // every server after this one did, a server replaced by a restart under
-    // the same id included, so this one's listings are older. A server this
-    // one listed can still have no listing there, such as one that refused
-    // the later refresh's request. Its tools would stay missing until
+    // A refresh started after this one has published already: it began
+    // listing after this one did, a server replaced by a restart under the
+    // same id included, so this one's listings are older. A server this one
+    // listed can still have no listing there, such as one that refused the
+    // later refresh's request. Its tools would stay missing until
     // something else refreshed, so one more refresh lists it again.
     if (generation < this.mcplToolsRefreshPublished) {
       const unlisted = [...listedServers].find((id) => !this.mcplListedServers.has(id));

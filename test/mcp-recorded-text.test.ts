@@ -11,6 +11,7 @@ import type { ModuleContext } from '../src/index.js';
 import { AgentFramework } from '../src/framework.js';
 import { McplProtocolVersionError, McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
 import { ModernMcpConnection, malformedLineDiagnostic } from '../src/mcpl/modern-connection.js';
+import { noteDialSent } from '../src/mcpl/protocol-family.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** Discovery succeeds; the inventory request gets a normal echoed-path 404. */
@@ -223,6 +224,14 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   // A server connected after it was made is covered too.
   framework.mcplServerConfigs = new Map([['late', { id: 'late', url: 'https://k/api/s/lateSecret0123456789/mcp' }]]);
   assert.equal(everyServer('closed lateSecret0123456789'), 'closed redacted');
+  // What a server's dial sent after the redactor was made is covered, though
+  // the server has gone by the time the text is recorded.
+  const dialing = { id: 'dialing', url: 'https://d/mcp' };
+  framework.mcplServerConfigs = new Map([[dialing.id, dialing]]);
+  const beforeDial = framework.everyServerRedactor();
+  noteDialSent(dialing, { token: 'prov-late-0123456789' });
+  framework.mcplServerConfigs = new Map();
+  assert.equal(beforeDial('refused prov-late-0123456789'), 'refused redacted');
   // A value that can't be printed reads as a placeholder.
   assert.equal(everyServer(Object.create(null)), '[a value that cannot be printed]');
   // One pass over every server's strings: a secret that begins another

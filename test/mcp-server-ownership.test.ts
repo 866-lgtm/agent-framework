@@ -587,6 +587,7 @@ for (const engine of ['legacy', 'modern'] as const) {
       await refreshing;
       const kept = framework.listToolClasses().filter((tool) => tool.serverId === 's' && tool.class.includes('files'));
       assert.deepEqual(kept, [], "no tool keeps the closed session's class");
+      assert.deepEqual(framework.getAllTools().filter((tool) => tool.name.startsWith('mcpl--s--')), [], "nor are the closed session's tools published");
     });
   });
 }
@@ -623,19 +624,132 @@ test("a disconnect still under way when a connect's tool listing ends fails the 
   await withFramework(async ({ framework, dir }) => {
     await framework.connectMcplServer(modern('a', '', join(dir, 'raw-a.jsonl')));
     const a = holdListings(framework, 'a');
-    const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
-    // m ignores SIGTERM, so its disconnect stays in flight for ~2 s, holding
-    // the id, with m still registered.
-    const connecting = framework.connectMcplServer(modern('m', 'ignore-sigterm', join(dir, 'raw-m.jsonl')));
+    const servers = (framework as unknown as { modernServers(): Map<string, { close(): Promise<void>; isConnected: boolean }> }).modernServers();
+    const connecting = framework.connectMcplServer(modern('m', '', join(dir, 'raw-m.jsonl')));
     await until(() => a.held() > 0, "m's connect, listing tools, waits on a");
-    const m = servers.get('m');
+    // m's close waits for the test, so its disconnect holds the id while m
+    // is still registered and still connected.
+    const m = servers.get('m')!;
+    const realClose = m.close.bind(m);
+    let openClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { openClose = resolve; });
+    m.close = async () => { await closeGate; return realClose(); };
     let disconnected = false;
     const disconnecting = framework.disconnectMcplServer('m').then(() => { disconnected = true; });
-    a.release();
-    await assert.rejects(connecting, /MCP server "m" was not connected: it was disconnected or lost while its tools were being listed/);
-    assert.equal(disconnected, false, 'the disconnect was still under way');
-    assert.equal(servers.get('m'), m, 'with m still registered');
-    await disconnecting;
+    try {
+      a.release();
+      await assert.rejects(connecting, /MCP server "m" was not connected: it was disconnected or lost while its tools were being listed/);
+      assert.equal(disconnected, false, 'the disconnect was still under way');
+      assert.equal(servers.get('m'), m, 'with m still registered');
+      assert.equal(m.isConnected, true, 'and still connected');
+    } finally {
+      openClose();
+      await disconnecting;
+    }
+  });
+});
+
+test("a disconnect that fails to reap during a connect's tool listing fails the connect", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('a', '', join(dir, 'raw-a.jsonl')));
+    const a = holdListings(framework, 'a');
+    const reaping = unreapable();
+    const connecting = framework.connectMcplServer(modern('m', '', join(dir, 'raw-m.jsonl')));
+    await until(() => a.held() > 0, "m's connect, listing tools, waits on a");
+    reaping.active = false;
+    try {
+      // The disconnect closes m and can't reap its child: m stays
+      // registered, closed, and the disconnect has let go of the id.
+      await assert.rejects(framework.disconnectMcplServer('m'), /could not be reaped/);
+      assert.equal(status(framework, 'm')?.connected, false, 'still listed, closed');
+      a.release();
+      await assert.rejects(connecting, /MCP server "m" was not connected: it was disconnected or lost while its tools were being listed/);
+    } finally {
+      a.release();
+      for (const stuck of reaping.stuck) await killAndWait(stuck);
+    }
+    await framework.disconnectMcplServer('m');
+  });
+});
+
+test("a listing of a server whose disconnect failed to reap isn't published", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const reaping = unreapable();
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw-m.jsonl')));
+    reaping.active = false;
+    assert.ok(toolsOf(framework, 'm').length > 0);
+    type Tool = { name: string; _meta?: Record<string, unknown> };
+    const internals = framework as unknown as {
+      modernServers(): Map<string, { listTools(): Promise<Tool[]> }>;
+      refreshMcplTools(): Promise<void>;
+    };
+    const connection = internals.modernServers().get('m')!;
+    const realList = connection.listTools.bind(connection);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let held = false;
+    connection.listTools = async () => {
+      const tools = (await realList()).map((tool) => ({ ...tool, _meta: { ...tool._meta, 'mcpl/class': ['files'] } }));
+      held = true;
+      await gate;
+      return tools;
+    };
+    const refreshing = internals.refreshMcplTools();
+    await until(() => held, 'the refresh holds its listing of m');
+    try {
+      // A failed teardown emits no 'close', so only m's state says it's over.
+      await assert.rejects(framework.disconnectMcplServer('m'), /could not be reaped/);
+      release();
+      await refreshing;
+      assert.deepEqual(toolsOf(framework, 'm'), [], "the closed connection's listing isn't published");
+      assert.deepEqual(framework.listToolClasses().filter((tool) => tool.serverId === 'm' && tool.class.includes('files')), []);
+    } finally {
+      release();
+      for (const stuck of reaping.stuck) await killAndWait(stuck);
+    }
+    await framework.disconnectMcplServer('m');
+  });
+});
+
+test('a listing begun before its server closed and reconnected is left out, and the new session is listed', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer({ ...modern('m', '', join(dir, 'raw.jsonl')), reconnect: true, reconnectIntervalMs: 50, reconnectMaxIntervalMs: 100 });
+    type Tool = { name: string; _meta?: Record<string, unknown> };
+    const internals = framework as unknown as {
+      modernServers(): Map<string, { listTools(): Promise<Tool[]> }>;
+      refreshMcplTools(): Promise<void>;
+    };
+    const connection = internals.modernServers().get('m')!;
+    const realList = connection.listTools.bind(connection);
+    // The first listing is the old session's, which declares `files`. The
+    // second is the reconnect's own refresh, of the new session.
+    const gates = [0, 1].map(() => { let open!: () => void; const shut = new Promise<void>((resolve) => { open = resolve; }); return { open, shut }; });
+    let calls = 0;
+    const answered: boolean[] = [];
+    connection.listTools = async () => {
+      const call = calls++;
+      const tools = await realList();
+      answered[call] = true;
+      if (call > 1) return tools;
+      await gates[call]!.shut;
+      return call === 0 ? tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, 'mcpl/class': ['files'] } })) : tools;
+    };
+    const refreshing = internals.refreshMcplTools();
+    try {
+      await until(() => answered[0] === true, "the refresh holds the old session's listing of m");
+      await framework.executeToolCall(call('mcpl--m--die')).catch(() => {});
+      // m's session closes and a new one starts: its reconnect lists it.
+      await until(() => calls > 1, "m's reconnect lists its new session");
+      gates[0]!.open();
+      await refreshing;
+      assert.deepEqual(toolsOf(framework, 'm'), [], "the old session's listing isn't published, though m is connected again");
+      assert.deepEqual(framework.listToolClasses().filter((tool) => tool.serverId === 'm' && tool.class.includes('files')), []);
+      gates[1]!.open();
+      await until(() => toolsOf(framework, 'm').length > 0, "the new session's listing is published");
+      assert.deepEqual(framework.listToolClasses().filter((tool) => tool.serverId === 'm' && tool.class.includes('files')), []);
+    } finally {
+      for (const gate of gates) gate.open();
+    }
   });
 });
 

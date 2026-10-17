@@ -341,28 +341,42 @@ test('both engines admit a configuration through checkServerConfig, which logs i
 });
 
 test("a query credential is removed as the WebSocket dial sends it, the query re-encoded once the token is set", () => {
-  const config = cfg({ url: 'wss://host.example/mcp?password=secret%20key123', token: 'tok-abcdefgh' });
+  const config = cfg({ url: 'wss://host.example/mcp?password=secret%20key123&q=a~b', token: 'tok-abcdefgh' });
   const sent = buildWebSocketUrl(config);
   // The form the server receives, and can echo, as URLSearchParams writes it.
-  assert.ok(sent.includes('password=secret+key123'), sent);
+  assert.ok(sent.includes('password=secret+key123') && sent.includes('q=a%7Eb'), sent);
   const shown = redactServerText(`closed by the server: ${sent}`, config);
   assert.ok(!shown.includes('key123'), shown);
   assert.ok(!shown.includes('tok-abcdefgh'), shown);
+  assert.ok(!shown.includes('q=a%7Eb'), shown);
 });
 
 test("an access provider's token is removed once a dial has sent it, in a WebSocket url or an HTTP header", async () => {
-  const ws = cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl?password=secret%20key123', accessProvider: async () => 'prov-ws-0123456789' });
+  const ws = cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl?password=secret%20key123', accessProvider: async () => 'prov/ws-0123456789' });
   const http = cfg({ id: 'http', url: 'http://127.0.0.1:1/mcp', accessProvider: async () => 'prov-http-0123456789' });
   // Made before the dial, as the framework makes a connection's.
   const recorded = serverTextRedactor(ws);
-  assert.ok(recorded('token=prov-ws-0123456789').includes('prov-ws'), 'no dial has sent it yet');
-  // Nothing listens on port 1: each dial fails after sending its credential.
+  assert.ok(recorded('token=prov%2Fws-0123456789').includes('ws-0123456789'), 'no dial has sent it yet');
+  // Nothing listens on port 1: each dial notes its credential before it fails.
   await assert.rejects(WebSocketTransport.open(ws));
   await assert.rejects(ModernMcpConnection.connect(http));
-  const shown = recorded('closed: ws://127.0.0.1:1/mcpl?password=secret+key123&token=prov-ws-0123456789');
-  assert.ok(!shown.includes('prov-ws') && !shown.includes('key123'), shown);
+  const shown = recorded('closed: ws://127.0.0.1:1/mcpl?password=secret+key123&token=prov%2Fws-0123456789');
+  assert.ok(!shown.includes('ws-0123456789') && !shown.includes('key123'), shown);
+  // The token in the forms a token takes, as JSON with its slash escaped.
+  const json = recorded('{"token":"prov\\/ws-0123456789"}');
+  assert.ok(!json.includes('ws-0123456789'), json);
   const header = redactServerText('refused: Authorization: Bearer prov-http-0123456789', http);
   assert.ok(!header.includes('prov-http'), header);
+});
+
+test("a token a dial sends again is the newest, so the oldest of the others goes first", () => {
+  const config = cfg({ id: 'r', url: 'http://127.0.0.1:1/mcp' });
+  noteDialSent(config, { token: 'prov-again-0000' });
+  for (let n = 1; n <= 15; n++) noteDialSent(config, { token: `prov-other-${String(n).padStart(4, '0')}` });
+  noteDialSent(config, { token: 'prov-again-0000' });
+  noteDialSent(config, { token: 'prov-other-0016' });
+  assert.equal(redactServerText('prov-again-0000', config), 'redacted');
+  assert.equal(redactServerText('prov-other-0001', config), 'prov-other-0001', 'the oldest of the others is let go');
 });
 
 test("a configuration keeps only its dials' newest provider tokens", () => {

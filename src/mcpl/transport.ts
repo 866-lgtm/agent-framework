@@ -368,8 +368,9 @@ export class WebSocketTransport extends McplTransport {
     }
     const url = buildWebSocketUrl(config, token);
     // A provider's token is in this url, and the query may be re-encoded:
-    // the server's text is recorded with what the dial sent.
-    noteDialSent(config, { url });
+    // the server's text is recorded with what the dial sent, the token in
+    // each form a token is replaced in.
+    noteDialSent(config, { url, token: token ?? undefined });
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);

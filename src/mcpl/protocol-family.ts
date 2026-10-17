@@ -100,7 +100,7 @@ export function redactUrl(url: string | undefined): string {
  *   the configured one, and each one dialed with an access provider's token
  *   ({@link noteDialSent}): credential-like path segments and
  *   query names, credential-shaped or credential-named query values, every
- *   other non-empty parameter as its whole name=value, and a ws:// url's
+ *   other non-empty parameter as its whole name=value, and a WebSocket url's
  *   username and password, its userinfo as one unit before its @ (the
  *   username alone when there's no password), with no length floor, so a
  *   short password goes with its username and a short username alone goes
@@ -138,7 +138,7 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  */
 export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
   let built = -1;
-  let redact: (text: unknown) => string = asText;
+  let redact!: (text: unknown) => string;
   return (text) => {
     const version = dialsSent.get(config)?.version ?? 0;
     if (version !== built) {
@@ -151,10 +151,12 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
 
 /**
  * What a configuration's dials sent that the configuration doesn't hold: the
- * urls dialed with an access provider's token, and the provider's tokens sent
- * in a header. Kept by the configuration object the dial read, which is the
- * one the framework records the server's text with. A provider can hand each
- * dial a new token, so only the newest are kept.
+ * urls dialed with an access provider's token, and the provider's tokens,
+ * sent in a url or a header. Kept by the configuration object the dial read.
+ * For the dials that note anything, a WebSocket dial and an HTTP bearer, that
+ * is the object the framework records the server's text with. A provider can
+ * hand each dial a new token, so only the newest sixteen of each are kept,
+ * newest by when a dial last sent it.
  */
 const dialsSent = new WeakMap<object, { readonly urls: string[]; readonly tokens: string[]; version: number }>();
 const DIAL_SENT_KEPT = 16;
@@ -169,7 +171,14 @@ export function noteDialSent(config: object, sent: { readonly url?: string; read
   }
   const kept = entry;
   const keep = (list: string[], value: string | undefined): void => {
-    if (!value || list.includes(value)) return;
+    if (!value) return;
+    const at = list.indexOf(value);
+    if (at >= 0) {
+      // Sent again: it moves to the newest place, and the set is unchanged.
+      list.splice(at, 1);
+      list.push(value);
+      return;
+    }
     list.push(value);
     if (list.length > DIAL_SENT_KEPT) list.shift();
     kept.version += 1;
