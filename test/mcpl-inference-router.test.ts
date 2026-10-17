@@ -12,9 +12,12 @@
  * The router runs on a real Membrane here, with a scripted provider adapter,
  * so each case meets membrane's own streams: its `error` and `aborted`
  * events, its `tool-calls` handshake, and the stop reasons and usage its
- * response carries. Each case runs in both tool modes a host configures
- * (connectome-host's recipe formatter: AnthropicXmlFormatter pinned to XML,
- * or NativeFormatter), since membrane streams each through its own path.
+ * response carries. The cases any provider can play run in both tool modes a
+ * host configures (connectome-host's recipe formatter: AnthropicXmlFormatter
+ * pinned to XML, or NativeFormatter), since membrane streams each through its
+ * own path. The tool-call markup and thinking cases run in XML mode and the
+ * cut-off tool_use block in native mode, where each arises; the stop reasons
+ * a provider can't play, and a stream with no terminal event, use stand-ins.
  */
 
 import { describe, it } from 'node:test';
@@ -35,7 +38,15 @@ import type { InferenceChunkParams, McplInferenceRequestResult } from '../src/mc
 
 /** What the scripted provider streams, and how its call ends. */
 type Script =
-  | { chunks: string[]; stopReason: string; stopSequence?: string }
+  | {
+    chunks: string[];
+    stopReason: string;
+    stopSequence?: string;
+    /** The provider's own stop token, as an adapter reports it. */
+    providerStopReason?: string;
+    /** A native tool_use block after the text. */
+    toolUse?: string;
+  }
   | { chunks: string[]; fails: Error };
 
 type Mode = 'native' | 'xml';
@@ -67,9 +78,13 @@ class ScriptedAdapter implements ProviderAdapter {
   private response(text: string): ProviderResponse {
     const script = this.script as Extract<Script, { stopReason: string }>;
     return {
-      content: [{ type: 'text', text }],
+      content: [
+        { type: 'text', text },
+        ...(script.toolUse ? [{ type: 'tool_use', id: 'toolu_1', name: script.toolUse, input: { q: 'memories' } }] : []),
+      ],
       stopReason: script.stopReason,
       ...(script.stopSequence ? { stopSequence: script.stopSequence } : {}),
+      ...(script.providerStopReason ? { providerStopReason: script.providerStopReason } : {}),
       usage: { ...USAGE },
       model: 'scripted-model',
       rawRequest: null,
@@ -143,6 +158,15 @@ const REFUSED = unnamedStop('refusal');
 const CALLED_A_TOOL = 'The model called a tool (search), and inference/request offers none';
 const OPEN_TOOL_BLOCK = "The model's output ended with a tool-call block still open, and inference/request offers no tools";
 const TOOL_MARKUP = 'The model wrote tool-call markup, and inference/request offers no tools';
+const PROVIDER_ERROR = "The provider ended the inference with an error (finish_reason 'error')";
+
+/**
+ * A provider that fails partway through and says so only with finish_reason
+ * 'error' in its last chunk, with no error object: membrane's
+ * OpenAI-compatible adapters report the token as both their stop reason and
+ * the provider's own.
+ */
+const PROVIDER_FAILED_PARTWAY: Script = { chunks: ['A summ'], stopReason: 'error', providerStopReason: 'error' };
 
 /** The success trace for a completion played with USAGE. */
 const completeTrace = (streamed: boolean) => ({
@@ -244,6 +268,14 @@ for (const mode of ['native', 'xml'] as const) {
       assert.strictEqual(answer.result, undefined);
       assert.deepStrictEqual(answer.error, { code: -32603, message: REFUSED });
     });
+
+    it("answers a provider's finish_reason 'error' with the error, not end_turn and the partial text", async () => {
+      const answer = await ask(PROVIDER_FAILED_PARTWAY, { stream: true, mode });
+
+      assert.strictEqual(answer.result, undefined);
+      assert.deepStrictEqual(answer.error, { code: -32603, message: PROVIDER_ERROR });
+      assert.strictEqual(joined(answer.chunks), 'A summ');
+    });
   });
 
   describe(`MCPL inference router, ${mode} mode: a request answered whole`, () => {
@@ -281,8 +313,32 @@ for (const mode of ['native', 'xml'] as const) {
         type: 'mcpl:inference_fail', serverId: 'scripted-server', model: 'default', error: REFUSED, streamed: false,
       });
     });
+
+    it("answers a provider's finish_reason 'error' with the error, not end_turn and the partial text", async () => {
+      const answer = await ask(PROVIDER_FAILED_PARTWAY, { stream: false, mode });
+
+      assert.strictEqual(answer.result, undefined);
+      assert.deepStrictEqual(answer.error, { code: -32603, message: PROVIDER_ERROR });
+    });
   });
 }
+
+// A native tool call arrives as a typed tool_use block. membrane lists it in
+// toolCalls only when the stop is tool_use; a block cut off by another stop
+// stays in the content.
+describe('MCPL inference router, native mode: a tool_use block', () => {
+  for (const stream of [true, false]) {
+    it(`answers a tool_use block cut off at max_tokens with the error, ${stream ? 'streamed' : 'not streamed'}`, async () => {
+      const answer = await ask(
+        { chunks: ['Let me look that up.'], stopReason: 'max_tokens', toolUse: 'search' },
+        { stream, mode: 'native' },
+      );
+
+      assert.strictEqual(answer.result, undefined);
+      assert.deepStrictEqual(answer.error, { code: -32603, message: CALLED_A_TOOL });
+    });
+  }
+});
 
 // A model's tool call and its <thinking> are parsed out of the text only in
 // XML mode; in native mode they arrive as typed blocks the provider sends.

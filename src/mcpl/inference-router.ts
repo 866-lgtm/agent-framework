@@ -76,13 +76,24 @@ function wildcardMatch(pattern: string, name: string): boolean {
  * modes: the response's text, why it stopped, and its usage.
  *
  * A response MCPL can't report as a completion throws, and is answered with
- * the error: one where the model wrote a tool call, since inference/request
- * offers the model none, and one with a stop reason FinishReason has no value
- * for (see finishReasonFor).
+ * the error: one the provider ended with an error, one where the model wrote a
+ * tool call, since inference/request offers the model none, and one with a
+ * stop reason FinishReason has no value for (see finishReasonFor).
  */
 function resultFrom(response: NormalizedResponse, model: string): McplInferenceRequestResult {
-  if (response.toolCalls.length > 0) {
-    throw toolCallError(response.toolCalls);
+  // A provider can end an inference with finish_reason 'error' and no error
+  // object. membrane's adapters fail a stream on a frame that carries one, as
+  // OpenRouter's mid-stream error does, but pass the token alone through, and
+  // membrane, having no stop reason for it, normalizes it to end_turn and
+  // keeps it as providerReason.
+  if (response.details.stop.providerReason === 'error') {
+    throw new Error("The provider ended the inference with an error (finish_reason 'error')");
+  }
+  // membrane's toolCalls holds a native tool call only when the stop was
+  // tool_use. A tool_use block cut off by another stop stays in the content.
+  const toolUses = response.content.filter((b: ContentBlock): b is ContentBlock & { type: 'tool_use' } => b.type === 'tool_use');
+  if (response.toolCalls.length > 0 || toolUses.length > 0) {
+    throw toolCallError(response.toolCalls.length > 0 ? response.toolCalls : toolUses);
   }
   // In XML tool mode membrane reads tool calls out of the text. Markup it
   // reads no call from still shows in how the output ended: with a tool-call
@@ -130,7 +141,7 @@ function finishReasonFor(stopReason: StopReason): McplInferenceRequestResult['fi
 }
 
 /** The error for a model that called a tool, which inference/request doesn't offer. */
-function toolCallError(calls: ToolCall[]): Error {
+function toolCallError(calls: Array<Pick<ToolCall, 'name'>>): Error {
   const names = calls.map((call) => call.name).join(', ');
   return new Error(`The model called a tool (${names}), and inference/request offers none`);
 }
@@ -355,8 +366,12 @@ export class InferenceRouter {
     for await (const event of stream) {
       switch (event.type) {
         case 'tokens':
-          // Thinking and tool-call markup stream as invisible tokens, and the
-          // result holds only the text blocks, so only visible text is sent.
+          // Only text membrane marks visible is sent, which leaves out
+          // thinking and tool-call markup. The result's content is the
+          // response's text blocks, which membrane parses on its own, so in
+          // XML tool mode the chunks can miss text the content holds: prose
+          // naming a tag the stream parser opens a block for, or a thinking
+          // block cut off before its close tag.
           if (event.meta.visible) {
             this.sendChunkFn!(serverId, { requestId, index: index++, delta: event.content });
           }
