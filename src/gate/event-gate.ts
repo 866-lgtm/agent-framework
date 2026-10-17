@@ -306,16 +306,19 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // problem, and nothing is saved. A field name that is no slip of one the gate
 // reads there, and that it reads at no other level, changes nothing, a slip of
 // another level's field included: it loads, and a note names it with the
-// fields its place holds. A "policies" holding nothing, or a slip of it that
-// does, writes no rules, as one left out does. Where "policies" writes no
-// rules, a list holding an object with a field of a rule, or of its match or
-// behavior, under a name gate.json doesn't read, is read as a slip of
-// "policies", and under a default that holds events back, such a field at
-// gate.json's top is read the same way. A rule's name, a filter's type and a
-// keyBy shape nothing on their own, so a label of the file can have their
-// names, and nor does a field of a rule or its match holding nothing, since
-// an empty one has always meant no constraint; a behavior names what a rule
-// does, even holding nothing.
+// fields its place holds. In a rule, a name holding a field's whole name is
+// such a name beside that field, an extra that explains it, and a slip of the
+// field where it's given in the field's place (fieldNames); at gate.json's
+// top, where it can be a label of the file, it's such a name either way. A
+// "policies" holding nothing, or a slip of it that does, writes no rules, as
+// one left out does. Where "policies" writes no rules, a list holding an
+// object with a field of a rule, or of its match or behavior, under a name
+// gate.json doesn't read, is read as a slip of "policies", and under a default
+// that holds events back, such a field at gate.json's top is read the same
+// way. A rule's name, a filter's type and a keyBy shape nothing on their own,
+// so a label of the file can have their names, and nor does a field of a rule
+// or its match holding nothing, since an empty one has always meant no
+// constraint; a behavior names what a rule does, even holding nothing.
 // A null is a field left out, and so is "", with a note: earlier releases read
 // most fields that way, and none narrows anything by them. Where they refused
 // a rule or a file for one (a passthrough, a behavior's kind, gate.json's
@@ -426,13 +429,29 @@ interface Slip {
   meant: string[];
 }
 
-/** An object's field names that the gate doesn't read in its place: slips of one it does, and the rest. */
-function fieldNames(obj: Record<string, unknown>, fields: readonly string[]): { slips: Slip[]; unread: string[] } {
+/**
+ * An object's field names that the gate doesn't read in its place: slips of
+ * one it does, and the rest. A name is a slip of each field isNearMiss finds
+ * it close to and, where `held`, of each whose whole name it holds, ignoring
+ * case, that the object doesn't give: sent in that field's place, it's the
+ * field under another name (`matchTags` with no `match`), where beside it,
+ * it's an extra. The object is one withoutEmpty read, so a field given as
+ * null or "" isn't given.
+ */
+function fieldNames(
+  obj: Record<string, unknown>, fields: readonly string[], held = true,
+): { slips: Slip[]; unread: string[] } {
   const slips: Slip[] = [];
   const unread: string[] = [];
   for (const key of Object.keys(obj)) {
     if (obj[key] === undefined || fields.includes(key)) continue;
-    const near = fields.filter((field) => isNearMiss(key, field));
+    // Every field the gate reads has four characters or more, so holding one
+    // needs no length of its own here. A field of two characters or fewer
+    // would be held by names that have nothing to do with it ("valid" holds
+    // "id"), and holding it would need the three characters isNearMiss asks
+    // of a part.
+    const holds = (field: string): boolean => key.toLowerCase().includes(field.toLowerCase());
+    const near = fields.filter((field) => isNearMiss(key, field) || (held && !Object.hasOwn(obj, field) && holds(field)));
     if (near.length === 0) {
       unread.push(key);
       continue;
@@ -531,10 +550,11 @@ function noteUnread(
 /**
  * A tool's input, its parameters given by its schema's `properties`, read as a
  * rule's fields are: a null or "" parameter is left out (a note names each "",
- * with what leaving it out does where `means` says), a near-miss of a
- * parameter is refused, naming the one meant, and so is a field of one of its
- * object parameters given on its own, naming that parameter; any other name is
- * noted, or named in that refusal. Returns the input without what was left out.
+ * with what leaving it out does where `means` says), a slip of a parameter
+ * (fieldNames) is refused, naming the one meant, and so is a field of one of
+ * its object parameters given on its own, naming that parameter; any other
+ * name is noted, or named in that refusal. Returns the input without what was
+ * left out.
  */
 export function checkToolInput(
   tool: string, input: Record<string, unknown>, properties: Readonly<Record<string, unknown>>, notes: string[],
@@ -1183,7 +1203,14 @@ function readConfig(raw: unknown, file: 'gate.json' | 'the starting config'): Co
 
   const sentences: string[] = [];
   const obj = withoutEmpty(file, raw, sentences, configLeftOut(raw.default));
-  const names = fieldNames(obj, CONFIG_FIELDS);
+  // Here a name holding "default" or "policies" isn't a slip of it. A slip of
+  // "policies" holding something keeps a file that holds events back out of
+  // force, and at the top such a name can be a label of the file
+  // ("policiesUpdated"), which a file the gate holds quiet can carry. Where
+  // "policies" writes no rules, a list of rules under any name is read as a
+  // slip of it below, and a name holding "default" leaves the default
+  // "always", as a slip of it does.
+  const names = fieldNames(obj, CONFIG_FIELDS, false);
   // A field of a rule, or of its match or behavior, says a rule was meant, but
   // for a label's names, which shape nothing on their own, and a field of a
   // rule or its match holding nothing, since an empty one has always meant no

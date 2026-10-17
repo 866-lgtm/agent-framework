@@ -178,6 +178,21 @@ test('a field name one slip from one the gate reads is a problem at every level,
       'behavior.rate_limit has "interval" (did you mean "refillIntervalMs"?), which the gate doesn\'t read; '
       + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed',
     ],
+    // A name holding a field's whole name, where the rule doesn't give that field, is the field under another name,
+    // at every level, and one holding two is a slip of each the rule doesn't give.
+    [{ behavior: 'skip', matchTags: ['chat:ambient'] }, 'it has "matchTags" (did you mean "match"?), which the gate doesn\'t read'],
+    [{ match: { channelId: 'discord:*:1' } }, 'match has "channelId" (did you mean "channel"?), which the gate doesn\'t read', all],
+    [
+      { behavior: { debounceMs: 60000 } },
+      'behavior has "debounceMs" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit" and "passive_sample"',
+    ],
+    [
+      { behavior: { rate_limit: { tokensPerHour: 5, refillIntervalMs: 60000 } } },
+      'behavior.rate_limit has "tokensPerHour" (did you mean "tokens"?), which the gate doesn\'t read; '
+      + 'behavior.rate_limit.tokens is missing, where a positive number is needed',
+    ],
+    [{ matchBehavior: 'skip' }, 'it has "matchBehavior" (did you mean "match" or "behavior"?), which the gate doesn\'t read'],
+    [{ match: { tagsAny: ['chat:dm'] }, matchBehavior: 'skip' }, 'it has "matchBehavior" (did you mean "behavior"?), which the gate doesn\'t read'],
   ];
   for (const [fields, problem, also] of cases) {
     assert.equal(refusal(gate, fields), `Policy "r" wasn't saved: ${problem}.${also ?? ''}`, JSON.stringify(fields));
@@ -924,6 +939,37 @@ test('a field name near none the gate reads loads, and is named', (t) => {
   );
 });
 
+test("a name holding a field's whole name is the field under another name where the rule doesn't give it, and an extra beside it; at gate.json's top, a name that does nothing", (t) => {
+  // In gate.json, a rule's slip is read as the field left out, as earlier releases read it.
+  const ops = { name: 'ops', match: { channel: 'discord:*:1', channelNote: 'the ops room' }, behavior: 'always' };
+  const quiet = { name: 'quiet', matchTags: ['chat:ambient'], behavior: 'skip' };
+  const { gate } = makeGate(tempDir(t), { file: { defaultBehavior: 'skip', policies: [ops, quiet] } });
+  assert.deepEqual(names(gate), ['ops', 'quiet']);
+  assert.equal(
+    gate.getStatus().errors[0],
+    'gate.json loaded. gate.json has "defaultBehavior", which the gate doesn\'t read, so it does nothing. Its fields are "default" and "policies". '
+    + `Policy "ops": match has "channelNote", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}. `
+    + 'Policy "quiet": it has "matchTags" (did you mean "match"?), which the gate doesn\'t read, so the rule matches every event. '
+    + 'Read so, it skips every event it now matches, as earlier releases did.',
+  );
+  assert.equal(gate.evaluate(MENTION).trigger, false, '"quiet" skips every event');
+  // A change refuses the slip, and takes the extra beside its field, naming it.
+  assert.equal(refusal(gate, quiet), 'Policy "quiet" wasn\'t saved: it has "matchTags" (did you mean "match"?), which the gate doesn\'t read.');
+  let ignored: string[] = [];
+  gate.addPolicy({ ...ops, name: 'ops2' }, { onIgnoredFields: (notes) => { ignored = notes; } });
+  assert.deepEqual(ignored, [`Policy "ops2": match has "channelNote", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`]);
+
+  // At gate.json's top, a name holding "policies" can be a label of the file,
+  // so a file that holds every event back with one is used, as before.
+  const held = makeGate(tempDir(t), { file: { default: 'skip', policiesUpdated: '2026-10-17' } });
+  assert.equal(held.gate.getStatus().configSource, 'file');
+  assert.equal(held.gate.evaluate(MENTION).trigger, false, 'every event is held back, as written');
+  assert.equal(
+    held.gate.getStatus().errors[0],
+    'gate.json loaded. gate.json has "policiesUpdated", which the gate doesn\'t read, so it does nothing. Its fields are "default" and "policies".',
+  );
+});
+
 test("a field the gate reads at another level is a problem naming where it's read: a load reads past it as earlier releases did, and a change refuses it", (t) => {
   const { gate, configPath } = makeGate(tempDir(t), {
     file: {
@@ -1606,6 +1652,14 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
     ),
     slip.content,
   );
+  // So is a name holding a parameter's whole name where the call doesn't give that parameter: it's the parameter under
+  // another name, and the rule would be saved without it.
+  const held = await call({ name: 'watch', matches: { tagsAny: ['chat:ambient'] }, behavior: 'skip' });
+  assert.equal(held.isError, true);
+  assert.ok(
+    held.content.includes(`wake_add_rule has "matches" (did you mean "match"?), which it doesn't take, so nothing was saved. Its parameters are ${parameters}.`),
+    held.content,
+  );
   // So is a field of one of its object parameters given on its own, which the rule would be saved without, naming that parameter.
   const loose = await call({ name: 'watch', tagsAny: ['chat:ambient'], behavior: 'skip' });
   assert.equal(loose.isError, true);
@@ -1675,14 +1729,20 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions'], 'nothing was saved');
 
   // A null or "" parameter is left out, so a null behavior beside debounceMs is
-  // no second behavior, and another name is named, as "matches" is.
-  const leftOut = await call({ name: 'quiet', behavior: null, debounceMs: 60000, position: null, insertBefore: '', matches: { tagsAny: ['x'] } });
+  // no second behavior, and another name is named, as "why" is.
+  const leftOut = await call({ name: 'quiet', behavior: null, debounceMs: 60000, position: null, insertBefore: '', why: 'night' });
   assert.equal(leftOut.isError, false, leftOut.content);
   assert.deepEqual(JSON.parse(leftOut.content).ignoredFields, [
     'wake_add_rule has "insertBefore" as "", so it\'s left out.',
-    `wake_add_rule has "matches", which it doesn't take, so it does nothing. Its parameters are ${parameters}.`,
+    `wake_add_rule has "why", which it doesn't take, so it does nothing. Its parameters are ${parameters}.`,
   ]);
   assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'quiet'], 'appended, as with no placement');
+  // Beside the parameter it holds, such a name is an extra that explains it, named and saved without.
+  const beside = await call({ name: 'beside', match: { tagsAny: ['chat:ambient'] }, matchNote: 'the ambient ones', behavior: 'skip' });
+  assert.equal(beside.isError, false, beside.content);
+  assert.deepEqual(JSON.parse(beside.content).ignoredFields, [
+    `wake_add_rule has "matchNote", which it doesn't take, so it does nothing. Its parameters are ${parameters}.`,
+  ]);
   // A "" match is a match left out, which matches every event, and the note says so.
   const everything = await call({ name: 'loud', match: '', behavior: 'always' });
   assert.equal(everything.isError, false, everything.content);
