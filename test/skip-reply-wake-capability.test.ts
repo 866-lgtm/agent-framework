@@ -228,6 +228,15 @@ describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
     assert.deepEqual(routed, []);
     assert.equal(results.length, 0, 'ordinary skip ends at the tool boundary');
   });
+
+  it('C: a wake that isn\'t a finite number of seconds asks for none, so it\'s an ordinary skip', async () => {
+    // A tool input arrives as JSON, so Infinity can come only as text.
+    for (const wake of ['Infinity', 'soon']) {
+      const { routed, results } = await runProbe(wake);
+      assert.deepEqual(routed, [], `wake_in_seconds: ${String(wake)}`);
+      assert.equal(results.length, 0, `wake_in_seconds: ${String(wake)} ends the turn at the tool boundary`);
+    }
+  });
 });
 
 // Lifecycle backstop: even if a refused-wake stream exits before its resumed
