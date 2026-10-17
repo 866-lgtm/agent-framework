@@ -1485,6 +1485,48 @@ describe('drafts resend ownership', () => {
     }
   });
 
+  it("what the connector says was posted reaches an unconfirmed resend's reply and the draft's read", async () => {
+    const t = await setup();
+    try {
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'part 2 failed (delivery uncertain)', detail: { posted: ['111'] } });
+      const reply = t.say(await sending);
+      assert.match(reply, new RegExp(`${t.a.id}: delivery to .+ NOT confirmed`));
+      assert.ok(reply.endsWith(' Connector detail: {"posted":["111"]}'), reply);
+      // The notices send the resident to read before a confirmDuplicate
+      // resend, so the attempt's line there carries it too.
+      const read = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.a.id] }));
+      assert.match(read, /UNKNOWN — may have been posted: part 2 failed \(delivery uncertain\); connector detail: \{"posted":\["111"\]\}/);
+      // A long string comes through as itself, bounded, in both places.
+      const long = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.b.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'timed out (delivery uncertain)', detail: 'p'.repeat(3000) });
+      const longReply = t.say(await long);
+      assert.ok(longReply.endsWith(` Connector detail: ${'p'.repeat(1987)}… [truncated]`), longReply.slice(-80));
+      const longRead = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.b.id] }));
+      assert.ok(longRead.includes(`; connector detail: ${'p'.repeat(1987)}… [truncated]`), longRead.slice(0, 400));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a resend that provably posted nothing shows no connector detail', async () => {
+    const t = await setup();
+    try {
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'failed', reason: 'refused before dispatch', detail: { posted: [] } });
+      const reply = t.say(await sending);
+      assert.match(reply, new RegExp(`${t.a.id}: not sent to .+ Nothing was posted by this attempt`));
+      assert.ok(!reply.includes('onnector detail'), reply);
+      const read = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.a.id] }));
+      assert.ok(!read.includes('onnector detail'), read);
+    } finally {
+      await t.close();
+    }
+  });
+
   it("a draft whose own result is in isn't being sent any more, though the rest of its batch is", async () => {
     const t = await setup();
     try {

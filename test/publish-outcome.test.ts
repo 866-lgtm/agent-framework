@@ -107,6 +107,11 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), [
       '[routeSpeech] agent: locus d was closed — opened by delivery (speech implies engagement)',
     ]);
+    // Speech into a channel that's already open opens nothing and says so nowhere.
+    seed('discord', 'e', '#e');
+    assert.equal((await registry.publish('agent', 'x', { channelId: 'e', routed: true })).status, 'delivered');
+    assert.equal(opened.length, 2);
+    assert.equal(lines.filter((l) => l.includes('was closed')).length, 1, 'no open line for an open channel');
   });
 
   it('refuses a send the grant forbids before opening anything', async () => {
@@ -342,8 +347,32 @@ describe('channel_publish answers by the receipt rule', () => {
     assert.match(notSent.error ?? '', /^Publish to c failed: Cannot send request: connection to "discord" is closed\. Nothing was posted\.$/);
     const answered = await publishWith(async () => { throw new McplRequestError('MCPL server "discord" returned error for channels/publish: [-32000] part 2 failed', 'error-response', { posted: ['111'] }); });
     assert.match(answered.error ?? '', /^Publish to c wasn't confirmed: .*part 2 failed \(delivery uncertain\)\. It may or may not have been posted/);
+    // What the connector says was posted reaches the answer, as it does the marker.
+    assert.ok(answered.error?.endsWith(' could post it twice. Connector detail: {"posted":["111"]}'), answered.error);
     const thrown = await publishWith(async () => { throw new Error('connector exploded'); });
     assert.match(thrown.error ?? '', /^Publish to c wasn't confirmed: connector exploded \(delivery uncertain\)\./);
+    assert.ok(!thrown.error?.includes('Connector detail'), 'no data, no detail');
+    // A long string comes through as itself, bounded.
+    const long = await publishWith(async () => { throw new McplRequestError('timed out', 'no-response', 'q'.repeat(3000)); });
+    assert.ok(long.error?.endsWith(` Connector detail: ${'q'.repeat(1987)}… [truncated]`), long.error?.slice(-80));
+    // A request that never left posted nothing, whatever data rides on it.
+    const refused = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent', { posted: [] }); });
+    assert.match(refused.error ?? '', /Nothing was posted\.$/);
+  });
+
+  it('publishForAgent, the subconscious\'s speak_in_channel path, answers by the same rule', async () => {
+    const answers: Array<[unknown, RegExp]> = [
+      [{ delivered: true, messageId: 'posted-1' }, /^$/],
+      [{ delivered: false }, /^Publish to c failed: server "discord" reported delivered:false\. Nothing was posted\.$/],
+      [undefined, /^Publish to c wasn't confirmed: .*no valid delivery receipt.*could post it twice\.$/],
+    ];
+    for (const [receipt, pattern] of answers) {
+      const { registry, seed } = registryWith({ discord: { publish: async () => receipt } });
+      seed('discord', 'c', '#c');
+      const result = await registry.publishForAgent('c', 'words', 'scout');
+      assert.equal(result.success, receipt !== undefined && (receipt as { delivered?: boolean }).delivered === true, JSON.stringify(receipt));
+      assert.match(result.error ?? '', pattern, JSON.stringify(receipt));
+    }
   });
 });
 

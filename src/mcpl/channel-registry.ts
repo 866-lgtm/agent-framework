@@ -478,7 +478,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 
 /** Bound connector values for notices, logs and an outcome's reason. A
  *  PublishOutcome keeps the connector's structured data (`detail`) whole. */
-function connectorText(value: unknown): string {
+export function connectorText(value: unknown): string {
   let text: string;
   try {
     text = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
@@ -506,10 +506,12 @@ export interface PublishDestination {
  *   the connector named one), not a claim the message still exists.
  * - `failed`: nothing was posted: the request never left the host
  *   (unresolvable or shared channel id, missing grant, failed open, closed
- *   connection), or the connector answered `delivered: false`.
+ *   connection), or the connector answered `delivered: false` and named no
+ *   message.
  * - `unknown`: the request was dispatched and no valid receipt came back (an
- *   error response, a timeout, a lost connection, or a missing or malformed
- *   receipt). It may or may not have been posted.
+ *   error response, a timeout, a lost connection, or a missing, malformed or
+ *   contradictory receipt, such as `delivered: false` beside a message id).
+ *   It may or may not have been posted.
  */
 export interface PublishOutcome {
   status: 'delivered' | 'failed' | 'unknown';
@@ -517,7 +519,7 @@ export interface PublishOutcome {
   destination?: PublishDestination;
   messageId?: string;
   /** Why it failed, or why its outcome is unknown — for a connector error,
-   *  its message verbatim (which may say what was already posted). */
+   *  its message, bounded (which may say what was already posted). */
   reason?: string;
   /** The connector error's structured `data`, verbatim, when it sent one. */
   detail?: unknown;
@@ -3246,9 +3248,10 @@ export class ChannelRegistry {
   /**
    * Publish `text` to one registered channel and report what the attempt
    * established (PublishOutcome). The delivery executor behind plain speech
-   * (deliverSpeech / routeSpeech) and resident resends of held drafts;
-   * channel_publish (and publishForAgent, which shares its handler) moves
-   * onto it with shelf-355 — until then that tool reads its own receipt.
+   * (deliverSpeech / routeSpeech) and resident resends of held drafts.
+   * channel_publish (and publishForAgent, which shares its handler) resolves
+   * and sends on its own path, and reads its answer through the same
+   * publishReceiptOutcome and publishErrorOutcome.
    *
    * Resolution is exact (resolveDestination): `serverId` plus `channelId`
    * when the caller has the server, otherwise the channel id must be
@@ -3522,12 +3525,14 @@ export class ChannelRegistry {
       outcome = publishErrorOutcome(err, destination, Date.now());
     }
     if (outcome.status === 'delivered') return { success: true, data: result };
+    // The connector's data may say what a multi-part send already posted.
+    const detail = outcome.status === 'unknown' && outcome.detail !== undefined ? ` Connector detail: ${connectorText(outcome.detail)}` : '';
     return {
       success: false,
-      error: outcome.status === 'failed'
+      error: (outcome.status === 'failed'
         ? `Publish to ${channelId} failed: ${outcome.reason}. Nothing was posted.`
         : `Publish to ${channelId} wasn't confirmed: ${outcome.reason}. ` +
-          'It may or may not have been posted, so sending it again could post it twice.',
+          'It may or may not have been posted, so sending it again could post it twice.') + detail,
       isError: true,
     };
   }

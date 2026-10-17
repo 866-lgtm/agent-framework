@@ -59,11 +59,13 @@ When the latest bounce may already have been posted (an attempt's outcome is
 unknown), or is being sent or queued in a resend right now, what happens
 depends on the route:
 - **Delivery** (`>>#channel … {{unsent}} …`): nothing is sent. The agent is
-  told, and can resend the bounce with the `drafts` tool's `confirmDuplicate`,
-  though that could post it twice. The envelope's own words are held as a new
-  bounce draft, with `{{unsent}}` written out and the risk carried, so that
-  draft too can be resent only with `confirmDuplicate`. A bare `{{unsent}}`
-  holds nothing new: its words already are the bounce.
+  told. While the bounce is being sent or queued, it is told to wait for that
+  result; once the bounce may already have been posted, it can resend it with
+  the `drafts` tool's `confirmDuplicate`, though that could post it twice.
+  The envelope's own words are held as a new bounce draft, with `{{unsent}}`
+  written out and the risk carried, so that draft too can be resent only
+  with `confirmDuplicate`. A bare `{{unsent}}` holds nothing new: its words
+  already are the bounce.
 - **Hold** (an envelope that bounces, or one an explicit send held back): the
   bounce's words are copied into the new draft with `{{unsent}}` written out,
   and the draft carries the same risk (`inheritedRisk`), so it reads

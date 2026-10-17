@@ -572,7 +572,7 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it('a thrown bare {{unsent}} delivery says its draft may already have been posted', async () => {
+  it('a thrown bare {{unsent}} delivery says sending its draft again could post it twice', async () => {
     const framework = await createFramework();
     try {
       stubRegistry(framework, ['throw']);
@@ -587,7 +587,7 @@ describe('explicit prose routing', () => {
       assert.deepEqual(store.open('assistant').map((d) => d.id), [original.id], 'a bare {{unsent}} holds no copy');
       assert.equal(draftState(store.get('assistant', original.id)!), 'unconfirmed');
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes(original.id))!;
-      assert.match(notice, /may already have been posted/);
+      assert.match(notice, /Its last send's outcome isn't known, so sending it again could post it twice: resend it only with confirmDuplicate: true\./);
       assert.doesNotMatch(notice, /was not delivered/, 'an unconfirmed send is not also declared undelivered');
       assert.match(notice, /may not have been delivered/);
       assert.ok(notice.includes(`draftIds: ["${original.id}"], destination: "#channel", confirmDuplicate: true`), notice);

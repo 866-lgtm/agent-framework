@@ -94,7 +94,7 @@ import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.j
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -692,12 +692,11 @@ function freshTurnRouting(): TurnRouting {
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
- * it doesn't send is held. `round` and `notice` say how an envelope that
- * bounces or is held back is held as a draft: the turn's round it came from,
- * and whether its notice is presented with this round's tool results ('now')
- * or at the next boundary that presents messages ('later'). `keepPrivate` is
- * a skip_reply round: its envelopes all stay in the context, and none is
- * sent, bounced or held.
+ * it doesn't send is held. `notice` says when the notice for an envelope that
+ * bounces or is held back as a draft is presented: with this round's tool
+ * results ('now') or at the next boundary that presents messages ('later').
+ * `keepPrivate` is a skip_reply round: its envelopes all stay in the context,
+ * and none is sent, bounced or held.
  */
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
@@ -11647,6 +11646,7 @@ export class AgentFramework {
                   ? `UNKNOWN — may have been posted: ${o.reason ?? 'no valid receipt'}`
                   : `failed, nothing posted: ${o.reason ?? 'refused'}`;
             return `  attempt ${this.draftTime(a.at)} → ${AgentFramework.destinationText(a.destination)}: ${status}` +
+              (o?.status === 'unknown' && o.detail !== undefined ? `; connector detail: ${connectorText(o.detail)}` : '') +
               (a.confirmedDuplicate ? ' (resent knowing it might duplicate)' : '');
           }),
           `Text (${d.text.length} chars, exactly as a resend publishes it):`,
@@ -11811,13 +11811,15 @@ export class AgentFramework {
         stopped = `${d.id} was not confirmed delivered`;
         const after = this.proseDrafts.get(agentName, d.id);
         const stillAtRisk = after !== undefined && draftState(after) === 'unconfirmed';
-        lines.push(outcome.status === 'unknown'
+        // The connector's data may say what a multi-part send already posted.
+        const detail = outcome.status === 'unknown' && outcome.detail !== undefined ? ` Connector detail: ${connectorText(outcome.detail)}` : '';
+        lines.push((outcome.status === 'unknown'
           ? `${d.id}: delivery to ${where} NOT confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. ` +
             `Sending it again could post it twice, so a resend needs confirmDuplicate: true${unrecorded}.`
           : `${d.id}: not sent to ${where} — ${outcome.reason ?? 'refused'}. Nothing was posted by this attempt${unrecorded}.` +
             (stillAtRisk
               ? ` The draft stays unconfirmed: ${this.riskText(after!)}.`
-              : ' The draft stays held.'));
+              : ' The draft stays held.')) + detail);
       }
     } finally {
       for (const claim of claims) {
@@ -12818,7 +12820,7 @@ export class AgentFramework {
       ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
         'can be resent only with the drafts tool and confirmDuplicate: true.'
       : ownRisk
-        ? ` Its last send's outcome isn't known, so it may already have been posted: resend it only with ` +
+        ? ` Its last send's outcome isn't known, so sending it again could post it twice: resend it only with ` +
           'confirmDuplicate: true.'
         : after.outcome === 'unknown'
           ? ' The send may have gone out, so sending it again could post it twice.'

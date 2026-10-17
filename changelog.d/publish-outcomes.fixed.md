@@ -27,4 +27,9 @@
   Now only `delivered: true` is success. `delivered: false` naming no
   message, or a request refused before it was written, is an error saying
   nothing was posted. Anything else is an error saying the publish wasn't
-  confirmed and that sending it again could post it twice.
+  confirmed and that sending it again could post it twice. That answer, a
+  draft resend's line for a send that wasn't confirmed, and the `drafts`
+  tool's read of that attempt carry the connector's data, bounded, when it
+  sent some. `channel_publish` and
+  `speak_in_channel` still resolve a channel id by its first registered
+  match and post into a closed channel without opening it, as before.
