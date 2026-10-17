@@ -952,8 +952,9 @@ export class HistoryModule implements Module {
       const one = resumeOnly.length === 1;
       throw new Error(
         `Nothing was read: ${quotedList(resumeOnly, 'and')} ${one ? 'resumes' : 'resume'} an author-filtered ` +
-          `extract, so ${one ? 'it goes' : 'they go'} with "author" or "excludeAuthor", copied together from its ` +
-          '"resume". To page through a range without an author filter, use "offset".',
+          `extract, so ${one ? 'it goes' : 'they go'} with the "author" or "excludeAuthor" of the call that returned ` +
+          `${one ? 'it' : 'them'}: repeat that call with the fields of its "resume". To page through a range without an ` +
+          'author filter, use "offset".',
       );
     }
 

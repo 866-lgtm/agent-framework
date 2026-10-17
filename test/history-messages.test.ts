@@ -268,14 +268,15 @@ test("extract's refusals say which fields go together, and how to read instead",
   );
   assert.equal(
     await refusal(bound(), 'extract', { windowOffset: 3 }),
-    'Nothing was read: "windowOffset" resumes an author-filtered extract, so it goes with "author" or '
-      + '"excludeAuthor", copied together from its "resume". To page through a range without an author filter, use "offset".',
+    'Nothing was read: "windowOffset" resumes an author-filtered extract, so it goes with the "author" or '
+      + '"excludeAuthor" of the call that returned it: repeat that call with the fields of its "resume". To page through a '
+      + 'range without an author filter, use "offset".',
   );
   assert.equal(
     await refusal(bound(), 'extract', { windowOffset: 3, afterId: 'm1', seqMark: 9 }),
-    'Nothing was read: "windowOffset", "afterId" and "seqMark" resume an author-filtered extract, so they go with '
-      + '"author" or "excludeAuthor", copied together from its "resume". To page through a range without an author '
-      + 'filter, use "offset".',
+    'Nothing was read: "windowOffset", "afterId" and "seqMark" resume an author-filtered extract, so they go with the '
+      + '"author" or "excludeAuthor" of the call that returned them: repeat that call with the fields of its "resume". To '
+      + 'page through a range without an author filter, use "offset".',
   );
   assert.equal(
     await refusal(bound(), 'extract', { author: ['alice'], maxScan: 0 }),
