@@ -260,11 +260,11 @@ export class PyRunner {
   }
 
   /**
-   * Abort the runner's script (turn cancelled, agent reset/stopped), running
-   * or still waiting for the interpreter to start, when it never runs. The
-   * exec settles at once, and the interpreter is reclaimed, a starting one
-   * too: after an abort its state is suspect (a script died midway), and the
-   * next exec gets a fresh one.
+   * Abort the runner's script (turn cancelled, agent reset/stopped), whether
+   * it's running or still waiting for its interpreter to start; a waiting
+   * script then never runs. The exec settles at once, and the interpreter is
+   * reclaimed, a starting one too: after an abort its state is suspect (a
+   * script died midway), and the next exec gets a fresh one.
    */
   abort(reason: string): void {
     if (!this.pending) return;
@@ -315,6 +315,14 @@ export class PyRunner {
       // Outside an exec, python stderr is runtime diagnostics (crash
       // tracebacks etc.) — surface them in host logs.
       console.error(`[pytc:${this.label}] ${chunk.trimEnd()}`);
+    });
+
+    // A write to an interpreter that no longer reads its input, such as one
+    // that died before its exit was handled, fails on the stream after
+    // write() returns. With no listener, that error is thrown as an uncaught
+    // exception. The interpreter's exit settles its exec.
+    child.stdin.on('error', (err) => {
+      console.error(`[pytc:${this.label}] write to the python runtime failed: ${err.message}`);
     });
 
     child.on('error', (err) => {
@@ -540,7 +548,12 @@ export class PyRunner {
       } catch {
         // stream may already be destroyed
       }
-      if (child.exitCode === null && !child.killed) {
+      // A child whose spawn failed has no pid, and its exitCode stays null
+      // until Node's 'error' for it, a tick later. A kill() in that tick, as
+      // from an abort or dispose on the tick exec was called, signals no
+      // child of ours: on Node 20 it sent SIGKILL to the host's own process
+      // group.
+      if (child.exitCode === null && !child.killed && child.pid !== undefined) {
         child.kill('SIGKILL');
       }
     }

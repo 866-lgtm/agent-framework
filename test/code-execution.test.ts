@@ -10,8 +10,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { ChildProcess, execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -31,6 +31,15 @@ import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
 const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
   { pyName: 'test__echo', toolName: 'test--echo' },
 ];
+
+/** Wait for a condition, failing after 10 s rather than hanging the run. */
+const until = async (cond: () => boolean, what: string) => {
+  const deadline = Date.now() + 10_000;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+};
 
 describe('buildInjectedTools', () => {
   it('sanitizes -- to __ and keeps valid identifiers', () => {
@@ -241,8 +250,12 @@ describe('PyRunner (real python3)', () => {
     });
     try {
       const pending = runner.exec('await test__echo({})\nimport asyncio\nawait asyncio.sleep(60)', ECHO_TOOLS);
-      // The script's tool call says it's running.
-      await running;
+      // The script's tool call says it's running. An exec that settles first
+      // fails the test rather than leaving it waiting.
+      await Promise.race([
+        running,
+        pending.then((r) => assert.fail(`the exec settled before its script called its tool: ${r.stderr}`)),
+      ]);
       assert.strictEqual(runner.busy, true);
       runner.abort('test abort');
       const result = await pending;
@@ -315,13 +328,17 @@ describe('PyRunner (real python3)', () => {
 // the script never runs.
 describe('PyRunner: an abort or dispose while the interpreter starts (real python3)', () => {
   /** An executable standing in for python3: a shell script with the given body. */
-  const standIn = (body: string): { path: string; done: () => void } => {
+  const standIn = (body: string): { path: string; dir: string; done: () => void } => {
     const dir = mkdtempSync(join(tmpdir(), 'af-pytc-standin-'));
     const path = join(dir, 'python3');
     writeFileSync(path, `#!/bin/sh\n${body}\n`);
     chmodSync(path, 0o755);
-    return { path, done: () => rmSync(dir, { recursive: true, force: true }) };
+    return { path, dir, done: () => rmSync(dir, { recursive: true, force: true }) };
   };
+  // The stand-ins are shell scripts.
+  const posix = { skip: process.platform === 'win32' ? 'the stand-ins need /bin/sh' : false };
+  // A write's failure comes back through the event loop: two turns of it.
+  const turns = () => new Promise<void>((r) => setImmediate(() => setImmediate(r)));
 
   it('an abort settles the exec at once, and its script never runs', async () => {
     const calls: string[] = [];
@@ -332,6 +349,7 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       },
     });
     try {
+      const started = Date.now();
       const pending = runner.exec('await test__echo({})\nimport asyncio\nawait asyncio.sleep(2)', ECHO_TOOLS);
       assert.strictEqual(runner.busy, true);
       runner.abort('turn abandoned');
@@ -339,6 +357,9 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       const result = await pending;
       assert.strictEqual(result.aborted, true);
       assert.match(result.stderr, /aborted by host: turn abandoned/);
+      // Waiting on the killed interpreter's readiness would take its 15 s start timeout.
+      const took = Date.now() - started;
+      assert.ok(took < 5_000, `settled after ${took} ms`);
       const after = await runner.exec('print("alive")', []);
       assert.strictEqual(after.returnCode, 0, after.stderr);
       assert.strictEqual(after.stdout, 'alive\n');
@@ -348,23 +369,24 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
     }
   });
 
-  it('an abort 300 ms into a start that takes 1 s settles the exec', async () => {
-    // The steps the abort test took with a 500 ms wait, which a loaded
-    // machine's start outlasted.
-    const slow = standIn('sleep 1\nexec python3 "$@"');
-    const runner = new PyRunner({ pythonPath: slow.path, onToolCall: async () => '' });
+  it('an abort 300 ms into a start that never finishes settles the exec', posix, async () => {
+    // The abort test's old steps, a wait and then an abort, which a loaded
+    // machine's start outlasted. The stand-in never says it's ready, so the
+    // abort lands while it starts, however late the wait ends.
+    const never = standIn('exec sleep 30');
+    const runner = new PyRunner({ pythonPath: never.path, onToolCall: async () => '' });
     try {
-      const pending = runner.exec('import asyncio\nawait asyncio.sleep(2)\nprint("ran")', []);
+      const pending = runner.exec('print("ran")', []);
       await new Promise((r) => setTimeout(r, 300));
       assert.strictEqual(runner.busy, true);
       runner.abort('test abort');
       const result = await pending;
       assert.strictEqual(result.aborted, true);
-      assert.match(result.stderr, /aborted by host: test abort/);
+      assert.strictEqual(result.stderr, 'script aborted by host: test abort');
       assert.strictEqual(result.stdout, '');
     } finally {
       runner.dispose();
-      slow.done();
+      never.done();
     }
   });
 
@@ -393,7 +415,8 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       const stopped = await first;
       assert.strictEqual(stopped.aborted, true);
       assert.match(stopped.stderr, /aborted by host: turn abandoned/);
-      // An exec that went on to arm its deadline would interrupt this one at 300 ms.
+      // Had the aborted exec gone on to arm its deadline, that would interrupt
+      // this next script at 300 ms.
       const next = await runner.exec('import asyncio\nawait asyncio.sleep(1)\nprint("whole")', []);
       assert.strictEqual(next.returnCode, 0, next.stderr);
       assert.strictEqual(next.stdout, 'whole\n');
@@ -428,7 +451,79 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
     });
   }
 
-  it('an interpreter that exits before it is ready still reads as a failed start', async () => {
+  it('an abort while an interpreter that has stopped reading its input starts throws nothing', posix, async () => {
+    // The stand-in closes its input, says so, and never gets ready, so the
+    // abort's write meets a pipe nobody reads.
+    const closed = standIn('exec 0<&-\ntouch "$(dirname "$0")/closed"\nexec sleep 30');
+    const runner = new PyRunner({ pythonPath: closed.path, onToolCall: async () => '' });
+    try {
+      const pending = runner.exec('print(1)', []);
+      await until(() => existsSync(join(closed.dir, 'closed')), 'the stand-in to close its input');
+      runner.abort('turn abandoned');
+      const result = await pending;
+      assert.strictEqual(result.stderr, 'script aborted by host: turn abandoned');
+      // An unheard write error would fail this test as an uncaught exception.
+      await turns();
+    } finally {
+      runner.dispose();
+      closed.done();
+    }
+  });
+
+  it("an exec whose interpreter stops reading its input once it's ready throws nothing, and settles at its exit", posix, async () => {
+    // The script's own writes, the init and the exec, meet a pipe nobody reads.
+    const closes = standIn(`exec 0<&-\necho '{"op":"ready"}'\nexec sleep 1`);
+    const runner = new PyRunner({ pythonPath: closes.path, onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.strictEqual(result.aborted, true);
+      assert.strictEqual(result.stderr, 'python runtime exited unexpectedly (code=0, signal=none)');
+      await turns();
+    } finally {
+      runner.dispose();
+      closes.done();
+    }
+  });
+
+  it("an abort or a dispose on the tick exec is called, with an interpreter that can't be spawned, kills no child without a pid", async () => {
+    // A failed spawn's child has no pid, and its exitCode stays null until
+    // Node's 'error' for it, a tick later. A kill() in that tick signals
+    // whatever pid Node's handle held: in a fresh Node 20 process that was 0,
+    // the caller's own process group. So the stub records such a kill
+    // instead, and passes on only a child's with a pid.
+    const kill = ChildProcess.prototype.kill;
+    const pidless: (NodeJS.Signals | number | undefined)[] = [];
+    ChildProcess.prototype.kill = function (this: ChildProcess, signal?: NodeJS.Signals | number) {
+      if (this.pid === undefined) {
+        pidless.push(signal);
+        return false;
+      }
+      return kill.call(this, signal);
+    };
+    try {
+      for (const stop of ['abort', 'dispose'] as const) {
+        const runner = new PyRunner({ pythonPath: '/definitely/not/a/python', onToolCall: async () => '' });
+        try {
+          const pending = runner.exec('print(1)', []);
+          if (stop === 'abort') runner.abort('stopped on the spawn tick');
+          else runner.dispose();
+          const result = await pending;
+          assert.strictEqual(result.aborted, true, stop);
+          assert.strictEqual(
+            result.stderr,
+            stop === 'abort' ? 'script aborted by host: stopped on the spawn tick' : 'code_execution runner disposed',
+          );
+          assert.deepStrictEqual(pidless, [], `${stop}: a kill reached a child with no pid`);
+        } finally {
+          runner.dispose();
+        }
+      }
+    } finally {
+      ChildProcess.prototype.kill = kill;
+    }
+  });
+
+  it('an interpreter that exits before it is ready still reads as a failed start', posix, async () => {
     const exits = standIn('exit 3');
     const runner = new PyRunner({ pythonPath: exits.path, onToolCall: async () => '' });
     try {
@@ -448,14 +543,6 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
 // Inner-call ids restart in every interpreter: a result that outlives its
 // interpreter must not resolve a call of the one that replaced it.
 describe('code_execution inner-call results after the interpreter is replaced (real python3)', () => {
-  const until = async (cond: () => boolean, what: string) => {
-    const deadline = Date.now() + 10_000;
-    while (!cond()) {
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  };
-
   const stops: Record<string, { code: string; stop?: (runner: PyRunner) => void }> = {
     aborted: { code: 'print(await test__echo({}))', stop: (runner) => runner.abort('turn abandoned') },
     crashed: {
