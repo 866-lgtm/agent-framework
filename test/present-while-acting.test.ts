@@ -997,6 +997,16 @@ describe('present while acting', () => {
       [ambient('discord:guild:portables')], 'discord:guild:portables'],
     ['leaves it for a reaction in a channel the turn engaged',
       [{ channelId: 'discord:guild:portables', tags: ['chat:reaction'] }], 'chan-turn'],
+    ['leaves it for a reaction removal in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:reaction-remove'] }], 'chan-turn'],
+    ['leaves it for an edit in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:edited'] }], 'chan-turn'],
+    ['leaves it for a deletion in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:deleted'] }], 'chan-turn'],
+    // An edit of a message addressed to the agent can arrive tagged
+    // chat:addressed too; it still moves nothing.
+    ['leaves it for an edit that carries the addressed tag',
+      [{ channelId: 'discord:dm:q', tags: ['chat:edited', 'chat:addressed'] }], 'chan-turn'],
   ] as const) {
     it(`a re-inference on unstreamed tool results ${label}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
@@ -1817,6 +1827,13 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [], 'post-send prose stayed suppressed after a reaction');
+    // That verdict counts only if the reaction was in the round: one that
+    // missed it would leave the suppression set as well.
+    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .map((m) => m.content.map((b) => (b as { text?: string }).text ?? '').join(''));
+    const markerAt = texts.findIndex((t) => t.includes('[reaction] @someone reacted'));
+    const replyAt = texts.findIndex((t) => t.includes('Sent it.'));
+    assert.ok(markerAt >= 0 && markerAt < replyAt, 'the reaction reached the turn before its reply');
 
     await framework.stop();
   });
@@ -1846,6 +1863,13 @@ describe('present while acting', () => {
       await framework.runUntilIdle();
 
       assert.deepEqual(routed, [], `post-send prose stayed suppressed after a ${tag} marker`);
+      // That verdict counts only if the marker was in the round: a marker that
+      // missed it would leave the suppression set as well.
+      const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .map((m) => m.content.map((b) => (b as { text?: string }).text ?? '').join(''));
+      const markerAt = texts.findIndex((t) => t.includes(`[${tag}] marker about an earlier message`));
+      const replyAt = texts.findIndex((t) => t.includes('Sent it.'));
+      assert.ok(markerAt >= 0 && markerAt < replyAt, `the ${tag} marker reached the turn before its reply`);
 
       await framework.stop();
     });
