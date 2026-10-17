@@ -298,6 +298,55 @@ describe('ChannelRegistry.publish outcomes', () => {
   });
 });
 
+describe('channel_publish answers by the receipt rule', () => {
+  // Ada-1017's item for #163's rule (agent-framework#163): the tool and the
+  // subconscious's speak_in_channel, which shares its path, count only a
+  // connector's delivered:true as posted, as plain speech does.
+  const publishWith = async (publish: Publish) => {
+    const { registry, seed } = registryWith({ discord: { publish } });
+    seed('discord', 'c', '#c');
+    return registry.handleChannelToolCall('channel_publish', { channelId: 'c', content: 'words' }) as Promise<{
+      success: boolean; data?: unknown; error?: string; isError?: boolean;
+    }>;
+  };
+
+  it('answers delivered:true with success and the connector receipt', async () => {
+    const result = await publishWith(ok);
+    assert.equal(result.success, true);
+    assert.deepEqual(result.data, { delivered: true, messageId: 'posted-1' });
+  });
+
+  for (const [what, receipt] of [['a missing receipt', undefined], ['an empty receipt', {}], ['a malformed delivered field', { delivered: 'yes' }]] as const) {
+    it(`answers ${what} as unconfirmed, never as success`, async () => {
+      const result = await publishWith(async () => receipt);
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.match(result.error ?? '', /^Publish to c wasn't confirmed: .*no valid delivery receipt.*\. It may or may not have been posted, so sending it again could post it twice\.$/);
+    });
+  }
+
+  it('answers delivered:false with no message id as failed: nothing was posted', async () => {
+    const result = await publishWith(async () => ({ delivered: false }));
+    assert.equal(result.success, false);
+    assert.match(result.error ?? '', /^Publish to c failed: server "discord" reported delivered:false\. Nothing was posted\.$/);
+  });
+
+  it('answers delivered:false beside a message id as unconfirmed', async () => {
+    const result = await publishWith(async () => ({ delivered: false, messageId: 'part-1' }));
+    assert.equal(result.success, false);
+    assert.match(result.error ?? '', /^Publish to c wasn't confirmed: .*named posted message part-1/);
+  });
+
+  it('answers a request refused before it was written as failed, and an error response or a plain throw as unconfirmed', async () => {
+    const notSent = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent'); });
+    assert.match(notSent.error ?? '', /^Publish to c failed: Cannot send request: connection to "discord" is closed\. Nothing was posted\.$/);
+    const answered = await publishWith(async () => { throw new McplRequestError('MCPL server "discord" returned error for channels/publish: [-32000] part 2 failed', 'error-response', { posted: ['111'] }); });
+    assert.match(answered.error ?? '', /^Publish to c wasn't confirmed: .*part 2 failed \(delivery uncertain\)\. It may or may not have been posted/);
+    const thrown = await publishWith(async () => { throw new Error('connector exploded'); });
+    assert.match(thrown.error ?? '', /^Publish to c wasn't confirmed: connector exploded \(delivery uncertain\)\./);
+  });
+});
+
 test('the resident\'s failure marker never claims an uncertain delivery did not happen', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'publish-outcome-'));
   const commandPath = join(dir, 'commands.jsonl');

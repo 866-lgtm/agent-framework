@@ -525,6 +525,66 @@ export interface PublishOutcome {
   at: number;
 }
 
+/**
+ * What a channels/publish request that threw establishes. Only a request
+ * that never left the host proves nothing was posted. An error response may
+ * follow a partial post (a multi-part send whose later part failed), so it
+ * is unknown, with the connector's own words, bounded, and its data kept for
+ * the resident to judge. The publish executor and channel_publish both read
+ * a failed request this way.
+ */
+function publishErrorOutcome(err: unknown, destination: PublishDestination, at: number): PublishOutcome {
+  const message = connectorText(err instanceof Error ? err.message : String(err));
+  const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
+  const detail = err instanceof McplRequestError ? err.data : undefined;
+  return {
+    status: notSent ? 'failed' : 'unknown',
+    destination,
+    reason: notSent ? message : `${message} (delivery uncertain)`,
+    ...(detail !== undefined ? { detail } : {}),
+    at,
+  };
+}
+
+/**
+ * What a channels/publish answer establishes. A final publish is a request,
+ * so success requires an explicit receipt; a missing or malformed one leaves
+ * delivery uncertain (anima-research/agent-framework#163's rule).
+ * `delivered: false` proves nothing went out only when the receipt names no
+ * message at all: a message id beside it, valid or malformed, contradicts it,
+ * since something may have been posted. The publish executor and
+ * channel_publish both read an answer this way.
+ */
+function publishReceiptOutcome(result: unknown, destination: PublishDestination, at: number): PublishOutcome {
+  const receipt = (result ?? {}) as { delivered?: unknown; messageId?: unknown };
+  const messageId = typeof receipt.messageId === 'string' && receipt.messageId ? receipt.messageId : undefined;
+  if (receipt.delivered === true) {
+    return { status: 'delivered', destination, ...(messageId ? { messageId } : {}), at };
+  }
+  if (receipt.delivered === false) {
+    if (receipt.messageId === undefined || receipt.messageId === null) {
+      return { status: 'failed', destination, reason: `server "${destination.serverId}" reported delivered:false`, at };
+    }
+    return {
+      status: 'unknown',
+      destination,
+      ...(messageId ? { messageId } : {}),
+      reason: messageId
+        ? `server "${destination.serverId}" reported delivered:false but named posted message ${connectorText(messageId)} (delivery uncertain)`
+        : `server "${destination.serverId}" reported delivered:false beside a malformed message id ` +
+          `${connectorText(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
+      at,
+    };
+  }
+  return {
+    status: 'unknown',
+    destination,
+    ...(messageId ? { messageId } : {}),
+    reason: `server "${destination.serverId}" returned no valid delivery receipt (delivery uncertain)`,
+    at,
+  };
+}
+
 interface ChannelRegistryOptions {
   /**
    * An ordinary (uncoalesced) `channels/incoming` message has just been
@@ -3294,60 +3354,9 @@ export class ChannelRegistry {
         content: [{ type: 'text', text }],
       });
     } catch (err) {
-      // The connector's error message is its own words: bounded, as its data is.
-      const message = connectorText(err instanceof Error ? err.message : String(err));
-      // Only a request that never left the host proves nothing was posted.
-      // An error response may follow a partial post (a multi-part send whose
-      // later part failed), so it is unknown, with the connector's own words
-      // (and data) kept for the resident to judge.
-      const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
-      const detail = err instanceof McplRequestError ? err.data : undefined;
-      return {
-        status: notSent ? 'failed' : 'unknown',
-        destination,
-        reason: notSent ? message : `${message} (delivery uncertain)`,
-        ...(detail !== undefined ? { detail } : {}),
-        at: at(),
-      };
+      return publishErrorOutcome(err, destination, at());
     }
-    const receipt = (result ?? {}) as { delivered?: unknown; messageId?: unknown };
-    const messageId = typeof receipt.messageId === 'string' && receipt.messageId ? receipt.messageId : undefined;
-    if (receipt.delivered === true) {
-      return { status: 'delivered', destination, ...(messageId ? { messageId } : {}), at: at() };
-    }
-    if (receipt.delivered === false) {
-      // `delivered: false` proves nothing went out only when the receipt
-      // names no message at all. A message id beside it — valid or
-      // malformed — contradicts it: something may have been posted.
-      if (receipt.messageId === undefined || receipt.messageId === null) {
-        return {
-          status: 'failed',
-          destination,
-          reason: `server "${entry.serverId}" reported delivered:false`,
-          at: at(),
-        };
-      }
-      return {
-        status: 'unknown',
-        destination,
-        ...(messageId ? { messageId } : {}),
-        reason: messageId
-          ? `server "${entry.serverId}" reported delivered:false but named posted message ${connectorText(messageId)} (delivery uncertain)`
-          : `server "${entry.serverId}" reported delivered:false beside a malformed message id ` +
-            `${connectorText(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
-        at: at(),
-      };
-    }
-    // Final publish is a request, so success requires an explicit receipt; a
-    // missing or malformed one leaves delivery uncertain (anima-research/
-    // agent-framework#163's rule).
-    return {
-      status: 'unknown',
-      destination,
-      ...(messageId ? { messageId } : {}),
-      reason: `server "${entry.serverId}" returned no valid delivery receipt (delivery uncertain)`,
-      at: at(),
-    };
+    return publishReceiptOutcome(result, destination, at());
   }
 
   /**
@@ -3484,31 +3493,42 @@ export class ChannelRegistry {
       };
     }
 
-    try {
-      if (!CapabilityGrant.of(server).has('channels.publish')) {
-        return {
-          success: false,
-          error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,
-          isError: true,
-        };
-      }
-      const publishParams: ChannelsPublishParams = {
-        conversationId: '', // Framework will fill this when wired
-        channelId,
-        content: [{ type: 'text', text: messageText }],
-      };
-
-      const result = await server.sendChannelsPublish(publishParams);
-      return {
-        success: true,
-        data: result ?? { delivered: true },
-      };
-    } catch (err) {
+    if (!CapabilityGrant.of(server).has('channels.publish')) {
       return {
         success: false,
-        error: `Failed to publish to channel: ${(err as Error).message}`,
+        error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,
         isError: true,
       };
     }
+    const publishParams: ChannelsPublishParams = {
+      conversationId: '', // Framework will fill this when wired
+      channelId,
+      content: [{ type: 'text', text: messageText }],
+    };
+    const destination: PublishDestination = {
+      serverId: entry.serverId,
+      channelId: entry.descriptor.id,
+      ...(entry.descriptor.label ? { label: entry.descriptor.label } : {}),
+    };
+
+    // The answer counts by the same rule as plain speech's: only the
+    // connector's delivered:true confirms a post.
+    let result: unknown;
+    let outcome: PublishOutcome;
+    try {
+      result = await server.sendChannelsPublish(publishParams);
+      outcome = publishReceiptOutcome(result, destination, Date.now());
+    } catch (err) {
+      outcome = publishErrorOutcome(err, destination, Date.now());
+    }
+    if (outcome.status === 'delivered') return { success: true, data: result };
+    return {
+      success: false,
+      error: outcome.status === 'failed'
+        ? `Publish to ${channelId} failed: ${outcome.reason}. Nothing was posted.`
+        : `Publish to ${channelId} wasn't confirmed: ${outcome.reason}. ` +
+          'It may or may not have been posted, so sending it again could post it twice.',
+      isError: true,
+    };
   }
 }

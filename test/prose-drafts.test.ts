@@ -567,7 +567,7 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().filter((p) => p.event === 'publish-error').length, 1, 'the request reached the server');
       await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
-      assert.match(marker, /was not confirmed \(.*connector exploded.*\(delivery uncertain\)\)\. It may or may not have been posted; check the channel/);
+      assert.match(marker, /was not confirmed \(.*connector exploded.*\(delivery uncertain\)\)\. It may or may not have been posted, so sending it again could post it twice/);
       // A resend of a held draft records the same outcome.
       await h.turn([
         createMockResponse([text('held beside a send'), explicitSend('s1')], 'tool_use'),
@@ -1047,7 +1047,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse(raced(unsure.id), 'tool_use'), createMockResponse([])]);
       [resent, dismissal] = h.toolResults();
       assert.match(dismissal!, waits(unsure.id));
-      assert.match(resent!, /NOT confirmed .* Check the channel before sending it again \(that needs confirmDuplicate: true\)/,
+      assert.match(resent!, /NOT confirmed .* Sending it again could post it twice, so a resend needs confirmDuplicate: true/,
         'the resend\'s advice holds: the draft is still open');
       assert.equal(draftState(h.store().get('scout', unsure.id)!), 'unconfirmed');
 

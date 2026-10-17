@@ -11813,7 +11813,7 @@ export class AgentFramework {
         const stillAtRisk = after !== undefined && draftState(after) === 'unconfirmed';
         lines.push(outcome.status === 'unknown'
           ? `${d.id}: delivery to ${where} NOT confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. ` +
-            `Check the channel before sending it again (that needs confirmDuplicate: true)${unrecorded}.`
+            `Sending it again could post it twice, so a resend needs confirmDuplicate: true${unrecorded}.`
           : `${d.id}: not sent to ${where} — ${outcome.reason ?? 'refused'}. Nothing was posted by this attempt${unrecorded}.` +
             (stillAtRisk
               ? ` The draft stays unconfirmed: ${this.riskText(after!)}.`
@@ -17862,7 +17862,7 @@ export class AgentFramework {
                 text: (outcome === 'unknown'
                   // A request went out and no valid receipt came back: it may
                   // have been posted (in part or whole). Never claim it wasn't.
-                  ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the channel before sending it again. It is saved in your archive.`
+                  ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted, so sending it again could post it twice. It is saved in your archive.`
                   : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`) +
                   (detail !== undefined ? ` Connector detail: ${detail}` : ''),
               }],
