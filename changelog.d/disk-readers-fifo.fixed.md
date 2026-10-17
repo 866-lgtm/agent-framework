@@ -1,0 +1,1 @@
+- `WorkspaceModule.readFileFromDisk` and `read_image` no longer wait on a FIFO in a mount until something writes to it. They open the path without blocking and refuse it as not a regular file, `readFileFromDisk` with the code `not_found`.
