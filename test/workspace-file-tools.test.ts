@@ -586,11 +586,15 @@ test("a path whose branch intent can't be read is told to sync the path, which r
   assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow"/);
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), unseen, "a sync that can't see disk's copy leaves the intent");
   rmSync(join(dir, 'w.txt'));
-  // Absent is a copy a sync sees, so the reason names the sync alone.
+  // Absent is a copy a sync sees, so the reason names the sync alone, and
+  // says that it takes disk's deletion.
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data),
-    /w\.txt: its branch intent can't be read: its record is not a branch intent — sync this path to adopt the disk version, which replaces the intent"/);
+    /w\.txt: its branch intent can't be read: its record is not a branch intent — sync this path to take disk's deletion, which removes the workspace's copy and replaces the intent"/);
   const seen = await call('sync', { path: 'work/w.txt' });
   assert.equal(seen.success, true, seen.error);
+  const removed = await call('read', { path: 'work/w.txt' });
+  assert.equal(removed.success, false, "the sync took disk's deletion");
+  assert.equal(removed.error, 'File not found: work/w.txt');
   assert.doesNotMatch(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), /branch intent/, 'once it sees disk, the sync replaces it');
 });
 

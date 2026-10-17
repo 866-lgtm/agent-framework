@@ -1121,8 +1121,11 @@ export async function pushPaths(
         // replaces it (decide()), and a sync replaces it only where it sees
         // disk's copy, so a copy it can't see is named first. For the rest,
         // fixing what the note names holds, and forcedWay says where force
-        // does too.
-        const sync = 'sync this path to adopt the disk version, which replaces the intent';
+        // does too. Where disk has deleted the file, that sync takes the
+        // deletion.
+        const sync = gone
+          ? "sync this path to take disk's deletion, which removes the workspace's copy and replaces the intent"
+          : 'sync this path to adopt the disk version, which replaces the intent';
         result.skipped.push({
           path,
           reason: bi?.unreadable !== undefined
