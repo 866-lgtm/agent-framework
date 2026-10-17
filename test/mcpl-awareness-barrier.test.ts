@@ -839,34 +839,48 @@ test('a runtime connect whose awareness accounting fails fails its gate, so a ru
   }
 });
 
-test('a runtime connect whose policy registration throws closes its connection for good and completes its gate, so a running server keeps its data', async () => {
-  mkdirSync(TEST_ROOT, { recursive: true });
-  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-policy-'));
+/**
+ * A framework serving `heartbeat`, then a runtime connect of `discord` whose
+ * awareness accounting succeeds and whose §5.3 policy registration throws
+ * (initializeServer made to throw for it). With `closeFails`, the close that
+ * follows rejects once, as a transport close that fails would. Returns the
+ * framework with both patches undone; a failure before then stops it.
+ */
+async function failPolicyRegistrationWhileServing(dir: string, closeFails: boolean) {
   const { config } = frameworkConfig(dir, {
     STATUS_PATH: join(dir, 'status.jsonl'),
     LEDGER_PATH: join(dir, 'awareness.json'),
     GENERATION_PATH: join(dir, 'generation'),
   });
   const discord = config.mcplServers[0]!;
-  let framework: AgentFramework | undefined;
-
+  const framework = await AgentFramework.create({ ...config, mcplServers: [heartbeatConfig(dir)] });
   try {
-    framework = await AgentFramework.create({ ...config, mcplServers: [heartbeatConfig(dir)] });
     const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
     framework.onTrace((event) => traces.push(event as never));
-    // Accounting succeeds; the §5.3 registration that follows it throws.
-    const prototype = FeatureSetManager.prototype as any;
-    const original = prototype.initializeServer;
-    prototype.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
+    const features = FeatureSetManager.prototype as any;
+    const initializeServer = features.initializeServer;
+    features.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
       if (serverId === discord.id) throw new Error('injected policy registration failure');
-      return original.call(this, serverId, ...rest);
+      return initializeServer.call(this, serverId, ...rest);
+    };
+    const connections = McplServerConnection.prototype as any;
+    const close = connections.close;
+    let closeFailed = false;
+    connections.close = function (this: McplServerConnection) {
+      if (closeFails && this.id === discord.id && !closeFailed) {
+        closeFailed = true;
+        return Promise.reject(new Error('injected close failure'));
+      }
+      return close.call(this);
     };
     try {
+      // The connect reports its own failure, not the close's.
       await assert.rejects(framework.connectMcplServer(discord), /injected policy registration failure/);
     } finally {
-      prototype.initializeServer = original;
+      features.initializeServer = initializeServer;
+      connections.close = close;
     }
-
+    assert.equal(closeFailed, closeFails, 'the close failed only when asked to');
     const internals = framework as unknown as {
       discordAwarenessBarrier: unknown;
       mcplServerRegistry: { getServer(id: string): unknown };
@@ -880,11 +894,53 @@ test('a runtime connect whose policy registration throws closes its connection f
       false,
       'no gate failed',
     );
-    assert.equal(internals.mcplServerRegistry.getServer(discord.id), null, 'the half-registered connection was closed for good');
+    return { framework, discord, registry: internals.mcplServerRegistry };
+  } catch (error) {
+    await framework.stop();
+    throw error;
+  }
+}
+
+test('a runtime connect whose policy registration throws closes its connection for good and completes its gate, so a running server keeps its data', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-policy-'));
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failPolicyRegistrationWhileServing(dir, false);
+    framework = failed.framework;
+    assert.equal(failed.registry.getServer(failed.discord.id), null, 'the half-registered connection was closed for good');
 
     // Connecting the id again reaches the server.
-    await framework.connectMcplServer(discord);
-    assert.equal(framework.listMcplServers().find((server) => server.id === discord.id)?.connected, true);
+    await framework.connectMcplServer(failed.discord);
+    assert.equal(framework.listMcplServers().find((server) => server.id === failed.discord.id)?.connected, true);
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a runtime connect whose policy registration throws and whose close then fails keeps that connection registered and paused, and logs the close', async (t) => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-policy-close-'));
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failPolicyRegistrationWhileServing(dir, true);
+    framework = failed.framework;
+    // A close that fails keeps the entry, so a later disconnect, restart or
+    // shutdown can close it again; the gate's completion leaves it paused,
+    // since no grant was established for it.
+    const refused = failed.registry.getServer(failed.discord.id) as { dataPlaneReady: boolean } | null;
+    assert.ok(refused, 'the connection whose close failed is still registered');
+    assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
+    assert.ok(
+      logged.some((line) => line.includes(`could not close MCPL server "${failed.discord.id}" after its policy registration failed`)
+        && line.includes('injected close failure')),
+      'the failed close was logged',
+    );
   } finally {
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
