@@ -1171,20 +1171,34 @@ export class ChannelRegistry {
         (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
         label && existing.descriptor.label === channelId
       ) {
-        existing.descriptor.label = label;
-        if (extraMetadata) {
-          existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
-        }
+        const metadata = extraMetadata
+          ? { ...existing.descriptor.metadata, ...extraMetadata }
+          : existing.descriptor.metadata;
         // The channel now has a real label, not just the bare id — durable.
-        this.appendLabelSighting(
-          existing.descriptor.id,
-          existing.descriptor.label,
-          extractDmMeta(existing.descriptor.metadata),
-        );
+        // Recorded before the live descriptor takes it, since this branch's
+        // guard reads the descriptor: an append that throws leaves the
+        // placeholder, so the next push tries again.
+        this.appendLabelSighting(existing.descriptor.id, label, extractDmMeta(metadata));
+        existing.descriptor.label = label;
+        existing.descriptor.metadata = metadata;
       }
       return;
     }
 
+    // Only persist a REAL label durably. Falling back to the bare
+    // channelId as a placeholder (no server-supplied label at all — e.g. a
+    // Discord DM push missing both channelName and an author name,
+    // framework.ts's derivePushEventChannel) must never overwrite a real
+    // label already on file from a previous boot: after a restart the live
+    // `channels` map starts empty, so THIS is the very branch a
+    // label-less post-restart event takes — recording the placeholder here
+    // would clobber the good label initializeLabelHistoryStore() just
+    // replayed, defeating the entire point of the durable log. The live
+    // descriptor below still carries the placeholder for in-process
+    // routing; only the durable write is skipped when there's no real
+    // label to record. A real label is recorded before the entry exists:
+    // an append that throws registers nothing, so the next push tries again.
+    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     const key = `${serverId}:${channelId}`;
     this.channels.set(key, {
       serverId,
@@ -1197,19 +1211,6 @@ export class ChannelRegistry {
       },
       open: false,
     });
-    // Only persist a REAL label durably. Falling back to the bare
-    // channelId as a placeholder (no server-supplied label at all — e.g. a
-    // Discord DM push missing both channelName and an author name,
-    // framework.ts's derivePushEventChannel) must never overwrite a real
-    // label already on file from a previous boot: after a restart the live
-    // `channels` map starts empty, so THIS is the very branch a
-    // label-less post-restart event takes — recording the placeholder here
-    // would clobber the good label initializeLabelHistoryStore() just
-    // replayed, defeating the entire point of the durable log. The live
-    // descriptor above still carries the placeholder for in-process
-    // routing; only the durable write is skipped when there's no real
-    // label to record.
-    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1599,10 +1600,13 @@ export class ChannelRegistry {
   }
 
   /**
-   * Each writer appends here before it changes memory, so an append that
-   * throws, as on a full disk, leaves memory as it was: the operation
-   * fails, a retry records it rather than taking a same-state return, and a
-   * restart replays what memory held.
+   * Each writer appends its record here before it changes memory for it, so
+   * an append that throws, as on a full disk, fails the operation with that
+   * change unmade, and memory and the log still agree. A retry then records
+   * the change rather than finding it in memory already, where
+   * setDesiredState's same-state return would record nothing, and a restart
+   * replays what memory held. appendLabelSighting keeps the same order for
+   * the label history.
    */
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);

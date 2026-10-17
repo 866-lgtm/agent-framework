@@ -70,13 +70,22 @@ function withStore(
 }
 
 function makeRegistry(store: JsStore) {
+  const openCalls: string[] = [];
   const closeCalls: string[] = [];
+  const ackCalls: string[] = [];
   const server = {
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
-    sendChannelsOpen: async () => ({}),
+    sendChannelsOpen: async (params: { channelId: string }) => {
+      openCalls.push(params.channelId);
+      return {};
+    },
     sendChannelsClose: async (params: { channelId: string }) => {
       closeCalls.push(params.channelId);
       return {};
+    },
+    sendChannelsAcknowledge: async (params: { messageId: string }) => {
+      ackCalls.push(params.messageId);
+      return { acknowledged: true, representation: 'not now' };
     },
   };
   const registry = new ChannelRegistry(
@@ -86,7 +95,7 @@ function makeRegistry(store: JsStore) {
     () => {},
     { store },
   );
-  return { registry, closeCalls };
+  return { registry, openCalls, closeCalls, ackCalls };
 }
 
 /** The decision on record in memory, with its source. */
@@ -111,6 +120,8 @@ const PARAMS: TuneOutParams = {
 };
 
 const lifecycleWrite = ({ id }: Write) => id === LIFECYCLE;
+const decisionWrite = ({ id, item }: Write) =>
+  id === LIFECYCLE && (item as { kind?: string }).kind === 'desired-state';
 
 test('a channel_close whose record fails to append fails and leaves the channel open; its retry records the close a restart replays', withStore('log-first-close', async ({ store, failNext }) => {
   const { registry, closeCalls } = makeRegistry(store);
@@ -130,6 +141,47 @@ test('a channel_close whose record fails to append fails and leaves the channel 
 
   const restarted = makeRegistry(store).registry;
   assert.deepEqual(decision(restarted, 'c1'), { state: 'closed', source: 'agent-tool' });
+}));
+
+test('a channel_open whose decision fails to append answers the failure and opens nothing; its retry records the open a restart replays', withStore('log-first-open', async ({ store, failNext }) => {
+  const { registry, openCalls } = makeRegistry(store);
+  await registry.handleRegister('discord', { channels: [commons] });
+  const before = decision(registry, 'c1');
+  assert.equal(before?.state, 'closed');
+  const opensBefore = openCalls.length;
+
+  failNext(decisionWrite);
+  const failed = await registry.handleChannelToolCall('channel_open', { channelId: 'c1' });
+  assert.equal(failed.success, false);
+  assert.match(failed.error ?? '', DISK_FULL);
+  assert.deepEqual(decision(registry, 'c1'), before);
+  assert.equal(openCalls.length, opensBefore, 'nothing went to the server');
+
+  const retried = await registry.handleChannelToolCall('channel_open', { channelId: 'c1' });
+  assert.equal(retried.success, true);
+  assert.equal(openCalls.length, opensBefore + 1);
+  const restarted = makeRegistry(store).registry;
+  assert.deepEqual(decision(restarted, 'c1'), { state: 'open', source: 'agent-tool' });
+}));
+
+test('a channel_decline whose decision fails to append fails and acknowledges nothing; its retry records the decline a restart replays', withStore('log-first-decline', async ({ store, failNext }) => {
+  // A channel first seen in a push has no decision yet, so the decline's
+  // decision is a change of state and has a record to append.
+  const { registry, ackCalls } = makeRegistry(store);
+  registry.ensureChannelRegistered('discord', 'c7', '#lobby');
+  assert.equal(decision(registry, 'c7'), undefined);
+  const decline = { channelId: 'c7', messageId: 'm1', acknowledge: 'not now' };
+
+  failNext(decisionWrite);
+  await assert.rejects(registry.handleChannelToolCall('channel_decline', decline), DISK_FULL);
+  assert.equal(decision(registry, 'c7'), undefined);
+  assert.equal(ackCalls.length, 0, 'nothing went to the server');
+
+  const retried = await registry.handleChannelToolCall('channel_decline', decline);
+  assert.equal((retried.data as { status?: string }).status, 'remained closed');
+  assert.deepEqual(ackCalls, ['m1']);
+  const restarted = makeRegistry(store).registry;
+  assert.deepEqual(decision(restarted, 'c7'), { state: 'closed', source: 'invitation-declined' });
 }));
 
 test('a tune-out whose record fails to append fails and leaves the channel undecided; its retry is what a restart replays', withStore('log-first-tune-out', ({ store, failNext }) => {
@@ -195,4 +247,39 @@ test('a label sighting whose record fails to append is recorded at the next sigh
 
   const restarted = makeRegistry(store).registry;
   assert.deepEqual(restarted.resolveProseTargetDurable('#commons'), { channelId: 'c1', label: '#commons' });
+}));
+
+test('a label first seen in a push, whose sighting fails to append, is recorded by the next push, so a restart still finds the channel by its label', withStore('log-first-push-label', ({ store, failNext }) => {
+  const { registry } = makeRegistry(store);
+  // A bare lazy registration, then a push that reveals its label.
+  registry.ensureChannelRegistered('discord', 'c9');
+  failNext(({ id }) => id === LABELS);
+  assert.throws(() => registry.ensureChannelRegistered('discord', 'c9', '#commons'), DISK_FULL);
+  assert.ok('error' in registry.resolveProseTarget('#commons'), 'the live descriptor keeps its placeholder');
+  registry.ensureChannelRegistered('discord', 'c9', '#commons');
+
+  // A channel whose first push carries its label.
+  failNext(({ id }) => id === LABELS);
+  assert.throws(() => registry.ensureChannelRegistered('discord', 'c8', '#ops'), DISK_FULL);
+  assert.ok('error' in registry.resolveProseTarget('c8'), 'nothing is registered');
+  registry.ensureChannelRegistered('discord', 'c8', '#ops');
+
+  const restarted = makeRegistry(store).registry;
+  assert.deepEqual(restarted.resolveProseTargetDurable('#commons'), { channelId: 'c9', label: '#commons' });
+  assert.deepEqual(restarted.resolveProseTargetDurable('#ops'), { channelId: 'c8', label: '#ops' });
+}));
+
+test('a DM recipient whose sighting fails to append is recorded at the next sighting, so a restart still finds the DM by its mention', withStore('log-first-dm', async ({ store, failNext }) => {
+  const { registry } = makeRegistry(store);
+  const dm = (metadata: Record<string, unknown>) =>
+    ({ id: 'discord:dm:antra', type: 'discord', label: 'DM: antra', direction: 'bidirectional' as const, metadata });
+  await registry.handleRegister('discord', { channels: [dm({ channelType: 'dm' })] });
+
+  // The same label, now with the recipient's id.
+  failNext(({ id }) => id === LABELS);
+  await assert.rejects(registry.handleRegister('discord', { channels: [dm({ channelType: 'dm', recipientId: '123456789' })] }), DISK_FULL);
+  await registry.handleRegister('discord', { channels: [dm({ channelType: 'dm', recipientId: '123456789' })] });
+
+  const restarted = makeRegistry(store).registry;
+  assert.deepEqual(restarted.resolveProseTargetDurable('<@123456789>'), { channelId: 'discord:dm:antra', label: 'DM: antra' });
 }));
