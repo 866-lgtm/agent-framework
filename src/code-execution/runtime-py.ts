@@ -260,25 +260,12 @@ def _resolve(fut, value):
 
 
 def _brief(value):
-    # A value as a refusal shows it: as written when that is short and copies
-    # as the same value, and otherwise by its type, such as <str>, which fails
-    # loudly if copied rather than sending something else. A long value is
-    # never repr'd whole, and only the built-in types are repr'd at all, so a
-    # subclass's own __repr__ never runs here. The type is compared by
-    # identity and named through type's own descriptor, so a metaclass's
-    # __eq__ or __name__ never runs either.
-    kind = type(value)
-    if kind is float and value != value:
-        return "float('nan')"
-    if kind is float and value in (float('inf'), float('-inf')):
-        return "float('inf')" if value > 0 else "float('-inf')"
-    if value is None or kind is bool or kind is float \
-            or (kind is int and -10 ** 36 < value < 10 ** 36) \
-            or (kind is str and len(value) <= 38):
-        shown = repr(value)
-        if len(shown) <= 40:
-            return shown
-    return "<" + type.__dict__["__name__"].__get__(kind) + ">"
+    # A value as a refusal shows it: by its type, such as <str>, which fails
+    # loudly if copied rather than sending something else. The agent has its
+    # values in the call it just wrote. No value's own code runs here: its
+    # __repr__ isn't called, and its type is named through type's own
+    # descriptor, so a metaclass's __name__ doesn't run either.
+    return "<" + type.__dict__["__name__"].__get__(type(value)) + ">"
 
 
 def _make_tool_fn(tool_name, py_name):

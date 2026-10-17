@@ -395,10 +395,8 @@ describe('PyRunner (real python3)', () => {
           'class Odd(metaclass=Meta):',
           '    def __repr__(self):',
           '        raise RuntimeError("repr ran")',
-          'for call in (lambda: test__echo(message="alpha", limit=5), lambda: test__echo({"message": "alpha"}, limit=5), lambda: test__echo("alpha"),',
-          '             lambda: test__echo(message="b" * 50), lambda: test__echo("c" * 80), lambda: test__echo("alpha", limit=5),',
-          '             lambda: test__echo(short="d" * 38, long="e" * 39, n=10 ** 5000, items=[1]),',
-          '             lambda: test__echo(include_archived_messages_older_than_days=7, nan=float("nan"), inf=float("inf"), ninf=float("-inf")),',
+          'for call in (lambda: test__echo(message="alpha", limit=5, items=[1]), lambda: test__echo({"message": "alpha"}, limit=5), lambda: test__echo("alpha"),',
+          '             lambda: test__echo("alpha", limit=5),',
           '             lambda: test__echo(text=Loud("x"), n=Int(3)), lambda: test__echo({Int(4): "a"}, n=1),',
           '             lambda: test__echo({"k" * 61: 1, "j" * 60: 2}, n=1), lambda: test__echo(Odd(), n=1)):',
           '    try:',
@@ -410,26 +408,19 @@ describe('PyRunner (real python3)', () => {
       );
       assert.strictEqual(result.returnCode, 0, result.stderr);
       assert.deepStrictEqual(result.stdout.trimEnd().split('\n'), [
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': 'alpha', 'limit': 5})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': 'alpha', 'limit': 5})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it 'alpha'",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'limit': <int>, 'items': <list>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'limit': <int>})",
         "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it <str>",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it 'alpha', "
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it <str>, "
           + 'so put every argument in one dict: await test__echo({...})',
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo("
-          + `{'short': '${'d'.repeat(38)}', 'long': <str>, 'n': <int>, 'items': <list>})`,
-        // A float that isn't finite is shown as the call that makes it.
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo("
-          + "{'include_archived_messages_older_than_days': 7, 'nan': float('nan'), 'inf': float('inf'), 'ninf': float('-inf')})",
-        // A subclass of a built-in type is shown by its type: its own __repr__ never runs.
+        // A value of a subclass is shown by its type: its own __repr__ never runs.
         "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'text': <Loud>, 'n': <Int>})",
         // A key that isn't a str is shown as a value is, so its __repr__ doesn't run either.
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({<Int>: 'a', 'n': 1})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({<Int>: <str>, 'n': <int>})",
         // A str key is shown whole up to 60 characters, and past that by its type.
         "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo("
-          + `{<str>: 1, '${'j'.repeat(60)}': 2, 'n': 1})`,
-        // A class's metaclass code doesn't run either: its type is checked by identity and named through type's own descriptor.
+          + `{<str>: <int>, '${'j'.repeat(60)}': <int>, 'n': <int>})`,
+        // A class's metaclass code doesn't run either: its type is named through type's own descriptor.
         "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it <Odd>, "
           + 'so put every argument in one dict: await test__echo({...})',
       ]);
@@ -469,9 +460,9 @@ describe('PyRunner (real python3)', () => {
       ].join('\n'), ECHO_TOOLS);
       assert.strictEqual(result.returnCode, 0, result.stderr);
       assert.deepStrictEqual(result.stdout.trimEnd().split('\n'), [
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': 'alpha', 'args': <dict>})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': 'alpha', 'args': <dict>})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it 'notes.md'",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'args': <dict>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'args': <dict>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it <str>",
         "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it 2 positional arguments",
       ]);
     } finally {
