@@ -5,12 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, type Module } from '../src/index.js';
+import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -304,4 +305,36 @@ test('a create() refused after it started the watchdog leaves none to kill the p
   assert.match(output, /\[liveness-watchdog\] armed/, 'the watchdog started before the refusal');
   assert.match(output, /refused: FrameworkConfig\.toolResultInlineMaxChars must be a number >= 1000/);
   assert.deepEqual({ code, signal }, { code: 0, signal: null });
+});
+
+test('a failed create() on a restart leaves the workspace\'s saved pins as they were', async t => {
+  const dir = tempDir(t);
+  const storePath = join(dir, 'store');
+  const mountDir = join(dir, 'mount');
+  mkdirSync(mountDir);
+  const workspace = () => new WorkspaceModule({ mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never' }] });
+  const savedState = () => {
+    const store = JsStore.openOrCreate({ path: storePath });
+    try { return store.getStateJson('modules/workspace/state'); } finally { store.close(); }
+  };
+
+  // A session that materializes, so its stop() saves the branch it pinned.
+  const first = workspace();
+  const framework = await AgentFramework.create({ ...baseConfig(storePath), modules: [first] });
+  first.initStore(framework.getStore());
+  let result = await first.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/one.txt', content: 'one' } });
+  assert.equal(result.success, true, `write failed: ${result.error}`);
+  result = await first.handleToolCall({ id: 'm', name: 'materialize', input: {} });
+  assert.equal(result.success, true, `materialize failed: ${result.error}`);
+  await framework.stop();
+  const pinned = savedState() as { mounts: { work?: { lastMaterializedBranchId?: string } } };
+  assert.ok(pinned.mounts.work?.lastMaterializedBranchId, 'the session saved a pin');
+
+  // A restart refused after the workspace module started, so before the host
+  // could call its initStore().
+  await rejectsWithItsOwnError(
+    AgentFramework.create({ ...baseConfig(storePath), modules: [workspace()], mcplServers: COLLIDING_SERVERS }),
+    COLLISION,
+  );
+  assert.deepEqual(savedState(), pinned, 'the saved state is as the session left it');
 });
