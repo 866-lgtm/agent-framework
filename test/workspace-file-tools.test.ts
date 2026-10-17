@@ -424,7 +424,7 @@ test('a deletion whose disk copy is not a regular file names the materialize tha
   assert.equal(spawnSync('mkfifo', [join(dir, 'q.txt')]).status, 0, 'mkfifo');
   assert.equal(errorOf(await call('delete', { path: 'work/q.txt' })), 'The deletion of "work/q.txt" is stored in the workspace, so don\'t send it again. '
     + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — "
-    + 'fix it and materialize again with applyDeletions.');
+    + 'fix it and materialize again with applyDeletions, or materialize it with force and applyDeletions to delete it.');
   const forced = await call('materialize', { path: 'work/q.txt', force: true, applyDeletions: true });
   assert.equal(forced.success, true, forced.error);
   assert.equal(existsSync(join(dir, 'q.txt')), false, 'the forced materialize unlinked it');

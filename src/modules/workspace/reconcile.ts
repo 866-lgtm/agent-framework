@@ -364,6 +364,19 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
 }
 
 /**
+ * Whether a forced push gets past what kept a disk copy from being verified:
+ * a file the module can't read, which a forced write overwrites where disk
+ * lets it be written and a forced deletion unlinks, and, for a deletion,
+ * what isn't a regular file, which unlinking removes. A forced push stops at
+ * the rest too (a symlink the mount doesn't follow, a FIFO for a write, a
+ * parent it can't use), or isn't known to pass them, so their refusal names
+ * only fixing it.
+ */
+function forcePasses(note: string | undefined, deletion: boolean): boolean {
+  return note === 'cannot open (EACCES)' || (deletion && note === 'not a regular file');
+}
+
+/**
  * The synchronous precondition of every workspace mutation: evidence owed a
  * barrier is made durable first, and an adoption left pending on the
  * selected branch is settled by the tree before the mutation changes it, and
@@ -1094,10 +1107,10 @@ export async function pushPaths(
       if (!opts.force) {
         result.skipped.push({
           path,
-          // Force can't pass most of what keeps disk from being verified (a
-          // symlink the mount doesn't follow, a FIFO for a write), so the
-          // fallback names only the way out that holds for every note.
-          reason: inTheWay(v.note, !s) ?? `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}`,
+          // Fixing it holds for every note; force is named only where a
+          // forced push gets past what the note names.
+          reason: inTheWay(v.note, !s) ??
+            `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcePasses(v.note, !s) ? `, or ${forced}` : ''}`,
         });
         continue;
       }
