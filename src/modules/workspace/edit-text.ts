@@ -148,9 +148,10 @@ export type AnswerKind = 'refusal' | 'stored';
 
 /**
  * The answer's last line: what it left out, and what to do. `cut` parts left
- * out their details; `problems` and `notes` weren't shown at all.
+ * out their details; `problems` and `notes` weren't shown at all. A refusal
+ * that shows a problem says to answer it and send the call again.
  */
-function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: number, notes: number): string {
+function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: number, notes: number, anyShown: boolean): string {
   const items = [
     ...(cut ? [`the details of ${cut} of these`] : []),
     ...(problems ? [kind === 'refusal' ? `${problems} more ${plural(problems, 'problem')}` : `${problems} more`] : []),
@@ -159,7 +160,7 @@ function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: num
   if (!items.length) return '';
   const next = kind === 'stored'
     ? " ls shows each path's state."
-    : problems ? ' Answer the problems shown and send the call again to see the rest.' : '';
+    : problems && anyShown ? ' Answer the problems shown and send the call again to see the rest.' : '';
   const list = items.length < 2 ? items[0] : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
   return `[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.${next}]`;
 }
@@ -179,7 +180,7 @@ function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: num
 export function fitted(head: string, problems: string[], notes: string[], maxChars: number, kind: AnswerKind): string {
   const parts = [...problems, ...notes];
   // The last line as long as it can be: every count at its most.
-  const reserve = tailText(kind, maxChars, parts.length, problems.length, notes.length).length + 2;
+  const reserve = tailText(kind, maxChars, parts.length, problems.length, notes.length, true).length + 2;
   let left = maxChars - head.length - reserve;
   const shown: string[] = [];
   for (const part of parts) {
@@ -203,7 +204,7 @@ export function fitted(head: string, problems: string[], notes: string[], maxCha
     shown[i] = parts[i]!;
   }
   const unshownProblems = Math.max(0, problems.length - shown.length);
-  const tail = tailText(kind, maxChars, cut, unshownProblems, parts.length - shown.length - unshownProblems);
+  const tail = tailText(kind, maxChars, cut, unshownProblems, parts.length - shown.length - unshownProblems, shown.length > 0);
   return [head, ...shown, tail].filter(Boolean).join('\n\n');
 }
 
@@ -351,8 +352,9 @@ const RECEIPT_RESERVE = 600;
  * `maxChars` as the answer's JSON holds it. Its counts and notes come first;
  * the regions take what is left, and past it a file's regions are named by
  * their lines. edit_many lists its files while they fit, a file whose notes
- * don't fit without them, and counts the rest. A receipt whose one file's
- * counts and notes alone pass `maxChars` keeps them, and shows no region.
+ * don't fit without them, or without its edits' numbers too, and counts the
+ * rest. edit's receipt, of one file, keeps its counts and notes and shows no
+ * region where those alone pass `maxChars`.
  */
 export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): Record<string, unknown> {
   const notesOf = ({ plan, notes }: StoredFile): string[] => {
@@ -387,28 +389,32 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     files: listed,
     changed: '',
   };
-  const fits = () => JSON.stringify(data).length <= maxChars - RECEIPT_RESERVE;
+  const fits = (entry: Record<string, unknown>) => {
+    listed.push(entry);
+    const fit = JSON.stringify(data).length <= maxChars - RECEIPT_RESERVE;
+    listed.pop();
+    return fit;
+  };
   let notesLeftOut = 0;
+  let editsLeftOut = 0;
   for (const [i, file] of files.entries()) {
     const notes = notesOf(file);
-    const entry: Record<string, unknown> = {
-      path: file.path,
-      size: file.plan.bytes.length,
-      replacements: file.plan.changes.length,
-      edits: [...new Set(file.plan.changes.map((change) => change.edit + 1))].sort((a, b) => a - b),
-    };
-    listed.push(notes.length ? { ...entry, note: notes.join(' ') } : entry);
-    if (fits()) continue;
-    if (notes.length) {
-      listed[listed.length - 1] = entry;
-      if (fits()) {
-        notesLeftOut++;
-        continue;
-      }
+    const bare = { path: file.path, size: file.plan.bytes.length, replacements: file.plan.changes.length };
+    const edits = [...new Set(file.plan.changes.map((change) => change.edit + 1))].sort((a, b) => a - b);
+    // The fullest entry that fits: with its notes, then without them, then
+    // without its edits' numbers too, so a file is named before it's counted.
+    const entry = [
+      ...(notes.length ? [{ ...bare, edits, note: notes.join(' ') }] : []),
+      { ...bare, edits },
+      bare,
+    ].find(fits);
+    if (!entry) {
+      data.filesNotListed = files.length - i;
+      break;
     }
-    listed.pop();
-    data.filesNotListed = files.length - i;
-    break;
+    listed.push(entry);
+    if (notes.length && !('note' in entry)) notesLeftOut++;
+    if (!('edits' in entry)) editsLeftOut++;
   }
   const budget = { left: maxChars - JSON.stringify(data).length - RECEIPT_RESERVE };
   const sections: string[] = [];
@@ -425,8 +431,10 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   const left = [
     ...(unshown ? [`the changed regions of ${unshown} more ${plural(unshown, 'file')}`] : []),
     ...(notesLeftOut ? [`the notes of ${notesLeftOut} ${plural(notesLeftOut, 'file')}`] : []),
+    ...(editsLeftOut ? [`the edit numbers of ${editsLeftOut} ${plural(editsLeftOut, 'file')}`] : []),
   ];
-  if (left.length) sections.push(`[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${left.join(' and ')}.]`);
+  const list = left.length < 2 ? left[0] : `${left.slice(0, -1).join(', ')} and ${left.at(-1)}`;
+  if (left.length) sections.push(`[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.]`);
   data.changed = sections.join('\n\n');
   return data;
 }

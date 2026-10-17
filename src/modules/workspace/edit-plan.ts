@@ -101,7 +101,8 @@ interface Found {
  * so "aa" starts twice in "aaa". The first `keep` positions are kept; `count`
  * is all of them, unless occurrences overlap. Those can't each be replaced, so
  * the edit is refused whatever their count, and the scan stops once it has
- * the SHOWN_MATCHES a refusal shows. Otherwise a needle that overlaps itself,
+ * found one more than the SHOWN_MATCHES a refusal shows, so a count it stopped
+ * at is more than those shown. Otherwise a needle that overlaps itself,
  * such as a run of spaces, would be compared in full at every position of a
  * long run of the same, at a cost of the run's length times the needle's.
  */
@@ -118,19 +119,24 @@ function scan(haystack: string, needle: string, keep: number): Found {
     if (count < keep) starts.push(at);
     count++;
     previous = at;
-    if (overlapping && count >= SHOWN_MATCHES) return { starts, count, overlapping, atLeast: true };
+    if (overlapping && count > SHOWN_MATCHES) return { starts, count, overlapping, atLeast: true };
   }
   return { starts, count, overlapping, atLeast: false };
 }
 
-/** The 1-based line of each index (ascending), in one pass over the text. */
+/**
+ * The 1-based line of each index (ascending), in one pass over the text: it
+ * keeps the next line end it found, so once none remains it reads no further.
+ */
 export function lineNumbersAt(value: string, indices: number[]): number[] {
   const lines: number[] = [];
   let line = 1;
-  let counted = 0;
+  let next = value.indexOf('\n');
   for (const index of indices) {
-    for (let nl = value.indexOf('\n', counted); nl !== -1 && nl < index; nl = value.indexOf('\n', nl + 1)) line++;
-    counted = index;
+    while (next !== -1 && next < index) {
+      line++;
+      next = value.indexOf('\n', next + 1);
+    }
     lines.push(line);
   }
   return lines;
@@ -270,7 +276,7 @@ export type MatchProblem =
     /** How many times it occurs, or with `atLeast` how many the scan found before it stopped at an overlap. */
     found: number;
     atLeast: boolean;
-    /** The line of each of its first SHOWN_MATCHES occurrences, and those lines shown, each once. */
+    /** The line of each of its first SHOWN_MATCHES occurrences, one per occurrence; `shown` shows each of those lines once. */
     lines: number[];
     shown: string;
     quoteNormalized: boolean;

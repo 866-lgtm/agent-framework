@@ -10,6 +10,7 @@ import {
   HINT_MAX_CHARS,
   decodeForEdit,
   hintBudget,
+  lineNumbersAt,
   planFile,
 } from '../src/modules/workspace/edit-plan.js';
 
@@ -55,15 +56,36 @@ test('an occurrence is a position: overlapping occurrences count, and they can\'
   assert.equal(plan('aa-aa\n', [spec(0, 'aa', 'b', 'all')]).bytes.toString(), 'b-b\n');
 });
 
-test('occurrences that overlap stop the count once a refusal has the matches it shows, however long the run', () => {
+test('occurrences that overlap stop the count once a refusal has more than it shows, however long the run', () => {
   // Compared in full at every position, this is 1,000 times 200,000 comparisons.
   const [run] = problems(`${' '.repeat(200_000)}\n`, [spec(0, ' '.repeat(1000), 'x', 'all')]);
   assert.equal(run!.kind, 'count');
   if (run!.kind !== 'count') return;
-  assert.deepEqual([run.found, run.atLeast, run.overlapping, run.lines.length], [20, true, true, 20]);
+  assert.deepEqual([run.found, run.atLeast, run.overlapping, run.lines.length], [21, true, true, 20]);
+  // Exactly as many as a refusal shows are counted exactly.
+  const [twenty] = problems(`${' '.repeat(119)}\n`, [spec(0, ' '.repeat(100), 'x', 'all')]);
+  assert.deepEqual(twenty, { ...twenty, found: 20, atLeast: false, overlapping: true });
   // Apart, every occurrence is counted, however many.
   const [apart] = problems('ab '.repeat(30), [spec(0, 'ab', 'x')]);
   assert.deepEqual(apart, { ...apart, found: 30, atLeast: false, overlapping: false });
+});
+
+test('line numbers are found in one pass over the text, past its last line end too', () => {
+  // A text that counts what each search for a line end reads: searching again
+  // from each index would read the million code units after the last line
+  // end once for each of the 20,000 indices.
+  const text = `${'x'.repeat(20_000)}${'y'.repeat(1_000_000)}`;
+  let read = 0;
+  const counted = {
+    indexOf: (search: string, from = 0) => {
+      const at = text.indexOf(search, from);
+      read += (at === -1 ? text.length : at + 1) - from;
+      return at;
+    },
+  };
+  const indices = Array.from({ length: 20_000 }, (_, i) => i);
+  assert.deepEqual(lineNumbersAt(counted as unknown as string, indices), indices.map(() => 1));
+  assert.ok(read <= text.length, `read ${read} code units of a ${text.length}-unit text`);
 });
 
 test('a count that differs names each matched line once, and a long line as an excerpt around its match', () => {

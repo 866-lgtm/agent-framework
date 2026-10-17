@@ -1163,7 +1163,7 @@ export class WorkspaceModule implements Module {
           + 'A miss shows the closest region it finds, numbered, and a count that differs shows the lines that matched. '
           + 'CRLF line ends are matched with LF text and kept, as is a BOM, and straight and curly quotes match as a second chance. '
           + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
-          + "A change disk made to the file is taken in first, and the answer says so. The answer shows the changed region, numbered. "
+          + "A change disk made to the file is taken in first, and the answer says so. The answer shows the changed region, numbered, as its length allows. "
           + 'For several edits at once, in one file or across files, applied all or none, use edit_many.',
         inputSchema: {
           type: 'object' as const,
@@ -1186,7 +1186,7 @@ export class WorkspaceModule implements Module {
           + "A refusal names every problem, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
           + 'and the answer then says every edit is stored and names each file disk refused, with the way to finish it. '
-          + "The answer shows each edit's first changed region, numbered.",
+          + "The answer shows each edit's first changed region, numbered, as its length allows.",
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2653,7 +2653,7 @@ export class WorkspaceModule implements Module {
   private generatedFileRefusal(generated: { agentName: string }, callerAgentName: string | undefined): string {
     return callerAgentName !== generated.agentName
       ? 'Generated file belongs to another agent'
-      : 'Generated file is read-only; edit the presentation configuration instead';
+      : 'Generated file is read-only; change the tool presentation it shows with set_tool_visibility or set_tool_description instead';
   }
 
   /**

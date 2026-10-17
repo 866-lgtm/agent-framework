@@ -231,13 +231,16 @@ export interface ToolCall {
    * as JSON (a content array as its text). For a model's call it is the
    * agent's inline cap, past which the framework spills the result to a
    * workspace file and sends a preview. For a call from a running
-   * code_execution script it is the script's limit, past which the result is
-   * cut. A tool that pages or budgets its answer can stay under it. The
-   * framework sets it where it dispatches a call whose result it stores or
-   * hands to a script, the operator's puppet call included. A call made in
-   * process (ModuleContext.callTool, executeToolCall) carries what its caller
-   * put on it, usually nothing, and a utility run through `utils` carries
-   * what its `utils` call carried.
+   * code_execution script it is the script's limit, past which a success's
+   * result is cut; an error reaches the script whole, after "Error: ". A tool
+   * that pages or budgets its answer can stay under it. The framework sets it
+   * on a model's, a script's and the operator's puppet's call to a module, a
+   * utility run through `utils` included. A call made in process
+   * (ModuleContext.callTool, executeToolCall, the framework's own read_image
+   * tool) carries what its caller put on it, usually nothing, and a utility
+   * run through `utils` carries what its `utils` call carried. Without it, a
+   * module holds its answer to a bound of its own, if any: the workspace's is
+   * the house default, 24,000.
    */
   resultMaxChars?: number;
 }
