@@ -1110,14 +1110,19 @@ export async function pushPaths(
     }
     if (v.state === 'unverified') {
       if (!opts.force) {
+        // An intent that can't be read is the one note fixing doesn't
+        // answer: nothing is decided over it until a sync of the path
+        // replaces it (decide()), and a sync replaces it only where it sees
+        // disk's copy, so a copy it can't see is named first. For the rest,
+        // fixing what the note names holds, and forcedWay says where force
+        // does too.
+        const sync = 'sync this path to adopt the disk version, which replaces the intent';
         result.skipped.push({
           path,
-          // An intent that can't be read is the one note fixing doesn't
-          // answer: nothing is decided over it until a sync of the path
-          // replaces it (decide()). For the rest, fixing what the note names
-          // holds, and forcedWay says where force does too.
           reason: bi?.unreadable !== undefined
-            ? `${v.note} — sync this path to adopt the disk version, which replaces the intent`
+            ? d.kind === 'absent' || d.kind === 'file'
+              ? `${v.note} — ${sync}`
+              : `${v.note}, and disk's copy can't be verified (${d.kind === 'unobserved' ? d.reason : 'not hashed'}) — once it can be, ${sync}`
             : inTheWay(v.note, !s) ??
               `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcedWay(v.note, !s, forced)}`,
         });
