@@ -5301,15 +5301,17 @@ export class AgentFramework {
   }
 
   /** Atomic, durable JSON write for the recovery files. The document goes to
-   *  a temp file at 0600, which is synced and renamed over the record, and
-   *  the directory is then synced (not on win32), so a crash leaves the
-   *  record as it was or the new one, whole. A failure before the rename
-   *  removes the temp file, leaves the record as it was and throws. A
-   *  directory sync that fails after the rename is logged, not thrown: the
-   *  new record is in place, and the callers go on to record it as written. */
+   *  a temp file at 0600, which is synced and renamed over the record. Then
+   *  the directory is synced, and its parent too if this write had to make
+   *  the directory, except on win32. So a crash leaves the record as it was
+   *  or the new one, whole. A failure before the rename removes the temp file
+   *  and throws an error saying the record was left as it was, with the
+   *  original as its cause and its code kept. A directory sync that fails
+   *  after the rename is logged, not thrown: the new record is in place, and
+   *  the callers go on to record it as written. */
   private writeRecoveryFile(path: string, document: unknown): void {
     const directory = dirname(path);
-    mkdirSync(directory, { recursive: true });
+    const made = mkdirSync(directory, { recursive: true });
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       const fd = openSync(temporary, 'w', 0o600);
@@ -5321,22 +5323,31 @@ export class AgentFramework {
       }
       renameSync(temporary, path);
     } catch (err) {
-      try { unlinkSync(temporary); } catch { /* nothing to remove if it was never made */ }
-      throw err;
+      try {
+        unlinkSync(temporary);
+      } catch (unlinkErr) {
+        if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.error(`[host-mode] couldn't remove ${temporary} after a failed write:`, unlinkErr);
+        }
+      }
+      const cause = err as NodeJS.ErrnoException;
+      throw Object.assign(new Error(`${path} was left as it was: ${cause.message}`, { cause }), cause.code ? { code: cause.code } : {});
     }
     if (process.platform === 'win32') return;
-    try {
-      const fd = openSync(directory, 'r');
+    for (const synced of made === undefined ? [directory] : [directory, dirname(directory)]) {
       try {
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
+        const fd = openSync(synced, 'r');
+        try {
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+      } catch (err) {
+        console.error(
+          `[host-mode] ${path} is in place, but syncing ${synced} failed, so a crash could still lose this change:`,
+          err,
+        );
       }
-    } catch (err) {
-      console.error(
-        `[host-mode] ${path} is in place, but syncing its directory failed, so a crash could still lose this change:`,
-        err,
-      );
     }
   }
 
