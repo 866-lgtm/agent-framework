@@ -2130,24 +2130,29 @@ export class WorkspaceModule implements Module {
    * disk now holds (an edit sees a disk change the settled adoption took in).
    * The pass may not settle it (a branch that keeps changing, an unreadable
    * disk copy); the precondition that matters is enforced again,
-   * synchronously, where the change commits (commitToolChange). The caller
-   * holds the mount's turn.
+   * synchronously, where the change commits (commitToolChange). The pass
+   * names the path, as a file tool names the one it acts on, so a path the
+   * mount passes over by design is observed there, as a sync naming it would
+   * observe it (#276). The caller holds the mount's turn.
    */
   private async settleBeforeMutation(mount: MountState, relativePath: string): Promise<void> {
     if (this.agreementOrThrow().get(mount.config.name, relativePath)?.kind !== 'pending') return;
-    await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+    await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
   }
 
   /**
    * Before a read: a path the workspace doesn't hold is observed under the
    * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. The caller holds
-   * the mount's turn.
+   * workspace deletion or a file absent from this branch. The pass names the
+   * path, as a file tool names the one it acts on: a path the mount passes
+   * over by design is observed, as a sync naming it would observe it (#276),
+   * while a path in another mount's directory is refused before this, and
+   * passed over by any pass. The caller holds the mount's turn.
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
     const store = this.getStore();
     if (store.treeGet(mount.treeStateId, relativePath)) return undefined;
-    const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+    const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
     return pass.reports.get(relativePath);
   }
 

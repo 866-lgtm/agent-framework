@@ -190,8 +190,10 @@ export interface PassOptions {
    */
   resume?: boolean;
   /**
-   * The scope was named by a path sync: ignore patterns that cover it don't
-   * apply beneath it (see walkScope). A listing's scope keeps them.
+   * The scope was named, by a path sync or by a file tool's pass on the path
+   * it acts on: what the mount passes over by design that covers the scope,
+   * at it or above it, doesn't apply there (see walkScope). A listing's scope
+   * keeps it.
    */
   named?: boolean;
   /**
@@ -663,16 +665,18 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable });
       continue;
     }
-    // What the mount passes over by design stays unobserved, however a pass
-    // reaches it, so no listing's absence proves a copy there gone. In
-    // another mount's directory, no pass of this mount observes anything.
+    // What the mount passes over by design stays unobserved by a pass that
+    // names no path, however it reaches it, so no listing's absence proves a
+    // copy there gone. In another mount's directory, no pass of this mount
+    // observes anything, named or not.
     // Beneath a directory a by-design rule covers, a pass that isn't named
     // observes nothing. A path a rule covers by its own name is observed as a
     // walk observes it: passed over where the walk lists it, and absent where
     // the walk lists its directory without it; a pass that reaches it by its
     // path alone, as a listing, glob or grep naming it does, passes over it.
-    // A pass that names its scope sets aside only what covers the scope, at
-    // it or above it, as its walk does (#276): a directory passed over by
+    // A pass that names its scope, as a sync naming a path and a file tool's
+    // pass on the path it acts on do, sets aside only what covers the scope,
+    // at it or above it, as its walk does (#276): a directory passed over by
     // design beneath a named directory stays passed over, and so does what
     // lies beneath it.
     let byDesign: string | undefined;

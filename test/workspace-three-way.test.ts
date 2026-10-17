@@ -883,6 +883,60 @@ describe('a listing, glob or grep inside a directory passed over by design', () 
   }
 });
 
+describe('a file tool naming a path passed over by design', () => {
+  // The last column: what a sync without a path then reports under skipped.
+  // Beneath a directory passed over by design, no walk can show the deleted
+  // file gone either, so its evidence is reported too, as on main; a file
+  // passed over by its own name is shown absent by the walk of its directory.
+  for (const [kind, ignore, read, edit, gone, skipped] of [
+    ['beneath a directory an ignore entry covers', ['node_modules'], 'node_modules/pkg/index.d.ts', 'node_modules/pkg/edit.d.ts', 'node_modules/pkg/gone.d.ts',
+      ['node_modules/pkg/edit.d.ts', 'node_modules/pkg/gone.d.ts', 'node_modules/pkg/index.d.ts']],
+    ['that an ignore entry covers by its own name', ['*.log'], 'build.log', 'edit.log', 'gone.log', ['build.log', 'edit.log']],
+    ["that is an editor's backup file", [], 'draft.md~', 'edit.md~', 'gone.md~', ['draft.md~', 'edit.md~']],
+  ] as const) {
+    test(`reads, edits and deletes a file ${kind} that the store doesn't hold, as a sync naming it takes it in (#276)`, async (t) => {
+      const env = new Env(t);
+      for (const f of [read, edit, gone]) env.writeDisk(f, `${f} v1\n`);
+      const m = await env.open({ ignore: [...ignore], autoMaterialize: true });
+      await call(m, 'sync', {});
+      assert.deepEqual(env.store.treeList(TREE), [], 'a sync without a path passes over all three');
+      assert.equal((await call(m, 'read', { path: `work/${read}` })).content, `     1\t${read} v1\n     2\t`);
+      await call(m, 'edit', { path: `work/${edit}`, oldString: 'v1', newString: 'v2' });
+      assert.equal(env.readDisk(edit), `${edit} v2\n`, 'the edit reached disk');
+      assert.equal((await call(m, 'delete', { path: `work/${gone}` })).deleted, true);
+      assert.equal(existsSync(env.disk(gone)), false, 'the deletion reached disk');
+      const paths = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).sort();
+      assert.deepEqual(paths(), [edit, read].sort(), 'the read and the edit took their files in');
+      // What they took in stays passed over by a sync without a path, which says so.
+      const bare = await call(m, 'sync', {});
+      assert.deepEqual((bare.skipped as Array<{ path: string }>).map((s) => s.path).sort(), [...skipped]);
+      assert.deepEqual(paths(), [edit, read].sort());
+    });
+  }
+
+  test("the nested mount's refusal comes first, and the lazy pass takes nothing in from another mount's directory", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('node_modules/pkg/inner.txt', 'inner');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+      { name: 'deep', path: env.disk('node_modules/pkg'), mode: 'read-write', watch: 'never' },
+    ] });
+    for (const [tool, input] of [
+      ['read', { path: 'work/node_modules/pkg/inner.txt' }],
+      ['edit', { path: 'work/node_modules/pkg/inner.txt', oldString: 'inner', newString: 'outer' }],
+      ['delete', { path: 'work/node_modules/pkg/inner.txt' }],
+    ] as const) {
+      const said = await refused(m, tool, input);
+      assert.ok(said.includes('mount "deep"') && said.includes('"deep/inner.txt"'), `${tool}: ${said}`);
+    }
+    // The lazy pass itself, reached past the refusal, observes nothing there.
+    const mount = (m as any).mounts.get('work');
+    await (m as any).withMount(mount, () => (m as any).ensureSynced(mount, 'node_modules/pkg/inner.txt'));
+    assert.deepEqual(env.store.treeList(TREE), [], 'the outer store gains nothing');
+    assert.equal(env.readDisk('node_modules/pkg/inner.txt'), 'inner');
+  });
+});
+
 describe('a mount nested inside another', () => {
   test('is passed over by the outer mount as the directory it is, and nothing else is', async (t) => {
     const env = new Env(t);
@@ -1660,6 +1714,17 @@ describe('restarts and faults', () => {
     assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
     assert.equal(await contentOf(m, 'a.txt'), 'C');
     assert.equal(await stateOf(m, 'a.txt'), 'synced');
+  });
+
+  test('an edit of a path the ignore list covers sees the disk version its settled adoption takes in too, since it names the path', async (t) => {
+    const env = new Env(t);
+    let m = await pendingAdoption(env);
+    m = await env.restart(m, { ignore: ['a.txt'] });
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending');
+    env.writeDisk('a.txt', 'C');
+    const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
+    assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.equal(await contentOf(m, 'a.txt'), 'C');
   });
 
   test('a delete settles the pending adoption first, and deletes what the workspace then holds', async (t) => {
