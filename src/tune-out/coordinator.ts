@@ -21,6 +21,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { armAfter, armAt } from '../deadline-timer.js';
 
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
@@ -64,7 +65,9 @@ export interface TuneOutFrameworkHooks {
 
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Duration-expiry timers (params.expiresAtMs); cleared on any cancel. */
+  /** Each duration's pending expiry step (params.expiresAtMs). stop clears
+   *  it, cancel does while the registry still holds the tune-out, and the
+   *  channel's next enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
@@ -108,11 +111,10 @@ export class TuneOutCoordinator {
     const key = this.key(serverId, channelId);
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
-    const remaining = Math.max(0, params.expiresAtMs - Date.now());
-    this.expiryTimers.set(key, setTimeout(() => {
+    armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
       this.expiryTimers.delete(key);
       this.cancel(serverId, channelId, 'duration', 'duration elapsed');
-    }, remaining));
+    });
   }
 
   private listActive(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
@@ -137,24 +139,89 @@ export class TuneOutCoordinator {
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string } {
     if (!this.hooks.subconsciousName()) {
-      return { ok: false, error: 'tune-out requires the subconscious resident (framework config `subconscious`)' };
+      return {
+        ok: false,
+        error: 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out '
+          + "isn't available here, and calling it again won't change that. If you need channels diverted, ask "
+          + 'whoever runs this host.',
+      };
     }
     if (this.hooks.isForkBound(channelId)) {
-      return { ok: false, error: `channel ${channelId} is bound to a conversation fork; tune-out and fork routing are mutually exclusive` };
+      return {
+        ok: false,
+        error: `Nothing changed: a conversation is bound to ${JSON.stringify(channelId)}, so its messages go to that `
+          + "conversation, and tune_out won't divert a channel while one is. Calling tune_out on it again won't change "
+          + 'that until the conversation ends, which happens only once the channel has been quiet for a while. Tune '
+          + 'out a different channel, or ask whoever runs this host if this one should be diverted.',
+      };
     }
-    if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
-      return { ok: false, error: `channel ${channelId} is already tuned out (cancel first to change params)` };
+    const current = this.channelRegistry.getTuneOutState(serverId, channelId);
+    if (current) {
+      const p = current.params;
+      // A duration so long its end is past what a Date can hold has no time to show.
+      const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
+      const until = expires && Number.isFinite(expires.getTime())
+        ? `, until ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
+        : '';
+      return {
+        ok: false,
+        error: `Nothing changed: ${JSON.stringify(channelId)} is already tuned out, with cadenceSeconds `
+          + `${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. To change those, `
+          + 'cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call tune_out '
+          + 'again with the new settings.',
+      };
+    }
+    // A tool's input reaches here as the model wrote it, and the store can't
+    // keep a NaN or an Infinity: its append would throw after the registry
+    // had marked the channel tuned out. So each option is read as a number
+    // before anything changes, a numeric string included, as the sleep tool
+    // reads its seconds; null counts as left out. A value that gives no
+    // finite number is refused.
+    const leftOut = {
+      durationSeconds: 'to stay tuned out until you cancel',
+      cadenceSeconds: `for the default, ${TUNE_OUT_DEFAULTS.cadenceSeconds}`,
+      backlogCap: `for the default, ${TUNE_OUT_DEFAULTS.backlogCap}`,
+      maxWakes: `for the default, ${TUNE_OUT_DEFAULTS.maxWakes}`,
+    } as const;
+    const given: Partial<Record<keyof typeof leftOut, number>> = {};
+    for (const name of Object.keys(leftOut) as Array<keyof typeof leftOut>) {
+      const value: unknown = opts[name];
+      if (value == null) continue;
+      const n = Number(value);
+      if (!Number.isFinite(n)) {
+        const got = typeof value === 'number'
+          ? String(value)
+          : `${typeof value === 'string' ? 'the string' : 'the value'} ${JSON.stringify(value)}`;
+        return {
+          ok: false,
+          error: `Nothing was tuned out: ${name} must be a finite number${name.endsWith('Seconds') ? ' of seconds' : ''}, `
+            + `and it was ${got}. Leave it out ${leftOut[name]}.`,
+        };
+      }
+      given[name] = n;
+    }
+    const expiresAtMs = given.durationSeconds === undefined
+      ? undefined
+      : Date.now() + Math.max(60, given.durationSeconds) * 1000;
+    if (expiresAtMs !== undefined && !Number.isFinite(expiresAtMs)) {
+      return {
+        ok: false,
+        error: `Nothing was tuned out: durationSeconds ${given.durationSeconds} is longer than an end time can be kept. `
+          + `Leave it out ${leftOut.durationSeconds}.`,
+      };
     }
     const params: TuneOutParams = {
       epochId: randomUUID(),
-      cadenceSeconds: Math.max(30, opts.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
-      backlogCap: Math.max(0, opts.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
-      maxWakes: Math.max(1, opts.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
+      cadenceSeconds: Math.max(30, given.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
+      backlogCap: Math.max(0, given.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
+      maxWakes: Math.max(1, given.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
       startedAtSequence: this.hooks.currentSequence(),
-      ...(opts.durationSeconds !== undefined
-        ? { expiresAtMs: Date.now() + Math.max(60, opts.durationSeconds) * 1000 }
-        : {}),
+      ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     };
+    // A tune-out can end in the registry without cancel (a send into the
+    // channel or a close sets its state there), leaving its timers armed:
+    // clear them, so none of them acts on this one.
+    this.clearTimers(serverId, channelId);
     this.channelRegistry.enterTuneOut(serverId, channelId, params, source);
     this.armExpiry(serverId, channelId, params);
 
@@ -188,19 +255,10 @@ export class TuneOutCoordinator {
   ): { ok: true } | { ok: false; error: string } {
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, 'open', source);
     if (!ended) {
-      return { ok: false, error: `channel ${channelId} is not tuned out` };
+      // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
+      return { ok: false, error: this.notTunedOut(channelId, 'you') };
     }
-    this.stopCadence(serverId, channelId);
-    const expiry = this.expiryTimers.get(this.key(serverId, channelId));
-    if (expiry) {
-      clearTimeout(expiry);
-      this.expiryTimers.delete(this.key(serverId, channelId));
-    }
-    const pending = this.pendingWakes.get(this.key(serverId, channelId));
-    if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingWakes.delete(this.key(serverId, channelId));
-    }
+    this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
     // Backlog: every message stamped with this epoch, oldest first.
@@ -342,6 +400,7 @@ export class TuneOutCoordinator {
   private startCadence(serverId: string, channelId: string, cadenceSeconds: number): void {
     this.stopCadence(serverId, channelId);
     const key = this.key(serverId, channelId);
+    const hold = (timer: ReturnType<typeof setTimeout>): void => { this.cadenceTimers.set(key, timer); };
     const tick = () => {
       const state = this.channelRegistry.getTuneOutState(serverId, channelId);
       if (!state) return; // cancelled meanwhile
@@ -350,9 +409,22 @@ export class TuneOutCoordinator {
       if (diverted > 0) {
         this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
       }
-      this.cadenceTimers.set(key, setTimeout(tick, cadenceSeconds * 1000));
+      armAfter(cadenceSeconds * 1000, hold, tick);
     };
-    this.cadenceTimers.set(key, setTimeout(tick, cadenceSeconds * 1000));
+    armAfter(cadenceSeconds * 1000, hold, tick);
+  }
+
+  /** Clear a channel's tune-out timers: its cadence, its end time and a wake
+   *  still coalescing. */
+  private clearTimers(serverId: string, channelId: string): void {
+    const key = this.key(serverId, channelId);
+    this.stopCadence(serverId, channelId);
+    const expiry = this.expiryTimers.get(key);
+    if (expiry) clearTimeout(expiry);
+    this.expiryTimers.delete(key);
+    const pending = this.pendingWakes.get(key);
+    if (pending) clearTimeout(pending.timer);
+    this.pendingWakes.delete(key);
   }
 
   private stopCadence(serverId: string, channelId: string): void {
@@ -485,7 +557,14 @@ export class TuneOutCoordinator {
       case 'deliver_summary': {
         const text = String(input.text ?? '').trim();
         const channelId = String(input.channelId ?? '');
-        if (!text) return { success: false, error: 'empty summary', isError: false };
+        if (!text) {
+          return {
+            success: false,
+            error: 'Nothing was delivered: deliver_summary needs the summary in "text". If there\'s nothing to '
+              + "report, don't call it: staying silent is allowed.",
+            isError: true,
+          };
+        }
         const subName = this.hooks.subconsciousName();
         if (!subName) return { success: false, error: 'subconscious not configured', isError: true };
         // Verbatim, under its own participant name, into the resident's window.
@@ -498,35 +577,70 @@ export class TuneOutCoordinator {
       case 'cancel_tuneout': {
         const channelId = String(input.channelId ?? '');
         const located = this.findByChannel(channelId);
-        if (!located) return { success: false, error: `channel ${channelId} is not tuned out`, isError: false };
+        if (!located) return { success: false, error: this.notTunedOut(channelId, 'the resident'), isError: true };
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
         const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note);
         return result.ok
           ? { success: true, data: { cancelled: true } }
-          : { success: false, error: result.error, isError: false };
+          : { success: false, error: result.error, isError: true };
       }
       case 'note_disposition': {
         const key = String(input.key ?? '').trim();
-        if (!key) return { success: false, error: 'key required', isError: false };
+        if (!key) {
+          return {
+            success: false,
+            error: 'Nothing was recorded: note_disposition needs a "key", a short stable name for the note, such as '
+              + '"busy-channels". To delete a note, call it with that note\'s key and an empty "text".',
+            isError: true,
+          };
+        }
         this.noteDisposition(key, String(input.text ?? ''));
         return { success: true, data: { noted: key } };
       }
       case 'speak_in_channel': {
         if (!this.hooks.allowChannelSpeech()) {
+          // The setting's name is the host's, for its log; the subconscious
+          // reads what it can do instead.
+          console.warn('[tune-out] speak_in_channel refused: FrameworkConfig.subconscious.allowChannelSpeech is off');
           return {
             success: false,
-            isError: false,
-            error: 'channel speech is disabled for the subconscious (recipe: subconscious.allowChannelSpeech)',
+            isError: true,
+            error: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and "
+              + "calling it again won't change that. The resident can speak there: tell it what's needed with "
+              + 'deliver_summary, or, if the channel is tuned out and needs the resident now, end the tune-out with '
+              + 'cancel_tuneout.',
           };
         }
         const channelId = String(input.channelId ?? '');
         const text = String(input.text ?? '').trim();
-        if (!text) return { success: false, error: 'empty message', isError: false };
+        if (!text) {
+          return { success: false, error: 'Nothing was posted: speak_in_channel needs the message in "text".', isError: true };
+        }
         return this.channelRegistry.publishForAgent(channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
       }
       default:
         return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };
     }
+  }
+
+  /**
+   * A cancel of a channel that isn't tuned out: which channels are, so the
+   * next call can name one, and how a tune-out ends without one. `backlogTo`
+   * names the resident as the message's reader knows it: "you" to the
+   * resident, "the resident" to the subconscious. It speaks of connected
+   * channels because listActive reads the registered ones: removing a server
+   * drops its channels and keeps their tune-outs, so a tune-out there is in
+   * neither this list nor findByChannel's lookup, and the text claims nothing
+   * about it.
+   */
+  private notTunedOut(channelId: string, backlogTo: 'you' | 'the resident'): string {
+    const active = this.listActive().map((e) => JSON.stringify(e.channelId));
+    const opening = active.length === 0
+      ? 'no connected channel is tuned out now.'
+      : `no connected channel ${JSON.stringify(channelId)} is tuned out. Connected channels tuned out now: `
+        + `${active.join(', ')}.`;
+    return `Nothing was cancelled: ${opening} A tune-out also ends by itself when its duration runs out, or at the `
+      + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;
   }
 
   private findByChannel(channelId: string): { serverId: string } | null {
