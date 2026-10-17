@@ -88,6 +88,8 @@ export class HookOrchestrator {
   private registry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
   private _isInHook = false;
+  /** Servers already told that an injection's namespace wasn't a string. */
+  private readonly namespaceWarned = new Set<string>();
 
   constructor(registry: McplServerRegistry, featureSetManager: FeatureSetManager) {
     this.registry = registry;
@@ -216,14 +218,15 @@ export class HookOrchestrator {
           if (!leaf || !CapabilityGrant.of(server).has(leaf.path)) {
             console.error(
               `[mcpl] ${server.id}: dropped beforeInference injection at position ` +
-                `"${mcplInj.position}" — not in the effective grant (§10.8)`,
+                `${logValue(mcplInj.position)} — not in the effective grant (§10.8)`,
             );
             continue;
           }
+          if (typeof mcplInj.namespace !== 'string') this.readNamespace(server.id, mcplInj.namespace);
           injections.push(convertMcplInjection(mcplInj));
         } catch (error) {
           // Such as a null block, content that isn't an array, a null
-          // injection, or a position with no string form.
+          // injection, or a namespace that can't be read as text.
           const position = (mcplInj as { position?: unknown } | null | undefined)?.position;
           console.error(
             `[mcpl] ${server.id}: dropped beforeInference injection at position ${logValue(position)} ` +
@@ -234,6 +237,30 @@ export class HookOrchestrator {
     }
 
     return injections;
+  }
+
+  /**
+   * Checks a namespace that isn't a string, which §10.4 doesn't allow. One
+   * that can be read as text is kept as it is, and its server's operator is
+   * told once: context-manager reads it as its text when it writes a
+   * beforeUser or afterUser injection's namespace into a participant's name,
+   * as it always has. One with no text form would throw there, after the
+   * catch around each injection, and fail the turn, so it throws here, and
+   * its injection alone is left out, whatever its position.
+   */
+  private readNamespace(serverId: string, namespace: unknown): void {
+    let text: string;
+    try {
+      text = String(namespace);
+    } catch {
+      throw new Error("its namespace isn't a string and can't be read as text");
+    }
+    if (this.namespaceWarned.has(serverId)) return;
+    this.namespaceWarned.add(serverId);
+    console.error(
+      `[mcpl] ${serverId}: a beforeInference injection's namespace isn't a string, which §10.4 requires, ` +
+        `so it was read as its text, ${logValue(text)}; this line prints once per server while the host runs`,
+    );
   }
 
 }

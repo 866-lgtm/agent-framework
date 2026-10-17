@@ -21,6 +21,7 @@ import { RefusalLines } from '../src/mcpl/refusal-lines.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { logDetail, logValue } from '../src/mcpl/log-value.js';
 
 /** Base64 for an image well over 1 MiB once serialized (a Retina screenshot). */
 const BIG_IMAGE = { type: 'image', data: 'A'.repeat(1_600_000), mimeType: 'image/png' };
@@ -425,7 +426,8 @@ test('an injection the host can\'t read is left out, with a console line, and ev
   // around the whole hook then dropped every server's injections for the
   // turn: a null block, content that isn't an array, a null injection, a
   // position with no string form, and an answer whose injections aren't a
-  // list.
+  // list. The position is refused as one outside the grant, and the rest
+  // as unreadable.
   const bad = server('bad', [
     { namespace: 'a', position: 'system', content: [null, { type: 'text', text: 'lost_beside_null' }] },
     { namespace: 'b', position: 'system', content: 5 },
@@ -442,8 +444,65 @@ test('an injection the host can\'t read is left out, with a console line, and ev
     [{ type: 'text', text: 'kept_from_good' }],
   ]);
   const dropped = '[mcpl] bad: dropped beforeInference injection at position ';
-  assert.equal(lines.filter((line) => line.startsWith(dropped) && line.includes(' — it couldn\'t be read: ')).length, 4, lines.join('\n'));
+  assert.equal(lines.filter((line) => line.startsWith(dropped) && line.includes(' — it couldn\'t be read: ')).length, 3, lines.join('\n'));
+  assert.equal(lines.filter((line) => line.startsWith(dropped) && line.endsWith(' — not in the effective grant (§10.8)')).length, 1, lines.join('\n'));
   assert.deepEqual(lines.filter((line) => line.startsWith('[mcpl] odd: ')), ['[mcpl] odd: dropped its beforeInference injections — contextInjections isn\'t an array']);
+});
+
+test('an injection whose namespace can\'t be read as text is left out, and any other namespace that isn\'t a string reaches the agent as before, named once per server', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const server = (id: string, contextInjections: unknown[]) => ({
+    id,
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system', 'contextHooks.beforeInference.inject.afterUser']), []),
+    sendBeforeInference: async () => ({ featureSet: 'doc', contextInjections }),
+  });
+  // context-manager writes an afterUser or beforeUser injection's namespace
+  // into a participant's name, as its text, as it builds the request, and
+  // never reads a system injection's. One with no text form threw there,
+  // after the hook's catch, and failed the whole request; any other reached
+  // the agent, and still does.
+  const bad = server('bad', [
+    { namespace: { toString: 1 }, position: 'afterUser', content: [{ type: 'text', text: 'lost_no_text_form' }] },
+    { namespace: { toString: 1 }, position: 'system', content: [{ type: 'text', text: 'lost_system_no_text_form' }] },
+    { namespace: 5, position: 'afterUser', content: [{ type: 'text', text: 'kept_number' }] },
+    { position: 'system', content: [{ type: 'text', text: 'kept_missing' }] },
+  ]);
+  const good = server('good', [{ namespace: 'notes', position: 'afterUser', content: [{ type: 'text', text: 'kept_from_good' }] }]);
+  const hooks = new HookOrchestrator({ getAllServers: () => [bad, good] } as never, { validateInbound: () => {} } as never);
+  const f = await fixture(); t.after(f.close);
+  (f.framework as unknown as { hookOrchestrator: HookOrchestrator }).hookOrchestrator = hooks;
+  const unreadable = (position: string) => `[mcpl] bad: dropped beforeInference injection at position ${position} — it couldn't be read: ${logDetail("its namespace isn't a string and can't be read as text")}`;
+  for (const turn of [1, 2]) {
+    const request = await f.framework.previewActivation('agent', { injections: true }) as unknown as { system?: unknown; messages: Array<{ participant: string; content: unknown }> };
+    const whole = JSON.stringify(request);
+    assert.ok(whole.includes('kept_from_good'), whole);
+    assert.ok(!whole.includes('lost_no_text_form') && !whole.includes('lost_system_no_text_form'), whole);
+    assert.equal(request.messages.find((m) => JSON.stringify(m.content).includes('kept_number'))?.participant, 'system_context:5', whole);
+    assert.ok(JSON.stringify(request.system).includes('kept_missing'), whole);
+    assert.equal(lines.filter((line) => line === unreadable('afterUser')).length, turn, lines.join('\n'));
+    assert.equal(lines.filter((line) => line === unreadable('system')).length, turn, lines.join('\n'));
+  }
+  // A server's first namespace that isn't a string, and only that one, is
+  // named, as the text it was read as.
+  assert.deepEqual(lines.filter((line) => line.includes('namespace isn\'t a string, which')), [
+    '[mcpl] bad: a beforeInference injection\'s namespace isn\'t a string, which §10.4 requires, so it was read as its text, 5; this line prints once per server while the host runs',
+  ]);
+});
+
+test('a position the grant refuses prints as one field of one line, whatever it holds', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const forged = 'bogus" — x\n[mcpl] other: forged line';
+  const server = {
+    id: 'bad',
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system']), []),
+    sendBeforeInference: async () => ({ featureSet: 'doc', contextInjections: [{ namespace: 'n', position: forged, content: [{ type: 'text', text: 'x' }] }] }),
+  };
+  const hooks = new HookOrchestrator({ getAllServers: () => [server] } as never, { validateInbound: () => {} } as never);
+  assert.deepEqual(await hooks.beforeInference({} as never), []);
+  assert.deepEqual(lines, [`[mcpl] bad: dropped beforeInference injection at position ${logValue(forged)} — not in the effective grant (§10.8)`]);
+  assert.ok(!lines[0]!.includes('\n'), lines[0]);
 });
 
 test('a reference stub names the lane its block came on: a channel message, a pushed event or an injection', async (t) => {
@@ -476,6 +535,8 @@ test('a tool result\'s text block whose text isn\'t a string shows as the same p
     alone: { content: [{ type: 'text', text: { a: 1 } }] },
     // An empty string is still dropped from the join, as before.
     blank: { content: [{ type: 'text', text: '' }, { type: 'text', text: 'found_text' }] },
+    // An error's text is its message, so such a text is the error's words.
+    error: { isError: true, content: [{ type: 'text', text: { a: 1 } }] },
   };
   const f = await fixture({
     tools: [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object' } }],
@@ -483,7 +544,7 @@ test('a tool result\'s text block whose text isn\'t a string shows as the same p
   });
   t.after(f.close);
   const internals = f.framework as unknown as { pushEvent(event: unknown): void; dispatchToolCall(agent: string, call: unknown): void };
-  const call = (id: string) => new Promise<{ data?: unknown }>((resolve) => {
+  const call = (id: string) => new Promise<{ data?: unknown; error?: unknown }>((resolve) => {
     const original = internals.pushEvent;
     internals.pushEvent = (event: unknown) => {
       const e = event as { type: string; callId?: string; result?: { data?: unknown } };
@@ -495,6 +556,7 @@ test('a tool result\'s text block whose text isn\'t a string shows as the same p
   assert.equal((await call('beside')).data, `${NON_STRING_TEXT_PLACEHOLDER}\nfound_text`);
   assert.equal((await call('alone')).data, NON_STRING_TEXT_PLACEHOLDER);
   assert.equal((await call('blank')).data, 'found_text');
+  assert.equal((await call('error')).error, NON_STRING_TEXT_PLACEHOLDER);
 });
 
 test('an inference filter reads the text conversion stores, a placeholder included, on both lanes, coalesced or not', async (t) => {
