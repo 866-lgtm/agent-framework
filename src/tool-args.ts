@@ -113,7 +113,10 @@ const OTHER_KEY_DECLARERS = [
  *  schema object for `additionalProperties` or `unevaluatedProperties`, `{}`
  *  included, or `true`, which means the same there, says the root takes keys
  *  `properties` doesn't list, as a map's input does, so a key in neither list
- *  may be meant. `false` there says it takes none, so it names. */
+ *  may be meant. `false` there says it takes none, so it names. Left out,
+ *  the keyword is JSON Schema's default, which says nothing of what the
+ *  author meant, and most schemas leave it out without welcoming other keys,
+ *  so a root without it names them too. */
 function declaresKeysPlainly(schema: Record<string, unknown>): boolean {
   return !OTHER_KEY_DECLARERS.some((key) => Object.hasOwn(schema, key))
     && !takesOtherKeys(schema.additionalProperties)
