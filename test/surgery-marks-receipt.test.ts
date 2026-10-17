@@ -337,7 +337,7 @@ describe('surgery and awareness marks', () => {
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === other), 'the redaction stood');
     assert.equal(outbox().batches().filter((batch) => batch.status === 'prepared').length, 1, 'its journal is left prepared');
     const alert = alerts.find((candidate) => candidate.kind === 'discord-awareness-unresolved');
-    assert.match(alert?.message ?? '', /suppress applied, but its resume journal \(awareness batch \S+, no marks\) could not be closed.*it stays prepared/);
+    assert.match(alert?.message ?? '', /suppress applied, but its resume journal \(awareness batch \S+, no marks\) could not be closed \(.*\); it stays prepared, unless the journal couldn't be read back and its closing record landed anyway; if it stays prepared, a start on this branch finds its removals applied and closes it$/);
   });
 
   it('a choice bound to previewed refs never widens to messages that arrive before it applies', async () => {

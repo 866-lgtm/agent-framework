@@ -527,7 +527,8 @@ adds and removals are dropped. The import names each batch that had such
 work, with how many adds and removals, on stderr wherever it runs, and in a
 `discord-awareness-import-unsent` ops alert at the host's start that
 imported it. A batch 0.22.x never activated placed no marks; a retract of a
-batch takes off every mark on its messages, whichever batch placed it.
+batch takes off the mark of its emoji from each of its messages, whichever
+batch placed it.
 
 ## Observability
 

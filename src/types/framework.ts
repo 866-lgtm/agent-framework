@@ -112,10 +112,10 @@ export interface FrameworkConfig {
   /**
    * A pre-journal Discord awareness ledger to import once. The awareness
    * journal itself lives in the store (typed records), so every framework
-   * has one; this only names the JSON file earlier releases kept, by default
-   * `<storePath>/recovery/discord-awareness-outbox.json`. Set it when
-   * providing an app-owned `store` without `storePath` whose earlier
-   * releases kept such a file.
+   * has one; this only names the JSON ledger agent-framework 0.22.x kept, by
+   * default `<storePath>/recovery/discord-awareness-outbox.json`. Set it when
+   * providing an app-owned `store` without `storePath` for which 0.22.x kept
+   * such a file.
    */
   discordAwarenessOutboxPath?: string;
 

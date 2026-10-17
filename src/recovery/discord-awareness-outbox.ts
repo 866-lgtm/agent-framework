@@ -103,8 +103,8 @@ const PRE_WRITE_REFUSAL = /^Cannot send request:/;
 const LEGACY_LEDGER_NAME = 'discord-awareness-outbox.json';
 
 /**
- * Where a pre-journal awareness ledger (the JSON file earlier releases kept
- * under a store) is found, to import once.
+ * Where a pre-journal awareness ledger (the JSON file agent-framework 0.22.x
+ * kept under a store) is found, to import once.
  */
 export function defaultDiscordAwarenessOutboxPath(storePath: string): string {
   return join(storePath, 'recovery', LEGACY_LEDGER_NAME);
@@ -1290,9 +1290,11 @@ export class DiscordAwarenessOutbox {
 
   /** The due dispatch for one key's operations (in request order), if any. */
   private headDispatch(ops: DiscordAwarenessOp[]): (DiscordAwarenessDispatch & { order: number }) | null {
-    // One request per reaction key on the wire at a time, including a
-    // cancelled one still awaiting its outcome: opposite actions must not
-    // overtake each other.
+    // One request per reaction key on the wire at a time from this process,
+    // including a cancelled one still awaiting its outcome: opposite actions
+    // must not overtake each other. An attempt a previous process left is
+    // recorded unknown at the start, and holds nothing: a retract's receipt
+    // says what may still land.
     if (ops.some((op) => op.attempts.length > 0 && op.attempts.at(-1)!.outcome === undefined
       && this.inFlight.has(op.opId))) return null;
     const live = ops.filter((op) => !op.cancelled);
@@ -1600,8 +1602,8 @@ export class DiscordAwarenessOutbox {
             'agent-framework 0.22.x had still to add or remove, and none of them will be sent, since nobody chose them: ' +
             imported.unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
               `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
-            '. A batch 0.22.x never activated placed no marks; retracting a batch takes off every mark on its ' +
-            'messages, whichever batch placed it',
+            '. A batch 0.22.x never activated placed no marks; retracting a batch takes off the mark of its emoji ' +
+            'from each of its messages, whichever batch placed it',
         );
       }
     }
@@ -1828,8 +1830,8 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
  * brought to the bound of unconfirmed attempts. One not cancelled that is
  * on the wire, or was left there by a previous process, hasn't ended.
  * headDispatch decides what is due among the operations that haven't, and
- * holds a key while any attempt of its, a cancelled one's included, is on
- * the wire.
+ * holds a key while an attempt this process sent for it, a cancelled one's
+ * included, awaits its outcome.
  */
 function opEnded(op: DiscordAwarenessOp): boolean {
   if (op.cancelled) return true;
@@ -1884,8 +1886,8 @@ interface LegacyBatch {
  * body may be pending on its branch, which stays prepared, as an
  * interrupted surgery's does, for a start on that branch to finish and
  * retire (see pendingSuppressionsFor). Nothing imported is ever dispatched;
- * a retract of a batch takes off every mark on its messages, whichever
- * batch placed it, the marks 0.22.x placed among them.
+ * a retract of a batch takes off the mark of its emoji from each of its
+ * messages, whichever batch placed it, the marks 0.22.x placed among them.
  *
  * Each batch is imported once. A batch the journal already holds, or a
  * second listing of one in this file, is skipped whole: its evidence would

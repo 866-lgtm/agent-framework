@@ -646,8 +646,8 @@ test('an import retires the work 0.22.x had still to do, none of it sent, and th
   assert.deepEqual(recovered.retired, [], 'its import retired it; no start does');
   // A later process imports nothing, and names nothing.
   assert.deepEqual(h.reopen().recoverAtStartup(() => true).imported, []);
-  // A retract still takes off every mark on the batch's messages, those
-  // 0.22.x may have placed among them.
+  // A retract still takes off the mark of the batch's emoji from each of
+  // its messages, those 0.22.x may have placed among them.
   assert.equal(h.reopen().retract('old-1').removalsQueued, 2);
 }));
 
@@ -1489,6 +1489,13 @@ test('after a failed surgery, retiring its batch says what the journal holds: re
       + '(injected sync failure): an operating system crash or a power failure before the store\'s next sync could lose '
       + 'that record, and the batch would then be prepared again at the next start, its removals pending for recovery/cairn/f1',
   );
+  // A batch with no suppression has no removals to leave pending.
+  assert.equal(
+    framework.retireAfterRestore({ id: 'f2', targetBranch: 'rollback/cairn/f2' }, 'main', 'cairn'),
+    '; awareness batch f2 is retired, none of its marks sent, but the journal\'s sync after its retirement failed '
+      + '(injected sync failure): an operating system crash or a power failure before the store\'s next sync could lose '
+      + 'that record, and the batch would then be prepared again at the next start',
+  );
   assert.deepEqual(alerts, [], 'retired: nothing is left unresolved');
   framework.discordAwarenessOutbox = {
     discard: () => { throw new Error('injected write failure'); },
@@ -1647,12 +1654,13 @@ test('the start that imports a pre-journal ledger raises one alert naming each b
       + `remove won't be sent, since nobody chose them: ${named}. A batch 0.22.x never activated placed no marks. To `
       + 'take off the marks it placed for a batch it activated, retract that batch through the host command marks '
       + '(action retract), or, with the host stopped, agent-framework-recover --awareness retract: a retract takes off '
-      + 'every mark on the batch\'s messages, whichever batch placed it',
+      + 'the mark of the batch\'s emoji from each of its messages, whichever batch placed it',
   }]);
   assert.deepEqual(logged, [
     `[discord-awareness] imported ${basename(h.legacyPath)}: 2 batch(es) had marks agent-framework 0.22.x had still `
       + `to add or remove, and none of them will be sent, since nobody chose them: ${named}. A batch 0.22.x never `
-      + 'activated placed no marks; retracting a batch takes off every mark on its messages, whichever batch placed it',
+      + 'activated placed no marks; retracting a batch takes off the mark of its emoji from each of its messages, '
+      + 'whichever batch placed it',
   ]);
   assert.equal(framework.discordAwarenessOutbox.pendingDispatches('discord').length, 0, 'nothing was sent');
   assert.deepEqual(
@@ -2401,6 +2409,18 @@ test('Discord refusals that no retry can change are permanent', () => {
     assert.equal(isPermanentDiscordReactionFailure(text), false, text);
   }
 });
+
+test("retract('all') takes the keys of every batch not retired, every key an add was requested for, and every key an imported ledger recorded, and no other key of a retired batch", withJournal((_outbox, h) => {
+  // Imported, never activated, so retired at import: its attempt on m3 is
+  // kept as evidence, and its m4 has none.
+  const outbox = importLegacyBatch(h, 'old', [{ ...ref('m3'), attempts: 1, lastAction: 'add' } as DiscordAwarenessRef, ref('m4')]);
+  activeBatch(outbox, [ref('m1')]);
+  const retired = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2', refs: [ref('m2')], scope: 'all' })!;
+  outbox.discard(retired.id);
+  const receipt = outbox.retract('all');
+  assert.equal(receipt.removalsQueued, 2);
+  assert.deepEqual(outbox.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`).sort(), ['remove:m1', 'remove:m3']);
+}));
 
 test('an operator\'s request the journal won\'t carry out is a refusal; a journal failure is not', withJournal((_outbox, h) => {
   const seams = journalSeams(h.store);

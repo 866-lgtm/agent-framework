@@ -46,7 +46,8 @@
   batches on stderr wherever it runs, and in a
   `discord-awareness-import-unsent` ops alert at the host's start that
   imported it. A batch 0.22.x never activated placed no marks; a retract of
-  a batch takes off every mark on its messages, whichever batch placed it.
+  a batch takes off the mark of its emoji from each of its messages, whichever
+  batch placed it.
   A release before this one doesn't read the
   journal, so a host downgraded after the import starts without it, and
   marks queued since aren't delivered.

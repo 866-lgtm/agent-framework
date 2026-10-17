@@ -16478,9 +16478,11 @@ export class AgentFramework {
     }
     if (recovered.imported.length > 0) {
       // This start imported a pre-journal ledger: the work agent-framework
-      // 0.22.x had still to do is retired, none of it sent, since nobody
-      // chose it. A retract of a batch 0.22.x activated takes off what it
-      // placed, and every other mark on that batch's messages.
+      // 0.22.x had still to do is never sent, since nobody chose it, and its
+      // batches are retired (a suppression whose body may be pending, once a
+      // start on its branch finishes the body). A retract of a batch 0.22.x
+      // activated takes off the mark of the batch's emoji from each of its
+      // messages, whichever batch placed it.
       this.opsAlert(
         'discord-awareness-import-unsent',
         'host',
@@ -16490,8 +16492,8 @@ export class AgentFramework {
             `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
           '. A batch 0.22.x never activated placed no marks. To take off the marks it placed for a batch it ' +
           'activated, retract that batch through the host command marks (action retract), or, with the host ' +
-          'stopped, agent-framework-recover --awareness retract: a retract takes off every mark on the batch\'s ' +
-          'messages, whichever batch placed it',
+          'stopped, agent-framework-recover --awareness retract: a retract takes off the mark of the batch\'s emoji ' +
+          'from each of its messages, whichever batch placed it',
         { data: { batches: recovered.imported } },
       );
     }
