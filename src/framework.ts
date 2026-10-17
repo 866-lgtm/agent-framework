@@ -14316,9 +14316,9 @@ export class AgentFramework {
     const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
     // Journal: a file under the agent's first read-write workspace mount so
-    // their existing read/grep/shell tools work on it. Python appends
-    // directly to the materialized path; watch-mode mounts sync it back to
-    // the chronicle tree on their usual cadence.
+    // their existing read/grep/shell tools work on it. The runner appends the
+    // script's output to the materialized path as it reads it; watch-mode
+    // mounts sync it back to the chronicle tree on their usual cadence.
     let logPath: string | null = null;
     let logAbsPath: string | null = null;
     const workspace = this.getWorkspaceModule();

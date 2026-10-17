@@ -43,7 +43,13 @@ export interface ProcessLoggingConfig {
 export interface CodeExecutionConfig {
   /** Master switch — the tool is only synthesized when true. */
   enabled: boolean;
-  /** Python interpreter to spawn (default: 'python3' from PATH). */
+  /**
+   * Python interpreter to spawn (default: 'python3' from PATH). The runner
+   * gives it the protocol on file descriptors 3 and 4, so a wrapper named
+   * here must pass those on: one that `exec`s Python does, while a container,
+   * or sudo with its default settings, closes them, and every script then
+   * fails to start, saying so.
+   */
   pythonPath?: string;
   /**
    * Per-inner-tool-call timeout; exceeding it raises TimeoutError inside the

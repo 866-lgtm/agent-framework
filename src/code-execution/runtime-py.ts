@@ -19,23 +19,38 @@
  *     the payload to the host, which injects it into the agent's context and
  *     triggers inference. Awaits a host ack so rate limiting backpressures
  *     inside the script instead of dropping wakes.
- *   - stdout/stderr tee'd line-buffered to `log_path` (agent-readable via
- *     their file tools) with an in-memory tail kept for the crash envelope.
+ *   - its stderr joined to its stdout (fd 2 onto fd 1's pipe), so the host's
+ *     journal of its output (a log file the agent can read, and a tail for the
+ *     crash envelope) holds the two in the order they were written.
+ *
+ * OUTPUT. The protocol has file descriptors of its own: the host opens the
+ * runtime's fds 3 (host -> py) and 4 (py -> host), which the runtime makes
+ * non-inheritable as it starts, so no command a script runs is given them. fd 0
+ * is /dev/null, and fds 1 and 2 are pipes the host reads itself: a script's
+ * prints and the output of every command it runs go there in the order
+ * written, and what reaches them reaches the host whatever then happens to the
+ * interpreter. The host gives each exec what arrived on each stream before
+ * that exec's end mark (the exec op's `mark`), which the runtime writes into
+ * both streams once the script has returned; each stream is first in, first
+ * out, so what the script and the commands it waited for wrote is ahead of
+ * it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
+ * protocol, and the runtime puts them back as the host set them at each
+ * exec's start.
  *
  * Embedded as a TS string because tsc does not copy non-TS assets to dist/;
  * PyRunner materializes it to a temp file at spawn.
  *
- * Protocol (JSON lines):
+ * Protocol (JSON lines, on fds 3 and 4):
  *   host -> py : {op:"init", tools:[{py_name,tool_name}], call_timeout_s,
- *                 background?, log_path?, tail_chars?}
- *                {op:"exec", id, code}
+ *                 background?}
+ *                {op:"exec", id, code, mark}
  *                {op:"tool_result", id, result}
  *                {op:"wake_ack", id, error?}
  *                {op:"cancel", id, reason?}
  *   py -> host : {op:"ready"}
  *                {op:"tool_call", id, exec_id, name, args}
  *                {op:"wake", id, exec_id, line, payload}
- *                {op:"exec_result", id, stdout, stderr, return_code, tail?}
+ *                {op:"exec_result", id, return_code}
  *
  * At a deadline the host sends cancel and then SIGINT, repeated until the
  * script reports (not on Windows): the cancel stops a script waiting on an
@@ -49,6 +64,7 @@
 export const PYTHON_RUNTIME_SOURCE: string = String.raw`
 import ast
 import asyncio
+import faulthandler
 import inspect
 import io
 import json
@@ -58,15 +74,21 @@ import sys
 import threading
 import traceback
 
-PROTO_OUT = sys.stdout          # protocol channel (real stdout)
-REAL_STDERR = sys.stderr        # runtime diagnostics outside execs
 CALL_TIMEOUT_S = 270.0
-OUTPUT_CAP_CHARS = 2_000_000
-LOG_FILE_CAP_BYTES = 50_000_000
-
 BACKGROUND = False
-LOG_PATH = None
-TAIL_CHARS = 4000
+
+# The protocol's own channel, fds 3 and 4 as the host opened them (_start).
+PROTO_IN = None
+PROTO_OUT = None
+
+# Private copies of fds 0, 1 and 2 as the host set them up: /dev/null, and the
+# two output pipes the host reads (_take_std_fds). Each exec puts fds 0, 1 and 2
+# back from them, whatever an earlier script did with its own, and writes its
+# end marks through them. os.dup's copies are non-inheritable, so no command a
+# script runs holds them.
+_STD_IN = None
+_STD_OUT = None
+_STD_ERR = None
 
 _send_lock = threading.Lock()
 
@@ -74,92 +96,112 @@ _send_lock = threading.Lock()
 def send(obj):
     line = json.dumps(obj, ensure_ascii=False, default=str)
     with _send_lock:
-        PROTO_OUT.write(line + "\n")
-        PROTO_OUT.flush()
+        try:
+            PROTO_OUT.write(line + "\n")
+            PROTO_OUT.flush()
+        except OSError as exc:
+            _fatal("cannot send the host a message any more (" + str(exc) + ")")
 
 
-class CappedIO(io.StringIO):
-    """StringIO that stops recording past a cap (keeps a truncation flag)."""
-
-    def __init__(self, cap):
-        super().__init__()
-        self._cap = cap
-        self.truncated = False
-
-    def write(self, s):
-        if not isinstance(s, str):
-            s = str(s)
-        if self.tell() >= self._cap:
-            self.truncated = True
-            return len(s)
-        remaining = self._cap - self.tell()
-        if len(s) > remaining:
-            self.truncated = True
-            return super().write(s[:remaining])
-        return super().write(s)
-
-
-class LogTee:
-    """Background-mode writer: line-buffered file append + rolling tail.
-
-    The file is the agent-readable journal (their read/grep/shell tools work
-    on it); the tail rides the exec_result so the host can build a crash
-    envelope without re-reading the file.
-    """
-
-    def __init__(self, path, tail_chars):
-        self._fh = None
-        self._written = 0
-        self._tail = ""
-        self._tail_chars = tail_chars
-        self.truncated = False
-        if path:
+def _start():
+    global PROTO_IN, PROTO_OUT
+    # A wrapper between the host and this interpreter can close fds 3 and 4
+    # (a container, or sudo with its default settings, does): say so where the
+    # host reads, for a failed start that names what to fix, and stop.
+    for fd in (3, 4):
+        try:
+            os.fstat(fd)
+        except OSError:
             try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                self._fh = open(path, "a", encoding="utf-8", errors="replace")
-            except Exception as exc:
-                REAL_STDERR.write("[pytc-runtime] cannot open log file: " + str(exc) + "\n")
-                REAL_STDERR.flush()
-
-    def write(self, s):
-        if not isinstance(s, str):
-            s = str(s)
-        self._tail = (self._tail + s)[-self._tail_chars:]
-        if self._fh is not None and not self.truncated:
-            if self._written + len(s) > LOG_FILE_CAP_BYTES:
-                self.truncated = True
-                try:
-                    self._fh.write("\n[log capped at " + str(LOG_FILE_CAP_BYTES) + " bytes]\n")
-                    self._fh.flush()
-                except Exception:
-                    pass
-            else:
-                try:
-                    self._fh.write(s)
-                    if "\n" in s:
-                        self._fh.flush()
-                    self._written += len(s)
-                except Exception:
-                    pass
-        return len(s)
-
-    def flush(self):
-        if self._fh is not None:
-            try:
-                self._fh.flush()
-            except Exception:
+                os.write(2, (
+                    "The host's channel didn't reach this Python interpreter (its file descriptors 3 and 4 "
+                    "aren't open): a pythonPath that starts Python through a wrapper must pass fds 3 and 4 on, "
+                    "which a container, or sudo with its default settings, doesn't.\n"
+                ).encode())
+            except OSError:
                 pass
+            sys.exit(2)
+    # fds 3 and 4 came from the host inheritable; no command a script runs may
+    # hold them, or read the host's messages.
+    os.set_inheritable(3, False)
+    os.set_inheritable(4, False)
+    PROTO_IN = open(3, "r", encoding="utf-8", newline="\n")
+    PROTO_OUT = open(4, "w", encoding="utf-8", newline="\n")
+    _take_std_fds()
 
-    def close(self):
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            except Exception:
-                pass
-            self._fh = None
 
-    def tail(self):
-        return self._tail
+def _take_std_fds():
+    global _STD_IN, _STD_OUT, _STD_ERR
+    _STD_IN, _STD_OUT, _STD_ERR = os.dup(0), os.dup(1), os.dup(2)
+    # A crash's own text goes where the host reads it, a pipe that outlives the
+    # process: faulthandler adds a traceback for a segfault or an abort, where
+    # CPython alone writes nothing.
+    faulthandler.enable(file=_STD_ERR, all_threads=False)
+
+
+def _diag(text):
+    # A note of the runtime's own for the host's log, through fd 2's copy.
+    try:
+        os.write(_STD_ERR, ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace"))
+    except OSError:
+        pass
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _script_writer(fd):
+    # Line-buffered, as Python's own stdout is on a terminal: each line reaches
+    # the host as it's printed, in order with what the commands a script runs
+    # write, for one write per line. A partial line waits for its newline, a
+    # flush or the end of the exec. It writes to the fd by number, so one an
+    # earlier script kept, such as a logging handler's, writes into the exec
+    # that's running.
+    return io.TextIOWrapper(io.BufferedWriter(io.FileIO(fd, "w", closefd=False)), encoding="utf-8",
+                            errors="backslashreplace", newline="\n", line_buffering=True)
+
+
+def _open_streams():
+    # fds 0, 1 and 2 as the host set them, whatever the last script did.
+    os.dup2(_STD_IN, 0)
+    os.dup2(_STD_OUT, 1)
+    # A background script's journal is one stream: its stderr joins its stdout's
+    # pipe, so the two keep the order they were written in.
+    os.dup2(_STD_OUT if BACKGROUND else _STD_ERR, 2)
+    return _script_writer(1), _script_writer(2)
+
+
+def _note(stream, text):
+    # The runtime's own line in a script's stream, which may have broken under it.
+    try:
+        stream.write(text)
+    except Exception:
+        pass
+
+
+def _end_streams(streams, mark):
+    # Send what the script left in its writers, then end this exec's share of
+    # each stream with its mark: everything the script wrote, and all of every
+    # command it waited for, is ahead of it.
+    for writer in streams:
+        try:
+            writer.flush()
+        except Exception:
+            pass  # its fd closed or broke under it, so that much can't be sent
+    data = mark.encode("utf-8")
+    _write_all(_STD_OUT, data)
+    _write_all(_STD_ERR, data)
+
+
+def _fatal(why):
+    # The runtime can't go on, as when a script closed one of the runtime's own
+    # fds under it: say why on fd 2, which the host reads, and end, so the host
+    # settles the exec on the exit with the output that arrived, rather than
+    # waiting out its time limit for a result that can't come.
+    _diag(why + "; exiting")
+    os._exit(70)
 
 
 # Persistent interpreter state (mirrors container reuse: variables survive
@@ -330,15 +372,11 @@ async def wake_agent(payload=None):
 
 
 def handle_init(msg):
-    global CALL_TIMEOUT_S, BACKGROUND, LOG_PATH, TAIL_CHARS
+    global CALL_TIMEOUT_S, BACKGROUND
     timeout = msg.get("call_timeout_s")
     if isinstance(timeout, (int, float)) and timeout > 0:
         CALL_TIMEOUT_S = float(timeout)
     BACKGROUND = bool(msg.get("background"))
-    LOG_PATH = msg.get("log_path") or None
-    tail = msg.get("tail_chars")
-    if isinstance(tail, int) and tail > 0:
-        TAIL_CHARS = tail
 
     # Remove functions injected by a previous init that are no longer present
     # (tool list changed) without touching user-defined globals.
@@ -368,17 +406,16 @@ def handle_init(msg):
         SCRIPT_GLOBALS.pop("wake_agent", None)
 
 
-async def _run_script(exec_id, code, st):
+async def _run_script(exec_id, code, mark, st):
     global _current_exec_id, _current_exec_task, _stop
-    if BACKGROUND:
-        out = LogTee(LOG_PATH, TAIL_CHARS)
-        err = out  # interleave, terminal-style; tail is shared
-    else:
-        out = CappedIO(OUTPUT_CAP_CHARS)
-        err = CappedIO(OUTPUT_CAP_CHARS)
+    try:
+        streams = _open_streams()
+    except OSError as exc:
+        _fatal("cannot reach the output pipes any more (" + str(exc) + ")")
+    out, err = streams
     old_out, old_err, old_in = sys.stdout, sys.stderr, sys.stdin
     sys.stdout, sys.stderr = out, err
-    sys.stdin = io.StringIO("")  # input() must not steal the protocol channel
+    sys.stdin = io.StringIO("")  # input() ends at once, as fd 0's /dev/null does for a command
     return_code = 0
     try:
         compiled = compile(code, "<script>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
@@ -394,7 +431,7 @@ async def _run_script(exec_id, code, st):
         finally:
             st.running = False
     except asyncio.CancelledError:
-        err.write("\nKeyboardInterrupt: script cancelled by host\n")
+        _note(err, "\nKeyboardInterrupt: script cancelled by host\n")
         return_code = 1
     except BaseException as exc:
         if exc is st.interrupt:
@@ -403,11 +440,10 @@ async def _run_script(exec_id, code, st):
                 f for f in traceback.extract_tb(exc.__traceback__)
                 if f.filename != _RUN_SCRIPT_CODE.co_filename
             ]
-            err.write("Traceback (most recent call last):\n")
-            err.write("".join(traceback.format_list(frames)))
-            err.write("KeyboardInterrupt: script interrupted by host\n")
+            _note(err, "Traceback (most recent call last):\n" + "".join(traceback.format_list(frames))
+                  + "KeyboardInterrupt: script interrupted by host\n")
         else:
-            traceback.print_exc(file=err)
+            _note(err, traceback.format_exc())
         return_code = 1
     finally:
         sys.stdout, sys.stderr, sys.stdin = old_out, old_err, old_in
@@ -425,32 +461,13 @@ async def _run_script(exec_id, code, st):
                 fut.cancel()
         _pending_wake_futures.clear()
 
-    if BACKGROUND:
-        out.flush()
-        out.close()
-        send({
-            "op": "exec_result",
-            "id": exec_id,
-            "stdout": "",
-            "stderr": "",
-            "tail": out.tail(),
-            "return_code": return_code,
-        })
-        return
-
-    stdout_text = out.getvalue()
-    if out.truncated:
-        stdout_text += "\n[stdout truncated at " + str(OUTPUT_CAP_CHARS) + " chars]"
-    stderr_text = err.getvalue()
-    if err.truncated:
-        stderr_text += "\n[stderr truncated at " + str(OUTPUT_CAP_CHARS) + " chars]"
-    send({
-        "op": "exec_result",
-        "id": exec_id,
-        "stdout": stdout_text,
-        "stderr": stderr_text,
-        "return_code": return_code,
-    })
+    # The result first, then the marks: should the result fail to go, the
+    # runtime's word on why still lands in this exec's share of stderr.
+    send({"op": "exec_result", "id": exec_id, "return_code": return_code})
+    try:
+        _end_streams(streams, mark)
+    except OSError as exc:
+        _fatal("cannot reach the output pipes any more (" + str(exc) + ")")
 
 
 def _dispatch(msg):
@@ -461,13 +478,10 @@ def _dispatch(msg):
         handle_init(msg)
     elif op == "exec":
         if _current_exec_task is not None and not _current_exec_task.done():
-            send({
-                "op": "exec_result",
-                "id": msg.get("id"),
-                "stdout": "",
-                "stderr": "RuntimeError: another script is already running in this interpreter",
-                "return_code": 1,
-            })
+            # The host runs one script at a time, so this is its mistake: a
+            # second script's output would run into the first's.
+            _diag("refused exec " + str(msg.get("id")) + ": another script is already running")
+            send({"op": "exec_result", "id": msg.get("id"), "return_code": 1})
             return True
         # Everything _on_sigint reads is in place before the script can run
         # (row 13). The task is built directly, not through the loop's task
@@ -478,7 +492,7 @@ def _dispatch(msg):
         _stop = st
         _current_exec_id = msg.get("id")
         _current_exec_task = asyncio.Task(
-            _run_script(msg.get("id"), msg.get("code") or "", st),
+            _run_script(msg.get("id"), msg.get("code") or "", msg.get("mark") or "", st),
             loop=asyncio.get_running_loop(),
         )
         st.task = _current_exec_task
@@ -498,7 +512,7 @@ async def main():
     queue = asyncio.Queue()
 
     def reader():
-        for raw_line in sys.stdin:
+        for raw_line in PROTO_IN:
             loop.call_soon_threadsafe(queue.put_nowait, raw_line)
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -525,8 +539,7 @@ async def main():
         try:
             msg = json.loads(line)
         except Exception:
-            REAL_STDERR.write("[pytc-runtime] bad protocol line\n")
-            REAL_STDERR.flush()
+            _diag("bad protocol line")
             continue
         if not _dispatch(msg):
             break
@@ -580,6 +593,7 @@ def _on_sigint(signum, frame):
 
 
 if __name__ == "__main__":
+    _start()
     # A handler of our own also keeps asyncio.run from installing one that
     # would cancel main() and end the interpreter.
     if hasattr(signal, "SIGINT"):

@@ -12,13 +12,21 @@
  * What this class guarantees is liveness: a wedged or runaway script cannot
  * hang the agent turn (cancel + SIGINT -> grace -> SIGKILL -> respawn) and a crashed
  * interpreter surfaces as a tool result, never as an unhandled rejection.
+ *
+ * The protocol runs on the interpreter's fds 3 (host -> py) and 4 (py -> host);
+ * its fd 0 is /dev/null, and the host reads its fds 1 and 2 itself (see
+ * OutputStream), so what a script and the commands it runs write to them
+ * reaches the host whatever then happens to the interpreter.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
+import type { Readable, Writable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
 
 export interface InjectedTool {
@@ -41,7 +49,7 @@ export interface ExecResult {
 
 /** Per-exec options for background (daemon) scripts. */
 export interface BackgroundExecOptions {
-  /** Absolute path for the line-buffered stdout+stderr journal (null: tail only). */
+  /** Absolute path for the stdout+stderr journal, which the runner appends to as the output arrives (null: tail only). */
   logPath: string | null;
   /**
    * Called on each wake_agent() from the script. Resolve with null to ack
@@ -60,6 +68,7 @@ export type ScriptToolCallHandler = (
 ) => Promise<string>;
 
 export interface PyRunnerOptions {
+  /** Python to spawn (default 'python3'). A wrapper must pass fds 3 and 4 on, where the protocol runs (see CodeExecutionConfig). */
   pythonPath?: string;
   /** Per-tool-call timeout surfaced as TimeoutError inside the script. */
   toolCallTimeoutMs?: number;
@@ -80,6 +89,20 @@ const DEFAULT_IDLE_RECLAIM_MS = 300_000;
 const CANCEL_GRACE_MS = 10_000;
 /** After the deadline, SIGINT is repeated at this interval until the script reports or is killed. */
 const INTERRUPT_REPEAT_MS = 200;
+/** Each of a script's stdout and stderr is kept up to this many characters in its result. */
+const OUTPUT_CAP_CHARS = 2_000_000;
+/** A background script's journal stops growing past this many bytes. */
+const LOG_FILE_CAP_BYTES = 50_000_000;
+/** How much of a background script's output its result keeps, for the envelope that tells the agent how it ended. */
+const TAIL_CHARS = 4000;
+/**
+ * How long an interpreter that exited unexpectedly gets for its last output to
+ * arrive when something still holds its output pipes open, such as a command its
+ * script left running; otherwise their end says it has all arrived.
+ */
+const EXIT_OUTPUT_GRACE_MS = 200;
+/** How much of what an interpreter wrote before it failed to start, or crashed, goes into the message and the host's log. */
+const LAST_WORDS_CHARS = 2000;
 
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
@@ -89,6 +112,197 @@ export function formatLimit(ms: number): string {
   if (ms < 120_000) return `${Math.round(ms / 1000)}s`;
   if (ms < 7_200_000) return `${Math.round(ms / 6_000) / 10} min`;
   return `${Math.round(ms / 360_000) / 10} h`;
+}
+
+/** `line` after `text`, on a line of its own: a text that doesn't end with a newline gets one first. */
+function onItsOwnLine(text: string, line: string): string {
+  return (text === '' || text.endsWith('\n') ? text : `${text}\n`) + line;
+}
+
+/**
+ * A background script's journal: the log file the agent can read with its own
+ * tools while the script runs, and the tail its result carries.
+ */
+class Journal {
+  private fd: number | null = null;
+  private written = 0;
+  private capped = false;
+  tail = '';
+
+  constructor(path: string | null, log: (text: string) => void) {
+    if (!path) return;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      this.fd = openSync(path, 'a');
+    } catch (err) {
+      log(`cannot open log file: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  write(text: string): void {
+    if (text === '') return;
+    this.tail = (this.tail + text).slice(-TAIL_CHARS);
+    if (this.fd === null || this.capped) return;
+    const bytes = Buffer.byteLength(text);
+    try {
+      if (this.written + bytes > LOG_FILE_CAP_BYTES) {
+        this.capped = true;
+        writeSync(this.fd, `\n[log capped at ${LOG_FILE_CAP_BYTES} bytes]\n`);
+      } else {
+        writeSync(this.fd, text);
+        this.written += bytes;
+      }
+    } catch {
+      // A journal that can't be written to still keeps its tail.
+    }
+  }
+
+  close(): void {
+    if (this.fd === null) return;
+    try {
+      closeSync(this.fd);
+    } catch {
+      // already gone
+    }
+    this.fd = null;
+  }
+}
+
+const NOTHING = Buffer.alloc(0);
+
+/**
+ * One of the interpreter's output pipes, its fd 1 or fd 2, as the host reads it.
+ * While an exec runs, what arrives before that exec's end mark is the exec's:
+ * kept for its result, up to OUTPUT_CAP_CHARS, or written to a background
+ * script's journal. The mark itself is cut out. What arrives while no exec runs,
+ * such as a command a script left running writes, goes to the host's log.
+ */
+class OutputStream {
+  /** Every process holding the pipe has closed it, so nothing more will come. */
+  ended = false;
+  /** The running exec's mark has arrived, so all of its output on this pipe has. */
+  marked = false;
+  /** The end of what arrived while no exec ran: an interpreter that failed to start says why here. */
+  lastIdle = '';
+  private mark: Buffer | null = null;
+  /** The end of a chunk that could be the start of a mark the next chunk completes. */
+  private carry: Buffer = NOTHING;
+  private readonly decoder = new StringDecoder('utf8');
+  private text = '';
+  private truncated = false;
+  private journal: Journal | null = null;
+  private onEnd: (() => void)[] = [];
+
+  constructor(
+    private readonly name: 'stdout' | 'stderr',
+    pipe: Readable,
+    private readonly log: (text: string) => void,
+    private readonly onMarked: () => void,
+  ) {
+    pipe.on('data', (chunk: Buffer) => this.push(chunk));
+    const ended = () => {
+      if (this.ended) return;
+      this.ended = true;
+      for (const fn of this.onEnd.splice(0)) fn();
+    };
+    pipe.on('end', ended);
+    pipe.on('close', ended);
+    pipe.on('error', (err) => {
+      log(`reading the python runtime's ${name} failed: ${err.message}`);
+      ended();
+    });
+  }
+
+  /** Begin an exec's share of the pipe, which its mark ends. */
+  begin(mark: Buffer, journal: Journal | null): void {
+    this.mark = mark;
+    this.marked = false;
+    this.journal = journal;
+    this.text = '';
+    this.truncated = false;
+  }
+
+  /** The exec's share as it stands, with a note if it was cut at the cap; what arrives next goes to the log. */
+  take(): string {
+    if (this.mark !== null) {
+      // Settled before its mark came (a kill, an abort or a crash): what arrived counts.
+      this.keep(this.carry);
+      this.carry = NOTHING;
+      this.keep(this.decoder.end());
+    }
+    const text = this.text + (this.truncated ? `\n[${this.name} truncated at ${OUTPUT_CAP_CHARS} chars]` : '');
+    this.mark = null;
+    this.journal = null;
+    this.text = '';
+    this.truncated = false;
+    return text;
+  }
+
+  /** Run fn once the pipe has ended (at once if it has). */
+  whenEnded(fn: () => void): void {
+    if (this.ended) fn();
+    else this.onEnd.push(fn);
+  }
+
+  private push(chunk: Buffer): void {
+    let bytes = this.carry.length > 0 ? Buffer.concat([this.carry, chunk]) : chunk;
+    this.carry = NOTHING;
+    if (this.mark !== null) {
+      const at = bytes.indexOf(this.mark);
+      if (at < 0) {
+        const hold = Math.min(bytes.length, this.mark.length - 1);
+        this.keep(bytes.subarray(0, bytes.length - hold));
+        this.carry = bytes.subarray(bytes.length - hold);
+        return;
+      }
+      this.keep(bytes.subarray(0, at));
+      this.keep(this.decoder.end());
+      bytes = bytes.subarray(at + this.mark.length);
+      this.mark = null;
+      this.marked = true;
+      this.onMarked();
+    }
+    if (bytes.length > 0) {
+      const text = this.decoder.write(bytes);
+      this.lastIdle = (this.lastIdle + text).slice(-LAST_WORDS_CHARS);
+      if (text.trim() !== '') this.log(`${this.name} while no script runs: ${text.trimEnd()}`);
+    }
+  }
+
+  /** Keep what arrived for the running exec. */
+  private keep(part: Buffer | string): void {
+    const text = typeof part === 'string' ? part : this.decoder.write(part);
+    if (text === '') return;
+    if (this.journal) {
+      this.journal.write(text);
+      return;
+    }
+    if (this.truncated) return;
+    const room = OUTPUT_CAP_CHARS - this.text.length;
+    if (text.length <= room) {
+      this.text += text;
+      return;
+    }
+    this.text += text.slice(0, room);
+    this.truncated = true;
+  }
+}
+
+/**
+ * Run fn once both of an exited interpreter's output pipes have ended, which
+ * says the last of what it wrote has arrived, or after EXIT_OUTPUT_GRACE_MS if
+ * something, such as a command its script left running, still holds them.
+ */
+function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, fn: () => void): void {
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    fn();
+  };
+  const timer = setTimeout(finish, EXIT_OUTPUT_GRACE_MS);
+  stdout.whenEnded(() => stderr.whenEnded(finish));
 }
 
 interface PendingExec {
@@ -105,6 +319,11 @@ interface PendingExec {
    *  waiting for the interpreter to start, and an interpreter that exits then
    *  failed to start (see exec). */
   sent: boolean;
+  /** A background exec's journal, which its output goes to instead of its result. */
+  journal: Journal | null;
+  /** The script's return code, once the interpreter has reported it; the exec
+   *  settles when its output's end marks have arrived too. */
+  returnCode: number | null;
 }
 
 export class PyRunner {
@@ -117,9 +336,17 @@ export class PyRunner {
   private readonly label: string;
 
   private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private child: ChildProcess | null = null;
   private childReady: Promise<void> | null = null;
+  /** The interpreter's fd 3, where the host's messages go. */
+  private protoIn: Writable | null = null;
+  /** Ends the interpreter whose fd 3 a message couldn't reach (see ensureChild). */
+  private unreachable: ((why: string) => void) | null = null;
+  /** Reads the interpreter's messages from its fd 4. */
   private reader: Interface | null = null;
+  /** The interpreter's stdout and stderr, as the host reads them. */
+  private out: OutputStream | null = null;
+  private err: OutputStream | null = null;
   private runtimeDir: string | null = null;
   private pending: PendingExec | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -187,6 +414,8 @@ export class PyRunner {
       settled: false,
       deadlineMs: null,
       sent: false,
+      journal: null,
+      returnCode: null,
     };
     this.pending = pending;
     try {
@@ -227,30 +456,30 @@ export class PyRunner {
       pending.interruptTimer = setInterval(() => this.interruptChild(), INTERRUPT_REPEAT_MS);
       pending.killTimer = setTimeout(() => {
         pending.deadlineMs = null; // this message already says why
-        this.settlePending({
-          stdout: '',
-          stderr:
-            `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, ` +
+        this.stopPending(
+          `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, ` +
             'so it was killed and the interpreter restarted (variables from earlier scripts are gone)',
-          returnCode: 1,
-          aborted: true,
-        });
+        );
         this.reclaim('deadline-kill');
       }, this.cancelGraceMs);
     }, deadlineMs);
     // A day-scale background deadline must not hold the process open.
     if (background) pending.deadlineTimer.unref?.();
 
+    // What the script writes, up to its mark, is this exec's: a background
+    // script's goes to its journal.
+    const mark = Buffer.from(`\x1epytc-end-${randomBytes(16).toString('hex')}\x1e`);
+    pending.journal = background ? new Journal(background.logPath, (text) => this.log(text)) : null;
+    this.out?.begin(mark, pending.journal);
+    this.err?.begin(mark, pending.journal);
     pending.sent = true;
     this.send({
       op: 'init',
       tools: tools.map((t) => ({ py_name: t.pyName, tool_name: t.toolName })),
       call_timeout_s: Math.round(this.toolCallTimeoutMs / 1000),
-      ...(background
-        ? { background: true, log_path: background.logPath ?? null }
-        : {}),
+      ...(background ? { background: true } : {}),
     });
-    this.send({ op: 'exec', id: execId, code });
+    this.send({ op: 'exec', id: execId, code, mark: mark.toString('utf8') });
 
     const result = await settled;
 
@@ -270,26 +499,14 @@ export class PyRunner {
   abort(reason: string): void {
     if (!this.pending) return;
     this.send({ op: 'cancel', id: this.pending.id, reason });
-    this.settlePending({
-      stdout: '',
-      stderr: `script aborted by host: ${reason}`,
-      returnCode: 1,
-      aborted: true,
-    });
+    this.stopPending(`script aborted by host: ${reason}`);
     this.reclaim(`abort: ${reason}`);
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    if (this.pending) {
-      this.settlePending({
-        stdout: '',
-        stderr: 'code_execution runner disposed',
-        returnCode: 1,
-        aborted: true,
-      });
-    }
+    this.stopPending('code_execution runner disposed');
     this.reclaim('dispose');
   }
 
@@ -306,32 +523,38 @@ export class PyRunner {
     writeFileSync(runtimePath, PYTHON_RUNTIME_SOURCE, 'utf8');
 
     const child = spawn(this.pythonPath, [runtimePath], {
-      stdio: ['pipe', 'pipe', 'pipe'],
+      // fd 0 is /dev/null, the host reads fds 1 and 2, and the protocol has 3 and 4.
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
     this.child = child;
+    const protoIn = child.stdio[3] as Writable;
+    const protoOut = child.stdio[4] as Readable;
+    this.protoIn = protoIn;
+    const stdout = new OutputStream('stdout', child.stdout as Readable, (text) => this.log(text), () => this.settleIfComplete(child));
+    const stderr = new OutputStream('stderr', child.stderr as Readable, (text) => this.log(text), () => this.settleIfComplete(child));
+    this.out = stdout;
+    this.err = stderr;
+    protoOut.on('error', (e) => this.log(`reading the python runtime's messages failed: ${e.message}`));
 
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
-      // Outside an exec, python stderr is runtime diagnostics (crash
-      // tracebacks etc.) — surface them in host logs.
-      console.error(`[pytc:${this.label}] ${chunk.trimEnd()}`);
-    });
-
-    // A write to an interpreter that no longer reads its input fails on the
-    // stream after write() returns; with no listener, that error is thrown as
-    // an uncaught exception. Such an interpreter can go on running, as after a
-    // script closes file descriptor 0, and every later message to it is lost:
-    // its exec would wait out its time limit. So end it, and its exit settles
-    // the exec now. One already dead or killed is left to its own exit.
+    // An interpreter that no longer reads the host's messages, as after a
+    // script closes file descriptor 3, could go on running, and every later
+    // message to it is lost: its exec would wait out its time limit. So the
+    // first message that can't reach it ends it, and its exit settles the exec
+    // now. Such a write fails after write() returns: the pipe refuses it, or
+    // has already ended, its far end closed. Its error, which with no listener
+    // would be thrown as an uncaught exception, is heard here too. One already
+    // dead or killed is left to its own exit.
     let inputFailed = false;
-    child.stdin.on('error', (err) => {
-      console.error(`[pytc:${this.label}] write to the python runtime failed: ${err.message}`);
+    const unreachable = (why: string) => {
+      this.log(`write to the python runtime failed: ${why}`);
       if (child.exitCode === null && !child.killed && child.pid !== undefined) {
         inputFailed = true;
         child.kill('SIGKILL');
       }
-    });
+    };
+    this.unreachable = unreachable;
+    protoIn.on('error', (e) => unreachable(e.message));
 
     child.on('error', (err) => {
       // Spawn failure lands here (e.g. python3 missing); readiness rejects.
@@ -341,51 +564,58 @@ export class PyRunner {
     child.on('exit', (exitCode, signal) => {
       // An exec still waiting for the interpreter is settled by exec, as a
       // runtime that failed to start.
-      if (this.pending?.sent) {
-        this.settlePending({
-          stdout: '',
-          stderr:
-            inputFailed && signal === 'SIGKILL'
-              ? 'python runtime stopped reading its input, so it was killed and the interpreter restarted ' +
-                '(variables from earlier scripts are gone). A script that closes its standard input ' +
-                '(file descriptor 0) does this.'
-              : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`,
-          returnCode: 1,
-          aborted: true,
-        });
+      const pending = this.pending;
+      if (!pending?.sent) {
+        if (this.child === child) this.teardownChild();
+        return;
       }
-      if (this.child === child) {
-        this.teardownChild();
-      }
+      const why =
+        inputFailed && signal === 'SIGKILL'
+          ? "python runtime stopped reading the host's messages, so it was killed and the interpreter restarted " +
+            '(variables from earlier scripts are gone). A script that closes file descriptor 3, where they ' +
+            'arrive, does this.'
+          : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`;
+      // What it wrote last, such as a fatal error's own text, is already on its
+      // way through its output pipes: settle once they've ended, or after a
+      // short grace while a command it started still holds them.
+      afterOutputEnds(stdout, stderr, () => {
+        if (this.pending === pending) {
+          const last = this.stopPending(why).trim();
+          this.log(last ? `${why}; the last it wrote: ${last.slice(-LAST_WORDS_CHARS)}` : why);
+        }
+        if (this.child === child) this.teardownChild();
+      });
     });
 
-    this.reader = createInterface({ input: child.stdout });
+    this.reader = createInterface({ input: protoOut });
     this.reader.on('line', (line) => this.handleLine(line, child));
 
     this.childReady = new Promise<void>((resolve, reject) => {
-      const onReady = () => {
-        cleanup();
-        resolve();
-      };
-      const onExit = () => {
-        cleanup();
-        reject(new Error('python runtime exited before becoming ready'));
-      };
-      const onError = (err: Error) => {
-        cleanup();
-        reject(err);
-      };
-      const timeout = setTimeout(() => {
-        cleanup();
-        reject(new Error('python runtime did not become ready within 15s'));
-      }, 15_000);
-      const cleanup = () => {
+      let over = false;
+      const finish = (outcome: () => void) => {
+        if (over) return;
+        over = true;
         clearTimeout(timeout);
-        this.readyResolver = null;
-        this.readyFailer = null;
+        // Another interpreter may have started since this one exited.
+        if (this.readyResolver === onReady) this.readyResolver = null;
+        if (this.readyFailer === onError) this.readyFailer = null;
         child.off('exit', onExit);
         child.off('error', onError);
+        outcome();
       };
+      const onReady = () => finish(resolve);
+      const onExit = () => {
+        // Why it ended, such as a traceback, is on its way through its stderr.
+        afterOutputEnds(stdout, stderr, () => {
+          const said = stderr.lastIdle.trim();
+          finish(() => reject(new Error(`python runtime exited before becoming ready${said ? `, saying: ${said}` : ''}`)));
+        });
+      };
+      const onError = (e: Error) => finish(() => reject(e));
+      const timeout = setTimeout(
+        () => finish(() => reject(new Error('python runtime did not become ready within 15s'))),
+        15_000,
+      );
       this.readyResolver = onReady;
       this.readyFailer = onError;
       child.on('exit', onExit);
@@ -394,16 +624,20 @@ export class PyRunner {
     return this.childReady;
   }
 
+  private log(text: string): void {
+    console.error(`[pytc:${this.label}] ${text}`);
+  }
+
   private readyResolver: (() => void) | null = null;
   /** Fails the readiness of an interpreter that is still starting (see reclaim). */
   private readyFailer: ((err: Error) => void) | null = null;
 
-  private handleLine(line: string, child: ChildProcessWithoutNullStreams): void {
-    let msg: { op?: string; id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
+  private handleLine(line: string, child: ChildProcess): void {
+    let msg: { op?: string; id?: string; name?: string; args?: unknown; return_code?: number };
     try {
       msg = JSON.parse(line);
     } catch {
-      console.error(`[pytc:${this.label}] non-protocol stdout line: ${line.slice(0, 200)}`);
+      this.log(`non-protocol line from the python runtime: ${line.slice(0, 200)}`);
       return;
     }
 
@@ -447,22 +681,56 @@ export class PyRunner {
       }
 
       case 'exec_result': {
-        if (this.pending && msg.id === this.pending.id) {
-          this.settlePending({
-            stdout: msg.stdout ?? '',
-            stderr: msg.stderr ?? '',
-            returnCode: typeof msg.return_code === 'number' ? msg.return_code : 1,
-            ...(typeof (msg as { tail?: unknown }).tail === 'string'
-              ? { tail: (msg as { tail: string }).tail }
-              : {}),
-          });
+        const pending = this.pending;
+        if (pending && msg.id === pending.id && pending.returnCode === null) {
+          pending.returnCode = typeof msg.return_code === 'number' ? msg.return_code : 1;
+          this.settleIfComplete(child);
         }
         return;
       }
 
       default:
-        console.error(`[pytc:${this.label}] unknown protocol op: ${String(msg.op)}`);
+        this.log(`unknown protocol op: ${String(msg.op)}`);
     }
+  }
+
+  /**
+   * Settle the running exec once its script has reported and the end marks
+   * of both its output pipes have arrived, which says all of its output has.
+   */
+  private settleIfComplete(child: ChildProcess): void {
+    const pending = this.pending;
+    if (child !== this.child || !pending || pending.returnCode === null) return;
+    if (!this.out?.marked || !this.err?.marked) return;
+    const stdout = this.out.take();
+    const stderr = this.err.take();
+    const journal = pending.journal;
+    if (journal) {
+      journal.close();
+      this.settlePending({ stdout: '', stderr: '', returnCode: pending.returnCode, tail: journal.tail });
+    } else {
+      this.settlePending({ stdout, stderr, returnCode: pending.returnCode });
+    }
+  }
+
+  /**
+   * Settle the running exec now: what its script wrote so far, then `why` it
+   * stopped, on a line of its own. Returns what the script wrote to stderr (a
+   * background script's tail), for the host's log.
+   */
+  private stopPending(why: string): string {
+    const pending = this.pending;
+    if (!pending || pending.settled) return '';
+    const stdout = this.out?.take() ?? '';
+    const stderr = this.err?.take() ?? '';
+    const journal = pending.journal;
+    if (journal) {
+      journal.close();
+      this.settlePending({ stdout: '', stderr: why, returnCode: 1, aborted: true, tail: onItsOwnLine(journal.tail, why) });
+      return journal.tail;
+    }
+    this.settlePending({ stdout, stderr: onItsOwnLine(stderr, why), returnCode: 1, aborted: true });
+    return stderr;
   }
 
   private settlePending(result: ExecResult): void {
@@ -474,8 +742,9 @@ export class PyRunner {
     // and finished its work returns 0, and must not read as stopped.
     if (pending.deadlineMs !== null && result.returnCode !== 0) {
       const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
-      // On a line of its own: the runner's own texts, such as an interpreter's exit, end without a newline.
-      const withNote = (text: string) => (text === '' || text.endsWith('\n') ? text : `${text}\n`) + note;
+      // On a line of its own: a script's output, and the runner's own texts, such as an
+      // interpreter's exit, can end without a newline.
+      const withNote = (text: string) => onItsOwnLine(text, note);
       // A background script reports its output tail, so the note goes there too.
       result = { ...result, stderr: withNote(result.stderr), ...(result.tail !== undefined ? { tail: withNote(result.tail) } : {}) };
     }
@@ -492,9 +761,9 @@ export class PyRunner {
    * aborted, killed or crashed, or the interpreter reclaimed) would resolve
    * the same id in the one that replaced it, inside another script: drop it.
    */
-  private reply(child: ChildProcessWithoutNullStreams, msg: unknown, what: string): void {
+  private reply(child: ChildProcess, msg: unknown, what: string): void {
     if (child !== this.child) {
-      console.error(`[pytc:${this.label}] dropped late ${what}: the interpreter that asked for it is gone`);
+      this.log(`dropped late ${what}: the interpreter that asked for it is gone`);
       return;
     }
     this.send(msg);
@@ -502,13 +771,15 @@ export class PyRunner {
 
   private send(obj: unknown): void {
     const child = this.child;
-    if (!child || child.exitCode !== null || child.killed) return;
+    const input = this.protoIn;
+    const unreachable = this.unreachable;
+    if (!child || !input || child.exitCode !== null || child.killed) return;
     try {
-      child.stdin.write(JSON.stringify(obj) + '\n');
+      input.write(JSON.stringify(obj) + '\n', (err) => {
+        if (err) unreachable?.(err.message);
+      });
     } catch (err) {
-      console.error(
-        `[pytc:${this.label}] protocol write failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      this.log(`protocol write failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -534,7 +805,7 @@ export class PyRunner {
   /** Kill interpreter + clean temp dir. State is lost (by design). */
   private reclaim(reason: string): void {
     if (this.child) {
-      console.error(`[pytc:${this.label}] reclaiming python interpreter (${reason})`);
+      this.log(`reclaiming python interpreter (${reason})`);
     }
     // An interpreter killed as it starts never says it's ready: fail its
     // readiness now, so an exec waiting on it returns at once rather than at
@@ -553,13 +824,21 @@ export class PyRunner {
     }
     if (this.child) {
       const child = this.child;
+      const input = this.protoIn;
       this.child = null;
       this.childReady = null;
       this.readyResolver = null;
       this.readyFailer = null;
+      this.protoIn = null;
+      this.unreachable = null;
+      // Its output pipes stay read, into the host's log, until whatever still
+      // holds them, such as a command its script left running, closes them:
+      // breaking them under such a command could end it.
+      this.out = null;
+      this.err = null;
       child.removeAllListeners('exit');
       try {
-        child.stdin.end();
+        input?.end();
       } catch {
         // stream may already be destroyed
       }
