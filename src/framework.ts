@@ -506,11 +506,12 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
 /** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
  *  (empty when addMessage deferred it again; a sharded body's first shard)
- *  and the content to carry for it: as given, or for a sharded body, its
- *  shards joined as later compiles render them. For an entry whose write
- *  threw after storing it, found in the store and counted as written, it is
- *  what landed, joined the same way, which for a sharded body can be its
- *  first shards alone. */
+ *  and the content to carry for it: as given, or for a sharded body read
+ *  back from its store, its shards joined as later compiles render them.
+ *  For an entry whose write threw after storing it, found in the store and
+ *  counted as written, it is what landed, joined the same way, which for a
+ *  sharded body can be its first shards alone. A store that can't be read
+ *  back (storedCopiesOf logs it) leaves a sharded body as given. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
@@ -3083,10 +3084,9 @@ export class AgentFramework {
     // queued with what follows it for its target, and a memory-only queue
     // still loses it at exit. What is queued for an agent leaves with it
     // (dropDeferredFor), so an entry for a target no longer registered is one
-    // queued after its agent left, or restored at a boot that doesn't
-    // register its agent. It is left: dropped with a memory-only queue at
-    // exit, and logged and dropped from a persisted one by the boot or resume
-    // flush that meets it.
+    // restored at a boot that doesn't register its agent. It is left in the
+    // persisted queue it came from, and the boot or resume flush that meets
+    // it logs and drops it.
     if (this.deferredMessages.length > 0) {
       const entries = [...this.agents.keys()].flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
@@ -9369,9 +9369,10 @@ export class AgentFramework {
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
             // stored is injected (the round's results go on either way). A
-            // sharded body is injected as later compiles render it, its shards
-            // joined, and a write that threw after storing, which counts as
-            // stored, as what landed of it (writeDrainedInOrder).
+            // sharded body read back from its store is injected as later
+            // compiles render it, its shards joined, and a write that threw
+            // after storing, which counts as stored, as what landed of it
+            // (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -16210,16 +16211,20 @@ export class AgentFramework {
    * of the body isn't stored. (Requeued, the
    * landed shards would be stored twice, and only the rest could not be
    * appended later without splitting the body.) Boot's scan for landed
-   * writes counts a landed shard the same way.
+   * writes counts a landed shard the same way. When the store can't be read
+   * back (storedCopiesOf logs it), nothing is found, and the entry is put
+   * back as one that couldn't be stored: if it had landed, a later flush
+   * stores it again.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
    * entries. Each comes with its content: as given, unless the store took it
-   * as more than one message (a sharded body), whose copies are returned
-   * joined, as later compiles render them (asCompiled), or its write threw
-   * after storing it (above). `onLanded` hears an entry whose write threw
-   * after storing it, with the id it landed under, as soon as it's found:
-   * before the writes after it, so whatever it records keeps their order.
+   * as more than one message (a sharded body) and can be read back, when its
+   * copies are returned joined, as later compiles render them (asCompiled),
+   * or its write threw after storing it (above). `onLanded` hears an entry
+   * whose write threw after storing it, with the id it landed under, as soon
+   * as it's found: before the writes after it, so whatever it records keeps
+   * their order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
