@@ -2498,6 +2498,9 @@ export class WorkspaceModule implements Module {
     };
 
     for (const { mount, relativePath } of mountsToSearch) {
+      // Built before the pass, as glob builds its own, so a pattern globToRegex
+      // refuses is refused before any mount is searched.
+      const fileGlobs = input.glob ? mountGlobs(input.glob, mount.config.name) : null;
       await this.withMount(mount, async () => {
         // A `path` naming a single file greps just that file; otherwise it is a
         // directory prefix. (A file path once produced the prefix "notes.md/"
@@ -2530,7 +2533,6 @@ export class WorkspaceModule implements Module {
         }
 
         const intents = this.intents.get(mount.config.name)!;
-        const fileGlobs = input.glob ? mountGlobs(input.glob, mount.config.name) : null;
         for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
           if (fileGlobs && !fileGlobs.relative.test(report.path) && fileGlobs.prefixed?.test(report.path) !== true) continue;
           const file = `${mount.config.name}/${report.path}`;
