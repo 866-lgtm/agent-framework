@@ -305,7 +305,9 @@ export const MAX_KEPT_IMAGE_SLOTS = DEFAULT_TOOL_IMAGE_LEDGER_MAX_ENTRIES;
 
 /** The ranges `[start, end)` of a tool result's text that its live copy
  *  showed beside its images: each text block up to where the live copy cut it
- *  at the inline cap (toolResultCutAt), and every other block whole. */
+ *  at the inline cap (toolResultCutAt), and every other block whole. They
+ *  come in text order and never overlap, as the blocks do, and
+ *  cutStoredToolResult relies on that. */
 export type ShownRanges = ReadonlyArray<readonly [number, number]>;
 
 /** A tool result's stored copy, cut at its inline cap. */
@@ -376,8 +378,17 @@ export function cutStoredToolResult(text: string, cap: number, shown: ShownRange
   const cutAt = toolResultCutAt(text, cap);
   const head = text.slice(0, cutAt);
   if (shown === null) return { head, kept: [], fell: 0 };
-  const past = parseImagePlaceholders(text).filter((slot) => slot.offset >= cutAt
-    && shown.some(([start, end]) => slot.offset >= start && slot.offset + slot.text.length <= end));
+  // The slots and the ranges both come in text order, so one pass walks
+  // them together: a range that ends where a slot starts, or before, holds
+  // no later slot either.
+  const past: ParsedImagePlaceholder[] = [];
+  let r = 0;
+  for (const slot of parseImagePlaceholders(text)) {
+    if (slot.offset < cutAt) continue;
+    while (r < shown.length && shown[r]![1] <= slot.offset) r++;
+    const range = shown[r];
+    if (range && slot.offset >= range[0] && slot.offset + slot.text.length <= range[1]) past.push(slot);
+  }
   return { head, kept: past.slice(-MAX_KEPT_IMAGE_SLOTS).map((slot) => slot.text), fell: past.length };
 }
 

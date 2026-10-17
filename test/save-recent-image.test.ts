@@ -1446,6 +1446,18 @@ describe('ToolImageLedger', () => {
       cutStoredToolResult(text, cut1, [[0, text.indexOf('1.2MB')], [text.indexOf(gif), text.length]]),
       { head: text.slice(0, cut1), kept: [gif], fell: 1 },
     );
+    // A slot wholly between two ranges, before one inside the second: the
+    // walk passes the gap without passing the range after it.
+    assert.deepStrictEqual(
+      cutStoredToolResult(text, cut1, [[0, text.indexOf(stub)], [text.indexOf('tail'), text.length]]),
+      { head: text.slice(0, cut1), kept: [gif], fell: 1 },
+    );
+    // Ranges that touch, with a slot starting where the first ends: the
+    // second holds it.
+    assert.deepStrictEqual(
+      cutStoredToolResult(text, cut1, [[0, text.indexOf(gif)], [text.indexOf(gif), text.length]]),
+      { head: text.slice(0, cut1), kept: [stub, gif], fell: 2 },
+    );
     // Every reader of the generic history truncation reads it as text: it
     // cuts as the stored copy cuts, and keeps nothing past the cut.
     assert.strictEqual(truncateForHistory(text, cut1), `${text.slice(0, cut1)}\n\n[truncated — original was ${text.length} chars]`);
