@@ -11,6 +11,7 @@ import { InferenceRouter } from '../src/mcpl/inference-router.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import { createMockResponse } from './helpers/mock-membrane.js';
 
 function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) {
   const traces: any[] = [];
@@ -177,15 +178,9 @@ test('inference responders retain request IDs and successful handling stays sync
 test('a real inference handler whose result write throws answers with its own error, its only reply, and the failed write is reported', async () => {
   const { framework, connection, traces } = harness();
   framework.inferenceRouter = new InferenceRouter(
-    {
-      async complete() {
-        return {
-          content: [{ type: 'text', text: 'done' }],
-          stopReason: 'end_turn',
-          usage: { inputTokens: 1, outputTokens: 1 },
-        };
-      },
-    } as never,
+    // The shared helper's response, so a change that has the router read more
+    // of a response gives this test that field along with every other test.
+    { async complete() { return createMockResponse([{ type: 'text', text: 'done' }]); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
     null,
