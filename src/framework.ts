@@ -2041,6 +2041,10 @@ export class AgentFramework {
    *  nothing, since that one listed every server after it. */
   private mcplToolsRefreshStarted = 0;
   private mcplToolsRefreshPublished = 0;
+  /** How many times each server's connection has closed. A listing that
+   *  began before its server's latest close is of a session that's over,
+   *  and refreshMcplTools publishes none of it. */
+  private mcplServerCloses: Map<string, number> = new Map();
   /** Zero-match tool-pattern diagnostics (checkToolPatterns): set at the end
    *  of create(), when the tool universe is first complete. */
   private toolPatternChecksArmed = false;
@@ -15292,6 +15296,13 @@ export class AgentFramework {
     this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
   }
 
+  /** Count one server's close (see mcplServerCloses). Partially-constructed
+   *  frameworks (tests build them with Object.create) have no map yet. */
+  private noteMcplServerClosed(serverId: string): void {
+    this.mcplServerCloses ??= new Map();
+    this.mcplServerCloses.set(serverId, (this.mcplServerCloses.get(serverId) ?? 0) + 1);
+  }
+
   /** Forget one server's RFC-008 class declarations (see the close handler). */
   private dropMcplToolClasses(serverId: string): void {
     // Tolerate partially-constructed frameworks (tests build them with
@@ -18569,7 +18580,10 @@ export class AgentFramework {
       this.featureSetManager?.removeServer(connection.id);
       // RFC-008: a closed provider's class hints are stale — on reconnect it
       // may class its tools differently. Until the next tools/list its tools
-      // are unclassed, the restrictive answer (RFC-007 §4.3).
+      // are unclassed, the restrictive answer (RFC-007 §4.3). A listing
+      // already under way is of the closed session, so it doesn't count as
+      // that next one (see refreshMcplTools).
+      this.noteMcplServerClosed(connection.id);
       this.dropMcplToolClasses(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
@@ -18629,7 +18643,9 @@ export class AgentFramework {
       this.emitTrace({ type: 'mcpl:server-error', serverId: connection.id, error: recorded(err.message) });
     });
     connection.on('close', () => {
-      // A closed provider's class hints are stale (RFC-008), as for MCPL.
+      // A closed provider's class hints are stale (RFC-008), as for MCPL,
+      // and so is a listing already under way.
+      this.noteMcplServerClosed(connection.id);
       this.dropMcplToolClasses(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
@@ -18675,10 +18691,14 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
+    const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
+    // Each server's close count as its listing began.
+    const closesAtListing = new Map<string, number>();
 
     for (const server of [...this.mcplServerRegistry.getAllServers()]) {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
+      closesAtListing.set(server.id, closesOf(server.id));
       try {
         const result = await server.sendToolsList();
         listedServers.add(server.id);
@@ -18729,6 +18749,7 @@ export class AgentFramework {
       if (!server.isConnected) continue;
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
+      closesAtListing.set(server.id, closesOf(server.id));
       try {
         const listed = await server.listTools();
         listedServers.add(server.id);
@@ -18757,6 +18778,27 @@ export class AgentFramework {
       }
     }
 
+    // A listing counts only while the session it came from is still its
+    // server's live one. A server removed while this refresh awaited its
+    // lists (a disconnect, or a server lost for good) contributes nothing,
+    // so whichever refresh finishes last can't bring back its tools. Nor
+    // does one whose connection closed after its listing began: the close
+    // forgot its class hints as stale (RFC-008), and its reconnect lists the
+    // new session. Asked of the same listing the refresh began from, now.
+    const live = new Set<string>([
+      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => server.id),
+      ...this.modernServers().keys(),
+    ]);
+    const over = new Set([...listedServers].filter((serverId) => !live.has(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
+    if (over.size > 0) {
+      for (const [name, serverId] of [...toolServers]) {
+        if (!over.has(serverId)) continue;
+        toolServers.delete(name);
+        toolFeatureSets.delete(name);
+        toolClasses.delete(name);
+      }
+      for (const serverId of over) listedServers.delete(serverId);
+    }
     // A refresh started after this one has published already: it listed
     // every server after this one did, a server replaced by a restart under
     // the same id included, so this one's listings are older. A server this
@@ -18768,26 +18810,8 @@ export class AgentFramework {
       if (unlisted !== undefined) this.handleToolsListChanged(unlisted);
       return;
     }
-    // A server removed while this refresh awaited its lists (a disconnect,
-    // or a server lost for good) publishes nothing: whichever refresh
-    // finishes last must not bring back a removed server's tools.
-    // Asked of the same listing the refresh began from, now.
-    const live = new Set<string>([
-      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => server.id),
-      ...this.modernServers().keys(),
-    ]);
-    const gone = new Set([...new Set(toolServers.values())].filter((serverId) => !live.has(serverId)));
-    if (gone.size > 0) {
-      for (const [name, serverId] of [...toolServers]) {
-        if (!gone.has(serverId)) continue;
-        toolServers.delete(name);
-        toolFeatureSets.delete(name);
-        toolClasses.delete(name);
-      }
-      for (const serverId of gone) listedServers.delete(serverId);
-    }
     this.mcplToolsRefreshPublished = generation;
-    this.mcplTools = gone.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
+    this.mcplTools = over.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;

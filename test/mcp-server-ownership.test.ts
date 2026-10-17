@@ -551,6 +551,46 @@ test('a server whose listing a later refresh failed is listed again when the ear
   });
 });
 
+for (const engine of ['legacy', 'modern'] as const) {
+  test(`${engine}: a listing begun before its server's session closed doesn't bring back the class hints the close dropped`, async () => {
+    await withFramework(async ({ framework, dir }) => {
+      const base = engine === 'legacy' ? legacy('s', 'ok', join(dir, 'legacy.log')) : modern('s', '', join(dir, 'raw.jsonl'));
+      // It reconnects, but not before the test is over.
+      await framework.connectMcplServer({ ...base, reconnect: true, reconnectIntervalMs: 60_000, reconnectMaxIntervalMs: 60_000 });
+      type Tool = { name: string; _meta?: Record<string, unknown> };
+      type Server = { on(event: 'close', listener: () => void): void; sendToolsList(): Promise<{ tools: Tool[] }>; listTools(): Promise<Tool[]> };
+      const internals = framework as unknown as {
+        mcplServerRegistry: { getServer(id: string): Server };
+        modernServers(): Map<string, Server>;
+        refreshMcplTools(): Promise<void>;
+      };
+      const server = engine === 'legacy' ? internals.mcplServerRegistry.getServer('s') : internals.modernServers().get('s')!;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let held = false;
+      // The session about to close declares its tools `files`.
+      const classed = (tools: Tool[]): Tool[] => tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, 'mcpl/class': ['files'] } }));
+      if (engine === 'legacy') {
+        const real = server.sendToolsList.bind(server);
+        server.sendToolsList = async () => { const result = await real(); held = true; await gate; return { ...result, tools: classed(result.tools) }; };
+      } else {
+        const real = server.listTools.bind(server);
+        server.listTools = async () => { const tools = classed(await real()); held = true; await gate; return tools; };
+      }
+      const refreshing = internals.refreshMcplTools();
+      await until(() => held, 'the refresh holds its listing');
+      let closed = false;
+      server.on('close', () => { closed = true; });
+      await framework.executeToolCall(call('mcpl--s--die')).catch(() => {});
+      await until(() => closed, 'the session closes, and the server waits to reconnect');
+      release();
+      await refreshing;
+      const kept = framework.listToolClasses().filter((tool) => tool.serverId === 's' && tool.class.includes('files'));
+      assert.deepEqual(kept, [], "no tool keeps the closed session's class");
+    });
+  });
+}
+
 test('a server lost for good, legacy or modern, leaves the tool list', async () => {
   await withFramework(async ({ framework, dir }) => {
     await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
