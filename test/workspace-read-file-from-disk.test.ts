@@ -17,7 +17,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -114,6 +114,23 @@ test('readBinaryFromDisk answers a file, a missing file, a directory and a file 
   assert.deepEqual(await workspace.readBinaryFromDisk('work/dir'), { error: 'Not a file: work/dir' });
   assert.deepEqual(await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 3 }), { error: 'File too large: 4 > 3 bytes' });
   assert.ok('data' in (await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 4 })), 'a file of exactly maxBytes is read');
+});
+
+test("readBinaryFromDisk says a file it can't read is unreadable, whatever its size", async (t) => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    t.skip('file modes don\'t keep this user out');
+    return;
+  }
+  const { mountDir, workspace } = setup(t);
+  writeFileSync(join(mountDir, 'locked.bin'), Buffer.alloc(8));
+  chmodSync(join(mountDir, 'locked.bin'), 0o000);
+  try {
+    for (const opts of [{}, { maxBytes: 4 }]) {
+      assert.deepEqual(await workspace.readBinaryFromDisk('work/locked.bin', opts), { error: 'Unable to read file: work/locked.bin' }, JSON.stringify(opts));
+    }
+  } finally {
+    chmodSync(join(mountDir, 'locked.bin'), 0o600);
+  }
 });
 
 test('a FIFO is refused at once by each disk reader, without waiting for a writer', async (t) => {
