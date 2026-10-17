@@ -6523,13 +6523,14 @@ export class AgentFramework {
         // is deregistered, a flush finds no agent to take it and drops it.
         // The run's namespace stays in the store for investigation, so the
         // messages stay with it. A quiesced host defers them again instead,
-        // as stop() does, and with the run gone, the flush that meets them
-        // later drops them.
+        // as stop() does. What is still queued then, deferred again or put
+        // back because its store threw, leaves with the run, logged as lost.
         const queued = this.drainDeferredFor(agent.name);
         if (queued.length > 0) {
           this.readdDrained(queued, `end of ephemeral run ${agent.name}`, { bypassDeferral: !this.quiesced });
           this.ackDeferredWrites();
         }
+        this.dropDeferredFor(agent.name, `end of ephemeral run ${agent.name}`);
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched.
@@ -10134,9 +10135,13 @@ export class AgentFramework {
    * Remove a closed conversation fork from the framework: its closure turn
    * has finished, so the home mapping has served its purpose and keeping the
    * agent registered would just grow every agent scan and broadcast filter
-   * forever. The fork's context stays in Chronicle for investigation.
+   * forever. The fork's context stays in Chronicle for investigation. What
+   * is still queued for it leaves with it, logged as lost (dropDeferredFor).
+   * When the end of its closure turn disposes it, that turn's flush has
+   * already stored what it could.
    */
   private disposeConversationAgent(agentName: string): void {
+    this.dropDeferredFor(agentName, `disposal of conversation fork ${agentName}`);
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
@@ -16100,6 +16105,29 @@ export class AgentFramework {
     // acknowledge before the write is durable.
     this.handOffDeferredWrites(drained);
     return drained;
+  }
+
+  /**
+   * An agent that leaves the framework takes what is still queued for it out
+   * of the queue, each entry logged as lost. Once the agent is gone, a flush
+   * that meets such an entry drops it as addressed to no registered agent, so
+   * kept, the entry would only wait for that, written to the recovery file
+   * meanwhile when the queue is persisted. Called where an agent leaves: an
+   * ephemeral run's deregistration and a conversation fork's disposal. What
+   * its store has already taken, waiting for its ack, isn't queued, and stays
+   * for the ack.
+   */
+  private dropDeferredFor(agentName: string, where: string): void {
+    const lost = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName);
+    if (lost.length === 0) return;
+    this.deferredMessages = this.deferredMessages.filter((msg) => !lost.includes(msg));
+    for (const msg of lost.sort(bySeq)) {
+      console.error(
+        `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ${agentName} is lost: ` +
+        `its agent has left the framework, so nothing will store it`,
+      );
+    }
+    if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
   }
 
   /**

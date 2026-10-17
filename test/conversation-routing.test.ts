@@ -664,6 +664,53 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it("a write deferred for a fork that its store refuses at the closure turn's end leaves the queue with the fork, logged as lost", async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D5', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const g1 = framework.getAgent('conversation-slack-D5-g1')!;
+    assert.ok(g1, 'g1 fork should exist after spawn');
+    // The fork's store refuses 'one more thing' each time it's written.
+    const cm = g1.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+      if ((args[1] as Array<{ text?: string }>).some((b) => b.text === 'one more thing')) throw new Error('disk full');
+      return add(...args);
+    };
+
+    forceExpiry(framework, 'slack:D5', IDLE_TTL_MS);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+      deferredMessages: Array<{ forAgent?: string }>;
+    };
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    let deferred: string | undefined;
+    membrane.streamYielding = (request, options) => {
+      deferred = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
+        { forAgent: 'conversation-slack-D5-g1' });
+      return streamYielding(request, options);
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    } finally { console.error = error; }
+
+    assert.equal(deferred, '', 'deferred: the closure turn was alive');
+    assert.equal(framework.getAgent('conversation-slack-D5-g1'), null, 'disposed once its closure turn finished');
+    assert.deepEqual(internals.deferredMessages.filter((m) => m.forAgent === 'conversation-slack-D5-g1'), [],
+      'nothing is left queued for the fork');
+    assert.ok(errors.some((e) => e.includes('disposal of conversation fork conversation-slack-D5-g1: deferred write ')
+      && e.includes('(alice: text) for conversation-slack-D5-g1 is lost: its agent has left the framework')), errors.join('\n'));
+
+    await framework.stop();
+  });
+
   it('a closure turn that restarts is disposed by the frame that ends it, after storing what was held for it', async () => {
     const IDLE_TTL_MS = 60_000;
     // One tool, for the closure turn's tool round.
