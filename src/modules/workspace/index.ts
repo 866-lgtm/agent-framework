@@ -51,6 +51,7 @@ import {
   type Scope,
   type TreeOp,
   WALK_CAP,
+  entryMode,
   pushPaths,
   reconcilePass,
   settleAdoptionBeforeMutation,
@@ -665,6 +666,12 @@ export class WorkspaceModule implements Module {
   /** Whether a mount root's filesystem maintains ctime, by canonical root. */
   /** Per canonical root: the device of its filesystem when that maintains ctime, else null. */
   private ctimeTrust = new Map<string, string | null>();
+  /**
+   * Whether a file's mode is observed, taken in and applied (MountRuntime's
+   * `modesObserved`): not on Windows, which reports no POSIX modes. A test
+   * sets it false to run that case anywhere.
+   */
+  private modesObserved = process.platform !== 'win32';
   /** Persisted state decoded in start(), held until mounts exist to apply it
    *  to — in the Host ordering start() runs before initStore() creates the
    *  mounts, so restoration must be second-callback-safe like watcher
@@ -755,7 +762,7 @@ export class WorkspaceModule implements Module {
 
     // What disk last agreed with, per mount and path: global records, so a
     // branch switch never rewinds it.
-    this.agreement = new DiskAgreement(store);
+    this.agreement = new DiskAgreement(store, { modesObserved: () => this.modesObserved });
     this.agreement.open(this.config.mounts.map((m) => ({ name: m.name, root: resolve(m.path) })));
 
     this.applySavedState();
@@ -812,6 +819,7 @@ export class WorkspaceModule implements Module {
       readOnly: mount.config.mode === 'read-only',
       walkCap: mount.config.walkCap ?? WALK_CAP,
       catchUpScan: (mount.config.watch ?? 'always') === 'always',
+      modesObserved: this.modesObserved,
     };
   }
 
@@ -1512,13 +1520,17 @@ export class WorkspaceModule implements Module {
         return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
       }
       const blobHash = store.storeBlob(data, mimeType);
+      // An overwrite keeps the file's mode, as the write tool's does.
+      const existing = store.treeGet(mount.treeStateId, relativePath);
       let committed = false;
       let failure: string | null;
+      let modeKept: string | null = null;
       try {
-        const materializeError = await this.commitToolChange(mount, relativePath,
-          { kind: 'set', blobHash, size: data.byteLength }, () => { committed = true; });
-        failure = materializeError === null ? null
-          : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`;
+        const answer = await this.commitToolChange(mount, relativePath,
+          { kind: 'set', blobHash, size: data.byteLength, ...(existing ? { mode: existing.mode } : {}) }, () => { committed = true; });
+        modeKept = answer.modeKept;
+        failure = answer.refused === null ? null
+          : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${answer.refused}.`;
       } catch (error) {
         if (!committed) throw error;
         failure = `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
@@ -1531,7 +1543,7 @@ export class WorkspaceModule implements Module {
       }
       return {
         success: true,
-        data: { path: mountPrefixedPath, size: data.byteLength, mimeType },
+        data: { path: mountPrefixedPath, size: data.byteLength, mimeType, ...(modeKept ? { modeKept } : {}) },
       };
     });
   }
@@ -1960,9 +1972,11 @@ export class WorkspaceModule implements Module {
    * The push follows materialize's rule: a disk copy that changed since it
    * last agreed is not overwritten or unlinked, and the refusal says why.
    *
-   * Returns the reason when the change reached the workspace but not disk, so
-   * callers surface it in the tool result: the autoMaterialize contract is
-   * that disk is the source of truth for downstream agents. The caller holds
+   * Answers, so callers surface them in the tool result, the reason when the
+   * change reached the workspace but not disk (`refused`): the
+   * autoMaterialize contract is that disk is the source of truth for
+   * downstream agents. And, apart from it, why a write whose bytes reached
+   * disk left the file's mode as disk had it (`modeKept`). The caller holds
    * the mount's turn and has settled the path first (settleBeforeMutation).
    */
   private async commitToolChange(
@@ -1970,7 +1984,7 @@ export class WorkspaceModule implements Module {
     relativePath: string,
     change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
     onCommitted?: () => void,
-  ): Promise<string | null> {
+  ): Promise<{ refused: string | null; modeKept: string | null }> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
     // The mutation's precondition, enforced here, synchronously with the
@@ -2000,14 +2014,14 @@ export class WorkspaceModule implements Module {
         return next;
       });
     }
-    if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return null;
+    if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return { refused: null, modeKept: null };
 
     const pushed = await this.pushUnlocked(mount, [relativePath], {
       applyDeletions: change.kind === 'remove',
       branchId: store.currentBranch().id,
     });
     const refused = pushed.skipped.find((s) => s.path === relativePath);
-    if (!refused) return null;
+    if (!refused) return { refused: null, modeKept: pushed.modesKept.find((k) => k.path === relativePath)?.reason ?? null };
     this.ctx?.pushEvent({
       type: 'workspace:materialize-failed',
       mount: mount.config.name,
@@ -2015,7 +2029,7 @@ export class WorkspaceModule implements Module {
       op: change.kind === 'set' ? 'write' : 'delete',
       error: refused.reason,
     } as ProcessEvent);
-    return refused.reason;
+    return { refused: refused.reason, modeKept: null };
   }
 
   // ==========================================================================
@@ -2242,15 +2256,17 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
-    const materializeError = await this.withMount(mount, async () => {
+    const { refused, modeKept } = await this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
       const blobHash = store.storeBlob(buffer, 'text/plain');
-      return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength });
+      // An overwrite keeps the file's mode, as an edit does.
+      const existing = store.treeGet(mount.treeStateId, relativePath);
+      return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength, ...(existing ? { mode: existing.mode } : {}) });
     });
-    if (materializeError) {
+    if (refused) {
       return {
         success: false,
-        error: `Wrote to Chronicle but failed to materialize "${input.path}" to disk: ${materializeError}. Downstream agents will not see this change until the next materialize call.`,
+        error: `Wrote to Chronicle but failed to materialize "${input.path}" to disk: ${refused}. Downstream agents see the change once it reaches disk; where the reason says to pass force, pass it to materialize for this path.`,
         isError: true,
       };
     }
@@ -2261,6 +2277,7 @@ export class WorkspaceModule implements Module {
         path: input.path,
         size: Buffer.byteLength(input.content),
         hash: hashContent(input.content),
+        ...(modeKept ? { modeKept } : {}),
       },
     };
   }
@@ -2309,16 +2326,16 @@ export class WorkspaceModule implements Module {
 
       const newBuffer = Buffer.from(content, 'utf-8');
       const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
-      const materializeError = await this.commitToolChange(mount, relativePath, {
+      const { refused, modeKept } = await this.commitToolChange(mount, relativePath, {
         kind: 'set',
         blobHash: newBlobHash,
         size: newBuffer.byteLength,
         mode: entry.mode,
       });
-      if (materializeError) {
+      if (refused) {
         return {
           success: false,
-          error: `Edited Chronicle but failed to materialize "${input.path}" to disk: ${materializeError}. Downstream agents will not see this change until the next materialize call.`,
+          error: `Edited Chronicle but failed to materialize "${input.path}" to disk: ${refused}. Downstream agents see the change once it reaches disk; where the reason says to pass force, pass it to materialize for this path.`,
           isError: true,
         };
       }
@@ -2328,6 +2345,7 @@ export class WorkspaceModule implements Module {
         data: {
           path: input.path,
           size: newBuffer.byteLength,
+          ...(modeKept ? { modeKept } : {}),
         },
       };
     });
@@ -2348,7 +2366,7 @@ export class WorkspaceModule implements Module {
         return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
       }
 
-      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash });
+      const { refused: materializeError } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash });
       if (materializeError) {
         return {
           success: false,
@@ -2665,8 +2683,10 @@ export class WorkspaceModule implements Module {
 
   /**
    * The workspace entries by what the evidence says of disk. `owed`: P
-   * differs from the entry (a draft, or a push still pending), or there is no
-   * P and the entry came from the workspace (a draft disk never had).
+   * differs from the entry (a draft, or a push still pending), the entry
+   * records a mode other than the one P agreed (a mode owed to disk), or
+   * there is no P and the entry came from the workspace (a draft disk never
+   * had).
    * `unchecked`: no P and no workspace origin, an entry from before the
    * evidence; a push agrees it, writes it where disk lacks it, or refuses it
    * as a conflict. `agreed`: how many have P = S, so disk holds them. Status
@@ -2685,6 +2705,9 @@ export class WorkspaceModule implements Module {
       const p = agreement.get(name, e.path);
       if (p === undefined) (intents.get(e.path)?.origin === 'store' ? owed : unchecked).push(e.path);
       else if (p.kind !== 'content' || p.hash !== e.blobHash) owed.push(e.path);
+      // A mode the store records, other than the one disk last agreed with,
+      // where modes are observed: elsewhere no push applies one.
+      else if (this.modesObserved && p.mode !== undefined && (entryMode(e.mode) ?? p.mode) !== p.mode) owed.push(e.path);
       else agreed++;
     }
     return { owed, unchecked, agreed };
@@ -2696,6 +2719,7 @@ export class WorkspaceModule implements Module {
     const allWritten: Array<{ mount: string; path: string }> = [];
     const allDeleted: Array<{ mount: string; path: string }> = [];
     const pendingDeletions: Array<{ mount: string; path: string }> = [];
+    const modesKept: Array<{ mount: string; path: string; reason: string }> = [];
 
     let explicit: { mount: MountState; relativePath: string } | null = null;
     if (input.path) explicit = this.parsePath(input.path);
@@ -2765,6 +2789,9 @@ export class WorkspaceModule implements Module {
       for (const s of pushed.skipped) {
         blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
       }
+      // Written paths whose mode stayed as disk had it: no refusal, so not
+      // among what was skipped.
+      for (const k of pushed.modesKept) modesKept.push({ mount: name, ...k });
 
       // What disk still owes is kept by its evidence, so the watermark and
       // the pin only feed the branch guard. Both are the push's own: what it
@@ -2807,10 +2834,11 @@ export class WorkspaceModule implements Module {
           }
           : {}),
         ...(blocked.length > 0 ? { skipped: blocked } : {}),
+        ...(modesKept.length > 0 ? { modesKept } : {}),
       },
       // What disk lost, then what it was written: kept in the stub if the
-      // guard withholds the result (agent-framework #277). What was left or
-      // skipped, and why, is in the full result.
+      // guard withholds the result (agent-framework #277). What was left,
+      // skipped or written at disk's mode, and why, is in the full result.
       keepWhenWithheld: ['deleted', 'materialized'],
     };
   }
@@ -3148,13 +3176,15 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Push one ProcessEvent per op for a pass's tree changes and new conflicts.
-   * A conflict rides the event for the disk change behind it (modified, or
-   * deleted for a disk deletion of a file with newer workspace changes).
+   * Push one ProcessEvent per op for a pass's tree changes and new conflicts,
+   * apart from an op that changes only a file's mode, which brings nothing
+   * new to read and makes none. A conflict rides the event for the disk
+   * change behind it (modified, or deleted for a disk deletion of a file with
+   * newer workspace changes).
    */
   private emitFsEvents(
     mountName: string,
-    ops: Array<{ path: string; op: TreeOp }>,
+    ops: Array<{ path: string; op: TreeOp; modeOnly?: true }>,
     newConflicts: Array<{ path: string; op: TreeOp }> = [],
   ): void {
     if (!this.ctx || (ops.length === 0 && newConflicts.length === 0)) return;
@@ -3167,7 +3197,10 @@ export class WorkspaceModule implements Module {
       if (conflict) group.conflicts.push(full);
       byOp.set(op, group);
     };
-    for (const { path, op } of ops) add(op, path, false);
+    // A path whose mode alone changed, on bytes already held, makes no
+    // event: it brings nothing new to read, and a `chmod -R` over a tree
+    // would otherwise reach every policy that matches its paths.
+    for (const { path, op, modeOnly } of ops) if (!modeOnly) add(op, path, false);
     for (const { path, op } of newConflicts) add(op, path, true);
 
     for (const [op, { paths, conflicts }] of byOp) {

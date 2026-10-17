@@ -70,13 +70,16 @@ export const NONBLOCK = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants
 
 export type Observation =
   | { kind: 'absent' }
-  | { kind: 'file'; size: number; mtimeMs: number; fp: StatFingerprint }
+  /** `mode`: the file's permission bits (`st_mode & 0o777`). */
+  | { kind: 'file'; size: number; mtimeMs: number; mode: number; fp: StatFingerprint }
   | { kind: 'unobserved'; reason: string };
 
 export interface ReadResult {
   kind: 'read';
   size: number;
   mtimeMs: number;
+  /** The permission bits of the inode the bytes were read from. */
+  mode: number;
   fp: Fingerprint;
   hash: string;
   /** The whole file, when it is at most the requested limit. */
@@ -503,7 +506,7 @@ export async function observePath(view: MountView, rootReal: string, relativePat
   } else if (!info.isFile()) {
     return { kind: 'unobserved', reason: 'not a regular file' };
   }
-  return { kind: 'file', size: Number(info.size), mtimeMs: Number(info.mtimeMs), fp: statFingerprint(info) };
+  return { kind: 'file', size: Number(info.size), mtimeMs: Number(info.mtimeMs), mode: Number(info.mode & 0o777n), fp: statFingerprint(info) };
 }
 
 /**
@@ -631,6 +634,7 @@ export async function readPath(
         kind: 'read',
         size: bytes.byteLength,
         mtimeMs: Number(info.mtimeMs),
+        mode: Number(info.mode & 0o777n),
         fp: { ...fp, size: bytes.byteLength },
         hash: createHash('sha256').update(bytes).digest('hex'),
         bytes,
@@ -652,6 +656,7 @@ export async function readPath(
       kind: 'read',
       size: offset,
       mtimeMs: Number(info.mtimeMs),
+      mode: Number(info.mode & 0o777n),
       fp: { ...fp, size: offset },
       hash: hash.digest('hex'),
       bytes: null,

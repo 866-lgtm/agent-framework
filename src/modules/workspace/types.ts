@@ -74,6 +74,8 @@ export interface MountConfig {
    *
    * Self-writes through the module's own tools are already suppressed by the
    * watcher, so a mount shared between agents only wakes on external writes.
+   * A change of a file's mode alone is recorded, and makes no event: it
+   * brings nothing new to read.
    * The EventGate still has final say — use gate policies for path-glob
    * filtering or to disable wake temporarily via hot-reload.
    */
