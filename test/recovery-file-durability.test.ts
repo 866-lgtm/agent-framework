@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -110,12 +110,23 @@ function assertSyncedAround(calls: FsCall[], record: string, directory: string):
   );
 }
 
-test('quiesce syncs the host-mode record\'s temp file before renaming it over the record, and the directory and its parent after', async () => {
+/** Every descriptor opened on a path `ours` names is closed before its number is opened again. */
+function assertEachClosed(calls: FsCall[], ours: (path: string | undefined) => boolean): void {
+  calls.forEach((c, i) => {
+    if (c.call !== 'open' || !ours(c.path)) return;
+    const next = calls.findIndex((d, j) => j > i && d.fd === c.fd && (d.call === 'close' || d.call === 'open'));
+    assert.ok(next >= 0 && calls[next]!.call === 'close', `${c.path} (fd ${c.fd}) closed: ${JSON.stringify(calls)}`);
+  });
+}
+
+test('quiesce syncs the host-mode record\'s temp file before renaming it over the record, and the directory and its parent after, closing each and publishing the record at 0600', async () => {
   await withFramework(async (framework, recovery) => {
     const record = join(recovery, 'host-mode.json');
     const calls = await recordingFs(() => framework.quiesce({ reason: 'test' }));
     assertSyncedAround(calls, record, recovery);
     assertSyncedAround(calls, record, dirname(recovery));
+    assertEachClosed(calls, (path) => isTemporaryOf(record, path) || path === recovery || path === dirname(recovery));
+    assert.equal(statSync(record).mode & 0o777, 0o600);
     assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
   });
 });

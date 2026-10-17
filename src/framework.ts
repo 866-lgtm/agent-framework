@@ -5400,8 +5400,7 @@ export class AgentFramework {
 
   /** Syncs the directory a recovery file is in, or that directory's parent,
    *  so its entries reach the disk; win32 is left out. A failure is raised as
-   *  an ops alert naming the record, since a failing directory sync usually
-   *  means a failing disk. */
+   *  an ops alert naming the record. */
   private syncRecoveryDirectory(directory: string, record: string): void {
     if (process.platform === 'win32') return;
     try {
