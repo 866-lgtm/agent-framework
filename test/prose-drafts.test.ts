@@ -545,7 +545,7 @@ describe('held prose drafts, end to end', () => {
 
       h.command({ op: 'publish-mode', mode: 'delivered' });
       await h.turn([createMockResponse([resend('r3')], 'tool_use'), createMockResponse([])]);
-      assert.match(h.toolResults()[0]!, /may already have been posted.*confirmDuplicate: true\. Nothing was sent/);
+      assert.match(h.toolResults()[0]!, /may already have been posted: .*, so sending it again could post it twice\. To send it anyway, resend with confirmDuplicate: true\. Nothing was sent/);
       const before = h.publishes().length;
       await h.turn([createMockResponse([resend('r4', true)], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /delivered to/);
@@ -967,15 +967,39 @@ describe('held prose drafts, end to end', () => {
       assert.equal(fresh.text, 'risky words and a postscript', 'nothing substituted or truncated');
       assert.equal(fresh.inheritedRisk?.draftId, risky!.id);
       assert.equal(draftState(fresh), 'unconfirmed');
-      assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true`)));
+      assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true.`)));
       // {{unsent}} now means the fresh draft, and it is refused unconfirmed.
       const before = h.publishes().length;
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
       assert.equal(h.publishes().length, before, 'neither draft goes out without confirmation');
-      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}, and ${fresh.id} includes the words of ${risky!.id}`)));
+      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}, and ${fresh.id} includes the words of ${risky!.id}`) &&
+        t.includes(`Nothing was sent; sending that draft again could post it twice. To send it anyway, use drafts(action: "resend", draftIds: ["${fresh.id}"], destination: "#channel", confirmDuplicate: true).`)));
       await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [fresh.id], destination: ROOM, confirmDuplicate: true })], 'tool_use'), createMockResponse([])]);
       assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['risky words and a postscript']);
       assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'the original still needs its own confirmation');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('explicit mode: {{unsent}} of a possibly-posted bounce holds the envelope\'s words, with nothing to wait for', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await h.turn([createMockResponse([text('risky words')])]);
+      const [risky] = h.drafts();
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
+      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
+      h.command({ op: 'publish-mode', mode: 'delivered' });
+      const before = h.publishes().length;
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}} and more`)])]);
+      assert.equal(h.publishes().length, before, 'nothing goes out without confirmation');
+      const copy = h.drafts().find((d) => d.id !== risky!.id)!;
+      assert.equal(copy.text, 'risky words and more');
+      // No attempt is out, so the notice gives the copy's condition and no wait.
+      const notice = h.texts().find((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${risky!.id}`))!;
+      assert.ok(notice.endsWith(`Your message is held as draft ${copy.id}, with {{unsent}} written out; since it includes ` +
+        `${risky!.id}'s words, it can be resent only with confirmDuplicate: true.`), notice);
     } finally {
       await h.close();
     }
@@ -1552,7 +1576,7 @@ describe('drafts resend ownership', () => {
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
       assert.ok(words.includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which is queued in a resend in progress. Nothing was sent; ` +
         `wait for that result. Your message is held as draft ${fresh.id}, with {{unsent}} written out; since it includes ` +
-        `${bounce!.id}'s words, it can be resent only with confirmDuplicate: true, after that.`), words.join('\n'));
+        `${bounce!.id}'s words, it can be resent only with confirmDuplicate: true, once that result is in.`), words.join('\n'));
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
       await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
@@ -1761,7 +1785,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       ]);
       assert.match(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!, new RegExp(
         `^\\[delivered\\] nothing confirmed — draft ${ids[3]} is unconfirmed: ${ids[3]}'s attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .+ ` +
-        'may already have been posted: .+ — check that channel before sending it again \\(resend needs confirmDuplicate: true\\)$'));
+        'may already have been posted: .+ — sending it again could post it twice \\(resend needs confirmDuplicate: true\\)$'));
 
       // Dismissed knowingly after an unknown resend: the dismissal sets it
       // aside, and the receipt still says its attempt may have been posted.
@@ -1828,7 +1852,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.ok(words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id}, ${copy.id} — `), `no "not sent" over words that may be out: ${words}`);
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#channel") delivers it unchanged`), words);
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
-      assert.ok(words.includes(`so check that channel before resending ${copy.id} (drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
+      assert.ok(words.includes(`so resending ${copy.id} could post it twice (to send it anyway: drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
       assert.ok(!words.includes(`draftIds: ["${free.id}", "${copy.id}"], destination`), 'no plain resend offered for the copy');
     } finally {
       await h.close();

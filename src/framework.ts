@@ -11335,8 +11335,8 @@ export class AgentFramework {
         ? [`drafts(action: "resend", draftIds: [${quoted(free)}], destination: "#channel") delivers ` +
           `${free.length > 1 ? 'them' : 'it'} unchanged`]
         : []),
-      ...risky.map((d) => `${this.riskText(d)}, so check that channel before resending ${d.id} ` +
-        `(drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
+      ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
+        `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
     // Named: residents that share one message slot (#197) share this window.
     // "Not sent" only when no copied words may already have been posted.
@@ -11835,7 +11835,7 @@ export class AgentFramework {
     const state = draftState(d);
     if (state === 'dismissed') return `${d.id} was dismissed, so it can't be resent.`;
     if (state === 'unconfirmed' && !confirmDuplicate) {
-      return `${this.riskText(d)}. Check that channel; to send it again anyway, resend with confirmDuplicate: true.`;
+      return `${this.riskText(d)}, so sending it again could post it twice. To send it anyway, resend with confirmDuplicate: true.`;
     }
     return undefined;
   }
@@ -11919,7 +11919,7 @@ export class AgentFramework {
     }
     const unconfirmed = inState('unconfirmed');
     for (const d of unconfirmed) {
-      notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — check that channel before sending it again (resend needs confirmDuplicate: true)`);
+      notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — sending it again could post it twice (resend needs confirmDuplicate: true)`);
     }
     // A dismissal sets a draft aside; it doesn't unsay that the draft's own
     // attempt may already have been posted.
@@ -12334,12 +12334,16 @@ export class AgentFramework {
     const key = `${agent.name}\u0000${draft.id}`;
     let why: string;
     let next: string;
+    // While that draft's attempt is out, a copy of its words waits for the
+    // result too.
+    let afterResult = '';
     if (this.draftsInFlight.has(key)) {
       why = this.draftsSending.has(key) ? 'which is being sent right now' : 'which is queued in a resend in progress';
       next = 'wait for that result';
+      afterResult = ', once that result is in';
     } else if (draftState(draft) === 'unconfirmed') {
       why = this.riskText(draft);
-      next = 'check that channel; to send that draft again anyway use ' +
+      next = 'sending that draft again could post it twice. To send it anyway, use ' +
         `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel", confirmDuplicate: true)`;
     } else {
       return { draft };
@@ -12360,7 +12364,7 @@ export class AgentFramework {
       ? ''
       : held
         ? ` Your message is held as draft ${held.id}, with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
-          'can be resent only with confirmDuplicate: true, after that.'
+          `can be resent only with confirmDuplicate: true${afterResult}.`
         : ' Your message could not be held as a draft; its words remain in your history.';
     const text = `[prose-routing] {{unsent}} is draft ${draft.id}, ${why.startsWith('which') ? why : `and ${why}`}. ` +
       `Nothing was sent; ${next}.${kept}`;
@@ -12765,8 +12769,7 @@ export class AgentFramework {
       // draft would invite a duplicate post.
       const notice =
         `[prose-routing] Your text (${text.length} chars) may not have been delivered — ${reason}. ` +
-        "It isn't held as a draft, since a resend could post it twice; the words remain in your history. " +
-        'Check that channel before writing them again.';
+        "It isn't held as a draft, since a resend could post it twice; the words remain in your history.";
       try {
         const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, { forAgent: name });
         this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
@@ -12813,12 +12816,12 @@ export class AgentFramework {
           `drafts(action: "dismiss", draftIds: ["${draft.id}"]) sets it aside.`;
     const risky = inherited && draft
       ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
-        'can be resent only with the drafts tool and confirmDuplicate: true, after checking that channel.'
+        'can be resent only with the drafts tool and confirmDuplicate: true.'
       : ownRisk
         ? ` Its last send's outcome isn't known, so it may already have been posted: resend it only with ` +
-          'confirmDuplicate: true, after checking that channel.'
+          'confirmDuplicate: true.'
         : after.outcome === 'unknown'
-          ? ' The send may have gone out, so check that channel before resending.'
+          ? ' The send may have gone out, so sending it again could post it twice.'
           : '';
     // A send that threw has no known outcome: the notice doesn't say it
     // wasn't delivered.

@@ -315,6 +315,7 @@ describe('explicit prose routing', () => {
           const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]'))!;
           assert.match(notice, /may not have been delivered/);
           assert.match(notice, /isn't held as a draft, since a resend could post it twice/);
+          assert.ok(notice.endsWith('the words remain in your history.'), notice);
           assert.doesNotMatch(notice, /\{\{unsent\}\}|was not delivered/);
           return;
         }
@@ -590,6 +591,7 @@ describe('explicit prose routing', () => {
       assert.doesNotMatch(notice, /was not delivered/, 'an unconfirmed send is not also declared undelivered');
       assert.match(notice, /may not have been delivered/);
       assert.ok(notice.includes(`draftIds: ["${original.id}"], destination: "#channel", confirmDuplicate: true`), notice);
+      assert.ok(notice.includes('resend it only with confirmDuplicate: true.'), notice);
       assert.ok(!notice.includes('{{unsent}}'), notice);
     } finally {
       await framework.stop();
