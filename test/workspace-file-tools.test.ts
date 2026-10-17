@@ -136,6 +136,10 @@ test('a write, edit or delete that is stored but refused by disk says so, with i
   assert.deepEqual(edit.data, { inChronicle: true, path: 'work/h.txt' });
   assert.equal(await stored('h.txt'), 'shared, edited\n');
   assert.equal(disk('h2.txt')!.toString(), 'shared\n');
+  // Why the answer says not to send it again: the edit's text is still there
+  // to match, so a second one applies the change twice.
+  await call('edit', { path: 'work/h.txt', oldString: 'shared', newString: 'shared, edited' });
+  assert.equal(await stored('h.txt'), 'shared, edited, edited\n');
 
   // A deletion whose disk copy changed since the workspace read it.
   writeFileSync(join(dir, 'd.txt'), 'doomed\n');
@@ -281,4 +285,15 @@ test("a push that disk's shape refuses names what's in the way and the way out",
   writeFileSync(join(dir, 'f.txt'), 'file\n');
   assert.match(errorOf(await call('write', { path: 'work/f.txt/x.txt', content: 'x\n' })),
     /Its push to disk was refused: not written: disk has a file where this path needs a directory, and no push writes below one, forced or not — move or remove that file on disk and materialize again, or write the file under another path\./);
+});
+
+test('a deletion whose path disk has made a directory is not told to write the file elsewhere', async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'gone.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/gone.txt' })).success, true);
+  rmSync(join(dir, 'gone.txt'));
+  mkdirSync(join(dir, 'gone.txt'));
+  const refused = errorOf(await call('delete', { path: 'work/gone.txt' }));
+  assert.match(refused, /^The deletion of "work\/gone\.txt" is stored in the workspace/);
+  assert.doesNotMatch(refused, /write the file under another path/, 'nothing is being written');
 });
