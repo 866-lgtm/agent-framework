@@ -260,11 +260,12 @@ export class PyRunner {
   }
 
   /**
-   * Abort the runner's script (turn cancelled, agent reset/stopped), whether
-   * it's running or still waiting for its interpreter to start; a waiting
-   * script then never runs. The exec settles at once, and the interpreter is
-   * reclaimed, a starting one too: after an abort its state is suspect (a
-   * script died midway), and the next exec gets a fresh one.
+   * Abort the runner's script (its turn ended or is reset to run again, or the
+   * agent was reset or stopped), whether it's running or still waiting for its
+   * interpreter to start; a waiting script then never runs. The exec settles
+   * at once, and the interpreter is reclaimed, a starting one too: after an
+   * abort its state is suspect (a script died midway), and the next exec gets
+   * a fresh one.
    */
   abort(reason: string): void {
     if (!this.pending) return;
@@ -317,12 +318,19 @@ export class PyRunner {
       console.error(`[pytc:${this.label}] ${chunk.trimEnd()}`);
     });
 
-    // A write to an interpreter that no longer reads its input, such as one
-    // that died before its exit was handled, fails on the stream after
-    // write() returns. With no listener, that error is thrown as an uncaught
-    // exception. The interpreter's exit settles its exec.
+    // A write to an interpreter that no longer reads its input fails on the
+    // stream after write() returns; with no listener, that error is thrown as
+    // an uncaught exception. Such an interpreter can go on running, as after a
+    // script closes file descriptor 0, and every later message to it is lost:
+    // its exec would wait out its time limit. So end it, and its exit settles
+    // the exec now. One already dead or killed is left to its own exit.
+    let inputFailed = false;
     child.stdin.on('error', (err) => {
       console.error(`[pytc:${this.label}] write to the python runtime failed: ${err.message}`);
+      if (child.exitCode === null && !child.killed && child.pid !== undefined) {
+        inputFailed = true;
+        child.kill('SIGKILL');
+      }
     });
 
     child.on('error', (err) => {
@@ -336,7 +344,12 @@ export class PyRunner {
       if (this.pending?.sent) {
         this.settlePending({
           stdout: '',
-          stderr: `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`,
+          stderr:
+            inputFailed && signal === 'SIGKILL'
+              ? 'python runtime stopped reading its input, so it was killed and the interpreter restarted ' +
+                '(variables from earlier scripts are gone). A script that closes its standard input ' +
+                '(file descriptor 0) does this.'
+              : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`,
           returnCode: 1,
           aborted: true,
         });
@@ -551,8 +564,8 @@ export class PyRunner {
       // A child whose spawn failed has no pid, and its exitCode stays null
       // until Node's 'error' for it, a tick later. A kill() in that tick, as
       // from an abort or dispose on the tick exec was called, signals no
-      // child of ours: on Node 20 it sent SIGKILL to the host's own process
-      // group.
+      // child of ours but whatever pid Node's handle held: the host's own
+      // process group on Node 20.20.2, another process's pid on 24.19.
       if (child.exitCode === null && !child.killed && child.pid !== undefined) {
         child.kill('SIGKILL');
       }
