@@ -434,6 +434,19 @@ test("a null in an exports array gives way to the next item, and a target only n
   ));
   assert.equal(required.code, 1);
   assert.match(required.stderr, /Cannot find module 'zz-dev-only'/);
+  // So does module-sync, on a Node that can require ES modules: beside an
+  // import target, a target only module-sync names is required.
+  const syncRequired = await check(fixture(
+    { files: ["dist"], exports: { ".": { import: "./dist/index.js", "module-sync": "./dist/sync.js" } }, ...devOnly },
+    { "dist/index.js": "export const ok = true;\n", "dist/sync.js": "import 'zz-dev-only';\nexport const ok = true;\n" },
+  ));
+  if ((process.features as { require_module?: boolean }).require_module) {
+    assert.equal(syncRequired.code, 1);
+    assert.match(syncRequired.stderr, /\(require\) from the installed/);
+    assert.match(syncRequired.stderr, /Cannot find package 'zz-dev-only'/);
+  } else {
+    assert.equal(syncRequired.code, 0, syncRequired.stderr);
+  }
 });
 
 test("an import that a null, an array of nulls or an empty array blocks isn't attempted, and require() still loads the default", async () => {
