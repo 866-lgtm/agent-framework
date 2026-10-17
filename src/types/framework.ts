@@ -237,6 +237,11 @@ export interface FrameworkConfig {
    * effective class (first matching pattern wins); replaces, never merges
    * with, what the providing server declared. Use it to correct or tighten a
    * misclassed tool.
+   *
+   * MCPL tools are named `<toolPrefix>--<tool>`, and toolPrefix defaults to
+   * `mcpl--<serverId>`: server `search` without a toolPrefix needs
+   * `mcpl--search--*`, not `search--*`. A pattern that matches no tool is
+   * reported once its servers have listed their tools.
    */
   toolClassOverrides?: Record<string, string[]>;
 
@@ -274,6 +279,13 @@ export interface FrameworkConfig {
    * messages route to per-channel fork agents spawned from the template
    * agent instead of the primary conversation. If omitted, behavior is
    * unchanged (all messages go to the primary agent).
+   *
+   * @deprecated Per-channel conversation routing is deprecated and will be
+   * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+   * rule reads `metadata.mentioned`, which not every channel server sets
+   * (discord-mcpl does not), so on those channels an @-mention neither binds
+   * a fork nor triggers a bound one. Routing still works for now; the
+   * framework logs one `[deprecated]` line at creation when this is set.
    */
   conversations?: ConversationRouterConfig;
 }
@@ -290,6 +302,10 @@ export interface ContextMaintenanceAgentRun {
   pendingAfter?: string;
   progressBefore?: Record<string, unknown>;
   progressAfter?: Record<string, unknown>;
+  /**
+   * The agent's failure in this pass: a tick that threw, or its readiness
+   * that couldn't be read, before the ticks or after them.
+   */
   error?: string;
 }
 
@@ -311,6 +327,12 @@ export interface ContextMaintenanceSnapshot {
     agentName: string;
     ready: boolean;
     pending?: string;
+    /**
+     * Why the agent's readiness can't be read: the context manager refuses
+     * while its strategy's initialization is pending or has failed, and a
+     * strategy can refuse on its own. `ready` is false then.
+     */
+    error?: string;
     progress?: Record<string, unknown>;
   }>;
 }

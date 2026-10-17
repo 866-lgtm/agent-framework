@@ -6,6 +6,7 @@
 
 import type { McplServerConfig, McplHostCapabilities } from './types.js';
 import { McplServerConnection } from './server-connection.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from '../shutdown.js';
 
 /**
  * Capability keys that can be queried via `getServersWithCapability`.
@@ -25,6 +26,7 @@ export type McplCapabilityQuery =
  */
 export class McplServerRegistry {
   private servers = new Map<string, McplServerConnection>();
+  private closing = new Map<McplServerConnection, Promise<void>>();
 
   /**
    * Connect to an MCPL server and register it.
@@ -40,14 +42,16 @@ export class McplServerRegistry {
       throw new Error(`MCPL server "${config.id}" is already registered`);
     }
 
-    const connection = config.reconnect
+    const connection = config.reconnect === true
       ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
       : await McplServerConnection.connect(config, hostCapabilities);
     this.servers.set(config.id, connection);
 
-    // Auto-remove on unexpected close (unless reconnect will re-add)
+    // Auto-remove on close unless the connection will reconnect. That was
+    // decided once, from `reconnect === true` at connect, and a close() the
+    // host asks for disarms it first, so a server closed for good goes too.
     connection.on('close', () => {
-      if (!config.reconnect) {
+      if (!connection.willReconnect) {
         this.servers.delete(config.id);
       }
     });
@@ -70,8 +74,7 @@ export class McplServerRegistry {
     if (!connection) {
       return;
     }
-    this.servers.delete(id);
-    await connection.close();
+    await this.closeServer(id, connection);
   }
 
   /**
@@ -135,11 +138,27 @@ export class McplServerRegistry {
   }
 
   /**
-   * Close all server connections and clear the registry.
+   * Close all server connections, retaining failed or pending attempts.
+   * An explicit timeout bounds the caller's wait without cancelling cleanup.
    */
-  async closeAll(): Promise<void> {
-    const connections = Array.from(this.servers.values());
-    this.servers.clear();
-    await Promise.all(connections.map((c) => c.close()));
+  async closeAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    validateShutdownTimeout(timeoutMs);
+    await waitForShutdown(Array.from(this.servers, ([id, connection]) => ({
+      label: `mcpl:${id}`, promise: this.closeServer(id, connection),
+    })), timeoutMs);
+  }
+
+  private closeServer(id: string, connection: McplServerConnection): Promise<void> {
+    const existing = this.closing.get(connection);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => connection.close()).then(() => {
+      if (this.servers.get(id) === connection) this.servers.delete(id);
+      this.closing.delete(connection);
+    }, error => {
+      this.closing.delete(connection);
+      throw error;
+    });
+    this.closing.set(connection, attempt);
+    return attempt;
   }
 }

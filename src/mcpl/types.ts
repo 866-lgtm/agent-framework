@@ -229,14 +229,19 @@ export interface McplServerConfig {
   /**
    * Environment variables for the child process. Stdio children do NOT inherit
    * the host environment wholesale: they get a small allowlist (PATH, HOME,
-   * LANG, LC_*, TMPDIR, ... — see CHILD_ENV_ALLOWLIST) plus exactly these.
+   * LANG, LC_*, TMPDIR, TLS CA bundles, and HTTP(S) proxy settings — see
+   * CHILD_ENV_ALLOWLIST) plus exactly these. Proxy URLs can contain credentials.
+   * This limits accidental inheritance; it does not isolate a hostile child.
    */
   env?: Record<string, string>;
 
   /**
    * Escape hatch: pass the host's entire environment (including secrets) to
    * the stdio child, as older versions did. Only for servers that genuinely
-   * need it. Default false.
+   * need it. Default false. Only `true` turns it on, and null counts as not
+   * set. For a stdio server, `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "false". A
+   * WebSocket server never reads it.
    */
   inheritEnv?: boolean;
 
@@ -276,14 +281,22 @@ export interface McplServerConfig {
    * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
    * grant cannot confer it — only this config, decided by the operator, can
    * (PR #79 review blocker 9). The one legitimate fleet user is
-   * discord-mcpl's slash-command relay.
+   * discord-mcpl's slash-command relay. Only `true` turns it on, and null
+   * counts as not set. `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "true".
    */
   allowHostCommands?: boolean;
 
-  /** Feature sets to enable on connect */
+  /**
+   * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
+   * every declared set is a candidate. `[]`: none. Either way a set is
+   * enabled only if its declared `uses` are recognized capabilities the
+   * grant covers (§6.4) — a set declaring no `uses` stays disabled even when
+   * listed here (logged, and traced as `mcpl:feature-set-disabled`).
+   */
   enabledFeatureSets?: string[];
 
-  /** Feature sets to explicitly disable on connect */
+  /** Feature sets to explicitly disable on connect (wins over enabledFeatureSets). */
   disabledFeatureSets?: string[];
 
   /**
@@ -343,6 +356,9 @@ export interface McplServerConfig {
    * When true, connect() resolves immediately (with null capabilities) if the
    * server is unavailable, and retries in the background.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   * Only `true` turns it on, and null counts as not set. `create()`,
+   * `connectMcplServer` and `restartMcplServer` refuse any other value, such
+   * as a quoted "false".
    */
   reconnect?: boolean;
 
@@ -366,7 +382,11 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. This is the
+   * timeout of every request that names none; the handshake's initialize has
+   * its own. Set 0 to disable. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 
@@ -386,11 +406,15 @@ export interface McplServerConfig {
 
   /**
    * Tool name prefix for this server's tools.
-   * Tools are exposed as `{toolPrefix}:{toolName}`.
+   * Tools are exposed as `{toolPrefix}--{toolName}`.
    *
-   * Default: `mcpl:{id}` (e.g., `mcpl:zk:lobby_start_game`).
+   * Default: `mcpl--{id}` (e.g., `mcpl--zk--lobby_start_game`).
    * Set to the server ID for cleaner names (e.g., `toolPrefix: 'zk'`
-   * gives `zk:lobby_start_game`).
+   * gives `zk--lobby_start_game`).
+   *
+   * Tool-name patterns elsewhere (`toolClassOverrides` keys,
+   * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
+   * `disabledTools` use the bare server-side names.
    *
    * Must not collide with any module name or another server's prefix.
    */

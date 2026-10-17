@@ -13,7 +13,8 @@
  *  - `disposition:"never"` withholds payload AND uri from model context
  *    unconditionally — enforced in code here, not by caller discipline (§5);
  *  - stub size is independent of every server-supplied field length (§5);
- *  - unparseable `expiresAt` fails closed (§7.4);
+ *  - unparseable `expiresAt` fails closed (§7.4), and so does one rejected
+ *    as a field: it's absent as testimony, never read as immortal;
  *  - unknown block types never propagate `undefined` (the pre-existing
  *    convertBlock switches had no default — a latent corruption this module
  *    retires).
@@ -56,12 +57,20 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 
 function takeString(
   raw: unknown, field: keyof typeof REFERENCE_LIMITS & string,
-  out: { rejected: string[]; truncated: string[] },
+  out: { rejected: string[] },
 ): string | undefined {
   if (raw === undefined) return undefined;
   if (typeof raw !== 'string') { out.rejected.push(field); return undefined; }
-  const limit = REFERENCE_LIMITS[field];
-  if (raw.length > limit) { out.truncated.push(field); return raw.slice(0, limit); }
+  // JSON Schema maxLength counts Unicode code points, not UTF-16 units.
+  // Stop as soon as the optional field is invalid, without allocating a copy
+  // of an arbitrarily large server string. Display truncation happens later.
+  let length = 0;
+  for (const _codePoint of raw) {
+    if (++length > REFERENCE_LIMITS[field]) {
+      out.rejected.push(field);
+      return undefined;
+    }
+  }
   return raw;
 }
 
@@ -133,16 +142,47 @@ export function isInlineContradiction(block: unknown): boolean {
 export const INLINE_WITHHELD_TEXT =
   '[inline content withheld: nonconformant bulk disposition on inline data]';
 
-export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt'>, nowMs = Date.now()): boolean {
-  if (t.expiresAt === undefined) return false;
+/**
+ * Why a reference counts as expired, or null when it doesn't: its expiresAt
+ * has passed, doesn't parse, or was rejected as a field (§7.4, §8). A
+ * rejected expiry (past its schema maximum, or not a string, null included)
+ * is absent as testimony under the one invalid-field rule, but reading that
+ * absence as "never expires" would let field invalidity widen exposure:
+ * like an unparseable one, it fails closed. A reference that claims no
+ * expiry has none.
+ */
+export function referenceExpiry(
+  t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now(),
+): 'rejected' | 'unparseable' | 'passed' | null {
+  if (t.rejectedFields.includes('expiresAt')) return 'rejected';
+  if (t.expiresAt === undefined) return null;
   const exp = Date.parse(t.expiresAt);
-  return Number.isNaN(exp) ? true : exp <= nowMs;
+  if (Number.isNaN(exp)) return 'unparseable';
+  return exp <= nowMs ? 'passed' : null;
 }
 
-/** Strip C0/C1 controls plus bidi marks/overrides/isolates; bound length.
+export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now()): boolean {
+  return referenceExpiry(t, nowMs) !== null;
+}
+
+/** Each expiry case as the stub and the fetcher's refusal both say it. */
+export const EXPIRY_REASON = {
+  passed: 'expired: its expiresAt has passed',
+  unparseable: 'treated as expired: its expiresAt does not parse (fail closed)',
+  rejected: `treated as expired: its expiresAt was rejected as a field, over ${REFERENCE_LIMITS.expiresAt} characters or not a string (fail closed)`,
+} as const;
+
+/** A reference registered with no server, as the stub, the fetcher's refusal
+ *  and save_recent_image's all say it: the fetcher dials only through the
+ *  server a reference was registered against. */
+export const UNBOUND_REASON = 'unbound: no server is recorded to fetch it from';
+
+/** Strip control characters (C0, DEL, C1) and every bidi control (marks,
+ *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
+ *  whitespace (a BOM included) left at either end, and bound the length.
  *  Labels are labels — storage naming is host-generated elsewhere (§7.3). */
 export function sanitizeLabel(s: string, maxChars: number): string {
-  const cleaned = s.replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '').trim();
   if (cleaned.length <= maxChars) return cleaned;
   let cut = cleaned.slice(0, Math.max(0, maxChars - 1));
   // never split a surrogate pair at the truncation boundary
@@ -179,9 +219,10 @@ const MAX_RECORDS = 2000;
 /**
  * Host-private store of received references. Raw URIs live here and in stubs
  * never (under `never`) or by policy only (`ref`/absent). Ids are stable and
- * never reused within the process (vector 20); eviction is FIFO past
- * MAX_RECORDS and a stale lookup returns undefined — a defined miss, never a
- * different record.
+ * never reused within the process (vector 20). Past MAX_RECORDS the record
+ * registered least recently is evicted (registering a uri the registry holds
+ * makes its record the newest), and a stale lookup returns undefined — a
+ * defined miss, never a different record.
  *
  * Process-wide singleton by design: ids are host-local *names*, not
  * capabilities, and the record itself carries serverId for any future
@@ -214,6 +255,9 @@ export class ReferenceRegistry {
         // describes verified bytes on disk and keeps the testimony they were
         // verified against.
         if (!existing.fetchedPath) existing.testimony = testimony;
+        // Newest again, so a uri just mentioned is the last to be evicted.
+        this.records.delete(existingId);
+        this.records.set(existingId, existing);
         return existing;
       }
     }
@@ -249,6 +293,12 @@ export const referenceRegistry = new ReferenceRegistry();
 // Stub building (§5)
 // ============================================================================
 
+/** A reference's type as its stub shows one, or '' when nothing is left of
+ *  it once sanitized (the stub then leaves it out). */
+export function referenceTypeLabel(mimeType: string | undefined): string {
+  return mimeType ? sanitizeLabel(mimeType, STUB_FIELD_CHARS) : '';
+}
+
 /**
  * Build the model-visible stub for a reference. Output length is bounded by
  * host constants and independent of every server-supplied field length.
@@ -259,20 +309,42 @@ export const referenceRegistry = new ReferenceRegistry();
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string): string {
   const record = referenceRegistry.register(t, serverId);
   const parts: string[] = [];
-  if (t.name) parts.push(sanitizeLabel(t.name, STUB_FIELD_CHARS));
+  // A label is shown only when something is left of it once sanitized.
+  const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
+  if (name) parts.push(name);
   const meta: string[] = [];
-  if (t.mimeType) meta.push(sanitizeLabel(t.mimeType, STUB_FIELD_CHARS));
+  const mimeType = referenceTypeLabel(t.mimeType);
+  if (mimeType) meta.push(mimeType);
   if (t.sizeBytes !== undefined) meta.push(`${formatSizeBytes(t.sizeBytes)} claimed`);
   if (meta.length) parts.push(meta.join(', '));
-  if (provenance) parts.push(sanitizeLabel(provenance, STUB_FIELD_CHARS));
+  const origin = provenance ? sanitizeLabel(provenance, STUB_FIELD_CHARS) : '';
+  if (origin) parts.push(origin);
   if (record.fetchedPath) {
     // Already materialized by the host-mediated fetcher: hand the model the
     // workspace path (host-generated, §7.3) so existing tools just work.
     parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
   } else {
-    parts.push('fetch with fetch_reference');
+    // A reference whose record shows the fetcher would refuse it says why,
+    // rather than inviting a fetch_reference call.
+    parts.push(unfetchableReason(record) ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
+}
+
+/**
+ * Why the fetcher would refuse a reference, as far as its record shows: no
+ * server registered for it, which the fetcher checks first, or its expiry.
+ * Null for a saved copy, which the fetcher serves before any check, and when
+ * the record shows neither. The fetcher's other refusals rest on what a record
+ * doesn't hold, such as a server gone by the time of the fetch, a uri off the
+ * origin its server was dialed at, a claimed size over the ceiling a fetch is
+ * given, or a server's fetch budget spent, and it gives those in its own words.
+ */
+export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
+  if (record.fetchedPath) return null;
+  if (record.serverId === undefined) return UNBOUND_REASON;
+  const expiry = referenceExpiry(record.testimony, nowMs);
+  return expiry ? EXPIRY_REASON[expiry] : null;
 }
 
 /**

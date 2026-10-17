@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
@@ -29,6 +30,9 @@ export interface TransportCloseInfo {
   code?: number | null;
   signal?: NodeJS.Signals | null;
   reason?: string;
+  /** True when `reason` is the peer's own text, a WebSocket server's close
+   *  reason, rather than the transport's words. */
+  reasonFromPeer?: boolean;
 }
 
 /**
@@ -71,6 +75,16 @@ export abstract class McplTransport extends EventEmitter {
     return this._closed;
   }
 
+  /**
+   * The last of what the server wrote to its diagnostic stream: at most its
+   * last {@link STDERR_TAIL_CHARS} UTF-16 code units, never opening inside a
+   * surrogate pair, after a '…' when earlier ones were dropped. A stdio
+   * child's stderr, and '' for a transport that has none.
+   */
+  get stderrTail(): string {
+    return '';
+  }
+
   /** Deliver an inbound line, buffering it if nobody is listening yet. */
   protected pushLine(line: string): void {
     if (this.listenerCount('line') > 0) this.emit('line', line);
@@ -104,10 +118,12 @@ export abstract class McplTransport extends EventEmitter {
 /**
  * Host variables a stdio child gets by default: just enough for an ordinary
  * process to run (find binaries, a home dir, temp dir, locale, TLS roots,
- * a display for GUI helpers). Everything else in the host env — notably API
+ * network proxies, a display for GUI helpers). Everything else in the host env — notably API
  * keys and bot tokens — is NOT passed on; a server that needs a variable must
  * declare it in its `env` (recipes can `${VAR}`-substitute from .env), or set
- * `inheritEnv: true` to get the whole host env as before.
+ * `inheritEnv: true` to get the whole host env as before. Proxy URLs may include
+ * credentials. This limits accidental inheritance, not access by a hostile
+ * same-user child process; it is not a process isolation boundary.
  */
 export const CHILD_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'TZ',
@@ -115,28 +131,71 @@ export const CHILD_ENV_ALLOWLIST = [
   'DISPLAY', 'WAYLAND_DISPLAY',
   'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'no_proxy',
   '__CF_USER_TEXT_ENCODING',
   // Windows equivalents, harmless elsewhere.
   'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE',
 ];
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
- *  server's declared `env` on top. `inheritEnv: true` restores full inheritance. */
+ *  server's declared `env` on top. Windows names merge case-insensitively;
+ *  POSIX names remain case-sensitive. `inheritEnv: true` restores full inheritance,
+ *  and only `true` does: a direct caller can pass any value, unchecked. */
 export function buildChildEnv(
   config: Pick<McplServerConfig, 'env' | 'inheritEnv'>,
   hostEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
-  if (config.inheritEnv) return { ...hostEnv, ...config.env };
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(hostEnv)) {
-    if (value === undefined) continue;
-    if (CHILD_ENV_ALLOWLIST.includes(key) || key.startsWith('LC_')) env[key] = value;
+  const win = platform === 'win32';
+  const inherit = config.inheritEnv === true;
+  const env: NodeJS.ProcessEnv = inherit ? { ...hostEnv } : {};
+  if (!inherit) {
+    for (const [key, value] of Object.entries(hostEnv)) {
+      if (value === undefined) continue;
+      // Windows commonly enumerates Path/SystemRoot rather than PATH/SYSTEMROOT.
+      const probe = win ? key.toUpperCase() : key;
+      if (CHILD_ENV_ALLOWLIST.includes(probe) || probe.startsWith('LC_')) env[key] = value;
+    }
   }
-  return { ...env, ...config.env };
+  if (!win) return { ...env, ...config.env };
+
+  // Windows spawn folds environment names case-insensitively and may choose
+  // an earlier host spelling over a differently cased declared override.
+  // Select Node's first lexicographic spelling within each source, then layer
+  // declared values (including '') over host values. Source precedence and
+  // duplicate-name resolution are separate decisions.
+  const merged: NodeJS.ProcessEnv = {};
+  const spellings = new Map<string, string>();
+  for (const source of [env, config.env ?? {}]) {
+    const seen = new Set<string>();
+    for (const key of Object.keys(source).sort()) {
+      const canonical = key.toUpperCase();
+      if (seen.has(canonical)) continue;
+      seen.add(canonical);
+      const previous = spellings.get(canonical);
+      if (previous !== undefined && previous !== key) delete merged[previous];
+      merged[key] = source[key];
+      spellings.set(canonical, key);
+    }
+  }
+  return merged;
 }
+
+/** The most of a stdio child's stderr a transport keeps for {@link McplTransport.stderrTail}. */
+export const STDERR_TAIL_CHARS = 2_048;
 
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
+  /** The first error on the child's stdin or stdout, named in the close reason. */
+  private pipeError: Error | undefined;
+  private stderrEnd = '';
+  private stderrCut = false;
+
+  override get stderrTail(): string {
+    return (this.stderrCut ? '…' : '') + this.stderrEnd;
+  }
 
   private constructor(
     private readonly child: ChildProcess,
@@ -146,26 +205,70 @@ export class StdioTransport extends McplTransport {
 
     this.rl.on('line', (line: string) => this.pushLine(line));
 
-    // Stitch stderr chunks into whole lines (a chunk can split a line).
+    // Stitch stderr chunks into whole lines (a chunk can split a line, and a
+    // character's bytes), and keep the stream's last characters for
+    // stderrTail.
     let carry = '';
-    this.child.stderr?.on('data', (chunk: Buffer) => {
-      const text = carry + chunk.toString('utf8');
-      const lines = text.split('\n');
+    const decoder = new StringDecoder('utf8');
+    const received = (text: string) => {
+      const end = this.stderrEnd + text;
+      this.stderrCut ||= end.length > STDERR_TAIL_CHARS;
+      let kept = end.slice(-STDERR_TAIL_CHARS);
+      // A cut between a surrogate pair's halves drops the low half too.
+      if (/^[\uDC00-\uDFFF]/.test(kept) && end.length > STDERR_TAIL_CHARS) kept = kept.slice(1);
+      this.stderrEnd = kept;
+      const lines = (carry + text).split('\n');
       carry = lines.pop() ?? '';
       for (const l of lines) if (l.length > 0) this.pushStderr(l);
+    };
+    this.child.stderr?.on('data', (chunk: Buffer) => received(decoder.write(chunk)));
+    // A last line with no newline is complete once the stream ends.
+    this.child.stderr?.on('end', () => {
+      received(decoder.end());
+      if (carry.length > 0) this.pushStderr(carry);
     });
 
     this.child.on('error', (err) => this.emit('error', err));
-    this.child.on('exit', (code, signal) =>
-      this.markClosed({ code, signal, reason: 'child process exited' }),
-    );
+    // The child's stdin and stdout carry the protocol, so after an error on
+    // either, a write's EPIPE or a read error, this transport can't reach the
+    // child even if it's still running. The handler sends a running child
+    // SIGTERM, and the exit's close names the error, so the connection handles
+    // it as any other exit. The close is the report: no 'error' is emitted,
+    // nothing is thrown. Nothing here escalates to SIGKILL, so a child that
+    // ignores SIGTERM keeps running, unreported. A child that stops reading
+    // without closing its stdin raises no error: the writes are buffered, and
+    // only request timeouts bound it (McplServerConfig.requestTimeoutMs).
+    const endOnPipeError = (err: Error) => {
+      this.pipeError ??= err;
+      if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
+    };
+    this.child.stdin?.on('error', endOnPipeError);
+    // On the stream itself, since close() closes readline, which takes its own
+    // listener off the stream. While readline is open, its listener, which
+    // came first, re-emits the error on the interface, where an empty
+    // listener absorbs that copy.
+    this.child.stdout?.on('error', endOnPipeError);
+    this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
+    // stderr carries diagnostics only: a read error on it is reported if
+    // anyone listens and never thrown. It ends nothing once the connection
+    // is wired; during a handshake the listener is the handshake's, which
+    // fails it.
+    this.child.stderr?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    });
+    this.child.on('exit', (code, signal) => this.markClosed({
+      code,
+      signal,
+      reason: this.pipeError ? `child process exited, and its pipe failed with ${this.pipeError.message}` : 'child process exited',
+    }));
   }
 
   /**
-   * Spawn `config.command` and return a ready stdio transport. Rejects if the
-   * command is missing (a config bug) or the process fails to spawn.
+   * Spawn `config.command` and resolve with a ready stdio transport once the
+   * child has spawned. Rejects if the command is missing (a config bug) or the
+   * process fails to spawn.
    */
-  static spawn(config: McplServerConfig): StdioTransport {
+  static async spawn(config: McplServerConfig): Promise<StdioTransport> {
     if (!config.command) {
       throw new Error(
         `MCPL server "${config.id}": stdio transport requires "command" (none provided)`,
@@ -174,6 +277,22 @@ export class StdioTransport extends McplTransport {
     const child = spawn(config.command, config.args ?? [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildChildEnv(config),
+    });
+    // Node reports a failed spawn (a command that doesn't exist, say) as an
+    // 'error' on a tick after spawn() returns, and no 'exit' follows. It is
+    // settled here, where it is listened for. A caller that listens only once
+    // this resolves, as the handshake does, would be too late when reached
+    // from a timer callback, as a reconnect is: Node runs that tick before the
+    // caller's promise continuation, and throws an 'error' nothing listens for.
+    await new Promise<void>((resolve, reject) => {
+      const failed = (err: Error) => {
+        reject(new Error(`MCPL server "${config.id}" could not be started: ${err.message}`, { cause: err }));
+      };
+      child.once('error', failed);
+      child.once('spawn', () => {
+        child.off('error', failed);
+        resolve();
+      });
     });
     const rl = createInterface({ input: child.stdout! });
     return new StdioTransport(child, rl);
@@ -191,7 +310,12 @@ export class StdioTransport extends McplTransport {
       this.child.kill();
     }
     await new Promise<void>((resolve) => {
-      if (!this.child || this.child.exitCode !== null || this.child.killed) {
+      // Once Node has seen a child exit, it has its exitCode set, or its
+      // signalCode when a signal ended it, and its 'exit' event has fired. A
+      // signal that didn't come through kill() (an OOM kill, a crash) leaves
+      // `killed` false. A child that has exited but isn't reaped yet still
+      // takes the kill() above, which sets `killed`.
+      if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null || this.child.killed) {
         resolve();
       } else {
         this.child.once('exit', () => resolve());
@@ -224,9 +348,10 @@ export class WebSocketTransport extends McplTransport {
     });
 
     this.ws.on('error', (err: Error) => this.emit('error', err));
-    this.ws.on('close', (code: number, reason: Buffer) =>
-      this.markClosed({ code, reason: reason?.toString('utf8') || 'websocket closed' }),
-    );
+    this.ws.on('close', (code: number, reason: Buffer) => {
+      const text = reason?.toString('utf8');
+      this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });
+    });
   }
 
   /**
@@ -356,6 +481,53 @@ export function isWebSocketTransport(config: McplServerConfig): boolean {
   if (config.transport === 'websocket') return true;
   if (config.transport === 'stdio') return false;
   return Boolean(config.url) && !config.command;
+}
+
+/** The settings of McplServerConfig whose type is boolean. */
+type BooleanSetting = {
+  [K in keyof McplServerConfig]-?: NonNullable<McplServerConfig[K]> extends boolean ? K : never;
+}[keyof McplServerConfig];
+
+/** What `true` does for each boolean setting, as its refusal says it. A
+ *  boolean setting added to McplServerConfig doesn't compile until it has
+ *  an entry here, so the check below covers it too. */
+const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
+  inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
+  reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
+  allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
+};
+
+/**
+ * Refuse a server config whose `inheritEnv`, `reconnect` or `allowHostCommands`
+ * holds anything but true or false. A config read from JSON can carry a quoted
+ * "false" where the type says boolean, and every reader of these settings takes
+ * only `true` as on, so the quotes would hide what the value does. null counts
+ * as not set, so a generated config that writes an unset setting as null
+ * keeps working. `inheritEnv` is checked only for a stdio server, since a
+ * WebSocket server never reads it. The error names the server, the setting
+ * and the value's kind, not the value, which could be a secret pasted into
+ * the wrong field.
+ */
+export function assertServerConfigBooleans(config: McplServerConfig): void {
+  for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
+    if (setting === 'inheritEnv' && isWebSocketTransport(config)) continue;
+    const value: unknown = config[setting];
+    if (value === undefined || value === null || typeof value === 'boolean') continue;
+    const wanted = typeof value === 'string' ? 'true or false, unquoted,' : 'true or false,';
+    throw new Error(`MCPL server "${config.id}" ${setting} must be ${wanted} not ${kindOf(value)}: ${whatTrueDoes}`);
+  }
+}
+
+/** The kind of a value that isn't undefined, null or a boolean, as a refusal
+ *  names it in place of the value. */
+function kindOf(value: unknown): string {
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value !== 'object') return `a ${typeof value}`;
+  const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
+  if (prototype === null || prototype === Object.prototype) return 'an object';
+  const name = prototype.constructor?.name;
+  if (!name) return 'an object that isn\'t plain';
+  return `${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name}`;
 }
 
 /**
