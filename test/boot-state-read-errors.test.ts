@@ -303,6 +303,12 @@ test("a deferred write whose agent's context can't be scanned fails create(), an
     staging.getAgent('agent')!.getContextManager()
       .addMessage('user', [{ type: 'text', text: 'said during surgery' }], { deferredWriteId: queued!.id } as never);
   } finally { await staging.stop(); }
+  // A crash between a write landing and its ack leaves the receipt its
+  // hand-off recorded, from before the copy landed. Staging's stop handed the
+  // queue off again from after the copy, so the receipt goes back to where
+  // the agent's context began.
+  const queueFile = join(storePath, 'recovery', 'deferred-writes.json');
+  writeFileSync(queueFile, JSON.stringify({ ...JSON.parse(readFileSync(queueFile, 'utf8')), scanFrom: { agent: 0 } }));
   const proto = ContextManager.prototype as unknown as { getMessageCount(this: ContextManager): number };
   const original = proto.getMessageCount;
   proto.getMessageCount = function (this: ContextManager) {
