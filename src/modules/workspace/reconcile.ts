@@ -54,13 +54,19 @@ import {
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
 import {
+  IGNORED,
   type MountView,
+  OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
   fingerprintVouches,
+  ignoreBeneath,
+  inOtherMount,
   locateRoot,
   looksBinary,
   observePath,
+  passedOverAt,
+  passedOverBetween,
   provenAbsent,
   readHead,
   readPath,
@@ -120,9 +126,11 @@ export interface PassResult {
   incomplete: Array<{ path: string; reason: string }>;
   /**
    * What the walk passed over by design and reported nowhere else, counted by
-   * reason: entries the mount's ignore list covers, when nothing beneath them
-   * is tracked (a tracked one is reported under `incomplete`). An ignored
-   * directory counts once, everything in it included. Only listings the walk
+   * reason: another mount's directory nested in this one, entries the mount's
+   * ignore list covers, and entries with an editor's swap or backup file
+   * name, when nothing beneath them is tracked (a tracked one is reported
+   * under `incomplete`). Such a directory counts
+   * once, everything in it included. Only listings the walk
    * kept count: a directory changed during the walk, or one past the file
    * cap, is reported under `incomplete` instead.
    */
@@ -655,12 +663,39 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable });
       continue;
     }
+    // What the mount passes over by design stays unobserved, however a pass
+    // reaches it, so no listing's absence proves a copy there gone. In
+    // another mount's directory, no pass of this mount observes anything.
+    // Beneath a directory a by-design rule covers, a pass that isn't named
+    // observes nothing. A path a rule covers by its own name is observed as a
+    // walk observes it: passed over where the walk lists it, and absent where
+    // the walk lists its directory without it; a pass that reaches it by its
+    // path alone, as a listing, glob or grep naming it does, passes over it.
+    // A pass that names its scope sets aside only what covers the scope, at
+    // it or above it, as its walk does (#276): a directory passed over by
+    // design beneath a named directory stays passed over, and so does what
+    // lies beneath it.
+    let byDesign: string | undefined;
+    if (inOtherMount(path, mount.view.others)) {
+      byDesign = OTHER_MOUNT;
+    } else if (!opts.named) {
+      const slash = path.lastIndexOf('/');
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      byDesign = above ?? own;
+    } else if (scope.kind === 'dir') {
+      byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);
+    }
+    if (byDesign !== undefined) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: byDesign });
+      continue;
+    }
     if (walk && provenAbsent(walk, path)) {
       gathered.facts.set(path, { kind: 'absent' });
       continue;
     }
-    if (walk?.others.get(path) === 'ignored by the mount') {
-      gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
+    if (walk?.others.get(path) === IGNORED) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: IGNORED });
       continue;
     }
     if (walk && !walk.files.has(path) && !walk.othersTaken.has(path)) {
@@ -874,8 +909,16 @@ export async function reconcilePass(
       // A link's own region hides only what lies beneath it: the link itself
       // is reported by path, with its own reason.
       const hides = tracked.some((p) => (region.kind !== 'symlink' && p === region.path) || p.startsWith(region.path + '/'));
-      if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
-      // An ignored name that hides nothing tracked is reported nowhere else:
+      // A scope passed over whole is the answer to the pass that asked for
+      // it, so it's always named. Another mount's directory met beneath the
+      // scope is passed over by design even where this mount's tree holds
+      // copies there: no tool of this mount syncs, pushes or clears them
+      // (listings show them, naming their holder), so naming the directory
+      // as unreached would never clear.
+      const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
+      const unreached = hides && region.reason !== OTHER_MOUNT;
+      if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });
+      // A name passed over by design that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
       // (agent-framework #276). A symlink region isn't counted: a link the
       // walk took is a candidate the pass reports by path, taken through the
@@ -934,6 +977,9 @@ export interface PushResult {
   sequence?: number;
 }
 
+/** Why a push skips a path in another mount's directory nested in its own. */
+export const NOT_PUSHED_IN_OTHER_MOUNT = "it lies in another mount's directory, which no push of this mount writes";
+
 /**
  * Make disk hold the store's version of each path, under the same rule:
  * drafts are written, agreement is left alone, conflicts and unverifiable
@@ -971,6 +1017,18 @@ export async function pushPaths(
   if ('reason' in root) {
     for (const path of paths) result.skipped.push({ path, reason: root.reason });
     return result;
+  }
+  // Another mount's directory nested in this one is that mount's: no push
+  // of this mount writes or deletes a path in it, forced or not. (On a mount
+  // that follows links, a link of this mount's that leads there is read as
+  // this mount's own path; on one that doesn't, the link is refused.)
+  if (mount.view.others.length > 0) {
+    const own: string[] = [];
+    for (const path of paths) {
+      if (inOtherMount(path, mount.view.others)) result.skipped.push({ path, reason: NOT_PUSHED_IN_OTHER_MOUNT });
+      else own.push(path);
+    }
+    paths = own;
   }
 
   type Plan = {
