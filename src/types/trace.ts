@@ -41,11 +41,14 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
-       * trace field; lets external taps (e.g. a TTS relay) tag the whole
-       * activation with its channel without re-deriving routing.
+       * The turn's locus as this stream starts (locus and hybrid mode): where
+       * its unprefixed plain prose is published, unless a hybrid `>>>`
+       * destination takes it, or a re-pin or a `channel_open` moves the locus
+       * later in the turn. Omitted for a turn with no locus: explicit and
+       * disabled mode, a silent turn, and a heartbeat with no default
+       * channel. Observability only, like every trace field; lets external
+       * taps (e.g. a TTS relay) tag the whole activation with its channel
+       * without re-deriving routing.
        */
       channelId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
@@ -60,7 +63,15 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:aborted';
       agentName: string;
+      /** How long this start of the turn ran; after a context-budget restart, from the restart. */
       durationMs: number;
+      /**
+       * Why the turn ended unfinished: the reason an operator gave
+       * `abortInference`, `'quiesce_abandoned'` for a turn an operator quiesce
+       * abandoned, or, for a turn dropped before it sent anything (its agent
+       * replaced or removed, or the framework stopping or restarted), a
+       * sentence saying which.
+       */
       reason?: string;
     })
   | (TraceEventBase & {
@@ -104,7 +115,9 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in: the turn's locus as the
+       *  stream started (see inference:started), or in explicit mode the
+       *  channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -119,7 +132,9 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in: the turn's locus as the
+       *  stream started (see inference:started), or in explicit mode the
+       *  channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -466,6 +481,12 @@ export type TraceEvent =
       type: 'mcpl:server-connect-failed';
       serverId: string;
       error: string;
+      /** The last of the server's stderr, when its handshake failed by its
+       *  transport closing, a transport error or its timeout and it had
+       *  written any: the server's own text, which `error` never carries. A
+       *  transport that failed its handshake was never wired, so its lines
+       *  never reached `mcpl:server-stderr`. */
+      stderrTail?: string;
       /** Ordinal of the failed attempt: 0 is the initial connect, N is the Nth background retry. */
       attempt: number;
       /** True when a background reconnect loop will keep retrying. */
@@ -493,6 +514,11 @@ export type TraceEvent =
       code: number | null;
       /** Signal that terminated the child, if any. */
       signal: string | null;
+      /** Why the transport closed, in its own words, such as `child process
+       *  exited, and its pipe failed with write EPIPE` or `closed by host`;
+       *  null when it gave none, or when its reason is a WebSocket server's
+       *  own close text, which stays off the trace. */
+      reason: string | null;
       /** True when a background reconnect loop will revive the connection. */
       willReconnect: boolean;
     })

@@ -1415,6 +1415,89 @@ test('an imported batch is reported in its own words: a suppression given up for
   ]);
 });
 
+test('a resumed suppression removes a one-shard body as a range and a message outside any body alone', async () => {
+  const h = storeHarness();
+  try {
+    const batch = h.outbox.prepare({
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'recovery/cairn/suppressed', activationPolicy: 'explicit',
+      suppressionIntervals: [{ fromId: 'plain', toId: 'plain' }, { fromId: 'shard', toId: 'shard' }],
+      refs: [ref('m1')], scope: 'all',
+    })!;
+    const present = new Set(['plain', 'shard']);
+    const removals: string[] = [];
+    // As context-manager 0.14 does, removeMessage refuses a shard, a
+    // one-shard body's included.
+    const cm = {
+      getMessage: (id: string) => present.has(id)
+        ? { id, ...(id === 'shard' ? { bodyGroupId: 'doc', shardIndex: 0 } : {}) }
+        : null,
+      removeMessage: (id: string) => {
+        if (id === 'shard') throw new Error(`Cannot remove shard ${id} in isolation: it is part of bodyGroup doc.`);
+        present.delete(id);
+        removals.push(id);
+      },
+      removeMessages: (from: string, to: string) => {
+        present.delete(from); present.delete(to); removals.push(`${from}..${to}`);
+      },
+    };
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = h.outbox;
+    framework.store = { currentBranch: () => ({ name: 'recovery/cairn/suppressed' }) };
+    framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
+    framework.opsAlert = () => {};
+
+    await muted(() => framework.resumePreparedDiscordSuppressions());
+
+    assert.deepEqual(removals, ['shard..shard', 'plain']);
+    const after = h.outbox.batches().find((candidate) => candidate.id === batch.id)!;
+    assert.equal(after.suppressionComplete, true);
+    assert.equal(after.status, 'discarded', 'a start never activates a surgery\'s marks');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a resumed suppression skips an interval that committed before the crash, and refuses one only partly present', async () => {
+  const run = async (present: Set<string>) => {
+    const h = storeHarness();
+    try {
+      const batch = h.outbox.prepare({
+        agentName: 'cairn', sourceBranch: 'main', targetBranch: 'recovery/cairn/suppressed', activationPolicy: 'explicit',
+        suppressionIntervals: [{ fromId: 'a0', toId: 'a1' }, { fromId: 'b0', toId: 'b1' }],
+        refs: [ref('m1')], scope: 'all',
+      })!;
+      const removals: string[] = [];
+      const cm = {
+        getMessage: (id: string) => (present.has(id) ? { id } : null),
+        removeMessage: (id: string) => { present.delete(id); removals.push(id); },
+        removeMessages: (from: string, to: string) => { present.delete(from); present.delete(to); removals.push(`${from}..${to}`); },
+      };
+      const framework = Object.create(AgentFramework.prototype) as any;
+      framework.discordAwarenessOutbox = h.outbox;
+      framework.store = { currentBranch: () => ({ name: 'recovery/cairn/suppressed' }) };
+      framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
+      framework.opsAlert = () => {};
+      const outcome = await muted(() => framework.resumePreparedDiscordSuppressions())
+        .then(() => 'resumed', (error: Error) => error.message);
+      return { outcome, removals, status: h.outbox.batches().find((candidate) => candidate.id === batch.id)?.status };
+    } finally {
+      h.cleanup();
+    }
+  };
+
+  // The later interval committed before the crash: only the earlier is removed.
+  const committed = await run(new Set(['a0', 'a1']));
+  assert.equal(committed.outcome, 'resumed');
+  assert.deepEqual(committed.removals, ['a0..a1']);
+  assert.equal(committed.status, 'discarded', 'a start never activates a surgery\'s marks');
+
+  // An interval with one end gone isn't safe to finish.
+  const partial = await run(new Set(['a0', 'a1', 'b0']));
+  assert.match(partial.outcome, /interval b0\.\.b1 is only partially present/);
+  assert.deepEqual(partial.removals, []);
+  assert.equal(partial.status, 'prepared');
+});
+
 test('two retirements for one agent each reach the ops webhook within its cooldown', async (t) => {
   const posts: string[] = [];
   t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: { body?: string }) => { posts.push(String(init?.body)); return new Response(null); });
@@ -1520,6 +1603,9 @@ test("a switch onto a suppression's target whose removals aren't recorded as fin
   framework.store = { switchBranch: (name: string) => { switched.push(name); } };
   framework.reserveStoreForSurgery = () => () => {};
   framework.moduleRegistry = { getModule: () => undefined };
+  // A switch waits for maintenance work that is running: here, none.
+  framework.maintenancePass = null;
+  framework.overBudgetDrains = new Set();
   await assert.rejects(
     framework.switchBranch('partial'),
     (error) => error instanceof OperatorActionError && error.code === 'invalid'
@@ -1818,6 +1904,11 @@ function hostCommandFramework(h: ReturnType<typeof storeHarness>, messages: Arra
   framework.pendingAssistantBlocks = new Map();
   // A host/command and a store surgery are operations stop() waits for.
   framework.operatorOperations = new Set();
+  // A surgery waits for maintenance work that is running: here, none.
+  framework.maintenancePass = null;
+  framework.overBudgetDrains = new Set();
+  // Its hold wakes maintenance calls parked at the provider gates: here, none.
+  framework.providerGates = new Map();
   framework.operatorLog = new OperatorLog(undefined);
   framework.opsAlert = () => {};
   return { framework, removed, setBranch: (name: string) => { currentBranch = name; } };

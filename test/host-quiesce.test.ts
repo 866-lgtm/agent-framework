@@ -312,6 +312,101 @@ test('resume proceeds with a warn when the strategy cannot preview', async () =>
   });
 });
 
+test('resume proceeds without a verdict for an agent whose context manager refuses, and warns naming it', async (t) => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // A failed strategy initialization fences the context manager: its
+    // settings queries throw until a successful switchBranch or setStrategy.
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const failing = {
+      name: 'refusing-init-test',
+      async initialize() { throw new Error('strategy initialization failed for the test'); },
+      checkReadiness: () => ({ ready: true }),
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    await assert.rejects(cm.setStrategy(failing), /strategy initialization failed for the test/);
+    assert.throws(() => cm.getHotContextSettings(), /requires successful strategy initialization/);
+
+    // The preview answers rather than throws: no verdict, with what the
+    // agent's own state still says.
+    // The agent runs at the default budget of 100,000 tokens, so 50,000 is a paced descent.
+    const preview = framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+    assert.equal(preview.available, false);
+    assert.match(String(preview.reason), /requires successful strategy initialization/);
+    assert.equal(preview.path, 'paced');
+    assert.equal(preview.liveBudgetTokens, 100_000);
+    assert.equal(preview.transition, 'stable');
+    assert.equal(preview.effective, undefined);
+    // A patch whose values the agent refuses still throws.
+    assert.throws(() => framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 5 }), /contextBudgetTokens must be/);
+    assert.throws(() => framework.previewAgentRuntimeSettings('agent', { tailTokens: -1 }), /tailTokens must be/);
+    // Whether the strategy takes a live tail or pace is the manager's to say,
+    // so while it refuses, a patch that sets one gets no verdict either.
+    for (const patch of [{ tailTokens: 2_000 }, { transitionPaceTokens: 1_000 }]) {
+      const unanswered = framework.previewAgentRuntimeSettings('agent', patch);
+      assert.equal(unanswered.available, false, JSON.stringify(patch));
+      assert.match(String(unanswered.reason), /requires successful strategy initialization/);
+      assert.equal(unanswered.liveBudgetTokens, 100_000);
+    }
+
+    // An update of the budget is refused, by the manager, and the preflight
+    // doesn't say it's applying one.
+    const preflight = t.mock.method(console, 'warn', () => {});
+    try {
+      assert.throws(
+        () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 }),
+        /requires successful strategy initialization/,
+      );
+      assert.ok(!preflight.mock.calls.some((call) => String(call.arguments[0]).includes('applying without preflight')));
+    } finally {
+      preflight.mock.restore();
+    }
+    assert.equal(framework.getAgent('agent')!.runtimeBudgetPath().liveBudgetTokens, 100_000, 'the budget is as it was');
+
+    const warn = t.mock.method(console, 'warn', () => {});
+    let status: Awaited<ReturnType<typeof framework.resume>>;
+    try {
+      status = await framework.resume();
+    } finally {
+      warn.mock.restore();
+    }
+    assert.equal(status.quiesced, false);
+    assert.ok(warn.mock.calls.some((call) => {
+      const line = String(call.arguments[0]);
+      return line.includes('feasibility preview unavailable for agent')
+        && line.includes('requires successful strategy initialization')
+        && line.includes('proceeding without a verdict');
+    }), 'resume warns, naming the agent and the reason');
+  });
+});
+
+test('a preview stopped by a stale branch generation says branch_generation_changed, as the reason documents', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // As the autobiographical strategy refuses a branch it hasn't reloaded:
+    // its readiness and its settings both say so.
+    const stale = 'TestStrategy.getHotContextSettings requires reinitialization for the current branch generation';
+    const strategy = {
+      name: 'stale-generation-test',
+      async initialize() {},
+      checkReadiness: () => { throw new Error(stale); },
+      getHotContextSettings: () => { throw new Error(stale); },
+      updateHotContextSettings: () => { throw new Error(stale); },
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    const cm = framework.getAgent('agent')!.getContextManager();
+    await cm.setStrategy(strategy);
+    const preview = framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+    assert.equal(preview.available, false);
+    assert.equal(preview.reason, 'branch_generation_changed');
+    assert.equal(preview.liveBudgetTokens, 100_000);
+  });
+});
+
 test('maintenanceTick runs the real maintenance pass while quiesced', async () => {
   class QueuedStrategy implements ContextStrategy {
     readonly name = 'queued-test';
@@ -338,6 +433,47 @@ test('maintenanceTick runs the real maintenance pass while quiesced', async () =
     const snapshot = await framework.maintenanceTick();
     assert.ok(strategy.ticks >= 2, `maintenance ticked while quiesced (${strategy.ticks})`);
     assert.ok(snapshot.agents.some((a) => a.agentName === 'agent'));
+  }, { strategy });
+});
+
+test('maintenanceTick runs no pass while a surgery holds the store, and says so', async (t) => {
+  class QueuedStrategy implements ContextStrategy {
+    readonly name = 'queued-test';
+    ticks = 0;
+    checkReadiness(): ReadinessState {
+      return { ready: false, description: 'test maintenance queued' };
+    }
+    async tick(_ctx: StrategyContext): Promise<void> {
+      this.ticks++;
+    }
+    select(
+      _store: MessageStoreView,
+      _log: ContextLogView,
+      _budget: TokenBudget,
+    ): ContextEntry[] {
+      return [];
+    }
+  }
+  const strategy = new QueuedStrategy();
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    // Held before start(), whose first pass would otherwise tick at once.
+    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    framework.start();
+    await framework.quiesce({ reason: 'compression window' });
+    const warn = t.mock.method(console, 'warn', () => {});
+    try {
+      const snapshot = await framework.maintenanceTick();
+      assert.equal(snapshot.ran, false);
+      assert.equal(strategy.ticks, 0);
+      assert.equal(snapshot.history.length, 0);
+      assert.ok(warn.mock.calls.some((call) =>
+        String(call.arguments[0]).includes('a rollback for agent holds the store — no pass executed')));
+    } finally {
+      internals.surgeryHold = null;
+      warn.mock.restore();
+    }
   }, { strategy });
 });
 
