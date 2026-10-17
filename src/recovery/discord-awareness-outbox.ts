@@ -1910,10 +1910,11 @@ interface LegacyBatch {
 
 /**
  * Whether a parsed pre-journal ledger is one the released readers accepted
- * (0.21.0 to 0.22.2 checked these fields alike): version 1, whose batches are
- * `prepared` or `pending` with plain refs, or version 2, whose batches are
- * `prepared` or `active`, with an activation policy and suppression
- * intervals of the shapes they wrote, and refs that are full entries.
+ * (every release with the outbox, 0.6.7 to 0.22.2, checked these fields
+ * alike): version 1, whose batches are `prepared` or `pending` with plain
+ * refs, or version 2, whose batches are `prepared` or `active`, with an
+ * activation policy and suppression intervals of the shapes they wrote, and
+ * refs that are full entries.
  */
 function isLegacyLedger(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;

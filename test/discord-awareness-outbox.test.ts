@@ -2579,7 +2579,7 @@ test("a legacy ledger whose batches the released readers would have refused can'
   };
   const v1 = { id: 'legacy-v1', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', emoji: '💤', createdAt: 1, refs: [ref('m1')] };
   const without = <T extends object>(value: T, key: string) => Object.fromEntries(Object.entries(value).filter(([k]) => k !== key));
-  // Every field the released readers (0.21.0 to 0.22.2) checked, each made
+  // Every field the released readers (0.6.7 to 0.22.2) checked, each made
   // wrong in turn: a batch's, an interval's, an entry's, and a version 1
   // batch's and ref's. Imported as written, the first would retire a
   // suppression whose removals a start on its branch still owes.
