@@ -1563,14 +1563,17 @@ test("a start logs each suppression whose removals stay pending for another bran
   // branch's own, which this start resumes.
   const there = suppression('main', 'recovery/cairn/1', 'i1');
   suppression('old', 'main', 'i2');
-  // An imported ledger's, for a branch that exists.
+  // Two an imported ledger had, for branches that exist: one it never
+  // activated, which stays prepared for its body, and an active one, whose
+  // body the old ledger doesn't prove.
   importLegacyBatch(h, 'legacy-x', [ref('m1')], { activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i3', toId: 'i3' }] });
+  importLegacyBatch(h, 'legacy-y', [ref('m2')], { status: 'active', activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i4', toId: 'i4' }] });
   const logged: string[] = [];
   const alerts: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.discordAwarenessOutbox = h.reopen();
   framework.store = {
-    listBranches: () => ['main', 'old', 'recovery/cairn/1', 'legacy/legacy-x'].map((name) => ({ name })),
+    listBranches: () => ['main', 'old', 'recovery/cairn/1', 'legacy/legacy-x', 'legacy/legacy-y'].map((name) => ({ name })),
     currentBranch: () => ({ name: 'main' }),
   };
   framework.opsAlert = (kind: string) => { alerts.push(kind); };
@@ -1590,6 +1593,10 @@ test("a start logs each suppression whose removals stay pending for another bran
     '[discord-awareness] startup: suppression legacy-x of cairn has removals pending for legacy/legacy-x, which only a '
       + 'start on it finishes, and a switch onto it is refused while they\'re pending, since a partly suppressed branch '
       + 'isn\'t safe to serve from. To give the suppression up, delete legacy/legacy-x (the host API\'s branch.delete): '
+      + 'the next start finds no branch with that name and gives it up. Until then that name is refused',
+    '[discord-awareness] startup: suppression legacy-y of cairn has removals pending for legacy/legacy-y, which only a '
+      + 'start on it finishes, and a switch onto it is refused while they\'re pending, since a partly suppressed branch '
+      + 'isn\'t safe to serve from. To give the suppression up, delete legacy/legacy-y (the host API\'s branch.delete): '
       + 'the next start finds no branch with that name and gives it up. Until then that name is refused',
   ].sort());
   // The import was an earlier process's, so this start names nothing.
