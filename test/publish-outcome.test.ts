@@ -92,6 +92,23 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.deepEqual(fails.published, [], 'nothing dispatched after a failed open');
   });
 
+  it('prints speech routing\'s open line only for speech routing\'s publishes', async (t) => {
+    const lines: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    const { registry, seed, opened } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c', false);
+    seed('discord', 'd', '#d', false);
+    // A draft resend isn't speech routing's: the channel opens, and no
+    // [routeSpeech] line is printed for it.
+    assert.equal((await registry.publish('agent', 'x', { serverId: 'discord', channelId: 'c' })).status, 'delivered');
+    assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), []);
+    await registry.publish('agent', 'x', { channelId: 'd', routed: true });
+    assert.deepEqual(opened, [{ serverId: 'discord', channelId: 'c' }, { serverId: 'discord', channelId: 'd' }]);
+    assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), [
+      '[routeSpeech] agent: locus d was closed — opened by delivery (speech implies engagement)',
+    ]);
+  });
+
   it('refuses a send the grant forbids before opening anything', async () => {
     // The grant could open the channel (channels.lifecycle), but not publish into it.
     const { registry, seed, opened, published } = registryWith({ discord: { publish: ok, grant: { without: ['channels.publish'] } } });

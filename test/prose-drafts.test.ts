@@ -1109,7 +1109,7 @@ describe('draft notices and turn-end settlement', () => {
     try {
       const internals = framework as unknown as {
         proseDrafts: ProseDraftStore;
-        routingOf(name: string): { logical: { drafts: unknown[] } };
+        routingOf(name: string): { drafts: unknown[] };
         settleTurnDrafts(agent: unknown, logical: unknown): void;
       };
       const agent = framework.getAgent('scout')!;
@@ -1117,7 +1117,7 @@ describe('draft notices and turn-end settlement', () => {
       // Only the first draft's notice reached the history.
       const cm = agent.getContextManager();
       const notice = cm.addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
-      const logical = internals.routingOf('scout').logical;
+      const logical = internals.routingOf('scout');
       logical.drafts.push(named, lost);
       internals.settleTurnDrafts(agent, logical);
       assert.deepEqual(logical.drafts, [], "the turn's draft tally is spent");
@@ -1141,7 +1141,7 @@ describe('draft notices and turn-end settlement', () => {
     });
     const internals = framework as unknown as {
       proseDrafts: ProseDraftStore;
-      routingOf(name: string): { logical: { drafts: unknown[] } };
+      routingOf(name: string): { drafts: unknown[] };
       openLogical: Map<string, unknown>;
       noticeUnnoticedDrafts(agent: unknown): void;
     };
@@ -1256,7 +1256,7 @@ describe('draft notices and turn-end settlement', () => {
       const [own, other] = t.internals.proseDrafts.hold('scout', [{ text: 'own', source }, { text: 'other', source }], 'explicit-send').held;
       // A later start continues this logical turn, whose receipt names its
       // drafts at the turn's end.
-      const logical = t.internals.routingOf('scout').logical;
+      const logical = t.internals.routingOf('scout');
       logical.drafts.push(own);
       t.internals.openLogical.set('scout', logical);
       t.internals.noticeUnnoticedDrafts(t.agent);
@@ -1281,7 +1281,7 @@ describe('draft identity and risk evidence', () => {
     });
     const internals = framework as unknown as {
       proseDrafts: ProseDraftStore;
-      routingOf(name: string): { logical: { drafts: unknown[] } };
+      routingOf(name: string): { drafts: unknown[] };
       settleTurnDrafts(agent: unknown, logical: unknown): void;
       bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: { routing: unknown; notice: 'later' }): void;
       riskText(draft: unknown): string;
@@ -1298,7 +1298,7 @@ describe('draft identity and risk evidence', () => {
       // Only the OTHER resident's notice for "d-same2" is in the shared history.
       t.framework.getAgent('other')!.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] other: …' }],
         { system: true, kind: 'prose-drafts', draftOwner: 'other', draftIds: ['d-same2'] } as never);
-      const logical = t.internals.routingOf('scout').logical;
+      const logical = t.internals.routingOf('scout');
       logical.drafts.push(mine);
       t.internals.settleTurnDrafts(t.framework.getAgent('scout')!, logical);
       assert.equal(t.internals.proseDrafts.get('scout', 'd-same2')!.noticedIn, undefined);
