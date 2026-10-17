@@ -412,19 +412,21 @@ describe('Trunk channel routing (item-3 redux)', () => {
         .map((block) => block.text)
         .join('\n') ?? '';
 
-    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'subscription-policy');
+    // Each form an agent can read: a delivery or a send opens one channel, and
+    // only the subscription policy opens several at once.
+    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
     const one = lastText();
     assert.match(
       one,
-      /Now open: #general \(acme\) \(slack:C1\) — your subscription policy just admitted it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
+      /Now open: #general \(acme\) \(slack:C1\) — your own message into the closed channel engaged it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
     );
     assert.doesNotMatch(one, /will reach you/);
 
-    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'opened-by-delivery');
+    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
     const two = lastText();
     assert.match(
       two,
-      /engaged it\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
+      /Now open: slack:C1, slack:C2 — your subscription policy just admitted them\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
     );
     assert.doesNotMatch(two, /will reach you/);
     await framework.stop();
