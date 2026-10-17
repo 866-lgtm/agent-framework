@@ -33,7 +33,7 @@ describe('ProseDraftStore', () => {
     try {
       const { held } = drafts.hold('a', [{ text: ' one\n' }, { text: 'two  ' }], 'explicit-send');
       assert.equal(held.length, 2);
-      assert.match(held[0]!.id, /^d-[a-z2-9]{5}$/);
+      assert.match(held[0]!.id, /^d-[a-z2-9]{7}$/);
       assert.notEqual(held[0]!.id, held[1]!.id);
       assert.deepEqual(drafts.open('a').map((d) => d.text), ['two  ', ' one\n'], 'newest first, bytes exact');
       assert.deepEqual(drafts.open('b'), [], 'another resident sees none of them');
@@ -736,7 +736,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r2', true)], 'tool_use'), createMockResponse([])]);
-      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{5}'s attempt to .* may already have been posted: .*delivery uncertain/);
+      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{7}'s attempt to .* may already have been posted: .*delivery uncertain/);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
@@ -814,7 +814,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice on this branch names: /);
-      assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); explicit send in the same round\)/);
+      assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in the same round\)/);
       assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in the same round\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
       assert.ok(!notice.includes('orphaned words') && !notice.includes('half-sent words'), `the notice quotes no draft's words: ${notice}`);
@@ -834,7 +834,7 @@ describe('held prose drafts, end to end', () => {
       assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
-      const named = [...notice.matchAll(/(d-[a-z2-9]{5}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
+      const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
       assert.deepEqual(named, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => held[i]!.id));
       assert.ok(notice.includes(` · and 2 more: ${held[1]!.id}, ${held[0]!.id}.`), notice);
       assert.ok(!/orphan \d/.test(notice), `the notice quotes no draft's words: ${notice}`);

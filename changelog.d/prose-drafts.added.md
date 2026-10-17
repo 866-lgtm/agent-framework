@@ -27,7 +27,9 @@
   days after anything last happened to it (held, named, attempted, answered,
   dismissed). The journal lets such a draft go when it next checkpoints what
   it keeps, every 500 entries, so opening it replays only what follows. A request naming a draft that was let go is
-  refused, and nothing is sent.
+  refused, and nothing is sent, unless that id has since been given to a newer draft,
+  which the request then names instead: an id is `d-` and seven characters, so after N more of its resident's drafts a let-go id has come back
+  with a probability of about N in 2.75 × 10^10.
 - A private notice names held drafts at the next tool boundary when the live
   stream presents mid-turn messages (a draft holding words copied from one
   that may already have been posted is named with that risk and the

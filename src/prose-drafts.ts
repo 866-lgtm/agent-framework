@@ -172,6 +172,12 @@ interface DraftSnapshot {
 
 /** Unambiguous lowercase alphabet for short ids (no i/l/o/0/1). */
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+/**
+ * Characters after `d-` in a draft's id: 31^7, about 2.75 × 10^10 ids, so a
+ * mistyped id almost never names a real draft, and an id retention let go is
+ * given again only rarely (see newId).
+ */
+const ID_LENGTH = 7;
 
 /** Each resident's newest drafts, by hold order, that are always kept. */
 export const KEEP_NEWEST = 100;
@@ -324,14 +330,16 @@ export class ProseDraftStore {
   }
 
   /** A new id, unique among the resident's kept drafts and never its latest
-   *  bounce's. One let go can be given again: the notices that named it are
-   *  by then at least KEEP_IDLE_MS old and KEEP_NEWEST drafts back. */
+   *  bounce's. One that retention let go can be given again: after N more
+   *  of its resident's drafts, a given let-go id has come back with a
+   *  probability of about N in 2.75 × 10^10 (ID_LENGTH), and a request naming
+   *  it then reaches the newer draft rather than being refused. */
   private newId(agent: string): string {
     const existing = this.agentDrafts(agent);
     const latestBounce = this.latestBounces.get(agent);
     for (;;) {
       let id = 'd-';
-      for (let i = 0; i < 5; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
+      for (let i = 0; i < ID_LENGTH; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
       if (!existing.has(id) && id !== latestBounce) return id;
     }
   }
