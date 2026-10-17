@@ -428,14 +428,19 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const incoming = (id: number, messageId: string) => serverSends({
       id, method: 'channels/incoming', params: { messages: [{ channelId: 'room', messageId, content: [{ type: 'text', text: 'hello' }] }] },
     });
-    const removeRoom = (id: number) => serverSends({ id, method: 'channels/changed', params: { removed: ['room'] } });
+    const removeChannel = (id: number, channel: string) =>
+      serverSends({ id, method: 'channels/changed', params: { removed: [channel] } });
+    const removeRoom = (id: number) => removeChannel(id, 'room');
+    const addRoom = (id: number) => serverSends({
+      id, method: 'channels/changed', params: { added: [{ id: 'room', type: 'text', direction: 'bidirectional' }] },
+    });
     register(1);
     incoming(2, 'kept-1');
     connection.sendToolsList().catch(() => {});
     await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
     registered.length = 0;
     const rejected = () => traces.filter((trace) => trace.type === 'mcpl:channel-incoming-rejected');
-    return { grant, admitted, rejected, register, incoming, removeRoom, registered };
+    return { grant, admitted, rejected, register, incoming, removeRoom, removeChannel, addRoom, registered };
   }
 
   it("lets a registration pass what its own transport sent before it, once a kept message is held", async () => {
@@ -474,6 +479,63 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     }
     assert.deepStrictEqual(rejected(), [], 'no message is refused as an unknown channel');
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-1']);
+  });
+
+  it('keeps a registration sent after a removal behind it, so a kept message for its channel is admitted first and refused', async () => {
+    const { grant, admitted, rejected, register, removeChannel, registered } = await keptIncomingSetup();
+    // The next process removes another channel, and only then registers the
+    // kept message's channel.
+    removeChannel(3, 'elsewhere');
+    register(4);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(registered, [4], 'the registration is admitted, after the removal');
+    assert.deepStrictEqual(admitted, [], 'the kept message went first');
+    assert.equal(rejected().length, 1, 'and was refused as an unknown channel');
+  });
+
+  it('moves a channels/changed that only adds channels ahead of a kept message, as a registration', async () => {
+    const { grant, admitted, rejected, addRoom } = await keptIncomingSetup();
+    addRoom(3);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(rejected(), [], 'not refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
+  });
+
+  it('during a quiesce, admits a removal as the control plane opens, ahead of a kept message for its channel, which is refused as the data plane opens', async () => {
+    const { grant, admitted, rejected, register, removeRoom, registered } = await keptIncomingSetup();
+    register(3);
+    removeRoom(4);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.readyControlPlane();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(registered, [3], 'the registration is admitted as the control plane opens');
+      assert.equal(admitted.length, 0, 'the kept message waits for the data plane');
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(admitted, []);
+    assert.equal(rejected().length, 1, 'the removal went first, so the kept message is refused as an unknown channel');
   });
 
   it('during a quiesce, admits the registration as the control plane opens and the kept message once the data plane does', async () => {

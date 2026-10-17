@@ -425,17 +425,24 @@ export class McplServerConnection extends EventEmitter {
    * when it holds items a transport boundary kept, the current transport's
    * channel registrations (`channels-register`, `channels-changed`) go
    * first. The registry refuses a message for a channel it doesn't know
-   * (§14.5), and the next process registers its channels anew, behind what
-   * was kept: a kept message admitted first would be refused, and lost,
-   * since its bridge has advanced past it. Nothing else moves, so a snapshot
-   * with nothing kept is flushed as it was held. A registration also passes
-   * whatever its own transport sent before it, which a server that announces
-   * its channels first, as a bridge does, never has. Nothing passes a
-   * removal: registrations move only up to the transport's first
-   * `channels-changed` that removes a channel, which stays where it was held,
-   * with everything after it. So what the transport sent before a removal is
-   * admitted before it, its messages for that channel included, and a
-   * registration it sent after a removal is admitted after it.
+   * (§14.5). It keeps a server's channels across a reconnect, but a
+   * registration the old process sent that was still held at the boundary
+   * was dropped with it (keepAcrossBoundary), so the next process registers
+   * that channel anew, behind what was kept: a kept message for it admitted
+   * first would be refused, and lost, since its bridge has advanced past it.
+   * Nothing else moves, so a snapshot with nothing kept is flushed as it was
+   * held. A registration also passes whatever its own transport sent before
+   * it, which a server that announces its channels first, as a bridge does,
+   * never has. Nothing passes a removal: registrations move only up to the
+   * transport's first `channels-changed` that removes a channel, which stays
+   * where it was held, with everything after it. So in a flush that opens
+   * both planes, what the transport sent before a removal is admitted before
+   * it, its messages for that channel included, and a registration it sent
+   * after a removal is admitted after it. A flush that opens only the control
+   * plane, as during a quiesce, admits the control traffic, a removal
+   * included, and holds the data plane's again until that plane opens, as
+   * live traffic is during a quiesce: a message held for a channel a removal
+   * took is then refused as the data plane opens.
    */
   private static admissionOrder(pending: HeldItem[]): HeldItem[] {
     if (!pending.some((item) => item.kept)) return pending;
