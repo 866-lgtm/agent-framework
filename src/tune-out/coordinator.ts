@@ -34,6 +34,9 @@ export const TUNE_OUT_DEFAULTS = {
  *  subconscious turn, and max-wakes counts invocations, not messages. */
 const WAKE_COALESCE_MS = 2_000;
 
+/** How long after an end time whose cancel threw the cancel is tried again. */
+const EXPIRY_RETRY_MS = 60_000;
+
 /** What a caught value says: an Error's message, or the value as a string. */
 function describeThrown(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -122,14 +125,22 @@ export class TuneOutCoordinator {
     const key = this.key(serverId, channelId);
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
-    armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
+    const hold = (timer: ReturnType<typeof setTimeout>): void => { this.expiryTimers.set(key, timer); };
+    const end = (): void => {
       try {
-        this.expiryTimers.delete(key);
-        this.cancel(serverId, channelId, 'duration', 'duration elapsed');
+        // The retry is armed before the cancel, as the cadence arms its next
+        // period before its turn, so a cancel that throws is tried again. A
+        // cancel that ends the tune-out clears it with the channel's other
+        // timers, and so does finding the tune-out already ended.
+        hold(setTimeout(end, EXPIRY_RETRY_MS));
+        if (!this.cancel(serverId, channelId, 'duration', 'duration elapsed').ok) {
+          this.clearTimers(serverId, channelId);
+        }
       } catch (err) {
         this.timerFailed('expiry', serverId, channelId, err);
       }
-    });
+    };
+    armAt(params.expiresAtMs, hold, end);
   }
 
   /** A timer callback's work threw. Report it on stderr and as a trace rather

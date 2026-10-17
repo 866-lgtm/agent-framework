@@ -65,6 +65,8 @@ function harness(
   const entered: TuneOutParams[] = [];
   /** The source of each cancel that ended a tune-out: 'duration' for an end time. */
   const cancels: string[] = [];
+  /** Every call to the registry's cancel, whatever came of it. */
+  let cancelCalls = 0;
   /** The reason of each inference requested, the subconscious's turns among them. */
   const inferences: string[] = [];
   const registry = {
@@ -75,6 +77,7 @@ function harness(
       state = { params, wakeCount: 0 };
     },
     cancelTuneOut: (_s: string, _c: string, _next: string, source: string) => {
+      cancelCalls++;
       throwIfSet('cancelTuneOut');
       const ended = state;
       state = null;
@@ -129,7 +132,7 @@ function harness(
   const stderrLines = () => stderr.mock.calls.map((c) => c.arguments as unknown[]);
   return {
     coordinator, entered, cancels, cadenceTurns, wakeTurns, delays, noTimerPastOne, endInRegistry, active,
-    failNext, timerFailures, ackFailures, notices, stderrLines,
+    failNext, timerFailures, ackFailures, notices, stderrLines, cancelCalls: () => cancelCalls,
   };
 }
 
@@ -470,20 +473,39 @@ it('a failed acknowledgement is written to stderr and traced, whatever it reject
   assert.deepEqual(h.stderrLines(), [['[tune-out] acknowledging m1 in #a on disc failed:', undefined]]);
 });
 
-it('an end time whose cancel throws stays in its timer and is reported', (t) => {
+it('an end time whose cancel throws after the registry ended the tune-out stays in its timer, is reported, and tries no more', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
   h.failNext();
   assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the cancel's error stays in the timer");
   assert.deepEqual(h.timerFailures(), [failure('expiry')]);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(h.cancelCalls(), 1, 'the registry ended it, so nothing tries again');
 });
 
-it("an end time whose registry cancel throws stays in its timer and is reported", (t) => {
+it('an end time whose registry cancel throws is reported, and the cancel is tried again a minute later', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
   h.failNext('cancelTuneOut');
   assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the cancel's error stays in the timer");
   assert.deepEqual(h.timerFailures(), [failure('expiry')]);
+  assert.equal(h.active(), true, 'still tuned out after the failed cancel');
+  t.mock.timers.tick(60_000 - 1);
+  assert.deepEqual(h.cancels, [], 'not before the minute');
+  t.mock.timers.tick(1);
+  assert.deepEqual(h.cancels, ['duration'], 'ended a minute later');
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(h.cancelCalls(), 2, 'and nothing tries again after it ended');
+});
+
+it('an end time that finds the tune-out already ended in the registry tries no more', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
+  h.endInRegistry();
+  t.mock.timers.tick(120_000);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(h.cancelCalls(), 1);
+  assert.deepEqual(h.timerFailures(), []);
 });
 
 it('a thrown value that is not an Error is reported as a string, even one with no string form', (t) => {
