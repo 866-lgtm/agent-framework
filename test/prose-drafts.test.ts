@@ -487,6 +487,37 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  for (const xml of [false, true]) {
+    it(`${xml ? 'XML tool mode' : 'native tool mode'}: a refused wake keeps only its own round private, so a later send's prose is held as drafts`, async () => {
+      // With no EventGate, skip_reply's wake_in_seconds is refused and the
+      // turn goes on: the silence before the refusal comes back at the next
+      // round, with why it silences, so the send's round is an explicit send's.
+      const h = await harness({ xml });
+      try {
+        const wake = call('w1', 'skip_reply', { reason: 'later', wake_in_seconds: 60 });
+        const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+        await h.turn([
+          createMockResponse([text('Private, beside the refused wake.'), wake], 'tool_use'),
+          createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+          // XML mode completes with the turn's whole content, as membrane
+          // parses it: each round's calls and then their results.
+          xml
+            ? { ...createMockResponse([text('Private, beside the refused wake.'), wake, done('w1'), text('Beside the send.'), explicitSend('s1'), done('s1'), text('After the send.')]), toolCalls: [] }
+            : createMockResponse([text('After the send.')]),
+        ]);
+        assert.match(h.toolResults()[0]!, /no wake was set/, 'the wake was refused, and the turn went on');
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
+        const held = h.drafts().reverse();
+        assert.deepEqual(held.map((d) => d.text), ['Beside the send.', 'After the send.'],
+          'the refused round stays private; the send\'s rounds are held, not kept private');
+        assert.ok(held.every((d) => d.reason === 'explicit-send'));
+        assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) held as drafts ')));
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
   it('disabled mode stays draft-free: its narration is private by configuration', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'disabled' }] });
     try {
