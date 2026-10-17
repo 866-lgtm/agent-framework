@@ -1097,14 +1097,17 @@ test('while the host stops, a failed gate lets out what a running connection hel
   }
   assert.deepEqual(delivered, []);
 
-  // closeAll has begun closing one of them: close() closes it for good.
-  await closing.close();
+  // closeAll has begun closing one of them, and that close is still under
+  // way while the gate is released and then failed: close() closes the
+  // connection for good as it starts.
+  const closed = closing.close();
   framework.releaseMcplDataPlaneGate(barrier);
   assert.deepEqual(delivered, ['running control'], 'only the running connection lets out its control traffic');
   await framework.failMcplDataPlaneGate(barrier, 'test sync', new Error('accounting failed'));
   assert.equal(framework.discordAwarenessBarrier, null, 'the stopping host released the failed gate');
   assert.deepEqual(delivered, ['running control', 'running data'],
-    'the running connection\'s held data reaches its listeners, and the closed one lets out nothing');
+    'the running connection\'s held data reaches its listeners, and the closing one lets out nothing');
+  await closed;
 });
 
 test('overlapping reconnect/list-change generations release only the newest barrier', async () => {

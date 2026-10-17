@@ -17520,7 +17520,8 @@ export class AgentFramework {
     // would start reconnects only for stop() to close them again. Release the
     // barrier instead, as a completed one is released: nothing waits on a
     // rejected barrier, and unless the host is quiesced, what the pause held
-    // back reaches the listeners' stopping refusal.
+    // back reaches the listeners' stopping refusal, except what a connection
+    // closed for good held, which stays held.
     if (this.queue?.isClosed) {
       this.completeMcplDataPlaneGate(barrier);
       return;

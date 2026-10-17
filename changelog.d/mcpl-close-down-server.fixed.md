@@ -19,18 +19,18 @@
   - When its Discord awareness accounting fails, it now fails that gate, as
     a failed reconnect, tools-list reconciliation,
     `syncDiscordAwarenessMarkers()` or `resume()` already does: each running
-    server is recycled, and its data flows once its reconnect's accounting
-    succeeds. A server without `reconnect: true` is closed for good there,
-    as on those paths. While the host is stopping, the gate is released
-    instead.
+    server is recycled, and its reconnect's own gate holds its data until
+    that reconnect's accounting succeeds. A server without `reconnect: true`
+    is closed for good there, as on those paths. While the host is stopping,
+    the gate is released instead.
   - When its policy registration throws after accounting succeeded, it now
     closes the new server for good, where it stayed connected and half
-    registered, and completes the gate, so the running servers' data flows
-    on with no recycle.
+    registered, and completes the gate, with no recycle.
 - `McplServerConnection.ready()` and `readyControlPlane()` now do nothing once
   the connection is closed for good: closed, with reconnect off, as after
-  `close()` or a drop with reconnect off. What it held stays held, where any
-  gate's completion let it out with no grant, as for a connection whose close
-  failed and so stayed registered. While the host stops, a connection being
-  closed no longer passes what it held to the stopping refusal; its server
-  learns of the close from the close itself.
+  `close()` or a drop with reconnect off. What it held stays held. Any gate's
+  completion used to pass the part of it that needs no grant to listeners,
+  as for a connection whose close failed and so stayed registered. While the
+  host stops, a connection closed for good, such as one being closed, no
+  longer passes what it held to the stopping refusal, whose answers can't be
+  sent on a closed connection.

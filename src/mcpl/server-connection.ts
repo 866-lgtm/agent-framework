@@ -350,9 +350,13 @@ export class McplServerConnection extends EventEmitter {
    * construction (when setupMessageRouting starts emitting) and now (when
    * the caller has attached listeners via wireMcplEvents).
    *
-   * Does nothing once the connection is closed for good: its policy was
-   * reset when it closed, so what it held would flow with no grant, and its
-   * server learns of the close from the close itself.
+   * Does nothing once the connection is closed for good. Its policy was reset
+   * when it closed, so what it held that needs a grant would be refused, and a
+   * closed connection sends no response, so nothing it held could be answered.
+   * Only what needs no grant would pass, to listeners of a server that won't
+   * be served again. A connection between retries isn't closed for good: what
+   * it held, such as a reconnect stub's connect-failed, still reaches its
+   * listeners.
    */
   ready(): void {
     if (this.closedForGood) return;
