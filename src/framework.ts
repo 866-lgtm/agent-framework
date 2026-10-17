@@ -1652,6 +1652,10 @@ export class AgentFramework {
    * clear failed, or a quiesce whose write failed partway, memory can say
    * serving while the record says quiesced, until a resume() clears it. */
   private hostModeRecordMayBeQuiesced = false;
+  /** Whether a resume() is between serving and clearing the record: it has
+   * cleared `quiesced` and is flushing the deferred writes, then clearing the
+   * record. A resume() on the serving host leaves the record to it. */
+  private resumeInFlight = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
   private traceListeners: TraceRegistration[] = [];
@@ -4801,9 +4805,14 @@ export class AgentFramework {
 
   private async runResume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     if (!this.quiesced) {
-      // A resume whose record clear failed left memory serving and the record
-      // quiesced: a retry clears the record, rather than answer as if it had.
-      if (this.hostModeRecordMayBeQuiesced) {
+      // A resume whose record clear failed, or a quiesce whose write failed
+      // partway, can leave memory serving and the record quiesced: this
+      // resume clears the record, rather than answer as if it had. It
+      // writes the store, so it waits out a surgery as the clear below does,
+      // and it leaves the record to a resume() still flushing, which clears
+      // it once its flush is done.
+      if (this.hostModeRecordMayBeQuiesced && !this.resumeInFlight) {
+        this.refuseResumeUnderSurgery();
         this.persistHostMode(null);
         this.hostModeRecordMayBeQuiesced = false;
       }
@@ -4883,6 +4892,7 @@ export class AgentFramework {
     this.lastUnabandonable = [];
     this.eventGate?.setQuiesced(false);
 
+    this.resumeInFlight = true;
     try {
       // Flush context writes deferred by the quiesce window (module events,
       // api message.send) — with no turn alive there is no other flush
@@ -4892,6 +4902,7 @@ export class AgentFramework {
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
     } finally {
+      this.resumeInFlight = false;
       // Reopen MCPL data planes through the existing barrier funnel — NOT a
       // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
       // nested-install guard (a flushed tools-list-changed can install a
@@ -5870,6 +5881,7 @@ export class AgentFramework {
 
   /** Persist (or clear, with null) the host quiesce mode: in the recovery file
    * when there's a path for one, and in framework/state's hostMode otherwise.
+   * (A boot with a path reads that legacy hostMode only while no file exists.)
    * Quiesce survives a restart BY DESIGN — a crash mid-surgery must come back
    * up NOT serving against a half-repaired store. Resume is always reachable
    * (public method, WS/HTTP, control-plane host/command), and every quiesced
@@ -5904,7 +5916,9 @@ export class AgentFramework {
       this.store.setStateJson(FRAMEWORK_STATE_ID, state);
       // Here the store is the record, and the whole feature rests on it
       // surviving a crash: until the store syncs it isn't durable, so a sync
-      // that fails is a write that failed, and quiesce() or resume() rejects.
+      // that fails fails quiesce() or resume(). The write is already in the
+      // store's log, unsynced, so it can still reach disk, which is why
+      // runQuiesce marks the record as possibly quiesced before it writes.
       this.store.sync();
       return;
     }

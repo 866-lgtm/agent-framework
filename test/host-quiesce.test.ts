@@ -405,8 +405,15 @@ test("a resume whose record clear fails rejects with the record still quiesced, 
         });
         assert.equal(h.framework.getHostModeStatus().quiesced, false, `${label}: resume() serves before it clears the record`);
         assert.equal(h.recorded(), true, `${label}: the record still says quiesced`);
+        // A retry whose clear fails too rejects, and the clear is still owed.
+        await withFailingHostModeWrite(async () => {
+          await assert.rejects(h.framework.resume(), {
+            message: where === 'store only' ? 'injected EIO writing framework/state' : 'injected EACCES writing host-mode.json',
+          });
+        });
+        assert.equal(h.recorded(), true, `${label}: a retry whose clear fails leaves the record quiesced`);
         await h.framework.resume();
-        assert.notEqual(h.recorded(), true, `${label}: the retried resume() clears the record`);
+        assert.notEqual(h.recorded(), true, `${label}: the next retried resume() clears the record`);
         // Cleared, a resume() on the serving host writes nothing, so a failing write doesn't reach it.
         await withFailingHostModeWrite(() => h.framework.resume().then(() => {}));
         await h.restart();
@@ -414,6 +421,70 @@ test("a resume whose record clear fails rejects with the record still quiesced, 
       } finally {
         await h.close();
       }
+    }
+  }
+});
+
+test("a resume() that would clear the record of a serving host waits out a surgery, as resume() does on a quiesced one", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    const h = await hostModeFixture(where);
+    const internals = h.framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    try {
+      await h.framework.quiesce({ reason: 'surgery' });
+      await withFailingHostModeWrite(async () => {
+        await assert.rejects(h.framework.resume());
+      });
+      assert.equal(h.recorded(), true, `${where}: the record still says quiesced`);
+      internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+      try {
+        await assert.rejects(h.framework.resume(), {
+          message: 'Cannot resume: a live rollback for agent holds the store — retry when it completes',
+        });
+        assert.equal(h.recorded(), true, `${where}: refused, it writes nothing`);
+      } finally {
+        internals.surgeryHold = null;
+      }
+      await h.framework.resume();
+      assert.notEqual(h.recorded(), true, `${where}: once the surgery is done, resume() clears the record`);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("a resume() during another resume()'s flush leaves the record to it, and it clears the record once its flush is done", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    const h = await hostModeFixture(where);
+    try {
+      await h.framework.quiesce({ reason: 'surgery' });
+      (h.framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'deferred' }]);
+      // Hold the first resume() in its flush of the deferred writes.
+      const internals = h.framework as unknown as { flushDeferredWrites(reason: string): Promise<unknown> };
+      const flush = internals.flushDeferredWrites.bind(h.framework);
+      let entered!: () => void;
+      const inFlush = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      internals.flushDeferredWrites = async (reason: string) => { entered(); await held; return flush(reason); };
+      const first = h.framework.resume();
+      try {
+        // A first resume() that settles without reaching its flush doesn't leave the test waiting here.
+        await Promise.race([inFlush, first.then(() => {}, () => {})]);
+        const status = await h.framework.resume();
+        assert.equal(status.quiesced, false, `${where}: the second resume() answers serving`);
+        assert.equal(h.recorded(), true, `${where}: and leaves the record to the first, mid-flush`);
+      } finally {
+        // Released whatever the assertions found, so stop() isn't left waiting on the first resume().
+        release();
+        await first.catch(() => {});
+      }
+      await first;
+      assert.notEqual(h.recorded(), true, `${where}: the first clears it once its flush is done`);
+      const texts = h.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .map((m) => (m.content[0] as { text?: string } | undefined)?.text);
+      assert.ok(texts.includes('deferred'), `${where}: and its flush landed the deferred write`);
+    } finally {
+      await h.close();
     }
   }
 });
