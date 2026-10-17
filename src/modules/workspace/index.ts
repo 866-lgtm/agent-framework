@@ -1159,7 +1159,8 @@ export class WorkspaceModule implements Module {
           + 'still on disk); not-in-branch (on disk, absent from this branch\'s workspace); disk-only (binary or over '
           + 'the size limit, never stored — shown with size and image type); conflict, with its kind (disk and the '
           + 'workspace both changed; disk holds a different copy and nothing records which is newer; or a write was '
-          + 'interrupted) — sync the path to take disk, or materialize that path with force to take the workspace; '
+          + 'interrupted) — sync the path to take disk, or materialize that path with force to take the workspace, '
+          + 'with applyDeletions too where the workspace deleted it; '
           + 'disk-missing-provenance-unknown; unverified (disk could not be checked). `incomplete` names regions '
           + 'the listing could not see.',
         inputSchema: {
@@ -2305,16 +2306,27 @@ export class WorkspaceModule implements Module {
         const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op);
         // Which copy the edit used, when it isn't the one the workspace last
         // agreed on with disk: disk's newer text, or the workspace's copy
-        // because disk's couldn't be read. A file the workspace didn't hold
-        // has no older copy, so taking it in needs no word.
+        // because disk's couldn't be read or disk has none. A file the
+        // workspace didn't hold has no older copy, so taking it in needs no
+        // word.
         const whichCopy = (verb: string): string | null => took('modified')
           ? `Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit ${verb} that text.`
           : report?.state === 'unverified'
             ? `The path couldn't be checked against disk (${report.note ?? 'not observed'}), so the edit ${verb} the workspace's copy.`
-            : null;
-        const lookedIn = whichCopy('looked in');
-        const suffix = lookedIn !== null ? ` ${lookedIn}` : '';
-        appliedNote = whichCopy('applied to');
+            : report?.state === 'disk-missing-provenance-unknown'
+              ? `Disk has no copy of this file, and nothing records whether it was deleted there, so the edit ${verb} the workspace's copy.`
+              : null;
+        // A mount that doesn't push keeps a conflict until materialize or
+        // sync settles it, so the edit says so, whether or not it applied.
+        const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
+        const conflictNote = (where: string): string | null => conflict === null ? null
+          : `The path is in conflict with disk (${conflict}): the edit ${where} the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.`;
+        const suffix = [whichCopy('looked in'), conflictNote('looked in')].filter((n) => n !== null).map((n) => ` ${n}`).join('');
+        // The edit makes the path the workspace's own change (commitToolChange),
+        // so a file disk lacks goes back to disk with the next push of it.
+        appliedNote = report?.state === 'disk-missing-provenance-unknown'
+          ? `${whichCopy('applied to')} It goes back to disk when the path is materialized; if it was deleted there on purpose, delete it here too.`
+          : whichCopy('applied to');
 
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
@@ -2373,15 +2385,7 @@ export class WorkspaceModule implements Module {
         }, () => { committed = true; });
         if (refused !== null) return storedButUnfinished('edit', input.path, { refused }, appliedNote);
 
-        // A mount that doesn't push keeps a conflict until materialize or
-        // sync settles it, so the edit says so.
-        const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
-        const notes = [
-          ...(appliedNote !== null ? [appliedNote] : []),
-          ...(conflict !== null
-            ? [`The path is in conflict with disk (${conflict}): the edit is in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.`]
-            : []),
-        ];
+        const notes = [appliedNote, conflictNote('is in')].filter((n): n is string => n !== null);
         return {
           success: true,
           data: {
@@ -3272,10 +3276,9 @@ const LONE_SURROGATE = /\p{Cs}/u;
  * entry threw. It stays an error, since part of the call failed, but it leads
  * with what the caller must know before acting on it: the change is stored,
  * and sending it again could apply it twice. The push's reason says what disk
- * holds and the way out, as materialize takes it. `inChronicle` says the
- * call's change is in Chronicle (for a deletion, the file's removal), so a
- * script can tell it from a call that changed nothing, as writeBinary's
- * answer does. An edit's note on which copy it applied to comes last.
+ * holds and the way out, as materialize takes it. The text carries all of it,
+ * since an error's data reaches neither the model nor a code_execution
+ * script. An edit's note on which copy it applied to comes last.
  */
 function storedButUnfinished(
   tool: 'write' | 'edit' | 'delete',
@@ -3289,7 +3292,7 @@ function storedButUnfinished(
   const rest = 'refused' in outcome
     ? ` Its push to disk didn't complete: ${outcome.refused}.`
     : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
-  return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : ''), data: { inChronicle: true, path } };
+  return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : '') };
 }
 
 /**

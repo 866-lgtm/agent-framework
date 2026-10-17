@@ -356,7 +356,7 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
   }
   // A deletion below a file finds nothing there to unlink, so only a write
   // meets this one.
-  if (reason === 'a parent path is not a directory' && !deletion) {
+  if (reason === 'a parent path is not a directory') {
     return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
       'move or remove it on disk and materialize again, or write the file under another path';
   }
@@ -364,16 +364,21 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
 }
 
 /**
- * Whether a forced push gets past what kept a disk copy from being verified:
- * a file the module can't read, which a forced write overwrites where disk
- * lets it be written and a forced deletion unlinks, and, for a deletion,
- * what isn't a regular file, which unlinking removes. A forced push stops at
- * the rest too (a symlink the mount doesn't follow, a FIFO for a write, a
- * parent it can't use), or isn't known to pass them, so their refusal names
- * only fixing it.
+ * The forced way out the refusal of a disk copy that couldn't be verified
+ * names, if any. A forced push skips the verification, so it gets past the
+ * note only where its effect can go on. A file the module can't read (EACCES)
+ * is overwritten, or unlinked, where disk lets the workspace write it, or
+ * unlink it, which a read's EACCES doesn't show: force is named on that
+ * condition. What isn't a regular file is unlinked by a forced deletion. No
+ * other note names force: a forced push stops at some (a symlink the mount
+ * doesn't follow, a FIFO for a write, a parent it can't use); another writer
+ * still at the file ("the file changed while it was read") is answered by
+ * materializing again; and the rest aren't known to pass.
  */
-function forcePasses(note: string | undefined, deletion: boolean): boolean {
-  return note === 'cannot open (EACCES)' || (deletion && note === 'not a regular file');
+function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
+  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (deletion && note === 'not a regular file') return `, or ${forced}`;
+  return '';
 }
 
 /**
@@ -1107,10 +1112,14 @@ export async function pushPaths(
       if (!opts.force) {
         result.skipped.push({
           path,
-          // Fixing it holds for every note; force is named only where a
-          // forced push gets past what the note names.
-          reason: inTheWay(v.note, !s) ??
-            `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcePasses(v.note, !s) ? `, or ${forced}` : ''}`,
+          // An intent that can't be read is the one note fixing doesn't
+          // answer: nothing is decided over it until a sync of the path
+          // replaces it (decide()). For the rest, fixing what the note names
+          // holds, and forcedWay says where force does too.
+          reason: bi?.unreadable !== undefined
+            ? `${v.note} — sync this path to adopt the disk version, which replaces the intent`
+            : inTheWay(v.note, !s) ??
+              `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcedWay(v.note, !s, forced)}`,
         });
         continue;
       }

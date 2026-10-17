@@ -4,7 +4,7 @@
 import { spawnSync } from 'node:child_process';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -119,7 +119,7 @@ test("a call whose input doesn't fit its tool's schema does nothing", async (t) 
   assert.equal(disk('u.txt')!.toString(), 'keep a\n');
 });
 
-test('a write, edit or delete that is stored but refused by disk says so, with inChronicle', async (t) => {
+test('a write, edit or delete that is stored but refused by disk says so, in its text alone', async (t) => {
   const { dir, call, disk, stored } = setup(t, { autoMaterialize: true });
 
   // A write over a disk change the workspace hasn't seen.
@@ -128,7 +128,7 @@ test('a write, edit or delete that is stored but refused by disk says so, with i
   writeFileSync(join(dir, 'w.txt'), 'v2 from another writer\n');
   const write = await call('write', { path: 'work/w.txt', content: 'v3 agent\n' });
   assert.match(errorOf(write), /^The write of "work\/w\.txt" is stored in the workspace, so don't send it again\. Its push to disk didn't complete: stale copy: disk changed since it last agreed with the workspace \(conflict: both-changed\) — sync this path to adopt the disk version, or materialize it with force to overwrite it\.$/);
-  assert.deepEqual(write.data, { inChronicle: true, path: 'work/w.txt' });
+  assert.equal(write.data, undefined, "an error's data reaches neither the model nor a script");
   assert.equal(await stored('w.txt'), 'v3 agent\n');
   assert.equal(disk('w.txt')!.toString(), 'v2 from another writer\n');
 
@@ -138,7 +138,7 @@ test('a write, edit or delete that is stored but refused by disk says so, with i
   linkSync(join(dir, 'h.txt'), join(dir, 'h2.txt'));
   const edit = await call('edit', { path: 'work/h.txt', oldString: 'shared', newString: 'shared, edited' });
   assert.match(errorOf(edit), /^The edit of "work\/h\.txt" is stored in the workspace, so don't send it again: a second edit can apply the change twice\. Its push to disk didn't complete: not written: a file with other hard links/);
-  assert.deepEqual(edit.data, { inChronicle: true, path: 'work/h.txt' });
+  assert.equal(edit.data, undefined);
   assert.equal(await stored('h.txt'), 'shared, edited\n');
   assert.equal(disk('h2.txt')!.toString(), 'shared\n');
   // Why the answer says not to send it again: the edit's text is still there
@@ -152,7 +152,7 @@ test('a write, edit or delete that is stored but refused by disk says so, with i
   writeFileSync(join(dir, 'd.txt'), 'changed on disk\n');
   const del = await call('delete', { path: 'work/d.txt' });
   assert.match(errorOf(del), /^The deletion of "work\/d\.txt" is stored in the workspace, so don't send it again\. Its push to disk didn't complete: stale copy: disk changed since it last agreed with the workspace \(conflict: [a-z-]+\) — sync this path to adopt the disk version, or materialize it with force and applyDeletions to delete it\.$/);
-  assert.deepEqual(del.data, { inChronicle: true, path: 'work/d.txt' });
+  assert.equal(del.data, undefined);
   assert.equal(disk('d.txt')!.toString(), 'changed on disk\n');
 });
 
@@ -169,13 +169,13 @@ test('a write, edit or delete that throws after its tree entry is set says the c
   try {
     const write = await call('write', { path: 'work/w.txt', content: 'new\n' });
     assert.equal(errorOf(write), 'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. The rest of the call failed: injected intent exception. ls shows the path\'s state.');
-    assert.deepEqual(write.data, { inChronicle: true, path: 'work/w.txt' });
+    assert.equal(write.data, undefined);
     const edit = await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' });
     assert.match(errorOf(edit), /^The edit of "work\/e\.txt" is stored in the workspace, so don't send it again: a second edit can apply the change twice\. The rest of the call failed: injected intent exception\. ls shows the path's state\.$/);
-    assert.deepEqual(edit.data, { inChronicle: true, path: 'work/e.txt' });
+    assert.equal(edit.data, undefined);
     const del = await call('delete', { path: 'work/d.txt' });
     assert.match(errorOf(del), /^The deletion of "work\/d\.txt" is stored in the workspace, so don't send it again\. The rest of the call failed: injected intent exception\. ls shows the path's state\.$/);
-    assert.deepEqual(del.data, { inChronicle: true, path: 'work/d.txt' });
+    assert.equal(del.data, undefined);
   } finally {
     intents.update = update;
   }
@@ -263,6 +263,9 @@ test('an edit of a draft whose disk copy also changed applies to the draft and n
   assert.equal((await call('write', { path: 'work/k.txt', content: 'agent draft\n' })).success, true);
   writeFileSync(join(dir, 'k.txt'), 'another writer\n');
 
+  // A miss says so too: the text the agent sought may be disk's.
+  assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'another', newString: 'x' })),
+    "String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
   const edit = await call('edit', { path: 'work/k.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
   assert.equal((edit.data as { note: string }).note,
@@ -373,7 +376,6 @@ test('a write, edit or delete that fails before its change is stored answers onl
     for (const [name, input] of calls) {
       const result = await call(name, input);
       assert.equal(errorOf(result), 'injected before the entry', name);
-      assert.equal((result.data as { inChronicle?: boolean } | undefined)?.inChronicle, undefined, name);
     }
   } finally {
     ws.withMount = withMount;
@@ -441,6 +443,7 @@ test("an edit of a file disk made binary answers the disk-only text, not a delet
   writeFileSync(join(dir, 'b.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
   assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'text', newString: 'x' })),
     'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+  assert.deepEqual([...readFileSync(join(dir, 'b.txt'))], [0, 1, 2, 0, 255, 0], 'disk keeps its bytes');
 });
 
 test('a deletion of a draft that met a disk file the workspace never saw names applyDeletions', async (t) => {
@@ -463,6 +466,7 @@ test("a forced deletion over a directory says no push unlinks one", async (t) =>
   assert.match(errorOf(await call('delete', { path: 'work/gone.txt' })), /^The deletion of "work\/gone\.txt" is stored in the workspace/);
   const forced = await call('materialize', { path: 'work/gone.txt', force: true, applyDeletions: true });
   assert.match(JSON.stringify(forced.data), /not unlinked: disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk/);
+  assert.equal(statSync(join(dir, 'gone.txt')).isDirectory(), true, 'the directory stays');
 });
 
 test("a write over a FIFO is told to fix it and materialize again, with no force", async (t) => {
@@ -470,4 +474,94 @@ test("a write over a FIFO is told to fix it and materialize again, with no force
   assert.equal(spawnSync('mkfifo', [join(dir, 'p.txt')]).status, 0, 'mkfifo');
   assert.equal(errorOf(await call('write', { path: 'work/p.txt', content: 'x\n' })), 'The write of "work/p.txt" is stored in the workspace, so don\'t send it again. '
     + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — fix it and materialize again.");
+  assert.equal(statSync(join(dir, 'p.txt')).isFIFO(), true, 'the FIFO stays');
 });
+
+// ---------------------------------------------------------------------------
+// The fix round of the third review (af-ws-fix-r2)
+// ---------------------------------------------------------------------------
+
+test("a write over a symlink the mount doesn't follow is told to fix it, with no force", async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'target.txt'), 'target\n');
+  symlinkSync('target.txt', join(dir, 'l.txt'));
+  assert.equal(errorOf(await call('write', { path: 'work/l.txt', content: 'x\n' })), 'The write of "work/l.txt" is stored in the workspace, so don\'t send it again. '
+    + "Its push to disk didn't complete: cannot verify disk copy (a symlink, which this mount does not follow) — fix it and materialize again.");
+  assert.equal(lstatSync(join(dir, 'l.txt')).isSymbolicLink(), true, 'the link stays');
+  assert.equal(readFileSync(join(dir, 'target.txt'), 'utf8'), 'target\n');
+});
+
+test('a disk copy the workspace cannot read is offered force on the condition force needs', async (t) => {
+  const { dir, call } = setup(t, { autoMaterialize: true });
+  for (const name of ['r.txt', 'n.txt', 's.txt']) writeFileSync(join(dir, name), 'v1\n');
+  for (const name of ['r.txt', 'n.txt', 's.txt']) assert.equal((await call('read', { path: `work/${name}` })).success, true);
+  chmodSync(join(dir, 'r.txt'), 0o200);
+  chmodSync(join(dir, 'n.txt'), 0o000);
+  chmodSync(join(dir, 's.txt'), 0o200);
+  t.after(() => { for (const name of ['r.txt', 'n.txt']) if (existsSync(join(dir, name))) chmodSync(join(dir, name), 0o600); });
+  try {
+    readFileSync(join(dir, 'r.txt'));
+    t.skip('this user can read a mode-0200 file (Windows or root)');
+    return;
+  } catch { /* unreadable, as intended */ }
+
+  const writeRefusal = (path: string): string => `The write of "work/${path}" is stored in the workspace, so don't send it again. `
+    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (EACCES)) — fix it and materialize again, "
+    + 'or, if disk lets the workspace write the file, materialize it with force to overwrite it.';
+  assert.equal(errorOf(await call('write', { path: 'work/r.txt', content: 'v2\n' })), writeRefusal('r.txt'));
+  assert.equal(errorOf(await call('write', { path: 'work/n.txt', content: 'v2\n' })), writeRefusal('n.txt'));
+  // Force gets past the read where disk lets the file be written, and not
+  // where it doesn't, which is why the offer carries its condition.
+  const forced = await call('materialize', { force: true });
+  assert.equal(forced.success, true, forced.error);
+  assert.match(JSON.stringify(forced.data), /n\.txt: not written: [^"]*EACCES/);
+  chmodSync(join(dir, 'r.txt'), 0o600);
+  chmodSync(join(dir, 'n.txt'), 0o600);
+  assert.equal(readFileSync(join(dir, 'r.txt'), 'utf8'), 'v2\n');
+  assert.equal(readFileSync(join(dir, 'n.txt'), 'utf8'), 'v1\n');
+
+  // A deletion's forced unlink needs its directory, not the file's own
+  // permissions: this one unlinks it.
+  assert.equal(errorOf(await call('delete', { path: 'work/s.txt' })), 'The deletion of "work/s.txt" is stored in the workspace, so don\'t send it again. '
+    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (EACCES)) — fix it and materialize again with applyDeletions, "
+    + 'or, if disk lets the workspace unlink the file, materialize it with force and applyDeletions to delete it.');
+  const unlinked = await call('materialize', { path: 'work/s.txt', force: true, applyDeletions: true });
+  assert.equal(unlinked.success, true, unlinked.error);
+  assert.equal(existsSync(join(dir, 's.txt')), false, 'the forced materialize unlinked it');
+});
+
+test("a path whose branch intent can't be read is told to sync the path, which replaces the intent", async (t) => {
+  const { store, dir, call } = setup(t);
+  writeFileSync(join(dir, 'u.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
+  const junk = Buffer.from('not an intent');
+  store.treeSet('workspace/work/intent', 'u.txt', { blobHash: store.storeBlob(junk, 'text/plain'), size: junk.byteLength, mode: 0o644 });
+  const refused = await call('materialize', { path: 'work/u.txt' });
+  assert.match(JSON.stringify(refused.data),
+    /u\.txt: its branch intent can't be read: its record is not a branch intent — sync this path to adopt the disk version, which replaces the intent/);
+  const synced = await call('sync', { path: 'work/u.txt' });
+  assert.equal(synced.success, true, synced.error);
+  const again = await call('materialize', { path: 'work/u.txt' });
+  assert.equal(again.success, true, again.error);
+  assert.doesNotMatch(JSON.stringify(again.data), /branch intent/, 'the sync replaced it');
+});
+
+for (const autoMaterialize of [false, true]) {
+  test(`an edit of a file disk lacks, with nothing to say whether disk deleted it, says so, ${autoMaterialize ? 'and its push writes it back' : 'and a materialize writes it back'}`, async (t) => {
+    const { store, call, disk } = setup(t, { autoMaterialize });
+    // An entry from before the evidence (as three-way's legacyEntry makes it).
+    const bytes = Buffer.from('legacy line\n');
+    store.treeSet('workspace/work/tree', 'l.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+    const edit = await call('edit', { path: 'work/l.txt', oldString: 'legacy', newString: 'edited' });
+    assert.equal(edit.success, true, edit.error);
+    assert.equal((edit.data as { note?: string }).note,
+      "Disk has no copy of this file, and nothing records whether it was deleted there, so the edit applied to the workspace's copy. "
+      + 'It goes back to disk when the path is materialized; if it was deleted there on purpose, delete it here too.');
+    if (!autoMaterialize) {
+      assert.equal(disk('l.txt'), null, "a mount that doesn't push leaves disk as it was");
+      const materialized = await call('materialize', {});
+      assert.equal(materialized.success, true, materialized.error);
+    }
+    assert.equal(disk('l.txt')!.toString(), 'edited line\n');
+  });
+}
