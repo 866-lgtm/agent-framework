@@ -250,6 +250,31 @@ function captureRouting(framework: AgentFramework) {
   return routed;
 }
 
+/**
+ * XML tool mode, as an older membrane streams it: no round carries its
+ * verbatim roundContent, so none is routed live, and the turn-end completion
+ * holds the cumulative tool round, its prose, its call and its result, as
+ * XML mode parses them, before the final text.
+ */
+function asXmlTurn(membrane: MockMembrane, call: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }): void {
+  const streamYielding = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (request, options) => {
+    const stream = streamYielding(request, options);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        if (event.type === 'tool-calls') {
+          yield { ...event, context: { ...event.context, roundContent: undefined } };
+        } else if (event.type === 'complete') {
+          const round = [{ type: 'text' as const, text: 'Public round prose' }, call, { type: 'tool_result' as const, toolUseId: call.id, content: 'result' }];
+          yield { ...event, response: { ...event.response, content: [...round, ...event.response.content] } };
+        } else yield event;
+      }
+    };
+    return stream;
+  };
+}
+
 for (const fallback of [false, true]) {
   for (const name of ['skip_reply', 'think', 'channel_publish']) {
     for (const permitted of [false, true]) {
@@ -258,26 +283,7 @@ for (const fallback of [false, true]) {
         try {
           const routed = captureRouting(h.framework);
           const call = { type: 'tool_use' as const, id: 'disposition', name, input: { reason: 'test', content: 'test' } };
-          if (fallback) {
-            const streamYielding = h.membrane.streamYielding.bind(h.membrane);
-            h.membrane.streamYielding = (request, options) => {
-              const stream = streamYielding(request, options);
-              const iterate = stream[Symbol.asyncIterator].bind(stream);
-              stream[Symbol.asyncIterator] = async function* () {
-                for await (const event of { [Symbol.asyncIterator]: iterate }) {
-                  if (event.type === 'tool-calls') {
-                    yield { ...event, context: { ...event.context, roundContent: undefined } };
-                  } else if (event.type === 'complete') {
-                    // Older membrane completion contains the cumulative tool round:
-                    // its prose, its call and its result, as XML mode parses them.
-                    const round = [{ type: 'text' as const, text: 'Public round prose' }, call, { type: 'tool_result' as const, toolUseId: call.id, content: 'result' }];
-                    yield { ...event, response: { ...event.response, content: [...round, ...event.response.content] } };
-                  } else yield event;
-                }
-              };
-              return stream;
-            };
-          }
+          if (fallback) asXmlTurn(h.membrane, call);
           h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
           h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
           h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
@@ -289,12 +295,14 @@ for (const fallback of [false, true]) {
             assert.ok(routed.includes('Public trailing prose'), 'a refused call silences nothing after its round');
             if (name === 'channel_publish') {
               // A refused send posted nothing, so it has nothing to keep from repeating.
-              if (!fallback) assert.ok(routed.includes('Public round prose'), "a refused send's round goes out");
+              assert.ok(routed.includes('Public round prose'), "a refused send's round goes out");
             } else if (name === 'skip_reply') {
               // The model's choice to keep its words private holds without the call's effect.
               assert.ok(!routed.includes('Public round prose'),
                 `a refused skip_reply keeps its own round private${fallback ? ', dropped by its place at turn end' : ''}`);
             } else if (!fallback) {
+              // Where rounds are routed live, the private same-round policy
+              // reads a refused think as it reads a permitted one.
               assert.ok(!routed.includes('Public round prose'), 'a refused think keeps its round private under the private same-round policy');
             }
           } else if (name === 'think') {
@@ -309,6 +317,63 @@ for (const fallback of [false, true]) {
   }
 }
 
+
+test("XML tool mode: a refused think's round goes as a permitted think's does", async () => {
+  const dispositions: string[][] = [];
+  for (const permitted of [true, false]) {
+    const h = await harness({ allowedTools: permitted ? ['think'] : [], sameRoundThinkTextPolicy: 'private' });
+    try {
+      const routed = captureRouting(h.framework);
+      const call = { type: 'tool_use' as const, id: 'think', name: 'think', input: { thought: 'test' } };
+      asXmlTurn(h.membrane, call);
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      await h.framework.runUntilIdle();
+      const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean }>;
+      assert.equal(results[0].isError === true, !permitted);
+      dispositions.push(routed);
+    } finally { await h.close(); }
+  }
+  assert.deepEqual(dispositions[1], dispositions[0], 'the refusal changes nothing about which prose goes out');
+});
+
+test("explicit prose routing: a refused skip_reply's round stays private, and what follows goes on as unprefixed prose does", async () => {
+  const h = await harness({ allowedTools: [], proseRouting: 'explicit' });
+  try {
+    const routed = captureRouting(h.framework);
+    const bounced: number[] = [];
+    h.framework.onTrace((e) => {
+      const ev = e as { type: string; source?: string };
+      if (ev.type === 'message:added' && ev.source === 'prose-bounce') bounced.push(1);
+    });
+    h.membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Private round prose' },
+      { type: 'tool_use', id: 'skip', name: 'skip_reply', input: { reason: 'quiet' } },
+    ], 'tool_use'));
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Unprefixed trailing prose' }]));
+    // A bounce wakes the agent again, and a stream takes the responses queued
+    // when it starts: answer each later turn privately as it starts.
+    let turns = 0;
+    h.framework.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:started') return;
+      if (++turns >= 2) h.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply\nnoted' }]));
+    });
+    const firstTurn: Array<NonNullable<typeof h.membrane.lastStream>> = [];
+    const streamYielding = h.membrane.streamYielding.bind(h.membrane);
+    h.membrane.streamYielding = (request, options) => {
+      const stream = streamYielding(request, options);
+      if (firstTurn.length === 0) firstTurn.push(h.membrane.lastStream!);
+      return stream;
+    };
+    h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+    await h.framework.runUntilIdle();
+    const results = firstTurn[0]!.receivedToolResults[0] as Array<{ isError?: boolean }>;
+    assert.equal(results[0].isError, true);
+    assert.deepEqual(routed, [], 'nothing is delivered');
+    assert.equal(bounced.length, 1, "only the trailing round's unprefixed prose bounces; the refused skip_reply's round stays in context");
+  } finally { await h.close(); }
+});
 
 test("a refused skip_reply beside a refused send keeps its round private, and neither silences what follows", async () => {
   const h = await harness({ allowedTools: [] });
@@ -336,24 +401,7 @@ for (const fallback of [false, true]) {
       const routed = captureRouting(h.framework);
       assert.equal((h.framework as unknown as { eventGate?: unknown }).eventGate ?? undefined, undefined, 'no EventGate');
       const call = { type: 'tool_use' as const, id: 'wake', name: 'skip_reply', input: { reason: 'later', wake_in_seconds: 60 } };
-      if (fallback) {
-        const streamYielding = h.membrane.streamYielding.bind(h.membrane);
-        h.membrane.streamYielding = (request, options) => {
-          const stream = streamYielding(request, options);
-          const iterate = stream[Symbol.asyncIterator].bind(stream);
-          stream[Symbol.asyncIterator] = async function* () {
-            for await (const event of { [Symbol.asyncIterator]: iterate }) {
-              if (event.type === 'tool-calls') {
-                yield { ...event, context: { ...event.context, roundContent: undefined } };
-              } else if (event.type === 'complete') {
-                const round = [{ type: 'text' as const, text: 'Public round prose' }, call, { type: 'tool_result' as const, toolUseId: call.id, content: 'result' }];
-                yield { ...event, response: { ...event.response, content: [...round, ...event.response.content] } };
-              } else yield event;
-            }
-          };
-          return stream;
-        };
-      }
+      if (fallback) asXmlTurn(h.membrane, call);
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
       h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });

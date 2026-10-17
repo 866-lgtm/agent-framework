@@ -165,8 +165,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * another external message is injected. The suppression prevents a
  * `send_message` followed by "sent it" from double-posting, but a new message
  * starts a new conversational round and must be answerable with plain prose.
- * `skip_reply` ends the turn at the tool-result boundary, unless it's refused
- * (wake_in_seconds without an EventGate): then the turn goes on, and only its
+ * `skip_reply` ends the turn at the tool-result boundary, unless it's refused,
+ * because the agent's allowedTools doesn't name it or because it asks for
+ * wake_in_seconds without an EventGate: then the turn goes on, and only its
  * own round stays silent.
  */
 const SILENCING_TOOLS = new Set([
@@ -13091,7 +13092,7 @@ export class AgentFramework {
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
               if (event.calls.some((c) => isSilencingTool(c.name)
-                && (this.canAgentUseTool(agent.name, c.name) || bareToolName(c.name) === 'skip_reply'))) {
+                && (this.canAgentUseTool(agent.name, c.name) || refusedSkipReply(c)))) {
                 turnSilenced = true;
               }
               if (roundContent && roundContent.length > 0) {
