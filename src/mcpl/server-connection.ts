@@ -955,7 +955,8 @@ export class McplServerConnection extends EventEmitter {
     const attempt = Promise.resolve().then(async () => {
       // An already opened handshake owns a transport too. It hands that
       // transport back without admission once reconnect has been disabled.
-      // The registry bounds this wait; retry reuses this real close attempt.
+      // Only the registry's closeAll bounds its caller's wait for this; retry
+      // reuses this real close attempt.
       if (this.reconnectPromise) await this.reconnectPromise;
       if (this.transport) await this.transport.close();
       this.closeIncomplete = false;
