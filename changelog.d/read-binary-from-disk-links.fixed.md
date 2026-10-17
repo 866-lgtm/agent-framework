@@ -1,0 +1,1 @@
+- `WorkspaceModule.readBinaryFromDisk` could read outside its mount through a symlink: it followed one at the path or among the directories on its way, wherever it led, whatever the mount's `followSymlinks` said. It now reaches a file as `readFileFromDisk` does, so it refuses a symlink the mount doesn't follow and anything that resolves outside the mount.

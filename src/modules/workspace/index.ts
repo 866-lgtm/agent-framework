@@ -7,7 +7,7 @@
 
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
+import { open, stat, lstat, realpath } from 'node:fs/promises';
 import { join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
+import { coveredByIgnore, filesystemTrustsCtime, linkOnTheWay, locateRoot, parentOf } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1548,8 +1548,11 @@ export class WorkspaceModule implements Module {
    * permanent cost to send something once is the wrong trade.
    *
    * Same mount boundary and traversal guard as every other path here: only
-   * declared mounts, nothing above their root. Deliberately does NOT sync,
-   * register, or hash anything — it reads and returns.
+   * declared mounts, nothing above their root, and the file reached as
+   * readFileFromDisk reaches it (openContainedFile), so the mount's
+   * `followSymlinks` holds for the file and the directories on its way, and
+   * what it reaches stays canonically inside the mount. Deliberately does NOT
+   * sync, register, or hash anything — it reads and returns.
    */
   async readBinaryFromDisk(
     mountPrefixedPath: string,
@@ -1563,16 +1566,25 @@ export class WorkspaceModule implements Module {
       return { error: error instanceof Error ? error.message : String(error) };
     }
     const absolutePath = resolve(mount.config.path, relativePath);
+    let tooLarge: string | undefined;
     try {
-      const info = await stat(absolutePath);
-      if (!info.isFile()) return { error: `Not a file: ${mountPrefixedPath}` };
-      if (opts.maxBytes !== undefined && info.size > opts.maxBytes) {
-        return { error: `File too large: ${info.size} > ${opts.maxBytes} bytes` };
+      const { handle } = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+        if (opts.maxBytes !== undefined && fileStat.size > opts.maxBytes) {
+          tooLarge = `File too large: ${fileStat.size} > ${opts.maxBytes} bytes`;
+          throw new Error(tooLarge);
+        }
+      });
+      try {
+        return { data: await handle.readFile(), absolutePath };
+      } finally {
+        await handle.close();
       }
-      return { data: await readFile(absolutePath), absolutePath };
     } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code === 'ENOENT') return { error: `File not found on disk: ${mountPrefixedPath}` };
+      if (tooLarge !== undefined) return { error: tooLarge };
+      if (error instanceof WorkspaceReadError && error.code === 'directory') return { error: `Not a file: ${mountPrefixedPath}` };
+      if (error instanceof WorkspaceReadError && error.code === 'not_found' && error.errno === 'ENOENT') {
+        return { error: `File not found on disk: ${mountPrefixedPath}` };
+      }
       return { error: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -1661,6 +1673,9 @@ export class WorkspaceModule implements Module {
    * Open a mount-relative file for reading with the mount boundary enforced on
    * the *filesystem*, not just the path string:
    *
+   * 0. On a mount that does not `followSymlinks`, refuse a path with a symlink
+   *    among the directories on its way beneath the mount's root, as a
+   *    `symlink`, wherever it leads (linkOnTheWay), before anything resolves it.
    * 1. `lstat` the lexical path — refuse directories; refuse a final-component
    *    symlink when the mount does not `followSymlinks`.
    * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
@@ -1685,6 +1700,18 @@ export class WorkspaceModule implements Module {
     const lexicalPath = resolve(mount.config.path, relativePath);
     const follow = mount.config.followSymlinks === true;
     const useNoFollow = !follow && typeof fsConstants.O_NOFOLLOW === 'number';
+
+    // Before anything resolves the path: a mount that doesn't follow symlinks
+    // goes through none among the directories on the way, wherever it leads.
+    const link = await linkOnTheWay({ root: mount.config.path, followSymlinks: follow }, parentOf(relativePath));
+    if (link !== null) {
+      throw new WorkspaceReadError(
+        'symlink',
+        `${mountPrefixedPath} goes through a symlink at "${mount.config.name}/${link}", which this mount does not follow: `
+          + 'use the path it leads to, or set followSymlinks: true on the mount',
+        'lstat',
+      );
+    }
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {

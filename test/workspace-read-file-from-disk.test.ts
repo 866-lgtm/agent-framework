@@ -119,8 +119,10 @@ test('an intermediate symlinked directory escaping the mount is rejected under n
   writeFileSync(join(outside, 'secret.txt'), 'SECRET');
   if (!symlinkOrSkip(t, outside, join(mountDir, 'linkdir'), 'dir')) return;
 
-  // Final component is a regular file; only the directory hop is a symlink.
-  const err = await expectRefusal(workspace.readFileFromDisk('work/linkdir/secret.txt'), 'escape');
+  // Final component is a regular file; only the directory hop is a symlink,
+  // which a mount that doesn't follow symlinks refuses as one, before it
+  // looks where the link leads.
+  const err = await expectRefusal(workspace.readFileFromDisk('work/linkdir/secret.txt'), 'symlink');
   assert.ok(!err.message.includes(root));
 });
 
