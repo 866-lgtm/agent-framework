@@ -1949,6 +1949,14 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * Whether a tool's change on this mount goes to disk as it commits: the
+   * push commitToolChange makes, and what an edit's answer says of it.
+   */
+  private pushesOnCommit(mount: MountState): boolean {
+    return mount.config.autoMaterialize === true && mount.config.mode !== 'read-only';
+  }
+
+  /**
    * Commit a tool's write or delete to the workspace tree, with the branch
    * intent it implies (store origin for a path disk never agreed with; a
    * tombstone for a deletion), and push it to disk when the mount opts in via
@@ -1999,7 +2007,7 @@ export class WorkspaceModule implements Module {
         return next;
       });
     }
-    if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return null;
+    if (!this.pushesOnCommit(mount)) return null;
 
     const pushed = await this.pushUnlocked(mount, [relativePath], {
       applyDeletions: change.kind === 'remove',
@@ -2317,9 +2325,10 @@ export class WorkspaceModule implements Module {
               ? `Disk has no copy of this file, and nothing records whether it was deleted there, so the edit ${verb} the workspace's copy.`
               : null;
         // A mount that doesn't push keeps a conflict until materialize or
-        // sync settles it, so an edit's answer says so, applied or refused. A
-        // stored edit that couldn't finish leaves it to the push's reason,
-        // which names the conflict, or to ls, which its answer points to.
+        // sync settles it, so an edit's answer says so, whether it applied or
+        // was refused for the text it found. A stored edit that couldn't
+        // finish leaves it to the push's reason, which names the conflict, or
+        // to ls, which its answer points to.
         const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
         const conflictNote = (where: string): string | null => conflict === null ? null
           : `The path is in conflict with disk (${conflict}): the edit ${where} the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.`;
@@ -2387,7 +2396,7 @@ export class WorkspaceModule implements Module {
         // so a file disk lacked goes back with this edit's push, or with the
         // next materialize where the mount doesn't push. A push that didn't
         // complete answers above, with its reason.
-        const pushes = mount.config.autoMaterialize && mount.config.mode !== 'read-only';
+        const pushes = this.pushesOnCommit(mount);
         const backOnDisk = report?.state === 'disk-missing-provenance-unknown'
           ? `${pushes ? 'Its push put the file back on disk' : 'A materialize of the path puts it back on disk'}; if it was deleted there on purpose, delete it here too.`
           : null;

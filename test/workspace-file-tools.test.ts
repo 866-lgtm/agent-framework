@@ -567,9 +567,16 @@ test("a path whose branch intent can't be read is told to sync the path, which r
   symlinkSync('u.txt', join(dir, 'w.txt'));
   const unseen = /w\.txt: its branch intent can't be read: its record is not a branch intent, and disk's copy can't be verified \(a symlink, which this mount does not follow\) — once it can be, sync this path to adopt the disk version, which replaces the intent/;
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), unseen);
-  await call('sync', { path: 'work/w.txt' });
+  const blind = await call('sync', { path: 'work/w.txt' });
+  assert.equal(blind.success, true, blind.error);
+  // Its adoption met the symlink, not the intent: the sync reached the verdict
+  // that would replace the intent, and couldn't.
+  assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow"/);
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), unseen, "a sync that can't see disk's copy leaves the intent");
   rmSync(join(dir, 'w.txt'));
+  // Absent is a copy a sync sees, so the reason names the sync alone.
+  assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data),
+    /w\.txt: its branch intent can't be read: its record is not a branch intent — sync this path to adopt the disk version, which replaces the intent/);
   const seen = await call('sync', { path: 'work/w.txt' });
   assert.equal(seen.success, true, seen.error);
   assert.doesNotMatch(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), /branch intent/, 'once it sees disk, the sync replaces it');
@@ -596,3 +603,17 @@ for (const autoMaterialize of [false, true]) {
     assert.equal(disk('l.txt')!.toString(), 'edited line\n');
   });
 }
+
+test("an edit of a file disk lacks whose push is refused doesn't say the file went back", async (t) => {
+  const { store, dir, call, stored } = setup(t, { autoMaterialize: true });
+  // An entry from before the evidence, below a path disk holds as a file, so
+  // the edit's push can't write it.
+  const bytes = Buffer.from('legacy line\n');
+  store.treeSet('workspace/work/tree', 'f.txt/l.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+  writeFileSync(join(dir, 'f.txt'), 'file\n');
+  assert.equal(errorOf(await call('edit', { path: 'work/f.txt/l.txt', oldString: 'legacy', newString: 'edited' })),
+    'The edit of "work/f.txt/l.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
+    + "Its push to disk didn't complete: not written: disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — move or remove it on disk and materialize again, or write the file under another path. "
+    + "Disk has no copy of this file, and nothing records whether it was deleted there, so the edit applied to the workspace's copy.");
+  assert.equal(await stored('f.txt/l.txt'), 'edited line\n');
+});
