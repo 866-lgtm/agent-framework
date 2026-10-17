@@ -16,7 +16,8 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -96,6 +97,34 @@ test('missing files and directories are distinguished', async (t) => {
   await expectRefusal(workspace.readFileFromDisk('work/missing.txt'), 'not_found');
   await expectRefusal(workspace.readFileFromDisk('work/dir'), 'directory');
   await expectRefusal(workspace.readFileFromDisk('work'), 'directory');
+});
+
+test('a FIFO is refused at once by each disk reader, without waiting for a writer', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('no FIFOs on Windows');
+    return;
+  }
+  const { mountDir, workspace } = setup(t);
+  const fifo = join(mountDir, 'pipe');
+  execFileSync('mkfifo', [fifo]);
+  const within = <T>(p: Promise<T>, what: string): Promise<T> => Promise.race([
+    p,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} still waits on the FIFO after 2 s`)), 2000).unref()),
+  ]);
+  try {
+    await expectRefusal(within(workspace.readFileFromDisk('work/pipe'), 'readFileFromDisk'), 'not_found');
+    const image = await within(workspace.handleToolCall({ id: 'f', name: 'read_image', input: { path: 'work/pipe' } }), 'read_image');
+    assert.equal(image.success, false);
+    assert.deepEqual(await within(workspace.readBinaryFromDisk('work/pipe'), 'readBinaryFromDisk'), { error: 'Not a file: work/pipe' });
+  } finally {
+    // Release any open still waiting for a writer, so a failure ends the
+    // test rather than holding the process.
+    try {
+      closeSync(openSync(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+    } catch {
+      // No reader waits (ENXIO): nothing to release.
+    }
+  }
 });
 
 test('a final-component symlink to an outside file is rejected under the default no-follow policy', async (t) => {

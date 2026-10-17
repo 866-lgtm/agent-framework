@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { coveredByIgnore, filesystemTrustsCtime, linkOnTheWay, locateRoot, parentOf } from './observe.js';
+import { NONBLOCK, coveredByIgnore, filesystemTrustsCtime, linkOnTheWay, locateRoot, parentOf } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1581,7 +1581,12 @@ export class WorkspaceModule implements Module {
       }
     } catch (error) {
       if (tooLarge !== undefined) return { error: tooLarge };
-      if (error instanceof WorkspaceReadError && error.code === 'directory') return { error: `Not a file: ${mountPrefixedPath}` };
+      // A directory, or a file that isn't regular (the reader's fstat check,
+      // which carries no errno), keeps this reader's own words.
+      if (error instanceof WorkspaceReadError && (error.code === 'directory'
+        || (error.code === 'not_found' && error.stage === 'fstat' && error.errno === undefined))) {
+        return { error: `Not a file: ${mountPrefixedPath}` };
+      }
       if (error instanceof WorkspaceReadError && error.code === 'not_found' && error.errno === 'ENOENT') {
         return { error: `File not found on disk: ${mountPrefixedPath}` };
       }
@@ -1739,7 +1744,9 @@ export class WorkspaceModule implements Module {
 
     let handle: Awaited<ReturnType<typeof open>>;
     try {
-      handle = await open(lexicalPath, fsConstants.O_RDONLY | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
+      // O_NONBLOCK: a FIFO opens at once instead of waiting for a writer, and
+      // the regular-file check below refuses it.
+      handle = await open(lexicalPath, fsConstants.O_RDONLY | NONBLOCK | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
       const code = errnoOf(err);
       if (code === 'ENOENT' || code === 'ENOTDIR') {
