@@ -312,3 +312,74 @@ test("reconnectAfterFailure() on a live transport reports byHost: true and still
     wss.close();
   }
 });
+
+/** A WebSocket server that closes each socket with `code` and the server's own
+ *  close reason `reason` when it receives `method`, and otherwise answers as
+ *  startMockMcplWsServer does. */
+function startClosingWsServer(method: string, code: number, reason: string) {
+  const wss = startMockMcplWsServer((ws) => {
+    ws.on('message', (data) => {
+      const msg = JSON.parse(String(data)) as { method?: string };
+      if (msg.method === method) ws.close(code, reason);
+    });
+  });
+  return wss;
+}
+
+// A close reason the server writes, made to forge a second host log line.
+const PEER_REASON = 'token expired\n[mcpl] editor: forged line';
+
+test("a server's close reason during the handshake stays out of the connect error, which gives the transport's words and the close code", async () => {
+  const wss = startClosingWsServer('initialize', 4001, PEER_REASON);
+  await waitListening(wss);
+  try {
+    await assert.rejects(
+      withDeadline(McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS), 10_000, 'the connect to fail'),
+      (error: Error) => {
+        assert.equal(error.message, 'MCPL server "editor" transport closed before handshake completed (websocket closed, code 4001)');
+        return true;
+      },
+    );
+  } finally {
+    wss.close();
+  }
+});
+
+test('a server that closes during the handshake with a code and no reason gets the same connect error, the code included', async () => {
+  // A refused credential can come as 4001 alone: the code is what tells it
+  // from another close, whether or not the server sent words with it.
+  const wss = startClosingWsServer('initialize', 4001, '');
+  await waitListening(wss);
+  try {
+    await assert.rejects(
+      withDeadline(McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS), 10_000, 'the connect to fail'),
+      (error: Error) => {
+        assert.equal(error.message, 'MCPL server "editor" transport closed before handshake completed (websocket closed, code 4001)');
+        return true;
+      },
+    );
+  } finally {
+    wss.close();
+  }
+});
+
+test("a server's close reason stays out of the error a pending request is rejected with", async () => {
+  const wss = startClosingWsServer('tools/call', 4001, PEER_REASON);
+  await waitListening(wss);
+  let conn: McplServerConnection | undefined;
+  try {
+    conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS);
+    conn.ready();
+    await assert.rejects(
+      withDeadline(conn.sendToolsCall('echo', { text: 'hello' }), 10_000, 'the call to be rejected'),
+      (error: Error) => {
+        assert.match(error.message, /^MCPL server "editor" disconnected unexpectedly \(code=4001, signal=n\/a, reason=websocket closed\) while awaiting tools\/call \(id=\d+\)$/);
+        return true;
+      },
+    );
+  } finally {
+    await conn?.close();
+    wss.close();
+  }
+});
+

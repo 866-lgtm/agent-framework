@@ -95,6 +95,20 @@ export function withStderr(error: unknown): string {
   return '. The last of its stderr:' + tail.split('\n').map((line) => `\n  stderr: ${logDetail(line)}`).join('');
 }
 
+/** A transport close's reason, as an error message gives it: the transport's
+ *  own words. A WebSocket peer's close reason is the server's text
+ *  (`reasonFromPeer`), so an error gives the words the transport uses for a
+ *  close without one, as `mcpl:server-closed` leaves that text out. A
+ *  WebSocket close's code, a number, says what the server meant (4001: a
+ *  refused credential), with or without a reason, so each error gives it too:
+ *  a pending request's error has `code=`, and the handshake's adds it for any
+ *  WebSocket close, since a close before the handshake completes reaches no
+ *  'close' event. A stdio child's exit reads as before. */
+function closeReasonText(info: TransportCloseInfo): string {
+  if (info.reasonFromPeer) return 'websocket closed';
+  return info.reason ?? 'unknown';
+}
+
 /** Default per-request timeout in milliseconds (see McplServerConfig.requestTimeoutMs).
  *  A live-but-wedged server (accepts requests, never answers, never closes its
  *  transport) would otherwise freeze the awaiting agent turn forever — no
@@ -625,7 +639,8 @@ export class McplServerConnection extends EventEmitter {
         };
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
-          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${info.reason ?? 'unknown'})`));
+          const code = transport.kind === 'websocket' && typeof info.code === 'number' ? `, code ${info.code}` : '';
+          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`));
         };
         const onError = (err: Error) => {
           cleanup();
@@ -1395,7 +1410,7 @@ export class McplServerConnection extends EventEmitter {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
             new Error(
-              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${info.reason ?? 'unknown'}) while awaiting ${pending.method} (id=${id})`,
+              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}) while awaiting ${pending.method} (id=${id})`,
             ),
           );
         }
