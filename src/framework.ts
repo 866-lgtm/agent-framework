@@ -12270,20 +12270,29 @@ export class AgentFramework {
     };
     this.streamBoundaryEnds.set(stream, (end) => {
       const durationMs = Date.now() - startTime;
-      if (end === 'turn_ended') {
-        this.recordProviderAccelerationRecovery(agent, compiledRequest, end);
-        completeTurn(latestUsage, durationMs);
-        this.endRefusalEpisode(agent.name);
-        return;
+      const turnEnded = end === 'turn_ended';
+      if (turnEnded) this.recordProviderAccelerationRecovery(agent, compiledRequest, end);
+      // The accounting writes to the store, and a write that fails must not
+      // skip what the boundary does after this call: the rest of a turn's
+      // end, or a restart's cancel and its request, and then the event's
+      // dispatch to modules.
+      try {
+        if (turnEnded) {
+          completeTurn(latestUsage, durationMs);
+        } else {
+          countUsage(latestUsage);
+          logStream({
+            success: true,
+            request: BOUNDARY_END_REQUEST,
+            response: { note: 'stream restarted to compress its context' },
+            durationMs,
+            stopReason: end,
+          });
+        }
+      } catch (error) {
+        console.error(`[usage] agent=${agent.name} could not record a stream's usage at its end: ${describeFailureWithFrames(error)}`);
       }
-      countUsage(latestUsage);
-      logStream({
-        success: true,
-        request: BOUNDARY_END_REQUEST,
-        response: { note: 'stream restarted to compress its context' },
-        durationMs,
-        stopReason: end,
-      });
+      if (turnEnded) this.endRefusalEpisode(agent.name);
     });
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the

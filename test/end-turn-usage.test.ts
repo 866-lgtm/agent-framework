@@ -969,3 +969,82 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     }
   });
 });
+
+describe("a write that fails at a tool boundary doesn't skip what the boundary does after it", () => {
+  /** Makes the framework's inference-log write throw for the entries
+   *  `refuse` picks, as a store that refuses the write would, and collects
+   *  stderr so a test can see the failure reported. */
+  function refuseWrites(framework: AgentFramework, refuse: (entry: { stopReason?: string }) => boolean) {
+    const internal = framework as unknown as { logInference: (entry: { stopReason?: string }) => void };
+    const write = internal.logInference.bind(framework);
+    internal.logInference = (entry) => {
+      if (refuse(entry)) throw new Error('zz store refused the write');
+      write(entry);
+    };
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    return {
+      reported: (agent: string) => lines.some((line) =>
+        line.startsWith(`[usage] agent=${agent} could not record a stream's usage at its end`)
+        && line.includes('zz store refused the write')),
+      restore: () => { console.error = original; },
+    };
+  }
+
+  it('a restart still opens its next stream', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
+    const membrane = new SequentialStreamMembrane();
+    membrane.pushResponse(toolResponse('echo', 'echo-1', firstUsage));
+    membrane.pushResponse(finalResponse('Recovered.', secondUsage));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [],
+      modules: [new TurnTools()], syncIntervalMs: 0,
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    const stderr = refuseWrites(framework, (entry) => entry.stopReason === 'context_budget');
+    framework.start();
+    try {
+      const { agent, contextManager } = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+        proseRouting: 'disabled', maxStreamTokens: 50,
+      });
+      contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
+      // Awaited below once the restart is in. Without the restart it never
+      // settles, and stop() mustn't turn it into an unhandled rejection.
+      run.catch(() => {});
+      assert.ok(await pollUntil(() => membrane.calls.length === 2), 'the restart opened its next stream');
+      await run;
+      assert.equal(traces.filter((e) => e.type === 'inference:stream_restarted').length, 1, 'the restart is announced');
+      assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 1, 'the turn ends on its next stream');
+      assert.ok(stderr.reported('worker'), 'the failed write is said');
+    } finally {
+      stderr.restore();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a tool-ended turn still ends its refusal episode, says it ended, and hands the tool's result to the modules", async () => {
+    const f = await fixture();
+    const stderr = refuseWrites(f.framework, (entry) => entry.stopReason === 'turn_ended');
+    try {
+      const refusalStreak = (f.framework as unknown as { refusalStreak: Map<string, number> }).refusalStreak;
+      refusalStreak.set('worker', 2);
+      f.membrane.pushResponse(toolResponse('finish', 'finish-1', totalUsage));
+      await run(f.framework, 'worker');
+      assert.equal(refusalStreak.has('worker'), false, 'the refusal episode ends');
+      assert.equal(f.traces.filter((e) => e.type === 'inference:turn_ended').length, 1, 'inference:turn_ended');
+      assert.ok(await pollUntil(() => f.traces.some((e) => e.type === 'process:completed'
+        && (e as { processEvent?: { type?: string } }).processEvent?.type === 'tool-result')),
+      "the tool result's event reaches the modules");
+      assert.ok(stderr.reported('worker'), 'the failed write is said');
+    } finally {
+      stderr.restore();
+      await f.framework.stop();
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+});
