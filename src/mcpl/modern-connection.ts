@@ -17,7 +17,10 @@
  *   bounds every leg of the call and the pauses between them. At the
  *   deadline the SDK requests cancellation of a leg in flight; between
  *   continuation rounds nothing is in flight. Either way the outcome is
- *   unknown. Calls are never replayed.
+ *   unknown. Calls are never replayed. The protocol has no cancel for a
+ *   call paused at `input_required`, so whatever the server holds for it,
+ *   beyond the `requestState` it gave this client, it keeps until its own
+ *   timeout.
  * - **Request outcomes from the wire.** A failed call is classified by what
  *   crossed Connectome's transport boundary, never by the error's class. The
  *   SDK raises the same error classes locally (an invalid outputSchema before

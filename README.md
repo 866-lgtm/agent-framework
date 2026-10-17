@@ -322,14 +322,16 @@ three ways:
 At the deadline, cancellation is requested for a leg still in flight;
 between the rounds of an `input_required` continuation nothing is in flight
 to cancel. Either way the outcome is reported as unknown (`no-response`),
-and the call is never retried. A call that ends for any other reason after
-the server asked for another round, before its final answer, is reported
-the same way, since the server may already have acted. An MCPL server that
-refuses `2024-11-05` with `-32022` fails with `McplProtocolVersionError`,
-and is not retried. The error names the revisions the server says it
-supports, or its error text when it lists none, and when the list includes
-`2026-07-28` it says to configure the server with `protocol: 'modern'` (stdio)
-or reach it over http(s).
+and the call is never retried. The protocol has no cancel for a paused call,
+so whatever the server holds for it, beyond the `requestState` it gave this
+client, it keeps until its own timeout. A call that ends for any other
+reason after the server asked for another round, before its final answer, is
+reported the same way, since the server may already have acted. An MCPL
+server that refuses `2024-11-05` with `-32022` fails with
+`McplProtocolVersionError`, and is not retried. The error names the
+revisions the server says it supports, or its error text when it lists none,
+and when the list includes `2026-07-28` it says to configure the server with
+`protocol: 'modern'` (stdio) or reach it over http(s).
 
 Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds: from the url, credential-like path segments and query names, credential-shaped or credential-named query values, and a `ws://` url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. The token an `accessProvider` fetches, and secrets the configuration doesn't hold, remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
 
