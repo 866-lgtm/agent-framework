@@ -145,15 +145,6 @@ export type LinkFound = { link: string } | { unsure: string; code: string };
 const UNSURE_PREFIX = 'cannot tell whether "';
 
 /**
- * Whether a reason refuses a symlink the mount doesn't follow, at the path or
- * on its way, or a directory the walk couldn't ask: none of them is a thing a
- * forced push gets past.
- */
-export function isSymlinkRefusal(reason: string): boolean {
-  return reason === NOT_FOLLOWED || /^"[^"]+" is a symlink[ ,]/.test(reason) || reason.startsWith(UNSURE_PREFIX);
-}
-
-/**
  * On a mount that doesn't follow symlinks, what is on the way to a
  * mount-relative path: the first directory, from beneath the mount's root
  * down to the path itself (or, `through` 'parents', down to its parent), that

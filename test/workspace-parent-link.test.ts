@@ -52,9 +52,13 @@ function linkedCode(target: 'inside' | 'outside'): 'symlink' | 'escape' {
   return target === 'inside' ? 'symlink' : 'escape';
 }
 
-/** A materialize's refusal before it pushes: the note, and the advice to fix it, with no force. */
-function unverified(path: string, note: string): string {
-  return `${path}: cannot verify disk copy (${note}) — fix it and materialize again`;
+/**
+ * A materialize's refusal before it pushes: the note, and the advice to fix
+ * it and materialize again (with applyDeletions, for a deletion), with no
+ * force.
+ */
+function unverified(path: string, note: string, again = 'materialize again'): string {
+  return `${path}: cannot verify disk copy (${note}) — fix it and ${again}`;
 }
 
 class Env {
@@ -153,7 +157,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
         assert.deepEqual(data.deleted ?? [], [], `force ${force}: nothing was deleted`);
         const reason = skippedReason(data, 'l/x.txt');
         if (force) assert.match(reason, LINKED, 'forced');
-        else assert.equal(reason, unverified('l/x.txt', linkedReason(target)));
+        else assert.equal(reason, unverified('l/x.txt', linkedReason(target), 'materialize again with applyDeletions'));
         assert.equal(readFileSync(join(away, 'x.txt'), 'utf8'), 'behind the link\n', `force ${force}: the file behind the link stays`);
       }
     });
