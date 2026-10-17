@@ -890,9 +890,10 @@ export class McplServerConnection extends EventEmitter {
    * When `config.reconnect` is true and the initial connection fails,
    * resolves immediately with null capabilities and retries in the background.
    * A configuration this engine can't use, or a protocol-version verdict,
-   * still throws: retrying can't change either. A failed launch that can't be
-   * reaped resolves with a halted stub that owns it: no retry starts beside
-   * a child that may still be running, and close() retries the reap.
+   * still throws: retrying can't change either. So does a failed launch that
+   * can't be reaped, as in {@link connect}: no retry starts beside a child
+   * that may still be running, and the {@link McplUnreapedLaunchError}
+   * carries the connection that owns it, whose close() retries the reap.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   static async connectWithReconnect(
@@ -908,20 +909,14 @@ export class McplServerConnection extends EventEmitter {
       // No common protocol revision is a configuration fact, not an outage:
       // a retry stub would restart the server forever for nothing. A connect
       // its caller ended (stop(), or a disconnect of its id) isn't retried
-      // either.
-      if (!config.reconnect || error instanceof McplProtocolVersionError || signal?.aborted) {
+      // either, nor is a launch that couldn't be reaped.
+      if (!config.reconnect || error instanceof McplProtocolVersionError || error instanceof McplUnreapedLaunchError || signal?.aborted) {
         throw error;
       }
 
       // Surface the initial failure. The event is buffered by the emit()
       // override until the host wires listeners and calls ready(), so it is
       // not lost in the window before wireMcplEvents runs.
-      if (error instanceof McplUnreapedLaunchError) {
-        const halted = error.connection;
-        console.error(`MCPL server "${config.id}" initial connect failed, not retrying:`, redactServerText(error.message, config));
-        halted.emit('connect-failed', { error: `${(error.cause as Error).message}; ${halted.unreapedFailure()}`, attempt: 0, permanent: true });
-        return halted;
-      }
       // Non-blocking start: create a disconnected stub that will reconnect in background
       console.error(`MCPL server "${config.id}" initial connect failed, will retry:`, redactServerText((error as Error).message, config));
       const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
@@ -1280,24 +1275,23 @@ export class McplServerConnection extends EventEmitter {
    * Tear down a live transport after an awareness-accounting failure without
    * disabling configured auto-reconnect. The normal transport close handler
    * rejects requests, emits lifecycle state, and schedules the next bounded
-   * reconnect attempt. With reconnect disabled this leaves the server closed.
+   * reconnect attempt. With reconnect disabled the recycle ends the
+   * connection for good, as close() does: 'close' comes once the child's
+   * exit is confirmed, and a child it can't reap stays owned, holding the id.
    */
   async reconnectAfterFailure(): Promise<void> {
     this.pauseDataPlane();
+    if (!this.reconnectEnabled) {
+      await this.close();
+      return;
+    }
     if (this.closed) {
       this.scheduleReconnect();
       return;
     }
     if (this.transport) {
       this.hostCloseRequested = true;
-      try {
-        await this.transport.close();
-      } catch (error) {
-        // The close couldn't confirm the child exited, so its close event
-        // never came: the next close is not one the host asked for.
-        this.hostCloseRequested = false;
-        throw error;
-      }
+      await this.transport.close();
       return;
     }
     this.closed = true;

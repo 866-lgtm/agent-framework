@@ -79,13 +79,13 @@
   calls share one teardown, and a
   later call re-checks a child that couldn't be reaped. A launch whose exit
   can't be confirmed is never orphaned, and nothing launches beside it:
-  - `McplServerConnection.connect()` throws the new `McplUnreapedLaunchError`,
-    whose `connection` owns the launch; its `close()` retries the reap.
-    `connectWithReconnect()` returns that connection, halted
-    (`connect-failed` with `permanent: true`, which raises the ops alert),
-    and a reconnect attempt halts the loop the same way
+  - `McplServerConnection.connect()` and `connectWithReconnect()` throw the
+    new `McplUnreapedLaunchError`, whose `connection` owns the launch; its
+    `close()` retries the reap. A reconnect attempt halts the loop instead
     (`reconnect-failed`, `permanent: true`). Reconnect attempts run one at
     a time, and never start before the previous child has exited.
+  - `reconnectAfterFailure()` on a connection without reconnect ends it
+    with `close()`, so a child it can't reap stays owned.
   - `close()` during a reconnect handshake ends that launch before it
     resolves, a WebSocket dial still opening included. In the framework,
     `stop()` and a disconnect of the id end a first connect still in its
@@ -99,9 +99,11 @@
     keeps each connection it couldn't reap, reporting every failure.
   - In the framework, a disconnect or failed connect whose cleanup can't
     reap the child keeps the server registered, closed and listed as
-    disconnected, and its error says so. A connect for that id is refused
-    until a disconnect, retried once the child is gone, confirms the exit
-    and completes the removal.
+    disconnected, and its error says so; its tools leave the agents' list.
+    A connect for that id is refused until a disconnect, retried once the
+    child is gone, confirms the exit and completes the removal. A failed
+    startup connect that leaves such a child raises the `mcpl-down` ops
+    alert.
 - One owner per server id, across both families: a connect is refused while
   another connect for that id is in flight (a legacy handshake included) or
   a disconnect is still tearing it down. A disconnect closes a registered

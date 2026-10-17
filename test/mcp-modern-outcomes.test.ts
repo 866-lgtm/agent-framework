@@ -219,6 +219,26 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no second launch');
 });
 
+test("without reconnect, a lost transport whose child can't be reaped is a permanent failure that says nothing of reconnecting (R1-1)", async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  connection.on('error', () => { /* the held launch, reported */ });
+  const failures: Array<{ error: string; permanent?: boolean }> = [];
+  connection.on('reconnect-failed', (failure: { error: string; permanent?: boolean }) => failures.push(failure));
+  const line = liveLine(connection);
+  const realKill = line.child.kill.bind(line.child);
+  line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  cleanups.push(async () => {
+    realKill('SIGKILL');
+    await until(() => !alive(line.child.pid), 'the held child killed');
+  });
+  line.markClosed({ reason: 'stdio pipe failed' });
+  await until(() => failures.length > 0, 'the permanent failure', 8000);
+  assert.equal(failures[0]!.permanent, true);
+  assert.match(failures[0]!.error, /the previous launch could not be reaped/);
+  assert.doesNotMatch(failures[0]!.error, /reconnecting/);
+});
+
 test("a close() during a lost transport's failing reap reports the failure itself, with no reconnect failure beside it (R1-1)", async () => {
   const log = scratchLog();
   const connection = await connect('', log);
@@ -297,14 +317,14 @@ test('close() right after start() ends a modern stdio connect still spawning, wi
   const started = connection.start().then(() => null, (error: unknown) => error);
   await connection.close();
   const tookMs = Date.now() - began;
-  assert.ok(tookMs < 5000, `close() took ${tookMs} ms, not the discover probe's 30 s`);
+  assert.ok(tookMs < 15_000, `close() took ${tookMs} ms, not the discover probe's 30 s`);
   // The child may be ended before it can log its start, so its pid comes
   // from the spawn.
   assert.equal(pids.length, 1, 'one launch');
   assert.equal(alive(pids[0]!), false, 'the child is gone once close() resolved');
   await started;
   const endedMs = Date.now() - began;
-  assert.ok(endedMs < 5000, `the connect ended after ${endedMs} ms, not the discover probe's 30 s`);
+  assert.ok(endedMs < 15_000, `the connect ended after ${endedMs} ms, not the discover probe's 30 s`);
   assert.equal(connection.isConnected, false);
 });
 

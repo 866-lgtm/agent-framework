@@ -16606,9 +16606,11 @@ export class AgentFramework {
           attempt: 0,
           willRetry: !!left?.willReconnect,
         });
-        // So the server doesn't vanish quietly: alert at once, as the
-        // reconnect path does for the same verdict, since no attempt follows.
-        if (error instanceof McplProtocolVersionError) {
+        // So the server doesn't vanish quietly: alert at once, since no
+        // attempt follows, for what needs the operator. That's a
+        // protocol-version verdict, as the reconnect path alerts for one, or
+        // a launch that couldn't be reaped, which only a disconnect retries.
+        if (error instanceof McplProtocolVersionError || left?.holdsUnreapedChild) {
           this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${message}`);
         }
       }
@@ -17879,6 +17881,10 @@ export class AgentFramework {
         // handshaking, whose own removal couldn't reap, is re-checked here.
         await registry.removeServer(id);
       } catch (error) {
+        // Closed either way, so its tools leave the agents' list. The server
+        // keeps its id until a disconnect confirms the exit.
+        await this.refreshMcplTools();
+        this.emitMcplToolDiff(oldToolNames, id);
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(
           `${message}. MCP server "${id}" stays registered, closed, until its exit is confirmed: disconnect it again to retry the reap`,
@@ -18526,7 +18532,7 @@ export class AgentFramework {
     // Surface connect/reconnect failures. Before these traces existed the
     // only receipt was a console.error on the host's own stderr — invisible
     // unless someone ssh'd in and read the process log.
-    connection.on('connect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
+    connection.on('connect-failed', (params: { error: string; attempt: number }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
@@ -18534,11 +18540,6 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      // `permanent`: the failed launch couldn't be reaped, so no retry will
-      // start beside it. Alert now, as for a permanent reconnect failure.
-      if (params.permanent) {
-        this.opsAlert('mcpl-down', connection.id, `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
-      }
     });
     connection.on('reconnect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
@@ -18562,6 +18563,9 @@ export class AgentFramework {
           `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`,
         );
       }
+      // Halted for good: its tools leave the agents' list, since it won't
+      // serve again on its own.
+      if (params.permanent) this.handleToolsListChanged(connection.id);
     });
 
     // A late response to a tools/call that already timed out, carrying
@@ -18661,10 +18665,12 @@ export class AgentFramework {
       });
       // `permanent`: reconnecting halted, on a launch that couldn't be
       // reaped or a protocol-version verdict. No later attempt will come, so
-      // alert now.
+      // alert now, and the server's tools leave the agents' list: it won't
+      // serve again on its own.
       if (params.permanent || params.attempt >= 5) {
         this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
       }
+      if (params.permanent) this.handleToolsListChanged(connection.id);
     };
     connection.on('connect-failed', failed);
     connection.on('reconnect-failed', failed);
@@ -18689,14 +18695,15 @@ export class AgentFramework {
       // holds the id, so nothing launches beside a child that may still run,
       // and stop() and a disconnect still reach it. A reap that fails keeps
       // it registered, holding the id, as a failed disconnect does, for a
-      // disconnect to retry. Its configuration stays listed as disconnected.
-      // One the host is closing stays until that teardown is done: whoever
-      // closes it removes it.
+      // disconnect to retry; that failure is a permanent one, which takes
+      // its tools out of the list. Its configuration stays listed as
+      // disconnected. One the host is closing stays until that teardown is
+      // done: whoever closes it removes it.
       if (!connection.isClosed && !connection.willReconnect) {
         void connection.lossReaped().then(() => {
-          if (connection.isClosed || this.modernServers().get(connection.id) !== connection) return;
-          if (!connection.holdsUnreapedChild) this.modernServers().delete(connection.id);
-          // Gone for good either way: its tools leave the agents' list, as a
+          if (connection.isClosed || connection.holdsUnreapedChild || this.modernServers().get(connection.id) !== connection) return;
+          this.modernServers().delete(connection.id);
+          // Gone for good: its tools leave the agents' list, as a
           // disconnect's do.
           this.handleToolsListChanged(connection.id);
         });

@@ -300,32 +300,6 @@ test("a server-side close with code 4001 surfaces on the connection 'close' even
   }
 });
 
-test("a reconnectAfterFailure() whose close fails leaves no host flag behind: a later remote drop is the server's", async () => {
-  const sockets: WebSocket[] = [];
-  const wss = startMockMcplWsServer((ws) => sockets.push(ws));
-  await waitListening(wss);
-  let conn: McplServerConnection | undefined;
-  try {
-    conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS);
-    conn.ready();
-    const transport = (conn as unknown as { transport: { close(): Promise<void> } }).transport;
-    const realClose = transport.close.bind(transport);
-    // A teardown that can't confirm its end, as an unreaped child's can't.
-    transport.close = async () => { throw new Error('could not be confirmed'); };
-    await assert.rejects(conn.reconnectAfterFailure(), /could not be confirmed/);
-    transport.close = realClose;
-    const remote = new Promise<McplConnectionCloseInfo | undefined>((resolve) =>
-      conn!.once('close', (_code?: number | null, _signal?: string | null, info?: McplConnectionCloseInfo) => resolve(info)));
-    sockets[0]!.close(4002, 'server going away');
-    const info = await withDeadline(remote, 5_000, "'close' after the server's drop");
-    assert.equal(info?.byHost, false);
-    assert.equal(info?.code, 4002);
-  } finally {
-    await conn?.close().catch(() => { /* already closed */ });
-    wss.close();
-  }
-});
-
 test("reconnectAfterFailure() on a live transport reports byHost: true and still reconnects", async () => {
   const sockets: WebSocket[] = [];
   const wss = startMockMcplWsServer((ws) => sockets.push(ws));

@@ -9,7 +9,7 @@ import { Client, type Transport } from '@modelcontextprotocol/client';
 import { EventEmitter } from 'node:events';
 import type { ModuleContext } from '../src/index.js';
 import { AgentFramework } from '../src/framework.js';
-import { McplProtocolVersionError, McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
+import { McplProtocolVersionError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import { ModernMcpConnection, malformedLineDiagnostic } from '../src/mcpl/modern-connection.js';
 import { noteDialSent } from '../src/mcpl/protocol-family.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -52,13 +52,16 @@ test('both framework engines scrub failure, error and stderr records before trac
     framework.mcplServerConfigs = new Map([[config.id, config]]);
     framework.emitTrace = (event: unknown) => traces.push(event);
     framework.opsAlert = (_kind: string, _id: string, text: string) => alerts.push(text);
+    // A permanent failure also refreshes the tool list.
+    framework.handleToolsListChanged = () => {};
     const connection = Object.assign(new EventEmitter(), { id: config.id, willReconnect: true });
     framework[method](connection, config);
-    connection.emit('connect-failed', { error: `Cannot POST ${secret}`, attempt: 0, permanent: true });
+    connection.emit('connect-failed', { error: `Cannot POST ${secret}`, attempt: 0 });
+    connection.emit('reconnect-failed', { error: `Cannot POST ${secret}`, attempt: 1, permanent: true });
     connection.emit('reconnect-failed', { error: `Cannot POST ${secret}`, attempt: 5 });
     connection.emit('error', new Error(`transport ${secret}`));
     connection.emit('stderr', { line: `server ${config.token}` });
-    assert.equal(traces.length, 4);
+    assert.equal(traces.length, 5);
     assert.equal(alerts.length, 2);
     assert.ok(!JSON.stringify(traces).includes(secret), method);
     assert.ok(!JSON.stringify(traces).includes(config.token), method);
@@ -168,13 +171,6 @@ test('legacy initial and reconnect console records redact known credentials', as
     assert.ok(lines.some(line => line.includes('reconnect failed: transport redacted')));
     assert.ok(!lines.join('\n').includes(secret));
   } finally { await connection.close(); }
-  const halted = Object.assign(new EventEmitter(), { unreapedFailure: () => `cleanup ${secret}` });
-  t.mock.method(McplServerConnection as any, 'connectChecked', async () => {
-    throw new McplUnreapedLaunchError(halted as unknown as McplServerConnection, new Error(`transport ${secret}`), new Error(`cleanup ${secret}`));
-  });
-  await McplServerConnection.connectWithReconnect(legacyConfig, capabilities);
-  assert.ok(lines.some(line => line.includes('initial connect failed, not retrying: transport redacted; its cleanup also failed: cleanup redacted')));
-  assert.ok(!lines.join('\n').includes(secret));
 });
 
 test('a real discover-then-tools/list 404 is redacted in the framework error trace', async (t) => {

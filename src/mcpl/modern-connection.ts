@@ -453,7 +453,9 @@ export class ModernMcpConnection extends EventEmitter {
 
   /** Whether a child this connection launched couldn't be confirmed exited.
    *  While it's true the connection owns that child, so whatever registered
-   *  it keeps its id held; close() retries the reap. */
+   *  it keeps its id held; close() retries the reap. It's settled only once
+   *  a reap has finished: while a lost session's reap or a close runs, it
+   *  reads false, so read it once lossReaped() or close() has settled. */
   get holdsUnreapedChild(): boolean {
     return this.unreaped.length > 0;
   }
@@ -478,7 +480,9 @@ export class ModernMcpConnection extends EventEmitter {
   /** The halt, as a permanent failure for the reconnect events. */
   private unreapedFailure(): string | null {
     const held = this.unreaped[0];
-    return held ? `the previous launch could not be reaped (${held.failure.message}); reconnecting is halted` : null;
+    if (!held) return null;
+    const halted = this.reconnectEnabled ? '; reconnecting is halted' : '';
+    return `the previous launch could not be reaped (${held.failure.message})${halted}`;
   }
 
   /**

@@ -389,6 +389,20 @@ test("a dial with an access provider takes its abort listener off the signal onc
   }
 });
 
+test("a dial whose signal aborts while its access provider is called ends then, not when the provider answers", { timeout: 10_000 }, async () => {
+  const controller = new AbortController();
+  await assert.rejects(
+    WebSocketTransport.open(cfg({
+      id: 'ws',
+      url: 'ws://127.0.0.1:1/mcpl',
+      // The connection is closed while the provider runs, and the provider
+      // never answers.
+      accessProvider: () => { controller.abort(); return new Promise<string>(() => {}); },
+    }), controller.signal),
+    /WebSocket connect abandoned: the connection was closed/,
+  );
+});
+
 test("a token a dial sends again is the newest, so the oldest of the others goes first", () => {
   const config = cfg({ id: 'r', url: 'http://127.0.0.1:1/mcp' });
   noteDialSent(config, { token: 'prov-again-0000' });

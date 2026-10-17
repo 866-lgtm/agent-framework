@@ -160,23 +160,20 @@ test('a failed connect that cannot be reaped hands its owner to the caller, who 
   await owner.close();
 });
 
-test('with reconnect, a failed first launch that cannot be reaped halts instead of retrying', async () => {
+test('with reconnect too, a failed first launch that cannot be reaped throws, handing over its owner, as without', async () => {
   const log = scratchLog();
   const stuck = unreapableFrom(1);
-  const connection = await McplServerConnection.connectWithReconnect(config('error', log, RECONNECT), HOST_CAPS);
-  cleanups.push(() => connection.close().catch(() => {}));
-  const failures: Array<{ error: string; attempt: number; permanent?: boolean }> = [];
-  connection.on('connect-failed', (f) => failures.push(f));
-  connection.ready();
-  await until(() => failures.length > 0, 'the connect-failed event');
-  assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /initialize failed on purpose; the previous launch could not be reaped .*reconnecting is halted/);
-  assert.equal(connection.willReconnect, false);
-  // 300 ms is several reconnect intervals (20–40 ms): a retry would have launched.
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(starts(log).length, 1, 'no launch beside the unreaped one');
+  const error = await McplServerConnection.connectWithReconnect(config('error', log, RECONNECT), HOST_CAPS).then(() => null, (e: unknown) => e);
+  // No stub: no retry starts beside a child that may still be running.
+  assert.ok(error instanceof McplUnreapedLaunchError, String(error));
+  assert.match(error.message, /initialize failed on purpose; its cleanup also failed: .*could not be reaped/);
+  const owner = error.connection;
+  cleanups.push(() => owner.close().catch(() => {}));
+  assert.equal(owner.willReconnect, false);
+  await assert.rejects(owner.close(), /could not be reaped/, 'still running: the reap fails again');
   await killAndWait(stuck[0]!);
-  await connection.close();
+  await owner.close();
+  assert.equal(starts(log).length, 1, 'no launch beside the unreaped one');
 });
 
 test('a reconnect launch that cannot be reaped halts reconnecting; close() settles it once it has exited', async () => {
