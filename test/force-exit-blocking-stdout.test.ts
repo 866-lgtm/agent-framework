@@ -34,7 +34,7 @@ test("a test file's process exits with everything it wrote to the runner deliver
   assert.equal(deliveredBy({ NODE_TEST_CONTEXT: 'child-v8' }, ['--import', helper]), BYTES);
 });
 
-test('the helper leaves a process that isn\'t a test file\'s alone', { skip: process.platform === 'win32' ? "Windows pipes don't drop a write at exit" : false }, () => {
+test('the helper leaves a process that isn\'t a test file\'s alone', { skip: process.platform === 'win32' ? 'nodejs/node#64833 reports no such loss on Windows' : false }, () => {
   // Without the helper, or outside a test file's process, the exit drops
   // what the pipe hasn't taken: the loss the helper is there to prevent.
   assert.ok(deliveredBy({ NODE_TEST_CONTEXT: 'child-v8' }, []) < BYTES, 'without the helper, the exit drops the rest');
