@@ -11,13 +11,16 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import type { ToolResult } from '../src/types/events.js';
 
-function setup(t: TestContext, opts: { autoMaterialize?: boolean } = {}) {
+function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: number } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'workspace-file-tools-'));
   const dir = join(root, 'mount');
   mkdirSync(dir);
   const store = JsStore.openOrCreate({ path: join(root, 'store') });
   const workspace = new WorkspaceModule({
-    mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: opts.autoMaterialize ?? false }],
+    mounts: [{
+      name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: opts.autoMaterialize ?? false,
+      ...(opts.maxFileSize !== undefined ? { maxFileSize: opts.maxFileSize } : {}),
+    }],
   });
   workspace.initStore(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -713,20 +716,27 @@ test("a push where disk has deleted the file says what a sync and a forced mater
   assert.equal(disk('w.txt')!.toString(), 'v2\n', "the forced materialize wrote the workspace's copy back");
 });
 
-test("an edit of a draft whose disk copy the workspace can't hold says a sync keeps disk's copy and gives up the workspace's", async (t) => {
-  const { dir, call, disk } = setup(t);
-  writeFileSync(join(dir, 'b.txt'), 'base\n');
-  assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
-  assert.equal((await call('write', { path: 'work/b.txt', content: 'agent draft\n' })).success, true);
-  // A null byte makes disk's copy binary, which the workspace doesn't store.
-  const binary = Buffer.from('bin\0ary\n');
-  writeFileSync(join(dir, 'b.txt'), binary);
-  assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'missing', newString: 'x' })),
-    "String not found in work/b.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. "
-    + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
-  assert.equal((await call('sync', { path: 'work/b.txt' })).success, true);
-  const after = await call('read', { path: 'work/b.txt' });
-  assert.equal(after.success, false, "the sync gave up the workspace's copy");
-  assert.equal(after.error, 'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
-  assert.deepEqual(disk('b.txt'), binary, 'disk keeps its copy');
-});
+// The workspace doesn't store a disk copy with a null byte (binary), or one
+// past the mount's maxFileSize.
+for (const [kind, limit, copy] of [
+  ['binary', undefined, Buffer.from('bin\0ary\n')],
+  ['past the size limit', 16, Buffer.from(`${'x'.repeat(40)}\n`)],
+] as const) {
+  test(`an edit of a draft whose disk copy the workspace can't hold (${kind}) says a sync keeps disk's copy and gives up the workspace's`, async (t) => {
+    const { dir, call, disk } = setup(t, { maxFileSize: limit });
+    writeFileSync(join(dir, 'b.txt'), 'base\n');
+    assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
+    assert.equal((await call('write', { path: 'work/b.txt', content: 'agent draft\n' })).success, true);
+    writeFileSync(join(dir, 'b.txt'), copy);
+    assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'missing', newString: 'x' })),
+      "String not found in work/b.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. "
+      + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
+    assert.equal((await call('sync', { path: 'work/b.txt' })).success, true);
+    const after = await call('read', { path: 'work/b.txt' });
+    assert.equal(after.success, false, "the sync gave up the workspace's copy");
+    assert.equal(after.error, 'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    const listed = (await call('ls', { path: 'work' })).data as { entries: Array<{ name: string; state: string }> };
+    assert.equal(listed.entries.find((e) => e.name === 'b.txt')?.state, 'disk-only', 'the listing shows it disk-only');
+    assert.deepEqual(disk('b.txt'), copy, 'disk keeps its copy');
+  });
+}
