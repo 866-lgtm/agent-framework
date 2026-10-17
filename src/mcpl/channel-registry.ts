@@ -2316,7 +2316,6 @@ export class ChannelRegistry {
           type: channel.type,
           address: channel.address,
         });
-        if (entry) entry.open = true;
         this.applyOpenAnswer(serverId, channel.id, answer);
       } catch (err) {
         if (entry) entry.open = false;
@@ -2505,7 +2504,6 @@ export class ChannelRegistry {
       address: entry.descriptor.address,
       ...(history ? { history } : {}),
     });
-    entry.open = true;
     this.applyOpenAnswer(entry.serverId, entry.descriptor.id, result);
     return result;
   }
@@ -2518,6 +2516,14 @@ export class ChannelRegistry {
    * entry, which a register or `channels/changed` during the open may have
    * replaced.
    *
+   * The open is recorded only while the channel's desired state is still
+   * on reconcile's open side, open or tuned-out (a tune-out keeps the
+   * transport open): a close the host asked for while the open was in
+   * flight is the newer decision, and its answer can come first, so an open
+   * answered after it leaves the channel closed. This is the one place an
+   * answered open is recorded, for both ways the host opens. The
+   * declaration is applied either way.
+   *
    * Only an inbound-only declaration is applied. The answer isn't always the
    * server's latest word: a `channels/changed` that arrives in the same read
    * as the answer is handled before the open's caller resumes, so the answer
@@ -2529,7 +2535,8 @@ export class ChannelRegistry {
   private applyOpenAnswer(serverId: string, channelId: string, answer: unknown): void {
     const current = this.channels.get(`${serverId}:${channelId}`);
     if (!current) return;
-    current.open = true;
+    const desired = this.getDesiredState(serverId, channelId);
+    if (desired === 'open' || desired === 'tuned-out') current.open = true;
     const declared = (answer as { channel?: { id?: unknown; direction?: unknown } } | undefined)?.channel;
     if (declared?.id === channelId && declared.direction === 'inbound') {
       current.descriptor = { ...current.descriptor, direction: 'inbound' };

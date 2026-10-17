@@ -12355,6 +12355,10 @@ export class AgentFramework {
             const r = this.channelRegistry!.resolveProseTarget(spec);
             return 'channelId' in r ? r.channelId : null;
           },
+          // A stream is a copy of speech, and nothing is published into a
+          // channel its server declared inbound-only: text routed there while
+          // it is one is never streamed or kept for the stream's end.
+          speakable: (channelId) => !this.channelRegistry!.inboundOnlyServer(channelId),
         })
       : null;
     const emitOutgoing = (deltas: { channelId: string; delta: string }[]): void => {

@@ -1262,3 +1262,69 @@ test('a channel announced again while the host opens it is recorded open once th
   release();
   await announced;
 });
+
+// An open answered after a close the host asked for during it: the close is
+// the newer decision, so the channel stays closed, whichever way the host
+// opened it and whether or not an announcement replaced its entry meanwhile.
+async function closedWhileOpening(holdOpen: number) {
+  const made = makeRegistry({ delivered: true });
+  const home = { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' };
+  await made.registry.handleRegister('body', { channels: [home] } as never);
+  let answer!: () => void;
+  const answered = new Promise<void>((resolve) => { answer = resolve; });
+  let sent!: () => void;
+  const held = new Promise<void>((resolve) => { sent = resolve; });
+  let opens = 0;
+  made.setOnOpen(async () => {
+    opens++;
+    if (opens === holdOpen) { sent(); await answered; }
+  });
+  const agent = { kind: 'agent' as const, agentName: 'linn' };
+  return { ...made, home, agent, answer, held, opens: () => opens };
+}
+
+test("an open answered after the agent closed the channel during it leaves the channel closed", async () => {
+  const { registry, closeCalls, agent, answer, held } = await closedWhileOpening(1);
+  const opening = registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent);
+  await held;
+  // Registering the channel already sent one close, its reconcile's.
+  const closesBefore = closeCalls.length;
+  const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'body:home' }, agent);
+  assert.equal((closed as { success?: boolean }).success, true);
+  assert.equal(closeCalls.length, closesBefore + 1, "the agent's close was sent");
+  answer();
+  await opening;
+  assert.equal(registry.getDesiredState('body', 'body:home'), 'closed');
+  assert.equal(registry.isChannelOpen('body:home'), false, 'the open answered after the close must not record the channel open');
+});
+
+test("an open answered after the agent closed the channel leaves it closed, though an announcement replaced its entry during the open", async () => {
+  const { registry, home, agent, answer, held, opens } = await closedWhileOpening(1);
+  const opening = registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent);
+  await held;
+  // The server announces the channel again: its entry is replaced, and the
+  // announcement's reconcile opens it, answered at once.
+  await registry.handleChanged('body', { added: [home] } as never);
+  assert.equal(opens(), 2);
+  assert.equal(registry.isChannelOpen('body:home'), true, "the reconcile's answered open is recorded");
+  await registry.handleChannelToolCall('channel_close', { channelId: 'body:home' }, agent);
+  assert.equal(registry.isChannelOpen('body:home'), false);
+  answer();
+  await opening;
+  assert.equal(registry.isChannelOpen('body:home'), false, "the first open's late answer must not reopen the replacement");
+});
+
+test("a reconcile's open answered after the agent closed the channel leaves it closed", async () => {
+  const { registry, home, agent, answer, held, opens } = await closedWhileOpening(2);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent) as { success?: boolean }).success, true);
+  assert.equal(registry.isChannelOpen('body:home'), true);
+  // The server announces it again; the reconcile's open is the one held.
+  const announced = registry.handleChanged('body', { added: [home] } as never);
+  await held;
+  assert.equal(opens(), 2);
+  await registry.handleChannelToolCall('channel_close', { channelId: 'body:home' }, agent);
+  answer();
+  await announced;
+  assert.equal(registry.getDesiredState('body', 'body:home'), 'closed');
+  assert.equal(registry.isChannelOpen('body:home'), false, "the reconcile's late answer must not record the channel open");
+});

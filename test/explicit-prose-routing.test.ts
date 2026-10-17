@@ -1334,6 +1334,28 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it('the stream neither sends nor keeps text for a channel `speakable` refuses, and keeps what it routes there once `speakable` accepts it', () => {
+    let earsSpeakable = false;
+    const router = new ProseStreamRouter({
+      mode: 'explicit',
+      initialTarget: null,
+      resolve: (spec) => (spec === '#ears' ? 'body:ears' : spec === '#alpha' ? 'chan-alpha' : null),
+      speakable: (channelId) => channelId !== 'body:ears' || earsSpeakable,
+    });
+    const streamed = [
+      ...router.feed('>>#ears refused words'), ...router.endSegment(),
+      ...router.feed('>>#alpha for alpha'), ...router.endSegment(),
+    ];
+    earsSpeakable = true;
+    streamed.push(...router.feed('>>#ears spoken words'), ...router.finish());
+    assert.deepEqual(streamed, [
+      { channelId: 'chan-alpha', delta: 'for alpha' },
+      { channelId: 'body:ears', delta: 'spoken words' },
+    ]);
+    assert.deepEqual([...router.byChannel()], [['chan-alpha', 'for alpha'], ['body:ears', 'spoken words']],
+      'outgoing/complete keeps only what was streamed');
+  });
+
   it('admission turns a resolver that throws into an envelope that bounces', async () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
@@ -1532,6 +1554,37 @@ describe('explicit prose routing', () => {
       .filter(t => t.startsWith('[prose-routing]') && t.includes('not delivered'));
     assert.ok(bounces.some(t => t.includes('body:ears is inbound-only')), `the refused target bounced with its reason: ${bounces.join(' | ')}`);
     assert.ok(bounces.some(t => t.includes('this turn has no destination now')), `the later unprefixed text bounced: ${bounces.join(' | ')}`);
+    await framework.stop();
+  });
+
+  it("explicit: text routed to a channel its server declared inbound-only isn't streamed there, or sent at the stream's end", async () => {
+    // The round's delivery refuses #ears and bounces its text. The stream
+    // took it as it was written, and its end would send it should the server
+    // lift the declaration before the stream ends.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#ears for the room' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha done' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    stubRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'body' : undefined);
+    const chunks: Array<{ channelId: string; delta: string }> = [];
+    const completes: Array<{ channelId: string; text: string }> = [];
+    registry.sendOutgoingChunk = (channelId: string, _agent: string, _inference: string, _index: number, delta: string) => {
+      chunks.push({ channelId, delta });
+    };
+    registry.sendOutgoingComplete = (channelId: string, _agent: string, _inference: string, text: string) => {
+      completes.push({ channelId, text });
+    };
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(chunks.filter((c) => c.channelId === 'body:ears'), [], 'nothing is streamed to the inbound-only channel');
+    assert.deepEqual(completes, [{ channelId: 'chan-alpha', text: 'done' }], "the stream's end sends only what the stream routed and kept");
     await framework.stop();
   });
 
