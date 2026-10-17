@@ -20,3 +20,9 @@
   takes up, marks its agent inferring again through the new
   `EventGate.onInferenceResumed()`, which, unlike `onInferenceStarted()`,
   leaves a pending self-wake alone.
+- A turn whose retry `stop()` cancels now ends with `inference:aborted`
+  after its `inference:failed`, with the reason "a retry waiting while the
+  framework was stopping is dropped before it sends anything", and
+  `healthSnapshot()`'s `lastInference` records its end. Before, nothing
+  followed that event, and for a turn whose stream couldn't start,
+  `lastInference` had no end.

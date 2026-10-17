@@ -704,6 +704,12 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
   return new Error(`Ephemeral agent "${name}" refused: the framework is stopping${observed ? ` (${observed})` : ''}`);
 }
 
+/** The reason on the inference:aborted that ends a turn whose retry stop()
+ *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
+ *  the stream couldn't start, or driveStream's, when it failed once started.
+ *  Its inference:failed came first, and this says no retry follows it. */
+const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -12283,8 +12289,11 @@ export class AgentFramework {
         await this.waitForRetry(action.delayMs);
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
-          // it. Nothing is written (the store is closing); this frame still
-          // owns its token, since no retry frame replaced it.
+          // it. The turn ends as one dropped before it sends anything does:
+          // a terminal event saying why, after the inference:failed above,
+          // and its record's end. Nothing is written (the store is closing);
+          // this frame still owns its token, since no retry frame replaced it.
+          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
@@ -13521,6 +13530,21 @@ export class AgentFramework {
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
               if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
+              else {
+                // The turn ends here, and its inference:failed doesn't say so,
+                // since a retry usually follows one: an inference:aborted
+                // says why none does, as beginAgentTurn's cancelled retry
+                // gives. The finally ends its gate entry and its record. As
+                // in abortDroppedTurn, nothing when another turn of this name
+                // holds the token, whose bracket the event would end.
+                const owner = this.activeTurnTokens.get(agent.name);
+                if (owner === undefined || owner === myTurnToken) {
+                  this.emitTrace({
+                    type: 'inference:aborted', agentName: agent.name,
+                    durationMs: Date.now() - startTime, reason: RETRY_CANCELLED_BY_STOP,
+                  });
+                }
+              }
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
