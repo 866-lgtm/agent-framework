@@ -393,6 +393,48 @@ test('grep numbers lines as read does: no match on an empty line after the last'
   assert.deepEqual((result.data as { results: unknown[] }).results, []);
 });
 
+test('grep matches and shows a CRLF file\'s lines without the CR, as read shows them', async (t) => {
+  const { dir, call } = setup(t);
+  writeFileSync(join(dir, 'crlf.txt'), 'alpha\r\nfoo\r\nomega\r\n');
+  writeFileSync(join(dir, 'mixed.txt'), 'foo\r\nbar\n');
+  writeFileSync(join(dir, 'lf.txt'), 'foo\n');
+  writeFileSync(join(dir, 'bom.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
+  const result = await call('grep', { pattern: '^foo$', contextBefore: 1, contextAfter: 1 });
+  assert.equal(result.success, true, result.error);
+  type Result = { file: string; lineEndings?: string; matches: unknown[] };
+  const byFile = Object.fromEntries((result.data as { results: Result[] }).results.map((r) => [r.file, r]));
+  assert.deepEqual(byFile['work/crlf.txt'], {
+    file: 'work/crlf.txt', state: 'synced', version: 'workspace', lineEndings: 'CRLF',
+    matches: [{ line: 2, text: 'foo', context: ['alpha', 'foo', 'omega'] }],
+  });
+  assert.equal(byFile['work/mixed.txt'].lineEndings, 'mixed');
+  assert.equal('lineEndings' in byFile['work/lf.txt'], false);
+  // A BOM is no part of the first line, as read doesn't show it.
+  assert.deepEqual(byFile['work/bom.txt'].matches, [{ line: 1, text: 'foo', context: ['foo'] }]);
+  // The cost: a pattern written to find the CR at a line's end no longer does.
+  const cr = await call('grep', { pattern: '\\r', path: 'work/crlf.txt' });
+  assert.deepEqual((cr.data as { results: unknown[] }).results, []);
+});
+
+test('text copied from a read or a grep of a CRLF file matches in an edit, and the file keeps its line ends and BOM', async (t) => {
+  const { dir, call, disk } = setup(t, { autoMaterialize: true });
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  writeFileSync(join(dir, 'w.txt'), Buffer.concat([bom, Buffer.from('one\r\ntwo\r\nthree\r\n')]));
+  // Two lines as the read shows them, each without its number and tab.
+  const page = (await call('read', { path: 'work/w.txt' })).data as { content: string };
+  const copied = page.content.split('\n').slice(0, 2).map((line) => line.slice(line.indexOf('\t') + 1)).join('\n');
+  assert.equal(copied, 'one\ntwo');
+  const edit = await call('edit', { path: 'work/w.txt', oldString: copied, newString: 'ONE\nTWO' });
+  assert.equal(edit.success, true, edit.error);
+  assert.deepEqual(disk('w.txt'), Buffer.concat([bom, Buffer.from('ONE\r\nTWO\r\nthree\r\n')]));
+  // A grep match's text copies the same way.
+  const found = await call('grep', { pattern: '^three$', path: 'work/w.txt' });
+  const text = (found.data as { results: Array<{ matches: Array<{ text: string }> }> }).results[0].matches[0].text;
+  const second = await call('edit', { path: 'work/w.txt', oldString: text, newString: 'THREE' });
+  assert.equal(second.success, true, second.error);
+  assert.deepEqual(disk('w.txt'), Buffer.concat([bom, Buffer.from('ONE\r\nTWO\r\nTHREE\r\n')]));
+});
+
 test('an offset or limit that is not a whole number of at least 1 is refused', async (t) => {
   const { dir, call } = setup(t);
   writeFileSync(join(dir, 'nl.txt'), 'a\nb\n');

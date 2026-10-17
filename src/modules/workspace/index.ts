@@ -1443,7 +1443,9 @@ export class WorkspaceModule implements Module {
           + 'which version matched: the workspace\'s (with its state); the disk version kept with a conflict '
           + '(conflicting-disk); or, once disk has changed since the conflict was recorded, that recorded version '
           + '(recorded-disk). Disk versions it could not search are listed as skipped: disk-only files (binary or '
-          + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded.',
+          + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded. '
+          + 'In a file with CRLF line ends, each line is matched and shown without its CR, as read shows it, '
+          + 'and the file\'s result says lineEndings.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -3388,12 +3390,16 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     type GrepMatch = { line: number; text: string; context?: string[] };
-    const results: Array<{ file: string; state: string; version: 'workspace' | 'conflicting-disk' | 'recorded-disk'; matches: GrepMatch[] }> = [];
+    type Searched = { lineEndings?: 'CRLF' | 'mixed'; matches: GrepMatch[] };
+    const results: Array<{ file: string; state: string; version: 'workspace' | 'conflicting-disk' | 'recorded-disk' } & Searched> = [];
     const skipped: Array<{ file: string; reason: string; size?: number; mimeType?: string }> = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
-    const search = (content: string): GrepMatch[] => {
-      const lines = linesOf(content);
+    // Lines as read shows them: a CR before a line feed is left out, for
+    // matching as well as display, as ripgrep's --crlf does, so `foo$` finds
+    // a CRLF file's line too, and the line copies into an edit as read's do.
+    const search = (bytes: Buffer): Searched => {
+      const { lines, crlfEnds, lfEnds } = fileText(bytes);
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -3406,7 +3412,7 @@ export class WorkspaceModule implements Module {
           found.push(match);
         }
       }
-      return found;
+      return { ...(crlfEnds > 0 ? { lineEndings: lfEnds > 0 ? 'mixed' : 'CRLF' } : {}), matches: found };
     };
 
     for (const { mount, relativePath } of mountsToSearch) {
@@ -3474,8 +3480,8 @@ export class WorkspaceModule implements Module {
           const entry = store.treeGet(mount.treeStateId, report.path);
           const blob = entry ? store.getBlob(entry.blobHash) : null;
           if (blob) {
-            const found = search(blob.toString('utf-8'));
-            if (found.length > 0) results.push({ file, state: report.state, version: 'workspace', matches: found });
+            const found = search(blob);
+            if (found.matches.length > 0) results.push({ file, state: report.state, version: 'workspace', ...found });
           } else if (entry) {
             skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
           }
@@ -3489,8 +3495,8 @@ export class WorkspaceModule implements Module {
           const changed = report.conflict?.diskChangedSinceRecorded === true;
           const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
           if (diskBlob) {
-            const found = search(diskBlob.toString('utf-8'));
-            if (found.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', matches: found });
+            const found = search(diskBlob);
+            if (found.matches.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', ...found });
           }
           if (disk?.stored && !diskBlob) {
             skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
@@ -4278,17 +4284,6 @@ function storedButUnfinished(
           : ' Its push to disk didn\'t run, so disk lacks the change until a materialize of the path writes it.')
       : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
   return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : '') };
-}
-
-/**
- * A text's lines, as read and grep number them: a final line end ends the
- * last line rather than starting an empty one, so "a\nb\n" is two lines,
- * and an empty text has none.
- */
-function linesOf(content: string): string[] {
-  const lines = content.split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  return lines;
 }
 
 /**
