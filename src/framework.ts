@@ -5301,20 +5301,32 @@ export class AgentFramework {
   }
 
   /** Atomic, durable JSON write for the recovery files. The document goes to
-   *  a temp file at 0600, which is synced and renamed over the record. Then
-   *  the directory is synced, and its parent too if this write had to make
-   *  the directory, except on win32. So a crash leaves the record as it was
-   *  or the new one, whole. A failure before the rename removes the temp file
-   *  and throws an error saying the record was left as it was, with the
-   *  original as its cause and its code kept. A directory sync that fails
-   *  after the rename is logged, not thrown: the new record is in place, and
-   *  the callers go on to record it as written. */
+   *  a temp file at 0600, which is synced and renamed over the record, and
+   *  then the directory is synced. A directory this write makes is synced
+   *  into its parent before anything is written to it. Directories are synced
+   *  on POSIX only; win32 syncs the file. So a crash leaves the record as it
+   *  was or the new one, whole. A failure before the rename removes the temp
+   *  file, if it was made, and throws an error saying the record was left as
+   *  it was, with the original as its cause and its code kept. A directory
+   *  sync that fails is raised as an ops alert, not thrown: after the rename
+   *  the new record is in place, and the callers go on to record it as
+   *  written. */
   private writeRecoveryFile(path: string, document: unknown): void {
     const directory = dirname(path);
-    const made = mkdirSync(directory, { recursive: true });
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    let opened = false;
     try {
+      const made = mkdirSync(directory, { recursive: true });
+      // mkdirSync answers the first directory it made, in the form it was
+      // given: each one it made, up to that one, is a new entry in its parent.
+      if (made !== undefined) {
+        for (let entry = directory; ; entry = dirname(entry)) {
+          this.syncRecoveryDirectory(dirname(entry), path);
+          if (entry === made || dirname(entry) === entry) break;
+        }
+      }
       const fd = openSync(temporary, 'w', 0o600);
+      opened = true;
       try {
         writeFileSync(fd, `${JSON.stringify(document, null, 2)}\n`);
         fsyncSync(fd);
@@ -5323,31 +5335,37 @@ export class AgentFramework {
       }
       renameSync(temporary, path);
     } catch (err) {
-      try {
-        unlinkSync(temporary);
-      } catch (unlinkErr) {
-        if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (opened) {
+        try {
+          unlinkSync(temporary);
+        } catch (unlinkErr) {
           console.error(`[host-mode] couldn't remove ${temporary} after a failed write:`, unlinkErr);
         }
       }
       const cause = err as NodeJS.ErrnoException;
       throw Object.assign(new Error(`${path} was left as it was: ${cause.message}`, { cause }), cause.code ? { code: cause.code } : {});
     }
+    this.syncRecoveryDirectory(directory, path);
+  }
+
+  /** Syncs a directory a recovery file is in, or one of its new parents, so
+   *  its entries reach the disk; win32 is left out. A failure is raised as an
+   *  ops alert naming the record, since a failing directory sync usually
+   *  means a failing disk. */
+  private syncRecoveryDirectory(directory: string, record: string): void {
     if (process.platform === 'win32') return;
-    for (const synced of made === undefined ? [directory] : [directory, dirname(directory)]) {
+    try {
+      const fd = openSync(directory, 'r');
       try {
-        const fd = openSync(synced, 'r');
-        try {
-          fsyncSync(fd);
-        } finally {
-          closeSync(fd);
-        }
-      } catch (err) {
-        console.error(
-          `[host-mode] ${path} is in place, but syncing ${synced} failed, so a crash could still lose this change:`,
-          err,
-        );
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
       }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.opsAlert('recovery-sync', 'framework',
+        `syncing ${directory} failed, so ${record} may not survive a crash: ${reason}`,
+        { data: { record, directory, code: (err as NodeJS.ErrnoException).code } });
     }
   }
 

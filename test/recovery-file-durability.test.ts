@@ -6,10 +6,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -131,16 +131,40 @@ test('a context write deferred while quiesced syncs the deferred-writes record t
   });
 });
 
-test('a write that makes the recovery directory syncs its parent too', async () => {
+test('a write that makes the record\'s directories syncs each into its parent before writing, and no higher', async () => {
   await withFramework(async (framework, _recovery, dir) => {
-    const fresh = join(dir, 'fresh');
-    const record = join(fresh, 'host-mode.json');
-    assert.equal(existsSync(fresh), false);
+    const upper = join(dir, 'a');
+    const lower = join(upper, 'b');
+    const record = join(lower, 'host-mode.json');
+    assert.equal(existsSync(upper), false);
     const calls = await recordingFs(() => framework.quiesce({ reason: 'test' }));
-    assertSyncedAround(calls, record, fresh);
-    const rename = recordRename(calls, record);
-    assert.ok(calls.some((c, i) => i > rename.at && c.call === 'fsync' && c.path === dir), `${dir} synced: ${JSON.stringify(calls)}`);
-  }, { hostModePath: (dir) => join(dir, 'fresh', 'host-mode.json') });
+    assertSyncedAround(calls, record, lower);
+    const tempOpen = calls.findIndex((c) => c.call === 'open' && isTemporaryOf(record, c.path));
+    const synced = (path: string) => calls.findIndex((c) => c.call === 'fsync' && c.path === path);
+    for (const parent of [upper, dir]) {
+      assert.ok(synced(parent) >= 0 && synced(parent) < tempOpen, `${parent} synced before the temp file is opened: ${JSON.stringify(calls)}`);
+    }
+    assert.equal(synced(dirname(dir)), -1, `${dirname(dir)}, which held no new directory, isn't synced`);
+  }, { hostModePath: (dir) => join(dir, 'a', 'b', 'host-mode.json') });
+});
+
+test('a write whose directory can\'t be made says the record was left as it was, and tries to remove no temp file', async () => {
+  await withFramework(async (framework, _recovery, dir) => {
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'a file where the record\'s directory goes');
+    const record = join(blocker, 'host-mode.json');
+    let error: unknown;
+    const calls = await recordingFs(() => framework.quiesce({ reason: 'test' }).catch((e: unknown) => { error = e; }));
+    assert.ok(error instanceof Error, String(error));
+    const cause = error.cause as NodeJS.ErrnoException;
+    assert.ok(typeof cause?.code === 'string', String(cause));
+    assert.equal(error.message, `${record} was left as it was: ${cause.message}`);
+    assert.equal((error as NodeJS.ErrnoException).code, cause.code);
+    assert.ok(
+      !calls.some((c) => (c.call === 'open' || c.call === 'unlink') && isTemporaryOf(record, c.path)),
+      `no temp file opened or removed: ${JSON.stringify(calls)}`,
+    );
+  }, { hostModePath: (dir) => join(dir, 'blocker', 'host-mode.json') });
 });
 
 test('a host-mode record that can\'t be replaced leaves no temp file behind, and quiesce says the record was left as it was', async () => {
@@ -210,16 +234,20 @@ test('on win32 the temp file is still synced, and the directory is not opened to
   });
 });
 
-test('a directory sync that fails after the rename leaves the new record in place and says so', async (t) => {
-  const logged: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+test('a directory sync that fails after the rename leaves the new record in place and raises an ops alert naming it', async () => {
   await withFramework(async (framework, recovery) => {
+    const alerts: Array<{ kind: string; agentName: string; message: string; data?: Record<string, unknown> }> = [];
+    (framework as unknown as { opsAlert: unknown }).opsAlert = (kind: string, agentName: string, message: string, opts?: { data?: Record<string, unknown> }) => {
+      alerts.push({ kind, agentName, message, data: opts?.data });
+    };
     const record = join(recovery, 'host-mode.json');
     await recordingFs(() => framework.quiesce({ reason: 'test' }), (c) => (c.call === 'fsync' && c.path === recovery ? fsError('EIO', 'fsync') : undefined));
     assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
-    assert.ok(
-      logged.some((line) => line.includes(`${record} is in place, but syncing ${recovery} failed, so a crash could still lose this change`)),
-      logged.join('\n'),
-    );
+    assert.deepEqual(alerts, [{
+      kind: 'recovery-sync',
+      agentName: 'framework',
+      message: `syncing ${recovery} failed, so ${record} may not survive a crash: EIO: i/o error, fsync`,
+      data: { record, directory: recovery, code: 'EIO' },
+    }]);
   });
 });
