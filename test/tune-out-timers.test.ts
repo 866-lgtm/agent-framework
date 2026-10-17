@@ -43,9 +43,19 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
   }) as unknown as typeof setTimeout;
 
   let state: { params: TuneOutParams; wakeCount: number } | null = stored ? { params: stored, wakeCount: 0 } : null;
-  /** What addMessage throws on its next call, as a failed store write would; null to succeed. */
-  let addMessageThrows: unknown = null;
+  /** What each step throws on its next call, as a failed store write would. */
+  const throwsNext = new Map<'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut', unknown>();
+  const throwIfSet = (step: 'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut') => {
+    if (!throwsNext.has(step)) return;
+    const thrown = throwsNext.get(step);
+    throwsNext.delete(step);
+    throw thrown;
+  };
   const traces: Array<Record<string, unknown>> = [];
+  /** The text of each message added: the subconscious's notices among them. */
+  const notices: string[] = [];
+  /** What the coordinator writes to stderr. */
+  const stderr = t.mock.method(console, 'error', () => {});
   const entered: TuneOutParams[] = [];
   /** The source of each cancel that ended a tune-out: 'duration' for an end time. */
   const cancels: string[] = [];
@@ -59,20 +69,21 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
       state = { params, wakeCount: 0 };
     },
     cancelTuneOut: (_s: string, _c: string, _next: string, source: string) => {
+      throwIfSet('cancelTuneOut');
       const ended = state;
       state = null;
       if (ended) cancels.push(source);
       return ended;
     },
-    recordTuneOutWake: () => (state ? { params: state.params, wakeCount: ++state.wakeCount } : null),
+    recordTuneOutWake: () => {
+      throwIfSet('recordTuneOutWake');
+      return state ? { params: state.params, wakeCount: ++state.wakeCount } : null;
+    },
   } as unknown as ChannelRegistry;
   const hooks = {
-    addMessage: () => {
-      if (addMessageThrows !== null) {
-        const thrown = addMessageThrows;
-        addMessageThrows = null;
-        throw thrown;
-      }
+    addMessage: (_participant: string, content: Array<{ text: string }>) => {
+      throwIfSet('addMessage');
+      notices.push(content[0]?.text ?? '');
       return '';
     },
     requestInference: (_agent: string, reason: string) => { inferences.push(reason); },
@@ -101,12 +112,17 @@ function harness(t: TestContext, stored?: TuneOutParams, { wallClock = true } = 
   /** End the tune-out in the registry alone, as a send into the channel or a close does. */
   const endInRegistry = () => { state = null; };
   const active = () => state !== null;
-  /** Make addMessage's next call throw `thrown`. */
-  const failNextAddMessage = (thrown: unknown = new Error('store write failed')) => { addMessageThrows = thrown; };
+  /** Make the step's next call throw `thrown`. */
+  const failNext = (
+    step: 'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut' = 'addMessage',
+    thrown: unknown = new Error('store write failed'),
+  ) => { throwsNext.set(step, thrown); };
   const timerFailures = () => traces.filter((e) => e.type === 'tune-out:timer-failed');
+  /** The arguments of each line written to stderr. */
+  const stderrLines = () => stderr.mock.calls.map((c) => c.arguments as unknown[]);
   return {
     coordinator, entered, cancels, cadenceTurns, wakeTurns, delays, noTimerPastOne, endInRegistry, active,
-    failNextAddMessage, timerFailures,
+    failNext, timerFailures, notices, stderrLines,
   };
 }
 
@@ -317,23 +333,56 @@ it('armAt arms a deadline that has passed for the next turn of the loop, with no
   }
 });
 
-// A timer callback's work can throw, as a failed store write in a subconscious
-// turn would. Thrown into the event loop, it's an uncaught exception, which
-// ends the host process. Under node:test's mock timers a throw also comes out
-// of tick(), and the mock then runs that callback once more at its next tick,
-// so these tests assert that nothing leaves tick(), not only what comes after.
+// A timer callback's work can throw, as a failed store write would. Thrown into
+// the event loop, it's an uncaught exception, which ends the host process.
+// Under node:test's mock timers a throw also comes out of tick(), and the mock
+// then runs that callback once more at its next tick, so these tests assert
+// that nothing leaves tick(), not only what comes after.
 
-it("a cadence turn that throws stays in its timer, is reported, and the next period's turn comes", (t) => {
+const failure = (timer: string, error = 'store write failed') =>
+  ({ type: 'tune-out:timer-failed', timer, serverId: 'disc', channelId: '#a', error });
+
+it("a cadence turn that throws stays in its timer, is reported, and the next period's turn counts its messages", (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
   h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
-  h.failNextAddMessage();
+  h.failNext();
   assert.doesNotThrow(() => t.mock.timers.tick(60_000), "the turn's error stays in the timer");
-  assert.deepEqual(h.timerFailures(), [
-    { type: 'tune-out:timer-failed', timer: 'cadence', serverId: 'disc', channelId: '#a', error: 'store write failed' },
-  ]);
+  assert.deepEqual(h.timerFailures(), [failure('cadence')]);
   assert.deepEqual(h.cadenceTurns(), [], 'the failed turn requested nothing');
-  h.coordinator.onIncoming('disc', '#a', 'm2', undefined);
+  // No new traffic: the next period's turn is for m1.
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], "the next period's turn comes");
+  assert.match(h.notices.at(-1) ?? '', /— 1 diverted message since your last look\]$/);
+});
+
+it('a timer failure is written to stderr with the error', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  const thrown = new Error('store write failed');
+  h.failNext('addMessage', thrown);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.stderrLines(), [['[tune-out] the cadence timer for #a failed:', thrown]]);
+});
+
+it("a cadence tick that finds the tune-out ended in the registry arms nothing and gives no turn", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  h.endInRegistry();
+  t.mock.timers.tick(60_000);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.cadenceTurns(), [], 'no turn for an ended tune-out');
+  assert.equal(h.delays.filter((ms) => ms === 60_000).length, 1, 'only the first period was armed');
+});
+
+it("a quiet cadence period arms the next, whose turn comes when a message is diverted", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.cadenceTurns(), [], 'a quiet period gives no turn');
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
   t.mock.timers.tick(60_000);
   assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a'], "the next period's turn comes");
 });
@@ -342,27 +391,48 @@ it('a coalesced wake whose turn throws stays in its timer and is reported', (t) 
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true);
   h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
-  h.failNextAddMessage();
+  h.failNext();
   assert.doesNotThrow(() => t.mock.timers.tick(2_000), "the turn's error stays in the timer");
-  assert.deepEqual(h.timerFailures().map((e) => [e.timer, e.error]), [['wake', 'store write failed']]);
+  assert.deepEqual(h.timerFailures(), [failure('wake')]);
   h.coordinator.onIncoming('disc', '#a', 'm2', ['chat:addressed']);
   t.mock.timers.tick(2_000);
   assert.deepEqual(h.wakeTurns(), ['tune-out wake: #a'], "the next wake's turn comes");
 });
 
+it("a coalesced wake whose count can't be recorded stays in its timer and is reported", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', {}, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
+  h.failNext('recordTuneOutWake');
+  assert.doesNotThrow(() => t.mock.timers.tick(2_000), "the error stays in the timer");
+  assert.deepEqual(h.timerFailures(), [failure('wake')]);
+  assert.deepEqual(h.wakeTurns(), [], 'no turn for the wake it could not count');
+});
+
 it('an end time whose cancel throws stays in its timer and is reported', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
-  h.failNextAddMessage();
+  h.failNext();
   assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the cancel's error stays in the timer");
-  assert.deepEqual(h.timerFailures().map((e) => [e.timer, e.error]), [['expiry', 'store write failed']]);
+  assert.deepEqual(h.timerFailures(), [failure('expiry')]);
 });
 
-it('a throw that is not an Error is reported as its string', (t) => {
+it("an end time whose registry cancel throws stays in its timer and is reported", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
+  h.failNext('cancelTuneOut');
+  assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the cancel's error stays in the timer");
+  assert.deepEqual(h.timerFailures(), [failure('expiry')]);
+});
+
+it('a thrown value that is not an Error is reported as a string, even one with no string form', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);
   h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
-  h.failNextAddMessage('disk full');
+  h.failNext('addMessage', 'disk full');
   assert.doesNotThrow(() => t.mock.timers.tick(60_000));
-  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full']);
+  // String() throws for an object with no prototype.
+  h.failNext('addMessage', Object.create(null));
+  assert.doesNotThrow(() => t.mock.timers.tick(60_000));
+  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full', '[object Object]']);
 });

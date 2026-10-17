@@ -34,6 +34,17 @@ export const TUNE_OUT_DEFAULTS = {
  *  subconscious turn, and max-wakes counts invocations, not messages. */
 const WAKE_COALESCE_MS = 2_000;
 
+/** What a caught value says: an Error's message, or the value as a string. */
+function describeThrown(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return String(err);
+  } catch {
+    // A value with no string form, such as an object with no prototype.
+    return Object.prototype.toString.call(err);
+  }
+}
+
 export interface TuneOutFrameworkHooks {
   /** Deliver a message into an agent's window (per-agent seam). */
   addMessage: (
@@ -66,7 +77,7 @@ export interface TuneOutFrameworkHooks {
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Each duration's pending expiry step (params.expiresAtMs). stop clears
-   *  it, cancel does while the registry still holds the tune-out, and the
+   *  it, cancel does when it finds the tune-out in the registry, and the
    *  channel's next enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
@@ -121,15 +132,17 @@ export class TuneOutCoordinator {
     });
   }
 
-  /** A timer callback's work threw. Report it rather than throw it into the
-   *  event loop, where an uncaught exception ends the host process. */
+  /** A timer callback's work threw. Report it on stderr and as a trace rather
+   *  than throw it into the event loop, where an uncaught exception ends the
+   *  host process. */
   private timerFailed(timer: 'cadence' | 'wake' | 'expiry', serverId: string, channelId: string, err: unknown): void {
+    console.error(`[tune-out] the ${timer} timer for ${channelId} failed:`, err);
     this.hooks.emitTrace({
       type: 'tune-out:timer-failed',
       timer,
       serverId,
       channelId,
-      error: err instanceof Error ? err.message : String(err),
+      error: describeThrown(err),
     });
   }
 
@@ -476,7 +489,6 @@ export class TuneOutCoordinator {
     const subName = this.hooks.subconsciousName();
     if (!subName) return;
     const key = this.key(serverId, channelId);
-    this.divertedSinceInvocation.set(key, 0);
 
     const notice = trigger === 'wake'
       ? `[Tune-out wake: ${channelId} — ${count} addressed message${count === 1 ? '' : 's'}]`
@@ -488,6 +500,9 @@ export class TuneOutCoordinator {
       subName,
     );
     this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+    // Counted from here only once the turn has been asked for, so a turn that
+    // throws leaves its messages for the next period's turn.
+    this.divertedSinceInvocation.set(key, 0);
   }
 
   // ==========================================================================
