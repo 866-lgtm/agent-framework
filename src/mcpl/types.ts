@@ -282,10 +282,16 @@ export interface McplServerConfig {
    */
   allowHostCommands?: boolean;
 
-  /** Feature sets to enable on connect */
+  /**
+   * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
+   * every declared set is a candidate. `[]`: none. Either way a set is
+   * enabled only if its declared `uses` are recognized capabilities the
+   * grant covers (§6.4) — a set declaring no `uses` stays disabled even when
+   * listed here (logged, and traced as `mcpl:feature-set-disabled`).
+   */
   enabledFeatureSets?: string[];
 
-  /** Feature sets to explicitly disable on connect */
+  /** Feature sets to explicitly disable on connect (wins over enabledFeatureSets). */
   disabledFeatureSets?: string[];
 
   /**
@@ -368,7 +374,11 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. This is the
+   * timeout of every request that names none; the handshake's initialize has
+   * its own. Set 0 to disable. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 
@@ -388,11 +398,15 @@ export interface McplServerConfig {
 
   /**
    * Tool name prefix for this server's tools.
-   * Tools are exposed as `{toolPrefix}:{toolName}`.
+   * Tools are exposed as `{toolPrefix}--{toolName}`.
    *
-   * Default: `mcpl:{id}` (e.g., `mcpl:zk:lobby_start_game`).
+   * Default: `mcpl--{id}` (e.g., `mcpl--zk--lobby_start_game`).
    * Set to the server ID for cleaner names (e.g., `toolPrefix: 'zk'`
-   * gives `zk:lobby_start_game`).
+   * gives `zk--lobby_start_game`).
+   *
+   * Tool-name patterns elsewhere (`toolClassOverrides` keys,
+   * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
+   * `disabledTools` use the bare server-side names.
    *
    * Must not collide with any module name or another server's prefix.
    */
