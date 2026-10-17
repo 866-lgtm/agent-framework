@@ -1665,16 +1665,16 @@ describe('drafts resend ownership', () => {
     }
   });
 
-  /** The framework's store fails the sync after the next dismissal reaches
-   *  it, as a disk can: the journal reconciles, so the dismissal stands though
-   *  recording it threw. */
-  const failSyncAfterDismissal = (framework: AgentFramework): (() => void) => {
+  /** The framework's store fails the sync after the next drafts entry with
+   *  this op reaches it, as a disk can: the journal reconciles, so the entry
+   *  stands though recording it threw. */
+  const failSyncAfter = (framework: AgentFramework, op: string): (() => void) => {
     const store = (framework as unknown as { store: { sync(): void; appendJson(t: string, p: unknown): unknown } }).store;
     const real = { sync: store.sync.bind(store), appendJson: store.appendJson.bind(store) };
     let armed = false;
     store.appendJson = (type, payload) => {
       const record = real.appendJson(type, payload);
-      if ((payload as { op?: string }).op === 'dismissed') armed = true;
+      if ((payload as { op?: string }).op === op) armed = true;
       return record;
     };
     store.sync = () => {
@@ -1688,12 +1688,77 @@ describe('drafts resend ownership', () => {
     const t = await setup();
     t0.mock.method(console, 'error', () => {});
     try {
-      const restore = failSyncAfterDismissal(t.framework);
+      const restore = failSyncAfter(t.framework, 'dismissed');
       const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] });
       restore();
       assert.equal(answer.success, false);
       assert.equal(t.say(answer), `Recording the dismissal of ${t.a.id} failed (EIO): it reads as dismissed now.`);
       assert.equal(draftState(t.internals.proseDrafts.get('scout', t.a.id)!), 'dismissed');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a dismissal of a possibly-posted draft that stands after its recording failed says so, with the risk, and is traced', async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
+      await sending;
+      const restore = failSyncAfter(t.framework, 'dismissed');
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] });
+      restore();
+      const text = t.say(answer);
+      assert.ok(text.startsWith(`Recording the dismissal of ${t.a.id} failed (EIO): it reads as dismissed now. Note that ${t.a.id}'s attempt to (chan) at `), text);
+      assert.ok(text.endsWith('may already have been posted: no receipt.'), text);
+      assert.deepEqual(traced, [[t.a.id]], 'the dismissal that stands is traced');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('the dismissal trace names the drafts the call dismissed, not ones already dismissed', async () => {
+    const t = await setup();
+    try {
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] });
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id, t.b.id] });
+      assert.equal(t.say(answer), `${t.a.id}: dismissed (your history keeps the words).\n${t.b.id}: already dismissed.`);
+      assert.deepEqual(traced, [[t.b.id], [t.a.id]]);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a dismissal that never reached the journal says the draft reads as it did, and traces nothing', async () => {
+    const t = await setup();
+    try {
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      const dismiss = t.internals.proseDrafts.dismiss.bind(t.internals.proseDrafts);
+      t.internals.proseDrafts.dismiss = (agent: string, id: string) => {
+        if (id === t.b.id) throw new Error('EIO');
+        dismiss(agent, id);
+      };
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id, t.b.id] });
+      t.internals.proseDrafts.dismiss = dismiss;
+      assert.equal(t.say(answer),
+        `${t.a.id}: dismissed (your history keeps the words).\nRecording the dismissal of ${t.b.id} failed (EIO): it reads as held now.`);
+      assert.deepEqual(traced, [[t.a.id]], 'the dismissal before the failure is traced; the one that failed is not');
     } finally {
       await t.close();
     }
@@ -1706,7 +1771,7 @@ describe('drafts resend ownership', () => {
       const agent = t.framework.getAgent('scout')!;
       const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
       const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
-      const restore = failSyncAfterDismissal(t.framework);
+      const restore = failSyncAfter(t.framework, 'dismissed');
       await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
       restore();
       assert.ok(words().includes(`[prose-routing] Recording setting aside draft ${bounce!.id}, which {{unsent}} named, failed (EIO): ` +
@@ -1717,7 +1782,81 @@ describe('drafts resend ownership', () => {
     }
   });
 
-  it("a puppeted drafts call acts as the resident, as the model's own call does", async () => {
+  it(">>skip_reply {{unsent}} of a possibly-posted bounce that stands after its recording failed says so, with the risk", async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
+      await sending;
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      const restore = failSyncAfter(t.framework, 'dismissed');
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      restore();
+      assert.deepEqual(traced, [[bounce!.id]], 'the dismissal that stands is traced');
+      assert.ok(words().some((w) => w.startsWith(`[prose-routing] Recording setting aside draft ${bounce!.id}, which {{unsent}} named, failed (EIO): ` +
+        `it reads as dismissed now, and {{unsent}} names nothing. Note that ${bounce!.id}'s attempt to (chan) at `) &&
+        w.endsWith('may already have been posted: no receipt.')), words().join('\n'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a resend whose attempt reached the journal before its recording failed is not sent, and says the draft reads as unconfirmed', async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const restore = failSyncAfter(t.framework, 'attempt');
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      restore();
+      assert.equal(t.pending.length, 0, 'nothing was sent');
+      assert.match(t.say(answer), new RegExp(`${t.a.id}: not sent — the attempt could not be recorded durably \\(EIO\\), and the draft reads as unconfirmed now\\.`));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("{{unsent}} whose attempt reached the journal before its recording failed bounces, saying the draft reads as unconfirmed", async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
+      const restore = failSyncAfter(t.framework, 'attempt');
+      await t.internals.deliverProse(agent, '>>chan {{unsent}}', { notice: 'later' });
+      restore();
+      assert.equal(t.pending.length, 0, 'nothing was sent');
+      assert.ok(words().some((w) => w.includes(`the attempt for draft ${bounce!.id} could not be recorded durably (EIO), and the draft reads as unconfirmed now`)),
+        words().join('\n'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("a puppeted drafts call whose handler throws is answered as a failure", async () => {
+    const t = await setup();
+    try {
+      (t.framework as unknown as { handleDraftsTool: () => Promise<unknown> }).handleDraftsTool = async () => { throw new Error('boom'); };
+      const { result } = await t.framework.puppetToolCall('scout', 'drafts', {
+        action: 'list', draftIds: null, destination: null, confirmDuplicate: null, offset: null,
+      });
+      assert.equal(result.success, false);
+      assert.equal(result.error, 'drafts failed: boom');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("a puppeted drafts call reaches the drafts tool and acts as the resident", async () => {
     const t = await setup();
     try {
       const { result } = await t.framework.puppetToolCall('scout', 'drafts', {

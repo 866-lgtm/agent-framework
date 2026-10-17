@@ -10356,7 +10356,7 @@ export class AgentFramework {
       // The inbound source envelope, frozen at acceptance (see the channel
       // lane). A channel-scoped push belongs to the channel its subject names.
       // Its message and thread are the subject's where its origin leaves them
-      // out, as an edit's may: delivery restores them the same way.
+      // out, as an edit's may, so it names the message delivery restores.
       const known = c.channelId
         ? this.pushCoalescer.identity(coalescingSubjectKey(
             serverId, this.coalescingBinding(serverId), { kind: 'channel', id: c.channelId }, c.key))
@@ -11562,8 +11562,9 @@ export class AgentFramework {
    *  be dismissed: the batch honours that when it reaches the draft. */
   private draftsSending = new Set<string>();
 
-  /** The drafts tool's answer, wherever the call comes in: a failure the
-   *  handler throws is answered as one. */
+  /** The drafts tool's answer to a resident's call, from the model's own
+   *  dispatch or an agent-origin call through executeToolCall (a puppet's):
+   *  a failure the handler throws is answered as one. */
   private draftsToolResult(agentName: string, rawInput: unknown): Promise<ToolResult> {
     return this.handleDraftsTool(agentName, rawInput).catch((err): ToolResult => ({
       success: false,
@@ -11683,6 +11684,8 @@ export class AgentFramework {
         );
       }
       const lines: string[] = [];
+      // The drafts this call dismissed, traced even when a later one fails.
+      const dismissed: string[] = [];
       for (const d of drafts) {
         const state = draftState(d);
         if (state === 'delivered') {
@@ -11702,14 +11705,17 @@ export class AgentFramework {
           // A write that failed after reaching the journal was reconciled
           // into it, so say what the draft reads as now rather than guess.
           const now = this.draftStateNow(agentName, d.id);
+          if (now === 'dismissed') dismissed.push(d.id);
+          if (dismissed.length > 0) this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: dismissed });
           return refuse(
             `${lines.length > 0 ? `${lines.join('\n')}\n` : ''}Recording the dismissal of ${d.id} failed ` +
             `(${err instanceof Error ? err.message : String(err)}): it reads as ${now} now.${now === 'dismissed' ? risk : ''}`,
           );
         }
+        dismissed.push(d.id);
         lines.push(`${d.id}: dismissed (your history keeps the words).${risk}`);
       }
-      this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: drafts.map((d) => d.id) });
+      if (dismissed.length > 0) this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: dismissed });
       return ok(lines.join('\n'));
     }
 
@@ -11794,7 +11800,10 @@ export class AgentFramework {
         try {
           attemptId = this.proseDrafts.beginAttempt(agentName, d.id, destination, 'resend', draftState(d) === 'unconfirmed');
         } catch (err) {
-          lines.push(`${d.id}: not sent — the attempt could not be recorded durably (${err instanceof Error ? err.message : String(err)}).`);
+          // A write that failed after reaching the journal was reconciled
+          // into it, so say what the draft reads as now rather than guess.
+          lines.push(`${d.id}: not sent — the attempt could not be recorded durably (${err instanceof Error ? err.message : String(err)}), ` +
+            `and the draft reads as ${this.draftStateNow(agentName, d.id)} now.`);
           stopped = `${d.id}'s attempt could not be recorded`;
           continue;
         }
@@ -12422,7 +12431,8 @@ export class AgentFramework {
         try {
           attemptId = this.proseDrafts.beginAttempt(agent.name, unsent.id, target.destination, 'unsent-token', false);
         } catch (err) {
-          const reason = `the attempt for draft ${unsent.id} could not be recorded durably (${err instanceof Error ? err.message : String(err)})`;
+          const reason = `the attempt for draft ${unsent.id} could not be recorded durably (${err instanceof Error ? err.message : String(err)}), ` +
+            `and the draft reads as ${this.draftStateNow(agent.name, unsent.id)} now`;
           console.error(`[drafts] ${agent.name}: ${reason} — not sending`);
           return { status: 'failed', reason, at: Date.now() };
         }
@@ -12615,6 +12625,7 @@ export class AgentFramework {
       // A write that failed after reaching the journal was reconciled into
       // it, so say what the draft reads as now rather than guess.
       const now = this.draftStateNow(agent.name, draft.id);
+      if (now === 'dismissed') this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
       const named = this.proseDrafts.latestBounce(agent.name)?.id === draft.id;
       tell(`[prose-routing] Recording setting aside draft ${draft.id}, which {{unsent}} named, failed ` +
         `(${err instanceof Error ? err.message : String(err)}): it reads as ${now} now, and {{unsent}} ` +
