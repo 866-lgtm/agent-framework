@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -481,7 +481,7 @@ import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from '.
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { boundedForLog, describeCause } from './mcpl/errors.js';
-import { assertServerConfigBooleans, isWebSocketTransport } from './mcpl/transport.js';
+import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -4690,7 +4690,17 @@ export class AgentFramework {
       this.referenceFetcherInstance = new ReferenceFetcher(
         (serverId) => {
           const cfg = this.mcplServerConfigs.get(serverId);
-          if (!cfg?.url) return undefined;
+          if (!cfg) return undefined;
+          // A server's address is the url the host dials it at, as the
+          // transport decides: none for a server the host spawns, as a stdio
+          // server, nor for a WebSocket server whose url the transport won't
+          // dial, which buildWebSocketUrl refuses (not ws:// or wss://).
+          if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
+          try {
+            buildWebSocketUrl(cfg, null);
+          } catch {
+            return 'no-address';
+          }
           return { url: cfg.url, token: cfg.token, autofetch: cfg.autofetch };
         },
         async (fileName, data, mimeType) => {
@@ -17368,11 +17378,12 @@ export class AgentFramework {
       if (result.isError) return mcplToolFailure(result.content);
       // RFC-005 §6.2: register the result's references with this server, so
       // a stub later made of them is bound and fetch_reference can fetch
-      // them. Nothing is fetched here: an in-process caller may never show
-      // them to an agent, and an eager fetch would spend the server's fetch
-      // budget, which the agent's own fetch_reference needs, on bytes nobody
-      // asked for. A failure keeps only its text (mcplToolFailure), so no
-      // stub is made of its references and they aren't registered.
+      // them through this server's address, where it has one. Nothing is
+      // fetched here: an in-process caller may never show them to an agent,
+      // and an eager fetch would spend the server's fetch budget, which the
+      // agent's own fetch_reference needs, on bytes nobody asked for. A
+      // failure keeps only its text (mcplToolFailure), so no stub is made of
+      // its references and they aren't registered.
       await this.autoFetchReferences(result.content, serverId, false)
         .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
       return {
@@ -23017,13 +23028,15 @@ export class AgentFramework {
             };
           }
           if (candidate.kind === 'reference') {
-            // Point at fetch_reference only where it can deliver: not for a
-            // reference this process holds no record of (fetch_reference
-            // looks the id up in the same registry), nor, as the stub does,
-            // for one whose record shows the fetcher would refuse it as
-            // unbound or expired. A saved copy it serves.
+            // Point at fetch_reference only where its fetch would go ahead: not
+            // for a reference this process holds no record of (fetch_reference
+            // looks the id up in the same registry), nor for one the fetcher
+            // would refuse before dialing. Its refusal() gives the reason a
+            // fetch_reference call naming no max_bytes would be refused with,
+            // from the checks its fetch makes, and none where the fetch would
+            // serve a saved copy or join a fetch already under way.
             const record = referenceRegistry.get(candidate.refId);
-            const unfetchable = record ? unfetchableReason(record) : null;
+            const refusal = record ? this.getReferenceFetcher().refusal(record) : null;
             throw new Error(
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
@@ -23031,8 +23044,8 @@ export class AgentFramework {
                 ? 'This process holds no record of it (a restart or an eviction drops records, and a stub quoted ' +
                   "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
                   'it again, re-run that tool for a fresh reference.'
-                : unfetchable
-                  ? `It can't be fetched either — ${unfetchable}.`
+                : refusal
+                  ? `It can't be fetched either — ${refusal.reason}.`
                   : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }

@@ -8,8 +8,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { ReferenceFetcher, normalizedOrigin } from '../src/mcpl/reference-fetcher.js';
-import { ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry } from '../src/mcpl/references.js';
+import { ReferenceFetcher, normalizedOrigin, type ServerResolution } from '../src/mcpl/reference-fetcher.js';
+import { EXPIRY_REASON, noAddressReason, ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry } from '../src/mcpl/references.js';
 import { AgentFramework } from '../src/framework.js';
 
 const PAYLOAD = Buffer.from('RIFF-not-really-a-wav-'.repeat(100));
@@ -63,7 +63,7 @@ const port = (server.address() as { port: number }).port;
 const ORIGIN = `http://127.0.0.1:${port}`;
 
 const saved: Array<{ name: string; bytes: number; mime: string }> = [];
-function makeFetcher(bindings: Record<string, { url: string; token?: string; autofetch?: { maxBytes?: number; maxTotalBytes?: number } }>) {
+function makeFetcher(bindings: Record<string, ServerResolution>) {
   return new ReferenceFetcher(
     (id) => bindings[id],
     async (name, data, mime) => { saved.push({ name, bytes: data.length, mime }); return `scratch/refs/${name}`; },
@@ -678,15 +678,126 @@ test('of two servers on the uri\'s origin, the first to deliver it is dialed, wi
   }
 });
 
-test('a server the host holds no address for is its refusal while it is the only one, and passed over for one on the origin', async () => {
+test('a server unknown to the host is its refusal while it is the only one, and passed over for one on the origin', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ owner: { url: `ws://127.0.0.1:${port}` } });
   const uri = `${ORIGIN}/ok?unknown-first`;
-  const record = makeRecord(reg, uri, {}, 'stdio-srv');
-  assert.equal((await f.fetch(record)).error, 'unknown server: stdio-srv');
+  const record = makeRecord(reg, uri, {}, 'gone');
+  assert.equal((await f.fetch(record)).error, 'unknown server: gone');
   makeRecord(reg, uri, {}, 'owner');
-  assert.deepEqual(record.serverIds, ['stdio-srv', 'owner']);
+  assert.deepEqual(record.serverIds, ['gone', 'owner']);
   const out = await f.fetch(record);
+  assert.equal(out.ok, true, out.error);
+});
+
+test('a server with no address is refused in a phrase naming it, and passed over for one on the origin', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ 'stdio-srv': 'no-address', owner: { url: `ws://127.0.0.1:${port}` } });
+  const uri = `${ORIGIN}/ok?no-address`;
+  // Small enough for an eager slot, so it takes none only for the server it came from.
+  const record = makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, 'stdio-srv');
+  assert.deepEqual(f.refusal(record), { reason: noAddressReason('stdio-srv'), ofReference: false });
+  assert.equal((await f.fetch(record)).error, "no address: this host doesn't connect to server stdio-srv over a network, so there's nowhere to fetch it from");
+  assert.equal(f.isEagerEligible(record), false);
+  assert.equal(hits.get('/ok?no-address') ?? 0, 0, 'nothing dialed');
+  makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, 'owner');
+  assert.equal(f.refusal(record), null);
+  assert.equal(f.isEagerEligible(record), true);
+  const out = await f.fetch(record);
+  assert.equal(out.ok, true, out.error);
+});
+
+test('a server with no address ahead of one off the origin is the refusal, and the other way round the origin check\'s is', async () => {
+  for (const [order, refusal] of [
+    [['stdio-srv', 'a'], /^no address: this host doesn't connect to server stdio-srv over a network/],
+    [['a', 'stdio-srv'], /^third-party origin \(http:\/\/127\.0\.0\.1:\d+ != dialed https:\/\/a\.example\.invalid\)/],
+  ] as const) {
+    const reg = new ReferenceRegistry();
+    const f = makeFetcher({ 'stdio-srv': 'no-address', a: { url: 'https://a.example.invalid' } });
+    const uri = `${ORIGIN}/ok?no-address-and-off-origin=${order[0]}`;
+    const record = makeRecord(reg, uri, {}, order[0]);
+    makeRecord(reg, uri, {}, order[1]);
+    assert.match(f.refusal(record)?.reason ?? '', refusal);
+    assert.match((await f.fetch(record)).error ?? '', refusal);
+    assert.equal(hits.get(`/ok?no-address-and-off-origin=${order[0]}`) ?? 0, 0, 'nothing dialed');
+  }
+});
+
+test('refusal() answers what the fetch would refuse before dialing, case by case, the eager check gives none of them a slot, and null where it would serve or dial', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({
+    srv: { url: `ws://127.0.0.1:${port}` },
+    'stdio-srv': 'no-address',
+    spent: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: 0 } },
+    // An eager limit past the fetch's own ceiling and its budget: those still decide.
+    roomy: { url: `ws://127.0.0.1:${port}`, autofetch: { maxBytes: 4 * 1024 * 1024 * 1024 } },
+  });
+  const small = { sizeBytes: PAYLOAD.length };
+  const cases: Array<[string, ReturnType<typeof makeRecord>, string | null]> = [
+    // makeRecord's server defaults when given undefined, so this one registers itself.
+    ['unbound', reg.register((classifyBlock({ type: 'resource', uri: `${ORIGIN}/ok?case=unbound`, ...small }) as Extract<ReturnType<typeof classifyBlock>, { kind: 'reference' }>).testimony), `reference ${UNBOUND_REASON}`],
+    ['unknown server', makeRecord(reg, `${ORIGIN}/ok?case=unknown`, small, 'gone'), 'unknown server: gone'],
+    ['no address', makeRecord(reg, `${ORIGIN}/ok?case=no-address`, small, 'stdio-srv'), noAddressReason('stdio-srv')],
+    ['off the origin', makeRecord(reg, 'https://cdn.example.invalid/case-origin', small, 'srv'), null],
+    ['expired', makeRecord(reg, `${ORIGIN}/ok?case=expired`, { ...small, expiresAt: '2001-01-01T00:00:00Z' }, 'srv'), `reference ${EXPIRY_REASON.passed}`],
+    ['budget spent', makeRecord(reg, `${ORIGIN}/ok?case=budget`, small, 'spent'), `per-server fetch budget exhausted (0/0 bytes); ${BUDGET_LASTS}`],
+    ['over the ceiling', makeRecord(reg, `${ORIGIN}/ok?case=ceiling`, { sizeBytes: 512 * 1024 * 1024 }, 'roomy'), 'claimed 536870912 bytes exceeds fetch ceiling 268435456'],
+    ['over the ceiling and what is left of the budget', makeRecord(reg, `${ORIGIN}/ok?case=both`, { sizeBytes: 2 * 1024 * 1024 * 1024 }, 'roomy'),
+      `claimed 2147483648 bytes exceeds what's left of the per-server fetch budget (0/1073741824 bytes); ${BUDGET_LASTS}`],
+  ];
+  for (const [what, record, error] of cases) {
+    const refusal = f.refusal(record);
+    assert.ok(refusal, `${what}: a refusal`);
+    assert.equal(f.isEagerEligible(record), false, `${what}: no eager slot`);
+    const said = refusal.ofReference ? `reference ${refusal.reason}` : refusal.reason;
+    const out = await f.fetch(record);
+    assert.equal(out.ok, false, what);
+    assert.equal(out.error, said, `${what}: the fetch answers what refusal() said`);
+    if (error !== null) assert.equal(said, error, what);
+    else assert.match(said, /^third-party origin \(https:\/\/cdn\.example\.invalid != dialed http:\/\/127\.0\.0\.1:\d+\); not fetched by this host$/, what);
+  }
+  assert.equal([...hits.keys()].filter((k) => k.startsWith('/ok?case=')).length, 0, 'nothing dialed');
+  // Null where the fetch serves a saved copy or dials, and the one it would dial takes an eager slot.
+  const savedCopy = makeRecord(reg, `${ORIGIN}/ok?case=saved`, { expiresAt: '2001-01-01T00:00:00Z' }, 'stdio-srv');
+  savedCopy.fetchedPath = 'scratch/refs/saved.bin';
+  assert.equal(f.refusal(savedCopy), null);
+  const dial = makeRecord(reg, `${ORIGIN}/ok?case=dial`, small, 'srv');
+  assert.equal(f.refusal(dial), null);
+  assert.equal(f.isEagerEligible(dial), true);
+  // A saved copy of one the fetch would otherwise dial takes no eager slot either: the fetch serves it.
+  const keptCopy = makeRecord(reg, `${ORIGIN}/ok?case=kept`, small, 'srv');
+  keptCopy.fetchedPath = 'scratch/refs/kept.bin';
+  assert.equal(f.refusal(keptCopy), null);
+  assert.equal(f.isEagerEligible(keptCopy), false);
+});
+
+test('a reference with two faults is refused for the first the fetch checks: the server, then the expiry, the spent budget, the claimed size', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ 'stdio-srv': 'no-address', spent: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: 0 } } });
+  const past = '2001-01-01T00:00:00Z';
+  const huge = 512 * 1024 * 1024;
+  const cases: Array<[string, ReturnType<typeof makeRecord>, string]> = [
+    ['no address, expired', makeRecord(reg, `${ORIGIN}/ok?two=1`, { expiresAt: past }, 'stdio-srv'), noAddressReason('stdio-srv')],
+    ['expired, budget spent, over the ceiling', makeRecord(reg, `${ORIGIN}/ok?two=2`, { expiresAt: past, sizeBytes: huge }, 'spent'), `reference ${EXPIRY_REASON.passed}`],
+    ['budget spent, over the ceiling', makeRecord(reg, `${ORIGIN}/ok?two=3`, { sizeBytes: huge }, 'spent'), `per-server fetch budget exhausted (0/0 bytes); ${BUDGET_LASTS}`],
+  ];
+  for (const [what, record, error] of cases) {
+    const refusal = f.refusal(record);
+    assert.ok(refusal, what);
+    assert.equal(refusal.ofReference ? `reference ${refusal.reason}` : refusal.reason, error, what);
+    assert.equal((await f.fetch(record)).error, error, what);
+  }
+});
+
+test('refusal() answers nothing while a fetch of the record is under way, which the fetch would join', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const record = makeRecord(reg, `${ORIGIN}/ok?in-flight`, { sizeBytes: PAYLOAD.length }, 'srv');
+  const fetching = f.fetch(record);
+  // The fetch has made its checks; the record's claims change while it is under way.
+  record.testimony = { ...record.testimony, expiresAt: '2001-01-01T00:00:00Z' };
+  assert.equal(f.refusal(record), null, 'joined, not refused');
+  const out = await fetching;
   assert.equal(out.ok, true, out.error);
 });
 

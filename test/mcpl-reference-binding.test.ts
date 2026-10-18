@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { fixture, TS } from './helpers/coalescing-fixture.js';
-import { referenceRegistry, type ReferenceRecord } from '../src/mcpl/references.js';
+import { noAddressReason, referenceRegistry, type ReferenceRecord } from '../src/mcpl/references.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { PushHandler } from '../src/mcpl/push-handler.js';
@@ -105,13 +105,15 @@ test("a context injection's reference is registered with the server whose hook s
   assert.deepEqual(stubRecords(text).map((record) => record?.serverIds), [['hooks'], ['hooks'], ['hooks']]);
 });
 
-test("fetch_reference reaches a push event's reference through its server's own address, and refuses one elsewhere or from a server with no address", async (t) => {
+test("fetch_reference reaches a push event's reference through its server's own address, and refuses one elsewhere, one from a server with no address, one from a server spawned from a command whatever url its config holds, and one from a server the host doesn't know, reading a server's transport as the host connects to it", async (t) => {
   const png = Buffer.from('not really a png, but bytes');
   let dialed = 0;
   const http = createServer((_req, res) => { dialed++; res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(png); });
   await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise<void>((resolve) => http.close(() => resolve())));
   const origin = `http://127.0.0.1:${(http.address() as AddressInfo).port}`;
+  // What a WebSocket server on that origin is dialed at: the origin check reads ws as http.
+  const wsOrigin = origin.replace(/^http:/, 'ws:');
   // The push path as the framework builds it, here with no coalescer.
   const pushed: unknown[] = [];
   const handler = new PushHandler({ validateInbound() {} } as unknown as FeatureSetManager, (event) => { pushed.push(event); }, () => {});
@@ -121,17 +123,39 @@ test("fetch_reference reaches a push event's reference through its server's own 
   } as never, { respond: () => {}, respondError: () => {} } as never);
   await push('push-srv', 'fetch-own', [`${origin}/binding/own.png`, 'https://cdn.example.invalid/binding/elsewhere.png']);
   await push('stdio-srv', 'fetch-stdio', [`${origin}/binding/stdio.png`]);
-  const [own, elsewhere, stdio] = stubRecords(JSON.stringify(pushed));
-  assert.deepEqual([own?.serverIds, elsewhere?.serverIds, stdio?.serverIds], [['push-srv'], ['push-srv'], ['stdio-srv']]);
+  await push('gone-srv', 'fetch-gone', [`${origin}/binding/gone.png`]);
+  await push('spawned-srv', 'fetch-spawned', [`${origin}/binding/spawned.png`]);
+  await push('ws-command-srv', 'fetch-ws-command', [`${origin}/binding/ws-command.png`]);
+  await push('stdio-url-srv', 'fetch-stdio-url', [`${origin}/binding/stdio-url.png`]);
+  await push('ws-http-srv', 'fetch-ws-http', [`${origin}/binding/ws-http.png`]);
+  const [own, elsewhere, stdio, gone, spawned, wsCommand, stdioUrl, wsHttp] = stubRecords(JSON.stringify(pushed));
+  assert.deepEqual(
+    [own, elsewhere, stdio, gone, spawned, wsCommand, stdioUrl, wsHttp].map((record) => record?.serverIds),
+    [['push-srv'], ['push-srv'], ['stdio-srv'], ['gone-srv'], ['spawned-srv'], ['ws-command-srv'], ['stdio-url-srv'], ['ws-http-srv']],
+  );
   // The framework's own fetcher, resolving each server from its MCPL config:
-  // push-srv has an address, and stdio-srv, as a stdio server, has none.
+  // push-srv has an address; stdio-srv, as a stdio server, has none, nor
+  // has spawned-srv, which the host spawns from its command though its
+  // config also holds a url on the uri's origin; and gone-srv isn't
+  // configured at all. An explicit transport decides as the host connects:
+  // ws-command-srv is a WebSocket server though its config holds a command,
+  // and stdio-url-srv is spawned though its config holds only a url.
+  // ws-http-srv is a WebSocket server whose url the transport won't dial,
+  // since it isn't ws:// or wss://.
   type Answer = { result: { success: boolean; data?: string; error?: string } };
   const framework = Object.create(AgentFramework.prototype) as {
     pushEvent(event: unknown): void;
     dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
   };
   Object.assign(framework, {
-    mcplServerConfigs: new Map([['push-srv', { id: 'push-srv', url: origin }], ['stdio-srv', { id: 'stdio-srv', command: 'stdio-server' }]]),
+    mcplServerConfigs: new Map([
+      ['push-srv', { id: 'push-srv', url: wsOrigin }],
+      ['stdio-srv', { id: 'stdio-srv', command: 'stdio-server' }],
+      ['spawned-srv', { id: 'spawned-srv', command: 'stdio-server', url: wsOrigin }],
+      ['ws-command-srv', { id: 'ws-command-srv', transport: 'websocket', command: 'stdio-server', url: wsOrigin }],
+      ['stdio-url-srv', { id: 'stdio-url-srv', transport: 'stdio', url: wsOrigin }],
+      ['ws-http-srv', { id: 'ws-http-srv', transport: 'websocket', url: origin }],
+    ]),
     getWorkspaceModule: () => ({ writeBinary: async () => ({ success: true }) }),
     firstWritableMountName: () => 'scratch',
     emitTrace: () => {},
@@ -150,10 +174,26 @@ test("fetch_reference reaches a push event's reference through its server's own 
   const refused = await fetchReference(elsewhere!.refId);
   assert.equal(refused.success, false);
   assert.match(refused.error ?? '', /third-party origin/);
-  const unknown = await fetchReference(stdio!.refId);
+  const noAddress = await fetchReference(stdio!.refId);
+  assert.equal(noAddress.success, false);
+  assert.equal(noAddress.error, noAddressReason('stdio-srv'));
+  const notDialed = await fetchReference(spawned!.refId);
+  assert.equal(notDialed.success, false);
+  assert.equal(notDialed.error, noAddressReason('spawned-srv'));
+  const unknown = await fetchReference(gone!.refId);
   assert.equal(unknown.success, false);
-  assert.equal(unknown.error, 'unknown server: stdio-srv');
-  assert.equal(dialed, 1, 'nothing dialed for the other two');
+  assert.equal(unknown.error, 'unknown server: gone-srv');
+  assert.equal(dialed, 1, 'nothing dialed for the other four');
+  const throughWebSocket = await fetchReference(wsCommand!.refId);
+  assert.equal(throughWebSocket.success, true, throughWebSocket.error);
+  assert.equal(dialed, 2);
+  const spawnedByTransport = await fetchReference(stdioUrl!.refId);
+  assert.equal(spawnedByTransport.success, false);
+  assert.equal(spawnedByTransport.error, noAddressReason('stdio-url-srv'));
+  const undialable = await fetchReference(wsHttp!.refId);
+  assert.equal(undialable.success, false);
+  assert.equal(undialable.error, noAddressReason('ws-http-srv'));
+  assert.equal(dialed, 2, 'nothing dialed for the last two');
 });
 
 /** The admin puppet's route to an MCPL tool, executeMcplToolCall, with a
