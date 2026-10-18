@@ -294,35 +294,34 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // is read as "always"; a field of the wrong type, one slip from one the gate
 // reads there, or one the gate reads at another level of the rule (a match's
 // "tagsAny" beside "name"), as left out, its problem naming where it's read;
-// and a number out of range the way the starting rules ran it. A rule is left
-// out only where earlier releases refused it. One that skips or defers is read
-// past a problem too, holding back what they held back: left out, the events
-// it held back would go on to the rules after it, where a rate limit, a sample
-// or a debounce could spend them and then hold back an event that woke the
-// agent before. Under a default that holds events back, a file that leaves out
-// a rule that could wake the agent isn't used, since that would hold back what
-// the rule was written to wake on; earlier releases didn't use it either. A
-// change through addPolicy, whose caller is there to fix it, refuses any
-// problem, and nothing is saved. A field name that is no slip of one the gate
-// reads there, and that it reads at no other level, changes nothing, a slip of
-// another level's field included: it loads, and a note names it with the
-// fields its place holds. In a rule, a name holding a field's whole name is
-// such a name beside that field, an extra that explains it, and a slip of the
-// field where it's given in the field's place (fieldNames); at gate.json's
-// top, where it can be a label of the file, it's such a name either way. A
-// "policies" holding nothing, or a slip of it that does, writes no rules, as
-// one left out does. Where "policies" writes no rules, a list holding an
-// object with a field of a rule, or of its match or behavior, under a name
-// gate.json doesn't read, is read as a slip of "policies", and under a default
-// that holds events back, such a field at gate.json's top is read the same
-// way. A rule's name, a filter's type and a keyBy shape nothing on their own,
-// so a label of the file can have their names, and nor does a field of a rule
-// or its match holding nothing, since an empty one has always meant no
-// constraint; a behavior names what a rule does, even holding nothing.
-// A null is a field left out, and so is "", with a note: earlier releases read
-// most fields that way, and none narrows anything by them. Where they refused
-// a rule or a file for one (a passthrough, a behavior's kind, gate.json's
-// default), it now loads without it.
+// and a number out of range the way the starting rules ran it, but for a
+// debounce, read at its nearest bound, which can send a batch later or sooner
+// but drops no event in it, and a refill interval of 0, read as refilling at
+// once. A rule is left out only where earlier releases refused it. One that
+// skips or defers is read past a problem too, holding back what they held back:
+// left out, the events it held back would go on to the rules after it, where a
+// rate limit, a sample or a debounce could spend them and then hold back an
+// event that woke the agent before. Under a default that holds events back, a
+// file that leaves out a rule that could wake the agent isn't used, since that
+// would hold back what the rule was written to wake on; earlier releases didn't
+// use it either. A change through addPolicy, whose caller is there to fix it,
+// refuses any problem, and nothing is saved. A field name that is no slip of
+// one the gate reads there, and that it reads at no other level, changes
+// nothing, a slip of another level's field included: it loads, and a note names
+// it with the fields its place holds. In a rule, a name holding a field's whole
+// name is such a name beside that field, an extra that explains it, and a slip
+// of the field where it's given in the field's place (fieldNames); at
+// gate.json's top, where it can be a label of the file, it's such a name either
+// way. A file earlier releases loaded loads as they read it: a slip of
+// "policies", a list of rules parked under a name the gate doesn't read, a
+// rule's fields at gate.json's top and a "policies" that isn't a list each do
+// nothing, and a note names each, so where "policies" writes no rules the file
+// has none, and under "skip" or "defer" it holds back every event, as it did. A
+// "policies" holding nothing writes no rules, as one left out does. A null is a
+// field left out, and so is "", with a note: earlier releases read most fields
+// that way, and none narrows anything by them. Where they refused a rule or a
+// file for one (a passthrough, a behavior's kind, gate.json's default), it now
+// loads without it.
 
 const CONFIG_FIELDS = ['default', 'policies'];
 const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough'];
@@ -333,9 +332,6 @@ const FILTER_FIELDS = ['type', 'pattern'];
 const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample'] as const;
 const RATE_LIMIT_FIELDS = ['tokens', 'refillIntervalMs', 'keyBy'];
 const PASSIVE_SAMPLE_FIELDS = ['every', 'keyBy'];
-// Fields of a rule that shape nothing on their own: a rule's name, a filter's
-// type without its pattern, and a keyBy without the tokens or every it groups.
-const LABEL_FIELDS = ['name', 'type', 'keyBy'];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -359,13 +355,11 @@ function beforeWriting(err: unknown): boolean {
 
 /**
  * A change's refusal where gate.json has no rule list it could edit without
- * writing over what it holds (a list, JSON that isn't an object, or a
- * "policies" that isn't a list and holds something), or leaving it out of
- * force (rules under a slip of "policies", or a rule's fields at the top,
- * beside which a list would bring only the new rule into force).
+ * writing over what it holds: a list, JSON that isn't an object, or a
+ * "policies" that isn't a list and holds something.
  */
 function noListRefusal(noList: string): string {
-  return `${noList}, so a change has no list of rules to edit without writing over or leaving out what gate.json holds, `
+  return `${noList}, so a change has no list of rules to edit without writing over what gate.json holds, `
     + 'and nothing was saved. Whoever runs this host can make gate.json an object whose "policies" is a list holding its '
     + 'rules; until then, a change is refused the same way.';
 }
@@ -807,9 +801,11 @@ function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | un
 }
 
 /**
- * A debounce: a number of milliseconds. One out of the gate's range ran as
- * written, which never silenced an event, so it's read at its nearest bound,
- * which keeps what the rule meant.
+ * A debounce: a number of milliseconds. One out of the gate's range is read
+ * at its nearest bound. Earlier releases refused it in gate.json and ran it
+ * as written in the starting rules, where one over 2,147,483,647 ms ran after
+ * 1 ms, the most a timer takes; read at the bound, a batch goes out later or
+ * sooner than it did there, and every event in it is still delivered.
  */
 function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) {
@@ -834,9 +830,10 @@ function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
 /**
  * A rate limit. A refill interval under 0 ran as a bucket that never refills,
  * waking on its first tokens and then on none of what the rule matched, and
- * one of 0 refilled it once, then never, its clock left at NaN; both are read
- * as never refilling (applyRateLimit). No tokens woke on none of it, so such
- * a rule is left out.
+ * is read so. One of 0 refilled the bucket once and then never, its clock left
+ * at NaN; it's read as refilling at once, every time, so the rule limits
+ * nothing, which holds back nothing it woke the agent on (applyRateLimit). No
+ * tokens woke on none of it, so such a rule is left out.
  */
 function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
@@ -862,7 +859,9 @@ function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
   } else if (refill <= 0) {
     r.problems.push({
       text: `behavior.rate_limit.refillIntervalMs is ${refill}, where a positive number of milliseconds is needed`,
-      read: "so its tokens never refill, and once they're spent it wakes the agent on nothing it matches",
+      read: refill === 0
+        ? 'so its tokens refill at once, and it limits nothing it matches'
+        : "so its tokens never refill, and once they're spent it wakes the agent on nothing it matches",
     });
   }
   const keyBy = readKeyBy(r, 'rate_limit', conf.keyBy);
@@ -1139,8 +1138,7 @@ type ConfigReading =
     sentences: string[];
     /** Its own fields as loaded, and its rule list, each rule as written, for
      *  a write to edit by name; or, for one with no rule list to edit (a list,
-     *  a "policies" that isn't one and holds something, or, where "policies"
-     *  writes no rules, a slip of it holding something), what it is instead. */
+     *  or a "policies" that isn't one and holds something), what it is instead. */
     listed: Listed;
   };
 
@@ -1164,26 +1162,22 @@ function heldNames(listed: Listed): Set<string> {
 
 /**
  * gate.json, or the host's starting rules, read (`file` names which in
- * messages). Earlier releases refused it whole where it isn't an object, or
- * its default isn't one of the three, and it isn't used. A list, a
- * "policies" that isn't a list and holds something, or, where "policies"
- * writes no rules, a slip of it holding something, they read as no rules
- * under its default, which is read so where that wakes ("always"), and
- * otherwise isn't used. A "policies" holding nothing, an empty list or one
- * that isn't a list, writes no rules, as one left out does, and so does a
- * slip of it holding nothing. Where "policies" writes no rules, a list under
- * a name the gate doesn't read, holding an object with a field that says a
- * rule was meant (meansRule), is read as such a slip, since its author meant
- * rules, and under a default that holds events back, a field at the file's
- * top that says a rule was meant isn't used either.
- * Each rule is read on its own. Under a default that holds events back, a
- * rule left out that could wake the agent would hold back what it was written
- * to wake on, so the file isn't used, as earlier releases, which refused such
- * a rule and so the file, didn't use it.
+ * messages). A file earlier releases loaded loads as they read it, with a
+ * note naming what they didn't read: a list is read as no rules under the
+ * default "always", and a slip of "policies", a name the gate doesn't read
+ * (a list of rules parked under one included), a field of a rule at the
+ * file's top and a "policies" that isn't a list each as nothing, so where
+ * "policies" writes no rules the file has none, and its default decides every
+ * event. A "policies" holding nothing, an empty list or one that isn't a
+ * list, writes no rules, as one left out does. Earlier releases refused it
+ * whole where it isn't an object, or its default isn't one of the three, and
+ * it isn't used. Each rule is read on its own. Under a default that holds
+ * events back, a rule left out that could wake the agent would hold back what
+ * it was written to wake on, so the file isn't used, as earlier releases,
+ * which refused such a rule and so the file, didn't use it.
  */
 function readConfig(raw: unknown, file: 'gate.json' | 'the starting config'): ConfigReading {
   const File = file === 'gate.json' ? file : 'The starting config';
-  const noRules = 'so it has no rules, and every event gets the default, "always"';
   if (Array.isArray(raw)) {
     return {
       config: { policies: [], default: 'always' },
@@ -1199,96 +1193,44 @@ function readConfig(raw: unknown, file: 'gate.json' | 'the starting config'): Co
 
   const sentences: string[] = [];
   const obj = withoutEmpty(file, raw, sentences, configLeftOut(raw.default));
-  // Here a name holding "default" or "policies" isn't a slip of it. A slip of
-  // "policies" holding something keeps a file that holds events back out of
-  // force, and at the top such a name can be a label of the file
-  // ("policiesUpdated"), which a file the gate holds quiet can carry. Where
-  // "policies" writes no rules, a list of rules under any name is read as a
-  // slip of it below, and a name holding "default" leaves the default
-  // "always", as a slip of it does.
+  // Here a name holding "default" or "policies" isn't a slip of it: at the
+  // top, such a name can be a label of the file ("policiesUpdated").
   const names = fieldNames(obj, CONFIG_FIELDS, false);
-  // A field of a rule, or of its match or behavior, says a rule was meant, but
-  // for a label's names, which shape nothing on their own, and a field of a
-  // rule or its match holding nothing, since an empty one has always meant no
-  // constraint. A behavior, one of its kinds or their fields counts even
-  // holding nothing, since it names what a rule does: a rule left out with a
-  // behavior that's a list or names no kind, or a rate limit without tokens,
-  // counts as one that could wake the agent too. A null or "" is a field left
-  // out, in a list's objects as everywhere else, so it says nothing.
-  const elsewhere = homesOf(file, CONFIG_FIELDS);
-  const ofBehavior = (key: string): boolean =>
-    key === 'behavior' || elsewhere(key).some((home) => home.startsWith('"behavior'));
-  const meansRule = (key: string, value: unknown): boolean => !LABEL_FIELDS.includes(key) && elsewhere(key).length > 0
-    && (ofBehavior(key) ? value !== null && value !== '' : !holdsNothing(value));
-  // A "policies" holding nothing writes no rules, as one left out does, so
-  // what gate.json holds beside it is read as it is with none.
-  const noPolicies = obj.policies === undefined || holdsNothing(obj.policies);
-  // There, a list holding an object with such a field, under a name the gate
-  // doesn't read, says its author meant rules, so it's read as a slip of
-  // "policies", whatever the name.
-  const ruleLists = noPolicies
-    ? names.unread.filter((key) => Array.isArray(obj[key]) && (obj[key] as unknown[]).some((item) => isPlainObject(item)
-      && Object.entries(item).some(([field, value]) => meansRule(field, value))))
-    : [];
-  const slips: Slip[] = [...names.slips, ...ruleLists.map((key) => ({ key, meant: ['policies'] }))];
-  const { misplaced, rest } = placedElsewhere(names.unread.filter((key) => !ruleLists.includes(key)), elsewhere);
+  const { misplaced, rest } = placedElsewhere(names.unread, homesOf(file, CONFIG_FIELDS));
   noteUnread(file, rest, CONFIG_FIELDS, sentences);
   for (const m of misplaced) {
     sentences.push(
       `${file} has ${misplacedShown(m)}, which the gate doesn't read here, so ${m.keys.length === 1 ? 'it does' : 'they do'} nothing.`,
     );
   }
-  // So does such a field at the file's top, where "policies" writes no rules.
-  // Under a default that holds events back, read as written the file would
-  // hold back what that rule was written to let through, so there it isn't
-  // used, as a slip of "policies" isn't.
-  const ruleAtTop = noPolicies && (obj.default === 'skip' || obj.default === 'defer')
-    && misplaced.some((m) => m.keys.some((key) => meansRule(key, obj[key])))
-    ? `${File} has ${misplaced.map(misplacedShown).join(', and ')}, which the gate doesn't read here`
-    : undefined;
-  // A slip of "policies" holding nothing writes no rules either.
-  const holdsRules = (slip: Slip): boolean => slip.meant.includes('policies') && !holdsNothing(obj[slip.key]);
+  // A "policies" holding nothing writes no rules, as one left out does.
+  const noPolicies = obj.policies === undefined || holdsNothing(obj.policies);
   // What a change edits, used or not: its own fields and rule list as written
-  // (a list left out, null or "", or one holding nothing, is an empty one), or
-  // what it is instead. Where "policies" writes no rules, a slip of it holding
-  // something holds rules the gate doesn't read, so there's no list to edit
-  // there, nor beside a rule's field at its top.
-  const policiesSlip = noPolicies ? slips.find(holdsRules) : undefined;
-  const listed: Listed = policiesSlip
-    ? { noList: `${File} has ${slipShown(policiesSlip)}, which the gate doesn't read` }
-    : ruleAtTop
-      ? { noList: ruleAtTop }
-      : noPolicies || Array.isArray(obj.policies)
-        ? { top: raw, rules: Array.isArray(obj.policies) ? obj.policies : [] }
-        : { noList: `${File}'s "policies" is ${shownValue(obj.policies)}` };
+  // (a list left out, null or "", or one holding nothing, is an empty one),
+  // beside whatever else it holds; or, where "policies" isn't a list and holds
+  // something, what it is instead, since a list there would write over it.
+  const listed: Listed = noPolicies || Array.isArray(obj.policies)
+    ? { top: raw, rules: Array.isArray(obj.policies) ? obj.policies : [] }
+    : { noList: `${File}'s "policies" is ${shownValue(obj.policies)}` };
   const given = obj.default;
   if (given !== undefined && given !== 'always' && given !== 'defer' && given !== 'skip') {
     return { refused: `${file} "default" must be "always", "defer", or "skip", got: ${shownValue(given)}`, listed };
   }
   const defaultBehavior = given ?? 'always';
-  const withoutRules = (text: string): string => `${text}, and with no rules its default, "${defaultBehavior}", would hold back every event.`;
-  for (const slip of slips) {
-    const text = `${File} has ${slipShown(slip)}, which the gate doesn't read`;
+  const noRules = configLeftOut(defaultBehavior).policies;
+  for (const slip of names.slips) {
     let read = SLIP_READ;
-    if (holdsRules(slip) && noPolicies) {
-      if (defaultBehavior !== 'always') return { refused: withoutRules(text), listed };
-      read = noRules;
-    } else if (slip.meant.includes('policies') && noPolicies) {
-      // One holding nothing is "policies" left out.
-      read = `and ${configLeftOut(defaultBehavior).policies}`;
-    } else if (slip.meant.includes('default') && obj.default === undefined) {
-      read = 'so its default is "always"';
-    }
-    sentences.push(`${text}, ${read}.`);
+    // Where "policies" writes no rules, what a slip of it holds leaves the file with none.
+    if (slip.meant.includes('policies') && noPolicies) read = `and ${noRules}`;
+    else if (slip.meant.includes('default') && obj.default === undefined) read = 'so its default is "always"';
+    sentences.push(`${File} has ${slipShown(slip)}, which the gate doesn't read, ${read}.`);
   }
-  if (ruleAtTop) return { refused: withoutRules(ruleAtTop), listed };
   const policies: unknown[] = Array.isArray(obj.policies) ? obj.policies : [];
   if (!Array.isArray(obj.policies) && obj.policies !== undefined) {
-    const text = `${File}'s "policies" is ${shownValue(obj.policies)}, where a list of rules is needed, such as `
-      + '[{"name": "my-rule", "behavior": "always"}]';
-    if (noPolicies) sentences.push(`${text}, and ${configLeftOut(defaultBehavior).policies}.`);
-    else if (defaultBehavior !== 'always') return { refused: withoutRules(text), listed };
-    else sentences.push(`${text}, ${noRules}.`);
+    sentences.push(
+      `${File}'s "policies" is ${shownValue(obj.policies)}, where a list of rules is needed, such as `
+      + `[{"name": "my-rule", "behavior": "always"}], and ${noRules}.`,
+    );
   }
 
   const rules = policies.map((rule, i) => {
@@ -1811,7 +1753,7 @@ export class EventGate {
       // Nothing was written, so gate.json loads as it did, without them.
       return {
         kind: 'reconcile-failed', names, atOpen: true, config: read.config,
-        error: `${read.listed.noList}, so there's no list of rules to add them to without writing over or leaving out what it holds`,
+        error: `${read.listed.noList}, so there's no list of rules to add them to without writing over what it holds`,
       };
     }
     const reconciled = { ...read.listed.top, policies: [...read.listed.rules, ...missing.map((rule) => rule.raw)] };
@@ -1959,11 +1901,9 @@ export class EventGate {
    * rules in force, where no text is or it has no rule list. A file that can't
    * be read or isn't JSON comes back with its error, and with its bytes when
    * it could be read, for keepUnreadableConfig before anything is written over
-   * it. A gate.json with no rule list a write could edit comes back as what
-   * it is instead: a list, a "policies" that isn't one and holds something,
-   * where "policies" writes no rules, a slip of it holding something or, under
-   * "skip" or "defer", a field at its top that says a rule was meant, or JSON
-   * that isn't an object.
+   * it. A gate.json with no rule list a write could edit without writing over
+   * what it holds comes back as what it is instead: a list, a "policies" that
+   * isn't one and holds something, or JSON that isn't an object.
    */
   private rulesForChange():
     | { top: Record<string, unknown>; rules: unknown[]; unreadable?: { error: string; bytes?: Buffer }; remedy?: string }
@@ -2125,41 +2065,30 @@ export class EventGate {
    * buckets and counters of the rule it was. A rule left out loses its stats
    * (matchCount, lastMatchTimestamp) too; a rule kept keeps them, which are
    * history, not live state, and one kept with the same behavior keeps all its
-   * state, its denial and fire counts included. Each pending debounce batch is
-   * sent last, as its timer would have sent it, once every rule's state is
-   * cleared. One whose delivery throws is named in the log and dropped, and
-   * the rest are still sent: the write or reload that cleared it has done what
-   * it was for, so its caller hears that it did, and no state is left behind.
+   * state, its denial and fire counts included. Rules that share a name share
+   * its state, so a name keeps it only where its rules, in order, keep their
+   * behaviors. Each pending debounce batch is sent last, as its timer would
+   * have sent it, once every rule's state is cleared; one whose delivery throws
+   * is named in the log and dropped (fireDebounce), and the rest are still
+   * sent, so the write or reload that cleared it has done what it was for, its
+   * caller hears that it did, and no state is left behind.
    */
   private clearStateFor(was: GateConfig, next: GateConfig): { removed: string[]; cleared: string[] } {
-    const behaviorByName = new Map<string, string>();
-    for (const p of was.policies) behaviorByName.set(p.name, behaviorFingerprint(p.behavior));
-    const nextNames = new Set(next.policies.map((p) => p.name));
-    const removed: string[] = [];
-    for (const name of behaviorByName.keys()) {
-      if (!nextNames.has(name)) {
-        this.clearPolicyState(name);
-        this.stats.delete(name);
-        removed.push(name);
-      }
+    const behaviorsByName = (config: GateConfig): Map<string, string> => {
+      const byName = new Map<string, string[]>();
+      for (const p of config.policies) byName.set(p.name, [...(byName.get(p.name) ?? []), behaviorFingerprint(p.behavior)]);
+      return new Map([...byName].map(([name, behaviors]) => [name, JSON.stringify(behaviors)]));
+    };
+    const before = behaviorsByName(was);
+    const after = behaviorsByName(next);
+    const removed = [...before.keys()].filter((name) => !after.has(name));
+    for (const name of removed) {
+      this.clearPolicyState(name);
+      this.stats.delete(name);
     }
-    const cleared: string[] = [];
-    for (const p of next.policies) {
-      const before = behaviorByName.get(p.name);
-      if (before !== undefined && before !== behaviorFingerprint(p.behavior)) {
-        this.clearPolicyState(p.name);
-        cleared.push(p.name);
-      }
-    }
-    // Each batch is sent on its own, as each timer would send it, so one whose
-    // delivery throws doesn't keep the rest.
-    for (const name of [...removed, ...cleared]) {
-      try {
-        this.fireDebounce(name);
-      } catch (err) {
-        console.error(`[gate] Policy "${name}": its pending batch couldn't be delivered (${errorText(err)}), so its events are dropped`);
-      }
-    }
+    const cleared = [...after.keys()].filter((name) => before.has(name) && before.get(name) !== after.get(name));
+    for (const name of cleared) this.clearPolicyState(name);
+    for (const name of [...removed, ...cleared]) this.fireDebounce(name);
     return { removed, cleared };
   }
 
@@ -2222,8 +2151,10 @@ export class EventGate {
    *
    * The freshest on-disk config is re-read first, so a concurrent operator edit
    * isn't clobbered, and the change edits gate.json's own rule list by name:
-   * every rule it doesn't change is written back as it was written, problems
-   * and fields the gate doesn't read included (rulesForChange). Over a
+   * every rule it doesn't change is written back as it was written, problems and
+   * fields the gate doesn't read included, and so is everything else gate.json
+   * holds, such as a list of rules parked under another name, beside which a
+   * change adds a "policies" list where there's none (rulesForChange). Over a
    * gate.json the gate doesn't use, only a change after which it loads is
    * written, such as one replacing or removing the rule that keeps it out; any
    * other is refused, naming what does, and the file stays as written. When
@@ -2231,24 +2162,24 @@ export class EventGate {
    * text whose rules are in force the same way, or the rules in force where
    * there's none; over a file that can't be read or isn't JSON, after a copy of
    * it is kept beside it (keepUnreadableConfig) and reported to
-   * `onUnreadableKept` once the change is written and traced. A policy with the same
-   * `name` is replaced IN PLACE when no `position` is given (order preserved);
-   * WITH a `position` it is moved there — so re-issuing a rule is also how you
-   * reposition it. New policies append
-   * by default; `'prepend'` puts one at the very front (ahead of EVERYTHING,
-   * including addressed-message wake rules — see the shadow lint), and the
-   * anchored forms `{before: name}` / `{after: name}` insert relative to an
-   * existing rule, which is almost always the safer way to order a sampler
-   * or debounce against a specific catch-all. Fields of the policy the gate
-   * reads nowhere, and that aren't a slip of one it does, are left out of
-   * what's written, and named to `onIgnoredFields` once the change is written
-   * and traced. A throw from either callback is logged, and the change stands
-   * (afterChange). A field it reads at another level is a problem, like a slip.
+   * `onUnreadableKept` once the change is written and traced. A policy with the
+   * same `name` is replaced IN PLACE when no `position` is given (order
+   * preserved); WITH a `position` it is moved there — so re-issuing a rule is
+   * also how you reposition it. New policies append by default; `'prepend'` puts
+   * one at the very front (ahead of EVERYTHING, including addressed-message wake
+   * rules — see the shadow lint), and the anchored forms `{before: name}` /
+   * `{after: name}` insert relative to an existing rule, which is almost always
+   * the safer way to order a sampler or debounce against a specific catch-all.
+   * Fields of the policy the gate reads nowhere, and that aren't a slip of one
+   * it does, are left out of what's written, and named to `onIgnoredFields` once
+   * the change is written and traced. A throw from either callback is logged,
+   * and the change stands (afterChange). A field it reads at another level is a
+   * problem, like a slip.
    *
    * Throws, writing nothing, for an invalid policy, a placement it can't make,
    * a gate.json that can't be read or kept, one with no rule list it could
-   * edit without writing over or leaving out what it holds, or one the gate
-   * doesn't use that the change doesn't mend; and throws when the write fails,
+   * edit without writing over what it holds, or one the gate doesn't use
+   * that the change doesn't mend; and throws when the write fails,
    * naming any copy kept.
    */
   addPolicy(
@@ -2643,10 +2574,14 @@ export class EventGate {
       buckets.set(key, bucket);
     } else if (bucket.tokens < config.tokens) {
       const elapsed = now - bucket.lastRefill;
-      // A refill interval at or under 0, read from gate.json or the starting
-      // rules (readRateLimit), never refills. Divided by, 0 refilled the
-      // bucket once and left its clock at NaN.
-      if (elapsed > 0 && config.refillIntervalMs > 0) {
+      // A refill interval of 0, read from gate.json or the starting rules
+      // (readRateLimit), refills at once; divided by, it refilled the bucket
+      // once and left its clock at NaN. Under 0, no number of whole intervals
+      // has passed, so it never refills.
+      if (config.refillIntervalMs === 0) {
+        bucket.tokens = config.tokens;
+        bucket.lastRefill = now;
+      } else if (elapsed > 0) {
         const tokensToAdd = Math.floor(elapsed / config.refillIntervalMs);
         if (tokensToAdd > 0) {
           bucket.tokens = Math.min(config.tokens, bucket.tokens + tokensToAdd);
@@ -2742,8 +2677,10 @@ export class EventGate {
         const key = this.resolveKey(info.metadata, cfg.keyBy);
         const bucket = this.rateLimitBuckets.get(policy.name)?.get(key);
         if (!bucket) return true; // fresh bucket starts full
+        // As applyRateLimit refills: at once, for an interval of 0, and never
+        // for one under 0.
+        if (cfg.refillIntervalMs === 0) return true;
         let tokens = bucket.tokens;
-        // As applyRateLimit refills: never, for an interval at or under 0.
         if (tokens < cfg.tokens && cfg.refillIntervalMs > 0) {
           const elapsed = Math.max(0, this.now() - bucket.lastRefill);
           tokens = Math.min(cfg.tokens, tokens + Math.floor(elapsed / cfg.refillIntervalMs));
@@ -2968,7 +2905,16 @@ export class EventGate {
       return;
     }
 
-    this.deliverEvents(events);
+    // A delivery that throws drops the batch, named in the log: thrown from
+    // its timer, it would be uncaught, and stop the process, and thrown to a
+    // write or reload that sends it (clearStateFor), it would report a change
+    // that was made as failed.
+    try {
+      this.deliverEvents(events);
+    } catch (err) {
+      console.error(`[gate] Policy "${policyName}": its pending batch couldn't be delivered (${errorText(err)}), so its events are dropped`);
+      return;
+    }
 
     this.emitTrace({
       type: 'gate:debounce-delivered',
@@ -3093,8 +3039,20 @@ export class EventGate {
     if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
-      // Defer to avoid re-entrancy inside trace callbacks
-      queueMicrotask(() => this.deliverEvents(events));
+      // Defer to avoid re-entrancy inside trace callbacks. A delivery that
+      // throws drops what was held, named in the log, as fireDebounce drops a
+      // batch: thrown in the microtask, it would be uncaught.
+      queueMicrotask(() => {
+        try {
+          this.deliverEvents(events);
+        } catch (err) {
+          const one = events.length === 1;
+          console.error(
+            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
+            + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
+          );
+        }
+      });
     }
   }
 

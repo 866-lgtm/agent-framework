@@ -521,7 +521,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
     const { gate: g, configPath: path } = makeGate(d, { file });
     const before = readFileSync(path, 'utf-8');
     assert.throws(() => g.addPolicy({ name: 'added', behavior: 'always' }), {
-      message: `${what}, so a change has no list of rules to edit without writing over or leaving out what gate.json holds, and `
+      message: `${what}, so a change has no list of rules to edit without writing over what gate.json holds, and `
         + 'nothing was saved. Whoever runs this host can make gate.json an object whose "policies" is a list holding its rules; '
         + 'until then, a change is refused the same way.',
     });
@@ -535,9 +535,12 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   noList(5, 'gate.json is 5');
 });
 
-test("gate.json's own problems: a list, or policies that isn't a list, is read as no rules where that wakes, and isn't used where it doesn't", (t) => {
-  const noRules = 'so it has no rules, and every event gets the default, "always"';
+test("gate.json's own problems: a list, a policies that isn't one, a slip of it, a name the gate doesn't read and a rule's fields at the top load as earlier releases read them, under the file's default", (t) => {
   const policiesNeeded = 'where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}]';
+  const noRules = (defaultBehavior: string): string => defaultBehavior === 'always'
+    ? 'it has no rules, so every event gets the default, "always"'
+    : `it has no rules, so under its default, "${defaultBehavior}", every event is held back`;
+  const unread = (key: string) => `gate.json has "${key}", which the gate doesn't read, so it does nothing. Its fields are "default" and "policies".`;
   const read: Array<[unknown, string, string]> = [
     [
       [{ name: 'dm', behavior: 'always' }],
@@ -545,17 +548,17 @@ test("gate.json's own problems: a list, or policies that isn't a list, is read a
       'gate.json is a list, where an object is needed, such as {"policies": [{"name": "my-rule", "behavior": "always"}]}, so none of it is read, '
       + 'and every event gets the default, "always".',
     ],
-    [{ policies: { name: 'r', behavior: 'always' } }, 'always', `gate.json's "policies" is {"name":"r","behavior":"always"}, ${policiesNeeded}, ${noRules}.`],
-    [{ polices: [{ name: 'dm', behavior: 'always' }] }, 'always', `gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, ${noRules}.`],
-    // A list holding a rule, under a name further from "policies" than a slip, says its author meant rules, as a slip does.
-    [{ rules: [{ name: 'dm', behavior: 'always' }] }, 'always', `gate.json has "rules" (did you mean "policies"?), which the gate doesn't read, ${noRules}.`],
+    [{ policies: { name: 'r', behavior: 'always' } }, 'always', `gate.json's "policies" is {"name":"r","behavior":"always"}, ${policiesNeeded}, and ${noRules('always')}.`],
+    [{ polices: [{ name: 'dm', behavior: 'always' }] }, 'always', `gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, and ${noRules('always')}.`],
+    // A list holding a rule, under a name further from "policies" than a slip, is a name like any other.
+    [{ rules: [{ name: 'dm', behavior: 'always' }] }, 'always', unread('rules')],
     [{ defualt: 'skip', policies: [] }, 'always', 'gate.json has "defualt" (did you mean "default"?), which the gate doesn\'t read, so its default is "always".'],
     // A "policies" holding nothing writes no rules, as [] does, and beside one a slip holding rules is read as it is with none.
-    [{ policies: {} }, 'always', `gate.json's "policies" is {}, ${policiesNeeded}, and it has no rules, so every event gets the default, "always".`],
+    [{ policies: {} }, 'always', `gate.json's "policies" is {}, ${policiesNeeded}, and ${noRules('always')}.`],
     [
       { policies: [], polices: [{ name: 'dm', behavior: 'always' }] },
       'always',
-      `gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, ${noRules}.`,
+      `gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, and ${noRules('always')}.`,
     ],
   ];
   for (const [file, defaultBehavior, said] of read) {
@@ -566,97 +569,8 @@ test("gate.json's own problems: a list, or policies that isn't a list, is read a
     assert.deepEqual(names(gate), []);
   }
 
+  // What earlier releases refused whole, it doesn't use.
   const refused: Array<[unknown, string]> = [
-    [{ default: 'skip', policies: { name: 'r', behavior: 'always' } }, `gate.json's "policies" is {"name":"r","behavior":"always"}, ${policiesNeeded}, and with no rules its default, "skip", would hold back every event.`],
-    [{ default: 'defer', polices: [{ name: 'dm', behavior: 'always' }] }, 'gate.json has "polices" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "defer", would hold back every event.'],
-    [{ default: 'skip', policy: [MENTIONS] }, 'gate.json has "policy" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "skip", would hold back every event.'],
-    // One rule among labels is enough.
-    [
-      { default: 'skip', notes: [{ date: '2026-10-01' }, MENTIONS] },
-      'gate.json has "notes" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "skip", would hold back every event.',
-    ],
-    // So do a rule's fields at the file's top, under a default that holds events back,
-    [
-      { default: 'skip', ...MENTIONS },
-      'gate.json has "name", "match" and "behavior", fields of a rule, which the gate doesn\'t read here, and with no rules its default, "skip", '
-      + 'would hold back every event.',
-    ],
-    // and a field of a rule's match, or of its behavior, there.
-    [
-      { default: 'skip', tagsAny: ['chat:dm'] },
-      'gate.json has "tagsAny", a field of "match", which the gate doesn\'t read here, and with no rules its default, "skip", would hold back every event.',
-    ],
-    [
-      { default: 'defer', tokens: 3, refillIntervalMs: 60000 },
-      'gate.json has "tokens" and "refillIntervalMs", fields of "behavior.rate_limit", which the gate doesn\'t read here, and with no rules its '
-      + 'default, "defer", would hold back every event.',
-    ],
-    // A keyBy beside its tokens, each named with where it's read,
-    [
-      { default: 'skip', keyBy: 'channel', tokens: 3 },
-      'gate.json has "keyBy", a field of "behavior.rate_limit" and "behavior.passive_sample", and "tokens", a field of "behavior.rate_limit", '
-      + 'which the gate doesn\'t read here, and with no rules its default, "skip", would hold back every event.',
-    ],
-    // a filter's type beside its pattern,
-    [
-      { default: 'skip', type: 'regex', pattern: 'urgent' },
-      'gate.json has "type" and "pattern", fields of "match.filter", which the gate doesn\'t read here, and with no rules its default, "skip", '
-      + 'would hold back every event.',
-    ],
-    // and a label named as a match field is, since nothing in a name tells the two apart.
-    [
-      { source: 'written by ops', default: 'skip' },
-      'gate.json has "source", a field of "match", which the gate doesn\'t read here, and with no rules its default, "skip", would hold back every '
-      + 'event.',
-    ],
-    // A value that holds something counts, though a rule would drop it: a list holding "" or null, false, or 0,
-    [
-      { default: 'skip', tagsAny: [''] },
-      'gate.json has "tagsAny", a field of "match", which the gate doesn\'t read here, and with no rules its default, "skip", would hold back every event.',
-    ],
-    [
-      { default: 'skip', passthrough: false },
-      'gate.json has "passthrough", a field of a rule, which the gate doesn\'t read here, and with no rules its default, "skip", would hold back every '
-      + 'event.',
-    ],
-    [
-      { default: 'defer', tokens: 0 },
-      'gate.json has "tokens", a field of "behavior.rate_limit", which the gate doesn\'t read here, and with no rules its default, "defer", would '
-      + 'hold back every event.',
-    ],
-    [
-      { default: 'skip', notes: [{ text: 'launch', tagsAny: [null] }] },
-      'gate.json has "notes" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "skip", would hold back every event.',
-    ],
-    // and a behavior, or one of its kinds, counts even holding nothing, as a rule's left out with one does.
-    [
-      { default: 'skip', rate_limit: {} },
-      'gate.json has "rate_limit", a field of "behavior", which the gate doesn\'t read here, and with no rules its default, "skip", would hold back '
-      + 'every event.',
-    ],
-    [
-      { default: 'skip', behavior: [] },
-      'gate.json has "behavior", a field of a rule, which the gate doesn\'t read here, and with no rules its default, "skip", would hold back every '
-      + 'event.',
-    ],
-    [
-      { default: 'skip', notes: [{ name: 'r', behavior: {} }] },
-      'gate.json has "notes" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "skip", would hold back every event.',
-    ],
-    // So does each beside a "policies" holding nothing, which writes no rules, as one left out does.
-    [
-      { default: 'skip', policies: {}, polices: [MENTIONS] },
-      'gate.json has "polices" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "skip", would hold back every event.',
-    ],
-    [
-      { default: 'defer', policies: [], rules: [MENTIONS] },
-      'gate.json has "rules" (did you mean "policies"?), which the gate doesn\'t read, and with no rules its default, "defer", would hold back every event.',
-    ],
-    [
-      { default: 'skip', policies: [], ...MENTIONS },
-      'gate.json has "name", "match" and "behavior", fields of a rule, which the gate doesn\'t read here, and with no rules its default, "skip", '
-      + 'would hold back every event.',
-    ],
     [{ default: 'sometimes', policies: [] }, 'gate.json "default" must be "always", "defer", or "skip", got: "sometimes"'],
     ['"skip"', 'gate.json must be a JSON object'],
   ];
@@ -679,9 +593,7 @@ test("gate.json's own problems: a list, or policies that isn't a list, is read a
   // Beside "policies", a list under a name the gate doesn't read is a name like any other.
   const { gate: beside } = makeGate(tempDir(t), { file: { policies: [MENTIONS], rules: [{ name: 'dm', behavior: 'always' }] } });
   assert.deepEqual(names(beside), ['mentions']);
-  assert.deepEqual(beside.getStatus().errors, [
-    'gate.json loaded. gate.json has "rules", which the gate doesn\'t read, so it does nothing. Its fields are "default" and "policies".',
-  ]);
+  assert.deepEqual(beside.getStatus().errors, [`gate.json loaded. ${unread('rules')}`]);
   beside.dispose();
 
   // Under "always", a rule's fields at the top are read as written, and named; beside a list holding rules, so they are under "skip".
@@ -698,75 +610,66 @@ test("gate.json's own problems: a list, or policies that isn't a list, is read a
     gate.dispose();
   }
 
-  // A list with no rule in it says nothing of rules, so the file is read as written: quiet, under "skip".
-  for (const [file, key] of [[{ default: 'skip', comments: ['quiet for now'] }, 'comments'], [{ default: 'skip', policy: [] }, 'policy']] as const) {
-    const { gate } = makeGate(tempDir(t), { file });
-    assert.deepEqual(gate.getStatus().errors, [
-      `gate.json loaded. gate.json has "${key}", which the gate doesn't read, so it does nothing. Its fields are "default" and "policies".`,
-    ]);
-    assert.equal(gate.getStatus().configSource, 'file');
-    assert.equal(gate.evaluate(MENTION).trigger, false, JSON.stringify(file));
-    gate.dispose();
-  }
-
-  // A rule's name, a filter's type or a keyBy shapes nothing a rule matches or
-  // does on its own, so a label of the file can have its name: at the top, or
-  // as all a list's objects hold, it says no rule was meant. Nor does a field
-  // of a rule or its match holding nothing, such as an empty list. The file is
-  // read as written, quiet under "skip" or "defer", and a change keeps the
-  // label, as it keeps a "comment".
-  const unread = (key: string) => `gate.json has "${key}", which the gate doesn't read, so it does nothing. Its fields are "default" and "policies".`;
-  const labels: Array<[Record<string, unknown>, string]> = [
-    [{ name: 'quiet-hours', default: 'skip' }, 'gate.json has "name", a field of a rule, which the gate doesn\'t read here, so it does nothing.'],
-    [{ type: 'gate-config', default: 'defer' }, 'gate.json has "type", a field of "match.filter", which the gate doesn\'t read here, so it does nothing.'],
+  // Under "skip" or "defer", a file earlier releases loaded loads as they read
+  // it: a slip of "policies", a list under a name the gate doesn't read
+  // (rules parked there, labels, or both), a rule's fields at the top, a label
+  // named like one, and a "policies" that isn't a list each do nothing, and a
+  // note names each without calling a parked list a slip. With no rules, it
+  // holds back every event, as it did; nothing in a name tells a parked list
+  // from a misplaced one, and leaving the file out of force at a start would
+  // run the host's starting rules, or wake on every event, in its place. A
+  // change keeps each as written, and adds a "policies" list beside it, in
+  // which the rule it adds is in force.
+  const misplaced = (shown: string, one = true) => `gate.json has ${shown}, which the gate doesn't read here, so ${one ? 'it does' : 'they do'} nothing.`;
+  const quiet: Array<[Record<string, unknown>, string[]]> = [
+    // Rules under a slip of "policies", or under a name further from it, among labels or alone,
+    [{ default: 'defer', polices: [{ name: 'dm', behavior: 'always' }] }, [`gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, and ${noRules('defer')}.`]],
+    [{ default: 'skip', policy: [MENTIONS] }, [unread('policy')]],
+    [{ default: 'skip', notes: [{ date: '2026-10-01' }, MENTIONS] }, [unread('notes')]],
+    [{ default: 'skip', policies: [], disabled: [MENTIONS] }, [unread('disabled')]],
     [
-      { keyBy: 'channel', default: 'skip' },
-      'gate.json has "keyBy", a field of "behavior.rate_limit" and "behavior.passive_sample", which the gate doesn\'t read here, so it does nothing.',
+      { default: 'skip', policies: [], history: [{ date: '2026-10-01', source: 'ops', text: 'muted for the offsite' }] },
+      [unread('history')],
     ],
-    [{ default: 'skip', notes: [{ date: '2026-10-01', text: 'muted during the launch' }] }, unread('notes')],
-    [{ default: 'defer', notes: [{ name: 'launch', type: 'mute' }] }, unread('notes')],
-    // As before: a "comment", a list of text, and a name beside "policies".
-    [{ comment: 'written by ops', default: 'skip' }, unread('comment')],
-    [{ default: 'skip', notes: ['muted during the launch'] }, unread('notes')],
-    [{ name: 'quiet-hours', default: 'skip', policies: [] }, 'gate.json has "name", a field of a rule, which the gate doesn\'t read here, so it does nothing.'],
-    // A null in the list is no object, and a null or "" field of one is a field left out, as everywhere else.
-    [{ default: 'skip', notes: [null, 'muted'] }, unread('notes')],
-    [{ default: 'skip', notes: [{ text: 'launch', match: null, source: '' }] }, unread('notes')],
-    [{ default: 'skip', notes: [{ name: 'launch', behavior: null }] }, unread('notes')],
-    [{ default: 'defer', notes: [{ text: 'launch', rate_limit: '' }] }, unread('notes')],
-    // An empty list, an empty object, or one holding only such values, sets nothing, at the top or in a list's objects.
-    [{ default: 'skip', tagsAny: [] }, 'gate.json has "tagsAny", a field of "match", which the gate doesn\'t read here, so it does nothing.'],
-    [{ default: 'defer', match: {} }, 'gate.json has "match", a field of a rule, which the gate doesn\'t read here, so it does nothing.'],
+    // a rule's fields at the top, or a field of its match or behavior,
+    [{ default: 'skip', ...MENTIONS }, [misplaced('"name", "match" and "behavior", fields of a rule', false)]],
+    [{ default: 'skip', tagsAny: ['chat:dm'] }, [misplaced('"tagsAny", a field of "match"')]],
+    [{ default: 'defer', channel: 'ops-room' }, [misplaced('"channel", a field of "match"')]],
+    [{ default: 'defer', tokens: 3, refillIntervalMs: 60000 }, [misplaced('"tokens" and "refillIntervalMs", fields of "behavior.rate_limit"', false)]],
     [
-      { default: 'skip', match: { tagsAny: [], filter: { pattern: '' } } },
-      'gate.json has "match", a field of a rule, which the gate doesn\'t read here, so it does nothing.',
+      { default: 'skip', keyBy: 'channel', tokens: 3 },
+      [misplaced('"keyBy", a field of "behavior.rate_limit" and "behavior.passive_sample"'), misplaced('"tokens", a field of "behavior.rate_limit"')],
     ],
-    [{ default: 'skip', notes: [{ text: 'launch', tagsAny: [] }] }, unread('notes')],
-    // So does a "policies", or a slip of it, holding nothing: it writes no rules, as [] does.
+    [{ default: 'skip', type: 'regex', pattern: 'urgent' }, [misplaced('"type" and "pattern", fields of "match.filter"', false)]],
+    [{ default: 'skip', passthrough: false }, [misplaced('"passthrough", a field of a rule')]],
+    [{ default: 'defer', tokens: 0 }, [misplaced('"tokens", a field of "behavior.rate_limit"')]],
+    [{ default: 'skip', rate_limit: {} }, [misplaced('"rate_limit", a field of "behavior"')]],
+    [{ default: 'skip', behavior: [] }, [misplaced('"behavior", a field of a rule')]],
+    // labels with a field's name, or none,
+    [{ name: 'quiet-hours', default: 'skip' }, [misplaced('"name", a field of a rule')]],
+    [{ source: 'written by ops', default: 'skip' }, [misplaced('"source", a field of "match"')]],
+    [{ comment: 'written by ops', default: 'skip' }, [unread('comment')]],
+    [{ default: 'skip', notes: ['muted during the launch'] }, [unread('notes')]],
+    [{ default: 'skip', comments: ['quiet for now'] }, [unread('comments')]],
+    [{ default: 'skip', policy: [] }, [unread('policy')]],
+    // and each beside a "policies" holding nothing, which writes no rules, as one left out does,
     [
-      { default: 'skip', polices: [] },
-      'gate.json has "polices" (did you mean "policies"?), which the gate doesn\'t read, and it has no rules, so under its default, "skip", every '
-      + 'event is held back.',
+      { default: 'skip', policies: {}, polices: [MENTIONS] },
+      [
+        `gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, and ${noRules('skip')}.`,
+        `gate.json's "policies" is {}, ${policiesNeeded}, and ${noRules('skip')}.`,
+      ],
     ],
-    [
-      { default: 'defer', polices: {} },
-      'gate.json has "polices" (did you mean "policies"?), which the gate doesn\'t read, and it has no rules, so under its default, "defer", every '
-      + 'event is held back.',
-    ],
-    [
-      { default: 'skip', policies: {} },
-      'gate.json\'s "policies" is {}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], and it has no rules, so under '
-      + 'its default, "skip", every event is held back.',
-    ],
-    [
-      { default: 'defer', policies: { a: [] } },
-      'gate.json\'s "policies" is {"a":[]}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], and it has no rules, '
-      + 'so under its default, "defer", every event is held back.',
-    ],
+    [{ default: 'defer', policies: [], rules: [MENTIONS] }, [unread('rules')]],
+    [{ default: 'skip', policies: [], ...MENTIONS }, [misplaced('"name", "match" and "behavior", fields of a rule', false)]],
+    // or a slip of it holding nothing.
+    [{ default: 'skip', polices: [] }, [`gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, and ${noRules('skip')}.`]],
+    [{ default: 'defer', policies: { a: [] } }, [`gate.json's "policies" is {"a":[]}, ${policiesNeeded}, and ${noRules('defer')}.`]],
+    [{ default: 'skip', policies: { a: null, b: '' } }, [`gate.json's "policies" is {"a":null,"b":""}, ${policiesNeeded}, and ${noRules('skip')}.`]],
   ];
-  for (const [file, said] of labels) {
+  for (const [file, said] of quiet) {
     const { gate, configPath } = makeGate(tempDir(t), { file });
-    assert.deepEqual(gate.getStatus().errors, [`gate.json loaded. ${said}`], JSON.stringify(file));
+    assert.deepEqual(gate.getStatus().errors, [`gate.json loaded. ${said.join(' ')}`], JSON.stringify(file));
     assert.equal(gate.getStatus().configSource, 'file');
     assert.equal(gate.getStatus().default, file.default);
     assert.deepEqual(names(gate), []);
@@ -776,6 +679,15 @@ test("gate.json's own problems: a list, or policies that isn't a list, is read a
     assert.equal(gate.evaluate(MENTION).trigger, true, JSON.stringify(file));
     gate.dispose();
   }
+
+  // So does a "policies" that isn't a list and holds something, which a change refuses to write over.
+  const { gate: notList } = makeGate(tempDir(t), { file: { default: 'skip', policies: { name: 'r', behavior: 'always' } } });
+  assert.deepEqual(notList.getStatus().errors, [
+    `gate.json loaded. gate.json's "policies" is {"name":"r","behavior":"always"}, ${policiesNeeded}, and ${noRules('skip')}.`,
+  ]);
+  assert.equal(notList.getStatus().configSource, 'file');
+  assert.equal(notList.evaluate(MENTION).trigger, false);
+  notList.dispose();
 });
 
 test("gate_status's entry for a gate.json the gate can't use says what's in force until it can use one again: the text in force, new text, or a write", (t) => {
@@ -810,6 +722,27 @@ test("gate_status's entry for a gate.json the gate can't use says what's in forc
   gate.addPolicy({ name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' });
   assert.deepEqual(gate.getStatus().errors, [said('why')], 'a write of the rules in force, after keeping a copy');
   assert.deepEqual(names(gate), ['mentions', 'dms']);
+});
+
+test("an onIgnoredFields that throws is logged once the change is made and traced, and the change answers as made", (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  const configPath = join(tempDir(t), 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [] }));
+  const traced: string[] = [];
+  const gate = new EventGate({
+    configPath, addMessage: () => '', requestInference: () => {}, getAgentNames: () => ['agent'],
+    emitTrace: (e) => { traced.push((e as { type: string }).type); },
+  });
+  t.after(() => gate.dispose());
+  let seen: string[] = [];
+  const saved = gate.addPolicy({ ...MENTIONS, comment: 'mine' }, {
+    onIgnoredFields: () => { seen = [...traced]; throw new Error('the host could not record it'); },
+  });
+  assert.equal(saved.name, 'mentions', 'addPolicy returns the rule it saved');
+  assert.deepEqual(onDisk(configPath).policies, [MENTIONS]);
+  assert.ok(seen.includes('gate:policy-added'), 'the callback runs once the change is traced');
+  assert.deepEqual(logged, ['[gate] onIgnoredFields threw once the change was made, and the change stands: the host could not record it']);
 });
 
 test('a null or "" is a field left out, and each "" is named, with what leaving it out does where that\'s more than no constraint', (t) => {
@@ -1127,34 +1060,16 @@ test('a change keeps every rule it doesn\'t change as written, problems and unkn
   assert.deepEqual(onDisk(configPath).policies, [MENTIONS]);
 });
 
-test('a change refuses, writing nothing, where gate.json has no rule list it could edit without writing over or leaving out what it holds', (t) => {
-  const slip = 'gate.json has "polices" (did you mean "policies"?), which the gate doesn\'t read';
+test('a change refuses, writing nothing, where gate.json has no rule list it could edit without writing over what it holds', (t) => {
   for (const [file, what] of [
     [[{ name: 'dm', behavior: 'always' }], 'gate.json is a list'],
     [{ policies: { name: 'dm', behavior: 'always' } }, 'gate.json\'s "policies" is {"name":"dm","behavior":"always"}'],
-    // Whatever its default: under "skip" it isn't used, and its rules are still the operator's.
+    // Whatever its default: under "skip" it loads holding every event back, and its rules are still the operator's.
     [{ default: 'skip', policies: { name: 'dm', behavior: 'always' } }, 'gate.json\'s "policies" is {"name":"dm","behavior":"always"}'],
-    // A slip of "policies" holds the rules the gate doesn't read, under it, so there's no list to edit there either.
-    [{ polices: [{ name: 'dm', behavior: 'always' }] }, slip],
-    [{ default: 'skip', polices: [{ name: 'dm', behavior: 'always' }] }, slip],
-    // So does one beside a "policies" holding nothing, which writes no rules, as one left out does.
-    [{ default: 'skip', policies: {}, polices: [{ name: 'dm', behavior: 'always' }] }, slip],
-    [{ policies: [], polices: [{ name: 'dm', behavior: 'always' }] }, slip],
-    // So does a list holding a rule under another name it doesn't read, which is read as a slip is.
-    [{ policy: [{ name: 'dm', behavior: 'always' }] }, 'gate.json has "policy" (did you mean "policies"?), which the gate doesn\'t read'],
-    [{ default: 'skip', rules: [{ name: 'dm', behavior: 'always' }] }, 'gate.json has "rules" (did you mean "policies"?), which the gate doesn\'t read'],
-    [{ default: 'defer', policies: [], rules: [{ name: 'dm', behavior: 'always' }] }, 'gate.json has "rules" (did you mean "policies"?), which the gate doesn\'t read'],
-    // And a rule's fields at the top, under a default that holds events back, beside which a list would bring only the new rule into force,
-    [{ default: 'defer', name: 'dm', behavior: 'always' }, 'gate.json has "name" and "behavior", fields of a rule, which the gate doesn\'t read here'],
-    // beside a "policies" holding nothing as with none,
-    [{ default: 'skip', policies: [], name: 'dm', behavior: 'always' }, 'gate.json has "name" and "behavior", fields of a rule, which the gate doesn\'t read here'],
-    [{ default: 'defer', policies: {}, name: 'dm', behavior: 'always' }, 'gate.json has "name" and "behavior", fields of a rule, which the gate doesn\'t read here'],
-    // a label named as a match field among them.
-    [{ default: 'skip', source: 'written by ops' }, 'gate.json has "source", a field of "match", which the gate doesn\'t read here'],
   ] as Array<[unknown, string]>) {
     const { gate, configPath } = makeGate(tempDir(t), { file });
     const before = readFileSync(configPath, 'utf-8');
-    const message = `${what}, so a change has no list of rules to edit without writing over or leaving out what gate.json holds, and `
+    const message = `${what}, so a change has no list of rules to edit without writing over what gate.json holds, and `
       + 'nothing was saved. Whoever runs this host can make gate.json an object whose "policies" is a list holding its rules; '
       + 'until then, a change is refused the same way.';
     assert.throws(() => gate.addPolicy({ name: 'later', behavior: 'defer' }), { message }, JSON.stringify(file));
@@ -1163,6 +1078,33 @@ test('a change refuses, writing nothing, where gate.json has no rule list it cou
     assert.throws(() => gate.removePolicy('dm'), { message }, JSON.stringify(file));
     assert.throws(() => gate.removePolicy('absent'), { message }, JSON.stringify(file));
     assert.equal(readFileSync(configPath, 'utf-8'), before);
+    gate.dispose();
+  }
+
+  // Rules under a slip of "policies" or under another name, and a rule's
+  // fields at the top, are left as written: a change adds a "policies" list
+  // beside them, as it adds one to a file with none, and a removal of a name
+  // only they hold removes nothing, since the gate holds no rule by it.
+  const dm = { name: 'dm', behavior: 'always' };
+  for (const file of [
+    { polices: [dm] },
+    { default: 'skip', polices: [dm] },
+    { default: 'skip', policies: {}, polices: [dm] },
+    { policies: [], polices: [dm] },
+    { policy: [dm] },
+    { default: 'skip', rules: [dm] },
+    { default: 'defer', policies: [], rules: [dm] },
+    { default: 'defer', name: 'dm', behavior: 'always' },
+    { default: 'skip', policies: [], name: 'dm', behavior: 'always' },
+    { default: 'skip', source: 'written by ops' },
+  ] as Array<Record<string, unknown>>) {
+    const { gate, configPath } = makeGate(tempDir(t), { file });
+    const before = readFileSync(configPath, 'utf-8');
+    assert.equal(gate.removePolicy('dm'), false, JSON.stringify(file));
+    assert.equal(readFileSync(configPath, 'utf-8'), before);
+    gate.addPolicy({ name: 'later', behavior: 'defer' });
+    assert.deepEqual(onDisk(configPath), { ...file, policies: [{ name: 'later', match: {}, behavior: 'defer' }] }, JSON.stringify(file));
+    assert.deepEqual(names(gate), ['later']);
     gate.dispose();
   }
 });
@@ -1201,14 +1143,26 @@ test("the host's starting rules are read rule by rule: a first start writes them
   assert.deepEqual(gate.getStatus().errors, [`gate.json loaded. ${said}`, `In the host's starting rules, ${said}`]);
   gate.dispose();
 
-  // The starting config as a whole, as gate.json is: not used where it would hold back every event.
-  const whole = makeGate(tempDir(t), { initialConfig: { default: 'skip', policies: { name: 'user-input' } } });
-  assert.deepEqual(whole.gate.getStatus().errors, [
-    'At start, the host\'s starting rules weren\'t used: The starting config\'s "policies" is {"name":"user-input"}, where a list of rules is '
-    + 'needed, such as [{"name": "my-rule", "behavior": "always"}], and with no rules its default, "skip", would hold back every event. '
-    + 'The gate started with no rules, as on a host without starting rules.',
+  // The starting config as a whole is read as gate.json is: one whose
+  // "policies" isn't a list loads with no rules under its default, as it ran,
+  // and gate.json holds it as given,
+  const notList = { default: 'skip', policies: { name: 'user-input' } };
+  const whole = makeGate(tempDir(t), { initialConfig: notList });
+  const noList = '"policies" is {"name":"user-input"}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], '
+    + 'and it has no rules, so under its default, "skip", every event is held back.';
+  assert.deepEqual(whole.gate.getStatus().errors, [`gate.json loaded. gate.json's ${noList}`, `In the host's starting rules, The starting config's ${noList}`]);
+  assert.deepEqual(onDisk(whole.configPath), notList);
+  assert.equal(whole.gate.evaluate(event([], 'user:message')).trigger, false);
+  whole.gate.dispose();
+  // and one that leaves out a rule that could wake the agent, under a default that holds events back, isn't used.
+  const leavesOut = makeGate(tempDir(t), { initialConfig: { default: 'skip', policies: [{ name: 'user-input', behavior: [] }] } });
+  assert.deepEqual(leavesOut.gate.getStatus().errors, [
+    'At start, the host\'s starting rules weren\'t used: the starting config leaves out a rule that could wake the agent, and under its '
+    + `default, "skip", what it was written to wake it on would be held back. Policy "user-input" is left out: behavior is [], where ${BEHAVIORS} `
+    + 'is needed. The gate started with no rules, as on a host without starting rules.',
   ]);
-  assert.equal(existsSync(whole.configPath), false);
+  assert.equal(existsSync(leavesOut.configPath), false);
+  leavesOut.gate.dispose();
   // One that's a list loaded as no rules under "always", which wakes, so it's read that way.
   const list = makeGate(tempDir(t), { initialConfig: [usable.policies[0]] });
   assert.deepEqual(onDisk(list.configPath), [usable.policies[0]]);
@@ -1358,7 +1312,7 @@ test("a rule gate.json holds keeps its name from the host's starting rules, read
   held.gate.dispose();
 });
 
-test("a later start adds nothing to a gate.json with no rule list it could edit, and says so", (t) => {
+test("a later start adds nothing to a gate.json with no rule list it could edit without writing over what it holds, and says so", (t) => {
   const { gate, configPath } = makeGate(tempDir(t), {
     file: [{ name: 'dm', behavior: 'always' }],
     initialConfig: { default: 'skip', policies: [{ name: 'user-input', match: {}, behavior: 'always' }] },
@@ -1369,37 +1323,34 @@ test("a later start adds nothing to a gate.json with no rule list it could edit,
     'gate.json loaded. gate.json is a list, where an object is needed, such as {"policies": [{"name": "my-rule", "behavior": "always"}]}, so '
     + 'none of it is read, and every event gets the default, "always".',
     'At start, the host\'s starting rules "user-input" couldn\'t be added to gate.json (gate.json is a list, so there\'s no list of rules '
-    + 'to add them to without writing over or leaving out what it holds), so they weren\'t put in force.',
+    + 'to add them to without writing over what it holds), so they weren\'t put in force.',
   ]);
   gate.dispose();
 
-  // Nor to one whose rules are under a name it doesn't read, which a change can't edit either.
+  // Beside rules under a name it doesn't read, which stay as written, it adds them in a "policies" list, as to a file with none.
   const theirs = { rules: [{ name: 'dm', behavior: 'always' }] };
-  const unread = makeGate(tempDir(t), { file: theirs, initialConfig: { default: 'skip', policies: [{ name: 'user-input', match: {}, behavior: 'always' }] } });
-  assert.deepEqual(onDisk(unread.configPath), theirs, 'gate.json is as it was');
-  assert.deepEqual(names(unread.gate), []);
-  assert.deepEqual(unread.gate.getStatus().errors, [
-    'gate.json loaded. gate.json has "rules" (did you mean "policies"?), which the gate doesn\'t read, so it has no rules, and every event gets '
-    + 'the default, "always".',
-    'At start, the host\'s starting rules "user-input" couldn\'t be added to gate.json (gate.json has "rules" (did you mean "policies"?), '
-    + 'which the gate doesn\'t read, so there\'s no list of rules to add them to without writing over or leaving out what it holds), so they '
-    + 'weren\'t put in force.',
-  ]);
-  unread.gate.dispose();
+  const userInput = { name: 'user-input', match: {}, behavior: 'always' };
+  const beside = makeGate(tempDir(t), { file: theirs, initialConfig: { default: 'skip', policies: [userInput] } });
+  assert.deepEqual(onDisk(beside.configPath), { ...theirs, policies: [userInput] });
+  assert.deepEqual(names(beside.gate), ['user-input']);
+  beside.gate.dispose();
 });
 
-test("numbers the gate's range refuses are read the way they ran, with a note, in the starting rules and gate.json, and addPolicy still refuses them", (t) => {
+test("numbers the gate's range refuses are read with a note, in the starting rules and gate.json: a debounce at its nearest bound, a refill interval of 0 as refilling at once, and the rest the way they ran; addPolicy still refuses them", (t) => {
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  // A debounce out of range ran as written in the starting rules: read at its
+  // bound, its batch goes out later or sooner, and every event in it is still delivered.
   const fast = { name: 'fast', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 50 } };
   const slow = { name: 'slow', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 500000 } };
   const none = { name: 'none', match: { scope: ['workspace:modified'] }, behavior: { debounce: 0 } };
   // It sampled when its count reached the step: at or under 0, every event, as 1 does; a fraction, as its next whole number.
   const each = { name: 'each', match: { scope: ['timer:fired'] }, behavior: { passive_sample: { every: 0 } } };
   const third = { name: 'third', match: { scope: ['chat:ambient'] }, behavior: { passive_sample: { every: 2.5, keyBy: 'channelId' } } };
-  // A bucket whose refill interval is at or under 0 never refills.
-  const spent = { name: 'spent', match: { scope: ['heartbeat'] }, behavior: { rate_limit: { tokens: 2, refillIntervalMs: 0 } } };
-  const starting = { default: 'skip', policies: [fast, slow, none, each, third, spent] };
+  // A bucket whose refill interval is 0 refills at once, so the rule limits
+  // nothing; earlier releases refilled it once, then never.
+  const refills = { name: 'refills', match: { scope: ['heartbeat'] }, behavior: { rate_limit: { tokens: 2, refillIntervalMs: 0 } } };
+  const starting = { default: 'skip', policies: [fast, slow, none, each, third, refills] };
   const asRead = [
     { debounce: 100 }, { debounce: 300000 }, { debounce: 100 },
     { passive_sample: { every: 1 } }, { passive_sample: { every: 3, keyBy: 'channelId' } }, { rate_limit: { tokens: 2, refillIntervalMs: 0 } },
@@ -1409,8 +1360,8 @@ test("numbers the gate's range refuses are read the way they ran, with a note, i
     + 'Policy "none": behavior.debounce is 0 ms, under the 100 ms minimum, so it\'s read as 100 ms. '
     + 'Policy "each": behavior.passive_sample.every is 0, under 1, so it\'s read as 1. '
     + 'Policy "third": behavior.passive_sample.every is 2.5, not a whole number, so it\'s read as 3. '
-    + 'Policy "spent": behavior.rate_limit.refillIntervalMs is 0, where a positive number of milliseconds is needed, so its tokens never refill, '
-    + 'and once they\'re spent it wakes the agent on nothing it matches.';
+    + 'Policy "refills": behavior.rate_limit.refillIntervalMs is 0, where a positive number of milliseconds is needed, so its tokens refill at '
+    + 'once, and it limits nothing it matches.';
 
   // A first start writes them as given, runs them as read, and says so in errors and the log, for the start and for gate.json.
   const first = makeGate(tempDir(t), { initialConfig: starting });
@@ -1854,6 +1805,97 @@ test('a write clears the state of a rule it leaves out or gives another behavior
   assert.equal(reloaded.gate.evaluate(ambient).trigger, true, 'and with a token of its own, not the spent bucket');
 });
 
+test('rules that share a name keep their state through a write that leaves them as they were, in order, and lose it where one changes', (t) => {
+  t.mock.method(console, 'error', () => {});
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  // A debounce for Discord, and a rule of the same name that skips Zulip: they share the name's state.
+  const discord = { name: 'dup', match: { source: 'discord' }, behavior: { debounce: 1000 } };
+  const zulip = { name: 'dup', match: { source: 'zulip' }, behavior: 'skip' };
+  const configPath = join(tempDir(t), 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [discord, zulip] }));
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, emitTrace: () => {}, addMessage: () => '', getAgentNames: () => ['agent'],
+    requestInference: (agent) => { wakes.push(agent); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, false, 'the event waits in the debounce batch');
+  // A write that changes neither keeps the batch on its timer.
+  gate.addPolicy(MENTIONS);
+  assert.deepEqual(wakes, [], 'the batch still waits');
+  // Giving the first the second's behavior changes the name's rules, so its
+  // state goes, and the batch is sent as its timer would have sent it.
+  gate.addPolicy({ ...discord, behavior: 'skip' });
+  assert.deepEqual(onDisk(configPath).policies, [{ ...discord, behavior: 'skip' }, zulip, MENTIONS]);
+  assert.deepEqual(wakes, ['agent'], 'the batch is sent once the rule no longer batches');
+  t.mock.timers.tick(1000);
+  assert.deepEqual(wakes, ['agent'], 'and its timer sends nothing more');
+
+  // Swapping two such rules' behaviors changes them too, though the same behaviors remain: a reload sends the batch.
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [discord, zulip] }));
+  (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  (gate as unknown as { reloadIfChanged(): void }).reloadIfChanged();
+  assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, false, 'a new batch waits');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ ...discord, behavior: 'skip' }, { ...zulip, behavior: { debounce: 1000 } }] }));
+  (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  (gate as unknown as { reloadIfChanged(): void }).reloadIfChanged();
+  assert.deepEqual(wakes, ['agent', 'agent'], 'the batch is sent once the rules swap behaviors');
+});
+
+test("a batch whose delivery throws is named in the log and dropped, whether its timer sends it or it was held for an agent's turn", async (t) => {
+  const dir = tempDir(t);
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const configPath = join(dir, 'gate.json');
+  const quiet = { name: 'quiet', match: {}, behavior: { debounce: 1000 } };
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet] }));
+  let fails = true;
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'],
+    addMessage: () => { if (fails) throw new Error('no agent to deliver to'); return ''; },
+    requestInference: (agent) => { wakes.push(agent); },
+  });
+  t.after(() => gate.dispose());
+
+  // Its timer sends it: thrown there, it would be uncaught.
+  assert.equal(gate.evaluate(MENTION).trigger, false, 'the event waits in the debounce batch');
+  t.mock.timers.tick(1000);
+  assert.deepEqual(logged, ['[gate] Policy "quiet": its pending batch couldn\'t be delivered (no agent to deliver to), so its events are dropped']);
+
+  // Held for the turn of the agent whose wake_add_rule changed the rule, and sent once it ends.
+  logged.length = 0;
+  gate.evaluate(MENTION);
+  gate.evaluate(MENTION);
+  gate.onInferenceStarted('agent');
+  gate.addPolicy({ ...quiet, behavior: 'always' });
+  gate.onInferenceEnded('agent');
+  await new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
+  assert.deepEqual(logged, [
+    '[gate] 2 events held for an agent\'s turn or the host\'s quiesce couldn\'t be delivered (no agent to deliver to), so they\'re dropped',
+  ]);
+  assert.deepEqual(wakes, []);
+
+  // Held while the host was quiesced, and sent once it resumes: one event, named so.
+  logged.length = 0;
+  gate.addPolicy(quiet);
+  gate.setQuiesced(true);
+  gate.evaluate(MENTION);
+  t.mock.timers.tick(1000);
+  gate.setQuiesced(false);
+  await new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
+  assert.deepEqual(logged, [
+    '[gate] 1 event held for an agent\'s turn or the host\'s quiesce couldn\'t be delivered (no agent to deliver to), so it\'s dropped',
+  ]);
+
+  // Once delivery works, the next batch goes out.
+  fails = false;
+  gate.evaluate(MENTION);
+  t.mock.timers.tick(1000);
+  assert.deepEqual(wakes, ['agent']);
+});
+
 test('a behavior holding two kinds names the problems of the kind it doesn\'t read too, and loads as before', (t) => {
   const dir = tempDir(t);
   t.mock.method(console, 'error', () => {});
@@ -1957,9 +1999,15 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   // The first delivery can't reach the agent; the next can.
   let deliveries = 0;
   const wakes: string[] = [];
-  const gate = new EventGate({
+  // Whether limited's bucket is still there as each batch is sent.
+  const bucketAtDelivery: boolean[] = [];
+  const gate: EventGate = new EventGate({
     configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: (agent) => { wakes.push(agent); },
-    addMessage: () => { if (++deliveries === 1) throw new Error('no agent to deliver to'); return ''; },
+    addMessage: () => {
+      bucketAtDelivery.push((gate as unknown as { rateLimitBuckets: Map<string, unknown> }).rateLimitBuckets.has('limited'));
+      if (++deliveries === 1) throw new Error('no agent to deliver to');
+      return '';
+    },
   });
   t.after(() => gate.dispose());
   const ambient = event(['chat:ambient']);
@@ -1979,6 +2027,7 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   );
   const state = gate as unknown as { rateLimitBuckets: Map<string, unknown>; debounceTimers: Map<string, unknown> };
   assert.equal(state.rateLimitBuckets.has('limited'), false, "limited's spent bucket is cleared, though quiet's batch came first");
+  assert.deepEqual(bucketAtDelivery, [false, false], 'every rule is cleared before any batch is sent');
   assert.equal(state.debounceTimers.has('quiet'), false, "quiet's batch isn't left to be sent again");
   assert.deepEqual(wakes, ['agent'], "later's batch is still sent");
   assert.equal(state.debounceTimers.has('later'), false, 'and nothing is left behind');

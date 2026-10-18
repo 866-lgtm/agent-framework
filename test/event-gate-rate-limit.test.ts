@@ -106,35 +106,38 @@ describe('validation: new behaviors', () => {
     );
   });
 
-  it('reads a rate_limit with a refillIntervalMs at or under 0 as tokens that never refill, as a negative one ran, and says so', () => {
-    for (const refillIntervalMs of [-1, 0]) {
+  it('reads a rate_limit with a refillIntervalMs under 0 as tokens that never refill, as it ran, and one of 0 as tokens that refill at once, and says so', () => {
+    for (const [refillIntervalMs, tokens, read, wakes] of [
+      [-1, 2, "so its tokens never refill, and once they're spent it wakes the agent on nothing it matches.", [true, true, false, false, false]],
+      // Earlier releases refilled a bucket with an interval of 0 once, and then never.
+      // One token is spent at each event, so the probe meets a spent bucket.
+      [0, 1, 'so its tokens refill at once, and it limits nothing it matches.', [true, true, true, true, true]],
+    ] as const) {
       const h = makeFakeClockGate({
         default: 'skip',
         policies: [{
           name: 'p',
           match: {},
-          behavior: { rate_limit: { tokens: 2, refillIntervalMs } },
+          behavior: { rate_limit: { tokens, refillIntervalMs } },
         }],
       });
-      assert.deepStrictEqual(h.gate.getStatus().policies[0]!.behavior, { rate_limit: { tokens: 2, refillIntervalMs } });
+      assert.deepStrictEqual(h.gate.getStatus().policies[0]!.behavior, { rate_limit: { tokens, refillIntervalMs } });
       assert.ok(
         h.gate.getStatus().errors.some(e => e.includes(
-          `Policy "p": behavior.rate_limit.refillIntervalMs is ${refillIntervalMs}, where a positive number of milliseconds is needed, `
-          + 'so its tokens never refill, '
-          + 'and once they\'re spent it wakes the agent on nothing it matches.',
+          `Policy "p": behavior.rate_limit.refillIntervalMs is ${refillIntervalMs}, where a positive number of milliseconds is needed, ${read}`,
         )),
         JSON.stringify(h.gate.getStatus().errors),
       );
-      // Its first two events wake the agent, and none after, however long it waits.
-      // The probe, which wake_add_rule's table reads, says the same at each step.
+      // However long it waits, and with no wait at all for 0. The probe, which
+      // wake_add_rule's table reads, says the same at each step.
       const woke: boolean[] = [];
       const probed: boolean[] = [];
       for (let i = 0; i < 5; i++) {
         probed.push(h.gate.probe(event()).trigger);
         woke.push(h.gate.evaluate(event()).trigger);
-        h.advance(60_000);
+        if (refillIntervalMs < 0) h.advance(60_000);
       }
-      assert.deepStrictEqual(woke, [true, true, false, false, false], `refillIntervalMs ${refillIntervalMs}`);
+      assert.deepStrictEqual(woke, wakes, `refillIntervalMs ${refillIntervalMs}`);
       assert.deepStrictEqual(probed, woke, `refillIntervalMs ${refillIntervalMs}: the probe`);
     }
   });
