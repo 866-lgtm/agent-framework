@@ -17049,12 +17049,8 @@ export class AgentFramework {
       // prefix is stored in order, or goes back into the queue whole under
       // its ids when a successor turn has already taken the agent. A fork or
       // run deregistered while the host is quiesced leaves its queue to its
-      // window's release at resume (releaseWindowNowOrAfterResume): flushed
-      // here, the entries would meet no registered agent and be dropped.
-      if (
-        frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name) &&
-        !this.releasesAfterResume.has(agent.name)
-      ) {
+      // window's release at resume (drainDeferredFor).
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
         this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
       }
@@ -19012,6 +19008,11 @@ export class AgentFramework {
    */
   private drainDeferredFor(agentName: string, stopAt?: (msg: DeferredWrite) => boolean): DeferredWrite[] {
     if (this.deferredMessages.length === 0) return [];
+    // A fork or run deregistered while the host is quiesced leaves its queue
+    // to its window's release at resume (runReleasesAfterResume, which clears
+    // the name first): drained by any other flush, its entries would meet no
+    // registered agent, be dropped, and be acked.
+    if (this.releasesAfterResume.has(agentName)) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
     for (const msg of this.deferredMessages) {

@@ -1018,6 +1018,33 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(idOf(told[0]), 'w-late', 'as the same entry, under its id');
     });
 
+    it('leaves a run that ended during a surgery to its window\'s release: the surgery\'s flush doesn\'t drop its queue', async () => {
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const state = internals(runFramework) as unknown as ReturnType<typeof internals> & {
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      };
+      // Not started, so the run is registered and idle when the surgery begins.
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 150 });
+      state.quiesced = true;
+      (state.deferredMessages as unknown as Array<Record<string, unknown>>).push({
+        id: 'w-held', seq: 1_000_000, participant: 'user', forAgent: 'worker',
+        content: [{ type: 'text', text: 'Written for the run while the host was quiesced.' }],
+      });
+      const releaseSurgery = state.reserveStoreForSurgery('test surgery', 'primary');
+      await assert.rejects(done, /failed to start inference/);
+      assert.equal(runFramework.getAgent('worker'), null, 'the run ended during the surgery');
+
+      releaseSurgery();
+      assert.deepEqual((state.deferredMessages as unknown as Array<{ id: string }>).map((m) => m.id), ['w-held'], 'its write waits for its window\'s release');
+
+      await runFramework.resume({ force: true });
+      assert.equal(state.deferredMessages.length, 0);
+      assert.equal(count(await archived(), 'Written for the run while the host was quiesced.'), 1, 'and lands in its window at resume');
+    });
+
     it('resumes past a run that ended while the host was quiesced: resume doesn\'t weigh its context', async (t) => {
       sender.quiesceOnCall = true;
       await run([
