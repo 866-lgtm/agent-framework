@@ -1406,10 +1406,10 @@ test('framework finishes an interrupted suppression\'s removals and retires its 
     assert.deepEqual(alerts.map((alert) => [alert.kind, alert.agent]), [['discord-awareness-not-scheduled', 'cairn']]);
     assert.equal(
       alerts[0]!.message,
-      `The suppression of cairn from main onto recovery/cairn/suppressed (awareness batch ${batch.id}) was interrupted; ` +
-        'this start finished its removals on recovery/cairn/suppressed. Its 1 awareness mark(s) weren\'t applied, ' +
-        'since a start never activates a surgery\'s marks. To apply them, switch to main, which still has every message it ' +
-        'removed, and redo the suppression there, onto a new branch name, with its marks',
+      `The surgery of cairn from main onto recovery/cairn/suppressed (awareness batch ${batch.id}: a suppression, or an ` +
+        'offline recovery that suppressed) was interrupted; this start finished its removals on recovery/cairn/suppressed. ' +
+        'Its 1 awareness mark(s) weren\'t applied, since a start never activates a surgery\'s marks. To apply them, redo ' +
+        'the surgery from main, if it still has every message the surgery removed, onto a new branch name, with its marks',
     );
   } finally {
     h.cleanup();
@@ -1658,7 +1658,7 @@ test('each kind of retirement alert a start raises reaches the ops webhook for t
   }
   assert.equal(posts.length, 8, posts.join('\n'));
   for (const kind of ['inplace', 'gone', 'imported', 'interrupted']) {
-    for (const n of [1, 2]) assert.ok(posts.some((post) => post.includes(`awareness batch ${kind}-${n})`)), `${kind}-${n}`);
+    for (const n of [1, 2]) assert.ok(posts.some((post) => new RegExp(`awareness batch ${kind}-${n}[):]`).test(post)), `${kind}-${n}`);
   }
 });
 

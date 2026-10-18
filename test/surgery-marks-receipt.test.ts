@@ -677,7 +677,7 @@ describe('surgery and awareness marks', () => {
       assert.equal(after.status, 'discarded', 'a start never activates a surgery\'s marks');
       assert.deepEqual(outbox().operations(), []);
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-not-scheduled']);
-      assert.match(alerts[0]!.message, new RegExp(`^The suppression of resident from ${sourceBranch} onto partial \\(awareness batch ${batch.id}\\) was interrupted; this start finished its removals on partial\\.`));
+      assert.match(alerts[0]!.message, new RegExp(`^The surgery of resident from ${sourceBranch} onto partial \\(awareness batch ${batch.id}: a suppression, or an offline recovery that suppressed\\) was interrupted; this start finished its removals on partial\\.`));
     });
   });
 
@@ -814,7 +814,7 @@ describe('surgery and awareness marks', () => {
     await withAlerts(async (alerts) => {
       await start(true);
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-suppression-unfinished']);
-      assert.match(alerts[0]!.message, /wasn't finished: fix-1 doesn't exist .*so none of them is in effect\. To apply it, switch to /);
+      assert.match(alerts[0]!.message, /wasn't finished: fix-1 doesn't exist .*so none of them is in effect\. To apply it, redo the surgery from /);
     });
     assert.equal(outbox().batches().find((batch) => batch.id === first.id)?.status, 'discarded');
     const retry = await framework.rollbackToMessage('resident', { messageId: removed[1], branchName: 'fix-1' });
@@ -848,9 +848,9 @@ describe('surgery and awareness marks', () => {
       await start(true);
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-not-scheduled']);
       assert.equal(alerts[0]!.message,
-        `The rollback of resident from ${sourceBranch} onto fix-1 (awareness batch ${first.id}) was interrupted. `
-        + 'Its 3 awareness mark(s) weren\'t applied, since a start never activates a surgery\'s marks. '
-        + `To apply them, switch to ${sourceBranch}, which still has every message it removed, and redo the rollback there, `
+        `The surgery of resident from ${sourceBranch} onto fix-1 (awareness batch ${first.id}: a rollback, or an offline `
+        + 'recovery) was interrupted. Its 3 awareness mark(s) weren\'t applied, since a start never activates a surgery\'s '
+        + `marks. To apply them, redo the surgery from ${sourceBranch}, if it still has every message the surgery removed, `
         + 'onto a new branch name, with its marks');
     });
     assert.equal(cm().currentBranch().name, 'fix-1');

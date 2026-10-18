@@ -450,9 +450,11 @@ const result = await framework.rollbackToMessage('cairn', {
   retired at the next start, none of its marks sent. One that had marks to
   apply raises a `discord-awareness-not-scheduled` ops alert that names the
   surgery, its agent and its branches, and the redo that applies the marks:
-  switch to the source, which still has every message the surgery removed,
-  and run the surgery there again onto a new branch name, choosing marks
-  again. One with none to apply (none chosen, or its marks cancelled) is
+  run the surgery again from the source onto a new branch name, choosing
+  marks again, if the source still has every message the surgery removed (a
+  `hide` there, or the source's deletion, changes that). A batch doesn't say
+  which surgery made it, so the alert names an offline recovery beside a
+  rollback or a suppression. One with none to apply (none chosen, or its marks cancelled) is
   only logged. An interrupted suppression's removals are still finished, at
   the first start on its branch, and its batch is retired then. A
   suppression whose removals are pending and whose branch doesn't exist (its

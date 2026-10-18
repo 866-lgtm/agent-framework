@@ -18412,11 +18412,14 @@ export class AgentFramework {
 
   /**
    * Report a batch a start retires, or whose suppression body it gives up,
-   * before that is recorded, with the redo that applies what was lost: the surgery again from its
-   * source, which still has every message it removed, onto a new branch
-   * name, choosing marks again (framework.switchBranch, then
-   * rollbackToMessage or suppressMessages; offline, the recover CLI). One
-   * with marks not applied, or a body given up, raises an ops alert; one
+   * before that is recorded, with the redo that applies what was lost: the
+   * surgery again from its source, if that still has every message the
+   * surgery removed (a hide there, or the source's deletion, changes that),
+   * onto a new branch name, choosing marks again (framework.switchBranch,
+   * then rollbackToMessage or suppressMessages; offline, the recover CLI).
+   * A batch doesn't say which surgery made it: an offline recovery's reads
+   * as a rollback's, or as a suppression's when the recovery suppressed, so
+   * the report names both. One with marks not applied, or a body given up, raises an ops alert; one
    * with neither (no marks chosen, or its marks cancelled, and its body
    * finished) is only logged. An in-place change's batch (a hide or a turn
    * undo, which a pre-release build recorded in two appends) has nothing to
@@ -18465,10 +18468,10 @@ export class AgentFramework {
       );
       return;
     }
-    const surgery = retirement.suppression ? 'suppression' : 'rollback';
-    const about = `The ${surgery} of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ${batchId})`;
-    const redo = `switch to ${sourceBranch}, which still has every message it removed, and redo the ${surgery} there, ` +
-      'onto a new branch name';
+    const kind = retirement.suppression ? 'a suppression, or an offline recovery that suppressed' : 'a rollback, or an offline recovery';
+    const about = `The surgery of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ${batchId}: ${kind})`;
+    const redo = `redo the surgery from ${sourceBranch}, if it still has every message the surgery removed, onto a new ` +
+      'branch name';
     const unmarked = `Its ${marks} awareness mark(s) weren't applied, since a start never activates a surgery's marks. `;
     if (retirement.reason === 'branch-gone') {
       this.opsAlert(
