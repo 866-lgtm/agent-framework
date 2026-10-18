@@ -637,6 +637,30 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.equal(readFileSync(join(env.dir, 'x.txt'), 'utf8'), 'someone else\n');
   });
 
+  test('a deletion that clears a conflict naming no disk file answers without a note', async (t) => {
+    // This branch records that disk lost the file it had changed (a
+    // deleted-on-disk conflict, with no disk file). Another branch's pass
+    // then records that disk has nothing there, so this branch's deletion
+    // clears its intent, conflict and all. Disk held no file to leave alone,
+    // so the answer says nothing of one.
+    const env = new Env(t);
+    env.writeDisk('x.txt', 'v1\n');
+    const m = await env.open(t);
+    await call(m, 'read', { path: 'work/x.txt' });
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    await call(m, 'write', { path: 'work/x.txt', content: 'agent\n' });
+    rmSync(join(env.dir, 'x.txt'));
+    assert.match(skippedReason(await call(m, 'materialize', { path: 'work/x.txt' }), 'x.txt'), /conflict: deleted-on-disk/);
+    env.store.switchBranch('other');
+    await call(m, 'sync', { path: 'work/x.txt' });
+    assert.equal((m as any).agreement.get('work', 'x.txt')?.kind, 'absent', 'the other branch recorded disk\'s absence');
+    env.store.switchBranch(main);
+    assert.deepEqual(await call(m, 'delete', { path: 'work/x.txt' }), { path: 'work/x.txt', deleted: true });
+    const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
+    assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
+  });
+
   test('a draft written over a disk file the workspace never saw, with no push, is deleted without touching that file', async (t) => {
     const env = new Env(t);
     env.writeDisk('c.txt', 'disk text\n');
@@ -669,6 +693,27 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     for (const path of ['agreed.txt', 'pushed.txt', 'legacy.txt']) await call(m, 'delete', { path: `work/${path}` });
     const deletions = (m as any).intents.get('work').list().filter(([, bi]: [string, { tombstone?: unknown }]) => bi.tombstone).map(([p]: [string]) => p).sort();
     assert.deepEqual(deletions, ['agreed.txt', 'legacy.txt', 'pushed.txt']);
+    // The deletion's pass left the push pending: disk shows its bytes, never
+    // confirmed, so nothing recorded them as a copy disk agreed with.
+    assert.equal(agreement.get('work', 'pushed.txt')?.kind, 'pending');
+  });
+
+  test('a deletion over a pending push whose bytes never reached disk leaves nothing pending once a sync observes the path', async (t) => {
+    // A push of a draft, with no prior, that left no file never created one.
+    // While it's recorded as pending, the deletion reads it as a push that may
+    // have landed; a pass over the path finds disk holding nothing there,
+    // which settles the deletion and forgets the push.
+    const env = new Env(t);
+    const m = await env.open(t);
+    const agreement = (m as any).agreement;
+    await call(m, 'write', { path: 'work/unlanded.txt', content: 'v1\n' });
+    agreement.intend('work', 'unlanded.txt', { effect: 'disk', prior: null, expect: { kind: 'content', hash: env.store.treeGet(TREE, 'unlanded.txt')!.blobHash }, branchId: env.store.currentBranch().id });
+    await call(m, 'delete', { path: 'work/unlanded.txt' });
+    await call(m, 'sync', { path: 'work/unlanded.txt' });
+    const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
+    assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
+    assert.equal(agreement.get('work', 'unlanded.txt'), undefined, 'the push is forgotten');
+    assert.equal(existsSync(join(env.dir, 'unlanded.txt')), false);
   });
 
   test('a workspace draft disk never agreed with is deleted with nothing pending, on a plain mount too', async (t) => {

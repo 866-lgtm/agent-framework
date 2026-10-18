@@ -248,11 +248,12 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 
 /**
  * A disk reader's refusal for what linkOnTheWay found on a path's way: the
- * link's reason, as the observations give it, after the path, or the walk's
- * failure as a failure to read. Its code follows where the link leads, so a
- * caller choosing advice by code gets advice that fits: `escape` for a link
- * leading outside the mount, the code of any path that resolves outside it,
- * and `symlink` for any other.
+ * link's reason, as the observations give it, after the path; or, for a
+ * directory the walk couldn't ask, a failure to read, coded `not_found` with
+ * the readlink's errno, as every failed lookup is. A link's code follows
+ * where it leads, so a caller choosing advice by code gets advice that fits:
+ * `escape` for a link leading outside the mount, the code a path resolving
+ * outside it gets too, and `symlink` for one inside.
  */
 async function linkReadError(
   mount: { config: { name: string; path: string } },
@@ -2250,7 +2251,9 @@ export class WorkspaceModule implements Module {
         }
         // A conflict it clears may name a file disk held there, which the
         // workspace never took in: the answer says that file wasn't unlinked,
-        // where the deletion alone would read as gone from disk.
+        // where the deletion alone would read as having removed it. The
+        // deletion doesn't look at disk, so a file nothing recorded gets no
+        // note.
         if (cur.conflict?.disk) {
           note = `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${relativePath} ` +
             `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`;
