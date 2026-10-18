@@ -581,6 +581,9 @@ function stoppedReading(background: boolean): string {
     + "shuts down or replaces file descriptor 3, where the host's messages arrive; if not, ask whoever runs this host.";
 }
 
+/** The signals faulthandler writes a traceback for (runtime-py.ts), which a crash ends a process with. */
+const CRASH_SIGNALS: ReadonlySet<string> = new Set(['SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGFPE', 'SIGILL']);
+
 /**
  * Why a script stopped when its interpreter exited under it, and what running it
  * again does; or, when the script's result came before the exit (ended), that
@@ -593,9 +596,14 @@ function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null,
   // copy of fd 2 and fd 2 itself, or shut down the socket under them, and it's read from what the result
   // keeps, which past a stream's cap or a journal's tail lacks it.
   const taken = exitCode === RUNTIME_FATAL_EXIT ? fdTakenFromRuntime(said) : null;
+  // A crash's signal comes with the traceback faulthandler writes, and more often from native code than
+  // from the script; SIGKILL is the out-of-memory killer's; any other signal, the script can send itself.
   const check = taken
     ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
-    : `check whether the script itself ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}`;
+    : signal && CRASH_SIGNALS.has(signal)
+      ? 'check the traceback above for native code that crashed, such as an extension module the script uses'
+      : `check whether the script itself ends the process, for example ${
+        signal === 'SIGKILL' ? 'by using too much memory' : signal ? 'with os.kill()' : 'with os._exit()'}`;
   const gone = background ? '' : ', and variables from earlier scripts are gone';
   if (ended) {
     return `script ended, but the Python interpreter ${how} before all of its output reached the host, so some of it may be missing${gone}. `
