@@ -43,6 +43,7 @@ class SenderModule implements Module {
   framework: AgentFramework | null = null;
   speaker = 'worker';
   quiesceOnCall = false;
+  endTurnOnPost = false;
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
@@ -56,6 +57,7 @@ class SenderModule implements Module {
       await internals(this.framework!).channelRegistry.routeSpeech(this.speaker, 'mid-turn reply', 'missing-channel');
     }
     if (this.quiesceOnCall) internals(this.framework!).quiesced = true;
+    if (this.endTurnOnPost && call.name.endsWith('post')) return { success: true, data: { ok: true }, endTurn: true };
     return { success: true, data: { ok: true } };
   }
   async onProcess(): Promise<EventResponse> { return {}; }
@@ -781,7 +783,8 @@ describe('notices about an agent\'s own action', () => {
       .flatMap((o) => o?.injectedMessages ?? [])
       .map((m) => JSON.stringify(m.content));
 
-    it('passes on nothing a run read live at a tool boundary', async () => {
+    it('passes on nothing a run read live at a tool boundary, when its stream declares it carries injected messages', async () => {
+      runMembrane.supportsInjectedMessages = true;
       await run([
         [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
         [{ type: 'text', text: '>>skip_reply done' }],
@@ -791,6 +794,34 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(await archived(), SEND_FAILED), 1, 'and its window');
       const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(messages, 'A reply by worker'), 0, 'it read it, so no one else is told');
+    });
+
+    it('passes on, by name, a notice injected into a stream that doesn\'t declare it carries injected messages', async () => {
+      // Such a stream may be one that drops them (membrane's XML path), so
+      // the run can't be counted as having read it.
+      await run([
+        [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
+        [{ type: 'text', text: '>>skip_reply done' }],
+      ]);
+
+      assert.ok(injected().some((c) => c.includes(SEND_FAILED)), 'the notice was offered to the run\'s live stream');
+      const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(messages, 'A reply by worker'), 1);
+    });
+
+    it('passes on, by name, a notice its boundary stored but never sent, when a tool ends the turn', async () => {
+      runMembrane.supportsInjectedMessages = true;
+      sender.endTurnOnPost = true;
+      await run([
+        [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
+        // Never asked for: the post's result ends the turn.
+        [{ type: 'text', text: 'unused' }],
+      ]);
+
+      assert.ok(!injected().some((c) => c.includes(SEND_FAILED)), 'the turn ended before the notice was sent');
+      assert.equal(count(await archived(), SEND_FAILED), 1, 'it was stored in the run\'s window');
+      const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(messages, 'A reply by worker'), 1, 'the run never read it, so the primary is told');
     });
 
     it('injects a bounced prose notice at the next tool boundary, after the prose it bounced', async () => {

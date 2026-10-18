@@ -2191,13 +2191,6 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
-  /**
-   * A fork's or an ephemeral run's failed-reply notices that reached its live
-   * stream at a tool boundary, by deferred-write id. Read, though stored above
-   * its consumed watermark, since no compile ran after them; a release
-   * (unreadFailedReplies) doesn't pass them on. Forgotten at release.
-   */
-  private readonly injectedFailureNotices = new Map<string, Set<string>>();
   /** Releases asked for while the host was quiesced, by agent name; resume() runs them. */
   private readonly releasesAfterResume = new Map<string, () => void>();
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
@@ -10353,7 +10346,6 @@ export class AgentFramework {
               };
               midTurnInjections.push(injection);
               injectedIds.set(injection, id);
-              this.noteInjectedFailureNotice(agent, msg.id, msg.metadata);
             }
           }
 
@@ -19270,11 +19262,13 @@ export class AgentFramework {
   /**
    * The failed-reply notices stored in `agent`'s window that it never read:
    * above its consumed watermark (or any, when it never compiled on this
-   * branch), and not injected into its live stream at a tool boundary.
+   * branch). The watermark moves at a compile, and at a tool boundary whose
+   * stream declares it carries the messages injected there
+   * (markContextConsumed), so a notice the live stream heard is under it, and
+   * one a boundary stored without sending (a turn a tool ended, a budget
+   * restart, a stream that may drop injections) is above it.
    */
   private unreadFailedReplies(agent: Agent): MessageMetadata[] {
-    const injected = this.injectedFailureNotices.get(agent.name);
-    this.injectedFailureNotices.delete(agent.name);
     try {
       const cm = agent.getContextManager();
       const watermark = agent.getConsumedWatermark();
@@ -19283,9 +19277,8 @@ export class AgentFramework {
         : Number.NEGATIVE_INFINITY;
       return cm.getAllMessages()
         .filter((m) => {
-          const metadata = m.metadata as { kind?: unknown; deferredWriteId?: unknown } | undefined;
-          return m.sequence > floor && metadata?.kind === 'discord-send-failed' &&
-            !(typeof metadata.deferredWriteId === 'string' && injected?.has(metadata.deferredWriteId));
+          const metadata = m.metadata as { kind?: unknown } | undefined;
+          return m.sequence > floor && metadata?.kind === 'discord-send-failed';
         })
         .map((m) => m.metadata as MessageMetadata);
     } catch (err) {
@@ -19293,19 +19286,6 @@ export class AgentFramework {
       console.error(`[route-failure] ${agent.name}: could not read its window for unread failed replies:`, err);
       return [];
     }
-  }
-
-  /**
-   * Record a failed-reply notice injected into `agent`'s live stream at a
-   * tool boundary (injectedFailureNotices). Residents are never released, so
-   * only an isolated agent's are kept.
-   */
-  private noteInjectedFailureNotice(agent: Agent, id: string, metadata: MessageMetadata | undefined): void {
-    if (this.sharedSlotAgents.has(agent)) return;
-    if ((metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return;
-    let ids = this.injectedFailureNotices.get(agent.name);
-    if (!ids) this.injectedFailureNotices.set(agent.name, (ids = new Set()));
-    ids.add(id);
   }
 
   /**
