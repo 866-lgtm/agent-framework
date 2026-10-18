@@ -142,6 +142,79 @@ function lexicalOf(view: MountView, rel: string): string {
 }
 
 // ===========================================================================
+// Disk's spelling of a path
+// ===========================================================================
+
+const sameFile = (a: BigIntStats, b: BigIntStats): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/** The name with each letter's case flipped. */
+const flippedCase = (name: string): string =>
+  [...name].map((c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join('');
+
+/** What a disk that folds names compares: NFC, in lower case. */
+const folded = (name: string): string => name.normalize('NFC').toLowerCase();
+
+/**
+ * The name `dir` lists for `segment`: `segment` itself, unless disk folds it
+ * there and lists it otherwise. Disk folds it there when its case flipped, or
+ * its other Unicode normalization form, finds the same file (device and
+ * inode) as `given`, the segment's own entry, or, for the last segment, which
+ * isn't looked up as given unless it must be, finds anything. Only then is
+ * `dir` listed, so a disk that tells the spellings apart is never listed.
+ * The name as given wins if it's listed; otherwise the segment takes the
+ * listed name that folds to it and is the same file, so the name returned
+ * reaches the file the segment does, or is the segment as given.
+ */
+async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<string> {
+  const variants = new Set([flippedCase(segment), segment.normalize('NFC'), segment.normalize('NFD')]);
+  variants.delete(segment);
+  let folds = false;
+  for (const variant of variants) {
+    const other = await lstat(join(dir, variant), { bigint: true }).catch(() => null);
+    if (other !== null && (given === null || sameFile(other, given))) { folds = true; break; }
+  }
+  if (!folds) return segment;
+  const listed = await readdir(dir).catch(() => null);
+  if (listed === null || listed.includes(segment)) return segment;
+  const target = given ?? await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+  if (target === null) return segment;
+  for (const name of listed) {
+    if (folded(name) !== folded(segment)) continue;
+    const info = await lstat(join(dir, name), { bigint: true }).catch(() => null);
+    if (info !== null && sameFile(info, target)) return name;
+  }
+  return segment;
+}
+
+/**
+ * `relativePath` as disk spells it. On a disk that folds names, as macOS's
+ * does by default (case and Unicode normalization), `SRC/a.ts` reaches
+ * `src/a.ts`, and whatever names what it finds from the spelling it was
+ * given takes the file in a second time, under a name disk doesn't list. So
+ * each segment, from the mount's root down, takes the name its directory
+ * lists for it (listedName). The walk goes on beneath a segment only if it's
+ * a directory, a symlink not included, so nothing past a link is read and
+ * nothing outside the mount, and it stops at an empty, `.` or `..` segment,
+ * keeping the rest as given.
+ */
+export async function diskSpelling(root: string, relativePath: string): Promise<string> {
+  if (relativePath === '') return relativePath;
+  const segments = relativePath.split('/');
+  let dir = root;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i]!;
+    if (segment === '' || segment === '.' || segment === '..') break;
+    const last = i === segments.length - 1;
+    const given = last ? null : await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+    if (!last && given === null) break;
+    segments[i] = await listedName(dir, segment, given);
+    if (given === null || !given.isDirectory()) break;
+    dir = join(dir, segments[i]!);
+  }
+  return segments.join('/');
+}
+
+// ===========================================================================
 // Checked directories
 // ===========================================================================
 

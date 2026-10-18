@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, OTHER_MOUNT, checkDir, filesystemTrustsCtime, inOtherMount, locateRoot, passedOverAt, readPrefix } from './observe.js';
+import { IGNORED, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, locateRoot, passedOverAt, readPrefix } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1583,7 +1583,8 @@ export class WorkspaceModule implements Module {
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
-      const { mount, relativePath } = this.parseFilePath(mountPrefixedPath);
+      // Synchronous, so the path as given: it reaches the same file.
+      const { mount, relativePath } = this.refuseNested({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath });
       return resolve(mount.config.path, relativePath);
     } catch {
       return null;
@@ -1621,7 +1622,7 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (error) {
       return {
         success: false,
@@ -1685,7 +1686,7 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
@@ -1722,7 +1723,7 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
@@ -1785,17 +1786,40 @@ export class WorkspaceModule implements Module {
    * observe it and its pushes don't write it, so its file operations refuse
    * it, naming the innermost mount that holds it and the path to use there.
    */
-  private parseFilePath(path: string): { mount: MountState; relativePath: string } {
-    const parsed = this.parsePath(path);
+  private async parseFilePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
+    return this.refuseNested(await this.parsePath(path));
+  }
+
+  /** A parsed path, refused if it lies in a nested mount's directory (parseFilePath). */
+  private refuseNested<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P): P {
     const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath);
-    if (holder) throw new NestedMountError(path, parsed.mount.config.name, holder.name, holder.use);
+    if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder.name, holder.use);
     return parsed;
   }
 
   /**
-   * Parse a mount-prefixed path into (mountName, relativePath).
+   * Parse a mount-prefixed path into its mount and mount-relative path, as
+   * disk spells it (diskSpelling), with `path` the mount-prefixed path so
+   * spelled. On a disk that folds names, a path spelled otherwise reaches
+   * disk's file, so every tool takes it by disk's name: one name per file,
+   * and the names its answers give are disk's. A handler reads what it reads
+   * at the moment it was asked, such as handleSync's branch, before calling
+   * this, since this awaits disk.
    */
-  private parsePath(path: string): { mount: MountState; relativePath: string } {
+  private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
+    const given = this.parsePathAsGiven(path);
+    const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath);
+    return {
+      mount: given.mount,
+      relativePath,
+      path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
+    };
+  }
+
+  /**
+   * Parse a mount-prefixed path into (mountName, relativePath), as spelled.
+   */
+  private parsePathAsGiven(path: string): { mount: MountState; relativePath: string } {
     // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
     // store would keep one name and disk another.
     if (LONE_SURROGATE.test(path)) {
@@ -2048,7 +2072,7 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const code: WorkspaceReadErrorCode = err instanceof NestedMountError ? 'other_mount'
@@ -2300,7 +2324,8 @@ export class WorkspaceModule implements Module {
     }
     let content = generatedContent;
     if (content === undefined) {
-      const { mount, relativePath } = this.parseFilePath(input.path);
+      const { mount, relativePath, path } = await this.parseFilePath(input.path);
+      input = { ...input, path };
       const store = this.getStore();
       const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
         const report = await this.ensureSynced(mount, relativePath);
@@ -2388,7 +2413,9 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(input.path));
+      let path: string;
+      ({ mount, relativePath, path } = await this.parseFilePath(input.path));
+      input = { ...input, path };
     } catch (err) {
       return {
         success: false,
@@ -2460,7 +2487,8 @@ export class WorkspaceModule implements Module {
     if (LONE_SURROGATE.test(input.content)) {
       return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store.' };
     }
-    const { mount, relativePath } = this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    input = { ...input, path };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2505,7 +2533,8 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: `The edit did nothing: "${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store.` };
       }
     }
-    const { mount, relativePath } = this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    input = { ...input, path };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2649,7 +2678,8 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
-    const { mount, relativePath } = this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    input = { ...input, path };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2692,7 +2722,8 @@ export class WorkspaceModule implements Module {
       return { success: true, data: { mounts } };
     }
 
-    const { mount, relativePath } = this.parsePath(input.path);
+    const { mount, relativePath, path } = await this.parsePath(input.path);
+    input = { ...input, path };
     const recursive = input.recursive === true;
 
     // Every listing checks the paths it shows against disk first, under the
@@ -2745,7 +2776,7 @@ export class WorkspaceModule implements Module {
 
     // Search across mounts
     const mountsToSearch = input.path
-      ? [this.parsePath(input.path)]
+      ? [await this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     // Every match lies beneath the pattern's literal directory, so the walk
@@ -2797,7 +2828,7 @@ export class WorkspaceModule implements Module {
     const contextAfter = input.contextAfter ?? 0;
 
     const mountsToSearch = input.path
-      ? [this.parsePath(input.path)]
+      ? [await this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     type GrepMatch = { line: number; text: string; context?: string[] };
@@ -3062,7 +3093,11 @@ export class WorkspaceModule implements Module {
     const modesKept: Array<{ mount: string; path: string; reason: string }> = [];
 
     let explicit: { mount: MountState; relativePath: string } | null = null;
-    if (input.path) explicit = this.parsePath(input.path);
+    if (input.path) {
+      const parsed = await this.parsePath(input.path);
+      explicit = parsed;
+      input = { ...input, path: parsed.path };
+    }
 
     let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
     if (explicit) {
@@ -3248,7 +3283,8 @@ export class WorkspaceModule implements Module {
     // A path names its own mount; otherwise the given mount, or every mount.
     let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
     if (input.path) {
-      const { mount, relativePath } = this.parsePath(input.path);
+      const { mount, relativePath, path } = await this.parsePath(input.path);
+      input = { ...input, path };
       targets = [{ name: mount.config.name, mount, relativePath }];
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
