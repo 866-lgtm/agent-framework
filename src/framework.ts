@@ -19471,20 +19471,29 @@ export class AgentFramework {
    * A foreground script's ending as the model reads it: whole when it fits
    * `cap`, or else cut to fit beside a notice, with the whole text written
    * to the tool result's file, where the inline cap's spill would put it.
-   * A cap too small to hold a cut of each stream leaves the whole text to
-   * that spill, which keeps its head.
+   * The cut leaves room for the longest notice it could end with, so it's
+   * decided before anything is written. A cap too small to hold a cut of
+   * each stream beside that notice leaves the whole text, unwritten, to the
+   * inline cap's spill, which keeps its head.
    */
   private async scriptEndResultText(end: ScriptEnd, cap: number, callId: string): Promise<string> {
     const whole = scriptEndText(end);
     if (whole.length <= cap) return whole;
-    const written = await this.writeToolResultFile(`${new Date().toISOString().slice(0, 10)}-${callId}`, whole);
-    const notice = written && written.error === undefined
-      ? `[cut to fit; the whole output (${whole.length} chars): workspace file ${written.path}. ${this.spillPageAdvice(written.path, cap)}]`
-      : written
-        ? `[cut to fit; writing the whole output (${whole.length} chars) to workspace file ${written.path} FAILED (${written.error}); what was cut was not retained]`
-        : `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace, what was cut was not retained]`;
-    const within = scriptEndTextWithin(end, cap - notice.length);
-    return within === null ? whole : within + notice;
+    const label = `${new Date().toISOString().slice(0, 10)}-${callId}`;
+    const keptIn = (path: string) =>
+      `[cut to fit; the whole output (${whole.length} chars): workspace file ${path}. ${this.spillPageAdvice(path, cap)}]`;
+    const writeFailed = (path: string, error: string) =>
+      `[cut to fit; writing the whole output (${whole.length} chars) to workspace file ${path} FAILED (${error.slice(0, 200)}); what was cut was not retained]`;
+    const noWorkspace = `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace, what was cut was not retained]`;
+    const place = this.toolResultFilePlace(label);
+    const reserve = place
+      ? Math.max(keptIn(place.path).length, writeFailed(place.path, 'x'.repeat(200)).length, noWorkspace.length)
+      : noWorkspace.length;
+    const within = scriptEndTextWithin(end, cap - reserve);
+    if (within === null) return whole;
+    const written = place ? await this.writeToolResultFile(label, whole) : null;
+    if (!written) return within + noWorkspace;
+    return within + (written.error === undefined ? keptIn(written.path) : writeFailed(written.path, written.error));
   }
 
   // ---------------------------------------------------------------------------

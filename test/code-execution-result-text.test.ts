@@ -82,6 +82,9 @@ describe('code_execution result text', () => {
     assert.ok(head.endsWith('\n'), JSON.stringify(head.slice(-20)));
     assert.match(tail, /^line \d{5}\n/);
     assert.ok(!text.includes('\n\n['), 'a blank line before the count');
+    // stderr needs 14 characters, so stdout has the rest of the room: all of
+    // it but its label, the count and less than a line on each side.
+    assert.ok(head.length + tail.length > 23_850, String(head.length + tail.length));
   });
 
   it('falls at a line\'s end on each side of a cut, whatever the budget', () => {
@@ -97,10 +100,13 @@ describe('code_execution result text', () => {
   });
 
   it('cuts mid-line when no line ends near the cut, and the count still says what was cut', () => {
-    const stdout = 'a'.repeat(20_000) + '\n' + 'b'.repeat(20_000);
+    // The only line ends are far from both cuts: near the start, in the
+    // middle, and near the end. A cut moves at most a quarter of its part.
+    const stdout = 's\n' + 'a'.repeat(20_000) + '\n' + 'b'.repeat(20_000) + '\ne';
     const text = scriptEndTextWithin({ stdout, stderr: '', returnCode: 0 }, 4000)!;
     const { head, cut, tail } = cutOf(bodyOf(text, 'stdout')!.replace(/\n$/, ''), stdout);
-    assert.ok(/^a+$/.test(head) && /^b+$/.test(tail), `${head.slice(-5)} | ${tail.slice(0, 5)}`);
+    assert.ok(/^s\na+$/.test(head) && /^b+\ne$/.test(tail), `${head.slice(-5)} | ${tail.slice(0, 5)}`);
+    assert.ok(head.length > 1500 && tail.length > 1500, `${head.length} and ${tail.length}`);
     assert.strictEqual(head.length + cut + tail.length, stdout.length);
   });
 
@@ -117,7 +123,9 @@ describe('code_execution result text', () => {
     // A third of the room, less what falling at a line's end left out: under
     // a 10-character line on each side of the cut.
     assert.ok(err.length <= Math.ceil(room / 3) && err.length > Math.ceil(room / 3) - 20, `${err.length} of ${room}`);
-    assert.ok(cutOf(err).tail.endsWith('err 01999\n'));
+    // A short last line leaves the tail its half: many lines, not just that one.
+    const errTail = cutOf(err).tail;
+    assert.ok(errTail.endsWith('err 01999\n') && errTail.length > 1300, `${errTail.length}`);
     assert.ok(cutOf(out).tail.endsWith('out 01999\n'));
     assert.ok(out.length > err.length);
   });
@@ -137,6 +145,10 @@ describe('code_execution result text', () => {
     assert.ok(over.length <= budget, String(over.length));
     const { tail } = cutOf(bodyOf(over, 'stderr')!);
     assert.ok(/^w+\n$/.test(tail) && longest.endsWith(tail), tail.slice(0, 20));
+    // Blank lines at the end go with the line before them.
+    const blanks = numbered(2000, 'tb') + lastLine + '\n\n';
+    const ended = scriptEndTextWithin({ stdout, stderr: blanks, returnCode: 1 }, budget)!;
+    assert.strictEqual(cutOf(bodyOf(ended, 'stderr')!, blanks).tail, `${lastLine}\n\n`);
   });
 
   it('gives stderr the room stdout leaves, and all of it when stdout is empty', () => {
@@ -160,8 +172,15 @@ describe('code_execution result text', () => {
     }
   });
 
-  it('is null when the budget cannot hold the heading and a cut of each stream', () => {
+  it('is null when the streams\' room is under three cut markers', () => {
     assert.strictEqual(scriptEndTextWithin({ stdout: 'x'.repeat(1000), stderr: '', returnCode: 0 }, 60), null);
+    // Both streams cut, with room for two markers but not three: stderr's
+    // third couldn't hold its own marker.
+    const both = { stdout: 'o'.repeat(20_000), stderr: 'e'.repeat(20_000), returnCode: 0 };
+    const fixed = 'exit code: 0\n'.length + 2 * ('--- stderr ---\n'.length + 1);
+    const marker = '\n[… 20000 characters cut …]\n'.length;
+    assert.strictEqual(scriptEndTextWithin(both, fixed + 3 * marker - 1), null);
+    assert.ok(scriptEndTextWithin(both, fixed + 3 * marker) !== null);
   });
 });
 
@@ -179,7 +198,12 @@ describe('code_execution result text, through the framework (real python3)', () 
       agents?: Parameters<typeof AgentFramework.create>[0]['agents'];
       toolResultInlineMaxChars?: number;
     },
-    body: (framework: AgentFramework, readSpill: (path: string) => Promise<string>, failWrites: () => void) => Promise<void>,
+    body: (
+      framework: AgentFramework,
+      readSpill: (path: string) => Promise<string>,
+      failWrites: (answer?: { success: false; error: string; isError: true; data?: unknown }) => void,
+      wroteFor: (callId: string, days: string[]) => Promise<boolean>,
+    ) => Promise<void>,
   ): Promise<void> {
     const tempDir = mkdtempSync(join(tmpdir(), 'pytc-text-'));
     const mountDir = join(tempDir, 'mount');
@@ -206,7 +230,13 @@ describe('code_execution result text, through the framework (real python3)', () 
           assert.ok('data' in read, JSON.stringify(read));
           return (read as { data: Buffer }).data.toString('utf8');
         },
-        () => { workspace!.writeBinary = async () => ({ success: false, error: 'disk full', isError: true }); },
+        (answer = { success: false, error: 'disk full', isError: true }) => { workspace!.writeBinary = async () => answer; },
+        async (callId, days) => {
+          for (const day of new Set(days)) {
+            if ('data' in await workspace!.readBinary(`files/tool-results/${day}-${callId}.txt`)) return true;
+          }
+          return false;
+        },
       );
     } finally {
       await framework.stop();
@@ -216,6 +246,7 @@ describe('code_execution result text, through the framework (real python3)', () 
 
   const run = (framework: AgentFramework, id: string, input: Record<string, unknown>, callerAgentName?: string) =>
     framework.executeToolCall({ id, name: 'code_execution', input, ...(callerAgentName ? { callerAgentName } : {}) });
+  const today = () => new Date().toISOString().slice(0, 10);
   const textOf = (r: ToolResult) => {
     assert.ok(Array.isArray(r.data), JSON.stringify(r.data).slice(0, 200));
     const blocks = r.data as Array<{ type: string; text: string }>;
@@ -234,7 +265,8 @@ describe('code_execution result text, through the framework (real python3)', () 
       const r = await run(framework, 'ce-output-tail', { code: outputTail });
       assert.strictEqual(r.success, true, JSON.stringify(r).slice(0, 300));
       const text = textOf(r);
-      assert.ok(text.length <= 24_000, `${text.length} characters, over the default inline cap`);
+      // The house default cap for a caller with no agent, filled by the cut.
+      assert.ok(text.length <= 24_000 && text.length > 23_000, `${text.length} characters against the default inline cap`);
       const { stderr } = r.structured as { stderr: string };
       assert.match(stderr, /^an error line\nTraceback \(most recent call last\):\n[\s\S]*SystemExit: 5\n$/);
       assert.ok(text.startsWith(`exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\nxxx`), text.slice(0, 400));
@@ -270,10 +302,17 @@ describe('code_execution result text, through the framework (real python3)', () 
       assert.ok(text.length <= 24_000, String(text.length));
       assert.ok(text.startsWith('exit code: 1\n--- stderr ---\nan error line\nTraceback'), text.slice(0, 80));
       assert.match(text, /\n\[cut to fit; writing the whole output \(\d+ chars\) to workspace file files\/tool-results\/\S+-ce-write-fails\.txt FAILED \(disk full\); what was cut was not retained\]$/);
+      // A store that left the file's branch answers with its own words, which
+      // the notice cuts at 200 characters, as the room it left assumes.
+      const said = `${'w'.repeat(200)}${'z'.repeat(100)}`;
+      failWrites({ success: false, error: said, isError: true, data: { branchLeft: true } });
+      const long = textOf(await run(framework, 'ce-write-left', { code: outputTail }));
+      assert.ok(long.length <= 24_000, String(long.length));
+      assert.ok(long.endsWith(`FAILED (${'w'.repeat(200)}); what was cut was not retained]`), long.slice(-80));
     });
   });
 
-  it('the calling agent\'s own inline cap bounds the text', async () => {
+  it('the inline cap resolved for the calling agent bounds the text', async () => {
     await withFramework({ workspace: true, toolResultInlineMaxChars: 5000, agents: [agentWithTokenBound(0)] }, async (framework) => {
       const text = textOf(await run(framework, 'ce-agent-cap', { code: outputTail }, 'prime'));
       assert.ok(text.length <= 5000 && text.length > 4500, String(text.length));
@@ -282,20 +321,34 @@ describe('code_execution result text, through the framework (real python3)', () 
     });
   });
 
-  it('a cap too small for a cut of each stream leaves the whole text to the inline cap\'s spill', async () => {
+  it('a cap too small for a cut of each stream returns the whole text, written nowhere, for the inline cap\'s spill', async () => {
     // 50 tokens bound the cap at 200 characters, less than the notice alone.
-    await withFramework({ workspace: true, agents: [agentWithTokenBound(50)] }, async (framework) => {
+    await withFramework({ workspace: true, agents: [agentWithTokenBound(50)] }, async (framework, _readSpill, _failWrites, wroteFor) => {
+      const days = [today()];
       const r = await run(framework, 'ce-tiny-cap', { code: outputTail }, 'prime');
+      days.push(today());
       const { stderr } = r.structured as { stderr: string };
       assert.strictEqual(textOf(r), `exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\n${'x'.repeat(30_000)}\n`);
+      assert.strictEqual(await wroteFor('ce-tiny-cap', days), false, 'the inline cap\'s spill writes the file when the result is stored, once');
+    });
+  });
+
+  it('a capped time limit is said in the heading', async () => {
+    await withFramework({ workspace: true, codeExecution: { scriptTimeoutMs: 1000 } }, async (framework) => {
+      const r = await run(framework, 'ce-capped', { code: 'print("ok")', time_limit_ms: 60_000 });
+      assert.strictEqual(textOf(r), "exit code: 0\ntime limit: time_limit_ms 60000 was capped at 1000, this deployment's maximum\n--- stdout ---\nok\n");
+      assert.strictEqual((r.structured as { time_limit_note: string }).time_limit_note, "time_limit_ms 60000 was capped at 1000, this deployment's maximum");
     });
   });
 
   it('a short run reads as its text, whole, with nothing written', async () => {
-    await withFramework({ workspace: true }, async (framework) => {
+    await withFramework({ workspace: true }, async (framework, _readSpill, _failWrites, wroteFor) => {
+      const days = [today()];
       const r = await run(framework, 'ce-short', { code: 'print("hello")' });
+      days.push(today());
       assert.strictEqual(textOf(r), 'exit code: 0\n--- stdout ---\nhello\n');
       assert.deepStrictEqual(r.structured, { stdout: 'hello\n', stderr: '', return_code: 0 });
+      assert.strictEqual(await wroteFor('ce-short', days), false);
     });
   });
 });
