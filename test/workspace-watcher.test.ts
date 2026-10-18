@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { MountWatcher, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
@@ -44,11 +44,12 @@ function makeConfig(): MountConfig {
 function collect(
   lifecycle?: WatcherLifecycle,
   config: MountConfig = makeConfig(),
+  others: readonly string[] = [],
 ): { watcher: MountWatcher; batches: FsChange[][] } {
   const batches: FsChange[][] = [];
   const watcher = new MountWatcher(config, (changes) => {
     batches.push(changes);
-  }, lifecycle);
+  }, lifecycle, others);
   watcher.start();
   return { watcher, batches };
 }
@@ -86,8 +87,9 @@ function collectWithPolling(lifecycle?: WatcherLifecycle): {
 function collectWithNative(
   lifecycle?: WatcherLifecycle,
   config?: MountConfig,
+  others?: readonly string[],
 ): { watcher: MountWatcher; batches: FsChange[][] } {
-  return withNativeBackend(() => collect(lifecycle, config));
+  return withNativeBackend(() => collect(lifecycle, config, others));
 }
 
 async function wait(ms: number) {
@@ -133,6 +135,41 @@ async function changeFor(batches: FsChange[][], path: string, op?: FsChange['op'
     () => batches.flat().some(c => c.path === path && (op === undefined || c.op === op)),
     `expected ${op ? `a ${op} entry` : 'a change'} for ${path}`,
   );
+}
+
+// The probe files changesFlow writes, which a test's results leave out by name.
+const PROBE_PREFIX = 'probe-';
+const isProbe = (path: string): boolean => basename(path).startsWith(PROBE_PREFIX);
+
+/**
+ * Waits until the watcher reports a change in each of `dirs`, relative to the
+ * mount's root `root` (the root itself when `dirs` names none), so what a test
+ * writes there next is written while changes are delivered. `onReady` says
+ * chokidar's first scan is done, not that the platform delivers events yet. By
+ * our reading of libuv, on macOS `fs.watch` of a directory returns before
+ * libuv's own thread has made the FSEventStream that reports it, a stream that
+ * starts "since now" and is made again for every watched directory each time
+ * one is added. So a file written in between isn't reported until a later
+ * change in its directory, when chokidar reads the directory again, and a probe
+ * reported in one directory can come from a stream made before another
+ * directory's watch. Each attempt writes a new probe in each directory still
+ * unreported and waits up to a second, since the next probe is that later
+ * change. The probes stay in the batches, and a test's results leave them out
+ * (isProbe).
+ */
+async function changesFlow(root: string, batches: FsChange[][], dirs: readonly string[]): Promise<void> {
+  const where = dirs.length ? dirs : [''];
+  const start = Date.now();
+  const left = () => Date.now() - start < EVENT_MS;
+  const reportedIn = (dir: string) => batches.flat().some((c) => isProbe(c.path) && dirname(c.path) === (dir || '.'));
+  for (let n = 0; left(); n++) {
+    for (const dir of where) if (!reportedIn(dir)) writeFileSync(join(root, dir, `${PROBE_PREFIX}${n}.txt`), String(n));
+    for (const attempt = Date.now(); Date.now() - attempt < 1_000 && left(); await wait(25)) {
+      if (where.every(reportedIn)) return;
+    }
+  }
+  const seen = [...new Set(batches.flat().map((c) => c.path))];
+  assert.fail(`expected the watcher to report a probe in each of ${where.map((d) => d || '.').join(', ')}; it reported ${seen.join(', ') || 'nothing'}`);
 }
 
 /**
@@ -409,5 +446,59 @@ describe('MountWatcher lifecycle', () => {
     } finally {
       await watcher.stop();
     }
+  });
+});
+
+describe('MountWatcher ignores what a walk passes over by design (connectome-host #278)', () => {
+  // The mount sits under a directory with a dot in its name, as one under
+  // ~/.local does: chokidar's own filter for editors' files tested the whole
+  // path, so there it hid every `*.swp` beneath the root.
+  async function reported(
+    collectOn: (lifecycle?: WatcherLifecycle, config?: MountConfig, others?: readonly string[]) => { watcher: MountWatcher; batches: FsChange[][] },
+    ignore: string[],
+    files: string[],
+    expected: string[],
+    others: readonly string[] = [],
+  ): Promise<string[]> {
+    const root = join(tmp, '.local', 'work');
+    mkdirSync(join(root, 'cache'), { recursive: true });
+    mkdirSync(join(root, 'drafts~'), { recursive: true });
+    for (const other of others) mkdirSync(join(root, other), { recursive: true });
+    let ready = false;
+    const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore }, others);
+    try {
+      await waitFor(() => ready, 'expected the watcher to be ready', 10_000);
+      // Probes in each directory a file must be reported from.
+      await changesFlow(root, batches, [...new Set(expected.map((f) => (dirname(f) === '.' ? '' : dirname(f))))]);
+      for (const f of files) writeFileSync(join(root, f), 'x');
+      // What must be reported, then time for anything that mustn't be.
+      const seen = (p: string) => batches.flat().some((c) => c.path === p);
+      await waitFor(() => expected.every(seen), `expected ${expected.join(', ')} to be reported`, 10_000);
+      await wait(SETTLE_MS);
+    } finally {
+      await watcher.stop();
+    }
+    return [...new Set(batches.flat().map((c) => c.path))].filter((p) => !isProbe(p)).sort();
+  }
+
+  const EDITORS = ['.gate.json.swp', '.gate.json.swx', 'gate.json~', '.x.subl3f9.tmp', 'drafts~/x.txt'];
+  const PLAIN = ['notes.swp', 'report.v2.swp', 'notes.sublime.tmpl', 'backup.txt.bak', 'kept.txt'];
+
+  for (const [backend, collectOn] of [
+    ['native', collectWithNative],
+    ['polling', (l?: WatcherLifecycle, c?: MountConfig, o?: readonly string[]) => withPollingBackend(() => collect(l, c, o))],
+  ] as const) {
+    it(`reports a plain name and passes over editors' files, by their own name (${backend})`, async () => {
+      assert.deepEqual(await reported(collectOn, [], [...EDITORS, ...PLAIN], PLAIN), [...PLAIN].sort());
+    });
+
+    it(`passes over another mount's directory nested in this one, and reports what lies beside it (${backend})`, async () => {
+      const files = ['inner/mount/x.txt', 'inner/kept.txt', 'kept.txt'];
+      assert.deepEqual(await reported(collectOn, [], files, ['inner/kept.txt', 'kept.txt'], ['inner/mount']), ['inner/kept.txt', 'kept.txt']);
+    });
+  }
+
+  it("passes over what the mount's ignore list covers, by the path relative to the mount", async () => {
+    assert.deepEqual(await reported(collectWithNative, ['*.log', 'cache/**'], ['new.log', 'cache/blob.txt', 'kept.txt'], ['kept.txt']), ['kept.txt']);
   });
 });

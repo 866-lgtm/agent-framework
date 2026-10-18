@@ -559,8 +559,13 @@ for (const permitted of [false, true]) {
     const h = await harness({ allowedTools: permitted ? ['prose_help'] : [], proseRouting: 'explicit' });
     try {
       const agent = h.framework.getAgent('assistant')!;
-      const internal = h.framework as unknown as { maybePrimeProseMode(value: typeof agent): void; bounceProse(value: typeof agent, text: string, reason: string): void };
-      internal.maybePrimeProseMode(agent); internal.bounceProse(agent, 'Unrouted prose', 'no destination');
+      const internal = h.framework as unknown as {
+        maybePrimeProseMode(value: typeof agent): void;
+        routingOf(name: string): unknown;
+        bounceProse(value: typeof agent, text: string, reason: string, candidates: undefined, prefix: '>>', round: { routing: unknown; notice: 'later' }): void;
+      };
+      internal.maybePrimeProseMode(agent);
+      internal.bounceProse(agent, 'Unrouted prose', 'no destination', undefined, '>>', { routing: internal.routingOf('assistant'), notice: 'later' });
       const compiled = await agent.compileContext(); const text = JSON.stringify(compiled.messages);
       assert.equal(text.includes('The prose_help tool shows the full syntax.'), permitted);
       assert.ok(text.includes('destination prefix') && text.includes('To deliver it unchanged'));

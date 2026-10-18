@@ -103,11 +103,16 @@ export interface AgentConfig {
   promptCaching?: boolean;
 
   /**
-   * Prefill-formatter support: a synthetic user message appended after the
-   * conversation (e.g. chapterx's `<cmd>cat untitled.txt</cmd>` CLI-sim
-   * scaffold). Forwarded verbatim to membrane's prefill formatters; ignored
-   * by native formatting. Part of reproducing a prefill-era bot's exact
-   * prompting structure when migrating it into a resident.
+   * A synthetic user message for a request whose formatted conversation
+   * would otherwise begin with the assistant (e.g. chapterx's
+   * `<cmd>cat untitled.txt</cmd>` CLI-sim scaffold). A non-empty value is
+   * forwarded verbatim to membrane, on framework turns and the direct API
+   * alike. Membrane's anthropic-xml formatter makes it the first message,
+   * ahead of the assistant turn that carries the conversation. Its native
+   * formatter uses it as the text of a leading user turn that its tool-pair
+   * normalizer adds, in place of `[continuing]`. Part of reproducing a
+   * prefill-era bot's exact prompting structure when migrating it into a
+   * resident.
    */
   prefillUserMessage?: string;
 
