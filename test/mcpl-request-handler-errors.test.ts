@@ -741,13 +741,16 @@ test('a server\'s error answer that no template can convert settles the host\'s 
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: fetch.id, error: { code: { toString: 1 }, message: { toString: 1 } } }));
   await settle();
   assert.deepEqual(lines, [
-    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): MCPL server "srv" returned error for mcpl/manifest: [[object Object]] [object Object]',
+    `MCPL server "srv" answered mcpl/manifest (id=${fetch.id}) with error "{\\"toString\\":1}": "{\\"toString\\":1}"`,
+    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): The "srv" server answered with an error without saying what went wrong, so whether the request took effect is unknown. Check its effect before trying again.',
   ]);
   assert.deepEqual(traces.filter((e) => e.type === 'mcpl:server-error' || e.type === 'mcpl:request-handler-error'), []);
   assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
 });
 
-test('a server\'s error code and message in the error a host request rejects with are bounded: control, format and line characters replaced, and each cut after 200 code points', async () => {
+test('a server\'s error message in the error a host request rejects with is bounded: control, format and line characters replaced, and cut after 200 code points; its code goes to the log line instead, as logValue prints it', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const transport = new ResponseTransport();
   const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
   connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
@@ -756,7 +759,7 @@ test('a server\'s error code and message in the error a host request rejects wit
   const fetch = JSON.parse(transport.lines.at(-1)!);
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: fetch.id, error: { code: -32000, message: `line one\nline two\u202e${'x'.repeat(300)}` } }));
   await assert.rejects(fetched, {
-    message: `MCPL server "srv" returned error for mcpl/manifest: [-32000] line one?line two?${'x'.repeat(182)}…`,
+    message: `The "srv" server answered with an error: line one?line two?${'x'.repeat(182)}…`,
   });
   // JSON-RPC's code is an integer, but a server can send a string, and it's
   // the server's text as much as the message is.
@@ -764,8 +767,10 @@ test('a server\'s error code and message in the error a host request rejects wit
   const second = JSON.parse(transport.lines.at(-1)!);
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: second.id, error: { code: `E\nx\u202e${'y'.repeat(300)}`, message: 'refused' } }));
   await assert.rejects(again, {
-    message: `MCPL server "srv" returned error for mcpl/manifest: [E?x?${'y'.repeat(196)}…] refused`,
+    message: 'The "srv" server answered with an error: refused',
   });
+  // The code is the operator's, so it's in the log line, escaped and cut there.
+  assert.ok(lines.some((line) => line.startsWith(`MCPL server "srv" answered mcpl/manifest (id=${second.id}) with error "E\\nx\\u202e${'y'.repeat(252)}"…(304): refused`)), lines.join('\n'));
 });
 
 test('a throw from the wired tools/list_changed handler is contained, traced and logged as the other handlers\' are', (t) => {
@@ -908,20 +913,20 @@ test('a request form held at the buffer cap is kept, and answered when its plane
   const errors = t.mock.method(console, 'error', () => {});
   const { connection, transport, refreshed } = stagedHarness();
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'mcpl/manifestChanged', params: { revision: 'held' } }));
-  // 1,100 notifications pass the cap of 1,000 held events by 101.
+  // 1,100 notifications pass the cap of 1,000 held notifications by 100. The
+  // request form is counted apart, against the budget for held requests.
   for (let i = 0; i < 1_100; i++) {
     transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'mcpl/manifestChanged', params: { revision: `n${i}` } }));
   }
   connection.ready();
   await settle();
   assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 5, result: {} }]);
-  assert.equal(refreshed.length, 1_000);
-  assert.deepEqual(refreshed.slice(0, 2), [{ revision: 'held' }, { revision: 'n101' }]);
+  assert.equal(refreshed.length, 1_001);
+  assert.deepEqual(refreshed.slice(0, 2), [{ revision: 'held' }, { revision: 'n100' }]);
   assert.deepEqual(refreshed.at(-1), { revision: 'n1099' });
   assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0])), [
     '[mcpl] srv: buffered-event cap (1000) — dropped 1 responder-less event(s) while the plane is paused',
-    '[mcpl] srv: buffered-event cap (1000) — dropped 101 responder-less event(s) while the plane is paused',
-    '[mcpl] srv: flushing 1000 buffered event(s) synchronously (long pause backlog; 101 dropped at cap)',
+    '[mcpl] srv: flushing 1001 buffered event(s) synchronously (long pause backlog; 100 dropped at cap)',
   ]);
 });
 

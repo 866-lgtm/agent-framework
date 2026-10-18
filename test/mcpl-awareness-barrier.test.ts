@@ -264,8 +264,8 @@ test('mandatory awareness deadline survives requestTimeoutMs: 0 and durably rele
     const entry = outbox.batches()[0]!.refs[0]!;
     assert.equal(entry.deliveryStatus, 'pending');
     assert.equal(entry.attempts, 1);
-    assert.match(entry.lastError ?? '', /did not respond to tools\/call/);
-    assert.match(entry.lastError ?? '', /outcome is unknown/i);
+    assert.match(entry.lastError ?? '', /didn't answer within/);
+    assert.match(entry.lastError ?? '', /took effect is unknown/i);
     assert.equal(records(statusPath).filter((record) => record.event === 'reaction-call').length, 1);
     const push = records(statusPath).find((record) => record.event === 'push-response');
     assert.equal(push?.ledgerStatus, 'pending', 'failure was durable before inference release');
