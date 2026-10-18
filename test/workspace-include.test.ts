@@ -3,9 +3,10 @@
  * outside the mount, for walks, the watcher's pass, materialize (even when the
  * workspace's history holds the file from before the include), sync, and the
  * agent's own reads and writes, which are refused with that reason.
- * connectome-host's `_config` mount, which versions the host's config files,
- * was versioning editor swap and backup files beside them and writing them
- * back after an undo or branch switch (connectome-host #278).
+ * connectome-host's `_config` mount versions the host's config files and
+ * holds only those: a file saved beside them, such as a kept
+ * `gate.json.unreadable-<suffix>` copy, stays out of its history and is never
+ * written back (connectome-host #278).
  */
 
 import { describe, test, type TestContext } from 'node:test';
@@ -86,7 +87,7 @@ describe('mount include', () => {
     const env = new Env(t);
     // Beside them, a directory whose name starts with `docs` and a file whose
     // name ends in `md` without the dot: each pattern's boundary holds.
-    for (const path of ['gate.json', '.gate.json.swp', 'gate.json~', 'notes.md', 'other.txt', 'sub/gate.json', 'sub/x.md', 'sub/y.txt', 'docs/a/b.txt', 'docsx/c.txt', 'readmemd']) {
+    for (const path of ['gate.json', 'gate.json.bak', 'gate.json.unreadable-1', 'notes.md', 'other.txt', 'sub/gate.json', 'sub/x.md', 'sub/y.txt', 'docs/a/b.txt', 'docsx/c.txt', 'readmemd']) {
       env.writeDisk(path, `${path}\n`);
     }
     const m = await env.open({ include: ['gate.json', '*.md', 'docs/**'] });
@@ -392,31 +393,105 @@ describe('mount include', () => {
     assert.deepEqual(((await call(m, 'ls', { path: 'work/build' })).entries as Array<{ name: string }>).map((e) => e.name), ['gate.json']);
   });
 
-  test('a name covered history lies beneath, where disk has since put a link, is a scope answered through the link, as a path through a parent link is on any mount', async (t) => {
-    for (const leadsOut of [false, true]) {
-      const env = new Env(t);
-      const outside = join(env.root, 'outside');
-      mkdirSync(join(outside, 'sub'), { recursive: true });
-      env.writeDisk('gate.json', '{}\n');
-      env.writeDisk('lnk/gate.json', '{"was":"lnk"}\n');
-      env.writeDisk('real/sub/gate.json', '{}\n');
-      let m = await env.open({ include: ['gate.json'] });
-      await call(m, 'sync', {});
-      await env.stop(m);
-      // Disk replaces the directory history recorded with a link.
-      rmSync(join(env.dir, 'lnk'), { recursive: true });
-      symlinkSync(leadsOut ? outside : join(env.dir, 'real'), join(env.dir, 'lnk'));
-      m = await env.open({ include: ['gate.json'] });
-      const top = ((await call(m, 'ls', { path: 'work' })).entries as Array<{ name: string; type: string }>).map((e) => `${e.type} ${e.name}`);
-      assert.ok(top.includes('directory lnk'), `${leadsOut}: covered history implies lnk: ${top.join(', ')}`);
-      const beneath = await call(m, 'ls', { path: 'work/lnk' });
-      if (leadsOut) {
-        // A link out of the mount: the scope is taken, and nothing beyond it is read.
-        assert.match(JSON.stringify(beneath), /resolves outside the mount/);
-      } else {
-        // A link to a directory in the mount: the listing names what lies beyond it.
-        assert.ok((beneath.entries as Array<{ name: string }>).some((e) => e.name === 'sub'), JSON.stringify(beneath.entries));
+  test('a name covered history lies beneath, where disk has since put a link, is a scope: a mount that follows symlinks answers it through the link, and one that doesn\'t refuses the link', async (t) => {
+    for (const followSymlinks of [false, true]) {
+      for (const leadsOut of [false, true]) {
+        const env = new Env(t);
+        const outside = join(env.root, 'outside');
+        mkdirSync(join(outside, 'sub'), { recursive: true });
+        env.writeDisk('gate.json', '{}\n');
+        env.writeDisk('lnk/gate.json', '{"was":"lnk"}\n');
+        env.writeDisk('real/sub/gate.json', '{}\n');
+        let m = await env.open({ include: ['gate.json'], followSymlinks });
+        await call(m, 'sync', {});
+        await env.stop(m);
+        // Disk replaces the directory history recorded with a link.
+        rmSync(join(env.dir, 'lnk'), { recursive: true });
+        symlinkSync(leadsOut ? outside : join(env.dir, 'real'), join(env.dir, 'lnk'));
+        m = await env.open({ include: ['gate.json'], followSymlinks });
+        const label = `followSymlinks ${followSymlinks}, ${leadsOut ? 'out of the mount' : 'in the mount'}`;
+        const top = ((await call(m, 'ls', { path: 'work' })).entries as Array<{ name: string; type: string }>).map((e) => `${e.type} ${e.name}`);
+        assert.ok(top.includes('directory lnk'), `${label}: covered history implies lnk: ${top.join(', ')}`);
+        const beneath = await call(m, 'ls', { path: 'work/lnk' });
+        const said = JSON.stringify(beneath);
+        const names = (beneath.entries as Array<{ name: string }>).map((e) => e.name);
+        if (!followSymlinks) {
+          // No link on a path is followed: nothing beyond it is read, and the listing says why.
+          assert.ok(!names.includes('sub'), `${label}: ${said}`);
+          assert.match(said, leadsOut
+            ? /\\"work\/lnk\\" is a symlink leading outside the mount, which this mount does not follow/
+            : /\\"work\/lnk\\" is a symlink to \\"work\/real\\", which this mount does not follow/, label);
+        } else if (leadsOut) {
+          // A link out of the mount: the scope is taken, and nothing beyond it is read.
+          assert.match(said, /resolves outside the mount/, label);
+        } else {
+          // A link to a directory in the mount: the listing names what lies beyond it.
+          assert.ok(names.includes('sub'), `${label}: ${said}`);
+        }
       }
+    }
+  });
+
+  test("a link's refusal names an inside target only where a tool could name it: a file the include covers, or a directory", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('secret.txt', 'not the mount\'s\n');
+    env.writeDisk('notes.md', 'covered\n');
+    env.writeDisk('real/gate.json', '{}\n');
+    // Links among a covered path's directories: to an uncovered file, to a
+    // covered file, and to a directory.
+    symlinkSync(join(env.dir, 'secret.txt'), join(env.dir, 'gate.json'));
+    symlinkSync(join(env.dir, 'notes.md'), join(env.dir, 'x.md'));
+    symlinkSync(join(env.dir, 'real'), join(env.dir, 'lnk'));
+    const m = await env.open({ include: ['gate.json', '*.md'] });
+    const refusal = async (path: string): Promise<string> => {
+      let message = '';
+      await assert.rejects(m.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
+      return message;
+    };
+    const uncovered = await refusal('work/gate.json/y.md');
+    assert.match(uncovered, /"work\/gate\.json" is a symlink, which this mount does not follow/);
+    assert.ok(!uncovered.includes('secret'), uncovered);
+    assert.match(await refusal('work/x.md/y.md'), /"work\/x\.md" is a symlink to "work\/notes\.md", which this mount does not follow/);
+    assert.match(await refusal('work/lnk/gate.json'), /"work\/lnk" is a symlink to "work\/real", which this mount does not follow; the mount's host can set followSymlinks: true/);
+    // Nor does a listing or a sync of the mount name the uncovered target.
+    for (const [name, input] of [['ls', { path: 'work' }], ['ls', { path: 'work', recursive: true }], ['sync', {}]] as Array<[string, Record<string, unknown>]>) {
+      const said = JSON.stringify(await call(m, name, input));
+      assert.ok(!said.includes('secret'), `${name} ${JSON.stringify(input)}: ${said}`);
+    }
+  });
+
+  test("a link into a nested mount's directory names its target only where that mount's own include covers it", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('inner/kept.json', '{}\n');
+    env.writeDisk('inner/hidden.txt', 'not the inner mount\'s\n');
+    env.writeDisk('inner/sub/a.json', '{}\n');
+    symlinkSync(join(env.dir, 'inner/hidden.txt'), join(env.dir, 'h.md'));
+    symlinkSync(join(env.dir, 'inner/kept.json'), join(env.dir, 'k.md'));
+    symlinkSync(join(env.dir, 'inner/sub'), join(env.dir, 'd'));
+    const m = new WorkspaceModule({ mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', include: ['*.md', '*.json'] },
+      { name: 'inner', path: join(env.dir, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+    ] });
+    m.initStore(env.store);
+    await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    try {
+      const refusal = async (path: string): Promise<string> => {
+        let message = '';
+        await assert.rejects(m.readFileFromDisk(path), (err: unknown) => {
+          message = `${(err as WorkspaceReadError).code}: ${String((err as Error).message)}`;
+          return err instanceof WorkspaceReadError;
+        });
+        return message;
+      };
+      // The inner mount's include leaves hidden.txt out, so neither it nor the mount is named, and the code says no
+      // more than the message: a link the mount doesn't follow, as for any other target the agent can't name.
+      const left = await refusal('work/h.md/y.md');
+      assert.match(left, /^parent_symlink: .*"work\/h\.md" is a symlink, which this mount does not follow/);
+      assert.ok(!left.includes('hidden') && !left.includes('inner'), left);
+      assert.match(await refusal('work/k.md/y.md'), /^other_mount: .*use "inner\/kept\.json"/);
+      assert.match(await refusal('work/d/a.json'), /^other_mount: .*use "inner\/sub"/);
+    } finally {
+      await m.stop();
     }
   });
 
@@ -438,24 +513,24 @@ describe('mount include', () => {
   test('history from before the include stays as it is, and no materialize writes it back', async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{"v":1}\n');
-    env.writeDisk('.gate.json.swp', 'swap\n');
-    env.writeDisk('gate.json~', 'backup\n');
+    env.writeDisk('gate.json.bak', 'backup\n');
+    env.writeDisk('gate.json.unreadable-1', 'a kept copy\n');
     let m = await env.open();
     await listed(m);
     // And a draft disk never had, in a directory disk doesn't have either,
     // and one beneath a directory named like the file the include will cover.
     await call(m, 'write', { path: 'work/old/notes.txt', content: 'a draft\n' });
     await call(m, 'write', { path: 'work/x/gate.json/run.sh', content: 'echo hi\n' });
-    assert.deepEqual(env.tree(), ['.gate.json.swp', 'gate.json', 'gate.json~', 'old/notes.txt', 'x/gate.json/run.sh'], 'without include, the editor files are versioned');
+    assert.deepEqual(env.tree(), ['gate.json', 'gate.json.bak', 'gate.json.unreadable-1', 'old/notes.txt', 'x/gate.json/run.sh'], 'without include, every file is versioned');
     const main = env.store.currentBranch().name;
     env.store.createBranch('earlier', main);
-    rmSync(join(env.dir, '.gate.json.swp'));
-    rmSync(join(env.dir, 'gate.json~'));
+    rmSync(join(env.dir, 'gate.json.bak'));
+    rmSync(join(env.dir, 'gate.json.unreadable-1'));
     await env.stop(m);
 
     m = await env.open({ include: ['gate.json'] });
     assert.deepEqual(await listed(m), ['gate.json']);
-    assert.deepEqual(env.tree(), ['.gate.json.swp', 'gate.json', 'gate.json~', 'old/notes.txt', 'x/gate.json/run.sh'],
+    assert.deepEqual(env.tree(), ['gate.json', 'gate.json.bak', 'gate.json.unreadable-1', 'old/notes.txt', 'x/gate.json/run.sh'],
       'a listing decides nothing outside the include, though disk no longer has those files');
     const top = await call(m, 'ls', { path: 'work' });
     assert.deepEqual((top.entries as Array<{ name: string }>).map((e) => e.name), ['gate.json'], 'no directory shows for history outside the include');
@@ -467,14 +542,14 @@ describe('mount include', () => {
     const written = await m.materializeMount('work');
     assert.deepEqual(written, ['gate.json'], 'the covered change is written, and nothing outside the include');
     assert.equal(readFileSync(join(env.dir, 'gate.json'), 'utf8'), '{"v":2}\n');
-    for (const path of ['.gate.json.swp', 'gate.json~', 'old/notes.txt', 'x/gate.json/run.sh']) assert.equal(existsSync(join(env.dir, path)), false, path);
-    assert.deepEqual(env.tree(), ['.gate.json.swp', 'gate.json', 'gate.json~', 'old/notes.txt', 'x/gate.json/run.sh'], 'the earlier branch\'s history outside the include is left as it was');
+    for (const path of ['gate.json.bak', 'gate.json.unreadable-1', 'old/notes.txt', 'x/gate.json/run.sh']) assert.equal(existsSync(join(env.dir, path)), false, path);
+    assert.deepEqual(env.tree(), ['gate.json', 'gate.json.bak', 'gate.json.unreadable-1', 'old/notes.txt', 'x/gate.json/run.sh'], 'the earlier branch\'s history outside the include is left as it was');
     const status = await call(m, 'status', {});
     assert.equal(status.work.fileCount, 1, 'only gate.json is the mount\'s');
     assert.equal(status.work.pendingChanges, 0, 'and nothing outside it is owed to disk');
     const all = await call(m, 'materialize', {});
     assert.equal(all.count, 0);
-    assert.equal(existsSync(join(env.dir, '.gate.json.swp')), false);
+    assert.equal(existsSync(join(env.dir, 'gate.json.bak')), false);
     // A directory that only history outside the include holds is no scope:
     // no listing names it, so it's refused as a name with nothing there is.
     assert.match(await refused(m, 'materialize', { path: 'work/old' }), /outside the mount's include/);
@@ -517,11 +592,11 @@ describe('mount include', () => {
   test('a deletion the workspace holds outside the include is left alone by a materialize, and counted only by one that names its directory', async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{}\n');
-    env.writeDisk('sub/.gate.json.swp', 'swap\n');
+    env.writeDisk('sub/gate.json.bak', 'backup\n');
     let m = await env.open();
     await listed(m);
     // The mount doesn't materialize on write, so the deletion is held, owed to disk.
-    await call(m, 'delete', { path: 'work/sub/.gate.json.swp' });
+    await call(m, 'delete', { path: 'work/sub/gate.json.bak' });
     assert.equal((await call(m, 'status', {})).work.pendingWorkspaceDeletions, 1, 'without the include, status counts it');
     await env.stop(m);
 
@@ -536,7 +611,21 @@ describe('mount include', () => {
     const named = await call(m, 'materialize', { path: 'work/sub', applyDeletions: true });
     assert.equal(named.skipped, undefined);
     assert.deepEqual(named.passedOver, [{ mount: 'work', reason: OUTSIDE, count: 1 }], 'one that names its directory counts what it left there');
-    assert.equal(existsSync(join(env.dir, 'sub/.gate.json.swp')), true, 'and disk keeps the file');
+    assert.equal(existsSync(join(env.dir, 'sub/gate.json.bak')), true, 'and disk keeps the file');
+  });
+
+  test('a sync naming a directory with a trailing separator records what it takes in under each file\'s one spelling', async (t) => {
+    // #351: the separator was kept, so the walk joined each name to the
+    // directory with a second one.
+    const env = new Env(t);
+    env.writeDisk('d/a.txt', 'a\n');
+    const m = await env.open();
+    const first = await call(m, 'sync', { path: 'work/d/' });
+    assert.deepEqual(first.results.flatMap((r: { synced: string[] }) => r.synced), ['d/a.txt']);
+    assert.deepEqual(env.tree(), ['d/a.txt']);
+    const names = ((await call(m, 'ls', { path: 'work/d' })).entries as Array<{ name: string }>).map((e) => e.name);
+    assert.deepEqual(names, ['a.txt'], 'and no entry with an empty name');
+    assert.equal((await call(m, 'sync', { path: 'work/d' })).totalSynced, 0, 'the plain spelling finds nothing more to take in');
   });
 
   test('without an include, a path is read in one spelling too, so history names the file the disk operation reaches', async (t) => {
@@ -664,15 +753,6 @@ describe('mount include', () => {
     assert.deepEqual(env.tree(), [], 'and history holds none of it');
   });
 
-  test('a mount whose path ends in a separator holds its own root', async (t) => {
-    const env = new Env(t);
-    env.writeDisk('a.txt', 'a\n');
-    const m = await env.open({ path: `${env.dir}/` });
-    assert.deepEqual(((await call(m, 'ls', { path: 'work' })).entries as Array<{ name: string }>).map((e) => e.name), ['a.txt']);
-    assert.equal(m.resolveAbsolutePath('work'), env.dir);
-    assert.equal(m.resolveAbsolutePath('work/a.txt'), join(env.dir, 'a.txt'));
-  });
-
   test('a path is split at "/", and at "\\" where that is the separator', () => {
     assert.deepEqual(pathSegments('gate.json/..\\gate.json~', '\\'), ['gate.json', '..', 'gate.json~'], 'on Windows a "\\" climb is a climb');
     assert.deepEqual(pathSegments('./a//b/.\\c\\', '\\'), ['a', 'b', 'c']);
@@ -690,23 +770,60 @@ describe('mount include', () => {
   test('a change outside include, even to a file history holds, is no change to the mount', async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{"v":1}\n');
-    env.writeDisk('gate.json~', 'backup 1\n');
+    env.writeDisk('gate.json.bak', 'backup 1\n');
     let m = await env.open();
     await listed(m);
-    const before = env.store.treeGet(TREE, 'gate.json~')!.blobHash;
+    const before = env.store.treeGet(TREE, 'gate.json.bak')!.blobHash;
     const gateBefore = env.store.treeGet(TREE, 'gate.json')!.blobHash;
     await env.stop(m);
 
     m = await env.open({ include: ['gate.json'] });
-    env.writeDisk('gate.json~', 'backup 2, edited after the include\n');
+    env.writeDisk('gate.json.bak', 'backup 2, edited after the include\n');
     env.writeDisk('gate.json', '{"v":2}\n');
     // The watcher's handler, as a debounced batch would call it.
     await (m as unknown as { handleFsChanges(mount: string, changes: Array<{ path: string; op: string }>): Promise<void> })
-      .handleFsChanges('work', [{ path: 'gate.json~', op: 'modified' }, { path: 'gate.json', op: 'modified' }]);
+      .handleFsChanges('work', [{ path: 'gate.json.bak', op: 'modified' }, { path: 'gate.json', op: 'modified' }]);
     await call(m, 'sync', {});
-    assert.equal(env.store.treeGet(TREE, 'gate.json~')!.blobHash, before, 'the backup\'s history entry is untouched');
-    assert.equal(readFileSync(join(env.dir, 'gate.json~'), 'utf8'), 'backup 2, edited after the include\n');
+    assert.equal(env.store.treeGet(TREE, 'gate.json.bak')!.blobHash, before, 'the backup\'s history entry is untouched');
+    assert.equal(readFileSync(join(env.dir, 'gate.json.bak'), 'utf8'), 'backup 2, edited after the include\n');
     assert.notEqual(env.store.treeGet(TREE, 'gate.json')!.blobHash, gateBefore, 'gate.json\'s edit is taken');
+  });
+
+  test("a path in a nested mount's directory is that mount's, whether or not the outer include covers it: every tool names the mount that holds it", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', '{}\n');
+    env.writeDisk('x.txt', 'stale words\n');
+    env.writeDisk('a/b/x.txt', 'stale words\n');
+    env.writeDisk('a/b/gate.json', '{"deep":1}\n');
+    const m = new WorkspaceModule({ mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', include: ['gate.json'] },
+      { name: 'deep', path: join(env.dir, 'a/b'), mode: 'read-write', watch: 'never' },
+    ] });
+    m.initStore(env.store);
+    await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    try {
+      const tools: Array<[string, Record<string, unknown>]> = [
+        ['read', {}], ['write', { content: 'x' }], ['delete', {}], ['ls', {}], ['glob', { pattern: '*' }],
+        ['grep', { pattern: 'stale' }], ['sync', {}], ['materialize', {}],
+      ];
+      // Uncovered and covered alike: the holder is named, and the include isn't.
+      for (const [path, use] of [['work/a/b/x.txt', 'deep/x.txt'], ['work/a/b/gate.json', 'deep/gate.json']]) {
+        for (const [name, extra] of tools) {
+          const res = await m.handleToolCall({ id: 't', name, input: { path, ...extra } });
+          const said = JSON.stringify(res.success ? res.data : String(res.error));
+          assert.ok(said.includes(`use \\"${use}\\"`), `${name} ${path}: ${said}`);
+          assert.ok(!said.includes(OUTSIDE), `${name} ${path}: ${said}`);
+        }
+        await assert.rejects(m.readFileFromDisk(path), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount');
+        assert.equal(m.resolveAbsolutePath(path), null);
+      }
+      // Where no nested mount holds it, the include still refuses it.
+      for (const [name, extra] of tools) {
+        assert.match(await refused(m, name, { path: 'work/x.txt', ...extra }), /outside the mount's include/, name);
+      }
+    } finally {
+      await m.stop();
+    }
   });
 
   test('the framework keeps its own files only in a writable mount without an include', (t) => {

@@ -16,11 +16,14 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, chmodSync, closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
+import { changedAfterFstat, countingLoads, withFileHandle } from './helpers/file-handle.js';
 
 function setup(t: TestContext, options?: { followSymlinks?: boolean }) {
   const root = mkdtempSync(join(tmpdir(), 'af-read-from-disk-'));
@@ -98,6 +101,124 @@ test('missing files and directories are distinguished', async (t) => {
   await expectRefusal(workspace.readFileFromDisk('work'), 'directory');
 });
 
+test('readBinaryFromDisk answers a file, a missing file, a directory and a file over maxBytes in its own words', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  writeFileSync(join(mountDir, 'a.bin'), Buffer.from([0, 1, 2, 3]));
+  mkdirSync(join(mountDir, 'dir'));
+  const read = await workspace.readBinaryFromDisk('work/a.bin');
+  assert.ok('data' in read, JSON.stringify(read));
+  assert.deepEqual([...read.data], [0, 1, 2, 3]);
+  assert.equal(read.absolutePath, join(mountDir, 'a.bin'));
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/missing.bin'), { error: 'File not found on disk: work/missing.bin' });
+  // A path through a file is missing too, not the system's message with the
+  // absolute path.
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/a.bin/x'), { error: 'File not found on disk: work/a.bin/x' });
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/dir'), { error: 'Not a file: work/dir' });
+  assert.deepEqual(await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 3 }), { error: 'File too large: 4 > 3 bytes' });
+  assert.ok('data' in (await workspace.readBinaryFromDisk('work/a.bin', { maxBytes: 4 })), 'a file of exactly maxBytes is read');
+});
+
+test("readBinaryFromDisk says a file it can't read is unreadable, whatever its size", async (t) => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    t.skip('file modes don\'t keep this user out');
+    return;
+  }
+  const { mountDir, workspace } = setup(t);
+  writeFileSync(join(mountDir, 'locked.bin'), Buffer.alloc(8));
+  chmodSync(join(mountDir, 'locked.bin'), 0o000);
+  try {
+    for (const opts of [{}, { maxBytes: 4 }]) {
+      assert.deepEqual(await workspace.readBinaryFromDisk('work/locked.bin', opts), { error: 'Unable to read file: work/locked.bin' }, JSON.stringify(opts));
+    }
+  } finally {
+    chmodSync(join(mountDir, 'locked.bin'), 0o600);
+  }
+});
+
+test('a FIFO is refused at once by each disk reader, without waiting for a writer', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('no FIFOs on Windows');
+    return;
+  }
+  const { mountDir, workspace } = setup(t);
+  const fifo = join(mountDir, 'pipe');
+  execFileSync('mkfifo', [fifo]);
+  // The bound only tells an answer from a wait for a writer that never
+  // comes, so it's generous: a slow runner answers well inside it.
+  const within = <T>(p: Promise<T>, what: string): Promise<T> => Promise.race([
+    p,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} still waits on the FIFO after 10 s`)), 10_000).unref()),
+  ]);
+  // Nothing opens it: each reader refuses it at its lstat.
+  const fsp = createRequire(import.meta.url)('node:fs/promises') as { open: (...args: any[]) => Promise<any> };
+  const open = fsp.open;
+  let opened = 0;
+  fsp.open = (path: string, ...rest: any[]) => {
+    if (String(path) === fifo) opened++;
+    return open(path, ...rest);
+  };
+  syncBuiltinESMExports();
+  try {
+    const err = await expectRefusal(within(workspace.readFileFromDisk('work/pipe'), 'readFileFromDisk'), 'not_found');
+    assert.equal(err.message, 'Not a regular file: work/pipe');
+    const image = await within(workspace.handleToolCall({ id: 'f', name: 'read_image', input: { path: 'work/pipe' } }), 'read_image');
+    assert.equal(image.error, 'Not a regular file: work/pipe');
+    assert.deepEqual(await within(workspace.readBinaryFromDisk('work/pipe'), 'readBinaryFromDisk'), { error: 'Not a file: work/pipe' });
+    assert.equal(opened, 0, 'no reader opened the FIFO');
+  } finally {
+    fsp.open = open;
+    syncBuiltinESMExports();
+    // Release any open still waiting for a writer, so a failure ends the
+    // test rather than holding the process.
+    try {
+      closeSync(openSync(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+    } catch {
+      // No reader waits (ENXIO): nothing to release.
+    }
+  }
+});
+
+test('a FIFO behind a symlink the mount follows is opened without waiting for a writer, and refused', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('no FIFOs on Windows');
+    return;
+  }
+  const { mountDir, workspace } = setup(t, { followSymlinks: true });
+  const fifo = join(mountDir, 'pipe');
+  execFileSync('mkfifo', [fifo]);
+  if (!symlinkOrSkip(t, fifo, join(mountDir, 'pipe-link'))) return;
+  const waited = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('readFileFromDisk still waits on the FIFO after 10 s')), 10_000).unref());
+  try {
+    const err = await expectRefusal(Promise.race([workspace.readFileFromDisk('work/pipe-link'), waited]), 'not_found');
+    assert.equal(err.message, 'Not a regular file: work/pipe-link');
+  } finally {
+    try {
+      closeSync(openSync(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+    } catch {
+      // No reader waits (ENXIO): nothing to release.
+    }
+  }
+});
+
+test("a directory on the way this user can't search is reported as the lookup's own failure, not as a symlink", async (t) => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    t.skip('file modes don\'t keep this user out');
+    return;
+  }
+  const { mountDir, workspace } = setup(t);
+  mkdirSync(join(mountDir, 'a', 'b'), { recursive: true });
+  writeFileSync(join(mountDir, 'a', 'b', 'x.txt'), 'x');
+  chmodSync(join(mountDir, 'a'), 0o600);
+  try {
+    const err = await expectRefusal(workspace.readFileFromDisk('work/a/b/x.txt'), 'not_found');
+    assert.equal(err.errno, 'EACCES');
+    assert.equal(err.stage, 'lstat');
+    assert.equal(err.message, 'Unable to read file: work/a/b/x.txt');
+  } finally {
+    chmodSync(join(mountDir, 'a'), 0o700);
+  }
+});
+
 test('a final-component symlink to an outside file is rejected under the default no-follow policy', async (t) => {
   const { root, mountDir, workspace } = setup(t);
   const outside = join(root, 'outside');
@@ -119,8 +240,11 @@ test('an intermediate symlinked directory escaping the mount is rejected under n
   writeFileSync(join(outside, 'secret.txt'), 'SECRET');
   if (!symlinkOrSkip(t, outside, join(mountDir, 'linkdir'), 'dir')) return;
 
-  // Final component is a regular file; only the directory hop is a symlink.
+  // Final component is a regular file; only the directory hop is a symlink,
+  // which a mount that doesn't follow symlinks refuses as one, with the code
+  // for where it leads.
   const err = await expectRefusal(workspace.readFileFromDisk('work/linkdir/secret.txt'), 'escape');
+  assert.equal(err.message, 'work/linkdir/secret.txt: "work/linkdir" is a symlink leading outside the mount, which this mount does not follow');
   assert.ok(!err.message.includes(root));
 });
 
@@ -176,7 +300,75 @@ test('maxBytes performs a bounded prefix read and reports truncation', async (t)
   assert.equal(whole.truncated, false);
   assert.equal(whole.bytes.length, 10_000);
 
+  const exact = await workspace.readFileFromDisk('work/big.txt', { maxBytes: 10_000 });
+  assert.equal(exact.truncated, false, 'a file of exactly maxBytes goes on no further');
+  assert.equal(exact.bytes.length, 10_000);
+
+  const none = await workspace.readFileFromDisk('work/big.txt', { maxBytes: 0 });
+  assert.deepEqual([none.bytes.length, none.truncated, none.size], [0, true, 10_000]);
+  writeFileSync(join(mountDir, 'empty.txt'), '');
+  const empty = await workspace.readFileFromDisk('work/empty.txt', { maxBytes: 0 });
+  assert.deepEqual([empty.bytes.length, empty.truncated, empty.size], [0, false, 0]);
+
   await assert.rejects(workspace.readFileFromDisk('work/big.txt', { maxBytes: -1 }), RangeError);
+});
+
+test('maxBytes bounds the read itself: a file that grows past it after the open is still read no further', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  for (const start of ['a'.repeat(10), '']) {
+    writeFileSync(path, start); // a file empty at the open, too: its fstat gives no size to read up to
+    const { result: read, loaded } = await countingLoads(() => changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(5000)),
+      () => workspace.readFileFromDisk('work/log.txt', { maxBytes: 100 })));
+    assert.equal(read.bytes.toString(), (start + 'b'.repeat(5000)).slice(0, 100), 'its first maxBytes');
+    assert.equal(read.truncated, true, 'the read found the file going on past maxBytes');
+    assert.equal(read.size, start.length + 5000, 'its size once read, not the size the open\'s fstat gave');
+    assert.ok(loaded <= 101, `loaded ${loaded} bytes: no more than maxBytes, and the one byte that shows the file goes on`);
+  }
+});
+
+test('a truncated read reports a size past maxBytes even when the file shrinks under it once read', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  writeFileSync(path, 'a'.repeat(200));
+  const ino = String(statSync(path, { bigint: true }).ino);
+  let stats = 0;
+  const read = await withFileHandle({
+    stat: (stat) => async function (this: unknown, ...args: unknown[]) {
+      const result = await stat.apply(this, args);
+      if (String(result.ino) !== ino || ++stats === 1) return result; // the open's fstat
+      truncateSync(path, 10); // the file shrinks before the fstat after the read
+      return stat.apply(this, args);
+    },
+  }, () => workspace.readFileFromDisk('work/log.txt', { maxBytes: 100 }));
+  assert.equal(stats, 2, 'the fstat after the read was made');
+  assert.equal(read.bytes.toString(), 'a'.repeat(100));
+  assert.equal(read.truncated, true, 'the read found the file going on past maxBytes');
+  assert.equal(read.size, 101, 'the bytes the read found, where the fstat after it says 10');
+});
+
+test('a file that shrinks under maxBytes after the open is read to its end, and not reported truncated', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  writeFileSync(path, 'a'.repeat(5000));
+  const read = await changedAfterFstat(path, () => truncateSync(path, 50),
+    () => workspace.readFileFromDisk('work/log.txt', { maxBytes: 100 }));
+  assert.equal(read.bytes.toString(), 'a'.repeat(50));
+  assert.equal(read.truncated, false, 'the read reached the file\'s end');
+  assert.equal(read.size, 50);
+});
+
+test('size is what the read found: a file that grows after the open, within maxBytes or with none, reports the bytes it gave', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  for (const options of [{}, { maxBytes: 100 }]) {
+    writeFileSync(path, 'a'.repeat(10));
+    const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(20)),
+      () => workspace.readFileFromDisk('work/log.txt', options));
+    assert.equal(read.bytes.toString(), 'a'.repeat(10) + 'b'.repeat(20), JSON.stringify(options));
+    assert.equal(read.truncated, false);
+    assert.equal(read.size, 30, `size agrees with the bytes (${JSON.stringify(options)})`);
+  }
 });
 
 test('read_image keeps its historical error wording after sharing the containment core', async (t) => {
