@@ -10273,8 +10273,11 @@ export class AgentFramework {
             // Under context-manager#160 such a write already gives the
             // replies stored after it stamps their requests didn't carry,
             // whatever the mark says; deferring those writers is the fix.
-            if (midTurnInjections.length > 0 && currentState.supportsInjectedMessages === true) {
-              agent.markContextConsumed();
+            if (midTurnInjections.length > 0) {
+              // Possibly shown, whatever the stream declares: the first-view
+              // mark (CoalescerHost.isUnshown) counts a doubt as shown.
+              agent.markContextShown();
+              if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
             agent.setStreaming(currentState.stream);
             this.emitTrace({
@@ -11177,6 +11180,7 @@ export class AgentFramework {
     let unreadable: { agent: string; error: unknown } | undefined;
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
+      isUnshown: (p) => this.isUnreadPlacement(p, 'shown'),
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
@@ -11571,20 +11575,25 @@ export class AgentFramework {
     }
   }
 
-  private isUnreadPlacement(p: CoalescingPlacement): boolean {
+  /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
+   *  shown watermark, never possibly shown (its isUnshown). A placement still
+   *  in the deferred queue is both. */
+  private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
     this.resolvePlacement(p);
     if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
-    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
+    return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
   }
 
   /**
    * Unread = stored, above the agent's consumed watermark on the current
    * branch, not a body-group shard (immutable), and not folded into any
    * summary (compression is consumption, §3.3). Conservative on every doubt.
+   * By the shown watermark (Agent.getShownWatermark), the same test says the
+   * message may never have been shown.
    */
-  private isUnreadStoredMessage(agent: Agent, messageId: MessageId): boolean {
+  private isUnreadStoredMessage(agent: Agent, messageId: MessageId, by: 'consumed' | 'shown' = 'consumed'): boolean {
     const cm = agent.getContextManager();
     let message: ReturnType<ContextManager['getMessage']>;
     try { message = cm.getMessage(messageId); } catch { return false; }
@@ -11608,7 +11617,7 @@ export class AgentFramework {
     const branch = cm.currentBranch().name;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
-      const watermark = reader.getConsumedWatermark();
+      const watermark = by === 'shown' ? reader.getShownWatermark() : reader.getConsumedWatermark();
       if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
       // Compression is consumption (§3.3): folded into any reader's summary.
       try {
@@ -13278,14 +13287,6 @@ export class AgentFramework {
         }
       }
 
-      // The compile below assembles every message stored at once for this
-      // agent, and for a shared slot every resident's, though the watermark
-      // moves only once it returns. So none of them is unseen any more
-      // (CoalescingPlacement.direct). A compile that fails leaves them so,
-      // which errs toward the marker.
-      this.pushCoalescer?.endDirectWindow(new Set(
-        this.sharedSlotAgents.has(agent) ? [...this.sharedSlotAgents].map((a) => a.name) : [agent.name],
-      ));
       const {
         stream,
         request: compiledRequest,
@@ -16926,7 +16927,7 @@ export class AgentFramework {
        */
       fromQueue?: { id: string; seq: number };
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
-      placement?: { agent?: string; messageId?: MessageId; deferredId?: string; direct?: true };
+      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
       /**
        * RFC-006 assembly: the named agent's turn is alive but its compile has
        * not run yet (the same window the turn-start deferred flush writes
@@ -17011,7 +17012,7 @@ export class AgentFramework {
       content,
       opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
     );
-    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.direct = true; }
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
     this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
     return stored;
   }

@@ -1353,10 +1353,11 @@ const accelerationLimit = (request: NormalizedRequest): MembraneError => new Mem
 /**
  * A turn, started by a mention in `chat`, whose first stream sends into
  * `chat` and then ends with an acceleration 429, so the turn waits for a
- * later compile with none of its streams running. `during` runs while it
- * waits. Returns the channel the turn's next start spoke into.
+ * later compile with none of its streams running. `midStream` runs while
+ * that first stream is still alive, and `during` while the turn waits.
+ * Returns the channel the turn's next start spoke into.
  */
-async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>): Promise<unknown> {
+async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>, midStream?: () => Promise<void>): Promise<unknown> {
   let streams = 0;
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
     f.membrane.calls.push(request as never);
@@ -1368,7 +1369,7 @@ async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>): Prom
     const iterate = stream[Symbol.asyncIterator].bind(stream);
     (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
       for await (const event of { [Symbol.asyncIterator]: iterate }) {
-        if ((event as { type?: string }).type === 'complete') { yield { type: 'error' as const, error: accelerationLimit(request) }; return; }
+        if ((event as { type?: string }).type === 'complete') { await midStream?.(); yield { type: 'error' as const, error: accelerationLimit(request) }; return; }
         yield event;
       }
     };
@@ -1494,4 +1495,77 @@ test("#157: another resident's compile ends the window of a message stored at on
   const stored = storedWith(f, 'doc_edited');
   assert(stored, 'the edit is stored');
   assert(!isMarked(stored), "the edit isn't marked as the agent's first view");
+});
+
+test("#157: an edit that addresses the agent, of a follow-up that arrived during the turn and was flushed when the turn was held, moves the turn to the follow-up's channel", async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register(); await f.register('other');
+  let outcome: string | undefined;
+  const channel = await heldTurnSpeaksInto(f, async () => {
+    assert(storedWith(f, 'follow_up_wiht_typo'), 'the hold flushed the follow-up into the store');
+    outcome = (await f.send('push/event', {
+      ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
+    })).result.coalesce.outcome;
+  }, async () => {
+    // The follow-up arrives while the first stream runs, so it waits in the deferred queue.
+    await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
+    assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+  });
+  assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
+  assert.equal(channel, 'other');
+});
+
+test("#157: an edit of a follow-up that arrived during a turn and was flushed at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
+  // The question wakes the turn. The follow-up and its edit wake nothing, so
+  // no compile shows the follow-up after the flush.
+  const f = await fixture({ server: { shouldTriggerInference: (content: string) => !content.includes('follow_up') } }); t.after(f.close); await f.register();
+  let streams = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request as never);
+    const stream = new MockYieldingStream([createMockResponse([{ type: 'text', text: 'answer' }] as ContentBlock[])]);
+    if (++streams > 1) return stream;
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        // The follow-up arrives after the turn's last round, so no tool
+        // boundary drains it: it waits for the turn-end flush.
+        if ((event as { type?: string }).type === 'complete') {
+          await f.send('push/event', f.params('d1', 'follow_up_wiht_typo', { initial: true }));
+          assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+        }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  await f.framework.runUntilIdle();
+  assert.equal(streams, 1, 'one turn ran');
+  assert(storedWith(f, 'follow_up_wiht_typo'), "the turn-end flush stored the follow-up");
+  assert(!f.membrane.calls.some((c) => JSON.stringify(c).includes('follow_up_wiht_typo')), 'no request held the follow-up');
+  const edit = await f.send('push/event', { ...f.params('d2', 'follow_up_fixed'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert(isMarked(storedWith(f, 'follow_up_fixed')), "the edit is the agent's first view");
+});
+
+test("#157: an edit admitted while the agent's compileContext is assembling a message stored at once stays a marker", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let outcome: string | undefined;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    shown = JSON.stringify(result).includes('doc_unseen');
+    outcome = (await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] })).result.coalesce.outcome;
+    return result;
+  };
+  await agent.compileContext();
+  assert(shown, 'compileContext assembled the message');
+  assert.equal(outcome, 'replaced', 'the message still counted as unread while compileContext ran');
+  assert(!isMarked(storedWith(f, 'doc_edited')), "the edit isn't the agent's first view");
 });

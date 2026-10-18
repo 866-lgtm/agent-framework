@@ -870,9 +870,23 @@ export class Agent {
   /** Counts marks: a compile writes its watermark back only if no mark was
    *  made while it ran (a tool boundary's, or another compile's). */
   private watermarkMarks = 0;
+  /**
+   * The newest stored message a compile or a tool boundary may have put in
+   * front of the agent, per branch. It moves where the consumed watermark
+   * does, and sooner: when a committing compile takes its value, before it
+   * awaits, and at every tool boundary that injects, whether or not the
+   * stream says it carries injected messages. So nothing above it can have
+   * been shown. A scalar counts a prefix, so a message stored below it
+   * without having been shown counts as shown, which errs toward a marker.
+   */
+  private shownWatermark: { branch: string; sequence: number } | null = null;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
+  }
+
+  getShownWatermark(): { branch: string; sequence: number } | null {
+    return this.shownWatermark;
   }
 
   /** Mark everything currently stored as consumed (the agent's creation, at
@@ -883,6 +897,13 @@ export class Agent {
     // stubs): without a watermark nothing is ever treated as unread.
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
+    this.shownWatermark = this.consumedWatermark;
+  }
+
+  /** Mark everything currently stored as possibly shown (a tool boundary
+   *  that injected messages, whatever its stream says it carries). */
+  markContextShown(): void {
+    this.shownWatermark = this.pendingWatermark() ?? this.shownWatermark;
   }
 
   /**
@@ -930,6 +951,7 @@ export class Agent {
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
     const marksBefore = this.watermarkMarks;
+    if (watermark) this.shownWatermark = watermark;
     const compile = () => this.contextManager.compile(this.compileBudget(budget));
     const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);
@@ -972,6 +994,9 @@ export class Agent {
     // any compile before it selects.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
     const marksBefore = this.watermarkMarks;
+    // Shown from the compile's start: what it assembles is in front of the
+    // agent before the consumed watermark moves, once it returns.
+    if (watermark) this.shownWatermark = watermark;
     const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
     const result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);

@@ -66,12 +66,6 @@ export interface CoalescingPlacement {
   messageId?: string;
   /** Entry id in the framework's deferred-write queue (turn-alive deferral). */
   deferredId?: string;
-  /** Stored at once, outside the deferred queue: while none of the agent's
-   *  turns was alive, or assembled for a start before its compile. No tool
-   *  boundary drained it, so the agent sees it first at a compile, and the
-   *  host clears this as a committing compile that reads it begins
-   *  (PushCoalescer.endDirectWindow). */
-  direct?: true;
 }
 
 export interface CoalescingScope { kind: 'featureSet' | 'channel'; id: string }
@@ -104,9 +98,8 @@ export interface CoalescedOccurrence<E = unknown> {
   deliverTo?: string;
   /** Set by the coalescer when a plain occurrence replaces one that was the
    *  agent's first view of the subject (its `initial` birth, or a
-   *  replacement so marked) and that the agent was never shown: still
-   *  waiting in the host's deferred queue, or stored at once, outside it
-   *  (CoalescingPlacement.direct). The replacement is then the agent's first
+   *  replacement so marked) and that the agent may never have been shown
+   *  (CoalescerHost.isUnshown). The replacement is then the agent's first
    *  view. No other path sets it. */
   replacesUnread?: boolean;
 }
@@ -198,6 +191,13 @@ export interface CoalescingReceiptRecord {
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
+  /** True iff nothing may have shown the placement to the agent: it is still
+   *  in the deferred queue, or stored where no committing compile has begun
+   *  to assemble it and no tool boundary has injected past it. Unlike
+   *  isUnread, a compile counts from its start, and a boundary counts
+   *  whether or not its stream says it carries injected messages: a doubt
+   *  counts as shown. */
+  isUnshown(placement: CoalescingPlacement): boolean;
   /** False when the unread occurrence could not be removed (it may still be read). */
   remove(placement: CoalescingPlacement): boolean;
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
@@ -451,17 +451,6 @@ export class PushCoalescer<E = unknown> {
     return structuredClone(entry.result);
   }
 
-  /** A committing compile of an agent that reads the stores of `agents` is
-   *  about to assemble its request. An occupant stored at once there is in
-   *  that request from now on, though it counts as unread until the compile
-   *  returns, so it is no longer one the agent hasn't seen. */
-  endDirectWindow(agents: ReadonlySet<string>): void {
-    for (const state of this.subjects.values()) {
-      const placement = state.occupant?.placement;
-      if (placement?.direct && agents.has(placement.agent)) delete placement.direct;
-    }
-  }
-
   // ---------------------------------------------------------------------------
   // Admission
   // ---------------------------------------------------------------------------
@@ -629,13 +618,10 @@ export class PushCoalescer<E = unknown> {
     if (occupantUnread && state.occupant) {
       const prior = state.occupant;
       // The replacement is the agent's first view only when its prior was
-      // one and the agent was never shown it: still waiting in the host's
-      // deferred queue, or stored at once, outside it. One drained from the
-      // queue may have been injected at a tool boundary, which leaves it
-      // unread where the stream doesn't say it carries injected messages, so
-      // it doesn't count. An occupant that isn't a first view
-      // ends the chain for every later replacement.
-      const firstView = prior.firstView === true && (prior.placement.deferredId !== undefined || prior.placement.direct === true);
+      // one and nothing may have shown it to the agent (isUnshown). An
+      // occupant that isn't a first view ends the chain for every later
+      // replacement.
+      const firstView = prior.firstView === true && this.host.isUnshown(prior.placement);
       this.host.audit({ kind: 'displaced', subject, eventId: prior.eventId });
       if (this.host.remove(prior.placement)) {
         this.host.cancelWake(subject);
