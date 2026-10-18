@@ -42,7 +42,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 import { JsStore } from '@animalabs/chronicle';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, StreamEvent } from '@animalabs/membrane';
 import type {
   ErrorAction,
   Module,
@@ -611,6 +611,95 @@ describe('stop() with work still in flight', () => {
         release();
         await framework.stop().catch(() => {});
       }
+    });
+
+    it("a write deferred behind the entry a retry that failed to compile left is stored by stop(), with a budget or without", { timeout: 30_000 }, async () => {
+      // A resident stream fails and its error policy retries, but the retry's
+      // compile throws after taking the agent's stream id. The old frame no
+      // longer owns the activeStreams entry, so its finally leaves it, and no
+      // new handle replaces it: the entry outlives its stream. No stream that
+      // stop() waited on is still running, so the final flush stores a write
+      // deferred behind that entry, as on main.
+      class FailingStream extends MockYieldingStream {
+        constructor(private readonly released: Promise<void>) {
+          super([createMockResponse([{ type: 'text', text: 'unused' }] as ContentBlock[])]);
+        }
+        override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+          await this.released;
+          yield { type: 'error', error: new Error('the provider failed') } as unknown as StreamEvent;
+        }
+      }
+      const agents = [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }];
+      const textsIn = (framework: AgentFramework): string[] => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
+      for (const budget of [undefined, 100]) {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => { release = resolve; });
+        const membrane = new MockMembrane();
+        membrane.streamYielding = (request) => {
+          membrane.calls.push(request);
+          return new FailingStream(released);
+        };
+        const events: Module = {
+          name: 'events',
+          async start() {},
+          async stop() {},
+          getTools: () => [],
+          async handleToolCall() { return { success: true }; },
+          async onProcess(event) {
+            if (event.type !== 'external-message') return {};
+            return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }], requestInference: true };
+          },
+        };
+        const attempts: number[] = [];
+        const storePath = join(tempDir, `store-${budget ?? 'unbounded'}`);
+        const framework = await AgentFramework.create({
+          storePath,
+          membrane: membrane.asMembrane(),
+          agents,
+          modules: [events],
+          syncIntervalMs: 0,
+          errorPolicy: {
+            maxRetries: 1,
+            onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+              attempts.push(attempt);
+              return attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false };
+            },
+          },
+        });
+        const internals = framework as unknown as {
+          activeStreams: Map<string, Promise<void>>;
+          deferredMessages: unknown[];
+          addMessage(participant: string, content: ContentBlock[]): string;
+        };
+        try {
+          framework.start();
+          framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+          await until(() => internals.activeStreams.has('assistant'), 'the first stream');
+          const handle = internals.activeStreams.get('assistant')!;
+          (framework.getAgent('assistant') as unknown as { buildActivationRequest: () => never }).buildActivationRequest = () => {
+            throw new Error('the compile failed');
+          };
+          release();
+          await handle;
+          await until(() => attempts.length === 2, 'the retry to fail');
+          assert.equal(internals.activeStreams.get('assistant'), handle, 'the old frame left its entry');
+          assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]), '', 'deferred behind it');
+          await framework.stop(budget);
+          assert.equal(internals.deferredMessages.length, 0, `budget ${budget}: the final flush took the write`);
+          assert.ok(!logged.some((line) => line.startsWith('[deferral] stop:')), logged.join('\n'));
+        } finally {
+          release();
+          await framework.stop().catch(() => {});
+        }
+        const reopened = await AgentFramework.create({ storePath, membrane: new MockMembrane().asMembrane(), agents, modules: [], syncIntervalMs: 0 });
+        try {
+          assert.ok(textsIn(reopened).includes('late note'), `budget ${budget}: the store has the write:\n${textsIn(reopened).join('\n')}`);
+        } finally {
+          await reopened.stop();
+        }
+      }
+      assert.deepEqual(rejections, []);
     });
 
     it("a stream handle that rejects settles stop()'s wait on it, as on main, with a budget or without", { timeout: 30_000 }, async () => {

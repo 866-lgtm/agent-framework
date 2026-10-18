@@ -3086,7 +3086,17 @@ export class AgentFramework {
       return [...all].map(([promise, label]) => ({ label, promise }));
     };
 
-    // Wait for all stream iteration handles to settle
+    // Wait for all stream iteration handles to settle. An agent whose handle
+    // hasn't settled by the final flush keeps its entries queued there. Its
+    // activeStreams entry alone doesn't say that a stream is still running:
+    // a restart whose compile failed after taking the stream id leaves the
+    // old frame's entry, which that frame no longer owns.
+    const stillStreaming = new Set<string>();
+    for (const [name, stream] of this.activeStreams) {
+      stillStreaming.add(name);
+      const settled = () => { stillStreaming.delete(name); };
+      void stream.then(settled, settled);
+    }
     await waitFor(withLeftovers('stream', [...this.activeStreams].map(([name, promise]) => ({ label: `stream:${name}`, promise }))), 'stream');
 
     // Stop sync timer
@@ -3228,18 +3238,19 @@ export class AgentFramework {
     // A registered agent's stream that outlasted its wait may still write,
     // so that agent's entries stay queued, said once for it: no entry lands
     // ahead of a stream that may still write. The stream counts as running
-    // while its activeStreams entry stands, as it does for addMessage's own
-    // deferral. When it settles in a process that lives on, its own turn-end
-    // flush takes them, as at any turn's end, and a later stop() takes what
-    // that leaves. Until then a persisted queue keeps them for boot, and a
-    // memory-only one loses them at exit.
+    // while the handle this stop() waited on for it hasn't settled
+    // (stillStreaming). When it settles in a process that lives on, its own
+    // turn-end flush takes them, as at any turn's end, and a later stop()
+    // takes what that leaves. Until then a persisted queue keeps them for
+    // boot, and a memory-only one loses them at exit.
     if (this.deferredMessages.length > 0) {
-      const entries = [...this.agents.keys()]
-        .filter((name) => !this.activeStreams.has(name))
+      const registered = [...this.agents.keys()];
+      const entries = registered
+        .filter((name) => !stillStreaming.has(name))
         .flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
       this.ackDeferredWrites();
-      for (const name of this.activeStreams.keys()) {
+      for (const name of registered.filter((agent) => stillStreaming.has(agent))) {
         const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (held > 0) {
           console.error(
