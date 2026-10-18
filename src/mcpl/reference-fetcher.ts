@@ -40,11 +40,11 @@ export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
  *  kept. */
 export const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 60_000;
-/** What a refusal by the per-server budget adds: the total isn't renewed
- *  while this process runs, so a second try meets the same refusal unless
- *  the server's budget is raised (its config's autofetch.maxTotalBytes, which
- *  each fetch reads afresh). */
-const BUDGET_LASTS = "the budget isn't renewed while this host runs, so calling again won't change that unless whoever runs this host raises it";
+/** What a refusal by the per-server budget adds. The total lives as long as
+ *  this fetcher, one per framework, so only someone running the host renews
+ *  it, by starting a new one, or raises the budget (the server's config's
+ *  autofetch.maxTotalBytes, which each fetch reads afresh). */
+const BUDGET_LASTS = "the budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it";
 const EAGER_FETCH_TIMEOUT_MS = 10_000;
 
 export interface ResolvedServerBinding {
@@ -187,8 +187,17 @@ export class ReferenceFetcher {
     if (used >= budget) {
       return { ok: false, error: `per-server fetch budget exhausted (${used}/${budget} bytes); ${BUDGET_LASTS}` };
     }
-    // Vector 4: a claim already over the ceiling refuses without dialing.
+    // Vector 4: a claim already over the ceiling refuses without dialing. One
+    // that's also over what's left of the budget is told about the budget,
+    // which no max_bytes lifts. A claim over what's left but within the
+    // ceiling still dials, and the budget stops it at its first chunk past.
     if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
+      if (t.sizeBytes > budget - used) {
+        return {
+          ok: false,
+          error: `claimed ${t.sizeBytes} bytes exceeds what's left of the per-server fetch budget (${used}/${budget} bytes); ${BUDGET_LASTS}`,
+        };
+      }
       return { ok: false, error: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}` };
     }
 

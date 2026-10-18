@@ -380,8 +380,8 @@ for (const expired of [true, false]) {
 }
 
 /** A refusal by the budget says it lasts, so a second try is no use unless
- *  whoever runs the host raises it. */
-const BUDGET_LASTS = "the budget isn't renewed while this host runs, so calling again won't change that unless whoever runs this host raises it";
+ *  whoever runs the host raises or renews it. */
+const BUDGET_LASTS = "the budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it";
 /** The budget's stop partway, with the server's running total and the budget. */
 const STOPPED_BY_BUDGET = new RegExp(`^aborted: per-server fetch budget exhausted \\((\\d+)/(\\d+) bytes\\); ${BUDGET_LASTS}$`);
 
@@ -494,6 +494,19 @@ test('a download past both max_bytes and the budget is told about the budget, wh
   // A first fetch's total is its own bytes, so both limits fall at the same chunk.
   const out = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?both-limits`), { maxBytes: 1000 });
   assert.match(out.error!, STOPPED_BY_BUDGET);
+});
+
+test("a claim over max_bytes and over what's left of the budget is refused for the budget, before dialing", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 100 } } });
+  assert.equal((await f.fetch(makeRecord(reg, `${ORIGIN}/ok?spend-most`))).ok, true);
+  // 100 bytes are left: a larger max_bytes wouldn't let this claim through.
+  const out = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?claim-past-both`, { sizeBytes: 10_000 }), { maxBytes: 1000 });
+  assert.equal(out.error, `claimed 10000 bytes exceeds what's left of the per-server fetch budget (${PAYLOAD.length}/${PAYLOAD.length + 100} bytes); ${BUDGET_LASTS}`);
+  // Within what's left, the same claim is refused for the ceiling, which a larger max_bytes lifts.
+  const roomy = makeFetcher({ srv: { url: ORIGIN } });
+  const ceilingOnly = await roomy.fetch(makeRecord(reg, `${ORIGIN}/ok?claim-past-ceiling`, { sizeBytes: 10_000 }), { maxBytes: 1000 });
+  assert.equal(ceilingOnly.error, 'claimed 10000 bytes exceeds fetch ceiling 1000');
 });
 
 test('a claim over max_bytes, once the budget is spent, is refused for the budget', async () => {
