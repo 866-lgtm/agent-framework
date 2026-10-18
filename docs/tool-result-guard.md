@@ -141,6 +141,12 @@ exhausted error retries; also an aborted direct `Agent.runInference`)
 settles its batch as `withheld` with `reason: "aborted"`, so a later turn
 neither resubmits the originals nor treats its own refusal as the guard's.
 
+An ephemeral run that leaves while its batch is still pending, however it
+leaves, settles the batch as it leaves, before its agent is deregistered,
+since nothing would settle it afterwards. The batch is `withheld` with
+`reason: "run_stalled"` when the completion watchdog ended the run as
+stalled, and otherwise with `reason: "aborted"`.
+
 If the process stops before settlement finishes, placeholders remain after
 restart; originals whose audit reached durability are still available. This is
 deliberately conservative: an interrupted submission does not establish that
