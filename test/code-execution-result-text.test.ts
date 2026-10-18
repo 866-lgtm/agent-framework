@@ -145,10 +145,14 @@ describe('code_execution result text', () => {
     assert.ok(over.length <= budget, String(over.length));
     const { tail } = cutOf(bodyOf(over, 'stderr')!);
     assert.ok(/^w+\n$/.test(tail) && longest.endsWith(tail), tail.slice(0, 20));
-    // Blank lines at the end go with the line before them.
+    // Blank lines at the end go with the line before them, LF or CRLF.
     const blanks = numbered(2000, 'tb') + lastLine + '\n\n';
     const ended = scriptEndTextWithin({ stdout, stderr: blanks, returnCode: 1 }, budget)!;
     assert.strictEqual(cutOf(bodyOf(ended, 'stderr')!, blanks).tail, `${lastLine}\n\n`);
+    const crlfLine = `ValueError: ${'v'.repeat(1500)}\r\n`;
+    const crlf = numbered(2000, 'tb') + crlfLine + '\r\n';
+    const crlfEnded = scriptEndTextWithin({ stdout, stderr: crlf, returnCode: 1 }, budget)!;
+    assert.strictEqual(cutOf(bodyOf(crlfEnded, 'stderr')!, crlf).tail, `${crlfLine}\r\n`);
   });
 
   it('gives stderr the room stdout leaves, and all of it when stdout is empty', () => {
@@ -157,6 +161,8 @@ describe('code_execution result text', () => {
     assert.ok(short.length <= 5000);
     assert.ok(short.endsWith('--- stdout ---\ndone\n'), 'a short stdout stays whole');
     assert.ok(cutOf(bodyOf(short, 'stderr')!).tail.endsWith('err 01999\n'));
+    // stderr has all the room but stdout's 5 characters, not a third of it.
+    assert.ok(bodyOf(short, 'stderr')!.length > 4900, String(bodyOf(short, 'stderr')!.length));
     const alone = scriptEndTextWithin({ stdout: '', stderr, returnCode: 1 }, 5000)!;
     assert.strictEqual(bodyOf(alone, 'stdout'), null);
     assert.ok(alone.length <= 5000 && alone.length >= 4990, String(alone.length));
@@ -203,6 +209,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       readSpill: (path: string) => Promise<string>,
       failWrites: (answer?: { success: false; error: string; isError: true; data?: unknown }) => void,
       wroteFor: (callId: string, days: string[]) => Promise<boolean>,
+      exists: (path: string) => Promise<boolean>,
     ) => Promise<void>,
   ): Promise<void> {
     const tempDir = mkdtempSync(join(tmpdir(), 'pytc-text-'));
@@ -222,6 +229,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       ...(opts.toolResultInlineMaxChars !== undefined ? { toolResultInlineMaxChars: opts.toolResultInlineMaxChars } : {}),
     });
     workspace?.initStore(framework.getStore());
+    const exists = async (path: string) => 'data' in await workspace!.readBinary(path);
     try {
       await body(
         framework,
@@ -232,11 +240,15 @@ describe('code_execution result text, through the framework (real python3)', () 
         },
         (answer = { success: false, error: 'disk full', isError: true }) => { workspace!.writeBinary = async () => answer; },
         async (callId, days) => {
+          // This path's own name for the file, and the inline cap's spill's.
           for (const day of new Set(days)) {
-            if ('data' in await workspace!.readBinary(`files/tool-results/${day}-${callId}.txt`)) return true;
+            for (const name of [`${day}-output-${callId}`, `${day}-${callId}`]) {
+              if (await exists(`files/tool-results/${name}.txt`)) return true;
+            }
           }
           return false;
         },
+        exists,
       );
     } finally {
       await framework.stop();
@@ -260,9 +272,11 @@ describe('code_execution result text, through the framework (real python3)', () 
   // exception: exit code 1, and its traceback after the error line.
   const outputTail = 'import sys\nsys.stdout.write("x" * 30000)\nsys.stderr.write("an error line\\n")\nraise SystemExit(5)';
 
-  it('a long stdout keeps stderr and the exit code in view, and the whole output goes to the tool result\'s file', async () => {
-    await withFramework({ workspace: true }, async (framework, readSpill) => {
+  it('a long stdout keeps stderr and the exit code in view, and the whole output goes to a file of its own', async () => {
+    await withFramework({ workspace: true }, async (framework, readSpill, _failWrites, _wroteFor, exists) => {
+      const days = [today()];
       const r = await run(framework, 'ce-output-tail', { code: outputTail });
+      days.push(today());
       assert.strictEqual(r.success, true, JSON.stringify(r).slice(0, 300));
       const text = textOf(r);
       // The house default cap for a caller with no agent, filled by the cut.
@@ -270,11 +284,17 @@ describe('code_execution result text, through the framework (real python3)', () 
       const { stderr } = r.structured as { stderr: string };
       assert.match(stderr, /^an error line\nTraceback \(most recent call last\):\n[\s\S]*SystemExit: 5\n$/);
       assert.ok(text.startsWith(`exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\nxxx`), text.slice(0, 400));
-      const notice = /\n\[cut to fit; the whole output \((\d+) chars\): workspace file (files\/tool-results\/\S+-ce-output-tail\.txt)\. Page with workspace--read \{"path":"files\/tool-results\/\S+","offsetChars":0,"limitChars":\d+\}; use nextOffsetChars as offsetChars until null, keeping limitChars\. Or raise the inline cap via agent_settings update tool_result_inline_max_chars\.\]$/.exec(text);
+      const notice = /\n\[cut to fit; the whole output \((\d+) chars\): workspace file (files\/tool-results\/\d{4}-\d{2}-\d{2}-output-ce-output-tail\.txt)\. Page with workspace--read \{"path":"files\/tool-results\/\S+","offsetChars":0,"limitChars":\d+\}; use nextOffsetChars as offsetChars until null, keeping limitChars\. Or raise the inline cap via agent_settings update tool_result_inline_max_chars\.\]$/.exec(text);
       assert.ok(notice, text.slice(-400));
       const whole = await readSpill(notice[2]);
       assert.strictEqual(whole, `exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\n${'x'.repeat(30_000)}\n`);
       assert.strictEqual(Number(notice[1]), whole.length);
+      // The inline cap's spill names its file without '-output', so a later
+      // spill of the cut text, at a cap lowered before storing, can't write
+      // over this one.
+      for (const day of new Set(days)) {
+        assert.strictEqual(await exists(`files/tool-results/${day}-ce-output-tail.txt`), false, day);
+      }
       // Hosts read the fields, whole, in structured.
       assert.deepStrictEqual(r.structured, { stdout: 'x'.repeat(30_000), stderr, return_code: 1 });
     });
@@ -302,8 +322,10 @@ describe('code_execution result text, through the framework (real python3)', () 
       assert.ok(text.length <= 24_000, String(text.length));
       assert.ok(text.startsWith('exit code: 1\n--- stderr ---\nan error line\nTraceback'), text.slice(0, 80));
       assert.match(text, /\n\[cut to fit; writing the whole output \(\d+ chars\) to workspace file files\/tool-results\/\S+-ce-write-fails\.txt FAILED \(disk full\); what was cut was not retained\]$/);
-      // A store that left the file's branch answers with its own words, which
-      // the notice cuts at 200 characters, as the room it left assumes.
+      // writeToolResultFile cuts a failed write's error at 200 characters,
+      // and passes a store's own words on whole only for a write on a branch,
+      // which this path never asks for. Answered so all the same, the notice
+      // cuts them at 200, as the room it left assumes.
       const said = `${'w'.repeat(200)}${'z'.repeat(100)}`;
       failWrites({ success: false, error: said, isError: true, data: { branchLeft: true } });
       const long = textOf(await run(framework, 'ce-write-left', { code: outputTail }));
@@ -329,7 +351,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       days.push(today());
       const { stderr } = r.structured as { stderr: string };
       assert.strictEqual(textOf(r), `exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\n${'x'.repeat(30_000)}\n`);
-      assert.strictEqual(await wroteFor('ce-tiny-cap', days), false, 'the inline cap\'s spill writes the file when the result is stored, once');
+      assert.strictEqual(await wroteFor('ce-tiny-cap', days), false, 'nothing is written here: the inline cap\'s spill writes its file when the result is stored');
     });
   });
 

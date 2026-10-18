@@ -6,8 +6,8 @@
  * end holds a traceback, and for a script the runner stopped, why it stopped,
  * which the runner writes on a line of its own after the script's own stderr.
  * Within a budget, each stream is cut to its head and its tail around a count
- * of what was cut, so in any budget that holds a cut of each stream, however
- * long the output, the ending stays in view.
+ * of what was cut, and stderr keeps a share of the room of its own, so however
+ * long stdout runs, it can't push the exit code or stderr's end out of view.
  */
 
 export interface ScriptEnd {
@@ -28,8 +28,8 @@ export function scriptEndText(end: ScriptEnd): string {
  * keeps up to a third of the room the streams have, or more when stdout needs
  * less, and stdout takes the rest, each cut to its head and tail. stderr's
  * tail keeps its last line whole when the line fits its room. Returns null
- * when the streams' room is under three cut markers, since stderr's third has
- * to hold a whole marker when stderr is cut.
+ * when the streams' room is under three cut markers, a simple bound that keeps
+ * stderr's third, when stderr is cut, at least its count.
  */
 export function scriptEndTextWithin(end: ScriptEnd, budget: number): string | null {
   const whole = scriptEndText(end);
@@ -79,10 +79,10 @@ function cutMiddle(text: string, keep: number, keepLastLine = false): string {
   let tailLength = left - headLength;
   if (keepLastLine) {
     // The tail keeps the last line whole, taking from the head, when the
-    // line fits; a longer one keeps its end. Blank lines at the end go with
-    // the line before them.
+    // line fits; a longer one keeps its end. Blank lines at the end, LF or
+    // CRLF, go with the line before them.
     let contentEnd = text.length;
-    while (contentEnd > 0 && text[contentEnd - 1] === '\n') contentEnd--;
+    while (contentEnd > 0 && (text[contentEnd - 1] === '\n' || text[contentEnd - 1] === '\r')) contentEnd--;
     const lastLine = text.length - (text.lastIndexOf('\n', contentEnd - 1) + 1);
     if (lastLine > tailLength && lastLine <= left) {
       tailLength = lastLine;

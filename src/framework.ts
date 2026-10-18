@@ -19470,16 +19470,19 @@ export class AgentFramework {
   /**
    * A foreground script's ending as the model reads it: whole when it fits
    * `cap`, or else cut to fit beside a notice, with the whole text written
-   * to the tool result's file, where the inline cap's spill would put it.
-   * The cut leaves room for the longest notice it could end with, so it's
-   * decided before anything is written. A cap too small to hold a cut of
-   * each stream beside that notice leaves the whole text, unwritten, to the
-   * inline cap's spill, which keeps its head.
+   * to a file of its own in the tool results folder. Its name differs from
+   * the one the inline cap's spill gives the result before the call id,
+   * which a long id can cut short, so a later spill of the cut text, as at a
+   * cap lowered before the result is stored, can't write over it. The cut
+   * leaves room for the longest notice it could end with, so it's decided
+   * before anything is written. A cap too small to hold a cut of each stream
+   * beside that notice leaves the whole text, unwritten, to the inline cap's
+   * spill, which keeps its head.
    */
   private async scriptEndResultText(end: ScriptEnd, cap: number, callId: string): Promise<string> {
     const whole = scriptEndText(end);
     if (whole.length <= cap) return whole;
-    const label = `${new Date().toISOString().slice(0, 10)}-${callId}`;
+    const label = `${new Date().toISOString().slice(0, 10)}-output-${callId}`;
     const keptIn = (path: string) =>
       `[cut to fit; the whole output (${whole.length} chars): workspace file ${path}. ${this.spillPageAdvice(path, cap)}]`;
     const writeFailed = (path: string, error: string) =>
