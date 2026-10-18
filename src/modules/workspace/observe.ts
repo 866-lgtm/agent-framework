@@ -245,6 +245,17 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
 }
 
 /**
+ * The nested mount whose directory holds `target` (mount-relative), the
+ * innermost where nested mounts nest, as #460 picks one; undefined when none
+ * does.
+ */
+export function nestedHolder(target: string, nested: readonly { dir: string; name: string }[]): { dir: string; name: string } | undefined {
+  return nested
+    .filter((n) => target === n.dir || target.startsWith(`${n.dir}/`))
+    .sort((a, b) => b.dir.length - a.dir.length)[0];
+}
+
+/**
  * Why a path is refused for what linkOnTheWay found, given where a link
  * leads (linkLeads). For a link, the link is the subject, with where it
  * leads: for a link inside the mount, its target, and for a link to a
@@ -258,17 +269,6 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
  * couldn't ask, which one, and the answer it got. Paths are spelled as the
  * tools take them, from the mount's name.
  */
-/**
- * The nested mount whose directory holds `target` (mount-relative), the
- * innermost where nested mounts nest, as #460 picks one; undefined when none
- * does.
- */
-export function nestedHolder(target: string, nested: readonly { dir: string; name: string }[]): { dir: string; name: string } | undefined {
-  return nested
-    .filter((n) => target === n.dir || target.startsWith(`${n.dir}/`))
-    .sort((a, b) => b.dir.length - a.dir.length)[0];
-}
-
 export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly { dir: string; name: string }[] = []): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
   if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${found.code})`;
