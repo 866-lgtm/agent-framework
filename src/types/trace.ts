@@ -312,7 +312,13 @@ export type TraceEvent =
       messageId?: string;
     })
   /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+   *  rendered / revoked / render-cancelled / late-render / render-failed).
+   *  A late-render whose push/render had already timed out, its fallback
+   *  materialized, is recorded by the connection's wiring rather than the
+   *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
+   *  channel-scoped subject, `channelId` instead of `subject`, carries a late
+   *  JSON-RPC error as `error` (`[code] message`, bounded), and its `eventId`
+   *  links it to the batch's render-failed. */
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
       kind: string;
@@ -630,6 +636,8 @@ export type TraceEvent =
       hadState: boolean;
       /** True when the dropped response carried a server-managed `checkpoint`. */
       hadCheckpoint: boolean;
+      /** A late JSON-RPC error, as `[code] message`, bounded. */
+      error?: string;
     })
 
   // Ops / fleet observability. Everything the framework's opsAlert() escalates
