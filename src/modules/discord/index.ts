@@ -290,11 +290,11 @@ function oncePerBody(rows: readonly StoredMessage[]): string[] {
 /** A live create on its way to the store (DiscordModule.creating). */
 interface LiveCreate {
   /** converting: the live path fetches its attachments; queued: its event
-   *  waits in the queue; handled: onProcess answered it, and the framework
-   *  writes that answer before the next Discord event reaches onProcess, or a
-   *  delete dropped it once it had converted. */
-  phase: 'converting' | 'queued' | 'handled';
-  /** A delete for the message came before its create was handled. */
+   *  waits in the queue; writing: onProcess answered it, and the store may
+   *  not show the message's row yet. */
+  phase: 'converting' | 'queued' | 'writing';
+  /** A delete for the message came before its create was handled, so no row
+   *  comes, and the entry waits for that delete to be handled. */
   deleted: boolean;
   /** The latest edit's text and attachments, from while it converted. */
   text?: string;
@@ -343,13 +343,17 @@ export class DiscordModule implements Module {
 
   // The Discord messages whose live create is on its way to the store: from
   // the moment the live path takes one up, through its conversion and the
-  // event queue, until the framework has written what onProcess answered,
-  // which it has by the next Discord event's onProcess, since its loop applies
-  // every module's answer to an event before it takes the next. A history
-  // sync stores none of them, so no message is stored twice. A delete before
-  // the create is handled drops it: nothing is stored and nobody is woken, and
-  // its entry stays until the next Discord event all the same. An edit while
-  // it converts is folded into it.
+  // event queue, until the store shows the row onProcess answered with. The
+  // framework holds a module's writes while the agent's turn is alive or the
+  // host is quiesced, and queryMessages shows a row only once it lands, so
+  // each Discord event looks for the rows still on their way. A history sync
+  // stores none of these messages, so no message is stored twice. A delete
+  // before the create is handled drops it: nothing is stored and nobody is
+  // woken. Any message's entry ends when its delete is handled, since a sync
+  // running then skips the message (noteLive) and a later one doesn't fetch
+  // it. An edit while it converts is folded into it. A create whose row never
+  // lands keeps its entry, and the sync off its message, until the module
+  // stops.
   private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -705,19 +709,15 @@ export class DiscordModule implements Module {
     // A stopped module answers nothing (stop()).
     if (!this.ctx) return {};
 
-    // By a Discord event, the framework has written every answer onProcess
-    // gave before it, so a create handled until now is in the store if its
-    // answer held a row. Only Discord events count: they come through the
-    // queue alone.
+    // Each Discord event ends the entries whose row the store shows now.
     if (event.type.startsWith('discord:')) {
-      for (const [id, live] of this.creating) if (live.phase === 'handled') this.creating.delete(id);
+      for (const [id, live] of this.creating) if (live.phase === 'writing' && this.storedRow(id)) this.creating.delete(id);
     }
 
     // Handle new Discord message
     if (event.type === 'discord:message') {
       const msg = event as DiscordMessageEvent;
       const live = this.creating.get(msg.discordMessageId);
-      if (live) live.phase = 'handled';
       // Deleted while its create waited in the queue: nothing is stored, and
       // nobody is woken by a message its author took back.
       if (live?.deleted) return {};
@@ -772,8 +772,10 @@ export class DiscordModule implements Module {
 
       // A message a history sync stored first keeps that row: the create adds
       // none, and still sets the reply context and asks for inference, since
-      // the message arrived live.
+      // the message arrived live. Either way the entry waits until a Discord
+      // event finds the message's row.
       const stored = this.storedRow(msg.discordMessageId);
+      if (live) live.phase = 'writing';
 
       // Return declarative response - framework applies all writes atomically
       return {
@@ -833,8 +835,9 @@ export class DiscordModule implements Module {
       // its delete as a copy. A row stored in shards is removed whole: the
       // framework takes out the body a shard belongs to. The message is the
       // live path's even when no row is found, so a running sync doesn't
-      // store what its fetch may still hold.
+      // store what its fetch may still hold, and that ends its entry.
       this.noteLive(del.discordMessageId);
+      this.creating.delete(del.discordMessageId);
       const rows = this.storedRows(del.discordMessageId);
       if (rows.length === 0) {
         return {};
@@ -1254,13 +1257,9 @@ export class DiscordModule implements Module {
       return;
     }
     // A delete that came meanwhile drops the create: nothing is stored,
-    // nobody is woken. Its entry stays, as handled, until the next Discord
-    // event reaches onProcess, so no sync stores the message before the
-    // delete is handled.
-    if (live.deleted) {
-      live.phase = 'handled';
-      return;
-    }
+    // nobody is woken. Its entry stays until that delete is handled, so no
+    // sync stores the message before then.
+    if (live.deleted) return;
     // An edit that came meanwhile: its text, and the blocks of the
     // attachments it left.
     if (live.text !== undefined) contentBlocks = withOwnText(contentBlocks, live.text);

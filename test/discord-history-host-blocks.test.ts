@@ -40,6 +40,7 @@ interface Harness {
   handleDiscordMessageDelete(messageId: string): void;
   syncChannelHistory(channelId: string): Promise<{ newMessages: number; editedMessages: number; deletedMessages: number }>;
   replyContexts: Map<string, { channelId: string }>;
+  creating: Map<string, unknown>;
 }
 
 const image: DiscordAttachment = { id: 'a1', filename: 'cat.png', url: 'https://cdn.example/cat.png', contentType: 'image/png', size: 2_000 };
@@ -64,7 +65,11 @@ function row(id: string, content: Block[], textFirst: boolean, timestamp = 1_000
 }
 
 /** `storeAdds`: the context's addMessage stores a row, as the store does,
- *  for tests where a later lookup must find what a sync added. */
+ *  for tests where a later lookup must find what a sync added. `hold` and
+ *  `land` play the framework's hold on a module's writes while the agent's
+ *  turn is alive: between them, an add, a sync's or a live answer's, waits
+ *  unseen by queryMessages, and `land` stores what waited, in order. Edits
+ *  and removals act at once, on stored rows, as the framework's do. */
 function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { storeAdds = false } = {}) {
   const module = new DiscordModule({ sendTyping: async () => {}, ...client } as unknown as DiscordClientInterface, { token: 't', autoTyping: false });
   const harness = module as unknown as Harness;
@@ -72,6 +77,9 @@ function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { stor
   const added: Array<{ content: Block[]; metadata: Record<string, unknown> }> = [];
   const edits: Array<{ id: string; content: Block[] }> = [];
   const removed: string[] = [];
+  let holding = false;
+  const waiting: Row[] = [];
+  const store = (row: Row) => { if (holding) waiting.push(row); else rows.push(row); };
   // As context-manager's store does, an edit or removal of a row it doesn't
   // hold throws, and so does an edit of a shard of a body.
   const held = (id: string) => {
@@ -100,8 +108,8 @@ function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { stor
     addMessage: (participant: string, content: Block[], metadata: Record<string, unknown>) => {
       added.push({ content, metadata });
       const id = `stored-new-${added.length}`;
-      if (storeAdds) rows.push({ id, participant, content, metadata: metadata as Row['metadata'], timestamp: new Date(metadata.timestamp as number) });
-      return id;
+      if (storeAdds) store({ id, participant, content, metadata: metadata as Row['metadata'], timestamp: new Date(metadata.timestamp as number) });
+      return holding ? '' : id;
     },
     editMessage: (id: string, content: Block[]) => { edit(id, content); edits.push({ id, content }); },
     removeMessage: (id: string) => { remove(id); removed.push(id); },
@@ -119,13 +127,15 @@ function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { stor
     const response = await module.onProcess(event as unknown as ProcessEvent, state);
     for (const message of response.addMessages ?? []) {
       const metadata = message.metadata as Row['metadata'];
-      rows.push({ id: `stored-${metadata.external.id}`, participant: message.participant, content: message.content as Block[], metadata, timestamp: new Date(metadata.timestamp as number) });
+      store({ id: `stored-${metadata.external.id}`, participant: message.participant, content: message.content as Block[], metadata, timestamp: new Date(metadata.timestamp as number) });
     }
     for (const change of response.editMessages ?? []) edit(change.messageId, change.content as Block[]);
     for (const id of response.removeMessages ?? []) remove(id);
     return response;
   };
-  return { module, harness, events, added, edits, removed, state, apply, rows };
+  const hold = () => { holding = true; };
+  const land = () => { holding = false; rows.push(...waiting.splice(0)); };
+  return { module, harness, events, added, edits, removed, state, apply, rows, hold, land };
 }
 
 function live(id: string, content: string, attachments: DiscordAttachment[] = []): DiscordMessageData {
@@ -645,26 +655,56 @@ test('a history sync stores nothing for a message whose live create is still con
   assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-n2', [text('with a file'), fileBlock]]]);
 });
 
-test('a history sync that writes after a live create was handled, and before the framework wrote it, stores nothing for it; by the next Discord event a sync may store one whose create never landed', async () => {
+test('a history sync stores nothing for a message whose row the framework holds, through later Discord events, and the record lets it go once the row is stored', async () => {
   const rows: Row[] = [];
   let fetched: HistoryMessage[] = [];
-  const { module, harness, events, state, apply } = setup(rows, { fetchHistory: async () => fetched }, { storeAdds: true });
-  // Handled: onProcess has answered, and the framework hasn't written it yet.
+  const { harness, events, apply, hold, land } = setup(rows, { fetchHistory: async () => fetched }, { storeAdds: true });
+  // The agent's turn is alive: the framework holds each answer's row.
+  hold();
   await harness.handleDiscordMessage(live('n3', 'late'));
-  const answer = await module.onProcess(events.shift()!, state);
-  fetched = [history('n3', 'late', 1_000, [])];
+  await harness.handleDiscordMessage(live('n4', 'later'));
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  fetched = [history('n4', 'later', 1_000, []), history('n3', 'late', 1_000, [])];
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
-  // The framework writes the answer, as it does before the next event.
-  for (const message of answer.addMessages ?? []) rows.push({ id: 'stored-n3', participant: message.participant, content: message.content as Block[], metadata: message.metadata as Row['metadata'], timestamp: new Date(1_000) });
-  assert.deepEqual(rows.map((r) => r.id), ['stored-n3']);
-  // A create whose answer never landed: once the next Discord event reaches
-  // onProcess, the framework has written all it will, and a sync stores it.
-  await harness.handleDiscordMessage(live('n4', 'lost'));
-  await module.onProcess(events.shift()!, state);
+  land();
+  assert.deepEqual(rows.map((r) => r.id), ['stored-n3', 'stored-n4']);
+  // The next Discord event finds both rows, and their entries end.
   await apply({ type: 'discord:delete', discordMessageId: 'unrelated' });
-  fetched = [history('n4', 'lost', 1_000, []), history('n3', 'late', 1_000, [])];
-  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 1, editedMessages: 0, deletedMessages: 0 });
-  assert.deepEqual(rows.map((r) => r.id), ['stored-n3', 'stored-new-1']);
+  assert.equal(harness.creating.size, 0);
+});
+
+test('a create a delete dropped keeps a history sync from storing its message until that delete is handled, though another Discord event comes first and the framework holds writes', async (t) => {
+  const rows: Row[] = [];
+  const release = heldFetch(t);
+  const { harness, events, apply, hold, land } = setup(rows, { fetchHistory: async () => [history('x6', 'withdrawn', 1_000, [])] }, { storeAdds: true });
+  hold();
+  const creating = harness.handleDiscordMessage(live('x6', 'withdrawn', [notes]));
+  await harness.handleDiscordMessage(live('x7', 'unrelated'));
+  harness.handleDiscordMessageDelete('x6');
+  release();
+  await creating;
+  // The unrelated create's event is ahead of the delete's.
+  await apply(events.shift() as unknown as Record<string, unknown>);
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  land();
+  assert.deepEqual(rows.map((r) => r.id), ['stored-x7']);
+  // Its delete ended its entry, and the next Discord event ends the other's.
+  await apply({ type: 'discord:delete', discordMessageId: 'unrelated' });
+  assert.equal(harness.creating.size, 0);
+});
+
+test('a delete handled while its create still converts ends the record\'s entry, and the create stores nothing once it has converted', async (t) => {
+  const rows: Row[] = [];
+  const release = heldFetch(t);
+  const { harness, events, apply } = setup(rows);
+  const creating = harness.handleDiscordMessage(live('x8', 'gone at once', [notes]));
+  harness.handleDiscordMessageDelete('x8');
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  assert.equal(harness.creating.size, 0);
+  release();
+  await creating;
+  assert.deepEqual([events, rows], [[], []]);
 });
 
 test('of a message stored twice, a live edit and a history sync both change the first row, and a live delete or a sync\'s delete takes every row', async () => {
