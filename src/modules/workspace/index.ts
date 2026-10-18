@@ -1943,10 +1943,10 @@ export class WorkspaceModule implements Module {
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
    * and the names its answers give are disk's, except that a path that
-   * names a workspace entry exactly keeps that spelling, unless that would
-   * take it out of a nested mount's directory that holds it as disk spells
-   * it. The workspace's entries (entriesOf) stand in for disk where it has
-   * nothing yet, so a draft has one name too.
+   * names a workspace entry exactly keeps that spelling. The workspace's
+   * entries (entriesOf) stand in for disk where it has nothing yet, so a
+   * draft has one name too. Neither applies to a path that disk's spelling
+   * puts in a nested mount's directory.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
    * calling this, since this awaits disk. The entries are read when the
@@ -1966,10 +1966,10 @@ export class WorkspaceModule implements Module {
    * A mount's entries on the current branch, as diskSpelling reads them when
    * it does, whether its root folds case as the last start read it (false
    * before the first), and which nested mount's directory holds a path, by
-   * holderOf, as the nested-mount checks read it. diskSpelling keeps a path
-   * in disk's spelling where the entries' spelling would take it out of the
-   * nested mount that holds disk's, so the checks refuse what they would
-   * refuse without the entries.
+   * holderOf, as the nested-mount checks read it. diskSpelling keeps disk's
+   * spelling of a path that lies in a nested mount's directory as disk
+   * spells it, so the checks refuse at least what they would refuse without
+   * the entries.
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();

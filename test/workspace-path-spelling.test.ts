@@ -8,10 +8,10 @@
 // one needs it to fold normalization, and three to fold ß with ss, ſ with s
 // and ς with σ. A draft not yet on disk takes the spelling of a workspace
 // entry it equals in simple case folding, on a disk that folds case, and a
-// path that names an entry exactly keeps its spelling, except where disk's
-// spelling puts it in a nested mount's directory and the entry's doesn't.
-// Four run only where the disk tells case apart, and those about starting
-// and stopping run anywhere.
+// path that names an entry exactly keeps its spelling. Neither applies where
+// disk's spelling puts the path in a nested mount's directory. Four run
+// only where the disk tells case apart, and those about starting and
+// stopping run anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -645,7 +645,9 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
     assert.equal(result.success, false, input.path);
     assert.match(String(result.error), new RegExp(`lies in mount "${mount}"`), input.path);
   };
-  // Disk's spelling puts each in a nested mount's directory, and the
+  // Disk's spelling puts each in a nested mount's directory: disk lists
+  // Inner as inner and the NFD name as NFC, and has nothing for proj, so
+  // the paths through it keep the configured spelling they're given. The
   // entry's spelling wouldn't.
   await refusedAs('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 }, 'inner');
   await refusedAs('write', { path: 'outer/proj/inner/x.txt', content: 'x\n' }, 'deep');

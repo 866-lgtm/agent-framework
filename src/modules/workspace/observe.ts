@@ -505,17 +505,21 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * where the directory reached folds case, each segment disk has nothing for
  * takes the name of an entry it equals in simple case folding (entryName),
  * as the disk will once that entry is written: a second draft spelled in
- * another case is the first one. The entries' spelling never takes a path
- * out of the nested mount whose directory holds it as disk spells it, by the
- * nested-mount checks' own reading (`holder`): there the path keeps disk's
- * spelling, which they refuse as that mount's. The root's folding is read at
- * start (`rootFoldsCase`), and a directory beneath it is taken to fold as
- * the directory holding it did when its name was looked up with its case
- * flipped, or, for a name with no letter to flip, as the nearest directory
- * above that told, so the step reads nothing more of disk for this.
+ * another case is the first one. None of this applies where disk's spelling
+ * puts the path in a nested mount's directory, by the nested-mount checks'
+ * own reading (`holder`): there the path keeps disk's spelling, so they
+ * refuse at least what they refuse without the entries. The root's folding
+ * is read at start (`rootFoldsCase`), and a directory beneath it is taken to
+ * fold as the directory holding it did when its name was looked up with its
+ * case flipped, or, for a name with no letter to flip, as the nearest
+ * directory above that told, so the step reads nothing more of disk for
+ * this.
  */
 export async function diskSpelling(root: string, relativePath: string, entries?: WorkspaceEntries): Promise<string> {
   if (relativePath === '' || isAbsolute(relativePath)) return relativePath;
+  // A path that names an entry exactly keeps its spelling, read before the
+  // walk awaits disk, so the entries' walk needn't run for it.
+  const exact = entries?.has(relativePath) ?? false;
   // The path as disk spells it, and as the workspace's entries spell it.
   const segments = relativePath.split('/');
   const spelled = [...segments];
@@ -535,7 +539,7 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     // The nearest directory, from the one reached up, that told.
     let folds: boolean | null = null;
     for (let k = folding.length - 1; folds === null && k >= 0; k--) folds = folding[k]!;
-    if (!entries || !folds) return;
+    if (!entries || exact || !folds) return;
     let prefix = names.length === 0 ? '' : `${names.join('/')}/`;
     const paths = entries.under(prefix);
     for (let j = from; j < spelled.length; j++) {
@@ -581,10 +585,8 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     folding.push(caseFolds);
   }
   const asDisk = segments.join('/');
-  if (!entries) return asDisk;
-  const asEntries = entries.has(relativePath) ? relativePath : spelled.join('/');
-  const holder = entries.holder(asDisk);
-  return holder === undefined || entries.holder(asEntries) === holder ? asEntries : asDisk;
+  if (!entries || entries.holder(asDisk) !== undefined) return asDisk;
+  return exact ? relativePath : spelled.join('/');
 }
 
 // ===========================================================================
