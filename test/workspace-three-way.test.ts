@@ -2605,6 +2605,32 @@ describe("a file's mode is kept with its bytes", () => {
     });
   }
 
+  test('an autoMaterialize edit_many that disk takes in part notes each file it took at the mode disk had, as its success answer does', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ autoMaterialize: true });
+    env.writeDisk('a.sh', 'echo a\n');
+    chmodSync(env.disk('a.sh'), 0o644);
+    env.writeDisk('linked.txt', 'shared\n');
+    await call(m, 'sync', {});
+    // A file with other hard links isn't written, so its push is refused.
+    linkSync(env.disk('linked.txt'), env.disk('linked-too.txt'));
+    const e = env.store.treeGet(TREE, 'a.sh')!;
+    env.store.treeSet(TREE, 'a.sh', { blobHash: e.blobHash, size: e.size, mode: 0o100755 });
+    const restore = await refuseChmod();
+    let error: string;
+    try {
+      error = await refused(m, 'edit_many', { edits: [
+        { path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' },
+        { path: 'work/linked.txt', oldString: 'shared', newString: 'SHARED' },
+      ] });
+    } finally {
+      restore();
+    }
+    assert.equal(env.readDisk('a.sh'), 'echo a v2\n');
+    assert.equal(modeOf(env, 'a.sh'), 0o644, "disk's mode kept");
+    assert.match(error, /\n\nDisk took 1 of the call's 2 files\. This file's push didn't complete:\n\nwork\/linked\.txt: not written: a file with other hard links[^\n]*\n\nwork\/a\.sh: written, its mode left at 0644: the kernel refused the chmod, so the workspace's \(0755\) isn't given, and a sync takes disk's mode in\.$/);
+  });
+
   test("an autoMaterialize write whose narrowing the kernel refuses fails, saying why and from which mode to which, in the write tools' frame", async (t) => {
     const env = new Env(t);
     const m = await env.open({ autoMaterialize: true });

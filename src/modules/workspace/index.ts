@@ -1656,10 +1656,13 @@ export class WorkspaceModule implements Module {
    * (agent-framework #277).
    *
    * A write whose tree entry is set but that then fails returns success
-   * false with `data: { inChronicle: true }`: its copy on disk was refused, or
+   * false with `data: { inChronicle: true }`: its copy on disk was refused,
+   * the store failed after recording the entry, which skips the push, or
    * something after the entry (recording its intent, the event, the push)
    * threw. The workspace's tools read the file from the tree, so it is there
-   * for them, on the branch that was current when the entry was set.
+   * for them, on the branch that was current when the entry was set. A set
+   * that threw and couldn't be read back throws, saying that whether the
+   * entry is set isn't known.
    */
   async writeBinary(
     mountPrefixedPath: string,
@@ -1708,7 +1711,12 @@ export class WorkspaceModule implements Module {
           : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${answer.refused}.`;
       } catch (error) {
         if (!committed) throw error;
-        failure = `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
+        // As write words it: a store that failed after recording the file
+        // skipped its push, so on a mount that pushes, disk lacks it.
+        failure = error instanceof StoredThenFailed
+          ? `Stored "${mountPrefixedPath}" in Chronicle, but the store failed after recording it: ${error.message}.`
+            + (error.pushes ? " Its push to disk didn't run, so disk lacks the file until a materialize of the path writes it." : '')
+          : `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
       }
       if (failure !== null) {
         // The file is in the Chronicle tree, where the workspace's tools read
@@ -2830,8 +2838,10 @@ export class WorkspaceModule implements Module {
             problems.push(...planned.problems.map((problem) => ({ ...problem, path: target.path })));
             continue;
           }
-          // The planner refuses a file it would take past the limit before
-          // building it, from the least its bytes can be.
+          // The planner refuses a file its counts take past the limit before
+          // building it, from the least its bytes can be; one it built past
+          // the limit, as its CRs or multi-byte characters can take it, is
+          // refused here.
           if ('tooLarge' in planned || planned.plan.bytes.length > maxSize) {
             const size = 'tooLarge' in planned ? `at least ${planned.tooLarge.toLocaleString('en-US')}` : planned.plan.bytes.length.toLocaleString('en-US');
             problems.push({
@@ -2859,7 +2869,7 @@ export class WorkspaceModule implements Module {
           path: target.relativePath,
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
         })), () => { committed = true; });
-        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { refused }, maxChars);
+        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { refused, modeKept }, maxChars);
         return {
           success: true,
           data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
@@ -2892,7 +2902,8 @@ export class WorkspaceModule implements Module {
         };
       }
       // The commit sets every entry in one record or none, and a set that
-      // threw was read back, so nothing is stored.
+      // threw was read back, so nothing is stored; or every change was one
+      // the tree already held, which leaves the tree as it was either way.
       if (tool === 'edit_many') return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
       throw error;
     }
@@ -2921,11 +2932,12 @@ export class WorkspaceModule implements Module {
       // two spellings in one call two plans of one file. Its plain spelling is
       // where it resolves in the mount, as the containment check resolves it.
       // A path whose part in the mount starts with a separator resolves
-      // outside it, and parsePath refuses that first.
+      // outside it, and parsePath refuses that first. One that resolves to
+      // the mount's root, its bare name included, names no file.
       const root = resolve(where.mount.config.path);
       const plain = relative(root, resolve(root, where.relativePath)).split(sep).join('/');
-      if (where.relativePath !== '' && plain !== where.relativePath) {
-        if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file.`);
+      if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file.`);
+      if (plain !== where.relativePath) {
         const named = `${where.mount.config.name}/${plain}`;
         return unusable(`${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from ${named}, the same file on disk; name it ${named}.`);
       }
@@ -2957,13 +2969,15 @@ export class WorkspaceModule implements Module {
    * what is stored, which must not be sent again: a second call can apply
    * those edits twice. edit's is the answer write and delete give, one path's;
    * edit_many's lists the files disk refused, each with its push's reason,
-   * within `maxChars`, and never says to send the call again.
+   * notes each file disk took with its mode left as disk had it, as the
+   * success answer's `modeKept` does, within `maxChars`, and never says to
+   * send the call again.
    */
   private editsStoredButUnfinished(
     tool: EditTool,
     targets: EditTarget[],
     applied: Map<EditTarget, string | null>,
-    outcome: { refused: Map<string, string> } | { threw: string } | { storeFailed: string; pushes: boolean },
+    outcome: { refused: Map<string, string>; modeKept: Map<string, string> } | { threw: string } | { storeFailed: string; pushes: boolean },
     maxChars: number,
   ): ToolResult {
     if (tool === 'edit') {
@@ -2993,7 +3007,13 @@ export class WorkspaceModule implements Module {
     } else {
       head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}. ls shows each path's state.`;
     }
-    const notes = targets.map((target) => applied.get(target)).filter((note): note is string => !!note);
+    const kept = 'modeKept' in outcome
+      ? targets.flatMap((target) => {
+        const reason = outcome.modeKept.get(target.relativePath);
+        return reason === undefined ? [] : [`${target.path}: ${reason}.`];
+      })
+      : [];
+    const notes = [...kept, ...targets.map((target) => applied.get(target)).filter((note): note is string => !!note)];
     return { success: false, isError: true, error: fitted(head, parts, notes, maxChars, 'stored') };
   }
 

@@ -113,10 +113,10 @@ test('a replaceAll that would grow its file past maxBytes is refused in a small 
   assert.deepEqual(JSON.parse(child.stdout), { tooLarge: 600_000_001 });
 });
 
-test("edits whose asks past what a refusal shows come to more than the text's characters are named as crowded", () => {
+test("edits whose asks past what a refusal shows come to more than the text is long are named as crowded", () => {
   const text = `${'x'.repeat(100)}\n`;
-  // Three edits that each find the 100 they ask for: 300 between them in 101
-  // characters, so some overlap.
+  // Three edits that each find the 100 they ask for: 300 between them in a
+  // text 101 UTF-16 code units long, its line ends read as LF, so some overlap.
   assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 100)]),
     [{ kind: 'crowded', edits: [0, 1, 2], found: 300, length: 101 }]);
   // One that finds fewer than it asks for is named as it always is, and the
@@ -124,8 +124,8 @@ test("edits whose asks past what a refusal shows come to more than the text's ch
   const [count] = problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]);
   assert.deepEqual(count, { ...count, kind: 'count', edit: 1, found: 100, expected: 150, overlapping: false });
   assert.equal(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]).length, 1);
-  // Where the rest still find more than the text's characters, their overlap
-  // is named beside the count.
+  // Where the rest still find more than the text is long, their overlap is
+  // named beside the count.
   assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 150)]).map((problem) => problem.kind), ['count', 'crowded']);
   // Asks that fit past what a refusal shows are matched as before: a count
   // that differs is named, and two edits of one text clash.

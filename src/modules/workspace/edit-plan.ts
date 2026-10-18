@@ -584,10 +584,13 @@ export function planFile(
   for (const clash of clashes) problems.push({ kind: 'clash', edits: clash.edits, line: lineAt.get(clash.at)!, same: clash.same });
   if (problems.length) return { problems };
 
-  // The new text's length in UTF-16 code units is known from the counts, and
-  // its UTF-8 bytes are at least that many (each code unit takes one or
-  // more), so a file the edits take past maxBytes is refused before a text
-  // that could run to gigabytes is built.
+  // The new text's length in UTF-16 code units, its line ends read as LF, is
+  // known from the counts, and its UTF-8 bytes are at least that many (each
+  // code unit takes one or more, and a CRLF file's CRs only add), so a file
+  // the edits take past maxBytes is refused before a text that could run to
+  // gigabytes is built. One that this floor leaves within it but its CRs or
+  // its multi-byte characters take past it is built, no longer than twice
+  // maxBytes in code units, and its caller refuses it by its bytes.
   const leastBytes = applied.reduce((length, { spec, count }) => length + count * (spec.newText.length - spec.oldText.length), value.length + (file.bom ? 3 : 0));
   if (leastBytes > maxBytes) return { tooLarge: leastBytes };
 

@@ -23740,8 +23740,10 @@ export class AgentFramework {
           try {
             result = await workspace.writeBinary(destination, bytes, image.mediaType);
           } catch (error) {
-            // Thrown before its tree entry was set; the images before it
-            // are saved, and the failure says so, as a returned one does.
+            // A throw leaves the file's tree entry as it was, unless its
+            // error says that whether the entry changed isn't known
+            // (writeBinary); the images before it are saved, and the
+            // failure says so, as a returned one does.
             failed(error);
             return;
           }

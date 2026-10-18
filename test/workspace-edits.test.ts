@@ -449,7 +449,7 @@ test('every entry is set in one record: a call that fails after it says every ed
 });
 
 test('a store that throws after recording the edits is read back: the answer says they are stored, and one it can\'t read back says it can\'t tell', async (t) => {
-  const { store, call, stored, file } = setup(t);
+  const { store, workspace, call, stored, file } = setup(t);
   await file('a.txt', 'alpha\n');
   await file('b.txt', 'beta\n');
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
@@ -496,6 +496,13 @@ test('a store that throws after recording the edits is read back: the answer say
     assert.equal(errorOf(await call('edit', { path: 'work/a.txt', oldString: 'ALPHA', newString: 'alpha' })),
       'Whether the edit of "work/a.txt" is stored isn\'t known: the store failed as it set it (injected set failure), '
       + 'and reading it back failed too (injected read failure). Read the file before sending the edit again: a second edit can apply the change twice.');
+    // writeBinary throws it, as its peer callers take a throw: inChronicle
+    // would tell them the file is there, which isn't known.
+    failed = false;
+    await assert.rejects(workspace.writeBinary('work/a.txt', Buffer.from('alpha\n'), 'text/plain'), {
+      name: 'CommitUnknownError',
+      message: "injected set failure; reading its entries back failed too (injected read failure), so whether the change is stored isn't known",
+    });
   } finally {
     delete s.treeBatch;
     delete s.treeSet;
@@ -503,21 +510,20 @@ test('a store that throws after recording the edits is read back: the answer say
   }
   assert.equal(await stored('a.txt'), 'ALPHA\n');
 
-  // A path whose entry already held its new bytes isn't read back, so it
-  // can't make an unrecorded batch read as stored.
+  // A change the tree already holds reads back the same whether or not the
+  // set recorded it, so a call whose every change the tree holds already
+  // answers the store's failure as its own: the tree is as it was either way.
   await file('q.txt', 'it’s\n');
-  s.treeBatch = () => { throw new Error('injected batch failure'); };
+  s.treeSet = () => { throw new Error('injected set failure'); };
   try {
     assert.equal(errorOf(await call('edit_many', {
-      edits: [
-        // Matched with quotes treated as equal, this edit leaves the file's bytes as they were.
-        { path: 'work/q.txt', oldString: "it's", newString: 'it’s' },
-        { path: 'work/a.txt', oldString: 'ALPHA', newString: 'alpha' },
-      ],
-    })), 'The edit_many call stored none of its edits: injected batch failure');
+      // Matched with quotes treated as equal, this edit leaves the file's bytes as they were.
+      edits: [{ path: 'work/q.txt', oldString: "it's", newString: 'it’s' }],
+    })), 'The edit_many call stored none of its edits: injected set failure');
   } finally {
-    delete s.treeBatch;
+    delete s.treeSet;
   }
+  assert.equal(await stored('q.txt'), 'it’s\n');
   assert.equal(await stored('a.txt'), 'ALPHA\n');
 });
 
@@ -557,7 +563,12 @@ test('an edit names its path plainly: a path with an empty, "." or ".." segment 
   for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/', 'work/../mount/sub/b.txt']) {
     assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), refusal(path));
   }
-  assert.equal(errorOf(await call('edit', { path: 'work/.', oldString: 'one', newString: 'ONE' })), 'work/. names the root of mount "work", which isn\'t a file.');
+  // Every spelling of the mount's root, its bare name included, names no file.
+  for (const path of ['work', 'work/', 'work/.', 'work/sub/..']) {
+    assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), `${path} names the root of mount "work", which isn't a file.`);
+  }
+  assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/', oldString: 'one', newString: 'ONE' }] })),
+    'The edit_many call stored none of its edits: 1 problem.\n\nedit 1: work/ names the root of mount "work", which isn\'t a file.');
   // Dots inside a name are a plain spelling.
   for (const name of ['..b.txt', 'b.', 'a..b']) {
     const error = errorOf(await call('edit', { path: `work/sub/${name}`, oldString: 'one', newString: 'ONE' }));
@@ -575,7 +586,7 @@ test('an edit names its path plainly: a path with an empty, "." or ".." segment 
   assert.deepEqual(store.treeList(treeStateId, null).map((entry) => entry.path), ['sub/b.txt']);
 });
 
-test("edits that find more occurrences between them than the file has characters are refused as crowded", async (t) => {
+test("edits that find more occurrences between them than the file's text is long are refused as crowded", async (t) => {
   const { call, stored, file } = setup(t);
   await file('x.txt', `${'x'.repeat(100)}\n`);
   assert.equal(errorOf(await call('edit_many', {

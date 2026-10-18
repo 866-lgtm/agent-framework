@@ -218,6 +218,14 @@ test('a write, edit or delete whose store throws after recording it says the cha
     armed = true;
     assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
       'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+    // writeBinary's peer callers read inChronicle as the file being there.
+    armed = true;
+    assert.deepEqual(await workspace.writeBinary('work/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream'), {
+      success: false,
+      isError: true,
+      error: 'Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28).',
+      data: { inChronicle: true },
+    });
     assert.equal(armed, false);
   } finally {
     delete s.treeSet;
@@ -309,22 +317,32 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
     assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
       `The deletion of "work/d.txt" is stored in the workspace, so don't send it again. ${failed}`
       + "Its push to disk didn't run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.");
+    armed = true;
+    assert.deepEqual(await workspace.writeBinary('work/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream'), {
+      success: false,
+      isError: true,
+      error: `Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28). `
+        + "Its push to disk didn't run, so disk lacks the file until a materialize of the path writes it.",
+      data: { inChronicle: true },
+    });
     assert.equal(armed, false);
   } finally {
     delete s.treeSet;
     delete s.treeRemove;
   }
   assert.equal(disk('w.txt'), null);
+  assert.equal(disk('b.bin'), null);
   assert.equal(disk('e.txt')!.toString(), 'line\n');
   assert.equal(disk('d.txt')!.toString(), 'doomed\n');
   // As each answer says, a materialize of the path takes the change to disk.
-  for (const path of ['work/w.txt', 'work/e.txt']) {
+  for (const path of ['work/w.txt', 'work/b.bin', 'work/e.txt']) {
     const result = await call('materialize', { path });
     assert.equal(result.success, true, result.error);
   }
   const deleted = await call('materialize', { path: 'work/d.txt', applyDeletions: true });
   assert.equal(deleted.success, true, deleted.error);
   assert.equal(disk('w.txt')!.toString(), 'new\n');
+  assert.deepEqual([...disk('b.bin')!], [0, 1, 2]);
   assert.equal(disk('e.txt')!.toString(), 'line, edited\n');
   assert.equal(disk('d.txt'), null);
 
