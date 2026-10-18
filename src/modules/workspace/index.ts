@@ -3169,16 +3169,16 @@ export class WorkspaceModule implements Module {
    * stored: edit names its first problem, and edit_many every problem found.
    *
    * Each edit's own input is checked first, and each path's mount. A problem
-   * there refuses edit at once, before anything is read, and edit_many when
-   * its edits name more than one mount, which no one pass settles. Otherwise
-   * edit_many goes on to settle and plan the rest, so its one refusal names
-   * the problems it finds; the settling is what a read or a listing of its
-   * files would take in from disk, and the refusal says what it took in. A
-   * failure before the commit sets the entries stores none of them, and
-   * edit_many's answer to it says so. A store that throws as it sets them is
-   * read back (commitToolChanges), so the answer says they're stored where
-   * its record landed, and that it can't tell where they couldn't be read
-   * back.
+   * there refuses edit at once, before any file's text is read, and edit_many
+   * when its edits name more than one mount, which no one pass settles.
+   * Otherwise edit_many goes on to settle and plan the rest, so its one
+   * refusal names the problems it finds; the settling is what a read or a
+   * listing of its files would take in from disk, and the refusal says what
+   * it took in. A failure before the commit sets the entries stores none of
+   * them, and edit_many's answer to it says so. A store that throws as it
+   * sets them is read back (commitToolChanges), so the answer says they're
+   * stored where its record landed, and that it can't tell where they
+   * couldn't be read back.
    * Under the mount's turn, one pass settles every path with disk, by the
    * rule a listing uses, so the edits apply to what disk now holds. That pass
    * is the only step that awaits before the commit: every file is then read,
@@ -3231,11 +3231,13 @@ export class WorkspaceModule implements Module {
       }
       if (problems.length === found) specs.set(index, spec);
     }
+    // edit names its first problem, so one in its input refuses it before
+    // its path is looked up on disk.
+    if (tool === 'edit' && problems.length) return refuse(problems);
 
-    // Each path in its mount, as disk spells it, before anything is read.
-    // Edits of one stored path are one file, planned once from one text,
-    // whatever path named it, and named as disk spells it. edit's refusal
-    // names its first problem, its input's before its path's.
+    // Each path in its mount, as disk spells it, before any file's text is
+    // read. Edits of one stored path are one file, planned once from one
+    // text, whatever path named it, and named as disk spells it.
     const parsed = new Map<string, { mount: MountState; relativePath: string; path: string } | Extract<EditProblem, { kind: 'file' }>>();
     const targets = new Map<string, EditTarget>();
     const mounts = new Map<string, MountState>();
@@ -3267,6 +3269,10 @@ export class WorkspaceModule implements Module {
     let committed = false;
     // What each file's settling took in, for a receipt.
     const applied = new Map<EditTarget, string | null>();
+    // The conflict each file's settling found, on a mount that doesn't push:
+    // the success answer names it, and so does the answer to a store that
+    // failed after recording the edits, which stand as on a success.
+    const conflicts = new Map<EditTarget, string>();
     try {
       return await this.withMount(mount, async (): Promise<ToolResult> => {
         // As every file tool's pass does, it names the paths it acts on, so a
@@ -3304,7 +3310,9 @@ export class WorkspaceModule implements Module {
           // completed met none: unforced, it stops at a conflict, so the edits
           // made the two copies agree, which settles it, or there was none.
           // Edits stored that couldn't finish leave it to the push's reason,
-          // which names the conflict, or to ls, which that answer points to.
+          // which names the conflict, or to ls, which that answer points to
+          // when the rest of the call failed; where the store failed after
+          // recording them, the answer names it as the success does.
           // What a sync does follows what disk holds now, whatever kind the
           // conflict was recorded as: where disk has no copy, it takes the
           // deletion; where disk has one, it keeps disk's copy and gives up
@@ -3360,7 +3368,9 @@ export class WorkspaceModule implements Module {
           if (!target.specs.length) continue;
           const planned = planFile(file, blob, target.specs, hints, maxSize);
           if ('problems' in planned) {
-            problems.push(...planned.problems.map((problem) => ({ ...problem, path: target.path })));
+            // One at a time: a call of many edits can have more problems
+            // than a spread passes as arguments.
+            for (const problem of planned.problems) problems.push({ ...problem, path: target.path });
             continue;
           }
           // The planner refuses a file its counts take past the limit before
@@ -3387,6 +3397,8 @@ export class WorkspaceModule implements Module {
             backOnDisk,
             conflictNote: pushes ? null : conflictNote(tool === 'edit' || target.edits.length === 1 ? 'is in' : 'are in'),
           });
+          const conflicted = plans.at(-1)!.conflictNote;
+          if (conflicted !== null) conflicts.set(target, conflicted);
         }
         if (problems.length) return refuse(problems, notes);
 
@@ -3394,7 +3406,7 @@ export class WorkspaceModule implements Module {
           path: target.relativePath,
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
         })), () => { committed = true; });
-        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { refused, modeKept }, maxChars);
+        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, { refused, modeKept }, maxChars);
         return {
           success: true,
           data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
@@ -3408,7 +3420,7 @@ export class WorkspaceModule implements Module {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (committed) {
-        return this.editsStoredButUnfinished(tool, [...targets.values()], applied, error instanceof StoredThenFailed
+        return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, error instanceof StoredThenFailed
           ? { storeFailed: message, pushes: error.pushes }
           : { threw: message }, maxChars);
       }
@@ -3436,11 +3448,12 @@ export class WorkspaceModule implements Module {
 
   /**
    * Where an edit's path is in its mount, or why the call can't edit it: a
-   * path no mount holds, or one a nested mount holds (parseFilePath), a path
-   * that names its mount's root, one not spelled plainly, a read-only mount,
-   * or for edit_many a generated file. edit's generated file is refused
-   * before it gets here, by the same rule (handleToolCall checks a call's
-   * `path`, which edit_many's input lacks).
+   * path no mount holds, one outside its mount or holding a lone surrogate
+   * (parsePath), one a nested mount holds or that leads into one through a
+   * link (parseFilePath), a path that names its mount's root, one not spelled
+   * plainly, a read-only mount, or for edit_many a generated file. edit's
+   * generated file is refused before it gets here, by the same rule
+   * (handleToolCall checks a call's `path`, which edit_many's input lacks).
    */
   private async editablePath(
     tool: EditTool,
@@ -3499,18 +3512,23 @@ export class WorkspaceModule implements Module {
    * edit_many's lists the files disk refused, each with its push's reason,
    * notes each file disk took with its mode left as disk had it, as the
    * success answer's `modeKept` does, within `maxChars`, and never says to
-   * send the call again.
+   * send the call again. Where the store failed after recording the edits,
+   * which stand as on a success, it names each conflict the success answer
+   * would (`conflicts`, found only where the mount doesn't push).
    */
   private editsStoredButUnfinished(
     tool: EditTool,
     targets: EditTarget[],
     applied: Map<EditTarget, string | null>,
+    conflicts: Map<EditTarget, string>,
     outcome: { refused: Map<string, string>; modeKept: Map<string, string> } | { threw: string } | { storeFailed: string; pushes: boolean },
     maxChars: number,
   ): ToolResult {
+    const conflictOf = (target: EditTarget) => ('storeFailed' in outcome ? conflicts.get(target) ?? null : null);
     if (tool === 'edit') {
       const [target] = targets;
-      return storedButUnfinished('edit', target!.path, 'refused' in outcome ? { refused: outcome.refused.get(target!.relativePath)! } : outcome, applied.get(target!) ?? null);
+      const note = [applied.get(target!) ?? null, conflictOf(target!)].filter((text): text is string => text !== null).join(' ');
+      return storedButUnfinished('edit', target!.path, 'refused' in outcome ? { refused: outcome.refused.get(target!.relativePath)! } : outcome, note || null);
     }
     const stored = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
     // The head is never cut, so what stands for the whole call goes in it,
@@ -3541,7 +3559,10 @@ export class WorkspaceModule implements Module {
         return reason === undefined ? [] : [`Disk took ${target.path}: ${reason}.`];
       })
       : [];
-    const notes = [...kept, ...targets.map((target) => applied.get(target)).filter((note): note is string => !!note)];
+    const notes = [
+      ...kept,
+      ...targets.flatMap((target) => [applied.get(target) ?? null, conflictOf(target)]).filter((note): note is string => !!note),
+    ];
     return { success: false, isError: true, error: fitted(head, parts, notes, maxChars, 'stored') };
   }
 

@@ -121,7 +121,6 @@ test('a read, write, edit and delete spelled in another case act on disk\'s file
     ] });
     assert.deepEqual((many.data as { files: Array<{ path: string; edits: number[] }> }).files.map((f) => [f.path, f.edits]), [['work/src/b.ts', [1, 2]]]);
     assert.equal(readFileSync(join(dir, 'src', 'b.ts'), 'utf8'), 'export const c = 4;\n');
-    await call('edit', { path: 'work/src/b.ts', oldString: 'export const c = 4;', newString: 'export const b = 3;' });
 
     const listed = await call('ls', { path: 'work', recursive: true });
     assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts', 'src/b.ts']);

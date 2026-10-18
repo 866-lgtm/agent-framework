@@ -50,6 +50,12 @@ test('hasBom finds a UTF-8 byte order mark at the start alone', () => {
   assert.equal(hasBom(Buffer.from([0xef, 0xbb, 0xbf, 0x61])), true);
   assert.equal(hasBom(Buffer.from([0xef, 0xbb])), false);
   assert.equal(hasBom(Buffer.from([0x61, 0xef, 0xbb, 0xbf])), false);
+  // A byte off the mark at any one of its three places is no mark.
+  for (const at of [0, 1, 2]) {
+    const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x61]);
+    bytes[at] ^= 1;
+    assert.equal(hasBom(bytes), false, `byte ${at} changed`);
+  }
 });
 
 test('jsonLength counts a string as JSON.stringify writes it', () => {
