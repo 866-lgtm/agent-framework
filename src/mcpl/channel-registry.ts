@@ -42,6 +42,7 @@ import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { readSkipReplyWake } from './skip-reply-wake.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -376,8 +377,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
           type: 'number',
           description:
             'Optional self-wake: if nothing else wakes you first, you wake again after this ' +
-            'many seconds (1 = go again almost immediately; clamped to 1–3600). Any other ' +
-            'wake before then cancels it. Omit to stay idle until the next external wake.',
+            'many seconds, from 1 to 3600; a larger number waits 3600 (1 = go again almost ' +
+            'immediately). Any other wake before then cancels it. Omit to stay idle until the ' +
+            'next external wake.',
         },
       },
       required: [],
@@ -1375,7 +1377,7 @@ export class ChannelRegistry {
         return this.handleToolJournal(input as { content?: string });
 
       case 'skip_reply':
-        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: number });
+        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: unknown });
 
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
@@ -2892,14 +2894,15 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
-    // EventGate) BEFORE this dispatch. Without a gate, a positive timer request
-    // is refused before this successful end-turn handler is reached.
-    const wakeSecs = Number(input.wake_in_seconds);
-    const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
-      ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))
-      : undefined;
+    // EventGate) BEFORE its dispatch reaches this handler, from the same
+    // reading, and the framework refuses a wake the host can't set before
+    // dispatching. A caller of this registry's handleChannelToolCall
+    // (AgentFramework.channels) goes past both, so its note names a wake
+    // nothing armed.
+    const wake = readSkipReplyWake(input);
+    const selfWake = wake.kind === 'wake' ? wake.seconds : undefined;
     return {
       success: true,
       // The note says "ended the turn" — make it TRUE. Without endTurn the
