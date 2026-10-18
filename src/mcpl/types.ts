@@ -386,7 +386,10 @@ export interface McplServerConfig {
    * stops reading its stdin without closing it: the host's writes are
    * buffered, no error is raised, and the connection stays up. This is the
    * timeout of every request that names none; the handshake's initialize has
-   * its own. Set 0 to disable. Default: 60000 (60 seconds).
+   * its own. Set 0 to disable, except for channels/publish and the
+   * channels/open a delivery may send first, which keep the 60 s default: a
+   * publish's outcome is reported to the resident and recorded for its
+   * draft, so it must end. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 
@@ -416,7 +419,10 @@ export interface McplServerConfig {
    * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
    * `disabledTools` use the bare server-side names.
    *
-   * Must not collide with any module name or another server's prefix.
+   * Must not equal any module name or another server's prefix, nor meet
+   * another server's prefix: two prefixes meet when one is the other
+   * followed by `-`, or begins with the other followed by `--`, as `foo-`
+   * and `foo--bar` each meet `foo` (prefixesMeet, #265).
    */
   toolPrefix?: string;
 

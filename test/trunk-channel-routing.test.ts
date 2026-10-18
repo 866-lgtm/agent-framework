@@ -160,6 +160,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -217,6 +218,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -282,6 +284,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
       stopAll: () => {},
@@ -300,6 +303,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       stopAll: () => {},
@@ -317,6 +321,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
       stopAll: () => {},
     };
@@ -340,6 +345,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
       getDescriptor: (id: string) => ({ label: labels[id] }),
+      getChannelLabel: (_serverId: string, id: string) => labels[id],
       stopAll: () => {},
     };
     const textOf = () =>
