@@ -186,6 +186,24 @@ test('third-party origin refused (v1 policy: dialed origin only)', async () => {
   assert.equal(out.remedy, NOTHING_TO_DO);
 });
 
+test('a reference whose address carries a user name or password is refused before dialing, without repeating them', async () => {
+  // fetch refuses such a url with a message that holds it whole, so the
+  // credential would reach the agent's context and the host's log.
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: `ws://127.0.0.1:${port}` } });
+  const clause = "its address carries a user name or password, which this host doesn't send";
+  for (const uri of [`http://user:s3cret@127.0.0.1:${port}/ok?userinfo`, `http://justauser@127.0.0.1:${port}/ok?userinfo-name`]) {
+    // A claimed size within the eager limit, so only the refusal keeps the eager fetch away.
+    const rec = makeRecord(reg, uri, { sizeBytes: 1000 });
+    assert.deepEqual(f.refusal(rec), { error: clause, remedy: NOTHING_TO_DO }, uri);
+    assert.equal(f.isEagerEligible(rec), false, uri);
+    const out = await f.fetch(rec);
+    assert.equal(out.error, clause, uri);
+    assert.equal(out.remedy, NOTHING_TO_DO, uri);
+  }
+  assert.equal((hits.get('/ok?userinfo') ?? 0) + (hits.get('/ok?userinfo-name') ?? 0), 0, 'nothing dialed');
+});
+
 test('an http: reference from a server dialed over TLS is refused as another origin, with nothing dialed', async () => {
   // The same host and port, so only the scheme differs: the origin check, which
   // compares origins with their schemes, is all that refuses it.
@@ -968,6 +986,8 @@ test("each HTTP status says what calling again can do: later, a fresh reference,
   const expect: Array<[number, string]> = [
     // Passing trouble, which can clear.
     [408, TRY_LATER], [429, TRY_LATER], [500, TRY_LATER], [503, TRY_LATER],
+    // A conflict or a lock the server's state can clear, and a request it calls too early.
+    [409, TRY_LATER], [423, TRY_LATER], [425, TRY_LATER],
     // The server doesn't support the request, which later won't change.
     [501, NOTHING_TO_DO], [505, NOTHING_TO_DO],
     // This host's credentials for the server, which a fresh reference keeps.

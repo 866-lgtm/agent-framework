@@ -121,7 +121,8 @@ export type FetchOutcome =
 const refused = (error: string, remedy: string): { refusal: Refusal } => ({ refusal: { error, remedy } });
 const fail = (error: string, remedy: string): FetchOutcome => ({ ok: false, error, remedy });
 
-/** What calling again can do about a server's HTTP status. A timeout, a rate
+/** What calling again can do about a server's HTTP status. A timeout, a
+ *  conflict or lock the server's state can clear, a request too early, a rate
  *  limit or a server's passing trouble can clear, though not 501 or 505, which
  *  say the server doesn't support the request. A 401 is about this host's
  *  credentials for the server, which a fresh reference doesn't change, and a
@@ -129,7 +130,7 @@ const fail = (error: string, remedy: string): FetchOutcome => ({ ok: false, erro
  *  reference, which a fresh one may not share. */
 function statusRemedy(status: number): string {
   if (status === 501 || status === 505) return NOTHING_TO_DO;
-  if (status === 408 || status === 429 || status >= 500) return TRY_LATER;
+  if (status === 408 || status === 409 || status === 423 || status === 425 || status === 429 || status >= 500) return TRY_LATER;
   if (status === 401) return CREDENTIALS;
   if (status === 403) return FRESH_OR_CREDENTIALS;
   return FRESH_REFERENCE;
@@ -260,8 +261,8 @@ export class ReferenceFetcher {
 
   /** Every check the fetch makes before it dials, in its order: the server
    *  (none, unknown, no address, an address of its own or the reference's
-   *  that doesn't parse, a scheme other than http: or https:, off the uri's
-   *  origin), the expiry, a claimed size over the host's own ceiling, the
+   *  that doesn't parse, a reference address carrying a user name or
+   *  password, a scheme other than http: or https:, off the uri's origin), the expiry, a claimed size over the host's own ceiling, the
    *  server's spent budget, a claimed size over a call's ceiling. For a record
    *  with no saved copy and no fetch under way, the fetch, `refusal()` and
    *  the eager check all ask this, so what save_recent_image says is the
@@ -331,11 +332,19 @@ export class ReferenceFetcher {
     if (!dialedOrigin) {
       return refused(`the "${serverId}" server's address doesn't parse as a URL, so there's nowhere to fetch it from`, NOTHING_TO_DO);
     }
+    const refUrl = new URL(record.testimony.uri);
+    // A user name or password in the uri is a credential embedded in it,
+    // which RFC-005 §6.1 forbids a server to mint and lets a host refuse
+    // (vector 6). This host neither sends nor repeats it: fetch refuses such
+    // a url with a message that holds it whole.
+    if (refUrl.username !== '' || refUrl.password !== '') {
+      return refused("its address carries a user name or password, which this host doesn't send", NOTHING_TO_DO);
+    }
     // The uri's own scheme, not its origin's: an origin reads ws: as http:
     // and wss: as https:, and fetch refuses a ws: or wss: uri ('unknown
     // scheme') before connecting, which would read as a failed request a
     // later try can mend.
-    const scheme = new URL(record.testimony.uri).protocol;
+    const scheme = refUrl.protocol;
     if (scheme !== 'https:' && scheme !== 'http:') {
       return refused(`its address uses ${scheme}, and this host fetches only http: and https: addresses`, NOTHING_TO_DO);
     }
