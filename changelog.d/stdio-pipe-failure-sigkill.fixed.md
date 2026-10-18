@@ -10,13 +10,11 @@
     then is refused as not sent (`not-sent`), where it was written to the
     failed pipe and reported at its deadline as possibly executed. One
     written before the failure is still reported as possibly executed.
-  - A child that outlives SIGKILL too is held as a launch that couldn't be
-    reaped, as a reconnect holds one: reconnecting halts, the `mcpl-down`
-    alert is raised, its tools leave the agents' list, and its id stays held
-    until a disconnect or `stop()` retries the reap and confirms the exit.
-    During a connect, the connect's own cleanup holds it once the connect
-    fails, at the latest when the connect times out, and the connect fails
-    with it.
+  - A connected server's child that outlives SIGKILL too is held as a
+    launch that couldn't be reaped, as a reconnect holds one: reconnecting
+    halts, the `mcpl-down` alert is raised, its tools leave the agents'
+    list, and its id stays held until a disconnect or `stop()` retries the
+    reap and confirms the exit.
   - Under Bun, a child that closes its stdin isn't reported at all, since
-    Bun emits no error for the writes to it, so request timeouts still
-    bound it, as they do a child that stops reading.
+    Bun emits no `'error'` event for the writes to it, so request timeouts
+    still bound it, as they do a child that stops reading.

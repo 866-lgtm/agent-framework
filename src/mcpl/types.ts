@@ -411,10 +411,10 @@ export interface McplServerConfig {
    * tool_result. Request timeouts are the only bound for a stdio server that
    * stops reading its stdin without closing it: the host's writes are
    * buffered, no error is raised, and the connection stays up. Under Bun they
-   * are also the only bound for one that closes its stdin, since Bun reports
-   * no error for the writes to it. requestTimeoutMs is the timeout of every
-   * request that names none; the handshake's initialize has its own. Set 0
-   * to disable. Default: 60000 (60 seconds). A value above
+   * are also the only bound for one that closes its stdin, since Bun emits no
+   * 'error' event for the writes to it. requestTimeoutMs is the timeout of
+   * every request that names none; the handshake's initialize has its own.
+   * Set 0 to disable. Default: 60000 (60 seconds). A value above
    * 2^31−1 is refused: Node runs a longer timer after about 1 ms, so every
    * request would time out at once.
    *
