@@ -396,6 +396,8 @@ describe('notices about an agent\'s own action', () => {
         dismissLatestBounce(agent: unknown): void;
         draftsSending: Set<string>;
         draftsInFlight: Set<string>;
+        proseDrafts: { get(agent: string, id: string): unknown; recordOutcome(...args: unknown[]): void };
+        deliverWithUnsent(agent: unknown, body: string, channelId: string, unsent: unknown): Promise<unknown>;
       };
       const agent = framework.getAgent('secondary')!;
       const writes = [
@@ -418,6 +420,11 @@ describe('notices about an agent\'s own action', () => {
         state.draftsInFlight.add(`secondary\u0000${held[0]!.id}`);
         state.dismissLatestBounce(agent);
         assert.equal((state.takeUnsent(agent, '{{unsent}}', round, '>>') as { refused?: unknown }).refused, true);
+        // {{unsent}} whose send came back, but whose outcome could not be recorded.
+        t.mock.method(state.channelRegistry, 'resolveDestination', () => ({ destination: { serverId: 'srv', channelId: 'unrecorded-channel' } }));
+        t.mock.method(state.channelRegistry, 'deliverSpeech', async () => ({ status: 'delivered', at: Date.now() }));
+        t.mock.method(state.proseDrafts, 'recordOutcome', () => { throw new Error('journal refused'); });
+        await state.deliverWithUnsent(agent, 'words resent', 'unrecorded-channel', state.proseDrafts.get('secondary', held[0]!.id));
         state.bounceProse(agent, 'words whose send threw', 'connection lost', undefined, '>>', round, { outcome: 'unknown' });
         await framework.runUntilIdle();
       } finally {
@@ -432,6 +439,7 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its empty-{{unsent}} notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its in-flight-dismiss notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its refused-{{unsent}} notice is dropped'));
+      assert.ok(errors.includes('[notice] secondary is no longer registered, so its unrecorded-outcome notice is dropped'));
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)), 'not dropped by addMessage instead');
     });
 
@@ -694,6 +702,30 @@ describe('notices about an agent\'s own action', () => {
       const again = notice('on the rewound branch');
       assert.ok(again.sequence <= agent.getConsumedWatermark()!.sequence, 'numbered within what the watermark covers on its own branch');
       assert.deepEqual(tags(), ['on the rewound branch']);
+    });
+
+    it('counts as unread a notice stored on a branch after the agent read past the point where it parts from another', async () => {
+      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const agent = framework.getAgent('secondary')!;
+      const cm = agent.getContextManager();
+      const store = framework.getStore();
+      const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
+      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+
+      notice('before the branch');
+      const home = store.currentBranch().name;
+      store.createBranch('side', home);
+      await framework.switchBranch('side');
+      notice('on the side branch');
+      notice('also on the side branch');
+      agent.markContextConsumed();
+      // Back on the branch the side branch was made from: its numbers past the
+      // branch point are its own, and the agent read none of them.
+      await framework.switchBranch(home);
+      const late = notice('stored at home after the agent read on the side branch');
+      assert.ok(late.sequence <= agent.getConsumedWatermark()!.sequence, 'numbered within what the watermark covers on the side branch');
+      assert.deepEqual(tags(), ['stored at home after the agent read on the side branch']);
     });
 
     for (const condition of ['ordinary', 'other-tool-cycle', 'quiesced', 'write-fails'] as const) {
