@@ -1302,7 +1302,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     }
   });
 
-  const createWith = (storePath: string, codeExecution: Record<string, unknown>) =>
+  const createWith = (storePath: string, codeExecution: unknown) =>
     AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
@@ -1312,41 +1312,62 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
       codeExecution: codeExecution as never,
     });
 
-  it('create() refuses a codeExecution.enabled that is not true or false, a quoted "false" included', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-enabled-');
+  /** create() refuses each config with exactly its message, before anything
+   *  opens: no store is left at storePath. */
+  async function assertRefused(cases: ReadonlyArray<readonly [unknown, string]>): Promise<void> {
+    const { tempDir, storePath } = tempStorePath('pytc-refused-');
     try {
-      // A quoted "false" is truthy, so it turned code execution on, and 0 is
-      // falsy, so it was read as off without a word. The value isn't shown,
-      // since a substituted value can be a credential.
-      for (const [enabled, refused] of [
-        ['false', /^Error: codeExecution\.enabled must be true or false, unquoted, not a string: true gives agents the code_execution tool/],
-        ['sk-secret-token', /^Error: codeExecution\.enabled must be true or false, unquoted, not a string:/],
-        [0, /^Error: codeExecution\.enabled must be true or false, not a number:/],
-        [{ on: true }, /^Error: codeExecution\.enabled must be true or false, not an object:/],
-      ] as const) {
-        await assert.rejects(createWith(storePath, { enabled }), (error: Error) => {
-          assert.match(String(error), refused);
-          assert.doesNotMatch(String(error), /sk-secret-token/);
+      for (const [codeExecution, message] of cases) {
+        await assert.rejects(createWith(storePath, codeExecution), (error: Error) => {
+          assert.equal(error.message, message);
           return true;
         });
+        assert.equal(existsSync(storePath), false, 'the refused config opened no store');
       }
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
+  }
+
+  it('create() refuses a codeExecution.enabled that is not true or false, a quoted "false" included', async () => {
+    // A quoted "false" is truthy, so it turned code execution on, and 0 is
+    // falsy, so it was read as off without a word. Each message names the
+    // value's kind, never the value, since a substituted value can be a
+    // credential.
+    const whatTrueDoes = 'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, '
+      + 'and false or leaving it out doesn\'t';
+    await assertRefused([
+      [{ enabled: 'false' }, `codeExecution.enabled must be true or false, unquoted, not a string: ${whatTrueDoes}`],
+      [{ enabled: 'sk-secret-token' }, `codeExecution.enabled must be true or false, unquoted, not a string: ${whatTrueDoes}`],
+      [{ enabled: 0 }, `codeExecution.enabled must be true or false, not a number: ${whatTrueDoes}`],
+      [{ enabled: { on: true } }, `codeExecution.enabled must be true or false, not an object: ${whatTrueDoes}`],
+    ]);
   });
 
-  it('a null codeExecution.enabled counts as left out, and a configuration that is off has nothing else checked', async () => {
+  it('create() refuses a codeExecution that is not an object, which would read as off', async () => {
+    await assertRefused([
+      [true, 'codeExecution must be an object, such as { enabled: true }, not a boolean'],
+      ['true', 'codeExecution must be an object, such as { enabled: true }, not a string'],
+      [[], 'codeExecution must be an object, such as { enabled: true }, not an array'],
+    ]);
+  });
+
+  it('a null or left-out codeExecution.enabled counts as off, and a configuration that is off has nothing else checked', async () => {
+    // Contradictory limits are refused only once code execution is on.
+    const contradictory = { scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 };
     for (const codeExecution of [
-      { enabled: null },
-      // Contradictory limits are refused only once code execution is on.
-      { enabled: false, scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 },
+      null,
+      { enabled: null, ...contradictory },
+      { enabled: false, ...contradictory },
+      { ...contradictory },
     ]) {
       const { tempDir, storePath } = tempStorePath('pytc-enabled-off-');
-      const framework = await createWith(storePath, codeExecution);
+      let framework: AgentFramework | undefined;
       try {
+        framework = await createWith(storePath, codeExecution);
         assert.equal(framework.getAllTools().some((tool) => tool.name === 'code_execution'), false);
       } finally {
-        await framework.stop();
+        await framework?.stop();
         rmSync(tempDir, { recursive: true, force: true });
       }
     }
