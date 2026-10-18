@@ -1080,6 +1080,31 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(await archived(), 'Written for the run while the host was quiesced.'), 1, 'and lands in its window at resume');
     });
 
+    it('passes a failed reply a run stored unread on to the primary\'s queue when the host stops before the release it waited for', async () => {
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      // Stored in its window, and never read: the run never compiled.
+      created.contextManager.addMessage('user',
+        [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 } as never);
+      const state = internals(runFramework) as unknown as ReturnType<typeof internals> & { releasesAfterResume: Map<string, unknown> };
+      // Not started, so its startup watchdog ends it, while the host is quiesced.
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 150 });
+      state.quiesced = true;
+      await assert.rejects(done, /failed to start inference/);
+      assert.ok(state.releasesAfterResume.has('worker'), 'its window\'s release waits for resume');
+
+      await runFramework.stop();
+
+      const passed = (state.deferredMessages as unknown as Array<{ forAgent?: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>)
+        .filter((m) => JSON.stringify(m.content).includes('A reply by worker'));
+      assert.equal(passed.length, 1, 'queued for the primary, for resume or boot');
+      assert.equal(passed[0]!.forAgent, undefined);
+      assert.equal(passed[0]!.metadata?.speaker, 'worker');
+    });
+
     it('resumes past a run that ended while the host was quiesced: resume doesn\'t weigh its context', async (t) => {
       sender.quiesceOnCall = true;
       await run([

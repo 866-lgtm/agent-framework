@@ -3315,8 +3315,8 @@ export class AgentFramework {
     // queued with what follows it for its target, and a memory-only queue
     // still loses it at exit. An entry for a target no longer registered (a
     // disposed fork) is left: dropped with a memory-only queue at exit, and
-    // logged and dropped from a persisted one by the boot or resume flush
-    // that meets it.
+    // from a persisted one, by the boot or resume flush that meets it, passed
+    // to the primary if it's a failed reply, and otherwise dropped, logged.
     //
     // A registered agent's stream that outlasted its wait may still write,
     // so that agent's entries stay queued, said once for it: no entry lands
@@ -3326,6 +3326,15 @@ export class AgentFramework {
     // turn-end flush takes them, as at any turn's end, and a later stop()
     // takes what that leaves. Until then a persisted queue keeps them for
     // boot, and a memory-only one loses them at exit.
+    // A window release the quiesce postponed (releasesAfterResume) never runs
+    // once the host stops, so its unread pass runs here: each failed reply
+    // stored unread in that window goes to the primary now, deferred while
+    // quiesced like any write, so it waits in the queue with the rest. What
+    // was queued for that agent stays queued, as a gone agent's.
+    for (const agent of this.releasesAfterResume.values()) {
+      for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+    }
+    this.releasesAfterResume.clear();
     if (this.deferredMessages.length > 0) {
       const registered = [...this.agents.keys()];
       const entries = registered
