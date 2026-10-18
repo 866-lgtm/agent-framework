@@ -121,6 +121,27 @@ describe('utils surface', () => {
     } finally { await framework.stop(); rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('lists a first line over 160 units cut there, without halving a surrogate pair', async () => {
+    const long = {
+      name: 'long',
+      async start(): Promise<void> {},
+      async stop(): Promise<void> {},
+      getTools: (): ToolDefinition[] => [],
+      // 159 units, then an emoji whose two units straddle the 160-unit cut.
+      getUtilities: (): ToolDefinition[] => [
+        { name: 'op', description: `${'d'.repeat(159)}😀 and the rest of a long first line`, inputSchema: { type: 'object' } },
+      ],
+      handleToolCall: async (): Promise<ToolResult> => ({ success: true }),
+      onProcess: async (): Promise<any> => ({}),
+    } as unknown as Module;
+    const { framework, dir } = await makeFramework([long]);
+    try {
+      const list = await framework.executeToolCall({ id: 'c1', name: 'utils', input: { action: 'list' }, callerAgentName: 'agent' });
+      assert.ok(list.success, list.error);
+      assert.deepEqual(list.data, [{ name: 'long--op', description: 'd'.repeat(159) }], 'the cut leaves the emoji out whole');
+    } finally { await framework.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('arg misses teach by bounce: schema rides the error', async () => {
     const stub = new StubModule();
     const { framework, dir } = await makeFramework([stub]);

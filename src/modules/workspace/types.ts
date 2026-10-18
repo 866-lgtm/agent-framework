@@ -63,9 +63,13 @@ export interface MountConfig {
    * kept with the mount's disk evidence, so a restart resumes there, unless
    * the machine went down before the store made the latest place durable.
    * An agent-action scan (`watch: 'on-agent-action'`) and a listing (`ls`,
-   * `glob`, `grep`) take up to it from their scope's start every time. Each
-   * directory's listing is read whole, so a deletion is seen wherever the
-   * walk lists, whatever it took.
+   * `glob`, `grep`) take up to it from their scope's start every time:
+   * `glob`'s is the directory its pattern's segments before the first
+   * wildcard name beneath its `path`, and `grep`'s the deeper of its `path`
+   * and its `glob` filter's directory, as far as disk lists each segment
+   * with that spelling as a directory, not a link. Each directory's listing
+   * is read whole, so a deletion is seen wherever the walk lists, whatever
+   * it took.
    *
    * It bounds what a walk observes, not the walk's own work: directories
    * don't count against it, and each one the walk visits is read whole, so
@@ -79,6 +83,8 @@ export interface MountConfig {
    *
    * Self-writes through the module's own tools are already suppressed by the
    * watcher, so a mount shared between agents only wakes on external writes.
+   * A change of a file's mode alone is recorded, and makes no event: it
+   * brings nothing new to read.
    * The EventGate still has final say — use gate policies for path-glob
    * filtering or to disable wake temporarily via hot-reload.
    */
@@ -141,7 +147,10 @@ export interface MountState {
   lastMaterializedSeq: number;
   /** Paths currently suppressed from watcher (recently materialized) */
   suppressedPaths: Set<string>;
-  /** Whether a full scan of the mount has completed this session */
+  /**
+   * Whether a pass over the whole mount has run this session. On a mount
+   * over its walkCap, that pass took the first walkCap entries.
+   */
   initialSyncDone: boolean;
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;

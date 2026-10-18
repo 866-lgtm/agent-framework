@@ -28,7 +28,8 @@ export interface WatcherEvents {
  * identical to an empty directory in the recorded state.
  */
 export interface WatcherLifecycle {
-  /** Fires once, when chokidar completes its initial scan. */
+  /** Fires when chokidar completes its initial scan: once for each attach, so
+   *  again after a re-attach. */
   onReady?: () => void;
   /** Fires on any chokidar-reported error (ENOENT, EACCES, platform faults). */
   onError?: (err: Error) => void;
