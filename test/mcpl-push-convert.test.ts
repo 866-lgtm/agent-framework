@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { convertBlock } from '../src/mcpl/convert-block.js';
 import type { McplContentBlock } from '../src/mcpl/types.js';
 
-const t = (b: unknown) => convertBlock(b as McplContentBlock, 'attachment on push event') as { type: string; text?: string; source?: { type: string } };
+const t = (b: unknown) => convertBlock(b as McplContentBlock, 'attachment on push event', 'push-srv') as { type: string; text?: string; source?: { type: string } };
 
 test('resource block converts to a bounded stub, never the raw uri', () => {
   const out = t({ type: 'resource', uri: 'https://host/files?path=x.wav', mimeType: 'audio/wav',

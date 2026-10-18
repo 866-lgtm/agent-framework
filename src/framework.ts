@@ -74,7 +74,8 @@ import type {
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent } from './agent.js';
+import { Agent, assertAgentSwitches } from './agent.js';
+import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
@@ -86,6 +87,7 @@ import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } f
 import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { readSkipReplyWake, skipReplyWakeRefusal } from './mcpl/skip-reply-wake.js';
 import { convertBlock } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
@@ -206,8 +208,8 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * `send_message` followed by "sent it" from double-posting, but a new message
  * starts a new conversational round and must be answerable with plain prose.
  * `skip_reply` ends the turn at the tool-result boundary, unless it's refused
- * (wake_in_seconds without an EventGate): then the turn goes on, and only its
- * own round stays silent.
+ * (a wake_in_seconds without an EventGate, or one that isn't a number of
+ * seconds): then the turn goes on, and only its own round stays silent.
  */
 const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
@@ -262,18 +264,6 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
 const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send' | 'private' | null => {
   if (calls.some((c) => bareToolName(c.name) === 'skip_reply')) return 'private';
   return calls.some(isSilencingCall) ? 'send' : null;
-};
-
-/**
- * The seconds a skip_reply call asks to be woken after: its wake_in_seconds
- * read as a number, when that's finite and above 0, and undefined when it asks
- * for no timed wake. Without an EventGate such a call is refused, so the
- * dispatch that refuses it and the round that keeps its prose private both
- * read the request here.
- */
-const requestedSelfWakeSeconds = (input: unknown): number | undefined => {
-  const secs = Number((input as Record<string, unknown> | null | undefined)?.wake_in_seconds);
-  return Number.isFinite(secs) && secs > 0 ? secs : undefined;
 };
 
 /**
@@ -968,6 +958,46 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
     MIN_DISCORD_AWARENESS_DEADLINE_MS,
     Math.min(MAX_DISCORD_AWARENESS_DEADLINE_MS, Math.floor(value)),
   );
+}
+
+/**
+ * Refuse a config whose `subconscious`, `watchdog` or `processLogging` is
+ * anything but an object, null or false (holdsSettings), or whose switch in
+ * one holds anything but true or false (assertBooleanSetting). A subconscious
+ * that isn't on has its `allowChannelSpeech` left unchecked, since nothing
+ * reads it then.
+ */
+function assertFrameworkSwitches(config: FrameworkConfig): void {
+  if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
+    assertBooleanSetting(
+      'subconscious.enabled',
+      config.subconscious.enabled,
+      'true creates the subconscious resident, a side agent that reads the residents\' timeline and delivers into their window, ' +
+        'and false or leaving it out doesn\'t',
+    );
+    if (config.subconscious.enabled === true) {
+      assertBooleanSetting(
+        'subconscious.allowChannelSpeech',
+        config.subconscious.allowChannelSpeech,
+        'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
+      );
+    }
+  }
+  if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
+    assertBooleanSetting(
+      'watchdog.enabled',
+      config.watchdog.enabled,
+      'true arms the liveness watchdog, which ends the process when the main thread misses its heartbeat for thresholdMs, ' +
+        'and false or leaving it out doesn\'t',
+    );
+  }
+  if (holdsSettings('processLogging', config.processLogging, '{ persist: true }')) {
+    assertBooleanSetting(
+      'processLogging.persist',
+      config.processLogging.persist,
+      'true writes each process event and its responses to Chronicle, and false or leaving it out doesn\'t',
+    );
+  }
 }
 
 /** Messages copied into another conversation (a fork's seed) without their
@@ -2437,6 +2467,8 @@ export class AgentFramework {
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
+    assertFrameworkSwitches(config);
+    for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
 
     // Create or use existing store
     let store: JsStore;
@@ -2554,7 +2586,7 @@ export class AgentFramework {
     }
 
     // Process logging config (default: disabled)
-    const processLoggingPersist = config.processLogging?.persist ?? false;
+    const processLoggingPersist = config.processLogging?.persist === true;
     const processLoggingBroadcast = config.processLogging?.broadcast ?? false;
 
     // Register process log state only if persistence is enabled
@@ -2637,7 +2669,7 @@ export class AgentFramework {
     // The subconscious resident (issue #77) registers after the residents so
     // it can never become primary; it is excluded from every broadcast
     // fan-out and woken only by the tune-out coordinator's explicit pushes.
-    if (config.subconscious?.enabled) {
+    if (config.subconscious?.enabled === true) {
       await framework.createSubconsciousAgent(config.subconscious);
     }
 
@@ -2738,7 +2770,7 @@ export class AgentFramework {
     }
 
     // Liveness watchdog: fail hard if the main thread wedges (opt-in).
-    if (config.watchdog?.enabled) {
+    if (config.watchdog?.enabled === true) {
       const { LivenessWatchdog } = await import('./runtime/liveness-watchdog.js');
       framework.livenessWatchdog = new LivenessWatchdog({
         enabled: true,
@@ -2889,7 +2921,7 @@ export class AgentFramework {
             [...framework.conversationAgentHomes.values()].includes(channelId),
           isPrivilegedAuthor: (authorId) =>
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
-          allowChannelSpeech: () => !!framework.subconsciousConfig?.allowChannelSpeech,
+          allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
           emitTrace: (e) => framework.emitTrace(e as never),
         },
       );
@@ -7149,6 +7181,10 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
+    // Checked before anything happens: the constructor checks too, but only
+    // after the name is reserved and ContextManager.open has registered the
+    // agent's message and context states in the store.
+    assertAgentSwitches(config);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -10982,6 +11018,7 @@ export class AgentFramework {
 
     const decision = await this.routeConversation({
       channelId: event.channelId,
+      serverId: event.serverId,
       mentioned: event.metadata?.mentioned === true,
       kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
     });
@@ -12019,6 +12056,7 @@ export class AgentFramework {
       const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
       const decision = await this.routeConversation({
         channelId: occ.scope.id,
+        serverId: occ.serverId,
         mentioned: metadata.mentioned === true,
         kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
       });
@@ -12070,7 +12108,7 @@ export class AgentFramework {
         messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
         threadId: identity.threadId ?? str(origin.threadId),
         author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
-        content: materialized ? materialized.map((block) => convertBlock(block, 'attachment on push event')) : push.content,
+        content: materialized ? materialized.map((block) => convertBlock(block, 'attachment on push event', occ.serverId)) : push.content,
         timestamp: occ.timestamp,
         metadata: origin,
         tags: push.tags,
@@ -12090,7 +12128,7 @@ export class AgentFramework {
       ...occ.event.event,
       eventId: occ.eventId,
       timestamp: occ.timestamp,
-      ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event')) } : {}),
+      ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event', occ.serverId)) } : {}),
       coalescingSubject,
       // §5.2: the materialized occurrence is consumed by the request being
       // assembled; the wake that started it is not repeated.
@@ -16182,7 +16220,7 @@ export class AgentFramework {
                   },
                   () => this.finishUnstick(agent.name, false, category),
                 );
-              } else if (rh?.autoRewind && !guardRefusal) {
+              } else if (rh?.autoRewind === true && !guardRefusal) {
                 const cap = Math.max(1, rh.maxRewinds ?? 3);
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
                 doRewind(
@@ -17368,6 +17406,15 @@ export class AgentFramework {
       // reads it. A success is the server's own blocks, for the caller to
       // use in process.
       if (result.isError) return mcplToolFailure(result.content, serverId, call.name);
+      // RFC-005 §6.2: register the result's references with this server, so
+      // a stub later made of them is bound and fetch_reference can fetch
+      // them. Nothing is fetched here: an in-process caller may never show
+      // them to an agent, and an eager fetch would spend the server's fetch
+      // budget, which the agent's own fetch_reference needs, on bytes nobody
+      // asked for. A failure keeps only its text (mcplToolFailure), so no
+      // stub is made of its references and they aren't registered.
+      await this.autoFetchReferences(result.content, serverId, false)
+        .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
       return {
         success: true,
         data: result.content,
@@ -18164,10 +18211,11 @@ export class AgentFramework {
     // not browse) — materialize the references of a content array now, so
     // the stub the script receives carries a workspace path it can open
     // directly. Only a reference registered against its server can be
-    // fetched: an MCPL server's result content is, on arrival. An in-process
-    // module's reference has no server, so its fetch is refused (and logged
-    // here) and the script gets its stub, as it does for a reference nested
-    // in other data, which isn't fetched.
+    // fetched: an MCPL server's result content is, on arrival, including
+    // content a module got from a call of its own (ctx.callTool) and returns.
+    // A reference a module makes itself has no server, so its fetch is
+    // refused (and logged here) and the script gets its stub, as it does for
+    // a reference nested in other data, which isn't fetched.
     if (Array.isArray(result.data)) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
@@ -18609,15 +18657,23 @@ export class AgentFramework {
   }
 
   /**
-   * Whether this host refuses a skip_reply call: it asks for a timed wake
-   * (requestedSelfWakeSeconds), the channel registry handles skip_reply, and
-   * there's no EventGate to set the wake. The dispatch that refuses the call,
-   * the round that keeps its prose private and the turn's silencing all read
-   * it here, for the model's own calls.
+   * Why this host refuses a skip_reply call, as the model will read it, or
+   * undefined when it doesn't (skipReplyWakeRefusal): without an EventGate,
+   * any wake_in_seconds; with one, a wake_in_seconds that isn't a number of
+   * seconds. Only when the channel registry handles skip_reply. The dispatch
+   * that refuses the call reads it here, and so does the turn's bookkeeping of
+   * a refused round, for the model's own calls: the silence before it, which
+   * comes back after its round, and in XML mode which round's prose stays
+   * private. A skip_reply round's own prose stays private by the tool's name,
+   * refused or not.
    */
+  private skipReplyRefusal(call: { name?: string; input?: unknown }): string | undefined {
+    if (call.name !== 'skip_reply' || !this.channelRegistry) return undefined;
+    return skipReplyWakeRefusal(readSkipReplyWake(call.input), !!this.eventGate);
+  }
+
   private refusesSelfWake(call: { name?: string; input?: unknown }): boolean {
-    return call.name === 'skip_reply' && !!this.channelRegistry && !this.eventGate
-      && requestedSelfWakeSeconds(call.input) !== undefined;
+    return this.skipReplyRefusal(call) !== undefined;
   }
 
   /**
@@ -18744,20 +18800,24 @@ export class AgentFramework {
       // the agent after N seconds unless something else wakes it first
       // (any turn start cancels the pending self-wake). Armed here because
       // the framework owns the EventGate; the registry only words the
-      // confirmation. Without a gate, a positive timer request is refused so
-      // the model learns that its turn remains open and no wake was armed.
+      // confirmation. A wake the host can't set is refused, so the model
+      // learns that its turn remains open and no wake was armed: any
+      // wake_in_seconds without a gate, and one that isn't a number of
+      // seconds with one.
       if (enrichedCall.name === 'skip_reply') {
-        const secs = requestedSelfWakeSeconds(enrichedCall.input);
-        if (secs !== undefined && this.eventGate) {
-          const { inMs } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
-          console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
-        } else if (this.refusesSelfWake(enrichedCall)) {
-          const error = "Your turn didn't end, and no wake was set: this host can't wake you on a timer, so skip_reply can't take wake_in_seconds here. To end the turn and wait for the next message, call skip_reply without it. Anything you meant to come back to, do now.";
-          console.error(`[self-wake] agent=${agentName} No EventGate configured (FrameworkConfig.gate is unset). ${error}`);
+        const error = this.skipReplyRefusal(enrichedCall);
+        if (error !== undefined) {
+          const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
+          console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
           this.toolLifecycleEmitter?.refuse(agentName, enrichedCall.id);
           this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result: { success: false, error, isError: true } });
           return;
+        }
+        const wake = readSkipReplyWake(enrichedCall.input);
+        if (wake.kind === 'wake' && this.eventGate) {
+          const { inMs } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);

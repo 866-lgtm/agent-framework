@@ -3,6 +3,7 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
   indexSilentTickRows,
   separateSilentHeartbeatTicks,
@@ -74,6 +75,53 @@ function stableHash(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+
+/**
+ * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
+ * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
+ * holds anything but true or false (assertBooleanSetting), or whose `thinking`
+ * or `refusalHandling` is anything but an object, null or false
+ * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * an Agent is built. `create()` also runs it for each of its agents before
+ * anything opens, and `createEphemeralAgent` before it reserves the name, so a
+ * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
+ * the refusal is here because the setting is AgentConfig's.
+ */
+export function assertAgentSwitches(config: AgentConfig): void {
+  const agent = `Agent "${config.name}"`;
+  assertBooleanSetting(
+    `${agent} promptCaching`,
+    config.promptCaching,
+    'true or leaving it out marks requests for prompt caching, and false leaves the markers off, for transports that refuse them',
+  );
+  if (holdsSettings(`${agent} thinking`, config.thinking, '{ enabled: true }')) {
+    assertBooleanSetting(
+      `${agent} thinking.enabled`,
+      config.thinking.enabled,
+      'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
+    );
+  }
+  if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
+    assertBooleanSetting(
+      `${agent} refusalHandling.autoRewind`,
+      config.refusalHandling.autoRewind,
+      'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' +
+        'and false or leaving it out doesn\'t',
+    );
+  }
+  assertBooleanSetting(
+    `${agent} toolResultGuard`,
+    config.toolResultGuard,
+    'true turns on tool-output admission, with one guarded retry after a provider refusal, ' +
+      'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} toolWrapperProseGuard`,
+    config.toolWrapperProseGuard,
+    'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
+      'and false or leaving it out doesn\'t',
+  );
+}
 
 /**
  * An agent wraps a context manager and manages inference state.
@@ -221,6 +269,7 @@ export class Agent {
     contextManager: ContextManager,
     membrane: Membrane
   ) {
+    assertAgentSwitches(config);
     this.name = config.name;
     this.model = config.model;
     this.systemPrompt = config.systemPrompt;
@@ -230,11 +279,11 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
-    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard);
+    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
-    this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
+    this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.cacheTtl = config.cacheTtl ?? '1h';
-    this.promptCaching = config.promptCaching ?? true;
+    this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;

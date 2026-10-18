@@ -57,7 +57,7 @@ test("a reference block that can't be read says which part is missing, and what 
   // converter says for the same block.
   for (const [block, text] of [[{ type: 'image', uri: '' }, IMAGE_NO_DATA_TEXT], [{ type: 'audio', uri: '' }, AUDIO_NO_DATA_TEXT]] as const) {
     assert.equal(referenceStubOrNull(block), text);
-    assert.deepEqual(convertBlock(block as never, 'test'), { type: 'text', text });
+    assert.deepEqual(convertBlock(block as never, 'test', 'words'), { type: 'text', text });
   }
   // Beside inline data, any string uri, an empty one too, stays withheld as
   // on main: the tool-result lane can't show every inline shape yet, and

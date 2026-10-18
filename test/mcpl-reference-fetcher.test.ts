@@ -559,7 +559,7 @@ test('normalizedOrigin maps ws/wss and elides default ports', () => {
 
 test.after(() => { server.close(); });
 
-test('binding upgrade: unbound stub-time registration gains the dispatch serverId', () => {
+test('an unbound stub-time registration gains the dispatch server, in the same record', () => {
   const reg = new ReferenceRegistry();
   const c = classifyBlock({ type: 'resource', uri: `${ORIGIN}/upgrade.wav`, sizeBytes: 10 });
   assert.equal(c.kind, 'reference');
@@ -567,11 +567,11 @@ test('binding upgrade: unbound stub-time registration gains the dispatch serverI
   const unbound = reg.register(t);                    // stub site: no server context
   const bound = reg.register(t, 'srv');               // dispatch: knows the server
   assert.equal(unbound.refId, bound.refId, 'one record, not a fork');
-  assert.equal(unbound.serverId, 'srv', 'binding upgraded in place');
+  assert.deepEqual(unbound.serverIds, ['srv'], 'the dispatch server added to the same record');
 });
 
 test('fetch_reference answers an unbound reference with the reason its stub gives, and dials nothing', { timeout: 10_000 }, async () => {
-  // Registered with no server, as an in-process module's reference or a channel message's is.
+  // Registered with no server, as a reference in a module's own tool result is.
   const c = classifyBlock({ type: 'resource', uri: `${ORIGIN}/ok?unbound`, sizeBytes: PAYLOAD.length });
   assert.equal(c.kind, 'reference');
   const record = referenceRegistry.register((c as Extract<ReturnType<typeof classifyBlock>, { kind: 'reference' }>).testimony);
@@ -605,6 +605,105 @@ test('a reference both unbound and expired is refused as unbound, the reason its
   assert.equal(out.ok, false);
   assert.equal(out.error, `reference ${UNBOUND_REASON}`);
   assert.equal(hits.get('/ok?unbound-expired') ?? 0, 0, 'nothing dialed');
+});
+
+test('a uri two servers deliver is fetched through the one on its origin, whichever came first, with that server\'s token, eager cap and budget', async () => {
+  for (const order of [['relay', 'owner'], ['owner', 'relay']] as const) {
+    const reg = new ReferenceRegistry();
+    // The relay's own limits would refuse both the eager slot and the fetch,
+    // so the record is eligible and fetched only by the owner's.
+    const f = makeFetcher({
+      relay: { url: 'https://relay.example.invalid', token: 'relay-token', autofetch: { maxBytes: 1, maxTotalBytes: 0 } },
+      owner: { url: `ws://127.0.0.1:${port}`, token: 'owner-token' },
+    });
+    const uri = `${ORIGIN}/ok?two-servers=${order[0]}`;
+    const record = makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, order[0]);
+    assert.equal(makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, order[1]), record, 'one record for the uri');
+    makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, order[0]);
+    assert.deepEqual(record.serverIds, [...order], 'each server once, in the order they delivered it');
+    assert.equal(f.isEagerEligible(record), true);
+    const out = await f.fetch(record);
+    assert.equal(out.ok, true, out.error);
+    assert.equal(lastAuth, 'Bearer owner-token', 'dialed with the token of the server on the origin');
+  }
+});
+
+test('a uri on none of its servers\' origins is refused with the first server\'s refusal, in either order', async () => {
+  for (const order of [['a', 'b'], ['b', 'a']] as const) {
+    const reg = new ReferenceRegistry();
+    const f = makeFetcher({ a: { url: 'https://a.example.invalid' }, b: { url: 'https://b.example.invalid' } });
+    const uri = `${ORIGIN}/ok?none-on-origin=${order[0]}`;
+    // A claim within both servers' eager limits, so only the origin check
+    // keeps the record from the eager pass.
+    const record = makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, order[0]);
+    makeRecord(reg, uri, { sizeBytes: PAYLOAD.length }, order[1]);
+    assert.equal(f.isEagerEligible(record), false);
+    const out = await f.fetch(record);
+    assert.equal(out.ok, false);
+    assert.match(out.error ?? '', new RegExp(`^third-party origin \\(http://127\\.0\\.0\\.1:\\d+ != dialed https://${order[0]}\\.example\\.invalid\\)`));
+    assert.equal(hits.get(`/ok?none-on-origin=${order[0]}`) ?? 0, 0, 'nothing dialed');
+  }
+});
+
+test('a server unknown to the host ahead of one off the origin is the refusal, and the other way round the origin check\'s is', async () => {
+  for (const [order, refusal] of [
+    [['gone', 'a'], /^unknown server: gone$/],
+    [['a', 'gone'], /^third-party origin \(http:\/\/127\.0\.0\.1:\d+ != dialed https:\/\/a\.example\.invalid\)/],
+  ] as const) {
+    const reg = new ReferenceRegistry();
+    const f = makeFetcher({ a: { url: 'https://a.example.invalid' } });
+    const uri = `${ORIGIN}/ok?unknown-and-off-origin=${order[0]}`;
+    const record = makeRecord(reg, uri, {}, order[0]);
+    makeRecord(reg, uri, {}, order[1]);
+    const out = await f.fetch(record);
+    assert.equal(out.ok, false);
+    assert.match(out.error ?? '', refusal);
+    assert.equal(hits.get(`/ok?unknown-and-off-origin=${order[0]}`) ?? 0, 0, 'nothing dialed');
+  }
+});
+
+test('of two servers on the uri\'s origin, the first to deliver it is dialed, with its token', async () => {
+  for (const order of [['first', 'second'], ['second', 'first']] as const) {
+    const reg = new ReferenceRegistry();
+    const f = makeFetcher({
+      first: { url: `ws://127.0.0.1:${port}`, token: 'first-token' },
+      second: { url: ORIGIN, token: 'second-token' },
+    });
+    const uri = `${ORIGIN}/ok?same-origin=${order[0]}`;
+    const record = makeRecord(reg, uri, {}, order[0]);
+    makeRecord(reg, uri, {}, order[1]);
+    const out = await f.fetch(record);
+    assert.equal(out.ok, true, out.error);
+    assert.equal(lastAuth, `Bearer ${order[0]}-token`, 'dialed with the token of the first to deliver it');
+  }
+});
+
+test('a server the host holds no address for is its refusal while it is the only one, and passed over for one on the origin', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ owner: { url: `ws://127.0.0.1:${port}` } });
+  const uri = `${ORIGIN}/ok?unknown-first`;
+  const record = makeRecord(reg, uri, {}, 'stdio-srv');
+  assert.equal((await f.fetch(record)).error, 'unknown server: stdio-srv');
+  makeRecord(reg, uri, {}, 'owner');
+  assert.deepEqual(record.serverIds, ['stdio-srv', 'owner']);
+  const out = await f.fetch(record);
+  assert.equal(out.ok, true, out.error);
+});
+
+test('a fetch is charged to the budget of the server it dials, not of the first to deliver the uri', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({
+    relay: { url: 'https://relay.example.invalid' },
+    owner: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: PAYLOAD.length } },
+  });
+  const relayed = makeRecord(reg, `${ORIGIN}/ok?charged-relayed`, {}, 'relay');
+  makeRecord(reg, `${ORIGIN}/ok?charged-relayed`, {}, 'owner');
+  const first = await f.fetch(relayed);
+  assert.equal(first.ok, true, first.error);
+  // That spent the owner's budget, so its own next reference is refused for it.
+  const next = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?charged-own`, {}, 'owner'));
+  assert.equal(next.error, `per-server fetch budget exhausted (${PAYLOAD.length}/${PAYLOAD.length} bytes); ${BUDGET_LASTS}`);
+  assert.equal(hits.get('/ok?charged-own') ?? 0, 0, 'nothing dialed');
 });
 
 test('testimony refreshes while unfetched, freezes after fetch', async () => {
