@@ -1387,3 +1387,56 @@ test('#157: an edit admitted while a compile is assembling a message stored at o
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
+
+/** A message in an agent's store whose text includes `text`. */
+const storedWith = (f: Fixture, text: string, agent = 'agent') =>
+  f.framework.getAgent(agent)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
+const isMarked = (message: { metadata?: unknown } | undefined) => (message?.metadata as { replacesUnread?: unknown } | undefined)?.replacesUnread === true;
+
+test("#157: a compile of an agent with a store of its own leaves another agent's message stored at once unseen, so its edit is still marked", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once in the agent's store, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'nothing has compiled yet');
+  // An ephemeral agent, whose store is its own, runs a turn.
+  const helper = await f.framework.createEphemeralAgent({ name: 'helper', model: 'test', systemPrompt: 'Do the task.' });
+  t.after(helper.cleanup);
+  helper.contextManager.addMessage('User', [{ type: 'text', text: 'helper_task' }]);
+  const run = f.framework.runEphemeralToCompletion(helper.agent, helper.contextManager);
+  await f.framework.runUntilIdle();
+  await run;
+  assert.equal(f.membrane.calls.length, 1, "the helper's compile ran");
+  assert(!JSON.stringify(f.membrane.calls[0]).includes('doc_unseen'), "the helper's request doesn't hold the agent's message");
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert(isMarked(storedWith(f, 'doc_edited')), "the edit is the agent's first view");
+});
+
+test("#157: another resident's compile ends the window of a message stored at once in the shared slot, so an edit admitted during it isn't marked", async (t) => {
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'other', model: 'test', systemPrompt: 'test' }], server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  // The edit is admitted after the other resident's compile has assembled
+  // the message and before that compile returns.
+  const cm = f.framework.getAgent('other')!.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let edited = false;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    if (!edited) {
+      edited = true;
+      shown = JSON.stringify(result).includes('doc_unseen');
+      await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+    }
+    return result;
+  };
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
+  internals.pendingRequests = internals.pendingRequests.filter((r) => r.agentName === 'other');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert(shown, "the other resident's compile assembled the message");
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't marked as the agent's first view");
+});
