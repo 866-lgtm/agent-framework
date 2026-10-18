@@ -97,6 +97,12 @@ interface Answer {
   result?: McplInferenceRequestResult;
   error?: { code: number; message: string };
   chunks: InferenceChunkParams[];
+  /**
+   * What reached the server, in the order it was sent: `chunk:` and the text
+   * of consecutive chunks joined, then `result:` and its content or `error:`
+   * and its message.
+   */
+  sent: string[];
   traces: Array<{ type: string; [key: string]: unknown }>;
   /** The stream the router opened, when it streamed. */
   stream?: YieldingStream;
@@ -107,7 +113,7 @@ async function ask(script: Script, opts: { stream: boolean; mode: Mode }): Promi
   const membrane = new Membrane(new ScriptedAdapter(script), {
     formatter: opts.mode === 'xml' ? new AnthropicXmlFormatter({ toolMode: 'xml' }) : new NativeFormatter(),
   });
-  const answer: Answer = { chunks: [], traces: [] };
+  const answer: Answer = { chunks: [], sent: [], traces: [] };
   const streamYielding = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (request: NormalizedRequest) => {
     answer.stream = streamYielding(request);
@@ -117,14 +123,19 @@ async function ask(script: Script, opts: { stream: boolean; mode: Mode }): Promi
 }
 
 /** Ask a router built on `membrane` for one inference. */
-async function askWith(membrane: Membrane, stream: boolean, answer: Answer = { chunks: [], traces: [] }): Promise<Answer> {
+async function askWith(membrane: Membrane, stream: boolean, answer: Answer = { chunks: [], sent: [], traces: [] }): Promise<Answer> {
   const router = new InferenceRouter(
     membrane,
     { isInHook: false } as unknown as HookOrchestrator,
     { validateInbound: () => {} } as unknown as FeatureSetManager,
     null,
     (event) => { answer.traces.push(event); },
-    (_serverId, params) => { answer.chunks.push(params); },
+    (_serverId, params) => {
+      answer.chunks.push(params);
+      const last = answer.sent.length - 1;
+      if (answer.sent[last]?.startsWith('chunk:')) answer.sent[last] += params.delta;
+      else answer.sent.push(`chunk:${params.delta}`);
+    },
   );
 
   await router.handleInferenceRequest('scripted-server', {
@@ -133,8 +144,14 @@ async function askWith(membrane: Membrane, stream: boolean, answer: Answer = { c
     messages: [{ role: 'user', content: 'Summarize these memories.' }],
   }, {
     requestId: 7,
-    respond: (result) => { answer.result = result; },
-    respondError: (code, message) => { answer.error = { code, message }; },
+    respond: (result) => {
+      answer.result = result;
+      answer.sent.push(`result:${result.content}`);
+    },
+    respondError: (code, message) => {
+      answer.error = { code, message };
+      answer.sent.push(`error:${message}`);
+    },
   });
 
   // Every answer is traced: an error by mcpl:inference_fail with its message,
@@ -146,10 +163,6 @@ async function askWith(membrane: Membrane, stream: boolean, answer: Answer = { c
     assert.strictEqual(last?.type, 'mcpl:inference_complete');
   }
   return answer;
-}
-
-function joined(chunks: InferenceChunkParams[]): string {
-  return chunks.map((chunk) => chunk.delta).join('');
 }
 
 const unnamedStop = (stopReason: string) =>
@@ -217,7 +230,7 @@ for (const mode of ['native', 'xml'] as const) {
       assert.strictEqual(answer.error, undefined);
       assert.strictEqual(answer.result?.content, 'Hello world');
       assert.strictEqual(answer.result?.finishReason, 'end_turn');
-      assert.strictEqual(joined(answer.chunks), 'Hello world');
+      assert.deepStrictEqual(answer.sent, ['chunk:Hello world', 'result:Hello world']);
       assert.ok(answer.chunks.every((chunk, i) => chunk.requestId === 7 && chunk.index === i));
     });
 
@@ -246,6 +259,7 @@ for (const mode of ['native', 'xml'] as const) {
 
       assert.strictEqual(answer.result, undefined);
       assert.deepStrictEqual(answer.error, { code: -32603, message: 'upstream connection reset' });
+      assert.deepStrictEqual(answer.sent, ['chunk:A summ', 'error:upstream connection reset']);
       assert.deepStrictEqual(answer.traces.map((trace) => trace.type), ['mcpl:inference_start', 'mcpl:inference_fail']);
       assert.deepStrictEqual(answer.traces.at(-1), {
         type: 'mcpl:inference_fail', serverId: 'scripted-server', model: 'default', error: 'upstream connection reset', streamed: true,
@@ -260,6 +274,7 @@ for (const mode of ['native', 'xml'] as const) {
 
       assert.strictEqual(answer.result, undefined);
       assert.deepStrictEqual(answer.error, { code: -32603, message: 'The inference stopped before it finished (timeout)' });
+      assert.deepStrictEqual(answer.sent, ['chunk:A summ', 'error:The inference stopped before it finished (timeout)']);
     });
 
     it('answers a refusal with the error, not end_turn', async () => {
@@ -274,7 +289,7 @@ for (const mode of ['native', 'xml'] as const) {
 
       assert.strictEqual(answer.result, undefined);
       assert.deepStrictEqual(answer.error, { code: -32603, message: PROVIDER_ERROR });
-      assert.strictEqual(joined(answer.chunks), 'A summ');
+      assert.deepStrictEqual(answer.sent, ['chunk:A summ', `error:${PROVIDER_ERROR}`]);
     });
   });
 
@@ -323,12 +338,17 @@ for (const mode of ['native', 'xml'] as const) {
   });
 }
 
-// A native tool call arrives as a typed tool_use block. membrane lists it in
-// toolCalls only when the stop is tool_use; a block cut off by another stop
-// stays in the content.
+// A native tool call arrives as a typed tool_use block. membrane's yielding
+// stream lists it in toolCalls only when the stop is tool_use, so a streamed
+// block cut off by another stop is only in the content, and only the router's
+// check of the content answers it. membrane's complete() lists every tool_use
+// block in toolCalls as well as in the content, so the router's checks of
+// toolCalls and of the content each answer the case that isn't streamed, which
+// makes it a control for each check.
 describe('MCPL inference router, native mode: a tool_use block', () => {
   for (const stream of [true, false]) {
-    it(`answers a tool_use block cut off at max_tokens with the error, ${stream ? 'streamed' : 'not streamed'}`, async () => {
+    const how = stream ? 'streamed' : 'not streamed (a control: either check answers it)';
+    it(`answers a tool_use block cut off at max_tokens with the error, ${how}`, async () => {
       const answer = await ask(
         { chunks: ['Let me look that up.'], stopReason: 'max_tokens', toolUse: 'search' },
         { stream, mode: 'native' },
@@ -349,7 +369,7 @@ describe('MCPL inference router, xml mode: what the text carries', () => {
     assert.strictEqual(answer.result, undefined);
     assert.deepStrictEqual(answer.error, { code: -32603, message: CALLED_A_TOOL });
     assert.strictEqual(answer.stream?.isWaitingForTools, false);
-    assert.strictEqual(joined(answer.chunks), 'Let me look that up.\n');
+    assert.deepStrictEqual(answer.sent, ['chunk:Let me look that up.\n', `error:${CALLED_A_TOOL}`]);
   });
 
   it('answers a tool call with the error, not its markup as content, when not streamed', async () => {
@@ -400,7 +420,7 @@ describe('MCPL inference router, xml mode: what the text carries', () => {
     }, { stream: true, mode: 'xml' });
 
     assert.strictEqual(answer.result?.content, 'They met twice.');
-    assert.strictEqual(joined(answer.chunks), 'They met twice.');
+    assert.deepStrictEqual(answer.sent, ['chunk:They met twice.', 'result:They met twice.']);
   });
 });
 
@@ -442,6 +462,6 @@ describe('MCPL inference router: a stream that ends with no terminal event', () 
 
     assert.strictEqual(answer.result, undefined);
     assert.deepStrictEqual(answer.error, { code: -32603, message: 'The inference stream ended without a result' });
-    assert.strictEqual(joined(answer.chunks), 'Hel');
+    assert.deepStrictEqual(answer.sent, ['chunk:Hel', 'error:The inference stream ended without a result']);
   });
 });

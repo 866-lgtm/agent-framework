@@ -82,15 +82,17 @@ function wildcardMatch(pattern: string, name: string): boolean {
  */
 function resultFrom(response: NormalizedResponse, model: string): McplInferenceRequestResult {
   // A provider can end an inference with finish_reason 'error' and no error
-  // object. membrane's adapters fail a stream on a frame that carries one, as
-  // OpenRouter's mid-stream error does, but pass the token alone through, and
-  // membrane, having no stop reason for it, normalizes it to end_turn and
-  // keeps it as providerReason.
+  // object. membrane 0.5.87's OpenAI-style adapters fail a stream on a frame
+  // that carries one, as OpenRouter's mid-stream error does, but pass the token
+  // alone through, and membrane, having no stop reason for it, normalizes it
+  // to end_turn and keeps it as providerReason.
   if (response.details.stop.providerReason === 'error') {
     throw new Error("The provider ended the inference with an error (finish_reason 'error')");
   }
-  // membrane's toolCalls holds a native tool call only when the stop was
-  // tool_use. A tool_use block cut off by another stop stays in the content.
+  // membrane's yielding stream lists a native tool call in toolCalls only
+  // when the stop was tool_use, so a tool_use block cut off by another stop is
+  // only in the content. membrane's complete() lists every tool_use block in
+  // toolCalls, whatever the stop.
   const toolUses = response.content.filter((b: ContentBlock): b is ContentBlock & { type: 'tool_use' } => b.type === 'tool_use');
   if (response.toolCalls.length > 0 || toolUses.length > 0) {
     throw toolCallError(response.toolCalls.length > 0 ? response.toolCalls : toolUses);
