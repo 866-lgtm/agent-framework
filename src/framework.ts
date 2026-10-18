@@ -3085,14 +3085,20 @@ export class AgentFramework {
   }
 
   /**
-   * Start the event loop.
+   * Start the event loop. A start() on a running framework does nothing.
+   * Refused, with an error, from a stop() call until that stop() settles,
+   * since that stop would wait on the lifecycle a start() begins, or tear it
+   * down under it. What a start() after a settled stop() should do is #315's
+   * question.
    */
   start(): void {
+    // Before the running check: stop() claims its attempt before it clears
+    // running, so a start() made in its first steps, such as from a trace
+    // listener, is refused too.
+    this.resetCompletedStop('start()');
     if (this.running) {
       return;
     }
-
-    this.resetCompletedStop();
 
     this.running = true;
     this.providerAdmissionClosed = false;
@@ -3125,9 +3131,10 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. Each step of the teardown runs whatever an earlier
-   * one did: one that throws, such as a host stream's cancel(), fails the
-   * stop() once the rest has run. When a step or a wait up to and including
+   * Stop the event loop. Until it settles, start() and addModule() are
+   * refused. Each step of the teardown runs whatever an earlier one did: one
+   * that throws, such as a host stream's cancel(), fails the stop() once the
+   * rest has run. When a step or a wait up to and including
    * the wait on awareness drains fails or times out, storage stays open and
    * stop() can be called again; one that fails after it, in the storage work
    * that finishes the stop, fails the stop() without keeping storage open.
@@ -3160,7 +3167,8 @@ export class AgentFramework {
    *   land in the run's namespace after them.
    * - an event loop still in a call, such as a module's onProcess, finishes
    *   that call and the rest of its iteration, and then exits. A start()
-   *   made meanwhile runs its own loop beside that last iteration.
+   *   made once that stop() has failed runs its own loop beside that last
+   *   iteration.
    * - a later stop() waits again, within its own budget, for any stream or
    *   loop this one left running, so the store never closes under it.
    */
@@ -3187,8 +3195,15 @@ export class AgentFramework {
     return attempt;
   }
 
-  private resetCompletedStop(): void {
+  /** What start() and addModule() pass before either begins work of a
+   * lifecycle. A stop() still running refuses both, from the moment it
+   * claims its attempt until that attempt settles. A failed stop() has
+   * cleared its attempt, unless it closed an owned store, which is refused
+   * first. A completed stop() is cleared, and the call goes on as before;
+   * whether a lifecycle should begin after a stop() is #315's question. */
+  private resetCompletedStop(verb: 'start()' | 'addModule()'): void {
     if (this.ownedStoreClosed) throw new Error('Cannot start a new lifecycle: owned store is closed');
+    if (this.stopPromise && !this.stopCompleted) throw new Error(`${verb} refused: the framework is stopping`);
     if (this.stopCompleted) {
       this.stopPromise = null;
       this.stopCompleted = false;
@@ -3269,7 +3284,7 @@ export class AgentFramework {
     for (const wake of [...this.retryWaitWakers]) step(wake);
     this.lifecycleGeneration++;
     // The generation this stop ends; withheld spills close for it alone, so a
-    // start() made before this stop finishes reopens them for its own.
+    // start() after this stop has settled reopens them for its own.
     const stoppingGeneration = this.lifecycleGeneration;
     step(() => this.queue.close());
     step(() => this.tuneOutCoordinator?.stop());
@@ -3413,10 +3428,8 @@ export class AgentFramework {
     // hold, and a run whose stream is still running would otherwise wait for
     // its idle watchdog. Its end stores its queue, as at any run's end; that
     // stream's late events are dropped once the run has left, and a later
-    // stop() waits for the stream itself (leftRunning). (A start() during a
-    // stop() is #315's. One made before the loop ended keeps a loop running,
-    // so this stop waits for it, up to its budget; one made just after,
-    // before this point, has its runs ended here too.)
+    // stop() waits for the stream itself (leftRunning). (A start() is refused
+    // until this stop() settles, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
@@ -3510,10 +3523,8 @@ export class AgentFramework {
     // No stream is left, unless its wait above ran out or its cancel threw:
     // from the start of stop() none registers and no agent turn starts
     // (providerAdmissionClosed, checked for every agent), and every stream
-    // registered before was cancelled and awaited above.
-    // (A start() made before this stop finishes reopens admission, so a turn
-    // it begins can be alive here and take one of these entries mid-stream;
-    // #315 asks how start() after stop() should behave.)
+    // registered before was cancelled and awaited above. (A start(), which
+    // would reopen admission, is refused until this stop() settles.)
     // What is still deferred (a message held for a turn's end whose flush
     // found the target busy again, or one deferred behind its target's own
     // state) would wait for a flush that may never come. Land each at its
@@ -4593,10 +4604,13 @@ export class AgentFramework {
   }
 
   /**
-   * Add a module at runtime.
+   * Add a module at runtime. Refused, with a rejection, while a stop() is
+   * still running: a module added then would either be stopped by that stop
+   * or, once the stop has taken its list of modules to stop, stay started
+   * past it.
    */
   async addModule(module: Module): Promise<void> {
-    this.resetCompletedStop();
+    this.resetCompletedStop('addModule()');
     await this.moduleRegistry.addModule(module);
     this.emitTrace({ type: 'module:added', moduleName: module.name });
   }
@@ -5145,7 +5159,7 @@ export class AgentFramework {
    *  is open again for an instance kept with a store it doesn't own and that
    *  is still open (start() doesn't restore stopped modules or MCPL
    *  connections, and refuses an owned store that stop() closed). A start()
-   *  made while a stop() is still draining isn't a supported order. */
+   *  made while a stop() is still running is refused. */
   private guardSpillsClosedFor: number | null = null;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
