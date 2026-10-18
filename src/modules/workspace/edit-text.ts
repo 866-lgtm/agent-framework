@@ -133,7 +133,7 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         : `edits ${a + 1} and ${b + 1} overlap in ${problem.path} (from line ${problem.line}); give each its own stretch of text, or make them one edit.`;
     }
     case 'crowded':
-      return `they find ${problem.found.toLocaleString('en-US')} occurrences between them in ${problem.path}, which has ${problem.length.toLocaleString('en-US')} characters, `
+      return `they find ${problem.found.toLocaleString('en-US')} occurrences between them in ${problem.path}, whose text, with its line ends read as LF, is ${problem.length.toLocaleString('en-US')} UTF-16 code units long, `
         + 'so some of their matches overlap; give each its own stretch of text.';
     case 'same':
       return `oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as ${problem.path}'s own, which the file keeps, so there's nothing to change.`;
@@ -164,8 +164,8 @@ export function cutLine(line: string): string {
  * The answer's last line: what it left out, and what to do. `cut` parts left
  * out their details; `problems` and `notes` weren't shown at all. A refusal
  * that leaves out problems, and shows at least one, says to answer those
- * shown and send the call again to see the rest; sending it again shows no
- * more of a problem whose details alone were left out. For edits stored, the
+ * shown and send the call again to see the rest: once those are answered,
+ * their room can show the rest, details included. For edits stored, the
  * problems are the files disk refused, and a last line that leaves some out
  * points to ls.
  */
@@ -282,8 +282,9 @@ function regionOf(updated: string, change: Change): Region {
 const CHANGE_LEAD = 80;
 
 /**
- * A line too long to show whole, numbered, as a stretch for each change that
- * starts on it, at the ascending `columns`: from at most CHANGE_LEAD
+ * A line too long to show whole, numbered, as a stretch for each change the
+ * receipt shows that starts on it (an edit's first change), at the ascending
+ * `columns`: from at most CHANGE_LEAD
  * characters before the change, for as much as read shows of a line.
  * Stretches that meet run together, and each stretch of the line left out is
  * marked with how many characters it holds.
@@ -332,8 +333,8 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     const slice = plan.updated.slice(region.start, region.end);
     const lines = slice.split('\n');
     if (slice.endsWith('\n')) lines.pop();
-    // A line too long to show whole shows its start, or, where changes
-    // start on it, a stretch from shortly before each.
+    // A line too long to show whole shows its start, or, where edits' first
+    // changes start on it, a stretch from shortly before each.
     let lineStart = region.start;
     const shown = lines.map((text, k) => {
       const n = region.from + k;

@@ -8,7 +8,7 @@
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
-import { join, posix, resolve, relative, sep } from 'node:path';
+import { join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -1186,7 +1186,7 @@ export class WorkspaceModule implements Module {
           + "occurrences that overlap count, but can't each be replaced. "
           + "Each edit is matched in its file as this call reads it, never in another edit's result, so the list's order doesn't matter, "
           + "and two edits' matches may touch but not overlap. Matching is edit's. "
-          + "A refusal names every problem, each by its edit's number in the list (from 1). "
+          + "A refusal names the problems it finds, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
           + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
           + "The answer shows each edit's first changed region, numbered, a long line from shortly before each change on it, as its length allows.",
@@ -2076,9 +2076,12 @@ export class WorkspaceModule implements Module {
     // A store can fail after its record lands: Chronicle 0.4 writes a state's
     // auto-snapshot after appending its update, and that failure reaches the
     // caller with the update recorded (anima-research/chronicle#39). So a set
-    // that threw is read back, and where every path holds what its change
-    // sets, the record is in: the paths' intents follow, as for any set, and
-    // then the error goes on in place of the push.
+    // that threw is read back, and where every path it changes holds what its
+    // change leaves, the record is in: the paths' intents follow, as for any
+    // set, and then the error goes on in place of the push. A change the tree
+    // already holds can't show whether the record is in, so a call whose every
+    // change the tree holds already goes on as the store's own failure.
+    const changing = changes.filter(({ path, change }) => !holds(store.treeGet(mount.treeStateId, path), change));
     let landedThenThrew: { error: unknown } | null = null;
     try {
       if (changes.length === 1) {
@@ -2092,7 +2095,7 @@ export class WorkspaceModule implements Module {
           : { op: 'remove', path })));
       }
     } catch (error) {
-      if (!changesLanded(store, mount.treeStateId, changes, error)) throw error;
+      if (changing.length === 0 || !changesLanded(store, mount.treeStateId, changing, error)) throw error;
       landedThenThrew = { error };
     }
     // A later intent update or disk push can throw; the tree entries are
@@ -2116,7 +2119,7 @@ export class WorkspaceModule implements Module {
         return next;
       });
     }
-    if (landedThenThrew) throw landedThenThrew.error;
+    if (landedThenThrew) throw new StoredThenFailed(landedThenThrew.error, this.pushesOnCommit(mount));
     const refused = new Map<string, string>();
     if (!this.pushesOnCommit(mount)) return refused;
 
@@ -2389,7 +2392,9 @@ export class WorkspaceModule implements Module {
       });
     } catch (error) {
       if (!committed) throw error;
-      return storedButUnfinished('write', input.path, { threw: error instanceof Error ? error.message : String(error) });
+      return storedButUnfinished('write', input.path, error instanceof StoredThenFailed
+        ? { storeFailed: error.message, pushes: error.pushes }
+        : { threw: error instanceof Error ? error.message : String(error) });
     }
     if (refused !== null) return storedButUnfinished('write', input.path, { refused });
 
@@ -2432,12 +2437,13 @@ export class WorkspaceModule implements Module {
    * there refuses edit at once, before anything is read, and edit_many when
    * its edits name more than one mount, which no one pass settles. Otherwise
    * edit_many goes on to settle and plan the rest, so its one refusal names
-   * every problem; the settling is what a read or a listing of its files
-   * would take in from disk, and the refusal says what it took in. A failure
-   * before the commit sets the entries stores none of them, and edit_many's
-   * answer to it says so. A store that throws as it sets them is read back
-   * (commitToolChanges), so the answer says they're stored where its record
-   * landed, and that it can't tell where they couldn't be read back.
+   * the problems it finds; the settling is what a read or a listing of its
+   * files would take in from disk, and the refusal says what it took in. A
+   * failure before the commit sets the entries stores none of them, and
+   * edit_many's answer to it says so. A store that throws as it sets them is
+   * read back (commitToolChanges), so the answer says they're stored where
+   * its record landed, and that it can't tell where they couldn't be read
+   * back.
    * Under the mount's turn, one pass settles every path with disk, by the
    * rule a listing uses, so the edits apply to what disk now holds. That pass
    * is the only step that awaits before the commit: every file is then read,
@@ -2657,19 +2663,28 @@ export class WorkspaceModule implements Module {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (committed) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { threw: message }, maxChars);
-      if (tool === 'edit_many') {
-        if (error instanceof CommitUnknownError) {
-          return {
-            success: false,
-            isError: true,
-            error: `The edit_many call can't tell whether it stored its edits: ${cutLine(message)}. Read its files before sending it again: a second call can apply its edits twice.`,
-          };
-        }
-        // The commit sets every entry in one record or none, and a set that
-        // threw was read back, so nothing is stored.
-        return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
+      if (committed) {
+        return this.editsStoredButUnfinished(tool, [...targets.values()], applied, error instanceof StoredThenFailed
+          ? { storeFailed: message, pushes: error.pushes }
+          : { threw: message }, maxChars);
       }
+      // A set that threw and couldn't be read back may have stored the edits,
+      // and a second call could then apply them twice.
+      if (error instanceof CommitUnknownError) {
+        const [set, read] = [cutLine(error.setError), cutLine(error.readError)];
+        return {
+          success: false,
+          isError: true,
+          error: tool === 'edit_many'
+            ? `The edit_many call can't tell whether it stored its edits: the store failed as it set them (${set}), and reading them back failed too (${read}). `
+              + 'Read its files before sending it again: a second call can apply its edits twice.'
+            : `Whether the edit of "${[...targets.values()][0]!.path}" is stored isn't known: the store failed as it set it (${set}), and reading it back failed too (${read}). `
+              + 'Read the file before sending the edit again: a second edit can apply the change twice.',
+        };
+      }
+      // The commit sets every entry in one record or none, and a set that
+      // threw was read back, so nothing is stored.
+      if (tool === 'edit_many') return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
       throw error;
     }
   }
@@ -2690,10 +2705,16 @@ export class WorkspaceModule implements Module {
     try {
       const where = this.parsePath(path);
       // The workspace keeps an entry for each spelling of a path, so a path
-      // with an empty, "." or ".." segment would be an entry apart from the
-      // file's own, and two spellings in one call two plans of one file.
-      const plain = posix.normalize(where.relativePath).replace(/\/$/, '');
+      // with an empty, "." or ".." segment, a trailing separator, or on
+      // Windows a backslash, would be an entry apart from the file's own, and
+      // two spellings in one call two plans of one file. Its plain spelling is
+      // where it resolves in the mount, as the containment check resolves it.
+      // A path whose part in the mount starts with a separator resolves
+      // outside it, and parsePath refuses that first.
+      const root = resolve(where.mount.config.path);
+      const plain = relative(root, resolve(root, where.relativePath)).split(sep).join('/');
       if (where.relativePath !== '' && plain !== where.relativePath) {
+        if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file.`);
         const named = `${where.mount.config.name}/${plain}`;
         return unusable(`${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from ${named}, the same file on disk; name it ${named}.`);
       }
@@ -2719,7 +2740,8 @@ export class WorkspaceModule implements Module {
 
   /**
    * The answer to edits stored but not finished: the commit set every file's
-   * entry, and then disk refused some of their pushes, or the rest of the call
+   * entry, and then disk refused some of their pushes, or the store failed
+   * after recording them, so their push didn't run, or the rest of the call
    * failed. It stays an error, since part of the call failed, and leads with
    * what is stored, which must not be sent again: a second call can apply
    * those edits twice. edit's is the answer write and delete give, one path's;
@@ -2730,14 +2752,12 @@ export class WorkspaceModule implements Module {
     tool: EditTool,
     targets: EditTarget[],
     applied: Map<EditTarget, string | null>,
-    outcome: { refused: Map<string, string> } | { threw: string },
+    outcome: { refused: Map<string, string> } | { threw: string } | { storeFailed: string; pushes: boolean },
     maxChars: number,
   ): ToolResult {
     if (tool === 'edit') {
       const [target] = targets;
-      return 'refused' in outcome
-        ? storedButUnfinished('edit', target!.path, { refused: outcome.refused.get(target!.relativePath)! }, applied.get(target!) ?? null)
-        : storedButUnfinished('edit', target!.path, { threw: outcome.threw }, applied.get(target!) ?? null);
+      return storedButUnfinished('edit', target!.path, 'refused' in outcome ? { refused: outcome.refused.get(target!.relativePath)! } : outcome, applied.get(target!) ?? null);
     }
     const stored = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
     // The head is never cut, so what stands for the whole call goes in it,
@@ -2756,6 +2776,9 @@ export class WorkspaceModule implements Module {
         const reason = outcome.refused.get(target.relativePath);
         if (reason !== undefined) parts.push(`${target.path}: ${reason}`);
       }
+    } else if ('storeFailed' in outcome) {
+      head = `${stored}\n\nThe store failed after recording them: ${cutLine(outcome.storeFailed)}.`
+        + (outcome.pushes ? " Their push to disk didn't run, so disk lacks them until a materialize of their files writes them." : '');
     } else {
       head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}. ls shows each path's state.`;
     }
@@ -2790,7 +2813,9 @@ export class WorkspaceModule implements Module {
       });
     } catch (error) {
       if (!committed) throw error;
-      return storedButUnfinished('delete', input.path, { threw: error instanceof Error ? error.message : String(error) });
+      return storedButUnfinished('delete', input.path, error instanceof StoredThenFailed
+        ? { storeFailed: error.message, pushes: error.pushes }
+        : { threw: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -3647,10 +3672,20 @@ interface EditTarget {
 }
 
 /**
+ * Whether a tree entry is what a change leaves: for a set, an entry with its
+ * blob, size and mode; for a removal, none.
+ */
+function holds(entry: ReturnType<JsStore['treeGet']>, change: ToolChange): boolean {
+  return change.kind === 'set'
+    ? entry !== null && entry.blobHash === change.blobHash && entry.size === change.size && entry.mode === (change.mode ?? 0o644)
+    : entry === null;
+}
+
+/**
  * Whether a store's set that threw recorded the changes anyway: every path
- * holds what its change sets. One record takes all of them or none, so a
- * change that set an entry to what it already held can't make it look
- * stored when the rest isn't. Reading them back can fail too, and then
+ * holds what its change leaves. The changes given are those the tree didn't
+ * hold before the set, and one record takes all of them or none, so their
+ * holding shows the record is in. Reading them back can fail too, and then
  * whether they're stored isn't known (CommitUnknownError).
  */
 function changesLanded(
@@ -3660,10 +3695,7 @@ function changesLanded(
   setError: unknown,
 ): boolean {
   try {
-    return changes.every(({ path, change }) => {
-      const entry = store.treeGet(treeStateId, path);
-      return change.kind === 'set' ? entry?.blobHash === change.blobHash : entry === null;
-    });
+    return changes.every(({ path, change }) => holds(store.treeGet(treeStateId, path), change));
   } catch (readError) {
     throw new CommitUnknownError(setError, readError);
   }
@@ -3674,10 +3706,27 @@ function changesLanded(
  * change is stored isn't known. Its message says so after both errors.
  */
 class CommitUnknownError extends Error {
+  readonly setError: string;
+  readonly readError: string;
   constructor(setError: unknown, readError: unknown) {
     const text = (error: unknown) => (error instanceof Error ? error.message : String(error));
     super(`${text(setError)}; reading its entries back failed too (${text(readError)}), so whether the change is stored isn't known`);
     this.name = 'CommitUnknownError';
+    this.setError = text(setError);
+    this.readError = text(readError);
+  }
+}
+
+/**
+ * A store's set that threw after recording the change (changesLanded): the
+ * entries are set and their intents follow, and the store's error goes on in
+ * place of the push. `pushes` says whether the mount would have pushed the
+ * change to disk.
+ */
+class StoredThenFailed extends Error {
+  constructor(storeError: unknown, readonly pushes: boolean) {
+    super(storeError instanceof Error ? storeError.message : String(storeError));
+    this.name = 'StoredThenFailed';
   }
 }
 
@@ -3694,7 +3743,7 @@ class CommitUnknownError extends Error {
 function storedButUnfinished(
   tool: 'write' | 'edit' | 'delete',
   path: string,
-  outcome: { refused: string } | { threw: string },
+  outcome: { refused: string } | { threw: string } | { storeFailed: string; pushes: boolean },
   note: string | null = null,
 ): ToolResult {
   const change = tool === 'delete' ? 'deletion' : tool;
@@ -3702,7 +3751,12 @@ function storedButUnfinished(
     + (tool === 'edit' ? ': a second edit can apply the change twice.' : '.');
   const rest = 'refused' in outcome
     ? ` Its push to disk didn't complete: ${outcome.refused}.`
-    : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
+    : 'storeFailed' in outcome
+      ? ` The store failed after recording it: ${outcome.storeFailed}.` + (!outcome.pushes ? ''
+        : tool === 'delete'
+          ? ' Its push to disk didn\'t run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.'
+          : ' Its push to disk didn\'t run, so disk lacks the change until a materialize of the path writes it.')
+      : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
   return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : '') };
 }
 

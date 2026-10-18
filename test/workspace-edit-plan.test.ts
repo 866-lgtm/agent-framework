@@ -124,9 +124,15 @@ test("edits whose asks past what a refusal shows come to more than the text's ch
   const [count] = problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]);
   assert.deepEqual(count, { ...count, kind: 'count', edit: 1, found: 100, expected: 150, overlapping: false });
   assert.equal(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]).length, 1);
-  // Asks that fit past what a refusal shows are matched and named as clashes.
+  // Where the rest still find more than the text's characters, their overlap
+  // is named beside the count.
+  assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 150)]).map((problem) => problem.kind), ['count', 'crowded']);
+  // Asks that fit past what a refusal shows are matched as before: a count
+  // that differs is named, and two edits of one text clash.
   assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 21)]).map((problem) => problem.kind), ['count']);
   assert.deepEqual(problems('x x x\n', [spec(0, 'x', 'a', 3), spec(1, 'x', 'b', 3)]), [{ kind: 'clash', edits: [0, 1], line: 1, same: true }]);
+  // And asks past it that fit apply in full: these keep every start, not the 20 a refusal shows.
+  assert.equal(plan(`${'x'.repeat(100)}${'y'.repeat(100)}\n`, [spec(0, 'x', 'a', 100), spec(1, 'y', 'b', 100)]).bytes.toString(), `${'a'.repeat(100)}${'b'.repeat(100)}\n`);
 });
 
 test('edits asking for millions of occurrences each are refused in a small heap', () => {

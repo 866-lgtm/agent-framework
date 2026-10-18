@@ -314,9 +314,10 @@ export type MatchProblem =
   | { kind: 'clash'; edits: [number, number]; line: number; same: boolean }
   /**
    * Edits that each found the occurrences they ask for, more of them between
-   * them than the text has characters: each takes one or more, and one
-   * edit's don't overlap one another, so some of different edits' do. Named
-   * in place of their clashes, whose places aren't kept (planFile).
+   * them than the text is long (`length`, in UTF-16 code units with line ends
+   * as LF): each takes one or more, and one edit's don't overlap one another,
+   * so some of different edits' do. Named in place of their clashes, whose
+   * places aren't kept (planFile).
    */
   | { kind: 'crowded'; edits: number[]; found: number; length: number }
   /**
@@ -508,8 +509,10 @@ export function planFile(
     applied.push({ spec: matched, starts, count });
   }
   if (crowded) {
-    // The edits that found what they ask for found more occurrences than the
-    // text has characters, so some overlap, though where isn't kept.
+    // Where the edits that found what they ask for found more occurrences
+    // than the text is long, some of theirs overlap, though where isn't kept,
+    // so they're named as crowded; otherwise only the loop's problems are,
+    // since some edit didn't find what it asked for.
     const found = applied.reduce((sum, { count }) => sum + count, 0);
     if (found > value.length) problems.push({ kind: 'crowded', edits: applied.map(({ spec }) => spec.index), found, length: value.length });
     return { problems };

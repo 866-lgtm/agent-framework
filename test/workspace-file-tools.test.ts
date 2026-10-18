@@ -184,26 +184,38 @@ test('a write, edit or delete that throws after its tree entry is set says the c
 });
 
 test('a write, edit or delete whose store throws after recording it says the change is stored', async (t) => {
-  const { store, dir, call, stored } = setup(t);
+  const { workspace, store, dir, call, stored } = setup(t);
   writeFileSync(join(dir, 'e.txt'), 'line\n');
   writeFileSync(join(dir, 'd.txt'), 'doomed\n');
   assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
   assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
-  // The record lands, then the store throws, as Chronicle 0.4 does when the
-  // auto-snapshot it writes after recording fails (anima-research/chronicle#39).
+  // The change's record lands, then the store throws, as Chronicle 0.4 does
+  // when the auto-snapshot it writes after recording fails
+  // (anima-research/chronicle#39). Only that record's set throws: the
+  // intents' own records after it go through.
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  let armed = false;
   for (const name of ['treeSet', 'treeRemove']) {
     const real = s[name]!;
-    s[name] = (...args) => { real.apply(store, args); throw new Error('No space left on device (os error 28)'); };
+    s[name] = (...args) => {
+      const record = real.apply(store, args);
+      if (!armed) return record;
+      armed = false;
+      throw new Error('No space left on device (os error 28)');
+    };
   }
   try {
+    armed = true;
     assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'new\n' })),
-      'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. The rest of the call failed: No space left on device (os error 28). ls shows the path\'s state.');
+      'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+    armed = true;
     assert.equal(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' })),
       'The edit of "work/e.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
-      + 'The rest of the call failed: No space left on device (os error 28). ls shows the path\'s state.');
+      + 'The store failed after recording it: No space left on device (os error 28).');
+    armed = true;
     assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
-      'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The rest of the call failed: No space left on device (os error 28). ls shows the path\'s state.');
+      'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+    assert.equal(armed, false);
   } finally {
     delete s.treeSet;
     delete s.treeRemove;
@@ -211,11 +223,124 @@ test('a write, edit or delete whose store throws after recording it says the cha
   assert.equal(await stored('w.txt'), 'new\n');
   assert.equal(await stored('e.txt'), 'line, edited\n');
   assert.equal((await call('read', { path: 'work/d.txt' })).success, false);
+
+  // A store that throws before recording a change leaves it unstored, as
+  // reading it back shows, and the store's error is the answer.
+  writeFileSync(join(dir, 'k.txt'), 'kept\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  for (const name of ['treeSet', 'treeRemove']) s[name] = () => { throw new Error('injected store failure'); };
+  try {
+    assert.equal(errorOf(await call('write', { path: 'work/k.txt', content: 'changed\n' })), 'injected store failure');
+    assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'kept', newString: 'changed' })), 'injected store failure');
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+  } finally {
+    delete s.treeSet;
+    delete s.treeRemove;
+  }
+  assert.equal(await stored('k.txt'), 'kept\n');
+  // The read-back compares the whole entry: the same bytes under another mode
+  // aren't what the write sets, so an unrecorded write doesn't read as stored.
+  const treeStateId = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  store.treeSet(treeStateId, 'k.txt', { ...store.treeGet(treeStateId, 'k.txt')!, mode: 0o755 });
+  s.treeSet = () => { throw new Error('injected store failure'); };
+  try {
+    assert.equal(errorOf(await call('write', { path: 'work/k.txt', content: 'kept\n' })), 'injected store failure');
+  } finally {
+    delete s.treeSet;
+  }
+  // And a write the store records before throwing reads back as stored, since
+  // the entry's mode is now the write's.
+  const realSet = store.treeSet;
+  let once = true;
+  s.treeSet = (...args) => {
+    const record = realSet.apply(store, args as never);
+    if (!once) return record;
+    once = false;
+    throw new Error('No space left on device (os error 28)');
+  };
+  try {
+    assert.equal(errorOf(await call('write', { path: 'work/k.txt', content: 'kept\n' })),
+      'The write of "work/k.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+  } finally {
+    delete s.treeSet;
+  }
+  assert.equal(store.treeGet(treeStateId, 'k.txt')!.mode, 0o644);
   // The written path's intent followed the record, so the new file is a draft
   // the workspace made, not a file disk may have deleted.
   const edited = await call('edit', { path: 'work/w.txt', oldString: 'new', newString: 'newer' });
   assert.equal(edited.success, true, edited.error);
   assert.doesNotMatch(String((edited.data as { note?: string }).note ?? ''), /nothing records/);
+});
+
+test('on a mount that pushes, a write, edit or delete whose store throws after recording it says its push didn\'t run, and a materialize takes it to disk', async (t) => {
+  const { workspace, store, dir, call, disk } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'e.txt'), 'line\n');
+  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
+  assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  let armed = false;
+  for (const name of ['treeSet', 'treeRemove']) {
+    const real = s[name]!;
+    s[name] = (...args) => {
+      const record = real.apply(store, args);
+      if (!armed) return record;
+      armed = false;
+      throw new Error('No space left on device (os error 28)');
+    };
+  }
+  const failed = 'The store failed after recording it: No space left on device (os error 28). ';
+  const writes = "Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it.";
+  try {
+    armed = true;
+    assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'new\n' })),
+      `The write of "work/w.txt" is stored in the workspace, so don't send it again. ${failed}${writes}`);
+    armed = true;
+    assert.equal(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' })),
+      `The edit of "work/e.txt" is stored in the workspace, so don't send it again: a second edit can apply the change twice. ${failed}${writes}`);
+    armed = true;
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
+      `The deletion of "work/d.txt" is stored in the workspace, so don't send it again. ${failed}`
+      + "Its push to disk didn't run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.");
+    assert.equal(armed, false);
+  } finally {
+    delete s.treeSet;
+    delete s.treeRemove;
+  }
+  assert.equal(disk('w.txt'), null);
+  assert.equal(disk('e.txt')!.toString(), 'line\n');
+  assert.equal(disk('d.txt')!.toString(), 'doomed\n');
+  // As each answer says, a materialize of the path takes the change to disk.
+  for (const path of ['work/w.txt', 'work/e.txt']) {
+    const result = await call('materialize', { path });
+    assert.equal(result.success, true, result.error);
+  }
+  const deleted = await call('materialize', { path: 'work/d.txt', applyDeletions: true });
+  assert.equal(deleted.success, true, deleted.error);
+  assert.equal(disk('w.txt')!.toString(), 'new\n');
+  assert.equal(disk('e.txt')!.toString(), 'line, edited\n');
+  assert.equal(disk('d.txt'), null);
+
+  // A write of the bytes its path holds already leaves nothing a read back
+  // could tell apart, so a set that throws is answered with the store's
+  // error, whether it recorded first or not.
+  const treeStateId = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  const realSet = store.treeSet;
+  for (const records of [false, true]) {
+    const sets: unknown[][] = [];
+    s.treeSet = (...args) => {
+      sets.push(args.slice(0, 2));
+      if (records) realSet.apply(store, args as never);
+      throw new Error('No space left on device (os error 28)');
+    };
+    try {
+      assert.equal(errorOf(await call('write', { path: 'work/e.txt', content: 'line, edited\n' })), 'No space left on device (os error 28)');
+    } finally {
+      delete s.treeSet;
+    }
+    assert.deepEqual(sets, [[treeStateId, 'e.txt']]);
+  }
+  assert.equal(disk('e.txt')!.toString(), 'line, edited\n');
 });
 
 // ---------------------------------------------------------------------------

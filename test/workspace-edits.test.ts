@@ -461,7 +461,7 @@ test('a store that throws after recording the edits is read back: the answer say
     ],
   });
   const storedAll = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
-    + "The rest of the call failed: No space left on device (os error 28). ls shows each path's state.";
+    + 'The store failed after recording them: No space left on device (os error 28).';
   // The record lands, then the store throws, as Chronicle 0.4 does when the
   // auto-snapshot it writes after recording fails (anima-research/chronicle#39).
   s.treeBatch = (...args) => { real.treeBatch.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
@@ -472,7 +472,7 @@ test('a store that throws after recording the edits is read back: the answer say
     assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/b.txt', oldString: 'BETA', newString: 'beta' }] })), storedAll);
     assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' })),
       'The edit of "work/b.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
-      + "The rest of the call failed: No space left on device (os error 28). ls shows the path's state.");
+      + 'The store failed after recording it: No space left on device (os error 28).');
   } finally {
     delete s.treeBatch;
     delete s.treeSet;
@@ -483,19 +483,67 @@ test('a store that throws after recording the edits is read back: the answer say
   // A set that throws, and then the entries can't be read back either.
   let failed = false;
   s.treeBatch = () => { failed = true; throw new Error('injected batch failure'); };
+  s.treeSet = () => { failed = true; throw new Error('injected set failure'); };
   s.treeGet = (...args) => {
     if (failed) throw new Error('injected read failure');
     return real.treeGet.apply(store, args as never);
   };
   try {
     assert.equal(errorOf(await call('edit_many', both(['ALPHA', 'BETA'], ['alpha', 'beta']))),
-      "The edit_many call can't tell whether it stored its edits: injected batch failure; reading its entries back failed too (injected read failure), "
-      + "so whether the change is stored isn't known. Read its files before sending it again: a second call can apply its edits twice.");
+      "The edit_many call can't tell whether it stored its edits: the store failed as it set them (injected batch failure), "
+      + 'and reading them back failed too (injected read failure). Read its files before sending it again: a second call can apply its edits twice.');
+    failed = false;
+    assert.equal(errorOf(await call('edit', { path: 'work/a.txt', oldString: 'ALPHA', newString: 'alpha' })),
+      'Whether the edit of "work/a.txt" is stored isn\'t known: the store failed as it set it (injected set failure), '
+      + 'and reading it back failed too (injected read failure). Read the file before sending the edit again: a second edit can apply the change twice.');
   } finally {
     delete s.treeBatch;
+    delete s.treeSet;
     delete s.treeGet;
   }
   assert.equal(await stored('a.txt'), 'ALPHA\n');
+
+  // A path whose entry already held its new bytes isn't read back, so it
+  // can't make an unrecorded batch read as stored.
+  await file('q.txt', 'it’s\n');
+  s.treeBatch = () => { throw new Error('injected batch failure'); };
+  try {
+    assert.equal(errorOf(await call('edit_many', {
+      edits: [
+        // Matched with quotes treated as equal, this edit leaves the file's bytes as they were.
+        { path: 'work/q.txt', oldString: "it's", newString: 'it’s' },
+        { path: 'work/a.txt', oldString: 'ALPHA', newString: 'alpha' },
+      ],
+    })), 'The edit_many call stored none of its edits: injected batch failure');
+  } finally {
+    delete s.treeBatch;
+  }
+  assert.equal(await stored('a.txt'), 'ALPHA\n');
+});
+
+test('on a mount that pushes, edits whose store throws after recording them say their push didn\'t run, and a materialize writes them', async (t) => {
+  const { store, call, disk, file } = setup(t, { autoMaterialize: true });
+  await file('a.txt', 'alpha\n');
+  await file('b.txt', 'beta\n');
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const real = store.treeBatch;
+  s.treeBatch = (...args) => { real.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
+  try {
+    assert.equal(errorOf(await call('edit_many', {
+      edits: [
+        { path: 'work/a.txt', oldString: 'alpha', newString: 'ALPHA' },
+        { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' },
+      ],
+    })), "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
+      + "The store failed after recording them: No space left on device (os error 28). Their push to disk didn't run, so disk lacks them until a materialize of their files writes them.");
+  } finally {
+    delete s.treeBatch;
+  }
+  assert.equal(disk('a.txt')!.toString(), 'alpha\n');
+  assert.equal(disk('b.txt')!.toString(), 'beta\n');
+  assert.equal((await call('materialize', { mount: 'work' })).success, true);
+  assert.equal(disk('a.txt')!.toString(), 'ALPHA\n');
+  assert.equal(disk('b.txt')!.toString(), 'BETA\n');
 });
 
 test('an edit names its path plainly: a path with an empty, "." or ".." segment is refused, naming the plain spelling', async (t) => {
@@ -505,8 +553,15 @@ test('an edit names its path plainly: a path with an empty, "." or ".." segment 
   assert.equal((await call('ls', { path: 'work/sub' })).success, true);
   const refusal = (path: string) =>
     `${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from work/sub/b.txt, the same file on disk; name it work/sub/b.txt.`;
-  for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/']) {
+  // The mount's directory is "mount", so "../mount/" leaves it and comes back.
+  for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/', 'work/../mount/sub/b.txt']) {
     assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), refusal(path));
+  }
+  assert.equal(errorOf(await call('edit', { path: 'work/.', oldString: 'one', newString: 'ONE' })), 'work/. names the root of mount "work", which isn\'t a file.');
+  // Dots inside a name are a plain spelling.
+  for (const name of ['..b.txt', 'b.', 'a..b']) {
+    const error = errorOf(await call('edit', { path: `work/sub/${name}`, oldString: 'one', newString: 'ONE' }));
+    assert.doesNotMatch(error, /plain spelling|root of mount/);
   }
   // Named two ways in one call, one file would be two plans of one text.
   assert.equal(errorOf(await call('edit_many', {
@@ -526,7 +581,8 @@ test("edits that find more occurrences between them than the file has characters
   assert.equal(errorOf(await call('edit_many', {
     edits: ['a', 'b', 'c'].map((newString) => ({ path: 'work/x.txt', oldString: 'x', newString, occurrences: 100 })),
   })), 'The edit_many call stored none of its edits: 1 problem.\n\n'
-    + 'edits 1–3: they find 300 occurrences between them in work/x.txt, which has 101 characters, so some of their matches overlap; give each its own stretch of text.');
+    + 'edits 1–3: they find 300 occurrences between them in work/x.txt, whose text, with its line ends read as LF, is 101 UTF-16 code units long, '
+    + 'so some of their matches overlap; give each its own stretch of text.');
   assert.equal(await stored('x.txt'), `${'x'.repeat(100)}\n`);
 });
 
