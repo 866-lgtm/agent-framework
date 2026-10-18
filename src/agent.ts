@@ -1351,7 +1351,7 @@ export class Agent {
    * The request fields that come from this agent's own settings: its model
    * config, prompt caching and cache TTL, prefill message, provider
    * parameters and participant name. Every request the agent sends takes
-   * them from here, a framework turn's (buildActivationRequest) and the
+   * them from here, a framework turn's (assembleActivationRequest) and the
    * direct API's (runInferenceWithInjections), so a setting reaches both or
    * neither.
    */
