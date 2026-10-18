@@ -337,6 +337,6 @@ describe('a script given such data', () => {
     }
     assert.ok(!text.includes(SIGNATURE), text);
     assert.match(text, /^zz-text\n\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/);
-    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: reference has no server binding/.test(line)), logged.join('\n'));
+    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: reference unbound: no server is recorded to fetch it from/.test(line)), logged.join('\n'));
   });
 });
