@@ -1291,11 +1291,11 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         );
         assert.strictEqual(first.stdout, 'started\n');
         writeFileSync(join(dir, 'line'), '');
-        await until(() => logged.some((l) => l.includes('stdout while no script runs: left-running')), 'its line in the log');
-        const line = logged.find((l) => l.includes('stdout while no script runs: left-running'));
-        assert.match(line ?? '', /stdout while no script runs: left-running x{1987} \[… 1013 more characters\]$/);
+        await until(() => logged.some((l) => l.includes('stdout while its interpreter runs no script: left-running')), 'its line in the log');
+        const line = logged.find((l) => l.includes('stdout while its interpreter runs no script: left-running'));
+        assert.match(line ?? '', /stdout while its interpreter runs no script: left-running x{1987} \[… 1013 more characters\]$/);
         writeFileSync(join(dir, 'half'), '');
-        await until(() => logged.some((l) => l.endsWith('stdout while no script runs: caf')), 'its half character in the log');
+        await until(() => logged.some((l) => l.endsWith('stdout while its interpreter runs no script: caf')), 'its half character in the log');
         // The half character it left is the log's, not the next script's.
         const next = await runner.exec('print("next")', []);
         assert.strictEqual(next.stdout, 'next\n');
@@ -1310,6 +1310,58 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           [],
         );
         assert.strictEqual(during.stdout, 'during-line\nafter it\n');
+      } finally {
+        runner.dispose();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("a command left running outlives its interpreter's reclaim, writing to the host's log, and a later interpreter's script doesn't get its lines", async () => {
+    await logging(async (logged) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pytc-reclaimed-'));
+      const runner = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 50 });
+      try {
+        // The command writes when each file appears, once its interpreter has
+        // been reclaimed, and makes a file of its own after each write, which
+        // it reaches only if the write didn't end it. It gives up after 20 s.
+        const command = [
+          'import os, sys, time',
+          'def wait(name):',
+          '    for _ in range(400):',
+          '        if os.path.exists(os.path.join(sys.argv[1], name)): return',
+          '        time.sleep(0.05)',
+          '    sys.exit(1)',
+          'wait("reclaimed")',
+          'print("after the reclaim", flush=True)',
+          'open(os.path.join(sys.argv[1], "wrote"), "w").close()',
+          'wait("replaced")',
+          'print("while a new interpreter runs a script", flush=True)',
+          'open(os.path.join(sys.argv[1], "wrote again"), "w").close()',
+        ].join('\n');
+        const first = await runner.exec(
+          `import subprocess, sys\nsubprocess.Popen([sys.executable, "-c", ${JSON.stringify(command)}, ${JSON.stringify(dir)}])\nprint("started")`,
+          [],
+        );
+        assert.strictEqual(first.stdout, 'started\n');
+        await until(() => logged.some((l) => l.endsWith('reclaiming python interpreter (idle)')), 'the idle reclaim');
+        writeFileSync(join(dir, 'reclaimed'), '');
+        await until(() => existsSync(join(dir, 'wrote')), 'the command to write after the reclaim and go on');
+        await until(() => logged.some((l) => l.endsWith('stdout while its interpreter runs no script: after the reclaim')), 'its line in the log');
+        // A new interpreter's script runs while the command writes again.
+        const next = await runner.exec(
+          [
+            'import os, time',
+            `open(os.path.join(${JSON.stringify(dir)}, "replaced"), "w").close()`,
+            'for _ in range(200):',
+            `    if os.path.exists(os.path.join(${JSON.stringify(dir)}, "wrote again")): break`,
+            '    time.sleep(0.05)',
+            'print("new")',
+          ].join('\n'),
+          [],
+        );
+        assert.strictEqual(next.stdout, 'new\n');
+        await until(() => logged.some((l) => l.endsWith('stdout while its interpreter runs no script: while a new interpreter runs a script')), 'its second line in the log');
       } finally {
         runner.dispose();
         rmSync(dir, { recursive: true, force: true });

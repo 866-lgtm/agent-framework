@@ -196,8 +196,9 @@ const NOTHING = Buffer.alloc(0);
  * One of the interpreter's output pipes, its fd 1 or fd 2, as the host reads it.
  * While an exec runs, what arrives before that exec's end mark is the exec's:
  * kept for its result, up to OUTPUT_CAP_CHARS, or written to a background
- * script's journal. The mark itself is cut out. What arrives while no exec runs,
- * such as a command a script left running writes, goes to the host's log.
+ * script's journal. The mark itself is cut out. What arrives while no exec of
+ * its interpreter runs, such as what a command a script left running writes,
+ * goes to the host's log, once the interpreter has ended too.
  */
 class OutputStream {
   /** Every process holding the pipe has closed it, so nothing more will come. */
@@ -311,7 +312,7 @@ class OutputStream {
   private logIdle(text: string): void {
     const shown = text.trimEnd();
     const more = shown.length - LAST_WORDS_CHARS;
-    this.log(`${this.name} while no script runs: ${more > 0 ? `${shown.slice(0, LAST_WORDS_CHARS)} [… ${more} more characters]` : shown}`);
+    this.log(`${this.name} while its interpreter runs no script: ${more > 0 ? `${shown.slice(0, LAST_WORDS_CHARS)} [… ${more} more characters]` : shown}`);
   }
 
   /** Keep what arrived for the running exec. */
