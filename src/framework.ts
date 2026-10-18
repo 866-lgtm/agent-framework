@@ -15897,9 +15897,12 @@ export class AgentFramework {
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
-    // is decided by the paths themselves: default completed, catch sets
-    // failed, a framework-cancelled stream sets aborted. Best-effort
-    // notifications — consumers dedupe by inferenceId and keep a timeout.
+    // is decided by the paths themselves: `completed` by default; `aborted`
+    // for a stream that a stop, the framework's cancel or a replacement
+    // ended, as each case tells them; `failed` where a failure is
+    // established, in the `error` and `aborted` cases and the catch.
+    // Best-effort notifications — consumers dedupe by inferenceId and keep a
+    // timeout.
     let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
     // Set by the complete / aborted / error cases: the stream SAID how it
     // ended. An iterator that just closes says nothing (see after the loop).
@@ -17013,6 +17016,10 @@ export class AgentFramework {
               return;
             }
 
+            // No cancel explains the error, so this inference failed (§10.5).
+            // A retry is an inference of its own, with its own `started`, and
+            // a stop that cancels the retry leaves this failure standing.
+            lifecyclePhase = 'failed';
             this.emitTrace({
               type: 'inference:failed',
               agentName: agent.name,
@@ -17034,13 +17041,11 @@ export class AgentFramework {
             agent.reset();
 
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
-              lifecyclePhase = 'failed';
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
             const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
             if (statedWait === 'held') {
-              lifecyclePhase = 'failed';
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
@@ -17144,6 +17149,11 @@ export class AgentFramework {
                   log: logStream,
                 });
               } else {
+                // Not a stop by the stream's own word (its reason isn't
+                // `user`), whether or not a caller asked for one, and not the
+                // framework's cancel: a failure, as the exhausted settle below
+                // records it (§10.5).
+                lifecyclePhase = 'failed';
                 const durationMs = Date.now() - startTime;
                 const terminal = `Stream aborted: ${reason}`;
                 this.abortAgentScript(agent.name, `stream aborted (${reason})`);
@@ -17477,8 +17487,9 @@ export class AgentFramework {
         (!generationLost || disposedEphemeralWithoutSuccessor) &&
         !preserveEventGateForSuccessor;
       // §10.5: exactly one terminal per `started`, on every exit path the
-      // host controls. Which one was decided by the path taken (default
-      // completed; catch → failed; framework-cancel → aborted). A host
+      // host controls. Which one was decided by the path taken (see the
+      // `let`: completed by default; a stop, a framework cancel or a
+      // replacement → aborted; a failure → failed). A host
       // crash emits nothing — that is the documented best-effort limit, and
       // why consumers keep their safety timeout.
       //
