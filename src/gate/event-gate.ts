@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -1484,7 +1485,7 @@ export class EventGate {
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
-        ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
+        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
