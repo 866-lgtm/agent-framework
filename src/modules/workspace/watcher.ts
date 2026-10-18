@@ -6,7 +6,7 @@
  */
 
 import { watch, type FSWatcher } from 'chokidar';
-import { closeSync, fstatSync, mkdirSync, openSync, statSync, type Stats } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, statSync, type Stats } from 'node:fs';
 import { basename, sep } from 'node:path';
 import { passedOverAt } from './observe.js';
 import { type MountConfig } from './types.js';
@@ -170,15 +170,15 @@ export class MountWatcher {
       this.reportError(err);
     });
     this.watcher.on('raw', (event: string, rawPath: string | null) => {
-      // libuv reports the root's own removal or move as a rename under the
-      // root's name, and the same for an entry beneath it with that name and,
-      // on macOS, for an FSEvents event on the root that carries no
-      // modification flags, such as its making just before the watch. A held
-      // root's identity tells these apart, so the rename runs the poll's
-      // check at once. A root that isn't held can be made again with the old
-      // one's identity, so there the rename forces a re-attach. A rename
-      // without a name, as libuv gives for a file whose path it can't read,
-      // is passed over.
+      // libuv reports the root's own move as a rename under the root's name,
+      // and its removal too once nothing holds it open. An entry beneath the
+      // root with that name comes the same way, as does, on macOS, an
+      // FSEvents event for the root that carries no modification flags, such
+      // as its making just before the watch. A held root tells these apart
+      // (checkRootLiveness), so the rename runs the check at once. A root
+      // that isn't held can be made again with the removed one's identity,
+      // so there the rename forces a re-attach. A rename without a name, as
+      // libuv gives for a file whose path it can't read, is passed over.
       if (event !== 'rename' || typeof rawPath !== 'string') return;
       if (basename(rawPath) !== basename(this.config.path)) return;
       void this.checkRootLiveness({ force: this.rootFd === null });
@@ -304,10 +304,13 @@ export class MountWatcher {
   }
 
   /**
-   * Whether the root is still the directory the watcher attached to. One
-   * that's gone, or replaced by another directory at its path, is attached
-   * to again, and with `force` so is one that looks unchanged. It runs every
-   * `watchRootPollMs`, and at a rename under the root's name.
+   * Whether the root is still the directory the watcher attached to, checked
+   * every `watchRootPollMs` and at a rename under the root's name. A root
+   * replaced at its path, or whose held directory has been removed, is
+   * attached to again, and with `force` so is one that looks unchanged. A
+   * root that's gone is let go of: a read-write mount makes it again and
+   * attaches to it, and a read-only one waits, detached, until a check finds
+   * it back.
    */
   private async checkRootLiveness(opts: { force?: boolean } = {}): Promise<void> {
     if (this.stopped || this.attaching) return;
@@ -318,6 +321,7 @@ export class MountWatcher {
     } catch (err) {
       if (this.isErrno(err, 'ENOENT')) {
         this.detached = true;
+        this.releaseRoot();
         if (this.config.mode === 'read-write') {
           await this.reattach();
         }
@@ -337,7 +341,7 @@ export class MountWatcher {
     }
 
     if (!opts.force && !this.detached && this.rootIdentity
-      && this.sameIdentity(current, this.rootIdentity)) {
+      && this.sameIdentity(current, this.rootIdentity) && !this.heldRootRemoved()) {
       return;
     }
 
@@ -351,6 +355,8 @@ export class MountWatcher {
     try {
       const oldWatcher = this.watcher;
       this.watcher = null;
+      // Before the close, so a close that fails still lets go of the root.
+      this.releaseRoot();
       if (oldWatcher) {
         await oldWatcher.close();
       }
@@ -368,11 +374,12 @@ export class MountWatcher {
   }
 
   private captureRootIdentity(): void {
-    this.releaseRoot();
     try {
       this.rootIdentity = this.holdRoot();
       this.detached = false;
     } catch (err) {
+      // What holdRoot opened before it failed isn't held.
+      this.releaseRoot();
       if (this.isErrno(err, 'ENOENT')) {
         this.rootIdentity = null;
         this.detached = true;
@@ -385,19 +392,23 @@ export class MountWatcher {
   }
 
   /**
-   * The root's identity, with the root held open on Linux until the next
-   * attach or the stop. There a removed directory's inode number can go to
-   * the next directory made, as ext4 gives it, so a root made again could
-   * look unchanged, and a number held open isn't given out. Elsewhere, or
-   * where the root can't be opened, as without read permission or at the
-   * process's file limit, it isn't held, and its identity is read from its
+   * The root's identity, with the root held open on Linux until the watcher
+   * lets go of it: at a re-attach, when the root is found gone, or at the
+   * stop. The held directory then says itself whether it has been removed
+   * (heldRootRemoved). A removed directory's inode number can otherwise go
+   * to the next directory made, as ext4 gives it, and one held open isn't
+   * given out. Elsewhere, or where the root can't be opened as a directory,
+   * as without read permission, at the process's file limit or when the
+   * path isn't a directory, it isn't held, and its identity is read from its
    * path.
    */
   private holdRoot(): RootIdentity {
     if (process.platform !== 'linux') return this.readRootIdentity();
     let fd: number;
     try {
-      fd = openSync(this.config.path, 'r');
+      // A directory only, so a FIFO at the path fails at once rather than
+      // blocking until a writer opens it.
+      fd = openSync(this.config.path, constants.O_RDONLY | constants.O_DIRECTORY);
     } catch {
       return this.readRootIdentity();
     }
@@ -405,11 +416,33 @@ export class MountWatcher {
     return identityOf(fstatSync(fd));
   }
 
+  /**
+   * Whether the directory the watcher holds has been removed, which its link
+   * count says whatever has since been made at its path. On a file system
+   * whose inode numbers a server gives out, the hold can't keep a root made
+   * again from taking the removed one's number. A held directory that can't
+   * be read, as a stale one on a network file system, counts as removed.
+   */
+  private heldRootRemoved(): boolean {
+    if (this.rootFd === null) return false;
+    try {
+      return fstatSync(this.rootFd).nlink === 0;
+    } catch {
+      return true;
+    }
+  }
+
   private releaseRoot(): void {
     if (this.rootFd === null) return;
     const fd = this.rootFd;
     this.rootFd = null;
-    closeSync(fd);
+    try {
+      closeSync(fd);
+    } catch (err) {
+      // Linux frees the descriptor whatever close returns, so the error is
+      // reported and what called this goes on.
+      this.reportError(err);
+    }
   }
 
   private readRootIdentity(): RootIdentity {
@@ -417,7 +450,11 @@ export class MountWatcher {
   }
 
   private sameIdentity(a: RootIdentity, b: RootIdentity): boolean {
-    // Where the root isn't held, birthtimeMs tells most replacements apart.
+    // birthtimeMs tells a root made again from a removed one whose inode
+    // number it took, unless both were made within one tick of the clock or
+    // the file system keeps no birth time. A held root's removal shows in its
+    // link count instead, and where the root isn't held the rename's force
+    // covers those.
     return a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
   }
 
