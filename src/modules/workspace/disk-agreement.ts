@@ -72,9 +72,12 @@ export interface Pending {
   /**
    * For a write that gives the file a mode: the mode it saw (`from`) and the
    * one it gives (`to`); a write that creates the file records `to` for
-   * both. It narrows to `from & to` before the bytes and widens to `to` after
-   * them, so a stop leaves disk at one of those three, with the old bytes or
-   * the new, and those are the push's own. A file that has setuid or setgid
+   * both. A push that goes on as our own narrowing push, stopped before its
+   * bytes, records that push's `from`, the old bytes' own mode, and the
+   * store's mode now, whether or not it gives a mode itself. It narrows to
+   * `from & to` before the bytes and widens to `to` after them, so a stop
+   * leaves disk at one of those three, with the old bytes or the new, and
+   * those are the push's own. A file that has setuid or setgid
    * when the write checks it loses them before the bytes too, a chmod that
    * keeps the permission bits it has then, so a stop after that chmod alone
    * leaves disk at the mode the write saw, less those bits.

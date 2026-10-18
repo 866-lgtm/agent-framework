@@ -201,11 +201,12 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
  * mode set while they went in is kept too, up to the check just before that
  * chmod. Without it, as a forced push writes, the mode is given whatever the
  * file has, before the bytes and again after them where a mode set while
- * they went in differs. Setuid and setgid are another matter, whatever
- * `from` says: a file that has either when the write checks it loses both
- * before the bytes, and keeps its permission bits and its sticky bit; the
- * chmod after the bytes keeps the special bits the file has then
- * (withSpecialBits).
+ * they went in differs, a file the forced push creates included; a file an
+ * unforced push creates keeps a mode set while its bytes go in. Setuid and
+ * setgid are another matter, whatever `from` says: a file that has either
+ * when the write checks it loses both before the bytes, and keeps its
+ * permission bits and its sticky bit; the chmod after the bytes keeps the
+ * special bits the file has then (withSpecialBits).
  *
  * Where the kernel refuses a chmod (EPERM or EACCES: another user's file,
  * an ACL), the write acts on the refusal. A refused drop of setuid and
@@ -285,8 +286,14 @@ export async function writeContained(
     // the file removed since.
     const exact = mode ?? (created ? createMode : undefined);
     if (exact !== undefined) {
-      if (created) before = exact;
-      else if (from === undefined || current === from) {
+      if (created) {
+        before = exact;
+        // Forced (the effect expects any copy), it gives a file it creates its
+        // mode after the bytes too, as it gives one in place; an unforced
+        // creation keeps a mode set while its bytes go in, as every unforced
+        // write does.
+        if (expect.kind === 'any') after = exact;
+      } else if (from === undefined || current === from) {
         before = current & exact;
         after = exact;
       }

@@ -1014,6 +1014,68 @@ describe("a file's mode is kept with its bytes", () => {
     return () => { proto.writeFile = writeFile; };
   }
 
+  test('where modes go unobserved, a push that creates a file gives it no mode from the store', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('c.txt', 'v1');
+    chmodSync(env.disk('c.txt'), 0o600);
+    await call(m, 'sync', {});
+    assert.equal(storedMode(env, 'c.txt'), 0o100600, 'a POSIX host recorded the mode');
+    (m as any).modesObserved = false;
+    rmSync(env.disk('c.txt'));
+    const umask = process.umask(0o022);
+    try {
+      await call(m, 'materialize', { path: 'work/c.txt', force: true });
+    } finally {
+      process.umask(umask);
+    }
+    assert.equal(env.readDisk('c.txt'), 'v1');
+    assert.equal(modeOf(env, 'c.txt'), 0o644, 'created as a file is without a mode, under the umask');
+    assert.equal(storedMode(env, 'c.txt'), 0o100600, 'and the store keeps its mode');
+  });
+
+  // An entry from before the evidence that disk lacks: only a push naming it writes it, creating the file.
+  for (const force of [true, false]) {
+    test(`${force ? 'a forced' : 'an unforced'} push that creates its file, whose mode is set while its bytes go in, ${force ? "ends at the store's mode" : 'keeps the mode set then'}`, async (t) => {
+      const env = new Env(t);
+      const m = await env.open();
+      const bytes = Buffer.from('fresh');
+      env.store.treeSet(TREE, 'u.txt', { blobHash: env.store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o100600 });
+      const restore = await chmodDuringWrite(env, 'u.txt', 0o644);
+      try {
+        const pushed = await pushModes(env, m, ['u.txt'], { named: true, ...(force ? { force: true } : {}) });
+        assert.deepEqual(pushed.written, ['u.txt']);
+      } finally {
+        restore();
+      }
+      assert.equal(env.readDisk('u.txt'), 'fresh');
+      assert.equal(modeOf(env, 'u.txt'), force ? 0o600 : 0o644);
+    });
+  }
+
+  test("a refused chmod to the store's mode for a file a forced push creates, with no mode owed when it planned, names the store's mode", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('g.txt', 'v1');
+    chmodSync(env.disk('g.txt'), 0o664);
+    await call(m, 'sync', {});
+    await call(m, 'write', { path: 'work/g.txt', content: 'v2' });
+    const umask = process.umask(0o022);
+    const restore = await refuseChmod();
+    let pushed: Awaited<ReturnType<typeof pushModes>>;
+    try {
+      pushed = await pushModes(env, m, ['g.txt'], { force: true, beforeEffect: () => rmSync(env.disk('g.txt')) });
+    } finally {
+      restore();
+      process.umask(umask);
+    }
+    assert.deepEqual(pushed.written, ['g.txt']);
+    assert.equal(modeOf(env, 'g.txt'), 0o644, 'created under the umask, the chmod refused');
+    assert.deepEqual(pushed.modesKept.map((k) => k.reason), [
+      "written, its mode left at 0644: the kernel refused the chmod, so the workspace's (0664) isn't given, and a sync takes disk's mode in",
+    ]);
+  });
+
   // 0o664 is one the umask narrows at creation, so the file is given it exactly.
   for (const mode of [0o600, 0o664]) {
     test(`a forced push that finds the file removed since its planning creates it at the store's mode, ${mode.toString(8)}, though disk had that mode when it planned`, async (t) => {
@@ -1087,6 +1149,116 @@ describe("a file's mode is kept with its bytes", () => {
     assert.equal(modeOf(env, 'mixed.txt'), 0o604);
     await call(m, 'sync', {});
     assert.deepEqual([storedText(env, 'mixed.txt'), storedMode(env, 'mixed.txt')], ['v2', 0o100604], 'and a sync then finds disk agreeing');
+  });
+
+  for (const between of ['nothing', 'a bare sync']) {
+    test(`a push that completes a narrowing push stopped before its bytes, and stops before its own bytes too, with ${between} between, leaves the old bytes' own mode for a sync that names the file`, async (t) => {
+      const env = new Env(t);
+      const m = await env.open();
+      await narrowingPush(env, m, 'mixed.txt');
+      for (let stop = 0; stop < 2; stop++) {
+        if (stop === 1 && between === 'a bare sync') await call(m, 'sync', {});
+        const restore = await stopAt('truncate', 1);
+        try {
+          await call(m, 'materialize', { path: 'work/mixed.txt' });
+        } finally {
+          restore();
+        }
+      }
+      assert.equal(modeOf(env, 'mixed.txt'), 0o600, 'the old bytes at the narrowed mode');
+      await call(m, 'sync', {});
+      assert.equal(storedMode(env, 'mixed.txt'), 0o100604, 'a bare sync takes nothing in');
+      await call(m, 'sync', { path: 'work/mixed.txt' });
+      assert.equal(storedText(env, 'mixed.txt'), 'v1', "the named sync took disk's bytes");
+      assert.equal(storedMode(env, 'mixed.txt'), 0o100640, "with the mode they had, not the push's narrowed one");
+    });
+  }
+
+  test('a narrowing push stopped before its bytes twice is completed by the next push: the new bytes at the new mode', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await narrowingPush(env, m, 'mixed.txt');
+    for (let stop = 0; stop < 2; stop++) {
+      const restore = await stopAt('truncate', 1);
+      try {
+        await call(m, 'materialize', { path: 'work/mixed.txt' });
+      } finally {
+        restore();
+      }
+    }
+    await call(m, 'materialize', {});
+    assert.equal(env.readDisk('mixed.txt'), 'v2');
+    assert.equal(modeOf(env, 'mixed.txt'), 0o604);
+    await call(m, 'sync', {});
+    assert.deepEqual([storedText(env, 'mixed.txt'), storedMode(env, 'mixed.txt')], ['v2', 0o100604], 'and a sync then finds disk agreeing');
+  });
+
+  test("after a narrowing push stopped before its bytes twice, the old bytes set back to their own mode are no change: the next push gives the store's mode", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await narrowingPush(env, m, 'mixed.txt');
+    for (let stop = 0; stop < 2; stop++) {
+      const restore = await stopAt('truncate', 1);
+      try {
+        await call(m, 'materialize', { path: 'work/mixed.txt' });
+      } finally {
+        restore();
+      }
+    }
+    chmodSync(env.disk('mixed.txt'), 0o640);
+    await call(m, 'materialize', {});
+    assert.equal(env.readDisk('mixed.txt'), 'v2');
+    assert.equal(modeOf(env, 'mixed.txt'), 0o604, 'the mode they last agreed on takes the store\'s');
+  });
+
+  test("a push that completes a pure narrowing stopped before its bytes plans no chmod, and stopped before its own bytes too, leaves the old bytes' own mode", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('p.txt', 'v1');
+    chmodSync(env.disk('p.txt'), 0o644);
+    await call(m, 'sync', {});
+    await call(m, 'write', { path: 'work/p.txt', content: 'v2' });
+    const e = env.store.treeGet(TREE, 'p.txt')!;
+    env.store.treeSet(TREE, 'p.txt', { blobHash: e.blobHash, size: e.size, mode: 0o100600 });
+    for (let stop = 0; stop < 2; stop++) {
+      const restore = await stopAt('truncate', 1);
+      try {
+        await call(m, 'materialize', { path: 'work/p.txt' });
+      } finally {
+        restore();
+      }
+    }
+    assert.equal(modeOf(env, 'p.txt'), 0o600, 'the old bytes at the narrowed mode, which is the store\'s');
+    await call(m, 'sync', { path: 'work/p.txt' });
+    assert.deepEqual([storedText(env, 'p.txt'), storedMode(env, 'p.txt')], ['v1', 0o100644], "the named sync took disk's bytes with the mode they had");
+  });
+
+  test("a sync naming the file whose adoption doesn't land, after a narrowing push stopped before its bytes, leaves the store's change owed, and the next push gives the store's mode", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await narrowingPush(env, m, 'mixed.txt');
+    const restore = await stopAt('truncate', 1);
+    try {
+      await call(m, 'materialize', { path: 'work/mixed.txt' });
+    } finally {
+      restore();
+    }
+    // The store refuses the adoption's tree commit, after its intent is durable.
+    const store = env.store as unknown as { treeSet: (...args: unknown[]) => unknown };
+    const treeSet = store.treeSet;
+    store.treeSet = function (this: unknown, ...args: unknown[]) {
+      if (args[1] === 'mixed.txt') throw new Error('refused');
+      return treeSet.apply(env.store, args);
+    };
+    try {
+      await call(m, 'sync', { path: 'work/mixed.txt' }).catch(() => undefined);
+    } finally {
+      store.treeSet = treeSet;
+    }
+    assert.equal(storedText(env, 'mixed.txt'), 'v2', "the adoption didn't land");
+    await call(m, 'materialize', {});
+    assert.equal(env.readDisk('mixed.txt'), 'v2');
+    assert.equal(modeOf(env, 'mixed.txt'), 0o604);
   });
 
   for (const force of [true, false]) {

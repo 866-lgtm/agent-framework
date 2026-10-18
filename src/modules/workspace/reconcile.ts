@@ -397,7 +397,13 @@ interface Verdict {
    * outcome, where the recorded P is still that adoption's pending record.
    * Or the evidence a push's narrowing left when it stopped before its
    * bytes, which decide uses without recording it, so the intent stays: a
-   * push plans from it, and its new intent carries it as its prior.
+   * push plans from it and goes on as the stopped push, its intent carrying
+   * that push's prior and modes (pushPaths), and a sync that adopts disk's
+   * copy carries it as its adoption's prior. An adoption that doesn't land
+   * returns to it, as every adoption returns to its prior: the store's
+   * change is owed again, and the next push completes it at the store's
+   * mode. The old bytes' own mode doesn't survive that, since the adoption's
+   * intent replaced the push's.
    */
   prior?: Agreed;
 }
@@ -432,8 +438,11 @@ function settleAdoption(p: Pending, s: StoreSide | null): Agreed | 'forget' {
   const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
   if (sameCandidate(sc, p.expect)) {
     // Where modes are observed, the adoption took disk's mode with its bytes,
-    // so the entry's mode is the one they agreed on. Where they aren't, the
-    // entry's mode is the store's own, and the evidence records none.
+    // so the entry's mode is the one they agreed on, but for an adoption that
+    // took the mode a stopped push of ours meant the old bytes to have: its
+    // entry holds that mode while disk holds the push's narrowed one, which a
+    // later sync then takes in. Where modes aren't observed, the entry's mode
+    // is the store's own, and the evidence records none.
     return p.expect.kind === 'absent'
       ? { kind: 'absent' }
       : { kind: 'content', hash: p.expect.hash, size: s!.size, ...(s!.mode !== undefined ? { mode: s!.mode } : {}) };
@@ -514,7 +523,8 @@ function resolvePending(
       // the bytes at it and then widens to the store's. The old bytes are
       // never given the store's mode. Nothing is recorded: the intent, with
       // the modes that map disk's narrowed one back to the old bytes' own,
-      // stays until a push completes it or a sync adopts disk's copy.
+      // stays, carried by a push that goes on with it (pushPaths), until a
+      // push completes it or a sync adopts disk's copy.
       if (prior!.kind === 'content' && d.kind === 'file' && pushedMode(p, dc, d) !== undefined) {
         return { p: { ...prior!, mode: d.mode } };
       }
@@ -1173,6 +1183,12 @@ export async function pushPaths(
         seenMode?: number;
         /** `apply` is forced over a mode disk changed since it last agreed, or one nothing records. */
         overDisk?: true;
+        /**
+         * For a push that re-plans over our own narrowing push stopped before
+         * its bytes, the modes its intent carries: from the old bytes' own
+         * mode, the stopped push's `from`, to the store's mode now.
+         */
+        ownModes?: { from: number; to: number };
       }
     | { kind: 'unlink' }
     /**
@@ -1285,6 +1301,14 @@ export async function pushPaths(
     // the bytes it wrote.
     const known = v.unconfirmed ? (p as Pending).prior ?? undefined : v.p === 'forget' ? undefined : v.p !== undefined ? v.p : v.prior ?? p;
     const prior = known && (known.kind === 'absent' || known.kind === 'content') ? known : null;
+    // A push that re-plans over our own narrowing push, stopped before its
+    // bytes, plans from disk's narrowed mode (the verdict's prior, which
+    // resolvePending leaves unrecorded), as above, and goes on as that push:
+    // its intent carries the stopped push's prior, the old bytes at their own
+    // mode, never the mode it narrowed them to, and modes from that mode, so a
+    // stop of this push too reads disk's narrowed mode as the push's own.
+    const stopped = p?.kind === 'pending' && p.effect === 'disk' && p.modes !== undefined &&
+      !v.unconfirmed && v.p === undefined && v.prior !== undefined ? p : undefined;
     if (v.mode === 'push' && s && d.kind === 'file') {
       // Forced, disk takes the store's mode whatever it holds now, as it takes its bytes.
       plans.push({ path, kind: 'chmod', mode: s.mode!, ...(opts.force ? {} : { from: d.mode }), hash: s.hash, size: s.size, prior, before: agreement.get(mount.name, path), expect });
@@ -1382,7 +1406,8 @@ export async function pushPaths(
     const apply = mount.modesObserved && s.mode !== undefined && s.mode !== dm &&
       (dm === undefined || opts.force === true || own || priorMode === dm) ? s.mode : undefined;
     plans.push({
-      path, kind: 'write', blob, hash: s.hash, prior, before: agreement.get(mount.name, path), expect,
+      path, kind: 'write', blob, hash: s.hash, prior: stopped ? stopped.prior : prior, before: agreement.get(mount.name, path), expect,
+      ...(stopped ? { ownModes: { from: stopped.modes!.from, to: s.mode ?? stopped.modes!.to } } : {}),
       ...(apply !== undefined ? { apply } : {}),
       ...(apply !== undefined && dm !== undefined && opts.force !== true ? { from: dm } : {}),
       // Forced over a mode disk changed: without force, the bytes would keep it.
@@ -1411,9 +1436,12 @@ export async function pushPaths(
       branchId,
       // A write that gives a mode records the modes it may leave, so a stop
       // is read by them: the mode it saw, or for a file it creates the one it
-      // creates it at, and the one it gives.
-      ...(step.kind === 'write' && step.apply !== undefined
-        ? { modes: { from: step.seenMode ?? step.apply, to: step.apply } } : {}),
+      // creates it at, and the one it gives. One that goes on as our own
+      // stopped narrowing records that push's, from the old bytes' own mode,
+      // whether or not it gives a mode itself.
+      ...(step.kind === 'write' && step.ownModes !== undefined ? { modes: step.ownModes }
+        : step.kind === 'write' && step.apply !== undefined
+          ? { modes: { from: step.seenMode ?? step.apply, to: step.apply } } : {}),
     }, { durable: i === announced.length - 1 });
   });
 
@@ -1424,7 +1452,9 @@ export async function pushPaths(
     try {
       if (step.kind === 'write') {
         const { perm, widenRefused, modeKept } = await writeContained(
-          mount.view, mount.rootReal, step.path, step.blob, step.expect, step.apply, step.from, step.overDisk === true, step.storeMode,
+          mount.view, mount.rootReal, step.path, step.blob, step.expect, step.apply, step.from, step.overDisk === true,
+          // Where modes go unobserved, nothing is applied, a created file's included.
+          mount.modesObserved ? step.storeMode : undefined,
         );
         effected.push({ step, dirs: chainOf(step.path), mode: perm, widenRefused, modeKept });
       } else if (step.kind === 'chmod') {
@@ -1539,7 +1569,7 @@ export async function pushPaths(
       result.modesKept.push({
         path: step.path,
         reason: `written, its mode left at ${octal(mode)}: the kernel refused the chmod, ` +
-          `so the workspace's (${octal(step.apply ?? mode)}) isn't given, and a sync takes disk's mode in`,
+          `so the workspace's (${octal(step.apply ?? step.storeMode ?? mode)}) isn't given, and a sync takes disk's mode in`,
       });
     } else if (step.kind === 'write' && modeKept && mode !== undefined) {
       // Forced over a mode disk changed, and refused: the bytes are written
