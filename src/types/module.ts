@@ -15,6 +15,8 @@ import type { TraceEventListener } from './trace.js';
 export interface MessageQuery {
   /** Filter by external source (e.g., 'discord') */
   source?: string;
+  /** Filter by external IDs: messages whose metadata.external.id is one of these. An empty list filters nothing. */
+  externalIds?: string[];
   /** Filter by participant name */
   participant?: string;
   /** Filter by metadata fields (shallow match) */
@@ -521,6 +523,15 @@ export interface SpeechContext {
    * Empty when no tool calls were made.
    */
   thoughts?: ContentBlock[];
+
+  /**
+   * The turn this speech ends: the same id as `ToolCall.callerTurnId` on the
+   * calls made in it (its model's calls and its foreground scripts' inner
+   * calls), kept across the turn's streams (a context-budget restart or a
+   * retry), and larger for the agent's next turn. Unique only within one run
+   * of the process.
+   */
+  turnId?: number;
 }
 
 /**

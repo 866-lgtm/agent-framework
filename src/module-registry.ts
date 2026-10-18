@@ -25,6 +25,7 @@ import type {
 } from './types/index.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
+import { logValue } from './mcpl/log-value.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -100,6 +101,8 @@ export class ModuleRegistry {
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
+  /** Module and namespace pairs already told that a system injection held a block that isn't text. */
+  private notShownWarned = new Set<string>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
@@ -330,12 +333,13 @@ export class ModuleRegistry {
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity)
+    // Create a call with the un-prefixed name (preserving caller identity and turn)
     const moduleCall: ToolCall = {
       id: call.id,
       name: toolName,
       input: call.input,
       callerAgentName: call.callerAgentName,
+      ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
     };
 
     try {
@@ -437,7 +441,10 @@ export class ModuleRegistry {
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => injections.push(...r)),
+        module.gatherContext(agentName).then(r => {
+          injections.push(...r);
+          this.noteBlocksNotShown(module.name, r);
+        }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
             () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
@@ -453,6 +460,28 @@ export class ModuleRegistry {
 
     await Promise.all(promises);
     return injections;
+  }
+
+  /**
+   * The system prompt is text, so an agent given a `system` injection reads
+   * a line in place of each of its blocks that isn't text (the agent's
+   * buildSystemPrompt), though `ContextInjection`'s content may be any
+   * block. The module meant those blocks for the model, so its operator is
+   * told, once per module and namespace, as the module's injections are
+   * gathered, whichever agents are given them.
+   */
+  private noteBlocksNotShown(moduleName: string, injections: ContextInjection[]): void {
+    for (const injection of injections) {
+      if (injection.position !== 'system' || !injection.content.some((block) => block.type !== 'text')) continue;
+      const key = `${moduleName}\u0000${injection.namespace}`;
+      if (this.notShownWarned.has(key)) continue;
+      this.notShownWarned.add(key);
+      console.error(
+        `[${moduleName}] gatherContext: a system injection in namespace ${logValue(injection.namespace)} holds a block that ` +
+          "isn't text, which the system prompt can't carry, so an agent given the injection reads a line in place of each such block; " +
+          'this line prints once per module and namespace while the host runs',
+      );
+    }
   }
 
   /**
