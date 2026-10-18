@@ -509,6 +509,15 @@ test("a claim over max_bytes and over what's left of the budget is refused for t
   assert.equal(ceilingOnly.error, 'claimed 10000 bytes exceeds fetch ceiling 1000');
 });
 
+test("a claim over what's left of the budget but within max_bytes still dials, since a claim can be wrong", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: 2 * PAYLOAD.length + 100 } } });
+  assert.equal((await f.fetch(makeRecord(reg, `${ORIGIN}/ok?spend-one`))).ok, true);
+  // The claim is past what's left, but the payload is the same 2200 bytes, which fit.
+  const out = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?claims-too-much`, { sizeBytes: 10_000 }));
+  assert.equal(out.ok, true, out.error);
+});
+
 test('a claim over max_bytes, once the budget is spent, is refused for the budget', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length } } });
