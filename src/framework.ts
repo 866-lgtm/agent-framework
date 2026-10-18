@@ -1495,7 +1495,7 @@ interface HostCommandParams {
   requesterName?: string;
 }
 
-/** Descriptor of a single refusal-driven rewind (see rewindTriggeringTurn). */
+/** Descriptor of a single refusal-driven rewind (see shedNewestTurn). */
 interface RewindRecord {
   /** tool = machine tool exchange; human = an ingested message; other = else. */
   kind: 'tool' | 'human' | 'other';
@@ -1503,8 +1503,6 @@ interface RewindRecord {
   descriptor: string;
   /** All message ids removed in this shed (a tool exchange removes 2+). */
   removedIds: MessageId[];
-  /** Discord (channelId, messageId) of the removed message, if it had one. */
-  discordRef?: { channelId: string; messageId: string };
 }
 
 interface Deferred<T> {
@@ -2041,7 +2039,7 @@ export class AgentFramework {
   private refusalStreak: Map<string, number> = new Map();
   /** Per-agent count of consecutive refusal-driven rewinds in the current turn
    *  chain (reset when a turn completes without a refusal). Bounds the auto
-   *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
+   *  rewind loop — see refusalHandling + shedNewestTurn. */
   private refusalRewinds: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
    *  breaker (noteInferenceExhausted). Reset when a turn completes
@@ -6629,7 +6627,9 @@ export class AgentFramework {
   }
 
   /**
-   * Check if process logging is enabled.
+   * Whether process events and their responses are written to Chronicle
+   * (`processLogging.persist`). `process:completed` trace events are emitted
+   * either way.
    */
   isProcessLoggingEnabled(): { persist: boolean } {
     return { persist: this.processLoggingPersist };
@@ -7951,17 +7951,17 @@ export class AgentFramework {
   }
 
   /**
-   * Rewind the single turn that fed a refused generation: redact the newest
-   * message the agent did NOT author (a tool result, or an incoming message)
-   * and inject a metadata-only marker in its place. The marker carries a
-   * *description* of what was withheld (kind + size), never the content — so it
-   * cannot itself re-trip the classifier — while the raw record survives in the
-   * chronicle log for forensics. Returns a record describing the removal, or
-   * null if there is nothing eligible to rewind (e.g. only the agent's own
-   * turns, or a prior system marker, remain).
+   * Shed the newest turn: remove the newest message that isn't a system
+   * message, whoever wrote it, with the rest of its exchange (the tool_use
+   * turn paired with a tool result, and the whole of a body stored in
+   * shards). It adds no marker; the caller keeps one consolidated marker for
+   * the episode (updateRewindMarker). The returned record describes what was
+   * removed (kind + size), never the content, while the raw record survives
+   * in the chronicle log for forensics. Returns null when only system
+   * messages remain.
    *
-   * Shared by the auto path (on `stop_reason: refusal`) and the `/rewind`
-   * host command.
+   * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
+   * the shed after inference exhaustion (quarantinePoisonedHistory).
    */
   private shedNewestTurn(agent: Agent): RewindRecord | null {
     const cm = agent.getContextManager();
@@ -7993,7 +7993,7 @@ export class AgentFramework {
     const members = all.slice(first, idx + 1);
     const msg = all[idx];
     const md = (msg.metadata ?? {}) as {
-      messageId?: unknown; channelId?: unknown; system?: unknown;
+      messageId?: unknown; system?: unknown;
     };
 
     const content = members.flatMap((m) => (Array.isArray(m.content) ? m.content : []));
@@ -8035,13 +8035,9 @@ export class AgentFramework {
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
-    const discordRef = md.messageId && md.channelId
-      ? { channelId: String(md.channelId), messageId: String(md.messageId) }
-      : undefined;
-
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
-    return { kind, descriptor, removedIds, discordRef };
+    return { kind, descriptor, removedIds };
   }
 
   /**
