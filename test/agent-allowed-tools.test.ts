@@ -137,6 +137,12 @@ for (const permitted of [false, true]) {
       assert.equal(result.toolUseId, 'help');
       assert.equal(Boolean(result.isError), !permitted);
       assert.match(result.content, permitted ? />>/ : /not permitted.*allowedTools/);
+      if (permitted) {
+        // The reference names the `>>skip_reply` envelope, which no list refuses, and not the
+        // skip_reply tool, which this agent's list doesn't name.
+        assert.match(result.content, />>skip_reply/);
+        assert.doesNotMatch(result.content, /skip_reply tool/);
+      }
     } finally { await h.close(); }
   });
 }
@@ -345,7 +351,7 @@ test("XML tool mode: a refused think's round goes as a permitted think's does", 
     const h = await harness({ allowedTools: permitted ? ['think'] : [], sameRoundThinkTextPolicy: 'private' });
     try {
       const routed = captureRouting(h.framework);
-      const call = { type: 'tool_use' as const, id: 'think', name: 'think', input: { thought: 'test' } };
+      const call = { type: 'tool_use' as const, id: 'think', name: 'think', input: { content: 'test' } };
       asXmlTurn(h.membrane, call);
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
@@ -356,6 +362,7 @@ test("XML tool mode: a refused think's round goes as a permitted think's does", 
       dispositions.push(routed);
     } finally { await h.close(); }
   }
+  assert.ok(dispositions[0].includes('Public round prose'), "a permitted think's round goes out in XML tool mode, where no round is routed live");
   assert.deepEqual(dispositions[1], dispositions[0], 'the refusal changes nothing about which prose goes out');
 });
 

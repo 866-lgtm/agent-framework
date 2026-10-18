@@ -342,7 +342,7 @@ const PROSE_ROUTING_HELP =
   '  The first destination in a turn applies to the rest of that turn.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
   '  immediately when this one ends, instead of pausing until the next event.\n' +
-  '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
+  '  >>skip_reply — text stays in your context only.\n' +
   'Text without a destination is not delivered: it is retained, and a notice will\n' +
   'prompt you to resend — reply e.g. ">>#channel {{unsent}}" to deliver the retained\n' +
   'text unchanged. Send tools (send_message, send_dm, …) are unaffected.';
@@ -4594,9 +4594,9 @@ export class AgentFramework {
     snapshot?: InferenceToolSnapshot,
   ): import('./types/index.js').ToolDefinition[] {
     const agent = this.agents.get(agentName);
-    // Model-facing advice names skip_reply only where this agent may call it:
-    // a refused skip_reply leaves the turn going on.
-    const canSkipReply = !agent || agent.canUseTool('skip_reply');
+    // Model-facing advice names skip_reply only where dispatch would let this
+    // agent call it: a refused skip_reply leaves the turn going on.
+    const canSkipReply = this.canAgentUseTool(agentName, 'skip_reply');
     // The subconscious gets its own small surface (plus think/skip_reply/
     // end_turn), not the residents' tool board: no channel lifecycle, no
     // gate rules, no workspace — it observes, judges, and reports.

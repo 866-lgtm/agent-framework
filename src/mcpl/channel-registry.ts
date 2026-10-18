@@ -417,6 +417,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'think',
+    // No agent's surface shows this description: getToolsForAgent gives every
+    // agent its own think (buildThinkTool), which names skip_reply only where
+    // that agent may call it.
     description:
       'Reason privately. The content stays in your own context and is NOT sent to any ' +
       'channel or surface. Same-round routing of ordinary text beside think() depends on ' +
@@ -2949,7 +2952,8 @@ export class ChannelRegistry {
    * Handle the synthesized `think` tool — a private reasoning scratchpad. It
    * sends nothing, and (unlike before) does NOT silence the turn: trailing
    * plain text is still routed as the reply. The thought stays in the agent's
-   * own context/chronicle. To deliberately not reply, the agent uses skip_reply.
+   * own context/chronicle. To deliberately not reply, an agent that may call
+   * skip_reply uses it.
    */
   private handleToolThink(input: { content?: string }): ToolResult {
     return {
