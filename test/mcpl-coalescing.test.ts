@@ -1780,6 +1780,112 @@ test("#157: a notice's render that lands while an earlier render of its subject 
   assert.deepEqual(delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'n2' }], 'only the first render is the first view');
 });
 
+/** A coalescer whose every render lands in the deferred queue of 'other', an
+ *  agent whose turn is alive, unless `stored` names the event, whose render is
+ *  then stored and so materialized for the assembling turn. The renders of
+ *  `held` wait for `release`. `state` answers the host's read and shown
+ *  questions for every placement. (slimepriestess's probe for #168, with the
+ *  held renders and the stored placement added.) */
+function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'], stored = [] as string[] } = {}) {
+  const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
+  const releases = new Map<string, () => void>();
+  const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
+  const started = new Map<string, () => void>();
+  const renderStarted = new Map(held.map((id) => [id, new Promise<void>((resolve) => { started.set(id, resolve); })]));
+  const host: CoalescerHost<null> = {
+    isUnread: () => !state.read, isUnshown: () => !state.shown && !state.read, remove: () => true,
+    deliver: async (occ) => {
+      delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) });
+      return stored.includes(occ.eventId)
+        ? { agent: 'agent', messageId: `stored-${delivered.length}` }
+        : { agent: 'other', deferredId: `deferred-${delivered.length}` };
+    },
+    wakeForBatch: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async (occ) => {
+      started.get(occ.eventId)?.();
+      await gates.get(occ.eventId);
+      return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] };
+    },
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  return {
+    coalescer, delivered, occurrence,
+    release: (id: string) => releases.get(id)!(),
+    renderStarted: (id: string) => renderStarted.get(id)!,
+  };
+}
+
+/** n1's render lands in 'other''s deferred queue as a first view, after n2
+ *  opened a batch of the same subject during that render. */
+async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewProbe>): Promise<void> {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  p.release('n1');
+  await first;
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }], "n1's render is the agent's first view");
+}
+
+for (const shown of [false, true]) test(`#157: a notice that displaces a queued first-view render ${shown ? 'the agent was shown, and joins a pending batch, leaves that batch no first view' : 'nothing has shown, and joins a pending batch, leaves that batch its first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await firstViewQueuedWithBatchPending(p);
+  // Shown at a boundary whose stream doesn't declare what it carries
+  // injected: still unread, but no longer unshown.
+  state.shown = shown;
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 displaced the queued render and joined the pending batch');
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered[1]?.eventId, 'n3');
+  assert.equal(p.delivered[1]?.replacesUnread === true, !shown, shown ? 'the agent was shown n1, so the batch\'s render is no first view' : 'nothing showed n1, so the batch\'s render is still the first view');
+});
+
+for (const shown of [false, true]) test(`#157: a notice that displaces a queued first-view render ${shown ? 'the agent was shown leaves a batch already rendering no first view' : 'nothing has shown leaves a batch already rendering its first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n1', 'n2'] });
+  await firstViewQueuedWithBatchPending(p);
+  // n2's batch renders, held, so no batch is pending when n3 arrives.
+  const second = p.coalescer.assemble('agent');
+  await settles(p.renderStarted('n2'), "n2's render");
+  state.shown = shown;
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 displaced the queued render');
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered[1]?.eventId, 'n2');
+  assert.equal(p.delivered[1]?.replacesUnread === true, !shown, shown ? 'the agent was shown n1, so the rendering batch\'s render is no first view' : 'nothing showed n1, so the rendering batch\'s render is still the first view');
+});
+
+test("#157: a batch opened during a render whose content the turn then read has a render that is no first view", async () => {
+  const state = { shown: false, read: false };
+  // n1's render is stored where the assembling turn's compile reads it, so
+  // that turn consumes it.
+  const p = firstViewProbe(state, { stored: ['n1'] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  p.release('n1');
+  await first;
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'n2' }], "n2's batch opened before the agent read n1, but its render comes after");
+});
+
+test('#157: a plain edit that takes the place of a pending first-view batch after the agent read an earlier render is no first view', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await firstViewQueuedWithBatchPending(p);
+  state.read = true;
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1' });
+});
+
 for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
   const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
   const host: CoalescerHost<null> = {

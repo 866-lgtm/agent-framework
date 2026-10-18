@@ -127,7 +127,10 @@ interface DeferredBatch<E> {
   /** The batch opened on the agent's first view of its subject: a fresh
    *  `initial` birth, or a first-view occupant it displaced that nothing had
    *  shown. Its first delivery is a first view too, while nothing of the
-   *  subject has been read since and no other version of it is placed. */
+   *  subject has been read since and no other version of it is placed. A
+   *  later notice that may have taken away the first view (it displaced an
+   *  occupant something may have shown, or found the subject read) clears
+   *  it, whether the batch is pending or rendering. */
   firstView?: true;
 }
 
@@ -668,10 +671,12 @@ export class PushCoalescer<E = unknown> {
 
   private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     let outcome: CoalesceOutcome = 'first';
-    // Whether a batch this notice opens is the agent's first view of the
-    // subject: a fresh `initial` birth with nothing read, or a first-view
-    // occupant it displaces that nothing has shown. A render still under way
-    // is weighed when this batch's first delivery is.
+    // Whether the agent can still get its first view of the subject from a
+    // batch: nothing read, and a first-view occupant this notice displaces
+    // that nothing has shown. It decides a batch this notice opens, and a
+    // pending or rendering batch keeps its own first view only while it holds
+    // (below). A render still under way is weighed when a batch's first
+    // delivery is.
     let firstView = state.history === 'none';
     if (occupantUnread && state.occupant) {
       // §5.1: a notice displaces an unread plain occurrence and opens a batch
@@ -687,6 +692,15 @@ export class PushCoalescer<E = unknown> {
     } else if (state.batch?.latest.deliverTo) {
       // Later notices stay in the batch's audience.
       occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
+    }
+    // A batch opened as the agent's first view stays one only while nothing
+    // may have shown the agent a version of the subject. A notice that
+    // displaced an occupant something may have shown, or that finds the
+    // subject read, ends that for the batch it joins and for one already
+    // rendering, whose render settles after this notice.
+    if (!firstView) {
+      if (state.batch) delete state.batch.firstView;
+      if (state.rendering) delete state.rendering.batch.firstView;
     }
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
