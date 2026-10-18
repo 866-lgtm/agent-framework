@@ -18972,6 +18972,14 @@ export class AgentFramework {
       bypassDeferralFor?: string;
     }
   ): MessageId {
+    // `deferredWriteId` is the framework's: a write from the queue is stored
+    // under its own (withDeferredWriteId), and boot's dedup and a module's
+    // handle (landedRow) find the write by it. Any other write drops one its
+    // metadata carries, such as one a module copied from a stored row.
+    if (!opts?.fromQueue && metadata && 'deferredWriteId' in metadata) {
+      const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
+      metadata = rest as MessageMetadata;
+    }
     const agent = this.deliveryAgent(opts?.forAgent);
     if (!agent) {
       if (opts?.forAgent) {

@@ -393,17 +393,18 @@ export class DiscordModule implements Module {
 
   // The Discord messages whose live create is on its way to the store: from
   // the moment the live path takes one up, through its conversion and the
-  // event queue, until the store shows the row onProcess answered with. The
-  // framework holds a module's writes while the agent's turn is alive or the
-  // host is quiesced, and queryMessages shows a held write's row, marked
-  // held, so the next Discord event finds it either way and ends its entry.
-  // A history sync stores none of these messages, so no message is stored
-  // twice. A delete before the create is handled drops it: nothing is stored
-  // and nobody is woken. Any message's entry ends when its delete is handled,
-  // since a sync running then skips the message (noteLive) and a later one
-  // doesn't fetch it. An edit while it converts is folded into it. A create
-  // whose answer the framework fails to write or hold shows no row, and
-  // keeps its entry, and the sync off its message, until the module stops.
+  // event queue, until a query shows the row onProcess answered with, stored
+  // or held. The framework holds a module's writes while the agent's turn is
+  // alive or the host is quiesced, and queryMessages shows a held write's
+  // row, marked held, so the next Discord event finds it either way and ends
+  // its entry. A history sync stores none of these messages, so no message is
+  // stored twice. A delete before the create is handled drops it: nothing is
+  // stored and nobody is woken. Any message's entry ends when its delete is
+  // handled, since a sync running then skips the message (noteLive) and a
+  // later one doesn't fetch it. An edit while it converts is folded into it.
+  // A create whose answer the framework fails to write or hold shows no row,
+  // and keeps its entry, and the sync off its message, until its delete is
+  // handled or the module stops.
   private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -1064,7 +1065,8 @@ export class DiscordModule implements Module {
 
   /**
    * Sync history for a specific channel - compare with Context Manager and update.
-   * Uses queryMessages() to enumerate stored messages for proper edit/delete detection.
+   * Uses queryMessages() to enumerate the channel's rows, a held write's among
+   * them, for proper edit/delete detection.
    *
    * The live path can store, edit or remove a row whenever the sync awaits.
    * So the sync fetches history and runs the live conversion it needs first,

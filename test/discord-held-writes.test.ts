@@ -134,7 +134,11 @@ test("a live create that comes after a sync's held add of its message adds no se
     assert.equal((await module.syncChannelHistory('c1')).newMessages, 1);
     assert.equal(rows('m3')[0]?.held, true, "the sync's add is held");
     await discord.onMessageHandler!(live('m3', 'seen by the sync first'));
-    await waitFor('the create to be handled', () => module.creating.get('m3')?.phase === 'writing');
+    // The framework takes Discord events in order and applies each answer
+    // before the next, so once the next message's row shows, the create's
+    // answer has been applied.
+    await discord.onMessageHandler!(live('m3b', 'the next message'));
+    await waitFor('the next create to be held', () => rows('m3b').length === 1);
     assert.equal(rows('m3').length, 1);
     await framework.resume();
     assert.deepEqual(storedTexts(framework, 'm3'), ['seen by the sync first']);

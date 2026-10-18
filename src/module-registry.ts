@@ -731,10 +731,13 @@ class ModuleContextImpl implements ModuleContext {
   ): MessageId {
     const id = this.addMessageFn(participant, content, metadata);
 
-    // Track external ID if provided
+    // Track external ID if provided. A write the framework holds keeps '',
+    // as it did before held writes had handles: the map is module state an
+    // earlier release reads back, and a handle is no id to it.
+    // findMessageByExternalId finds the held write by its external id.
     if (metadata?.external) {
       const key = `${metadata.external.source}:${metadata.external.id}`;
-      this.externalIdMap.set(key, id);
+      this.externalIdMap.set(key, heldWriteId(id) === undefined ? id : '');
       // Persist the mapping
       this.persistExternalIdMap();
     }
@@ -762,24 +765,25 @@ class ModuleContextImpl implements ModuleContext {
     const key = `${source}:${externalId}`;
     const entry = this.externalIdMap.get(key);
     if (entry === undefined) return null;
-    // A stored id answers as it is. A held write's handle answers while the
-    // write is held, and names its stored row once it lands (getMessage). ''
-    // is what addMessage answered for a held write before handles: it's
-    // looked up in the store by the external id, held rows included, as a
-    // handle is once its write is gone. The entry is set to what's found, so
-    // a stored id found once answers as it is from then on, and the entry is
-    // dropped when nothing is found.
-    if (entry !== '' && heldWriteId(entry) === undefined) return entry;
-    const row = (entry !== '' ? this.getMessageFn(entry) : null)
-      ?? this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0]
-      ?? null;
-    const found = row?.id ?? null;
-    if (found !== entry) {
-      if (found === null) this.externalIdMap.delete(key);
-      else this.externalIdMap.set(key, found);
-      this.persistExternalIdMap();
+    // A stored id answers while the store holds its row. Otherwise, as for
+    // the '' a held write keeps here (addMessage), the message is looked up
+    // in the store by its external id, held rows included, and the first row
+    // found is taken, as context-manager's findByExternalId takes it. A held
+    // row answers by its handle and leaves the entry as it is. A stored row's
+    // id becomes the entry. With nothing found, the entry goes.
+    if (entry !== '' && this.getMessageFn(entry)) return entry;
+    const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
+    if (row?.held) return row.id;
+    if (row) {
+      if (row.id !== entry) {
+        this.externalIdMap.set(key, row.id);
+        this.persistExternalIdMap();
+      }
+      return row.id;
     }
-    return found;
+    this.externalIdMap.delete(key);
+    this.persistExternalIdMap();
+    return null;
   }
 
   getMessage(id: MessageId): ModuleMessage | null {
