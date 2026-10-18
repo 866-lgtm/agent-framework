@@ -27,6 +27,15 @@ function within<T, F>(promise: Promise<T>, fallback: F, ms = 15_000): Promise<T 
   return Promise.race([promise, late]).finally(() => clearTimeout(timer));
 }
 
+/** A server script's last step: it exits once the host's initialize line
+ *  arrives, before answering it. A server that exits at once races the host's
+ *  initialize write instead: a write that meets the closed pipe fails with
+ *  EPIPE, and the close's reason names that failure ("…, and its pipe failed
+ *  with write EPIPE") whenever it is handled before the exit, which only
+ *  scheduling decides. Exiting after the line arrives leaves the host nothing
+ *  to write once the server is gone. */
+const EXIT_ON_INITIALIZE = "process.stdin.once('data', () => process.exit(1))";
+
 /** How a connect to a server running `script` is refused: the error's message
  *  and its `stderrTail`. */
 async function refusal(id: string, script: string, ms?: number): Promise<{ message: string; stderrTail?: string }> {
@@ -51,7 +60,7 @@ test("a connect whose server exits before it answers initialize carries the last
   const refused = await refusal('needs-token', [
     "console.error('fatal: DISCORD_TOKEN is not set')",
     "process.stderr.write('exiting with code 1')",
-    'process.exit(1)',
+    EXIT_ON_INITIALIZE,
   ].join('; '));
   assert.deepEqual(refused, {
     message: 'MCPL server "needs-token" transport closed before handshake completed (child process exited)',
@@ -65,22 +74,23 @@ test("a server whose stderr ends with a newline is refused with its last line an
 });
 
 test("a server that writes nothing to stderr is refused as before, with no `stderrTail`", { timeout: 30_000 }, async () => {
-  assert.deepEqual(await refusal('quiet', 'process.exit(1)'), {
+  assert.deepEqual(await refusal('quiet', EXIT_ON_INITIALIZE), {
     message: 'MCPL server "quiet" transport closed before handshake completed (child process exited)',
     stderrTail: undefined,
   });
 });
 
 test(`the error keeps at most the last ${STDERR_TAIL_CHARS} code units of stderr, after a '\u2026'`, { timeout: 30_000 }, async () => {
-  const refused = await refusal('chatty', `process.stderr.write('a'.repeat(5000) + 'b'.repeat(${STDERR_TAIL_CHARS - 3}) + 'end'); process.exit(1)`);
+  const refused = await refusal('chatty', `process.stderr.write('a'.repeat(5000) + 'b'.repeat(${STDERR_TAIL_CHARS - 3}) + 'end'); ${EXIT_ON_INITIALIZE}`);
   assert.equal(refused.message, 'MCPL server "chatty" transport closed before handshake completed (child process exited)');
   assert.equal(refused.stderrTail, `\u2026${'b'.repeat(STDERR_TAIL_CHARS - 3)}end`);
 });
 
 test('a server that writes 256 KB to stderr just before it exits is refused with the last of it', { timeout: 30_000 }, async () => {
   // Past a pipe's buffer, so the parent reads it in many chunks while the child
-  // writes; the child exits once its write has been taken.
-  const refused = await refusal('burst', "process.stderr.write('x'.repeat(256 * 1024) + 'the end', () => process.exit(1))");
+  // writes; the child exits once its write has gone into the pipe and the
+  // initialize line has arrived.
+  const refused = await refusal('burst', `process.stderr.write('x'.repeat(256 * 1024) + 'the end', () => ${EXIT_ON_INITIALIZE})`);
   assert.equal(refused.message, 'MCPL server "burst" transport closed before handshake completed (child process exited)');
   assert.equal(refused.stderrTail, `\u2026${'x'.repeat(STDERR_TAIL_CHARS - 7)}the end`);
 });
@@ -155,7 +165,7 @@ test("a connect and a reconnect that fail their handshakes report the server's s
     {
       id: 'needs-token',
       command: process.execPath,
-      args: ['-e', "console.error('fatal: DISCORD_TOKEN is not set'); process.exit(1)"],
+      args: ['-e', `console.error('fatal: DISCORD_TOKEN is not set'); ${EXIT_ON_INITIALIZE}`],
       reconnect: true,
       reconnectIntervalMs: 10,
       reconnectMaxIntervalMs: 10,
