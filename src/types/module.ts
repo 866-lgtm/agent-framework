@@ -19,15 +19,38 @@ export interface MessageQuery {
   externalIds?: string[];
   /** Filter by participant name */
   participant?: string;
-  /** Filter by metadata fields (shallow match) */
+  /** Filter by metadata fields: each key a path, dot-separated for a nested
+   *  field (such as 'external.channelId'), its value compared by strict
+   *  equality */
   metadata?: Record<string, unknown>;
 }
+
+/**
+ * A message as a module context's reads answer it: a stored row, or a row
+ * for a write the framework holds (`held`).
+ */
+export type ModuleMessage = StoredMessage & {
+  /**
+   * True while the framework holds the message's write, as it does while
+   * the write's agent has a turn alive or the host is quiesced, until a
+   * later boundary stores it. The row's `id` is then a handle, which
+   * getMessage, editMessage and removeMessage take as they take a stored
+   * id, and which names the stored row once the write lands. Its `sequence`
+   * and `timestamp` are provisional: the sequence comes after every stored
+   * row's, the timestamp is when the framework held the write (for a write
+   * an older release held, when its queue was read back), and both change
+   * when it lands. Absent on a stored row.
+   */
+  held?: true;
+};
 
 /**
  * Result of a message query.
  */
 export interface MessageQueryResult {
-  messages: StoredMessage[];
+  /** The matching stored rows, then the matching rows of writes the
+   *  framework holds (ModuleMessage.held) */
+  messages: ModuleMessage[];
   totalCount: number;
 }
 
@@ -249,7 +272,12 @@ export interface ModuleContext {
   getModule<T extends Module>(name: string): T | null;
 
   /**
-   * Add a message to the conversation.
+   * Add a message to the conversation, and answer its id. While the
+   * framework holds the write (the agent's turn is alive, or the host is
+   * quiesced), the id is a handle, `held:` and the write's id, which
+   * getMessage, editMessage and removeMessage take as they take a stored
+   * id, and which names the stored row once the write lands
+   * (ModuleMessage.held).
    */
   addMessage(
     participant: string,
@@ -258,28 +286,33 @@ export interface ModuleContext {
   ): MessageId;
 
   /**
-   * Edit a message.
+   * Edit a message, by its id or a held write's handle. A held write is
+   * stored with the new content.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
   /**
-   * Remove a message.
+   * Remove a message, by its id or a held write's handle. A held write is
+   * dropped, so the agent never reads it.
    */
   removeMessage(id: MessageId): void;
 
   /**
-   * Find a message by external ID.
+   * Find a message this context added with an external ID: a held write's
+   * handle until the write lands, then the stored row's id.
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
 
   /**
-   * Get a message by ID.
+   * Get a message by its id or a held write's handle.
    */
-  getMessage(id: MessageId): StoredMessage | null;
+  getMessage(id: MessageId): ModuleMessage | null;
 
   /**
    * Query messages by filter criteria.
    * Useful for finding messages from external sources, by participant, etc.
+   * The rows of writes the framework holds come after the stored rows,
+   * marked `held` (ModuleMessage).
    */
   queryMessages(filter: MessageQuery): MessageQueryResult;
 
@@ -447,12 +480,14 @@ export interface EventResponse {
   addMessages?: NewMessage[];
 
   /**
-   * Messages to edit.
+   * Messages to edit, each by its id or a held write's handle
+   * (ModuleContext.editMessage).
    */
   editMessages?: MessageEdit[];
 
   /**
-   * Messages to remove.
+   * Messages to remove, each by its id or a held write's handle
+   * (ModuleContext.removeMessage).
    */
   removeMessages?: MessageId[];
 

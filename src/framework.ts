@@ -18,7 +18,6 @@ import type {
   MessageId,
   MessageMetadata,
   MessageQuery,
-  MessageQueryResult,
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
@@ -70,7 +69,9 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentSettingsExtension,
   SameRoundThinkTextPolicy,
+  ModuleMessage,
 } from './types/index.js';
+import { heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
@@ -577,6 +578,9 @@ interface DeferredWrite {
   content: ContentBlock[];
   metadata?: MessageMetadata;
   forAgent?: string;
+  /** When the framework first held the write, in ms since the epoch: a
+   *  module reads it as the held row's timestamp (heldRows). */
+  heldAt: number;
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
@@ -2139,6 +2143,8 @@ export class AgentFramework {
     /** Delivery target (registry name). Absent = the primary agent —
      *  the historical behavior of every existing caller. */
     forAgent?: string;
+    /** When the framework first held the write (DeferredWrite.heldAt). */
+    heldAt: number;
   }> = [];
 
   // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
@@ -2395,7 +2401,7 @@ export class AgentFramework {
     // go through pushModuleEvent(), which names the module.
     this.moduleRegistry = new ModuleRegistry(store, { push: (event, moduleName) => this.pushModuleEvent(event, moduleName, false) }, {
       getAgents: () => Array.from(this.agents.values()),
-      addMessage: (p, c, m) => this.addMessage(p, c, m),
+      addMessage: (p, c, m) => this.addModuleMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
@@ -6207,7 +6213,7 @@ export class AgentFramework {
     // another value comes from damage or a hand edit, and the agent it
     // meant can't be known: sent to the primary, as a falsy one would be, it
     // could put another agent's message in the primary's window.
-    const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: unknown; seq?: unknown } => {
+    const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq' | 'heldAt'> & { id?: unknown; seq?: unknown; heldAt?: unknown } => {
       if (!m || typeof m !== 'object') return false;
       const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
       return typeof participant === 'string'
@@ -6236,6 +6242,14 @@ export class AgentFramework {
     const seen = new Set<string>();
     const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
     let duplicates = 0;
+    // The time a write was first held, which a module reads as its held
+    // row's timestamp. An entry that has none (written by a release before
+    // it) or one that isn't a time (damage or a hand edit: a Date holds
+    // times within 8.64e15 ms of the epoch) takes the time it's read back
+    // here.
+    const readAt = Date.now();
+    const heldAt = (value: unknown): number =>
+      typeof value === 'number' && Math.abs(value) <= 8.64e15 ? value : readAt;
     for (const m of data.filter(wellFormed)) {
       const hasId = typeof m.id === 'string' && m.id !== '';
       const id = hasId ? (m.id as string) : randomUUID();
@@ -6251,7 +6265,7 @@ export class AgentFramework {
         continue;
       }
       seen.add(id);
-      kept.push({ ...m, id });
+      kept.push({ ...m, id, heldAt: heldAt(m.heldAt) });
     }
     // A seq is a positive whole number no larger than
     // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
@@ -17253,9 +17267,10 @@ export class AgentFramework {
         cm.addMessage(agentName, toolUse);
         cm.addMessage('user', blocks);
       } else {
+        const heldAt = Date.now();
         this.deferredMessages.push(
-          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName },
-          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName, heldAt },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName, heldAt },
         );
         // As addMessage's own deferral does: a crash before the next persist
         // must not lose the pair from a persisted queue.
@@ -18919,9 +18934,10 @@ export class AgentFramework {
        * the id into `metadata.deferredWriteId` (boot dedup). A re-deferral
        * moves the same logical entry back to pending under the same id and
        * seq, instead of minting a second, independently replayable one, or
-       * moving it behind entries that arrived after it.
+       * moving it behind entries that arrived after it, and keeps the time
+       * it was first held.
        */
-      fromQueue?: { id: string; seq: number };
+      fromQueue?: { id: string; seq: number; heldAt: number };
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
       placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
       /**
@@ -18997,7 +19013,10 @@ export class AgentFramework {
       if (opts?.fromQueue) {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
-      this.deferredMessages.push({ id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      this.deferredMessages.push({
+        id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent,
+        heldAt: opts?.fromQueue?.heldAt ?? Date.now(),
+      });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
@@ -19223,7 +19242,7 @@ export class AgentFramework {
       opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
     const written = this.writeDrainedInOrder(entries, where, (msg) =>
       this.addMessage(msg.participant, msg.content, msg.metadata, {
-        fromQueue: { id: msg.id, seq: msg.seq },
+        fromQueue: { id: msg.id, seq: msg.seq, heldAt: msg.heldAt },
         ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
         ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
       }), (msg, id) => {
@@ -19233,44 +19252,135 @@ export class AgentFramework {
     return [...written.keys()];
   }
 
+  /**
+   * A module's write through its context: addMessage's, except that a write
+   * the framework holds is answered by its handle (heldHandle) rather than
+   * '', so the module can find, read, edit and remove what it wrote before
+   * the write lands. The framework's own callers keep the '' they've always
+   * had, which their traces and checks take as a write not stored yet.
+   */
+  private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata): MessageId {
+    const placement: { deferredId?: string } = {};
+    const id = this.addMessage(participant, content, metadata, { placement });
+    return placement.deferredId === undefined ? id : heldHandle(placement.deferredId);
+  }
+
+  /**
+   * The writes the framework holds for the store `reader` reads, in queue
+   * order: those addressed to it and, when it's an ordinary resident, those
+   * addressed to any ordinary resident, since residents share one message
+   * slot (sharedSlotAgents). A write whose target is gone is dropped at its
+   * flush (addMessage), so it isn't among them.
+   */
+  private heldWritesFor(reader: Agent): DeferredWrite[] {
+    return this.deferredMessages
+      .filter((m) => {
+        const target = this.deliveryAgent(m.forAgent);
+        return !!target && (target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)));
+      })
+      .sort(bySeq);
+  }
+
+  /**
+   * The writes held for `reader`'s store (heldWritesFor) as the rows a
+   * module's context reads: each under its handle, marked `held`, with the
+   * participant, content and metadata it was written with, the time it was
+   * first held as its timestamp, and a sequence after every row the store
+   * holds, in queue order. The sequence and timestamp are provisional: the
+   * stored row has the store's own.
+   */
+  private heldRows(reader: Agent): ModuleMessage[] {
+    const writes = this.heldWritesFor(reader);
+    if (writes.length === 0) return [];
+    const cm = reader.getContextManager();
+    const count = cm.getMessageCount();
+    const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+    return writes.map((m, i) => ({
+      id: heldHandle(m.id),
+      sequence: last + 1 + i,
+      participant: m.participant,
+      content: m.content,
+      metadata: m.metadata,
+      timestamp: new Date(m.heldAt),
+      held: true,
+    }));
+  }
+
+  /** The row a held write landed as, found by the id it's stored with
+   *  (`metadata.deferredWriteId`): the first, for a body stored in shards,
+   *  as addMessage answers a stored write. Null when it hasn't landed, or is
+   *  no longer in the store. */
+  private landedRow(cm: ContextManager, writeId: string): StoredMessage | null {
+    return cm.queryMessages({ metadata: { deferredWriteId: writeId } }).messages[0] ?? null;
+  }
+
+  // A module context's reads, edits and removals, and a process answer's,
+  // go to the store addMessage writes by default, and take a held write's
+  // handle as well as a stored id. A handle reaches the write while it's
+  // held for that store, and its stored row once it lands. A handle whose
+  // write the framework dropped names nothing, as an unknown id does: the
+  // store answers it.
+
   private editMessage(id: MessageId, content: ContentBlock[]): void {
-    const agent = this.primaryAgentName
-      ? this.agents.get(this.primaryAgentName)
-      : this.agents.values().next().value;
+    const agent = this.deliveryAgent();
     if (!agent) {
       throw new Error('No agents configured');
     }
-    agent.getContextManager().editMessage(id, content);
+    const writeId = heldWriteId(id);
+    if (writeId !== undefined) {
+      const held = this.heldWritesFor(agent).find((m) => m.id === writeId);
+      if (held) {
+        held.content = content;
+        if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+        return;
+      }
+    }
+    const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
+    agent.getContextManager().editMessage(landed?.id ?? id, content);
   }
 
   private removeMessage(id: MessageId): void {
-    const agent = this.primaryAgentName
-      ? this.agents.get(this.primaryAgentName)
-      : this.agents.values().next().value;
+    const agent = this.deliveryAgent();
     if (!agent) {
       throw new Error('No agents configured');
     }
-    removeStoredMessage(agent.getContextManager(), id);
+    const writeId = heldWriteId(id);
+    if (writeId !== undefined && this.heldWritesFor(agent).some((m) => m.id === writeId)) {
+      this.deferredMessages = this.deferredMessages.filter((m) => m.id !== writeId);
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      return;
+    }
+    const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
+    removeStoredMessage(agent.getContextManager(), landed?.id ?? id);
   }
 
-  private getMessage(id: MessageId): StoredMessage | null {
-    const agent = this.primaryAgentName
-      ? this.agents.get(this.primaryAgentName)
-      : this.agents.values().next().value;
+  private getMessage(id: MessageId): ModuleMessage | null {
+    const agent = this.deliveryAgent();
     if (!agent) {
       return null;
     }
-    return agent.getContextManager().getMessage(id);
+    const writeId = heldWriteId(id);
+    if (writeId === undefined) return agent.getContextManager().getMessage(id);
+    return this.heldRows(agent).find((row) => row.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
   }
 
-  private queryMessages(filter: MessageQuery): MessageQueryResult {
-    const agent = this.primaryAgentName
-      ? this.agents.get(this.primaryAgentName)
-      : this.agents.values().next().value;
+  private queryMessages(filter: MessageQuery): { messages: ModuleMessage[]; totalCount: number } {
+    const agent = this.deliveryAgent();
     if (!agent) {
       return { messages: [], totalCount: 0 };
     }
-    return agent.getContextManager().queryMessages(filter);
+    const cm = agent.getContextManager();
+    const held = this.heldRows(agent).filter((row) => matchesMessageQuery(row, filter));
+    if (held.length === 0) return cm.queryMessages(filter);
+    // The stored rows, then the held ones, reversed and cut to the limit as
+    // the store's own query does it: it matches every row, then reverses,
+    // then cuts.
+    const { limit, reverse, ...match } = filter;
+    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages, ...held];
+    const totalCount = messages.length;
+    if (reverse) messages = messages.reverse();
+    if (limit !== undefined && limit < messages.length) messages = messages.slice(0, limit);
+    return { messages, totalCount };
   }
 
   private createFrameworkState(): FrameworkState {

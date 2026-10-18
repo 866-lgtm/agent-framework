@@ -4,8 +4,6 @@ import type {
   MessageId,
   MessageMetadata,
   MessageQuery,
-  MessageQueryResult,
-  StoredMessage,
   ContextInjection,
 } from '@animalabs/context-manager';
 import type {
@@ -22,7 +20,10 @@ import type {
   SpeechHandlerOptions,
   ProcessEvent,
   TraceEventListener,
+  ModuleMessage,
+  MessageQueryResult,
 } from './types/index.js';
+import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
@@ -111,7 +112,7 @@ export class ModuleRegistry {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
-  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private getMessageFn: (id: MessageId) => ModuleMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
@@ -135,7 +136,7 @@ export class ModuleRegistry {
       addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
-      getMessage: (id: MessageId) => StoredMessage | null;
+      getMessage: (id: MessageId) => ModuleMessage | null;
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
@@ -583,7 +584,7 @@ class ModuleContextImpl implements ModuleContext {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
-  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private getMessageFn: (id: MessageId) => ModuleMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
@@ -603,7 +604,7 @@ class ModuleContextImpl implements ModuleContext {
     addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
-    getMessage: (id: MessageId) => StoredMessage | null,
+    getMessage: (id: MessageId) => ModuleMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
@@ -759,10 +760,29 @@ class ModuleContextImpl implements ModuleContext {
 
   findMessageByExternalId(source: string, externalId: string): MessageId | null {
     const key = `${source}:${externalId}`;
-    return this.externalIdMap.get(key) ?? null;
+    const entry = this.externalIdMap.get(key);
+    if (entry === undefined) return null;
+    // A stored id answers as it is. A held write's handle answers while the
+    // write is held, and names its stored row once it lands (getMessage). ''
+    // is what addMessage answered for a held write before handles: it's
+    // looked up in the store by the external id, held rows included, as a
+    // handle is once its write is gone. The entry is set to what's found, so
+    // a stored id found once answers as it is from then on, and the entry is
+    // dropped when nothing is found.
+    if (entry !== '' && heldWriteId(entry) === undefined) return entry;
+    const row = (entry !== '' ? this.getMessageFn(entry) : null)
+      ?? this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0]
+      ?? null;
+    const found = row?.id ?? null;
+    if (found !== entry) {
+      if (found === null) this.externalIdMap.delete(key);
+      else this.externalIdMap.set(key, found);
+      this.persistExternalIdMap();
+    }
+    return found;
   }
 
-  getMessage(id: MessageId): StoredMessage | null {
+  getMessage(id: MessageId): ModuleMessage | null {
     return this.getMessageFn(id);
   }
 
