@@ -644,6 +644,40 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  // A conversation agent's name is its agent's for the framework's life, as an
+  // ephemeral agent's is. Some state the framework keys by name outlives a
+  // disposed agent, and would pass to the next agent given the name. One is
+  // the record of a stream the framework cancelled itself, keyed by the
+  // agent's name and stream id, which stays behind if that stream never ends.
+  // A new agent's stream ids start again from 1, so the framework would read
+  // the old agent's record for the new agent's stream of the same id, and
+  // treat that stream as one it had stopped.
+  it("a disposed conversation agent's name is refused for a new agent", async () => {
+    const framework = await makeFramework();
+    const internals = framework as unknown as {
+      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      disposeConversationAgent(name: string): void;
+    };
+    const name = forkName('slack:D9', 1);
+    try {
+      await internals.createConversationAgent(name, 'slack:D9');
+      assert.ok(framework.getAgent(name), 'the first agent is registered under the name');
+      internals.disposeConversationAgent(name);
+      assert.equal(framework.getAgent(name), null, 'the agent is gone, so only its name is held');
+      // Twice: a refusal that released the name would let the second through.
+      for (const attempt of [1, 2]) {
+        await assert.rejects(
+          internals.createConversationAgent(name, 'slack:D9'),
+          new RegExp(`Conversation agent name "${name}" is already registered or reserved`),
+          `attempt ${attempt}`,
+        );
+      }
+      assert.equal(framework.getAgent(name), null, 'and no new agent took it');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
