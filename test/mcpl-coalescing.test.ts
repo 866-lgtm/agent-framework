@@ -1165,7 +1165,12 @@ test("a batch-only turn that reaches its assembly while another resident's assem
   const assemble = coalescer.assemble.bind(coalescer);
   let joins!: () => void;
   const otherAssembles = new Promise<void>((resolve) => { joins = resolve; });
-  coalescer.assemble = (agent, causes) => { if (agent === 'other') joins(); return assemble(agent, causes); };
+  let otherAssembly: ReturnType<typeof assemble> | undefined;
+  coalescer.assemble = (agent, causes) => {
+    const assembly = assemble(agent, causes);
+    if (agent === 'other') { otherAssembly = assembly; joins(); }
+    return assembly;
+  };
   const start = internals.startAgentStream.bind(internals);
   let otherTurn: Promise<unknown> = new Promise(() => {});
   let otherStarts!: () => void;
@@ -1178,6 +1183,13 @@ test("a batch-only turn that reaches its assembly while another resident's assem
   otherGate.auxiliaryInFlight = 0;
   for (const resolve of otherGate.idleWaiters.splice(0)) resolve();
   await settles(Promise.race([otherAssembles, otherStarted.then(() => otherTurn)]), "'other''s assembly or its turn");
+  if (otherAssembly) {
+    // 'other' joined the render in flight, so its assembly waits for it.
+    let settledEarly = false;
+    void otherAssembly.then(() => { settledEarly = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert(!settledEarly, "'other''s assembly waits for the render in flight");
+  }
   release({ content: [{ type: 'text', text: 'shared_render' }] });
   await settles(pass, "the primary's turn");
   await settles(otherTurn, "'other''s turn");
@@ -1185,6 +1197,9 @@ test("a batch-only turn that reaches its assembly while another resident's assem
   assert.equal(f.membrane.calls.length, 1, 'the batch got one model call');
   assert(f.lastRequest().includes('shared_render'), 'and that call read the render');
   assert.deepEqual(withdrawn, ['other'], "'other''s turn got nothing of the primary's render");
+  const joined = await settles(otherAssembly!, "'other''s assembly");
+  assert.equal(joined.settled.size, 1, "'other''s assembly settled the subject once the render did");
+  assert.equal(joined.materialized.size, 0, 'and took nothing of it as its own');
 });
 
 test("a render placed in a live turn's deferred queue isn't read by the resident that rendered it; the queue's agent is woken for it", async (t) => {
@@ -1280,6 +1295,44 @@ test("a render placed in a live turn's deferred queue wakes its agent though a n
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
+test("a render placed in a live turn's deferred queue keeps its agent's wake when another agent's assembly freezes a newer batch of its subject that gives nothing", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  const withdrawn = withdrawals(f);
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  let renders = 0;
+  f.renderer(() => {
+    if (++renders > 1) return Promise.resolve({ content: [] });
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // As above: the primary's turn is alive, 'other''s assembly renders the
+  // batch into the primary's queue, and a notice during the render opens a
+  // newer batch, which wakes both. In the next pass the primary is still
+  // busy, and 'other''s assembly freezes the newer batch, whose render is
+  // empty: the freeze withdraws the subject's wakes, and nothing is placed.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    const pass = internals.processInferenceRequests();
+    await settles(started, "the render for 'other'");
+    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+    release({ content: [{ type: 'text', text: 'first_render' }] });
+    await settles(pass, 'the first pass');
+    await settles(internals.processInferenceRequests(), 'the second pass');
+    assert.deepEqual(withdrawn, ['other', 'other']);
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], "the primary's wake for the render outlived the newer batch's freeze");
+  } finally {
+    endStandInTurn(internals);
+  }
+  await settles(f.framework.runUntilIdle(), "the primary's turn");
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
+});
+
 test("a render queued for an agent that its running turn already read gives the agent's re-woken turn nothing", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
@@ -1305,6 +1358,36 @@ test("a render queued for an agent that its running turn already read gives the 
   assert(f.context().includes('document_diff'), 'the render was stored');
   assert.equal(f.membrane.calls.length, 0, 'the re-woken turn had nothing new to read');
   assert.deepEqual(withdrawn, ['other', 'agent']);
+});
+
+test("a render still in its agent's deferred queue, which the flush couldn't store, gives the agent's re-woken turn nothing", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  const withdrawn = withdrawals(f);
+  await f.send('push/event', f.params('1', 'queued_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals & { deferredMessages: unknown[] };
+  // As above, 'other''s assembly renders the batch into the primary's queue,
+  // and the primary is woken for it.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'one scheduler pass');
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent']);
+  } finally {
+    internals.activeTurnTokens.delete('agent');
+  }
+  // The store takes no writes, so every flush is cut short at its first
+  // entry and the render stays queued (writeDrainedInOrder): the primary's
+  // turn-start flush leaves it there, and its compile wouldn't show it.
+  const drain = internals.drainDeferredFor.bind(internals);
+  internals.drainDeferredFor = () => [];
+  try {
+    await settles(f.framework.runUntilIdle(), "the primary's re-woken turn");
+    assert.equal(f.membrane.calls.length, 0, 'the re-woken turn had nothing it could read');
+    assert.deepEqual(withdrawn, ['other', 'agent']);
+    assert.equal(internals.deferredMessages.length, 1, 'the render is still queued');
+  } finally {
+    internals.drainDeferredFor = drain;
+  }
 });
 
 test("a render queued for one resident isn't another resident's to read once its flush has stored it", async (t) => {

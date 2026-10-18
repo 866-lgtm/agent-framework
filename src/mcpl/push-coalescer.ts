@@ -713,7 +713,8 @@ export class PushCoalescer<E = unknown> {
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock. The queued render is read
-      // before the freeze, whose render of a newer batch would clear it.
+      // under the same lock, before any render this freeze starts can settle
+      // and take the occupant's place.
       const { queued, started } = await this.locked(async () => ({
         queued: cause && this.queuedFor(subject, agentName),
         started: await this.freeze(subject, agentName, cause),

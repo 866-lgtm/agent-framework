@@ -11712,7 +11712,7 @@ export class AgentFramework {
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
-      wakeToRead: (occ, agentName) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }),
+      wakeToRead: (occ, agentName) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }, true),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -12104,8 +12104,9 @@ export class AgentFramework {
     await this.queueCoalescedWakes(occ);
   }
 
-  /** Queue a wake for each agent of the batch's audience, when its latest occurrence triggers inference. */
-  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+  /** Queue a wake for each agent of the batch's audience, when its latest
+   *  occurrence triggers inference; `read`: for a render queued for it. */
+  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, read = false): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
@@ -12124,15 +12125,20 @@ export class AgentFramework {
         addressed: isAddressedMessage(occ.tags, origin),
         coalescingSubject: subject,
         coalescingBatch: true,
+        ...(read ? { coalescingRead: true } : {}),
       });
     }
   }
 
-  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). A wake
+   *  to read a render queued for its agent stays: it is for that render,
+   *  which a later batch of the subject doesn't replace, and if the render is
+   *  gone or read by then, the turn finds nothing of it at its assembly. */
   private cancelCoalescedWakes(subject: string): void {
-    this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
+    const keep = (r: InferenceRequest) => r.coalescingSubject !== subject || r.coalescingRead === true;
+    this.pendingRequests = this.pendingRequests.filter(keep);
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
-      cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+      cooldown.heldRequests = cooldown.heldRequests.filter(keep);
     }
   }
 
@@ -14789,7 +14795,8 @@ export class AgentFramework {
     // its causes (a batch whose wake the freeze withdrew, or one that never
     // qualified for a wake), and so does a render queued for this agent that
     // the flush has stored and nothing has read. A cause this assembly did not
-    // settle (the host stopping) keeps the turn, as before.
+    // settle (the host stopping, or its subject moving on during the audience
+    // lookup) keeps the turn, as before.
     if (assembly && batchSubjects?.length && assembly.materialized.size === 0
       && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
