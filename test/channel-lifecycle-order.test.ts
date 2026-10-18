@@ -1204,3 +1204,37 @@ test('disconnecting a server removes its channel entries before its connection c
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a channel its server registers while a disconnect closes it is removed with the rest', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'disconnect-late-register-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'Test.' }],
+    modules: [], syncIntervalMs: 0,
+  });
+  try {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+    const internals = framework as unknown as { channelRegistry: ChannelRegistry | null; mcplServerRegistry: unknown };
+    internals.channelRegistry = f.registry;
+    let lateRegistered = false;
+    internals.mcplServerRegistry = {
+      // A connect still setting up when the disconnect began: a channel
+      // change it had received is handled while its connection closes, after
+      // the disconnect removed the entries it found.
+      removeServer: async () => {
+        if (lateRegistered) return;
+        await f.registry.handleChanged('test', { added: [descriptor('y')] });
+        lateRegistered = f.registry.listChannelsRaw().some((c) => c.descriptor.id === 'y');
+      },
+      getAllServers: () => [],
+      closeAll: async () => {},
+    };
+    await framework.disconnectMcplServer('test');
+    assert.equal(lateRegistered, true, 'the channel was registered while the connection closed');
+    assert.deepEqual(f.registry.listChannelsRaw(), [], 'no channel of the disconnected server outlives its disconnect');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
