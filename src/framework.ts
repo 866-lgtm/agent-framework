@@ -4920,11 +4920,19 @@ export class AgentFramework {
           }
           return { url: cfg.url, token: cfg.token, autofetch: cfg.autofetch };
         },
+        // A null tells the agent only that the payload couldn't be stored;
+        // why, which can name the host's paths, goes to the log.
         async (fileName, data, mimeType) => {
           const workspace = this.getWorkspaceModule();
-          if (!workspace) return null;
+          if (!workspace) {
+            console.error(`[refs] couldn't store ${fileName}: this host has no workspace`);
+            return null;
+          }
           const mount = this.firstWritableMountName(workspace);
-          if (!mount) return null;
+          if (!mount) {
+            console.error(`[refs] couldn't store ${fileName}: no workspace mount is writable`);
+            return null;
+          }
           const path = `${mount}/refs/${fileName}`;
           const res = await workspace.writeBinary(path, data, mimeType);
           if (res.success) return path;
@@ -4934,6 +4942,7 @@ export class AgentFramework {
             console.error(`[refs] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${res.error ?? 'unknown error'}`);
             return path;
           }
+          console.error(`[refs] couldn't store ${path}: ${res.error ?? 'unknown error'}`);
           return null;
         },
       );
@@ -23684,7 +23693,10 @@ export class AgentFramework {
         result = outcome.ok
           ? { success: true, data: JSON.stringify({ path: outcome.path, bytes: outcome.bytes,
               mime_type: outcome.mimeType, digest_verified: outcome.digestVerified ?? 'no digest claimed' }) }
-          : { success: false, isError: true, error: outcome.error };
+          // The fetcher says what happened as a clause about the reference,
+          // and what calling again can do as a sentence of its own.
+          : { success: false, isError: true,
+              error: `fetch_reference couldn't fetch "${refId}": ${outcome.error}. ${outcome.remedy}` };
       }
       this.emitTrace({
         type: result.isError ? 'tool:failed' : 'tool:completed',
@@ -23937,7 +23949,7 @@ export class AgentFramework {
                   "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
                   'it again, re-run that tool for a fresh reference.'
                 : refusal
-                  ? `It can't be fetched either — ${refusal.reason}.`
+                  ? `It can't be fetched either — ${refusal.error}. ${refusal.remedy}`
                   : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }

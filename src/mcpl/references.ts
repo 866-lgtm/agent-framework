@@ -223,12 +223,12 @@ export const EXPIRY_REASON = {
 export const UNBOUND_REASON = "not tied to any server, so there's nowhere to fetch it from";
 
 /** The fetcher's refusal for a server it has no address to dial, one the
- *  host doesn't connect to over a network, such as a stdio server; the
- *  fetcher dials only through a server's address. save_recent_image gives it
- *  too. A stub can't know it, since only the framework holds its servers'
- *  configs. */
+ *  host doesn't connect to over a network, such as a stdio server, as a
+ *  clause about the reference; the fetcher dials only through a server's
+ *  address. save_recent_image gives it too. A stub can't know it, since only
+ *  the framework holds its servers' configs. */
 export function noAddressReason(serverId: string): string {
-  return `no address: this host doesn't connect to server ${serverId} over a network, so there's nowhere to fetch it from`;
+  return `this host doesn't connect to the "${serverId}" server over a network, so there's nowhere to fetch it from`;
 }
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
