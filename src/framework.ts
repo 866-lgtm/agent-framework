@@ -963,6 +963,38 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
   }
 }
 
+/**
+ * Refuse a config that gives two of its agents one name, naming each repeated
+ * name and every place it's at in `agents`. A name keys its agent in the
+ * framework's registry, its context log in the store (`agents/<name>/context`)
+ * and its persisted runtime settings, so a later agent of a name would take
+ * the earlier one's place in the registry while both used the name's one
+ * context log. Names compare exactly, as the registry keys them, so `Dup`
+ * beside `dup` is two agents. A name that isn't a string, as a YAML config
+ * can give one, is read as its text, as the context log's namespace reads it,
+ * so `7` beside "7" is one name.
+ */
+function assertAgentNamesUnique(agents: readonly AgentConfig[]): void {
+  const places = new Map<string, number[]>();
+  agents.forEach((agent, index) => {
+    const key = String(agent.name);
+    const seen = places.get(key);
+    if (seen) seen.push(index);
+    else places.set(key, [index]);
+  });
+  const repeats = [...places.values()].filter((at) => at.length > 1);
+  if (repeats.length === 0) return;
+  const sentences = repeats.map((at) => {
+    const where = at.map((index) => `agents[${index}]`);
+    const name = agents[at[0]!]!.name;
+    return `${where.slice(0, -1).join(', ')} and ${where[where.length - 1]} are ${at.length === 2 ? 'both' : 'all'} named ${JSON.stringify(name) ?? String(name)}.`;
+  });
+  throw new Error(
+    `${sentences.join(' ')} Each configured agent needs a name of its own: keep one agent of each name, and rename or remove the others. ` +
+      'An agent that keeps its name keeps its context log and runtime settings, and one you rename starts both afresh.',
+  );
+}
+
 /** Messages copied into another conversation (a fork's seed) without their
  *  `thinking` and `redacted_thinking` blocks: a fork inherits the template's
  *  conversation, not its reasoning. A signed block was minted under the
@@ -2429,6 +2461,7 @@ export class AgentFramework {
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     assertFrameworkSwitches(config);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
+    assertAgentNamesUnique(config.agents);
 
     // Create or use existing store
     let store: JsStore;

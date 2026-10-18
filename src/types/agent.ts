@@ -14,7 +14,12 @@ export type SameRoundThinkTextPolicySource =
  */
 export interface AgentConfig {
   toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
-  /** Unique name for this agent */
+  /**
+   * Unique name for this agent: create() refuses two configured agents of one
+   * name. Names compare exactly, so `Dup` beside `dup` is two agents, though
+   * the history tool's author filter matches their own turns without letter
+   * case and can't tell them apart there.
+   */
   name: string;
 
   /** Model to use (e.g., 'claude-sonnet-4-20250514') */
