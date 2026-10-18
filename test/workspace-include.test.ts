@@ -3,21 +3,20 @@
  * outside the mount, for walks, the watcher's pass, materialize (even when the
  * workspace's history holds the file from before the include), sync, and the
  * agent's own reads and writes, which are refused with that reason.
- * connectome-host's `_config` mount, which versions the host's config files,
- * can name them with an include and hold only those, and a file saved beside
- * them then stays out of its history and is never written back
- * (connectome-host #278).
+ * connectome-host can give its `_config` mount, which versions the host's
+ * config files, an include naming them, and a file saved beside them then
+ * stays out of its history and is never written back (connectome-host #278).
  */
 
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { includePatternReadable, insideMount, parsedSpelling, pathSegments } from '../src/modules/workspace/observe.js';
+import { includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, type Walk } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -591,21 +590,48 @@ describe('mount include', () => {
     assert.equal(readFileSync(join(env.dir, 'docs'), 'utf8'), 'on disk again\n');
   });
 
-  test('a covered file whose directory disk has replaced with a file the include doesn\'t cover is gone after a full sync', async (t) => {
+  test('a covered file whose directory disk has replaced with a regular file the include doesn\'t cover is gone after a full sync', async (t) => {
     const env = new Env(t);
     env.writeDisk('x/gate.json', '{"needle": 1}\n');
+    env.writeDisk('a/y/gate.json', '{"needle": 2}\n');
     const m = await env.open({ include: ['gate.json'] });
     await call(m, 'sync', {});
-    assert.deepEqual(env.tree(), ['x/gate.json']);
-    rmSync(join(env.dir, 'x'), { recursive: true, force: true });
-    writeFileSync(join(env.dir, 'x'), 'now a file\n');
-    // The walk passes over `x`, outside the include, and as a regular file it
-    // holds nothing beneath it: the sync records the covered file as gone, as
-    // it would where `x` had gone altogether.
+    assert.deepEqual(env.tree(), ['a/y/gate.json', 'x/gate.json']);
+    for (const dir of ['x', 'a/y']) {
+      rmSync(join(env.dir, dir), { recursive: true, force: true });
+      writeFileSync(join(env.dir, dir), 'now a file\n');
+    }
+    // The walk passes over `x` and `a/y`, outside the include, and as regular
+    // files they hold nothing beneath them: the sync records each covered file
+    // as gone, as it would where its directory had gone altogether.
     await call(m, 'sync', {});
-    assert.deepEqual(env.tree(), [], 'history records the covered file as gone');
+    assert.deepEqual(env.tree(), [], 'history records the covered files as gone');
     assert.deepEqual(await listed(m), []);
     assert.equal((await call(m, 'grep', { path: 'work', pattern: 'needle' })).totalMatches, 0);
+  });
+
+  test('a covered file whose directory disk has replaced with a link the include doesn\'t cover stays in history, as a file beneath any link does', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('x/gate.json', '{"needle": 1}\n');
+    env.writeDisk('elsewhere/gate.json', '{"needle": 2}\n');
+    const m = await env.open({ include: ['gate.json'], followSymlinks: true });
+    await call(m, 'sync', {});
+    rmSync(join(env.dir, 'x'), { recursive: true, force: true });
+    symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'x'));
+    // A walk doesn't go through a link, and on a mount that follows links
+    // `x/gate.json` may be a file through it, so a full sync proves nothing
+    // about it, with or without an include.
+    await call(m, 'sync', {});
+    assert.ok(env.tree().includes('x/gate.json'), 'history keeps the covered file beneath the link');
+  });
+
+  test('provenAbsent takes a path beneath a regular file the include doesn\'t cover as absent, and not that file itself', () => {
+    const walk: Walk = {
+      files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map([['x', 'outside the include']]),
+      otherFiles: new Set(['x']), complete: new Set(['']), missing: new Set(), incomplete: [],
+    };
+    assert.equal(provenAbsent(walk, 'x/gate.json'), true);
+    assert.equal(provenAbsent(walk, 'x'), false);
   });
 
   test('a deletion the workspace holds outside the include is left alone by a materialize, and counted only by one that names its directory', async (t) => {
@@ -907,5 +933,7 @@ describe('mount include', () => {
     for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**']]) {
       assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(good)] }), JSON.stringify(good));
     }
+    // Where "/" is the separator, "\" is part of a name, so a pattern may hold one.
+    if (sep === '/') assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(['a\\b.json'])] }), 'a pattern holding "\\"');
   });
 });

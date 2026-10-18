@@ -1537,6 +1537,7 @@ export async function walkScope(
     // The links, ignored names and other entries those listings showed, and
     // the regions they gave rise to, described the directory that was there.
     for (const [path] of walk.others) if (beneath(path) && !walk.othersTaken.has(path)) walk.others.delete(path);
+    for (const path of walk.otherFiles) if (!walk.others.has(path)) walk.otherFiles.delete(path);
     for (let i = walk.incomplete.length - 1; i >= 0; i--) {
       const region = walk.incomplete[i]!;
       if ((region.kind === 'symlink' || region.kind === 'ignored') && beneath(region.path)) walk.incomplete.splice(i, 1);
