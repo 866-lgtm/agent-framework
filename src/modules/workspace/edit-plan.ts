@@ -427,9 +427,10 @@ function lineFeeds(value: string): number {
  * replacements it keeps only what a receipt names. Two bounds keep a call
  * from holding more than its file: edits whose asks, past what a refusal
  * shows, come to more occurrences than the text is long keep no more starts
- * than a refusal shows, and a file the edits would take past
- * `maxBytes` is refused as `tooLarge`, at least that many bytes, before its
- * new text is built.
+ * than a refusal shows, and a file whose counts take it past `maxBytes` is
+ * refused as `tooLarge`, at least that many bytes, before its new text is
+ * built. One that its CRs or multi-byte characters take past it is built
+ * and returned, for its caller to refuse by its bytes.
  */
 export function planFile(
   file: FileText,

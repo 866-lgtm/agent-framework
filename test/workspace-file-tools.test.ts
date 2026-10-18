@@ -322,7 +322,7 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
       success: false,
       isError: true,
       error: `Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28). `
-        + "Its push to disk didn't run, so disk lacks the file until a materialize of the path writes it.",
+        + "Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it.",
       data: { inChronicle: true },
     });
     assert.equal(armed, false);

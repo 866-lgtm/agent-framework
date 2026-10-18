@@ -2628,7 +2628,7 @@ describe("a file's mode is kept with its bytes", () => {
     }
     assert.equal(env.readDisk('a.sh'), 'echo a v2\n');
     assert.equal(modeOf(env, 'a.sh'), 0o644, "disk's mode kept");
-    assert.match(error, /\n\nDisk took 1 of the call's 2 files\. This file's push didn't complete:\n\nwork\/linked\.txt: not written: a file with other hard links[^\n]*\n\nwork\/a\.sh: written, its mode left at 0644: the kernel refused the chmod, so the workspace's \(0755\) isn't given, and a sync takes disk's mode in\.$/);
+    assert.match(error, /\n\nDisk took 1 of the call's 2 files\. This file's push didn't complete:\n\nwork\/linked\.txt: not written: a file with other hard links[^\n]*\n\nDisk took work\/a\.sh: written, its mode left at 0644: the kernel refused the chmod, so the workspace's \(0755\) isn't given, and a sync takes disk's mode in\.$/);
   });
 
   test("an autoMaterialize write whose narrowing the kernel refuses fails, saying why and from which mode to which, in the write tools' frame", async (t) => {

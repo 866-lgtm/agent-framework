@@ -200,6 +200,14 @@ test("an edit that would take a file past its mount's maxFileSize is refused", a
     "The edit did nothing: work/s.txt would be 21 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
     + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
   assert.equal(await stored('s.txt'), 'small\n');
+  // So is one that a CRLF file's CRs take past it: read as LF, these 20 bytes
+  // are 15, and the edit makes them 20, within the limit, but each of the
+  // five line ends keeps its CR.
+  await file('c.txt', 'ab\r\n'.repeat(5));
+  assert.equal(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'b', newString: 'bc', replaceAll: true })),
+    "The edit did nothing: work/c.txt would be 25 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
+    + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
+  assert.equal(await stored('c.txt'), 'ab\r\n'.repeat(5));
 });
 
 // ---------------------------------------------------------------------------
@@ -563,12 +571,16 @@ test('an edit names its path plainly: a path with an empty, "." or ".." segment 
   for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/', 'work/../mount/sub/b.txt']) {
     assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), refusal(path));
   }
-  // Every spelling of the mount's root, its bare name included, names no file.
+  // These spellings of the mount's root, its bare name included, are refused
+  // as naming no file. One that starts its part in the mount with a
+  // separator, such as "work//", resolves outside it, and parsePath refuses
+  // that first.
+  const root = (path: string) => `${path} names the root of mount "work", which isn't a file; ls work lists the files in it.`;
   for (const path of ['work', 'work/', 'work/.', 'work/sub/..']) {
-    assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), `${path} names the root of mount "work", which isn't a file.`);
+    assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), root(path));
   }
   assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/', oldString: 'one', newString: 'ONE' }] })),
-    'The edit_many call stored none of its edits: 1 problem.\n\nedit 1: work/ names the root of mount "work", which isn\'t a file.');
+    `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${root('work/')}`);
   // Dots inside a name are a plain spelling.
   for (const name of ['..b.txt', 'b.', 'a..b']) {
     const error = errorOf(await call('edit', { path: `work/sub/${name}`, oldString: 'one', newString: 'ONE' }));

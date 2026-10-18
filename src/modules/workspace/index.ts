@@ -1698,12 +1698,12 @@ export class WorkspaceModule implements Module {
    *
    * A write whose tree entry is set but that then fails returns success
    * false with `data: { inChronicle: true }`: its copy on disk was refused,
-   * the store failed after recording the entry, which skips the push, or
-   * something after the entry (recording its intent, the event, the push)
-   * threw. The workspace's tools read the file from the tree, so it is there
-   * for them, on the branch that was current when the entry was set. A set
-   * that threw and couldn't be read back throws, saying that whether the
-   * entry is set isn't known.
+   * the store failed after recording the entry, which skips the push where
+   * the mount pushes, or something after the entry (recording its intent,
+   * the event, the push) threw. The workspace's tools read the file from the
+   * tree, so it is there for them, on the branch that was current when the
+   * entry was set. A set that threw and couldn't be read back throws, saying
+   * that whether the entry is set isn't known.
    */
   async writeBinary(
     mountPrefixedPath: string,
@@ -1756,7 +1756,7 @@ export class WorkspaceModule implements Module {
         // skipped its push, so on a mount that pushes, disk lacks it.
         failure = error instanceof StoredThenFailed
           ? `Stored "${mountPrefixedPath}" in Chronicle, but the store failed after recording it: ${error.message}.`
-            + (error.pushes ? " Its push to disk didn't run, so disk lacks the file until a materialize of the path writes it." : '')
+            + (error.pushes ? " Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it." : '')
           : `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
       }
       if (failure !== null) {
@@ -2331,9 +2331,10 @@ export class WorkspaceModule implements Module {
   /**
    * Commit a tool's write or delete to the workspace tree, with the branch
    * intent it implies: store origin for a path disk never agreed with; for a
-   * deletion, a tombstone, unless the evidence holds no agreed disk copy (P
-   * absent, or no P and store origin), when it clears the path's intent and
-   * pushes nothing. It pushes the change to disk when the mount opts in via
+   * deletion, a tombstone, unless the agreement's evidence for the path, P,
+   * holds no agreed disk copy (P absent, or no P and store origin), when it
+   * clears the path's intent and pushes nothing. It pushes the change to
+   * disk when the mount opts in via
    * `autoMaterialize` — required for cross-agent pipelines, since another
    * agent's watcher on the same directory only sees real filesystem events.
    * The push follows materialize's rule: a disk copy that changed since it
@@ -2363,9 +2364,10 @@ export class WorkspaceModule implements Module {
    * commitToolChange for several paths of one mount at once, as edit_many
    * commits its files: every path's precondition is enforced before any entry
    * is set, then every entry is set in one record of the store, which takes
-   * all of them or none, then each path's intent, by commitToolChange's rule,
-   * with no await between, and one push takes the paths to disk, but for a
-   * deletion that clears its path's intent. `onCommitted` is told of each
+   * all of them or none, then each path's intent, by the rule
+   * commitToolChange's doc gives, which the loop below applies, with no await
+   * between, and one push takes the paths to disk, but for a deletion that
+   * clears its path's intent. `onCommitted` is told of each
    * path once the entries are set, also when the store throws after setting
    * them, whose error then goes on in place of the push (changesLanded).
    * Answers, by path, the reason for each that reached the workspace but not
@@ -3059,10 +3061,11 @@ export class WorkspaceModule implements Module {
 
   /**
    * Where an edit's path is in its mount, or why the call can't edit it: a
-   * path no mount holds, a read-only mount, a path not spelled plainly, or for
-   * edit_many a generated file. edit's generated file is refused before it
-   * gets here, by the same rule (handleToolCall checks a call's `path`, which
-   * edit_many's input lacks).
+   * path no mount holds, or one a nested mount holds (parseFilePath), a path
+   * that names its mount's root, one not spelled plainly, a read-only mount,
+   * or for edit_many a generated file. edit's generated file is refused
+   * before it gets here, by the same rule (handleToolCall checks a call's
+   * `path`, which edit_many's input lacks).
    */
   private editablePath(
     tool: EditTool,
@@ -3084,7 +3087,7 @@ export class WorkspaceModule implements Module {
       // the mount's root, its bare name included, names no file.
       const root = resolve(where.mount.config.path);
       const plain = relative(root, resolve(root, where.relativePath)).split(sep).join('/');
-      if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file.`);
+      if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
       if (plain !== where.relativePath) {
         const named = `${where.mount.config.name}/${plain}`;
         return unusable(`${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from ${named}, the same file on disk; name it ${named}.`);
@@ -3158,7 +3161,7 @@ export class WorkspaceModule implements Module {
     const kept = 'modeKept' in outcome
       ? targets.flatMap((target) => {
         const reason = outcome.modeKept.get(target.relativePath);
-        return reason === undefined ? [] : [`${target.path}: ${reason}.`];
+        return reason === undefined ? [] : [`Disk took ${target.path}: ${reason}.`];
       })
       : [];
     const notes = [...kept, ...targets.map((target) => applied.get(target)).filter((note): note is string => !!note)];
@@ -4184,7 +4187,7 @@ class CommitUnknownError extends Error {
  * change to disk, and `notes` are commitToolChanges' own, by path.
  */
 class StoredThenFailed extends Error {
-  constructor(storeError: unknown, readonly pushes: boolean, readonly notes: Map<string, string> = new Map()) {
+  constructor(storeError: unknown, readonly pushes: boolean, readonly notes: Map<string, string>) {
     super(storeError instanceof Error ? storeError.message : String(storeError));
     this.name = 'StoredThenFailed';
   }
