@@ -15,10 +15,12 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { buildChildEnv } from '../mcpl/transport.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
+import { boundedErrorMessage } from '../error-message.js';
 import { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
 
 export interface InjectedTool {
@@ -72,6 +74,19 @@ export interface PyRunnerOptions {
   onToolCall: ScriptToolCallHandler;
   /** Log prefix, typically the agent name. */
   label?: string;
+  /** Variables for the interpreter beyond what it inherits, such as
+   *  PYTHONPATH or a venv's. It inherits only what stdio MCPL children do
+   *  (CHILD_ENV_ALLOWLIST and LC_*, CA bundles and proxy variables among
+   *  them, and a proxy URL can carry credentials), then these, then
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING, which the runner sets last.
+   *  Like the allowlist, this limits what the model's code inherits, not
+   *  what a process running as the same user can read. */
+  env?: Record<string, string>;
+  /** Pass the host's whole environment instead of the allowlist, as before
+   *  `env` existed. That hands every host variable, provider keys included,
+   *  to the model's code and to every subprocess a script starts; listing
+   *  what scripts need in `env` is the safer route. */
+  inheritEnv?: boolean;
 }
 
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 270_000;
@@ -91,6 +106,56 @@ export function formatLimit(ms: number): string {
   return `${Math.round(ms / 360_000) / 10} h`;
 }
 
+/**
+ * What a script stopped at its time limit is told after why: that the tool
+ * calls it made keep their effects, and whether a longer limit can help,
+ * which only the deployment's ceiling for its kind of script can say. A
+ * foreground script at its ceiling is offered background mode too, when its
+ * caller passes `backgroundCeilingMs` (the framework does for an agent that
+ * could start a background script as the script starts) and a background
+ * script may run longer.
+ */
+function limitRemedy(limitMs: number, ceilingMs: number | undefined, background: boolean, backgroundCeilingMs?: number): string {
+  const effects = 'Tool calls it had already made keep their effects, so check them before running it again.';
+  if (ceilingMs === undefined) return effects;
+  if (limitMs < ceilingMs) return `${effects} To give it longer, ${background ? 'start it with' : 'pass'} time_limit_ms up to ${ceilingMs} (${formatLimit(ceilingMs)}).`;
+  if (background) return `${effects} ${formatLimit(limitMs)} is the longest a background script runs here; starting it again runs it from the top.`;
+  const inBackground = backgroundCeilingMs !== undefined && backgroundCeilingMs > limitMs
+    ? `, or run it with background: true, where a script can run up to ${formatLimit(backgroundCeilingMs)}` : '';
+  return `${effects} ${formatLimit(limitMs)} is the longest a script can run here, so split the work across shorter scripts${inBackground}.`;
+}
+
+/**
+ * Why a script didn't run when its interpreter didn't start. A spawn that
+ * found nothing it could run (ENOENT, EACCES) fails the same way until the
+ * host changes, so that one says code_execution can't run here rather than
+ * to try again. A failure before the spawn, while creating or writing the
+ * runtime's files, is about those files rather than the interpreter, and
+ * keeps Node's own text, which names the path for an open or a mkdtemp.
+ */
+function startFailure(pythonPath: string, err: unknown): string {
+  const { code, syscall } = (err ?? {}) as { code?: unknown; syscall?: unknown };
+  const spawning = typeof syscall === 'string' && syscall.startsWith('spawn');
+  if (spawning && (code === 'ENOENT' || code === 'EACCES')) {
+    const until = code === 'ENOENT' ? 'installs it or points this host at one' : 'makes it executable or points this host at another';
+    return `script didn't run: this host can't start its Python interpreter, ${pythonPath} (${code}), so code_execution can't run scripts here until whoever runs this host ${until}. Calling it again before then fails the same way.`;
+  }
+  if (typeof syscall === 'string' && !spawning) {
+    return `script didn't run: this host couldn't create or write the files its Python runtime starts from (${boundedErrorMessage(err)}), so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.`;
+  }
+  const why = typeof code === 'string' ? `couldn't be started (${code})` : boundedErrorMessage(err);
+  return `script didn't run: the Python interpreter, ${pythonPath}, ${why}, so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.`;
+}
+
+/** Why a script stopped when its interpreter exited under it, and what running it again does. */
+function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean): string {
+  const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
+  return `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
+    + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
+    + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script itself '
+    + `ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}; if not, ask whoever runs this host.`;
+}
+
 interface PendingExec {
   id: string;
   resolve: (result: ExecResult) => void;
@@ -101,10 +166,27 @@ interface PendingExec {
   settled: boolean;
   /** Set once the deadline fired: the result then says the script ran out of time. */
   deadlineMs: number | null;
+  /** The longest limit this exec could have had (exec's opts): whether a longer one would help. */
+  ceilingMs: number | undefined;
+  /** For a foreground exec, the longest a background script may run (exec's opts): whether background mode would help. */
+  backgroundCeilingMs: number | undefined;
+  /** A background exec has its interpreter to itself, so no earlier script's state is lost with it. */
+  background: boolean;
   /** Set once the script went to the interpreter. Before that, the exec is
    *  waiting for the interpreter to start, and an interpreter that exits then
    *  failed to start (see exec). */
   sent: boolean;
+}
+
+/**
+ * The interpreter to spawn. A bare name is looked up on PATH. A path with a
+ * separator is resolved against the host's working directory, where it
+ * resolved before the interpreter got a working directory of its own: spawn
+ * would resolve it against the runtime directory instead.
+ */
+function spawnablePath(pythonPath: string): string {
+  const hasSeparator = pythonPath.includes('/') || (process.platform === 'win32' && pythonPath.includes('\\'));
+  return hasSeparator ? resolve(pythonPath) : pythonPath;
 }
 
 export class PyRunner {
@@ -115,6 +197,7 @@ export class PyRunner {
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
+  private readonly envOptions: { env?: Record<string, string>; inheritEnv?: boolean };
 
   private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -134,6 +217,12 @@ export class PyRunner {
     this.idleReclaimMs = options.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
+    // The interpreter runs model-authored code: the same env discipline as an
+    // MCPL connector child (#175), for a child that deserves it more. Stored
+    // as options, not a snapshot — the env is rebuilt at every spawn so a
+    // respawn after idle reclaim sees current host values, as the old
+    // per-spawn `{ ...process.env }` did.
+    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv };
   }
 
   get busy(): boolean {
@@ -152,12 +241,18 @@ export class PyRunner {
    *
    * `opts.deadlineMs` replaces the runner's scriptTimeoutMs for this exec (a
    * per-call time limit); a background exec uses its `lifetimeMs` instead.
+   * `opts.ceilingMs` is the longest limit the deployment allows this kind of
+   * script: a script stopped at its limit is offered a longer one only below
+   * it. Without it, the stop doesn't say whether a longer limit would help.
+   * `opts.backgroundCeilingMs`, for a foreground exec, is the longest a
+   * background script may run: one stopped at its ceiling is offered
+   * background mode when that is longer.
    */
   async exec(
     code: string,
     tools: InjectedTool[],
     background?: BackgroundExecOptions,
-    opts?: { deadlineMs?: number },
+    opts?: { deadlineMs?: number; ceilingMs?: number; backgroundCeilingMs?: number },
   ): Promise<ExecResult> {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
@@ -165,7 +260,8 @@ export class PyRunner {
     if (this.busy) {
       return {
         stdout: '',
-        stderr: 'RuntimeError: another code_execution script is already running for this agent',
+        stderr: "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
+          + 'Run this one again once that one has finished, or combine the two into one script.',
         returnCode: 1,
         aborted: true,
       };
@@ -186,6 +282,9 @@ export class PyRunner {
       killTimer: null,
       settled: false,
       deadlineMs: null,
+      ceilingMs: opts?.ceilingMs,
+      backgroundCeilingMs: opts?.backgroundCeilingMs,
+      background: background !== undefined,
       sent: false,
     };
     this.pending = pending;
@@ -195,10 +294,9 @@ export class PyRunner {
       // Settled already when an abort or dispose reclaimed the interpreter
       // as it started; another exec may have claimed the runner since.
       if (!pending.settled) {
-        const message = err instanceof Error ? err.message : String(err);
         this.settlePending({
           stdout: '',
-          stderr: `Failed to start python runtime (${this.pythonPath}): ${message}`,
+          stderr: startFailure(this.pythonPath, err),
           returnCode: 1,
           aborted: true,
         });
@@ -230,8 +328,9 @@ export class PyRunner {
         this.settlePending({
           stdout: '',
           stderr:
-            `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, ` +
-            'so it was killed and the interpreter restarted (variables from earlier scripts are gone)',
+            `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, so it was killed` +
+            (pending.background ? '. ' : ' and the interpreter restarted (variables from earlier scripts are gone). ') +
+            limitRemedy(deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs),
           returnCode: 1,
           aborted: true,
         });
@@ -301,13 +400,23 @@ export class PyRunner {
     }
     this.teardownChild();
 
-    this.runtimeDir = mkdtempSync(join(tmpdir(), 'af-pytc-'));
+    // Absolute, since the interpreter runs in it: from a relative TMPDIR,
+    // runtime.py's path would otherwise resolve against the directory itself.
+    this.runtimeDir = resolve(mkdtempSync(join(tmpdir(), 'af-pytc-')));
     const runtimePath = join(this.runtimeDir, 'runtime.py');
     writeFileSync(runtimePath, PYTHON_RUNTIME_SOURCE, 'utf8');
 
-    const child = spawn(this.pythonPath, [runtimePath], {
+    const child = spawn(spawnablePath(this.pythonPath), [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      // The runtime directory, not the host's working directory: a script's
+      // relative paths land here, and go at teardown, rather than beside the
+      // host's .env and data. An absolute path still reaches the host's files.
+      cwd: this.runtimeDir,
+      // Set last, over a declared env: the protocol needs both. It writes
+      // non-ASCII JSON on piped stdio, which Python before 3.15 on Windows
+      // encodes in the ANSI code page unless told otherwise, and a host's
+      // own PYTHONUTF8 no longer reaches the interpreter.
+      env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
 
@@ -349,7 +458,7 @@ export class PyRunner {
               ? 'python runtime stopped reading its input, so it was killed and the interpreter restarted ' +
                 '(variables from earlier scripts are gone). A script that closes its standard input ' +
                 '(file descriptor 0) does this.'
-              : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`,
+              : interpreterExit(exitCode, signal, this.pending.background),
           returnCode: 1,
           aborted: true,
         });
@@ -369,7 +478,7 @@ export class PyRunner {
       };
       const onExit = () => {
         cleanup();
-        reject(new Error('python runtime exited before becoming ready'));
+        reject(new Error('exited as it started'));
       };
       const onError = (err: Error) => {
         cleanup();
@@ -377,7 +486,7 @@ export class PyRunner {
       };
       const timeout = setTimeout(() => {
         cleanup();
-        reject(new Error('python runtime did not become ready within 15s'));
+        reject(new Error("didn't start within 15 seconds"));
       }, 15_000);
       const cleanup = () => {
         clearTimeout(timeout);
@@ -473,7 +582,8 @@ export class PyRunner {
     // Only a script that ended unsuccessfully was stopped: one that caught the cancellation
     // and finished its work returns 0, and must not read as stopped.
     if (pending.deadlineMs !== null && result.returnCode !== 0) {
-      const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
+      const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit. `
+        + `${limitRemedy(pending.deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs)}\n`;
       // On a line of its own: the runner's own texts, such as an interpreter's exit, end without a newline.
       const withNote = (text: string) => (text === '' || text.endsWith('\n') ? text : `${text}\n`) + note;
       // A background script reports its output tail, so the note goes there too.
@@ -539,8 +649,8 @@ export class PyRunner {
     // An interpreter killed as it starts never says it's ready: fail its
     // readiness now, so an exec waiting on it returns at once rather than at
     // the 15 s timeout. Here rather than in teardownChild, which an
-    // interpreter's own exit also runs, so that one still reads "exited
-    // before becoming ready".
+    // interpreter's own exit also runs, so that one still reads "exited as
+    // it started".
     this.readyFailer?.(new Error(`python runtime reclaimed (${reason}) before it was ready`));
     this.teardownChild();
     this.clearIdleTimer();
@@ -551,8 +661,8 @@ export class PyRunner {
       this.reader.close();
       this.reader = null;
     }
-    if (this.child) {
-      const child = this.child;
+    const child = this.child;
+    if (child) {
       this.child = null;
       this.childReady = null;
       this.readyResolver = null;
@@ -572,13 +682,24 @@ export class PyRunner {
         child.kill('SIGKILL');
       }
     }
-    if (this.runtimeDir) {
-      try {
-        rmSync(this.runtimeDir, { recursive: true, force: true });
-      } catch {
-        // temp cleanup is best-effort
-      }
-      this.runtimeDir = null;
+    const dir = this.runtimeDir;
+    this.runtimeDir = null;
+    if (dir) {
+      const remove = (): void => {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // temp cleanup is best-effort
+        }
+      };
+      // The directory is the interpreter's working directory, which Windows
+      // won't remove while the process lives, so there it goes once the
+      // process has. Elsewhere it goes now, so a host that exits right after
+      // this doesn't leave it behind. A child that never started has no exit
+      // to wait for.
+      const running = child !== null && child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+      if (running && process.platform === 'win32') child.once('exit', remove);
+      else remove();
     }
   }
 
