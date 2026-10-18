@@ -296,7 +296,7 @@ test('a message the live path stored is neither rebuilt nor fetched again by a h
   assert.deepEqual([edits, added, fetched], [[], [], []]);
 });
 
-test('a history sync rebuilds a row that doesn\'t hold what the live path would store, blanked or stripped before the mark, still holding a removed attachment or text its message lost, and a row whose text changed keeps its file', async (t) => {
+test('a history sync rebuilds a row that doesn\'t hold what the live path would store, blanked or stripped before the mark, still holding a removed attachment or text its message lost, or a caption its message lost, and a row whose text changed keeps its file', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => new Response('file body', { status: 200 }));
   const pdf: DiscordAttachment = { id: 'a3', filename: 'x.pdf', url: 'https://cdn.example/x.pdf', contentType: 'application/pdf', size: 50 };
   const pdfNote = text('[Attachment: x.pdf (application/pdf)]');
@@ -309,8 +309,15 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     row('b6', [imageBlock], false, 6_000),
     row('b7', [text('was here'), fileBlock], false, 7_000),
     row('b8', [text('')], false, 8_000),
+    // An earlier sync stripped b9 to its caption, and the caption went while
+    // its file stayed: one block where one is expected.
+    row('b9', [text('old caption')], false, 9_000),
+    // b10's own text reads as the marker.
+    row('b10', [text('[Empty message]'), fileBlock], false, 10_000),
   ], {
     fetchHistory: async () => [
+      history('b10', '[Empty message]', 10_000, [notes]),
+      history('b9', '', 9_000, [notes]),
       history('b8', '', 8_000, []),
       history('b7', '', 7_000, [notes]),
       history('b6', '', 6_000, []),
@@ -321,7 +328,7 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
       history('b1', '', 1_000, [notes]),
     ],
   });
-  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 7, deletedMessages: 0 });
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 9, deletedMessages: 0 });
   assert.deepEqual(edits, [
     // An attachment-only message an earlier sync blanked.
     { id: 'stored-b1', content: [text(''), fileBlock] },
@@ -329,7 +336,10 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     { id: 'stored-b2', content: [text('own'), pdfNote] },
     // One whose text changed while the client was away keeps its file.
     { id: 'stored-b3', content: [text('new'), fileBlock] },
-    // b4 holds what the live path stored before the mark, and is left alone.
+    // b4 holds what the live path stored before the mark, but its message has
+    // no text, so its first block can't be told from a caption it lost, and
+    // it's stored again, once.
+    { id: 'stored-b4', content: [text(''), pdfNote] },
     // A marked row whose image was removed from the message loses it.
     { id: 'stored-b5', content: [text('keep')] },
     // So does an image-only message stored before the mark.
@@ -339,6 +349,9 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     { id: 'stored-b7', content: [text(''), fileBlock] },
     // A message with neither text nor attachments, which an earlier sync blanked.
     { id: 'stored-b8', content: [text(''), text('[Empty message]')] },
+    // The caption its message lost goes, and its file comes back.
+    { id: 'stored-b9', content: [text(''), fileBlock] },
+    // b10's text and file are both there, so it's left alone.
   ]);
   assert.deepEqual(added, []);
   // Each row it rebuilt holds what the next sync expects, so that sync

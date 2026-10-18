@@ -179,17 +179,26 @@ function contentForText(stored: StoredMessage, discordText: string): ContentBloc
  * EMPTY_MESSAGE aside, which the text's rule keeps. A row stored before that
  * layout held its text, when it had any, then those blocks, or EMPTY_MESSAGE
  * alone; one that doesn't was blanked or stripped by an earlier edit or sync,
- * or its message gained or lost text, or lost an attachment. One whose text
- * alone changed is left to the text's rule, which keeps the blocks after it.
- * History without attachments can't be compared, so it rebuilds nothing.
+ * or its message gained or lost text, or lost an attachment. Its first block,
+ * when it is the message's own text, counts as that text, even when the text
+ * reads as EMPTY_MESSAGE. For a message without text of its own, a first
+ * block that's text may be what the host added or a caption the message has
+ * since lost, which no count tells apart, so that row is stored again; it
+ * then begins with its own '' text. One whose text alone changed is left to
+ * the text's rule, which keeps the blocks after it. History without
+ * attachments can't be compared, so it rebuilds nothing.
  */
 function needsRebuild(stored: StoredMessage, message: HistoryMessage): boolean {
   if (message.attachments === undefined) return false;
   const attachments = message.attachments.length;
   const held = (blocks: ContentBlock[]) => blocks.filter((block) => !isBlankText(block) && !isEmptyMarker(block)).length;
   if (stored.metadata?.[TEXT_FIRST] === true) return held(stored.content.slice(1)) !== attachments;
-  const expected = (ownText(message.content) ? 1 : 0) + attachments;
-  return held(stored.content) !== expected || (expected === 0 && !stored.content.some(isEmptyMarker));
+  const own = ownText(message.content);
+  const [first, ...rest] = stored.content;
+  if (!own && first?.type === 'text' && !isBlankText(first) && !isEmptyMarker(first)) return true;
+  const expected = (own ? 1 : 0) + attachments;
+  const counted = own && first?.type === 'text' && first.text === own ? 1 + held(rest) : held(stored.content);
+  return counted !== expected || (expected === 0 && !stored.content.some(isEmptyMarker));
 }
 
 /**
