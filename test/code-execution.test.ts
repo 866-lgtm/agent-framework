@@ -1466,23 +1466,27 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
   });
 
   it("a signal's advice fits it: the traceback's call after a crash's signal, native code when no traceback came, the script's own os.kill() after another", async () => {
-    // Each with whether faulthandler's traceback is in the result, above the advice.
-    const cases: [string, string, boolean, string][] = [
-      ['a segfault', 'import ctypes\nctypes.string_at(0)', true, exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
-      ['a fatal error', 'import ctypes\nctypes.pythonapi.Py_FatalError(b"probe reason")', true, exitedUnder('was ended by SIGABRT', false, NATIVE_CRASH)],
-      ...['SIGBUS', 'SIGFPE', 'SIGILL'].map((sig): [string, string, boolean, string] =>
-        [sig, `import os, signal\nos.kill(os.getpid(), signal.${sig})`, true, exitedUnder(`was ended by ${sig}`, false, NATIVE_CRASH)]),
-      ['a segfault with faulthandler disabled', 'import ctypes, faulthandler\nfaulthandler.disable()\nctypes.string_at(0)', false,
+    // Each with where faulthandler's traceback begins in the result, above the advice, or null where none came.
+    const header = /^Fatal Python error: /m;
+    const cases: [string, string, RegExp | null, string][] = [
+      ['a segfault', 'import ctypes\nctypes.string_at(0)', header, exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
+      ['a fatal error', 'import ctypes\nctypes.pythonapi.Py_FatalError(b"probe reason")', header, exitedUnder('was ended by SIGABRT', false, NATIVE_CRASH)],
+      ...['SIGBUS', 'SIGFPE', 'SIGILL'].map((sig): [string, string, RegExp, string] =>
+        [sig, `import os, signal\nos.kill(os.getpid(), signal.${sig})`, header, exitedUnder(`was ended by ${sig}`, false, NATIVE_CRASH)]),
+      // faulthandler doesn't start a line: after a progress bar's, which doesn't end, its first words follow on it.
+      ["a segfault after a line the script didn't end", 'import sys, ctypes\nsys.stderr.write("\\r 45%|####      | 45/100")\nsys.stderr.flush()\nctypes.string_at(0)',
+        /45\/100Fatal Python error: /, exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
+      ['a segfault with faulthandler disabled', 'import ctypes, faulthandler\nfaulthandler.disable()\nctypes.string_at(0)', null,
         exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH_UNSEEN)],
-      ['SIGTERM', 'import os, signal\nos.kill(os.getpid(), signal.SIGTERM)', false, exitedUnder('was ended by SIGTERM')],
+      ['SIGTERM', 'import os, signal\nos.kill(os.getpid(), signal.SIGTERM)', null, exitedUnder('was ended by SIGTERM')],
     ];
-    for (const [what, code, traced, says] of cases) {
+    for (const [what, code, traceback, says] of cases) {
       const runner = new PyRunner({ onToolCall: async () => '' });
       try {
         const result = await within(runner.exec(code, []), what);
         assert.strictEqual(result.aborted, true, what);
-        if (traced) {
-          assert.match(result.stderr, /^Fatal Python error: /m, what);
+        if (traceback) {
+          assert.match(result.stderr, traceback, what);
           assert.ok(result.stderr.endsWith(`\n${says}`), `${what}: ${JSON.stringify(result.stderr.slice(-600))}`);
         } else {
           assert.strictEqual(result.stderr, says, what);

@@ -601,7 +601,9 @@ function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null,
   const taken = exitCode === RUNTIME_FATAL_EXIT ? fdTakenFromRuntime(said) : null;
   // After a crash's signal, faulthandler's traceback shows the call that crashed, in native code or the
   // script's own os.abort(), when it reached what the result keeps: a script can disable faulthandler,
-  // and a stream's cap or a journal's tail can lose it. SIGKILL is the out-of-memory killer's; any
+  // and a stream's cap or a journal's tail can lose it. Its first words are looked for anywhere, not
+  // only at a line's start: faulthandler doesn't start a line, so after output that didn't end one,
+  // such as a progress bar's, they follow on that line. SIGKILL is the out-of-memory killer's; any
   // other signal, the script can send itself.
   const check = taken
     ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
