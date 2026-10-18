@@ -224,9 +224,10 @@ export const UNBOUND_REASON = "not tied to any server, so there's nowhere to fet
 
 /** The fetcher's refusal for a server it has no address to dial, one the
  *  host doesn't connect to over a network, such as a stdio server, as a
- *  clause about the reference; the fetcher dials only through a server's
- *  address. save_recent_image gives it too. A stub can't know it, since only
- *  the framework holds its servers' configs. */
+ *  clause that completes "couldn't fetch <ref>: " and says so of the server;
+ *  the fetcher dials only through a server's address. save_recent_image gives
+ *  it too. A stub can't know it, since only the framework holds its servers'
+ *  configs. */
 export function noAddressReason(serverId: string): string {
   return `this host doesn't connect to the "${serverId}" server over a network, so there's nowhere to fetch it from`;
 }

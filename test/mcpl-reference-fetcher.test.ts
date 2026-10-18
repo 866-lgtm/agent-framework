@@ -83,6 +83,7 @@ function makeRecord(reg: ReferenceRegistry, uri: string, extra: Record<string, u
 const NOTHING_TO_DO = "Calling again won't change that.";
 const FRESH_REFERENCE = "Once a fresh reference to it arrives, fetching may work; until then, fetching it again won't.";
 const TRY_LATER = 'Trying again later may work.';
+const REQUEST_FAILED = "Trying again later may work; if it fails the same way, whoever runs this host can check its connection to the server.";
 const BUDGET = "The budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it.";
 const HOST_CEILING = "No max_bytes or setting lifts that limit, so calling again won't change it.";
 const SERVER_BACK = "Calling again won't change that unless whoever runs this host adds that server back.";
@@ -109,7 +110,7 @@ test('vector 5: digest mismatch is never presented', async () => {
   const out = await f.fetch(rec);
   assert.equal(out.ok, false);
   assert.match(out.error!, /^the bytes that arrived don't match the reference's digest \(sha256:B{13}…, against sha256:[\w-]{13}…\), so they weren't kept$/);
-  assert.equal(out.remedy, "Trying again may work; if it fails the same way, this reference can't be fetched here.");
+  assert.equal(out.remedy, "Trying again may work; if it fails the same way, fetching may work once a fresh reference to it arrives.");
   assert.equal(rec.fetchedPath, undefined);
 });
 
@@ -193,7 +194,7 @@ test('an http: reference from a server dialed over TLS is refused as another ori
   const rec = makeRecord(reg, `${ORIGIN}/ok?plaintext-from-tls`);
   const out = await f.fetch(rec);
   assert.equal(out.error,
-    `it points to ${ORIGIN}, not to the "srv" server's own address (https://127.0.0.1:${port}), and this host fetches only from the server itself`);
+    `it points to ${ORIGIN}, not to the "srv" server's own address (wss://127.0.0.1:${port}), and this host fetches only from the server itself`);
   assert.equal(out.remedy, NOTHING_TO_DO);
   assert.equal(hits.get('/ok?plaintext-from-tls') ?? 0, 0, 'nothing dialed');
 });
@@ -532,6 +533,8 @@ test('bytes past the ceiling still count against the budget', async () => {
   const out = await f.fetch(makeRecord(reg, `${ORIGIN}/drip?first=1200&rest=5000&wait=10000`), { maxBytes: 1000 });
   const [, received] = /^the download had reached (\d+) bytes, past the 1000 bytes this call allows, so it was stopped and nothing was kept$/.exec(out.error!) ?? [];
   assert.ok(received, out.error);
+  // Past max_bytes, and no more than the 1200 bytes sent before the pause, however they were chunked.
+  assert.ok(Number(received) > 1000 && Number(received) <= 1200, received);
   // A larger max_bytes can read no more than the budget has left after these bytes.
   assert.equal(out.remedy, `It's at least ${received} bytes; a larger max_bytes, up to ${PAYLOAD.length + 500 - Number(received)}, may fetch it.`);
   assert.match((await f.fetch(makeRecord(reg, `${ORIGIN}/ok?after-ceiling`))).error!, STOPPED_BY_BUDGET);
@@ -808,13 +811,14 @@ test('refusal() answers what the fetch would refuse before dialing, case by case
     ['unknown server', makeRecord(reg, `${ORIGIN}/ok?case=unknown`, small, 'gone'), 'this host no longer has the "gone" server it came from', SERVER_BACK],
     ['no address', makeRecord(reg, `${ORIGIN}/ok?case=no-address`, small, 'stdio-srv'), noAddressReason('stdio-srv'), NOTHING_TO_DO],
     ['off the origin', makeRecord(reg, 'https://cdn.example.invalid/case-origin', small, 'srv'),
-      `it points to https://cdn.example.invalid, not to the "srv" server's own address (${ORIGIN}), and this host fetches only from the server itself`, NOTHING_TO_DO],
+      `it points to https://cdn.example.invalid, not to the "srv" server's own address (ws://127.0.0.1:${port}), and this host fetches only from the server itself`, NOTHING_TO_DO],
     ['expired', makeRecord(reg, `${ORIGIN}/ok?case=expired`, { ...small, expiresAt: '2001-01-01T00:00:00Z' }, 'srv'), `the reference is ${EXPIRY_REASON.passed}`, FRESH_REFERENCE],
     ['budget spent', makeRecord(reg, `${ORIGIN}/ok?case=budget`, small, 'spent'), 'this host\'s fetch budget for the "spent" server is used up (0 of 0 bytes)', BUDGET],
     ['over the ceiling', makeRecord(reg, `${ORIGIN}/ok?case=ceiling`, { sizeBytes: 512 * 1024 * 1024 }, 'roomy'),
       'it claims 536870912 bytes, over the 268435456 bytes this host fetches at most', HOST_CEILING],
-    ['over the ceiling and what is left of the budget', makeRecord(reg, `${ORIGIN}/ok?case=both`, { sizeBytes: 2 * 1024 * 1024 * 1024 }, 'roomy'),
-      'it claims 2147483648 bytes, more than the 1073741824 bytes left of this host\'s fetch budget for the "roomy" server', BUDGET],
+    // Past the host's own ceiling, whatever the budget has left, since no budget lifts it.
+    ['over the host ceiling and what is left of the budget', makeRecord(reg, `${ORIGIN}/ok?case=both`, { sizeBytes: 2 * 1024 * 1024 * 1024 }, 'roomy'),
+      'it claims 2147483648 bytes, over the 268435456 bytes this host fetches at most', HOST_CEILING],
   ];
   for (const [what, record, error, remedy] of cases) {
     const refusal = f.refusal(record);
@@ -840,7 +844,7 @@ test('refusal() answers what the fetch would refuse before dialing, case by case
   assert.equal(f.isEagerEligible(keptCopy), false);
 });
 
-test('a reference with two faults is refused for the first the fetch checks: the server, then the expiry, the spent budget, the claimed size', async () => {
+test('a reference with two faults is refused for the first the fetch checks: the server, then the expiry, a claim past the host\'s ceiling, the spent budget', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ 'stdio-srv': 'no-address', spent: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: 0 } } });
   const past = '2001-01-01T00:00:00Z';
@@ -848,7 +852,9 @@ test('a reference with two faults is refused for the first the fetch checks: the
   const cases: Array<[string, ReturnType<typeof makeRecord>, string]> = [
     ['no address, expired', makeRecord(reg, `${ORIGIN}/ok?two=1`, { expiresAt: past }, 'stdio-srv'), noAddressReason('stdio-srv')],
     ['expired, budget spent, over the ceiling', makeRecord(reg, `${ORIGIN}/ok?two=2`, { expiresAt: past, sizeBytes: huge }, 'spent'), `the reference is ${EXPIRY_REASON.passed}`],
-    ['budget spent, over the ceiling', makeRecord(reg, `${ORIGIN}/ok?two=3`, { sizeBytes: huge }, 'spent'), 'this host\'s fetch budget for the "spent" server is used up (0 of 0 bytes)'],
+    // Nothing lifts the host's ceiling, so it comes before a budget whoever runs the host can raise.
+    ['over the host ceiling, budget spent', makeRecord(reg, `${ORIGIN}/ok?two=3`, { sizeBytes: huge }, 'spent'), 'it claims 536870912 bytes, over the 268435456 bytes this host fetches at most'],
+    ['budget spent, within the ceiling', makeRecord(reg, `${ORIGIN}/ok?two=4`, { sizeBytes: 1000 }, 'spent'), 'this host\'s fetch budget for the "spent" server is used up (0 of 0 bytes)'],
   ];
   for (const [what, record, error] of cases) {
     const refusal = f.refusal(record);
@@ -991,7 +997,7 @@ test('a fetch that meets no listener says the request failed, with its cause, an
   const f = makeFetcher({ dead: { url: `ws://127.0.0.1:${deadPort}` } });
   const out = await f.fetch(makeRecord(reg, `http://127.0.0.1:${deadPort}/x`, {}, 'dead'));
   assert.equal(out.error, `the request to the "dead" server failed: connect ECONNREFUSED 127.0.0.1:${deadPort}`);
-  assert.equal(out.remedy, TRY_LATER);
+  assert.equal(out.remedy, REQUEST_FAILED);
   // A host with several addresses is refused at each, and its cause, an
   // AggregateError, has no words of its own: each attempt's stand in.
   t.mock.method(globalThis, 'fetch', async () => {
@@ -1001,18 +1007,19 @@ test('a fetch that meets no listener says the request failed, with its cause, an
   const both = await makeFetcher({ dual: { url: 'ws://dual.example.invalid:4321' } })
     .fetch(makeRecord(reg, 'http://dual.example.invalid:4321/x', {}, 'dual'));
   assert.equal(both.error, 'the request to the "dual" server failed: connect ECONNREFUSED ::1:4321; connect ECONNREFUSED 127.0.0.1:4321');
-  assert.equal(both.remedy, TRY_LATER);
+  assert.equal(both.remedy, REQUEST_FAILED);
 });
 
 test("a save that throws is the workspace's failure, logged for whoever runs the host, not the fetch's", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   const reg = new ReferenceRegistry();
-  const f = new ReferenceFetcher(() => ({ url: ORIGIN }), async () => { throw new Error('disk on fire'); });
+  // Its words take one line of the log, as the agent's text would.
+  const f = new ReferenceFetcher(() => ({ url: ORIGIN }), async () => { throw new Error('disk on fire\nand smoking'); });
   const rec = makeRecord(reg, `${ORIGIN}/ok?save-throws`);
   const out = await f.fetch(rec);
   assert.equal(out.error, "it was fetched, but this host couldn't store it in its workspace, so nothing was kept");
   assert.equal(out.remedy, 'Calling again is likely to fail the same way; whoever runs this host can see why in its log.');
-  assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [`[refs] couldn't store ${rec.refId}.wav: disk on fire`]);
+  assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [`[refs] couldn't store ${rec.refId}.wav: disk on fire?and smoking`]);
   assert.equal(rec.fetchedPath, undefined);
 });
 
@@ -1057,7 +1064,7 @@ test("an address that doesn't parse is refused before anything is dialed: the re
   assert.equal(bad.error, "its address doesn't parse as a URL");
   assert.equal(bad.remedy, NOTHING_TO_DO);
   const misconfigured = await makeFetcher({ srv: { url: 'not a url either' } }).fetch(makeRecord(reg, `${ORIGIN}/ok?misconfigured`));
-  assert.equal(misconfigured.error, noAddressReason('srv'));
+  assert.equal(misconfigured.error, "the \"srv\" server's address doesn't parse as a URL, so there's nowhere to fetch it from");
   assert.equal(misconfigured.remedy, NOTHING_TO_DO);
   assert.equal(hits.get('/ok?misconfigured') ?? 0, 0, 'nothing dialed');
 });
@@ -1070,6 +1077,7 @@ test("past what's left of the server's budget, a download stopped at max_bytes i
   const out = await f.fetch(makeRecord(reg, `${ORIGIN}/drip?first=1200&rest=5000&wait=10000`), { maxBytes: 1000 });
   const [, received] = /^the download had reached (\d+) bytes, past the 1000 bytes this call allows, so it was stopped and nothing was kept$/.exec(out.error!) ?? [];
   assert.ok(received, out.error);
+  assert.ok(Number(received) > 1000 && Number(received) <= 1200, received);
   assert.equal(out.remedy,
     `It's at least ${received} bytes, more than the ${1500 - Number(received)} bytes left of this host's fetch budget for the "srv" server. ${BUDGET}`);
 });

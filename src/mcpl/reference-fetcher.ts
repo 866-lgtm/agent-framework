@@ -56,6 +56,11 @@ const NOTHING_TO_DO = "Calling again won't change that.";
  *  uri arrives as this very id and refreshes its record. */
 const FRESH_REFERENCE = "Once a fresh reference to it arrives, fetching may work; until then, fetching it again won't.";
 const TRY_LATER = 'Trying again later may work.';
+/** A request that failed before an answer: a refused or reset connection
+ *  can clear, and a cause that repeats on every try (a port fetch refuses, a
+ *  name that doesn't resolve, a certificate this host doesn't trust) is
+ *  whoever runs the host's to change, so the remedy names both. */
+const REQUEST_FAILED = "Trying again later may work; if it fails the same way, whoever runs this host can check its connection to the server.";
 const CREDENTIALS = "Calling again won't change that; whoever runs this host can check its credentials for the server.";
 const FRESH_OR_CREDENTIALS = "Once a fresh reference to it arrives, fetching may work; if that's refused too, whoever runs this host can check its credentials for the server.";
 /** The total lives as long as this fetcher, one per framework, so only
@@ -137,7 +142,8 @@ function statusRemedy(status: number): string {
 function largerMaxBytes(received: number, left: number, server: string): string {
   const most = Math.min(DEFAULT_FETCH_MAX_BYTES, left);
   if (received <= most) return `It's at least ${received} bytes; a larger max_bytes, up to ${most}, may fetch it.`;
-  return left < DEFAULT_FETCH_MAX_BYTES
+  // Past the host's own ceiling nothing lifts it, whatever the budget has left.
+  return received <= DEFAULT_FETCH_MAX_BYTES
     ? `It's at least ${received} bytes, more than the ${left} bytes left of this host's fetch budget for ${server}. ${BUDGET}`
     : `It's at least ${received} bytes, more than the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most. ${HOST_CEILING}`;
 }
@@ -253,8 +259,10 @@ export class ReferenceFetcher {
   }
 
   /** Every check the fetch makes before it dials, in its order: the server
-   *  (none, unknown, no address, off the uri's origin), the expiry, the
-   *  server's spent budget, a claimed size over the ceiling. For a record
+   *  (none, unknown, no address, an address of its own or the reference's
+   *  that doesn't parse, a scheme other than http: or https:, off the uri's
+   *  origin), the expiry, a claimed size over the host's own ceiling, the
+   *  server's spent budget, a claimed size over a call's ceiling. For a record
    *  with no saved copy and no fetch under way, the fetch, `refusal()` and
    *  the eager check all ask this, so what save_recent_image says is the
    *  reason the fetch would refuse with, and no eager slot goes to a fetch
@@ -269,8 +277,13 @@ export class ReferenceFetcher {
     if (expiry) return refused(`the reference is ${EXPIRY_REASON[expiry]}`, FRESH_REFERENCE);
 
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
-    // The budget is checked before the ceiling, here and while reading: a
-    // larger max_bytes lifts the ceiling, and nothing the caller does lifts
+    // A claim past the host's own ceiling is refused first: nothing lifts
+    // it, not even a budget whoever runs the host raises.
+    if (t.sizeBytes !== undefined && t.sizeBytes > DEFAULT_FETCH_MAX_BYTES) {
+      return refused(`it claims ${t.sizeBytes} bytes, over the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most`, HOST_CEILING);
+    }
+    // The budget is checked before a call's ceiling, here and while reading:
+    // a larger max_bytes lifts that ceiling, and nothing the caller does lifts
     // the budget, so a fetch past both is told about the budget.
     const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     const used = this.totals.get(serverId) ?? 0;
@@ -288,12 +301,10 @@ export class ReferenceFetcher {
           BUDGET,
         );
       }
-      // Within what's left of the budget, so a ceiling of the call's own,
-      // below the host's, is what a larger max_bytes lifts.
-      return t.sizeBytes <= DEFAULT_FETCH_MAX_BYTES
-        ? refused(`it claims ${t.sizeBytes} bytes, over the ${ceiling} bytes this call allows`,
-          `Pass max_bytes of at least ${t.sizeBytes} to fetch it.`)
-        : refused(`it claims ${t.sizeBytes} bytes, over the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most`, HOST_CEILING);
+      // Within what's left of the budget and the host's ceiling, so a
+      // ceiling of the call's own is what a larger max_bytes lifts.
+      return refused(`it claims ${t.sizeBytes} bytes, over the ${ceiling} bytes this call allows`,
+        `Pass max_bytes of at least ${t.sizeBytes} to fetch it.`);
     }
     return { serverId, binding, ceiling, budget };
   }
@@ -313,14 +324,17 @@ export class ReferenceFetcher {
   private originCheck(record: ReferenceRecord, binding: ResolvedServerBinding, serverId: string): { refusal: Refusal } | null {
     const refOrigin = normalizedOrigin(record.testimony.uri);
     if (!refOrigin) return refused("its address doesn't parse as a URL", NOTHING_TO_DO);
-    // A server's address that doesn't parse leaves nothing to dial, as for a
-    // server with none. The framework's resolver gives only an address its
-    // transport dials, so this guards other resolvers.
+    // A server's address that doesn't parse leaves nothing to dial. The
+    // framework's resolver gives only an address its transport dials, so this
+    // guards other resolvers.
     const dialedOrigin = normalizedOrigin(binding.url);
-    if (!dialedOrigin) return refused(noAddressReason(serverId), NOTHING_TO_DO);
+    if (!dialedOrigin) {
+      return refused(`the "${serverId}" server's address doesn't parse as a URL, so there's nowhere to fetch it from`, NOTHING_TO_DO);
+    }
     // The uri's own scheme, not its origin's: an origin reads ws: as http:
-    // and wss: as https:, and fetch can't dial a ws: or wss: uri, which would
-    // fail only once dialed, as a network error a later try can't mend.
+    // and wss: as https:, and fetch refuses a ws: or wss: uri ('unknown
+    // scheme') before connecting, which would read as a failed request a
+    // later try can mend.
     const scheme = new URL(record.testimony.uri).protocol;
     if (scheme !== 'https:' && scheme !== 'http:') {
       return refused(`its address uses ${scheme}, and this host fetches only http: and https: addresses`, NOTHING_TO_DO);
@@ -328,7 +342,7 @@ export class ReferenceFetcher {
     // Origins compare with their schemes, so this also refuses an http:
     // reference from a server dialed over TLS (wss://).
     if (refOrigin !== dialedOrigin) {
-      return refused(`it points to ${refOrigin}, not to the "${serverId}" server's own address (${dialedOrigin}), ` +
+      return refused(`it points to ${refOrigin}, not to the "${serverId}" server's own address (${new URL(binding.url).origin}), ` +
         'and this host fetches only from the server itself', NOTHING_TO_DO);
     }
     return null;
@@ -409,7 +423,7 @@ export class ReferenceFetcher {
           return fail(
             `the bytes that arrived don't match the reference's digest (${t.digest.slice(0, 20)}…, against ${got.slice(0, 20)}…), ` +
               "so they weren't kept",
-            "Trying again may work; if it fails the same way, this reference can't be fetched here.",
+            "Trying again may work; if it fails the same way, fetching may work once a fresh reference to it arrives.",
           );
         }
         digestVerified = true;
@@ -433,7 +447,7 @@ export class ReferenceFetcher {
       try {
         path = await this.saveFile(fileName, data, observedMime);
       } catch (e) {
-        console.error(`[refs] couldn't store ${fileName}: ${describeCause(e)}`);
+        console.error(`[refs] couldn't store ${fileName}: ${boundedForLog(describeCause(e))}`);
         path = null;
       }
       if (path === null) {
@@ -453,7 +467,7 @@ export class ReferenceFetcher {
         const seconds = timeoutMs / 1000;
         return fail(`it took longer than ${seconds} second${seconds === 1 ? '' : 's'}`, TRY_LATER);
       }
-      return fail(`the request to ${server} failed: ${boundedForLog(whyFetchFailed(e))}`, TRY_LATER);
+      return fail(`the request to ${server} failed: ${boundedForLog(whyFetchFailed(e))}`, REQUEST_FAILED);
     } finally {
       clearTimeout(timer);
     }

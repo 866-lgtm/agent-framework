@@ -689,7 +689,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const expected = [
         ['call_save0', noAddress.refId, `It can't be fetched either — ${noAddressReason('stdio')}. ${nothing}`],
         ['call_save1', offOrigin.refId, "It can't be fetched either — it points to https://cdn.example.invalid, not to the \"vst\" server's own address "
-          + `(https://example.invalid), and this host fetches only from the server itself. ${nothing}`],
+          + `(wss://example.invalid), and this host fetches only from the server itself. ${nothing}`],
         ['call_save2', gone.refId, "It can't be fetched either — this host no longer has the \"gone\" server it came from. "
           + "Calling again won't change that unless whoever runs this host adds that server back."],
         ['call_save3', big.refId, "It can't be fetched either — it claims 536870912 bytes, over the 268435456 bytes this host fetches at most. "
