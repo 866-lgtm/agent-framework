@@ -704,6 +704,30 @@ describe('surgery and awareness marks', () => {
     assert.equal(outbox().operations().length, 0);
   });
 
+  it('a start that imports a pre-journal ledger alerts with each batch whose undelivered marks it retires', async () => {
+    // The store exists first, as for a host upgraded from 0.22.x.
+    await start(false);
+    await framework.stop();
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    writeFileSync(join(storePath, 'recovery', 'discord-awareness-outbox.json'), JSON.stringify({
+      version: 2,
+      batches: [{
+        id: 'legacy-pending', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1',
+        emoji: '💤', createdAt: 1,
+        refs: [{
+          serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1',
+          desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 0,
+        }],
+      }],
+    }));
+    await withAlerts(async (alerts) => {
+      await start(false);
+      assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-import-unsent']);
+      assert.match(alerts[0]!.message, /^This start imports the pre-journal awareness ledger, .*: batch legacy-pending \(resident, main to rollback\/resident\/1\): 1 to add, 0 to remove\./);
+    });
+    assert.equal(outbox().operations().length, 0, 'nothing is sent');
+  });
+
   it('an imported active suppression is verified on its target at startup: the old ledger does not prove its body', async () => {
     await start(false);
     const { removed } = seed(3);

@@ -450,6 +450,7 @@ import {
   type DiscordAwarenessBatch,
   type DiscordAwarenessView,
   type DiscordAwarenessCancelReceipt,
+  type DiscordAwarenessImportedUnsent,
   type DiscordAwarenessMarks,
   type DiscordAwarenessPrepareInput,
   type DiscordAwarenessRetractReceipt,
@@ -2458,6 +2459,9 @@ export class AgentFramework {
     const discordAwarenessOutbox = new DiscordAwarenessOutbox(store, {
       legacyPath: config.discordAwarenessOutboxPath
         ?? (config.storePath ? defaultDiscordAwarenessOutboxPath(config.storePath) : undefined),
+      // The start's reconciliation is the journal's first read, so the
+      // framework is built when an import announces itself.
+      announceImport: (unsent) => building.framework?.announceDiscordAwarenessImport(unsent),
     });
 
     const operatorLogPath = config.operatorLogPath === false
@@ -18279,22 +18283,21 @@ export class AgentFramework {
         removeStoredMessages(cm, from, to);
       }
       // The body is the surgery's own effect, which the operator chose: it
-      // is finished. Marks wait on no crash: a prepared batch is retired.
-      const { retired } = this.discordAwarenessOutbox.completeSuppression(batch.id);
-      if (retired) {
-        this.reportRetiredAwareness({
-          batchId: batch.id,
-          agentName: batch.agentName,
-          sourceBranch: batch.sourceBranch,
-          targetBranch: batch.targetBranch,
-          // An import's undelivered marks were reported as its import
-          // retired them.
-          marks: batch.cancelled || batch.scope === 'legacy' ? 0 : batch.refs.length,
-          suppression: true,
-          reason: 'interrupted',
-          ...(batch.scope === 'legacy' ? { imported: true } : {}),
-        }, { finished: true });
-      } else {
+      // is finished. Marks wait on no crash: a prepared batch is retired,
+      // and reported before that is recorded, as at reconciliation.
+      const { retired } = this.discordAwarenessOutbox.completeSuppression(batch.id, () => this.reportRetiredAwareness({
+        batchId: batch.id,
+        agentName: batch.agentName,
+        sourceBranch: batch.sourceBranch,
+        targetBranch: batch.targetBranch,
+        // An import's undelivered marks were reported as its import
+        // retired them.
+        marks: batch.cancelled || batch.scope === 'legacy' ? 0 : batch.refs.length,
+        suppression: true,
+        reason: 'interrupted',
+        ...(batch.scope === 'legacy' ? { imported: true } : {}),
+      }, { finished: true }));
+      if (!retired) {
         // An imported ledger's active batch (completeSuppression retires
         // every other one): its marks stay as they were.
         console.error(`[discord-awareness] completed suppression body ${batch.id} (marks ${batch.status})`);
@@ -18310,64 +18313,79 @@ export class AgentFramework {
    * branch that exists, which a start on that branch finishes
    * (resumePreparedDiscordSuppressions); a pending suppression whose branch
    * doesn't exist is given up; an attempt the previous process left on the
-   * wire is recorded unknown. No content is read. Then it logs what it did,
-   * each suppression whose removals stay pending for another branch
-   * (logPendingDiscordSuppressions), and each retirement
-   * (reportRetiredAwareness), and raises the delivery alert for operations
-   * that reached the bound. A journal it can't read stops the start.
+   * wire is recorded unknown. No content is read. Before it records any of
+   * that, it logs what it does, reports each retirement
+   * (reportRetiredAwareness) and raises the delivery alert for operations
+   * that reach the bound: each is recorded once, so a notice given after the
+   * record would be lost for good if the record landed and the process
+   * ended, or the record's sync failed, before the notice. Then it logs each
+   * suppression whose removals stay pending for another branch
+   * (logPendingDiscordSuppressions). A journal it can't read stops the start.
    */
   private reconcileDiscordAwarenessAtStartup(): void {
     let recovered: ReturnType<DiscordAwarenessOutbox['recoverAtStartup']>;
     try {
       const branches = new Set(this.store.listBranches().map((branch) => branch.name));
-      recovered = this.discordAwarenessOutbox.recoverAtStartup((name) => branches.has(name));
+      recovered = this.discordAwarenessOutbox.recoverAtStartup(
+        (name) => branches.has(name),
+        (planned) => this.announceDiscordAwarenessRecovery(planned),
+      );
     } catch (error) {
       // The branch may be safe, but reporting the framework ready while its
       // durable awareness journal is unreadable creates a half-ready host.
       throw new DiscordAwarenessAccountingError('startup reconciliation', error);
     }
-    if (recovered.retired.length > 0 || recovered.unknownAttempts > 0) {
-      const gone = recovered.retired.filter((retirement) => retirement.reason === 'branch-gone').length;
-      console.error(
-        `[discord-awareness] startup: retired ${recovered.retired.length - gone} batch(es) a surgery or an in-place ` +
-          `change left unfinished, none of their marks sent; gave up ${gone} suppression(s) whose branch doesn't ` +
-          `exist; recorded ${recovered.unknownAttempts} unanswered attempt(s) as unknown`,
-      );
-    }
-    if (recovered.imported.length > 0) {
-      // This start imported a pre-journal ledger: the work agent-framework
-      // 0.22.x had still to do is never sent, since nobody chose it, and its
-      // batches are retired (a suppression whose body may be pending, once a
-      // start on its branch finishes the body). A retract of a batch 0.22.x
-      // activated takes off the mark of the batch's emoji from each of its
-      // messages, whichever batch placed it.
-      this.opsAlert(
-        'discord-awareness-import-unsent',
-        'host',
-        `The pre-journal awareness ledger is imported, and the marks agent-framework 0.22.x had still to add or ` +
-          'remove won\'t be sent, since nobody chose them: ' +
-          recovered.imported.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
-            `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
-          '. A batch 0.22.x never activated placed no marks. To take off the marks it placed for a batch it ' +
-          'activated, retract that batch through the host command marks (action retract), or, with the host ' +
-          'stopped, agent-framework-recover --awareness retract: a retract takes off the mark of the batch\'s emoji ' +
-          'from each of its messages, whichever batch placed it',
-        { data: { batches: recovered.imported } },
-      );
-    }
     this.logPendingDiscordSuppressions(recovered.pending, this.store.currentBranch().name);
-    for (const retirement of recovered.retired) this.reportRetiredAwareness(retirement);
-    if (recovered.givenUp > 0) {
+  }
+
+  /** What a start's reconciliation retires, gives up and records unknown, before it is recorded. */
+  private announceDiscordAwarenessRecovery(
+    planned: { retired: DiscordAwarenessRetirement[]; unknownAttempts: number; givenUp: number },
+  ): void {
+    if (planned.retired.length > 0 || planned.unknownAttempts > 0) {
+      const gone = planned.retired.filter((retirement) => retirement.reason === 'branch-gone').length;
+      console.error(
+        `[discord-awareness] startup: retiring ${planned.retired.length - gone} batch(es) a surgery or an in-place ` +
+          `change left unfinished, none of their marks sent; giving up ${gone} suppression(s) whose branch doesn't ` +
+          `exist; recording ${planned.unknownAttempts} unanswered attempt(s) as unknown`,
+      );
+    }
+    for (const retirement of planned.retired) this.reportRetiredAwareness(retirement);
+    if (planned.givenUp > 0) {
       // The alert a delivery pass raises when it gives up on operations:
-      // these reached the bound here, with no pass to report them.
+      // these reach the bound here, with no pass to report them.
       this.opsAlert(
         'discord-awareness-delivery',
         'host',
-        `${recovered.givenUp} awareness mark operation(s) won't be sent again: their third unconfirmed attempt ` +
+        `${planned.givenUp} awareness mark operation(s) won't be sent again: their third unconfirmed attempt ` +
           'was still unanswered when the previous process ended',
-        { data: { givenUp: recovered.givenUp } },
+        { data: { givenUp: planned.givenUp } },
       );
     }
+  }
+
+  /**
+   * An import of a pre-journal ledger, before it is recorded (the outbox's
+   * announceImport): the work agent-framework 0.22.x had still to do is never
+   * sent, since nobody chose it, and its batches are retired (a suppression
+   * whose body may be pending, once a start on its branch finishes the
+   * body). A retract of a batch 0.22.x activated takes off the mark of the
+   * batch's emoji from each of its messages, whichever batch placed it.
+   */
+  private announceDiscordAwarenessImport(unsent: DiscordAwarenessImportedUnsent[]): void {
+    this.opsAlert(
+      'discord-awareness-import-unsent',
+      'host',
+      `This start imports the pre-journal awareness ledger, and the marks agent-framework 0.22.x had still to add ` +
+        'or remove won\'t be sent, since nobody chose them: ' +
+        unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
+          `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
+        '. A batch 0.22.x never activated placed no marks. To take off the marks it placed for a batch it ' +
+        'activated, retract that batch through the host command marks (action retract), or, with the host ' +
+        'stopped, agent-framework-recover --awareness retract: a retract takes off the mark of the batch\'s emoji ' +
+        'from each of its messages, whichever batch placed it',
+      { data: { batches: unsent } },
+    );
   }
 
   /**
@@ -18393,8 +18411,8 @@ export class AgentFramework {
   }
 
   /**
-   * Report a batch a start retired, or whose suppression body it gave up,
-   * with the redo that applies what was lost: the surgery again from its
+   * Report a batch a start retires, or whose suppression body it gives up,
+   * before that is recorded, with the redo that applies what was lost: the surgery again from its
    * source, which still has every message it removed, onto a new branch
    * name, choosing marks again (framework.switchBranch, then
    * rollbackToMessage or suppressMessages; offline, the recover CLI). One
@@ -18415,15 +18433,15 @@ export class AgentFramework {
         this.opsAlert(
           'discord-awareness-suppression-unfinished',
           agentName,
-          `The imported suppression of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ` +
-            `${batchId}) is given up: ${targetBranch} doesn't exist, and its removals apply only there, so they ` +
+          `This start gives up the imported suppression of ${agentName} from ${sourceBranch} onto ${targetBranch} ` +
+            `(awareness batch ${batchId}): ${targetBranch} doesn't exist, and its removals apply only there, so they ` +
             'can\'t be checked or resumed. Its marks stay as the import left them',
           { data: { batchId, imported: true }, key: batchId },
         );
         return;
       }
-      const body = opts.finished ? `; this start finished its removals on ${targetBranch}` : '';
-      console.error(`[discord-awareness] imported awareness batch ${batchId} of ${agentName} is retired${body}`);
+      const body = opts.finished ? `, having finished its removals on ${targetBranch}` : '';
+      console.error(`[discord-awareness] this start retires imported awareness batch ${batchId} of ${agentName}${body}`);
       return;
     }
     if (!retirement.suppression && sourceBranch === targetBranch) {
@@ -18433,7 +18451,7 @@ export class AgentFramework {
       if (marks === 0) {
         console.error(
           `[discord-awareness] A hide or turn undo of ${agentName} on ${targetBranch} (awareness batch ${batchId}) ` +
-            'stands, and its batch is retired, with no marks to apply',
+            'stands, and this start retires its batch, with no marks to apply',
         );
         return;
       }
@@ -18465,7 +18483,7 @@ export class AgentFramework {
     }
     const body = opts.finished ? `; this start finished its removals on ${targetBranch}` : '';
     if (marks === 0) {
-      console.error(`[discord-awareness] ${about} was interrupted${body}. It is retired, with no marks to apply`);
+      console.error(`[discord-awareness] ${about} was interrupted${body}. This start retires it, with no marks to apply`);
       return;
     }
     this.opsAlert(

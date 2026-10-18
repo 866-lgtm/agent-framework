@@ -25,6 +25,7 @@ import {
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
   type DiscordAwarenessBatchView,
+  type DiscordAwarenessImportedUnsent,
   type DiscordAwarenessRef,
   type DiscordAwarenessRetractView,
 } from '../src/recovery/discord-awareness-outbox.js';
@@ -40,8 +41,10 @@ interface Harness {
   store: JsStore;
   dir: string;
   legacyPath: string;
+  /** What each import by an instance reopen() made announced, in order. */
+  announced: DiscordAwarenessImportedUnsent[][];
   /** A fresh instance over the same store: what a restarted process reads. */
-  reopen(): DiscordAwarenessOutbox;
+  reopen(opts?: { announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void }): DiscordAwarenessOutbox;
 }
 
 function withJournal(fn: (outbox: DiscordAwarenessOutbox, h: Harness) => void | Promise<void>): () => Promise<void> {
@@ -49,7 +52,10 @@ function withJournal(fn: (outbox: DiscordAwarenessOutbox, h: Harness) => void | 
     const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-'));
     const store = JsStore.openOrCreate({ path: join(dir, 'store') });
     const legacyPath = join(dir, 'recovery', 'discord-awareness-outbox.json');
-    const h: Harness = { store, dir, legacyPath, reopen: () => new DiscordAwarenessOutbox(store, { legacyPath }) };
+    const h: Harness = {
+      store, dir, legacyPath, announced: [],
+      reopen: (opts = {}) => new DiscordAwarenessOutbox(store, { legacyPath, announceImport: (unsent) => { h.announced.push(unsent); }, ...opts }),
+    };
     try {
       await fn(h.reopen(), h);
     } finally {
@@ -209,7 +215,6 @@ test('startup activates nothing: it retires what interrupted surgeries left, and
   // A later restart changes nothing, and still keeps the suppression for its branch.
   assert.deepEqual(h.reopen().recoverAtStartup((name) => exists.has(name)), {
     retired: [], pending: [{ batchId: suppression.id, agentName: 'cairn', targetBranch: 'suppress/cairn/1' }], unknownAttempts: 0, givenUp: 0,
-    imported: [],
   });
 }));
 
@@ -367,7 +372,7 @@ test('an imported suppression 0.22.x never activated keeps its body pending, and
   assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
   // Its marks are named as unsent at the start that imported it.
-  assert.deepEqual(outbox.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds, b.removals]), [['legacy-sup', 1, 0]]);
+  assert.deepEqual(h.announced.flat().map((b) => [b.batchId, b.adds, b.removals]), [['legacy-sup', 1, 0]]);
   assert.deepEqual(outbox.completeSuppression('legacy-sup'), { retired: true });
   assert.equal(outbox.batches()[0].status, 'discarded');
   assert.equal(outbox.batches()[0].suppressionComplete, true);
@@ -535,6 +540,106 @@ test('startup records a retirement only after syncing the store, and nothing whe
   assert.deepEqual(h.reopen().recoverAtStartup(() => false).retired.map((r) => r.batchId), [batch.id]);
 }));
 
+/**
+ * Run `body` with the store's sync failing from its `failAt`th call on, and
+ * each sync and append named in `calls`, after anything `body` adds there.
+ */
+function withSyncFailing(h: Harness, failAt: number, calls: string[], body: () => void): void {
+  const sync = h.store.sync.bind(h.store);
+  const append = h.store.appendJson.bind(h.store);
+  let syncs = 0;
+  (h.store as any).appendJson = (type: string, payload: unknown) => { calls.push('append'); return append(type, payload); };
+  (h.store as any).sync = () => {
+    calls.push('sync');
+    if (++syncs >= failAt) throw new Error('injected sync failure');
+    return sync();
+  };
+  try {
+    body();
+  } finally {
+    (h.store as any).sync = sync;
+    (h.store as any).appendJson = append;
+  }
+}
+
+test('startup announces a retirement before recording it, so a record whose sync fails still had its notice', withJournal((outbox, h) => {
+  // R2-3: a retirement is recorded once. The sync after its record fails
+  // here, and the record is in the store anyway, so the next start has
+  // nothing to say about it: the notice has to come first.
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all' })!;
+  const restarted = h.reopen();
+  const calls: string[] = [];
+  const announced: string[][] = [];
+  withSyncFailing(h, 2, calls, () => {
+    assert.throws(() => restarted.recoverAtStartup(() => false, (planned) => {
+      calls.push('announce');
+      announced.push(planned.retired.map((r) => r.batchId));
+    }), /injected sync failure/);
+  });
+  assert.deepEqual(calls, ['announce', 'sync', 'append', 'sync'], 'announced before the record and its syncs');
+  assert.deepEqual(announced, [[batch.id]]);
+  assert.equal(h.reopen().batches().find((b) => b.id === batch.id)?.status, 'discarded', 'the record landed');
+  assert.deepEqual(h.reopen().recoverAtStartup(() => false).retired, [], 'and the next start has nothing to report');
+}));
+
+test('startup announces an operation brought to the bound before recording its unanswered attempt unknown', withJournal((outbox, h) => {
+  activeBatch(outbox, [ref('m1')]);
+  answer(outbox, 'm1', 'failed');
+  answer(outbox, 'm1', 'unknown');
+  // The third attempt is left on the wire by a process that ends.
+  assert.ok(outbox.claimDispatch('discord', () => false), 'a third attempt is claimed');
+  const announced: Array<{ unknownAttempts: number; givenUp: number }> = [];
+  const recovered = h.reopen().recoverAtStartup(() => true, ({ unknownAttempts, givenUp }) => { announced.push({ unknownAttempts, givenUp }); });
+  assert.deepEqual(announced, [{ unknownAttempts: 1, givenUp: 1 }], 'counted before the record');
+  assert.equal(recovered.givenUp, 1);
+  assert.equal(h.reopen().pendingDispatches('discord').length, 0, 'it won\'t be sent again');
+}));
+
+test('a resumed suppression announces its retirement before recording it', withJournal((outbox, h) => {
+  const suppression = outbox.prepare({
+    agentName: 'cairn', sourceBranch: 'main', targetBranch: 'suppress/cairn/1', refs: [ref('m1')], scope: 'all',
+    activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }],
+  })!;
+  const restarted = h.reopen();
+  const calls: string[] = [];
+  withSyncFailing(h, 2, calls, () => {
+    assert.throws(() => restarted.completeSuppression(suppression.id, () => { calls.push('announce'); }), /injected sync failure/);
+  });
+  assert.deepEqual(calls, ['announce', 'sync', 'append', 'sync'], 'announced before the record and its syncs');
+  const settled = h.reopen().batches().find((b) => b.id === suppression.id)!;
+  assert.deepEqual([settled.status, settled.suppressionComplete], ['discarded', true], 'the record landed');
+}));
+
+test('an import announces what it retires before recording it, so a record whose sync fails still had its notice', withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 2,
+    batches: [{
+      id: 'queued', status: 'active', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2',
+      emoji: '💤', createdAt: 2,
+      refs: [{ ...ref('m3'), desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 0 }],
+    }],
+  }));
+  const calls: string[] = [];
+  const announced: string[][] = [];
+  const importing = h.reopen({ announceImport: (unsent) => { calls.push('announce'); announced.push(unsent.map((b) => b.batchId)); } });
+  const error = console.error;
+  console.error = () => {};
+  try {
+    withSyncFailing(h, 1, calls, () => {
+      assert.throws(() => importing.batches(), /injected sync failure/);
+    });
+  } finally {
+    console.error = error;
+  }
+  assert.deepEqual(calls, ['announce', 'append', 'sync'], 'announced before the record and its sync');
+  assert.deepEqual(announced, [['queued']]);
+  // The record landed, so the next process only moves the file aside.
+  const next: string[][] = [];
+  assert.deepEqual(h.reopen({ announceImport: (unsent) => { next.push(unsent.map((b) => b.batchId)); } }).batches().map((b) => b.id), ['queued']);
+  assert.deepEqual(next, [], 'and has nothing to announce');
+}));
+
 test('startup gives up a pending suppression whose branch doesn\'t exist, and keeps one whose branch does', withJournal((outbox, h) => {
   const prepare = (targetBranch: string, messageId: string, suppression = false) => outbox.prepare({
     agentName: 'cairn', sourceBranch: 'main', targetBranch, refs: [ref(messageId)], scope: 'all',
@@ -640,12 +745,13 @@ test('an import retires the work 0.22.x had still to do, none of it sent, and th
   assert.equal(outbox.pendingDispatches('discord').length, 0);
   assert.deepEqual(batches(outbox), [], 'a retired batch leaves the view');
   const recovered = outbox.recoverAtStartup(() => true);
-  assert.deepEqual(recovered.imported, [
+  assert.deepEqual(h.announced, [[
     { batchId: 'old-1', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/old-1', adds: 2, removals: 0 },
-  ]);
+  ]]);
   assert.deepEqual(recovered.retired, [], 'its import retired it; no start does');
   // A later process imports nothing, and names nothing.
-  assert.deepEqual(h.reopen().recoverAtStartup(() => true).imported, []);
+  h.reopen().recoverAtStartup(() => true);
+  assert.equal(h.announced.length, 1);
   // A retract still takes off the mark of the batch's emoji from each of
   // its messages, those 0.22.x may have placed among them.
   assert.equal(h.reopen().retract('old-1').removalsQueued, 2);
@@ -889,7 +995,7 @@ test('v2 import keeps what the old ledger recorded as evidence, retires pending 
   // Its pending add is retired, never sent, and named at the start that
   // imported it.
   assert.equal(views.get('pending-batch')!.status, 'active');
-  assert.deepEqual(outbox.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds, b.removals]), [['pending-batch', 1, 0]]);
+  assert.deepEqual(h.announced.flat().map((b) => [b.batchId, b.adds, b.removals]), [['pending-batch', 1, 0]]);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
 
   // Retract carries out the act for every ref and discloses what history leaves open.
@@ -952,10 +1058,11 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
     version: 2,
     batches: [pending('restored', 'm1'), pending('later', 'm2'), pending('later', 'm2')],
   }));
+  const announcedBefore = h.announced.length;
   const widened = h.reopen();
   const later = batches(widened).find((v) => v.id === 'later')!;
   assert.equal(later.status, 'active');
-  assert.deepEqual(widened.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds]), [['later', 1]]);
+  assert.deepEqual(h.announced.slice(announcedBefore).flat().map((b) => [b.batchId, b.adds]), [['later', 1]]);
   assert.deepEqual(later.legacy, { entries: 1, lastAddConfirmed: 0, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
   assert.deepEqual(widened.view().filter((v) => v.id !== 'later'), view);
   assert.deepEqual(widened.operations(), operations);
@@ -1006,7 +1113,7 @@ test('legacy evidence reads outcomes from the old writer\'s lastError, never fro
   assert.deepEqual(view.legacy, { entries: 2, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
   // The old writer's pending removal is retired, never sent, and named.
   assert.equal(view.status, 'active');
-  assert.deepEqual(outbox.recoverAtStartup(() => true).imported.map((b) => [b.batchId, b.adds, b.removals]), [['reconciled', 0, 1]]);
+  assert.deepEqual(h.announced.flat().map((b) => [b.batchId, b.adds, b.removals]), [['reconciled', 0, 1]]);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
 
   // A retract takes the mark off, and its own requests are disclosed when
@@ -1279,7 +1386,10 @@ test('framework finishes an interrupted suppression\'s removals and retires its 
     // The body is recorded complete only once its removals are made.
     const complete = h.outbox.completeSuppression.bind(h.outbox);
     const presentAtCompletion: string[][] = [];
-    h.outbox.completeSuppression = (batchId: string) => { presentAtCompletion.push([...present]); return complete(batchId); };
+    h.outbox.completeSuppression = (batchId: string, announceRetirement?: () => void) => {
+      presentAtCompletion.push([...present]);
+      return complete(batchId, announceRetirement);
+    };
     const alerts: Array<{ kind: string; agent: string; message: string }> = [];
     const framework = Object.create(AgentFramework.prototype) as any;
     framework.discordAwarenessOutbox = h.outbox;
@@ -1381,7 +1491,7 @@ test('a pre-release in-place batch whose marks were cancelled is retired with a 
   }
   assert.deepEqual(alerts, []);
   assert.deepEqual(logged, [
-    `[discord-awareness] A hide or turn undo of cairn on main (awareness batch ${batch.id}) stands, and its batch is retired, with no marks to apply`,
+    `[discord-awareness] A hide or turn undo of cairn on main (awareness batch ${batch.id}) stands, and this start retires its batch, with no marks to apply`,
   ]);
 }));
 
@@ -1403,15 +1513,15 @@ test('an imported batch is reported in its own words: a suppression given up for
   assert.deepEqual(alerts, [
     {
       kind: 'discord-awareness-suppression-unfinished',
-      message: 'The imported suppression of cairn from main onto legacy/x (awareness batch gone-x) is given up: legacy/x '
+      message: 'This start gives up the imported suppression of cairn from main onto legacy/x (awareness batch gone-x): legacy/x '
         + "doesn't exist, and its removals apply only there, so they can't be checked or resumed. Its marks stay as the "
         + 'import left them',
       key: 'gone-x',
     },
   ]);
   assert.deepEqual(logged, [
-    '[discord-awareness] imported awareness batch done-x of cairn is retired; this start finished its removals on legacy/x',
-    '[discord-awareness] imported awareness batch old-x of cairn is retired',
+    '[discord-awareness] this start retires imported awareness batch done-x of cairn, having finished its removals on legacy/x',
+    '[discord-awareness] this start retires imported awareness batch old-x of cairn',
   ]);
 });
 
@@ -1721,7 +1831,7 @@ test('the start that imports a pre-journal ledger raises one alert naming each b
   const alerts: Array<{ kind: string; agent: string; message: string }> = [];
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
-  framework.discordAwarenessOutbox = h.reopen();
+  framework.discordAwarenessOutbox = h.reopen({ announceImport: (unsent) => framework.announceDiscordAwarenessImport(unsent) });
   framework.store = { listBranches: () => [{ name: 'main' }], currentBranch: () => ({ name: 'main' }) };
   framework.opsAlert = (kind: string, agent: string, message: string) => { alerts.push({ kind, agent, message }); };
   const error = console.error;
@@ -1736,14 +1846,14 @@ test('the start that imports a pre-journal ledger raises one alert naming each b
   assert.deepEqual(alerts, [{
     kind: 'discord-awareness-import-unsent',
     agent: 'host',
-    message: 'The pre-journal awareness ledger is imported, and the marks agent-framework 0.22.x had still to add or '
-      + `remove won't be sent, since nobody chose them: ${named}. A batch 0.22.x never activated placed no marks. To `
+    message: 'This start imports the pre-journal awareness ledger, and the marks agent-framework 0.22.x had still to add '
+      + `or remove won't be sent, since nobody chose them: ${named}. A batch 0.22.x never activated placed no marks. To `
       + 'take off the marks it placed for a batch it activated, retract that batch through the host command marks '
       + '(action retract), or, with the host stopped, agent-framework-recover --awareness retract: a retract takes off '
       + 'the mark of the batch\'s emoji from each of its messages, whichever batch placed it',
   }]);
   assert.deepEqual(logged, [
-    `[discord-awareness] imported ${basename(h.legacyPath)}: 2 batch(es) had marks agent-framework 0.22.x had still `
+    `[discord-awareness] importing ${basename(h.legacyPath)}: 2 batch(es) had marks agent-framework 0.22.x had still `
       + `to add or remove, and none of them will be sent, since nobody chose them: ${named}. A batch 0.22.x never `
       + 'activated placed no marks; retracting a batch takes off the mark of its emoji from each of its messages, '
       + 'whichever batch placed it',
@@ -2095,7 +2205,7 @@ test('host/command hide takes the store reservation and marks only on request, t
       assert.equal(marked.markers.queued, 1);
       const [dispatch] = h.outbox.pendingDispatches('discord');
       assert.deepEqual(dispatch.key, { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1', emoji: '🫥' });
-      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
+      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
       // Each hide that removed messages records its marks choice and the
       // receipt it returned; the refused one records nothing.
       const hides = logged.filter((entry) => entry.kind === 'hide');
@@ -2220,7 +2330,7 @@ test('an applied change\'s batch that failed before reaching the store is not sc
     assert.equal(result.markers.status, 'not-scheduled');
     const fresh = new DiscordAwarenessOutbox(h.store);
     assert.equal(fresh.batches().length, 0, 'nothing was recorded');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
     assert.equal(fresh.pendingDispatches('discord').length, 0);
     assert.match(result.markers.error, /recording the batch failed: injected sync failure/);
     assert.deepEqual(alerts, ['discord-awareness-not-scheduled']);
@@ -2246,7 +2356,7 @@ test('an applied change\'s batch that reached the store before its barrier faile
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
     assert.deepEqual(alerts, []);
   } finally {
     h.cleanup();
@@ -2266,7 +2376,7 @@ test('an applied change\'s batch is one entry with its activation: once it lands
     const [batch] = fresh.batches();
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
     assert.deepEqual(alerts, []);
   } finally {
@@ -2312,7 +2422,7 @@ test('an applied change\'s batch written but out of this view of the store is un
     const [batch] = fresh.batches();
     assert.equal(batch.id, result.markers.batchId);
     assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0, imported: [] });
+    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
     assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
   } finally {
     h.cleanup();

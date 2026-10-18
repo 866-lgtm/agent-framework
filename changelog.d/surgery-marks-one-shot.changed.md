@@ -13,10 +13,12 @@
   names the surgery and the redo that applies them. An interrupted
   suppression's removals are still finished, at the first start on its
   branch, and one whose branch doesn't exist is given up with a
-  `discord-awareness-suppression-unfinished` alert. Until a suppression is
-  finished or given up, a rollback, a suppression, an offline recovery or
-  the API's `branch.create` refuses its branch name, and a switch or a redo
-  onto that branch is refused.
+  `discord-awareness-suppression-unfinished` alert. Each of these notices
+  comes before the start records what it reports, so a start that doesn't
+  get that record written gives the notice again at the next start. Until
+  a suppression is finished or given up, a rollback, a suppression, an
+  offline recovery or the API's `branch.create` refuses its branch name,
+  and a switch or a redo onto that branch is refused.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch, or the batch a `hide` or turn
   `undo` records after its change) is now written only after that change is

@@ -46,7 +46,7 @@
   or remove are never sent, since nobody chose them. The import names their
   batches on stderr wherever it runs, and in a
   `discord-awareness-import-unsent` ops alert at the host's start that
-  imported it. A batch 0.22.x never activated placed no marks; a retract of
+  imports it, each before the import is recorded. A batch 0.22.x never activated placed no marks; a retract of
   a batch takes off the mark of its emoji from each of its messages, whichever
   batch placed it.
   A release before this one doesn't read the

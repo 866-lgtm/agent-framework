@@ -686,14 +686,19 @@ export class DiscordAwarenessOutbox {
   private state: JournalState | null = null;
   /** Operations dispatched by this process and still awaiting an outcome. */
   private readonly inFlight = new Set<string>();
-  /** The batches whose undelivered work this process's import retired. */
-  private importedUnsent: DiscordAwarenessImportedUnsent[] = [];
+  /** Told what an import retires, before it is recorded (see importLegacyLedger). */
+  private readonly announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void;
 
   /**
    * @param store the Chronicle store the journal lives in.
    * @param opts.legacyPath a pre-journal JSON ledger to import once, if present.
+   * @param opts.announceImport told, before an import of that ledger is
+   *   recorded, which batches' undelivered work it retires, none of it sent.
    */
-  constructor(store: JsStore, opts: { legacyPath?: string } = {}) {
+  constructor(
+    store: JsStore,
+    opts: { legacyPath?: string; announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void } = {},
+  ) {
     // No checkpoints: the reduced state keeps every request and attempt,
     // which receipts, operations() and authorization order read, so a
     // snapshot of it would copy all of it, and copying it every N entries
@@ -703,6 +708,7 @@ export class DiscordAwarenessOutbox {
     // every entry they covered is still there to replay.
     this.journal = new RecordJournal(store, { type: DISCORD_AWARENESS_RECORD_TYPE, checkpoints: false });
     if (opts.legacyPath) this.legacyPath = opts.legacyPath;
+    if (opts.announceImport) this.announceImport = opts.announceImport;
   }
 
   // -- surgery side -----------------------------------------------------------
@@ -966,13 +972,18 @@ export class DiscordAwarenessOutbox {
    * never activated) is retired in the same entry, none of its marks sent: a
    * restart never activates a surgery's marks. An import's active batch
    * keeps its marks as they are. Returns whether it was retired.
+   * `announceRetirement` is told before a retirement is recorded, for the
+   * reason recoverAtStartup's `announce` is.
    */
-  completeSuppression(batchId: string): { retired: boolean } {
+  completeSuppression(batchId: string, announceRetirement?: () => void): { retired: boolean } {
     const batch = this.load().batches.get(batchId);
     const retired = !!batch && isSurgeryLeftover(batch);
     const at = Date.now();
     const records: JournalRecord[] = [{ t: 'suppression-complete', at, batchId }];
-    if (retired) records.push({ t: 'discarded', at, batchId });
+    if (retired) {
+      records.push({ t: 'discarded', at, batchId });
+      announceRetirement?.();
+    }
     // Certifies the redactions just made: only after they are synced.
     this.append(records, { afterCommittedState: true, durable: true });
     return { retired };
@@ -1001,11 +1012,15 @@ export class DiscordAwarenessOutbox {
    * body stays pending for a branch that exists, a leftover's or an
    * import's, in `pending`. What it records is written only after the
    * store's state is synced, since giving up a body relies on its branch
-   * being gone. `imported` names the batches whose undelivered work this
-   * process's import of a pre-journal ledger retired, none of it sent.
+   * being gone. `announce` is told what it retires, gives up and records unknown before
+   * it is recorded: each is recorded once, so a notice given after the
+   * record would be lost for good if the record landed and the process
+   * ended, or the record's sync failed, before the notice. If the record
+   * doesn't land, the next start says it again.
    */
   recoverAtStartup(
     branchExists?: (name: string) => boolean,
+    announce?: (planned: { retired: DiscordAwarenessRetirement[]; unknownAttempts: number; givenUp: number }) => void,
   ): {
     retired: DiscordAwarenessRetirement[];
     /** Suppressions whose removals stay pending for a branch that exists:
@@ -1013,17 +1028,17 @@ export class DiscordAwarenessOutbox {
     pending: Array<{ batchId: string; agentName: string; targetBranch: string }>;
     unknownAttempts: number;
     givenUp: number;
-    imported: DiscordAwarenessImportedUnsent[];
   } {
     const state = this.load();
     const at = Date.now();
     const records: JournalRecord[] = [];
     let unknownAttempts = 0;
-    const orphaned = new Set<string>();
+    let givenUp = 0;
     for (const op of state.ops.values()) {
+      let orphaned = 0;
       for (const attempt of op.attempts) {
         if (attempt.outcome !== undefined) continue;
-        orphaned.add(op.opId);
+        orphaned++;
         records.push({
           t: 'outcome',
           at,
@@ -1034,6 +1049,8 @@ export class DiscordAwarenessOutbox {
         });
         unknownAttempts++;
       }
+      // Recorded unknown, each of these attempts counts toward the bound.
+      if (orphaned > 0 && !op.cancelled && unconfirmedAttempts(op) + orphaned >= MAX_UNCONFIRMED_ATTEMPTS) givenUp++;
     }
     const retired: DiscordAwarenessRetirement[] = [];
     const kept: Array<{ batchId: string; agentName: string; targetBranch: string }> = [];
@@ -1070,17 +1087,13 @@ export class DiscordAwarenessOutbox {
         ...(batch.scope === 'legacy' ? { imported: true } : {}),
       });
     }
+    announce?.({ retired, unknownAttempts, givenUp });
     // A body given up relies on its branch's deletion, which may be unsynced
     // in a caller-supplied store already open: a crash could keep the
     // retirement and lose the deletion. The store is synced first, as before
     // every retirement, and a failed sync records nothing.
     if (records.length > 0) this.append(records, { afterCommittedState: true, durable: true });
-    const after = this.load();
-    const givenUp = [...orphaned].filter((opId) => {
-      const op = after.ops.get(opId);
-      return !!op && !op.cancelled && unconfirmedAttempts(op) >= MAX_UNCONFIRMED_ATTEMPTS;
-    }).length;
-    return { retired, pending: kept, unknownAttempts, givenUp, imported: [...this.importedUnsent] };
+    return { retired, pending: kept, unknownAttempts, givenUp };
   }
 
   // -- operator controls ------------------------------------------------------
@@ -1629,18 +1642,22 @@ export class DiscordAwarenessOutbox {
         throw new Error(`Invalid Discord awareness ledger ${this.legacyPath}`);
       }
       const imported = importLegacy(parsed, this.legacyPath, sha256, state.batches);
-      this.append(imported.records, { durable: true });
-      this.importedUnsent = imported.unsent;
+      // Said before it's recorded: an import is recorded once, so a notice
+      // given after the record would be lost for good if the record landed
+      // and the process ended, or the record's sync failed, before the
+      // notice. If the record doesn't land, the next import says it again.
       if (imported.unsent.length > 0) {
         console.error(
-          `[discord-awareness] imported ${basename(this.legacyPath)}: ${imported.unsent.length} batch(es) had marks ` +
+          `[discord-awareness] importing ${basename(this.legacyPath)}: ${imported.unsent.length} batch(es) had marks ` +
             'agent-framework 0.22.x had still to add or remove, and none of them will be sent, since nobody chose them: ' +
             imported.unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
               `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
             '. A batch 0.22.x never activated placed no marks; retracting a batch takes off the mark of its emoji ' +
             'from each of its messages, whichever batch placed it',
         );
+        this.announceImport?.(imported.unsent);
       }
+      this.append(imported.records, { durable: true });
     }
     // Imported (now or by an earlier process that stopped before renaming):
     // the file is inert; move it out of the way. A copy retired earlier stays
