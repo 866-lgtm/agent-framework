@@ -16,7 +16,7 @@
 
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -230,6 +230,37 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), "the inner mount's\n");
   });
 
+  test('a copy taken in through a file link before the nested mount was configured is no longer vouched for by its fingerprint', async (t) => {
+    // A listing's pass takes a file whose recorded fingerprint still matches
+    // as unchanged, without reading it, so only the observation of the link
+    // can say it now leads into another mount's directory.
+    const env = new Env(t);
+    env.write('outer/a/b/x.txt', "the inner mount's\n");
+    symlinkSync(env.at('outer/a/b/x.txt'), env.at('outer/flink.txt'));
+    // Each module trusts this filesystem's ctime, whatever it is, so the
+    // fingerprint vouches, as on Linux's.
+    const trust = (m: WorkspaceModule) => (m as any).ctimeTrust.set(realpathSync(env.at('outer')), statSync(env.at('outer/a/b/x.txt'), { bigint: true }).dev.toString());
+    const before = new WorkspaceModule({ mounts: [mount('outer', env.at('outer'), { followSymlinks: true })] });
+    trust(before);
+    before.initStore(env.store);
+    await before.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    await new Promise((r) => setTimeout(r, 2100)); // past the racy window, so the fingerprint the sync records vouches
+    assert.equal((await call(before, 'sync', {})).success, true);
+    await before.stop();
+    assert.deepEqual(env.tree('outer'), ['a/b/x.txt', 'flink.txt']);
+    const m = new WorkspaceModule({ mounts: [mount('outer', env.at('outer'), { followSymlinks: true }), mount('inner', env.at('outer/a/b'))] });
+    trust(m);
+    m.initStore(env.store);
+    await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    t.after(() => m.stop().catch(() => {}));
+    const ls = await call(m, 'ls', { path: 'outer' });
+    assert.equal(ls.success, true, ls.error);
+    const entry = (ls.data.entries as Array<{ name: string; state?: string; note?: string }>).find((e) => e.name === 'flink.txt');
+    assert.deepEqual({ state: entry?.state, note: entry?.note }, {
+      state: 'unverified', note: '"outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place',
+    });
+  });
+
   test('a directory replaced by a link into it is the nested mount\'s: a forced push of a copy held from before writes nothing (#324)', async (t) => {
     const env = new Env(t);
     env.write('outer/alias/x.txt', 'old copy\n');
@@ -305,9 +336,9 @@ describe('the checks where disk is acted on, called directly as a push and a rea
     symlinkSync(env.at('outer/a/b/x.txt'), env.at('outer/flink.txt'));
     // Cast, so the file also compiles against code whose nested mounts carry
     // no real root, for the run of these tests on it.
+    const nested = [{ dir: 'a/b', name: 'inner', real: realpathSync(env.at('outer/a/b')) }];
     const view = {
-      root: env.at('outer'), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: ['a/b'],
-      nested: [{ dir: 'a/b', name: 'inner', real: realpathSync(env.at('outer/a/b')) }],
+      root: env.at('outer'), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: ['a/b'], nested,
     } as MountView;
     return { env, view, rootReal: realpathSync(env.at('outer')) };
   }
@@ -340,7 +371,8 @@ describe('the checks where disk is acted on, called directly as a push and a rea
   test('a directory made for a push isn\'t made where a link leads into a nested mount\'s root not made yet (G3)', async (t) => {
     const { env, view, rootReal } = rig(t);
     symlinkSync(env.at('outer/a'), env.at('outer/l'));
-    const later = { ...view, nested: [{ dir: 'a/c', name: 'later', real: join(realpathSync(env.at('outer/a')), 'c') }] } as MountView;
+    const nested = [{ dir: 'a/c', name: 'later', real: join(realpathSync(env.at('outer/a')), 'c') }];
+    const later = { ...view, nested } as MountView;
     assert.deepEqual(await checkDir(later, rootReal, 'l/c/d', { create: true }), {
       kind: 'unobserved', reason: '"outer/l/c" leads into mount "later", nested in mount "outer": use "later" in its place',
     });
