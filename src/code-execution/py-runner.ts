@@ -200,6 +200,8 @@ class OutputStream {
   marked = false;
   /** The end of what arrived while no exec ran: an interpreter that failed to start says why here. */
   lastIdle = '';
+  /** Whether lastIdle lost its beginning to the LAST_WORDS_CHARS cut. */
+  lastIdleCut = false;
   private mark: Buffer | null = null;
   /** The end of a chunk that could be the start of a mark the next chunk completes. */
   private carry: Buffer = NOTHING;
@@ -286,7 +288,15 @@ class OutputStream {
     }
     if (bytes.length > 0) {
       const text = this.decoder.write(bytes);
-      this.lastIdle = (this.lastIdle + text).slice(-LAST_WORDS_CHARS);
+      const idle = this.lastIdle + text;
+      if (idle.length > LAST_WORDS_CHARS) {
+        this.lastIdleCut = true;
+        // A cut between a surrogate pair's halves would leave its low half, which reads as U+FFFD.
+        const kept = idle.slice(-LAST_WORDS_CHARS);
+        this.lastIdle = /^[\uDC00-\uDFFF]/.test(kept) ? kept.slice(1) : kept;
+      } else {
+        this.lastIdle = idle;
+      }
       if (text.trim() !== '') this.logIdle(text);
     }
   }
@@ -387,10 +397,12 @@ function limitRemedy(limitMs: number, ceilingMs: number | undefined, background:
  * to try again. A failure before the spawn, while creating or writing the
  * runtime's files, is about those files rather than the interpreter, and
  * keeps Node's own text, which names the path for an open or a mkdtemp. An
- * interpreter that exits as it starts passes on what it wrote to stderr; when
- * the runtime itself exits so because the host's channel didn't reach it
- * (HOST_CHANNEL_MISSING_EXIT), its own words say who must act and that
- * calling again fails the same way, so they end the text.
+ * interpreter that exits as it starts passes on the last LAST_WORDS_CHARS of
+ * what it wrote to stderr, from the end, where a traceback says what failed,
+ * and with "…" where they're cut; when the runtime itself exits so because
+ * the host's channel didn't reach it (HOST_CHANNEL_MISSING_EXIT), its own
+ * words say who must act and that calling again fails the same way, so they
+ * end the text.
  */
 function startFailure(pythonPath: string, err: unknown): string {
   const { code, syscall, exitCode, said } = (err ?? {}) as { code?: unknown; syscall?: unknown; exitCode?: unknown; said?: unknown };
@@ -416,7 +428,8 @@ function startFailure(pythonPath: string, err: unknown): string {
 function stoppedReading(background: boolean): string {
   return "script stopped: the Python interpreter stopped reading the host's messages, so the host ended it and the rest of the script didn't run"
     + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
-    + 'so check them before you run it again in a new interpreter. If it stops the same way, ask whoever runs this host.';
+    + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script closes or '
+    + "replaces file descriptor 3, where the host's messages arrive; if not, ask whoever runs this host.";
 }
 
 /** Why a script stopped when its interpreter exited under it, and what running it again does. */
@@ -763,13 +776,15 @@ export class PyRunner {
         outcome();
       };
       const onReady = () => finish(resolve);
-      const onExit = (exitCode: number | null) => {
+      const onExit = (exitCode: number | null, signal: NodeJS.Signals | null) => {
         // Why it ended, such as a traceback, is on its way through its stderr.
         // Its messages' pipe doesn't matter here, and the exit's teardown has
-        // stopped reading it.
+        // stopped reading it. A tail that lost its beginning says so.
         afterOutputEnds(stdout, stderr, null, () => {
-          const said = stderr.lastIdle.trim();
-          finish(() => reject(Object.assign(new Error('exited as it started'), { exitCode, said })));
+          const tail = stderr.lastIdle.trim();
+          const said = tail !== '' && stderr.lastIdleCut ? `…${tail}` : tail;
+          const how = signal ? `was ended by ${signal} as it started` : 'exited as it started';
+          finish(() => reject(Object.assign(new Error(how), { exitCode, said })));
         });
       };
       const onError = (e: Error) => finish(() => reject(e));

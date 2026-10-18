@@ -700,7 +700,8 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
         result.stderr,
         "script stopped: the Python interpreter stopped reading the host's messages, so the host ended it and the rest of the script didn't run, "
           + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again '
-          + 'in a new interpreter. If it stops the same way, ask whoever runs this host.',
+          + 'in a new interpreter. If it stops the same way, check whether the script closes or replaces file descriptor 3, '
+          + "where the host's messages arrive; if not, ask whoever runs this host.",
       );
       assert.strictEqual(runner.busy, false);
       await turns();
@@ -772,7 +773,12 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
   });
 
   it("an interpreter whose wrapper doesn't pass fds 3 and 4 on says so as its start fails", posix, async () => {
-    for (const drops of ['3<&- 4<&-', '3<&-', '4<&-']) {
+    const rows: [string, string][] = [
+      ['3<&- 4<&-', "its file descriptors 3 and 4 aren't open"],
+      ['3<&-', "its file descriptor 3 isn't open"],
+      ['4<&-', "its file descriptor 4 isn't open"],
+    ];
+    for (const [drops, which] of rows) {
       const wraps = standIn(`exec ${drops}\nexec python3 "$@"`);
       const runner = new PyRunner({ pythonPath: wraps.path, onToolCall: async () => '' });
       try {
@@ -781,16 +787,68 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
         assert.strictEqual(
           result.stderr,
           `script didn't run: the Python interpreter, ${wraps.path}, exited as it started, saying: ` +
-            "The host's channel didn't reach this Python interpreter: its file descriptors 3 and 4 aren't open, as " +
-            "when the host's pythonPath starts Python through a wrapper that doesn't pass them on, such as a " +
-            "container, or sudo with its default settings. code_execution can't run scripts here until whoever " +
-            'runs this host changes that, so calling it again fails the same way.',
+            `The host's channel didn't reach this Python interpreter: ${which}, as when the host's pythonPath ` +
+            "starts Python through a wrapper that doesn't pass file descriptors 3 and 4 on, such as a container, or " +
+            "sudo with its default settings. code_execution can't run scripts here until whoever runs this host " +
+            'changes that, so calling it again fails the same way.',
           drops,
         );
       } finally {
         runner.dispose();
         wraps.done();
       }
+    }
+  });
+
+  it("a wrapper's own exit 78 has its words end the result, with no claim about the channel", posix, async () => {
+    const own = standIn('echo "no container here" >&2\nexit 78');
+    const runner = new PyRunner({ pythonPath: own.path, onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.strictEqual(result.stderr, `script didn't run: the Python interpreter, ${own.path}, exited as it started, saying: no container here`);
+    } finally {
+      runner.dispose();
+      own.done();
+    }
+  });
+
+  it("a failed start's stderr keeps its last 2,000 characters, marked where they're cut, and a pair's half never starts it", posix, async () => {
+    const base = (path: string) =>
+      `script didn't run: the Python interpreter, ${path}, exited as it started, so none of the script ran. `
+      + 'Run it again; if it fails the same way, ask whoever runs this host. It wrote to stderr: ';
+    // A traceback's last line is at its end, past where a cut of its head would stop.
+    const long = standIn(`head -c 3000 /dev/zero | tr '\\0' x >&2\nprintf '\\nthe last line\\n' >&2\nexit 3`);
+    // An emoji is two UTF-16 units, and the cut falls between them.
+    const split = standIn(`printf '\\360\\237\\230\\200' >&2\nhead -c 1999 /dev/zero | tr '\\0' x >&2\nexit 3`);
+    const runner = new PyRunner({ pythonPath: long.path, onToolCall: async () => '' });
+    const splitRunner = new PyRunner({ pythonPath: split.path, onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.ok(result.stderr.startsWith(`${base(long.path)}…x`), result.stderr.slice(0, 300));
+      assert.ok(result.stderr.endsWith('x\nthe last line'), result.stderr.slice(-100));
+      const cut = await splitRunner.exec('print(1)', []);
+      assert.strictEqual(cut.stderr, `${base(split.path)}…${'x'.repeat(1999)}`);
+    } finally {
+      runner.dispose();
+      splitRunner.dispose();
+      long.done();
+      split.done();
+    }
+  });
+
+  it('an interpreter ended by a signal as it starts says which', posix, async () => {
+    const killed = standIn('kill -9 $$');
+    const runner = new PyRunner({ pythonPath: killed.path, onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.strictEqual(
+        result.stderr,
+        `script didn't run: the Python interpreter, ${killed.path}, was ended by SIGKILL as it started, so none of the script ran. `
+          + 'Run it again; if it fails the same way, ask whoever runs this host.',
+      );
+    } finally {
+      runner.dispose();
+      killed.done();
     }
   });
 
@@ -1284,12 +1342,14 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     const runner = new PyRunner({ onToolCall: async () => 'echoed' });
     try {
       // The tool's result can still reach a read already waiting on fd 3; the
-      // read after it fails, while the script sleeps.
-      const result = await within(runner.exec('import os, time\nos.close(3)\nawait test__echo({})\ntime.sleep(5)', ECHO_TOOLS), 'the reader to fail');
+      // read after it fails, while the script sleeps. The sleep outlasts
+      // within's 10 s, so the end-of-script check, which says the same, can't
+      // be what settles it.
+      const result = await within(runner.exec('import os, time\nos.close(3)\nawait test__echo({})\ntime.sleep(30)', ECHO_TOOLS), 'the reader to fail');
       assert.strictEqual(result.aborted, true);
       assert.match(
         result.stderr,
-        /cannot read the host's messages any more \(\[Errno 9\] Bad file descriptor\); exiting\nscript stopped: the Python interpreter exited with code 70 while it ran, [^\n]*$/,
+        /cannot read the host's messages any more: a script closed or replaced fd 3, where they arrive; exiting\nscript stopped: the Python interpreter exited with code 70 while it ran, [^\n]*$/,
       );
     } finally {
       runner.dispose();
@@ -1350,6 +1410,25 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       assert.strictEqual(result.stdout, 'child\nparent saw 1\n');
       assert.match(result.stderr, /^Traceback \(most recent call last\):\n[\s\S]*RuntimeError: raised in the child\n$/);
       assert.strictEqual(result.returnCode, 0);
+      // A child's sys.exit() is its exit status, with no traceback, as in Python.
+      const exits = await within(
+        runner.exec(
+          [
+            'import os, sys, warnings',
+            'warnings.simplefilter("ignore", DeprecationWarning)',
+            'statuses = []',
+            'for code in (3, None):',
+            '    pid = os.fork()',
+            '    if pid == 0:',
+            '        sys.exit(code)',
+            '    statuses.append(os.WEXITSTATUS(os.waitpid(pid, 0)[1]))',
+            'print("parent saw", statuses)',
+          ].join('\n'),
+          [],
+        ),
+        'the sys.exit children',
+      );
+      assert.deepStrictEqual(exits, { stdout: 'parent saw [3, 0]\n', stderr: '', returnCode: 0 });
       assert.strictEqual((await runner.exec('print("next")', [])).stdout, 'next\n');
     } finally {
       runner.dispose();

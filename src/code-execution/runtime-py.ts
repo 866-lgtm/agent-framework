@@ -132,21 +132,26 @@ def _start():
     # host reads, for a failed start that names what to fix, and stop with
     # EX_CONFIG (78), which tells the host that calling again won't help
     # (HOST_CHANNEL_MISSING_EXIT in py-runner.ts).
+    missing = []
     for fd in (3, 4):
         try:
             os.fstat(fd)
         except OSError:
-            try:
-                os.write(2, (
-                    "The host's channel didn't reach this Python interpreter: its file descriptors 3 and 4 "
-                    "aren't open, as when the host's pythonPath starts Python through a wrapper that doesn't "
-                    "pass them on, such as a container, or sudo with its default settings. code_execution "
-                    "can't run scripts here until whoever runs this host changes that, so calling it again "
-                    "fails the same way.\n"
-                ).encode())
-            except OSError:
-                pass
-            sys.exit(78)
+            missing.append(fd)
+    if missing:
+        which = ("its file descriptors 3 and 4 aren't open" if len(missing) == 2
+                 else "its file descriptor " + str(missing[0]) + " isn't open")
+        try:
+            os.write(2, (
+                "The host's channel didn't reach this Python interpreter: " + which + ", as when the "
+                "host's pythonPath starts Python through a wrapper that doesn't pass file descriptors 3 "
+                "and 4 on, such as a container, or sudo with its default settings. code_execution can't "
+                "run scripts here until whoever runs this host changes that, so calling it again fails "
+                "the same way.\n"
+            ).encode())
+        except OSError:
+            pass
+        sys.exit(78)
     # fds 3 and 4 came from the host inheritable; no command a script runs may
     # hold them, or read the host's messages.
     os.set_inheritable(3, False)
@@ -555,6 +560,17 @@ def handle_init(msg):
         SCRIPT_GLOBALS.pop("wake_agent", None)
 
 
+def _leave_forked(code, err):
+    # A process the script forked ends on sys.exit() as Python ends: with its
+    # code, 0 for none, or 1 after writing a code that isn't a number.
+    if code is None:
+        os._exit(0)
+    if isinstance(code, int):
+        os._exit(code & 0xFF)
+    _note(err, str(code) + "\n")
+    os._exit(1)
+
+
 async def _run_script(exec_id, code, mark, st):
     global _current_exec_id, _current_exec_task, _stop
     _check_own_fds()
@@ -580,6 +596,8 @@ async def _run_script(exec_id, code, mark, st):
         _note(err, "\nKeyboardInterrupt: script cancelled by host\n")
         return_code = 1
     except BaseException as exc:
+        if isinstance(exc, SystemExit) and os.getpid() != _RUNTIME_PID:
+            _leave_forked(exc.code, err)
         if exc is st.interrupt:
             # Where the script was when it was stopped, without the runtime's frames.
             frames = [
@@ -669,7 +687,9 @@ async def main():
                 loop.call_soon_threadsafe(queue.put_nowait, raw_line)
         except (OSError, ValueError) as exc:
             # A script closed fd 3 under it, or a file it opened took the
-            # number: nothing more can reach the runtime (_check_own_fds).
+            # number: nothing more can reach the runtime. Its check says so,
+            # by name; a failure with fd 3 still the host's says what failed.
+            _check_own_fd(3)
             _fatal("cannot read the host's messages any more (" + str(exc) + ")")
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
