@@ -390,9 +390,9 @@ export function otherReplacements(plan: FilePlan, labelled: boolean): string[] {
 }
 
 /**
- * A file a receipt describes: its path as the call named it, its plan, what
- * the call's settling found of it, and, where its push left the file's mode as
- * disk had it, why (commitToolChange's `modeKept`).
+ * A file a receipt describes: its mount-prefixed path as disk spells it, its
+ * plan, what the call's settling found of it, and, where its push left the
+ * file's mode as disk had it, why (commitToolChange's `modeKept`).
  */
 export interface StoredFile {
   path: string;

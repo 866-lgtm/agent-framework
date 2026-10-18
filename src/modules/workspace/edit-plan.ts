@@ -425,9 +425,10 @@ function lineFeeds(value: string): number {
  * occurrence's start, and with several edits a key in one Float64Array. The
  * new text is built a batch of pieces at a time, and of each edit's
  * replacements it keeps only what a receipt names. Two bounds keep a call
- * from holding more than its file: edits whose asks, past what a refusal
- * shows, come to more occurrences than the text is long keep no more starts
- * than a refusal shows, and a file whose counts take it past `maxBytes` is
+ * from holding more than its file: two or more edits whose asks, past what a
+ * refusal shows, come to more occurrences than the text is long keep no more
+ * starts than a refusal shows (one edit keeps the starts it finds, which the
+ * text's length bounds), and a file whose counts take it past `maxBytes` is
  * refused as `tooLarge`, at least that many bytes, before its new text is
  * built. One that its CRs or multi-byte characters take past it is built
  * and returned, for its caller to refuse by its bytes.

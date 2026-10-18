@@ -3445,11 +3445,12 @@ export class WorkspaceModule implements Module {
 
   /**
    * Where an edit's path is in its mount, or why the call can't edit it: a
-   * path no mount holds, or one a nested mount holds (parseFilePath), a path
-   * that names its mount's root, one not spelled plainly, a read-only mount,
-   * or for edit_many a generated file. edit's generated file is refused
-   * before it gets here, by the same rule (handleToolCall checks a call's
-   * `path`, which edit_many's input lacks).
+   * path no mount holds, one outside its mount or holding a lone surrogate
+   * (parsePath), one a nested mount holds or that leads into one through a
+   * link (parseFilePath), a path that names its mount's root, one not spelled
+   * plainly, a read-only mount, or for edit_many a generated file. edit's
+   * generated file is refused before it gets here, by the same rule
+   * (handleToolCall checks a call's `path`, which edit_many's input lacks).
    */
   private async editablePath(
     tool: EditTool,

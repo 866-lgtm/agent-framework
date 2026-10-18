@@ -1,7 +1,8 @@
 // edit and edit_many through one planner: a miss shows the closest region, a
 // count that differs shows the lines that matched, CRLF and a BOM are kept,
 // and edit_many stores every edit or none. Each answer keeps to the length
-// its call's result may have (ToolCall.resultMaxChars).
+// its call's result may have (ToolCall.resultMaxChars), unless its head and
+// its last line alone are longer.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -572,13 +573,15 @@ test('an edit names its path plainly: a path with an empty, "." or ".." segment 
     assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), refusal(path));
   }
   // These spellings of the mount's root, its bare name included, are refused
-  // as naming no file. One that starts its part in the mount with a
-  // separator, such as "work//", resolves outside it, and parsePath refuses
-  // that first.
+  // as naming no file. A part in the mount that starts with a separator is
+  // absolute: parsePath refuses it where it resolves outside the mount, as
+  // "work//" does, and here the mount's own path names its root, and a file
+  // beneath it isn't that file's plain spelling.
   const root = (path: string) => `${path} names the root of mount "work", which isn't a file; ls work lists the files in it.`;
-  for (const path of ['work', 'work/', 'work/.', 'work/sub/..']) {
+  for (const path of ['work', 'work/', 'work/.', 'work/sub/..', `work/${dir}`]) {
     assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), root(path));
   }
+  assert.equal(errorOf(await call('edit', { path: `work/${dir}/sub/b.txt`, oldString: 'one', newString: 'ONE' })), refusal(`work/${dir}/sub/b.txt`));
   assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/', oldString: 'one', newString: 'ONE' }] })),
     `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${root('work/')}`);
   // Dots inside a name are a plain spelling.
