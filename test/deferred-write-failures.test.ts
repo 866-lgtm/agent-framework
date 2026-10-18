@@ -146,9 +146,9 @@ for (const where of ['recovery file', 'store only'] as const) {
       await h.liveTurn();
       h.add('held for the turn');
       const quiesce = () => h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
-      const waysOut = ". So the record doesn't hold the queue's 1 deferred context write(s). Once it can be written, " +
-        'quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to go on with the ' +
-        'queue in memory, and resume before any restart.';
+      const waysOut = ". So the queue as it stands, 1 deferred context write(s), isn't on disk. Once the record can " +
+        'be written, quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to go on ' +
+        'with the queue in memory, and resume before any restart.';
       if (where === 'recovery file') {
         mkdirSync(h.queuePath, { recursive: true });
         const refusal = await quiesce().then(() => undefined, (error: unknown) => error as Error & { cause?: NodeJS.ErrnoException });
@@ -217,7 +217,7 @@ test("a quiesce() whose record write fails after the queue's leaves the host ser
     mkdirSync(h.queuePath);
     h.add('third');
     assert.equal(h.alerts.length, 1);
-    assert.ok(h.alerts[0]!.message.endsWith("the queue's 3 deferred context write(s)"), h.alerts[0]!.message);
+    assert.ok(h.alerts[0]!.message.endsWith("3 deferred context write(s), isn't on disk"), h.alerts[0]!.message);
     rmSync(h.queuePath, { recursive: true });
 
     await h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
@@ -425,8 +425,8 @@ test('a deferral whose write fails while quiesced keeps the write in memory, rai
     assert.equal(alert!.agentName, 'framework');
     assert.match(alert!.message, new RegExp(
       `^writing ${h.queuePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} failed: .*EISDIR.*\\. The queue's next change writes ` +
-      `it again, and until a write of it succeeds, the record doesn't hold the queue's 1 deferred context ` +
-      `write\\(s\\)\\. Resume before any restart$`,
+      `it again, and until a write of it succeeds, the queue as it stands, 1 deferred context write\\(s\\), isn't ` +
+      `on disk\\. Resume before any restart$`,
     ));
     assert.deepEqual(alert!.data, { record: h.queuePath, queued: 1, code: 'EISDIR' });
 
@@ -535,8 +535,8 @@ test('store only, a deferral while quiesced syncs the store after the slot\'s wr
     assert.equal(h.alerts.length, 1);
     assert.equal(h.alerts[0]!.message,
       "writing the store's framework/deferred-writes slot failed: injected EIO syncing the store. The queue's next " +
-      "change writes it again, and until a write of it succeeds, the record doesn't hold the queue's 2 deferred " +
-      'context write(s). Resume before any restart');
+      "change writes it again, and until a write of it succeeds, the queue as it stands, 2 deferred context " +
+      "write(s), isn't on disk. Resume before any restart");
     assert.deepEqual(h.alerts[0]!.data, { record: "the store's framework/deferred-writes slot", queued: 2 });
   });
 });

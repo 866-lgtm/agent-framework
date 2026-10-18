@@ -1039,8 +1039,8 @@ export class ResumeBlockedError extends Error {
 /**
  * Thrown by `quiesce()` without `abandon` when the queue of deferred context
  * writes can't reach disk: it's over its cap, so its record can't hold it, or
- * its write failed, and that error is the `cause`. So the record doesn't
- * hold the queue as it stands. The host's mode is as it was, and the
+ * its write failed, and that error is the `cause`. So the queue as it
+ * stands isn't on disk. The host's mode is as it was, and the
  * message names the ways out, among them quiescing with `abandon: true`,
  * which goes on with the queue in memory.
  */
@@ -5706,10 +5706,10 @@ export class AgentFramework {
         return;
       }
       throw new QuiesceBlockedError(
-        `quiesce refused: writing ${this.deferredWritesRecord()} failed: ${thrownText(error)}. So the record ` +
-        `doesn't hold the queue's ${this.durableDeferredWrites().length} deferred context write(s). Once it can ` +
-        'be written, quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to go ' +
-        'on with the queue in memory, and resume before any restart.',
+        `quiesce refused: writing ${this.deferredWritesRecord()} failed: ${thrownText(error)}. So the queue as it ` +
+        `stands, ${this.durableDeferredWrites().length} deferred context write(s), isn't on disk. Once the record ` +
+        'can be written, quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to ' +
+        'go on with the queue in memory, and resume before any restart.',
         { cause: error },
       );
     }
@@ -5770,7 +5770,7 @@ export class AgentFramework {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     this.opsAlert('deferred-writes', 'framework',
       `writing ${record} failed: ${reason}. The queue's next change writes it again, and until a write of it ` +
-      `succeeds, the record doesn't hold the queue's ${queued} deferred context write(s)${resumeFirst}`,
+      `succeeds, the queue as it stands, ${queued} deferred context write(s), isn't on disk${resumeFirst}`,
       { data: { record, queued, ...(code ? { code } : {}) } });
   }
 
