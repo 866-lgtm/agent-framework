@@ -37,9 +37,10 @@ const joined = (notes: Array<string | null>): string | undefined => {
  * one more line would take its data past `maxChars` as JSON; if even the
  * first line doesn't fit, that line is cut shorter, at the most the page has
  * room for. Where the page's last line is cut, its note names where that
- * line's rest starts before the next line, since reading on in order starts
- * there. A page whose own fields and least content pass `maxChars` still
- * moves on, and passes it.
+ * line's rest starts, since reading on in order starts there: before the next
+ * line, or, on the page that ends the file, before the file is read whole. A
+ * page whose own fields and least content pass `maxChars` still moves on, and
+ * passes it.
  */
 export function linePage(path: string, file: FileText, offset: number, limit: number, maxChars: number, extraNotes: string[] = []): ToolResult {
   const { lines, starts } = file;
@@ -93,7 +94,8 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   const final = (lastMax = MAX_LINE_CHARS) => {
     const to = first + shownLines.length;
     const rest = restOf(to - 1, lastMax);
-    return page(to, shownLines.join('\n'), joined([to === last ? (to < total ? limitNote(to, rest) : null) : budgetNote(to, rest), ...notes]));
+    const endNote = to < total ? limitNote(to, rest) : rest === null ? null : `${cutLine(to, rest)}.`;
+    return page(to, shownLines.join('\n'), joined([to === last ? endNote : budgetNote(to, rest), ...notes]));
   };
   if (shownLines.length === 0) {
     // The estimate above found no room for the first line as a page shows it.

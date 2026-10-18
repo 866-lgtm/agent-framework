@@ -132,7 +132,7 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   // Reading on in order means the rest of line 1 first, so the note names it.
   assert.equal(page.note, `Stopped at line 1 to stay within the 1000-character result limit (file has 2). Line 1 is cut: read its rest with offsetChars=${at}, then continue with offset=2.`);
   // The cut is the most the page has room for: one character more passes the
-  // limit, on a page with a note and on one that ends the file with none.
+  // limit, on a page that goes on and on one that ends the file.
   const oneMore = (cutPage: LinePage, chars: number) => {
     const more = chars + 1;
     return JSON.stringify({
@@ -146,8 +146,10 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   const last = await readOneLine({}, 1_000);
   assert.ok(stored(last) <= 1_000, `${stored(last)}`);
   const lastPage = last.data as LinePage;
-  assert.equal(lastPage.note, undefined);
   const lastShown = /^ {5}1\t("*) \[/.exec(lastPage.content)![1].length;
+  // The page ends the file, and its last line is cut, so its note names the rest.
+  assert.equal(lastPage.toLine, lastPage.totalLines);
+  assert.equal(lastPage.note, `Line 1 is cut: read its rest with offsetChars=${lastShown}.`);
   assert.ok(oneMore(lastPage, lastShown) > 1_000, `${oneMore(lastPage, lastShown)}`);
   // Shown whole, a line carries no marker and its note no cut, so its page can
   // fit where a cut one character shorter doesn't: it is shown whole.
@@ -174,11 +176,15 @@ test('a page whose last line is cut names where its rest starts before the next 
   const byBudget = (await read({}, 5_000)).data as LinePage;
   assert.equal(byBudget.toLine, 3);
   assert.equal(byBudget.note, `Stopped at line 3 to stay within the 5000-character result limit (file has 4). Line 3 is cut: read its rest with offsetChars=${at(3)}, then continue with offset=4.`);
-  // A cut line inside a page has its rest named by its own marker alone, and
-  // a page that ends the file has no next line to name.
+  // A cut line inside a page has its rest named by its own marker alone. The
+  // page that ends the file names its cut last line too: toLine is the last
+  // line, but the file isn't read whole until that line's rest is.
   const whole = (await read({}, 24_000)).data as LinePage;
   assert.equal(whole.toLine, 4);
-  assert.equal(whole.note, undefined);
+  assert.equal(whole.note, `Line 4 is cut: read its rest with offsetChars=${at(4)}.`);
+  // A page that ends the file on a line shown whole has nothing to say.
+  const { read: readShort } = await setup(t, `${long}\nshort\n`);
+  assert.equal(((await readShort({}, 24_000)).data as LinePage).note, undefined);
 });
 
 test('a call that carries no resultMaxChars gets pages held to the framework\'s default, 24,000', async t => {
