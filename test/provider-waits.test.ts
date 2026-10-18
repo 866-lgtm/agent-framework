@@ -2135,6 +2135,32 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
   });
 });
 
+test("a stop made while that hold is reported finds nothing to stop: abortInference() from a listener of its inference:failed reports false", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
+    const { fw, internal } = await framework(path, membrane);
+    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    // The compiled stream is cancelled, and the start's window closed, before
+    // the hold is reported: a host's listener of that report finds no turn
+    // it could stop, rather than a stop it takes and the hold then loses.
+    let taken: boolean | undefined;
+    fw.onTrace((event) => {
+      if (event.type === 'inference:failed' && (event as { agentName?: string }).agentName === 'resident' && taken === undefined) {
+        taken = fw.abortInference('resident', 'user');
+      }
+    });
+    try {
+      await conversationTurn(fw, internal as NonOwning, 'zz-first');
+      assert.equal(taken, false, 'abortInference took no stop');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test('a release can name a disposed conversation agent whose wait the listing shows, and a name with neither is refused', async () => {
   await withStoreDir(async (path) => {
     const log = silence();

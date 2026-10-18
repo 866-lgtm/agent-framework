@@ -20,24 +20,33 @@
     for an operator's abandon. The framework's `abortInference()` returns
     `true` for such a turn. `abortInference()` and an operator's abandon end
     a turn's wait to retry, however long, so the turn ends at once; a stop
-    through `Agent.cancelStream()` ends it when the wait runs out. A stop
-    made while a failed inference's `inference:failed` is delivered ends the
-    turn there, before a hold or a retry. In the tool-result guard's wait,
-    `stop()` and an operator's abandon end the turn as their own stop even
-    when a caller's stop came first.
-    `host:quiesce`'s `unabandonable` lists a turn with no stream that the
-    abandon hasn't ended when its grace runs out: one with no check ahead,
-    such as a puppet tool turn, or one that hasn't reached its check yet. A
-    turn whose stream the abandon cancelled isn't listed, even one still
-    running, as one whose tool-result guard waits on its speech may be.
+    through `Agent.cancelStream()` ends it when the wait runs out. In the
+    tool-result guard's wait, `stop()` and an operator's abandon end the
+    turn as their own stop even when a caller's stop came first, and as
+    `stop()`'s when both reach it.
+    `host:quiesce`'s `unabandonable` lists a turn that the abandon hasn't
+    ended when its grace runs out: one with no stream and no check ahead,
+    such as a puppet tool turn, or one that hasn't reached its check yet,
+    the tool-result guard's wait for its speech included. A turn whose live
+    stream the abandon cancelled isn't listed, even one still running.
+  - **A failure's report:** a turn's stream that failed or threw no longer
+    holds the agent while its `inference:failed` is delivered, nor does a
+    compiled stream held for a provider's wait. A listener sees the agent
+    idle, and `abortInference()` from a listener reports `false`: no stream
+    or check is there to take the stop. A stop through
+    `Agent.cancelStream()` made then ends the turn at the check after its
+    wait to retry, if the error policy retries it, and otherwise ends
+    nothing.
   - **A stop followed by a failure:** when a turn's hooks or compile fail
     after a stop reached it, the turn ends at the failure: its
     `inference:failed`, then its `inference:aborted`. It isn't held by a
-    provider hold, and the error policy doesn't retry it. A failure that
-    would have exhausted the turn emits no `inference:exhausted`, the event
-    from which the hard-down alert's failure streak, the over-budget drain
-    and the poison-history breaker count failures, so none of them counts
-    it.
+    provider hold, and the error policy doesn't retry it. If the agent was
+    replaced or the framework is stopping by then, the turn is dropped as
+    theirs, before it sends anything, as at the checks after the hooks and
+    the compile. A failure that would have exhausted the turn emits no
+    `inference:exhausted`, the event from which the hard-down alert's
+    failure streak, the over-budget drain and the poison-history breaker
+    count failures, so none of them counts it.
   - **A stop made where no check of a turn is ahead ends nothing:** the
     agent's next turn runs, as after a host's interrupt of every agent.
     That covers an idle agent, a turn finishing its last delivery, a budget
