@@ -93,7 +93,7 @@ function isMap(value: unknown): value is Record<string, unknown> {
 /** Every root keyword in JSON Schema's drafts 4 to 2020-12, besides
  *  `properties` and `required`, that can accept, require or name an object's
  *  keys, except the two read by declaresKeysPlainly (`additionalProperties`
- *  and `unevaluatedProperties`, which count only as a schema object). The
+ *  and `unevaluatedProperties`, which count when `true` or a schema object). The
  *  reading is cautious: a root with any of them names no key, whatever its
  *  subschemas hold, since naming a key the schema takes would mislead the
  *  agent more than a hint left out. So `not` is here too, since a negation

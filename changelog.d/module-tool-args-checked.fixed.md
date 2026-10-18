@@ -1,9 +1,10 @@
 - A module tool's call that lacks a required argument, or whose input is
   there but isn't an object, is answered before the module runs with what to
-  send, such as `Nothing was done: workspace--read needs "path" (a string),
-  and this call gave none.`, every problem named at once. Before, the call
-  reached the handler, which could fail deep inside with a `TypeError`, or
-  run without it: `workspace--grep` with no `pattern` matched every line.
+  send, such as `Nothing was done: discord--set_reply_context needs
+  "channelId" (a string), and this call gave none.`, every problem named at
+  once. Before, the call reached the handler, which could fail deep inside
+  with a `TypeError`, or run without it: `discord--set_reply_context` with no
+  `channelId` left the reply context with no channel and answered success.
 - The `utils` tool's check of a run's arguments reads the same way ("Nothing
   was done: …"), names every problem at once, and is still followed by the
   utility's schema. It now admits any type of a declared type list, where it
