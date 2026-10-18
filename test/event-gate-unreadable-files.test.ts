@@ -174,23 +174,22 @@ test('a gate.json that is not UTF-8 is kept byte for byte', (t) => {
   assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions']);
 });
 
-test("a copy has gate.json's group and permission bits: an owner-only file's copy is owner-only, and a group-readable one's stays group-readable", {
+test("a copy is owner-only whatever gate.json's bits: an owner-only, a group-readable and a world-readable gate.json each get an owner-only copy", {
   skip: process.platform === 'win32' ? 'needs POSIX permission bits' : false,
 }, (t) => {
   const dir = tempDir(t);
   const { gate, configPath } = makeGate(dir, { config: RULES });
   t.mock.method(console, 'error', () => {});
-  for (const [mode, kept] of [[0o600, 'gate.json.unreadable-20261015T025905Z'], [0o640, 'gate.json.unreadable-20261015T025905Z-2']] as const) {
+  const kept = ['gate.json.unreadable-20261015T025905Z', 'gate.json.unreadable-20261015T025905Z-2', 'gate.json.unreadable-20261015T025905Z-3'];
+  for (const [i, mode] of [0o600, 0o640, 0o644].entries()) {
     writeFileSync(configPath, BROKEN);
     chmodSync(configPath, mode);
     gate.addPolicy({ name: `ambient-${mode.toString(8)}`, behavior: 'defer' });
-    const copy = statSync(join(dir, kept));
-    assert.equal(copy.mode & 0o777, mode, `the copy of a ${mode.toString(8)} gate.json`);
-    assert.equal(copy.gid, statSync(configPath).gid, "and gate.json's group");
+    assert.equal(statSync(join(dir, kept[i]!)).mode & 0o777, 0o600, `the copy of a ${mode.toString(8)} gate.json`);
   }
 });
 
-test("a copy of a gate.json shared through another of this process's groups takes that group, so the group can read it", {
+test("a copy of a gate.json shared through another of this process's groups is owner-only, so that group can't read it", {
   skip: OTHER_GROUP === undefined ? 'needs a group this process is in besides its own' : false,
 }, (t) => {
   const dir = tempDir(t);
@@ -207,12 +206,10 @@ test("a copy of a gate.json shared through another of this process's groups take
 
   gate.addPolicy({ name: 'ambient', behavior: 'defer' });
 
-  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
-  assert.equal(copy.gid, OTHER_GROUP, "the copy has gate.json's group, not this process's own");
-  assert.equal(copy.mode & 0o777, 0o640, 'and its bits');
+  assert.equal(statSync(join(dir, 'gate.json.unreadable-20261015T025905Z')).mode & 0o777, 0o600, 'the copy is owner-only');
 });
 
-test("a copy takes gate.json's group and bits where chown refuses -1 for its owner, as Bun 1.3.14 does", {
+test("nothing chowns or chmods the copy by its path once it's made, so a link swapped in for it can't redirect either", {
   skip: process.platform === 'win32' ? 'needs POSIX permission bits' : false,
 }, (t) => {
   const dir = tempDir(t);
@@ -220,47 +217,19 @@ test("a copy takes gate.json's group and bits where chown refuses -1 for its own
   t.mock.method(console, 'error', () => {});
   writeFileSync(configPath, BROKEN);
   chmodSync(configPath, 0o640);
-  const original = fs.chownSync;
-  const chown = t.mock.method(fs, 'chownSync', (path: unknown, uid: number, gid: number) => {
-    if (uid === -1) throw Object.assign(new Error(`EPERM: operation not permitted, chown '${String(path)}'`), { code: 'EPERM', syscall: 'chown' });
-    original(path as string, uid, gid);
-  });
+  const chown = t.mock.method(fs, 'chownSync', () => { throw new Error('chownSync called'); });
+  const chmod = t.mock.method(fs, 'chmodSync', () => { throw new Error('chmodSync called'); });
   syncBuiltinESMExports();
   try {
     gate.addPolicy({ name: 'ambient', behavior: 'defer' });
   } finally {
     chown.mock.restore();
+    chmod.mock.restore();
     syncBuiltinESMExports();
   }
 
-  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
-  assert.equal(copy.gid, statSync(configPath).gid, "the copy has gate.json's group");
-  assert.equal(copy.mode & 0o777, 0o640, 'and its bits');
-});
-
-test("a copy that can't take gate.json's group stays owner-only", {
-  skip: process.platform === 'win32' ? 'needs POSIX permission bits' : false,
-}, (t) => {
-  const dir = tempDir(t);
-  const { gate, configPath } = makeGate(dir, { config: RULES });
-  t.mock.method(console, 'error', () => {});
-  writeFileSync(configPath, BROKEN);
-  chmodSync(configPath, 0o640);
-  // chown refuses a group this process isn't in with EPERM.
-  const chown = t.mock.method(fs, 'chownSync', (path: unknown) => {
-    throw Object.assign(new Error(`EPERM: operation not permitted, chown '${String(path)}'`), { code: 'EPERM', syscall: 'chown' });
-  });
-  syncBuiltinESMExports();
-  try {
-    gate.addPolicy({ name: 'ambient', behavior: 'defer' });
-  } finally {
-    chown.mock.restore();
-    syncBuiltinESMExports();
-  }
-
-  assert.equal(chown.mock.callCount(), 1, 'the copy was to take the group');
-  const copy = statSync(join(dir, 'gate.json.unreadable-20261015T025905Z'));
-  assert.equal(copy.mode & 0o777, 0o600, "so it stays owner-only, without gate.json's bits");
+  assert.equal(chown.mock.callCount() + chmod.mock.callCount(), 0, 'the mode comes from the exclusive create alone');
+  assert.equal(statSync(join(dir, 'gate.json.unreadable-20261015T025905Z')).mode & 0o777, 0o600, "and it's owner-only");
 });
 
 test("a copy of a gate.json that's a link stays owner-only, since a directory on the way to its file may be what closes it", {
@@ -305,6 +274,40 @@ test('keeping a copy leaves a symlinked gate.json pointing at its file, which ke
   assert.equal(statSync(target).mode & 0o777, 0o640, 'its file keeps its mode');
   assert.deepEqual(onDisk(target).policies.map((p) => p.name), ['mentions', 'ambient'], 'and holds the change');
   assert.equal(readFileSync(join(dir, 'gate.json.unreadable-20261015T025905Z'), 'utf-8'), BROKEN);
+});
+
+test("an onUnreadableKept that throws is logged once the change is made and traced, and the change answers as made", (t) => {
+  const dir = tempDir(t);
+  const traces: Array<{ type: string; [k: string]: unknown }> = [];
+  const { gate, configPath } = makeGate(dir, { config: RULES, traces });
+  const logged = t.mock.method(console, 'error', () => {});
+  const order: string[] = [];
+  const said = () => logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('onUnreadableKept'));
+
+  writeFileSync(configPath, BROKEN);
+  const added = gate.addPolicy({ name: 'ambient', behavior: 'defer' }, {
+    onUnreadableKept: () => {
+      order.push(traces.some((e) => e.type === 'gate:policy-added') ? 'after the trace' : 'before the trace');
+      throw new Error('the host could not record it');
+    },
+  });
+  assert.equal(added.name, 'ambient', 'addPolicy returns the rule it saved');
+  assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'ambient']);
+  assert.deepEqual(order, ['after the trace'], 'the callback runs once the change is traced');
+  assert.deepEqual(said(), ['[gate] onUnreadableKept threw once the change was made, and the change stands: the host could not record it']);
+
+  // So for a removal, and a thrown value whose text can't be read is named as such.
+  writeFileSync(configPath, BROKEN);
+  const unprintable = { toString(): string { throw new Error('no text'); } };
+  const removed = gate.removePolicy('mentions', {
+    onUnreadableKept: () => {
+      order.push(traces.some((e) => e.type === 'gate:policy-removed') ? 'after the trace' : 'before the trace');
+      throw unprintable;
+    },
+  });
+  assert.equal(removed, true, 'removePolicy answers that it removed the rule');
+  assert.deepEqual(order, ['after the trace', 'after the trace'], 'once the removal is traced');
+  assert.equal(said()[1], '[gate] onUnreadableKept threw once the change was made, and the change stands: a value that could not be printed');
 });
 
 test('nothing is kept, and an unreadable gate.json stays as it was, when nothing is written over it', (t) => {

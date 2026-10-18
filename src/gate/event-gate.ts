@@ -11,7 +11,7 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { chmodSync, chownSync, lstatSync, readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
@@ -345,10 +345,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function holdsNothing(value: unknown): boolean {
   return value === null || value === '' || (Array.isArray(value) && value.length === 0)
     || (isPlainObject(value) && Object.values(value).every(holdsNothing));
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -1535,6 +1531,28 @@ export function formatUnreadableKept(kept: UnreadableConfigKept): string {
     + 'runs this host can restore rules from it.';
 }
 
+/** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
+function errorText(err: unknown): string {
+  try {
+    return err instanceof Error ? err.message : String(err);
+  } catch {
+    return 'a value that could not be printed';
+  }
+}
+
+/**
+ * Run a caller's callback once the change it's told of is made and traced. A
+ * throw from it is logged, not thrown, so the call answers as the change it
+ * made: told the change had failed, an agent could make it a second time.
+ */
+function afterChange(name: string, callback: () => void): void {
+  try {
+    callback();
+  } catch (err) {
+    console.error(`[gate] ${name} threw once the change was made, and the change stands: ${errorText(err)}`);
+  }
+}
+
 /** The privileged-users file's error when some entries of its list aren't user ids. */
 function skippedPrivilegedIds(skipped: unknown[], loaded: number): string {
   const one = skipped.length === 1;
@@ -2001,18 +2019,12 @@ export class EventGate {
     // No colons: Windows doesn't allow them in a file name.
     const stamp = new Date(this.now()).toISOString().replace(/\.\d+Z$/, 'Z').replace(/[-:]/g, '');
     const base = `${this.configPath}.unreadable-${stamp}`;
-    // The copy is no more readable than gate.json: it's created owner-only,
-    // then given gate.json's group, and only then its permission bits. A copy
-    // that can't take the group (this process isn't in it), or whose
-    // gate.json can't be stat'd, stays owner-only. So does the copy of a
-    // gate.json that's a symbolic link: what keeps others out of the file it
-    // points to can be a directory on the way there, and the copy, beside the
-    // link, isn't behind it.
-    let gateFile: { gid: number; mode: number } | undefined;
-    try {
-      const file = lstatSync(this.configPath);
-      if (!file.isSymbolicLink()) gateFile = file;
-    } catch { /* owner-only */ }
+    // The copy is created with mode 0600, and nothing widens it, so on Linux
+    // only the user the host runs as can read it (a directory's default ACL is
+    // masked by that mode). What keeps others out of gate.json can be more than
+    // its own bits, such as a directory on the way to the file a link or a
+    // single-file bind mount puts there, or an ACL, and the copy, beside it, has
+    // none of those. The host read gate.json, so its user is one who could.
     for (let n = 1; ; n++) {
       const kept = n === 1 ? base : `${base}-${n}`;
       try {
@@ -2029,14 +2041,6 @@ export class EventGate {
           `gate.json couldn't be used (${reason}), and keeping a copy of it at ${kept} failed (${e.message ?? String(err)}), `
           + 'so nothing was written.',
         );
-      }
-      if (gateFile) {
-        try {
-          // The copy's own owner, this process, rather than -1 for "unchanged",
-          // which Bun 1.3.14 refuses with EPERM.
-          chownSync(kept, process.geteuid?.() ?? -1, gateFile.gid);
-          chmodSync(kept, gateFile.mode & 0o777);
-        } catch { /* it stays owner-only */ }
       }
       console.error(`[gate] ${this.configPath} couldn't be used (${reason}); kept a copy at ${kept} before writing the rules in force`);
       this.emitTrace({
@@ -2227,7 +2231,7 @@ export class EventGate {
    * text whose rules are in force the same way, or the rules in force where
    * there's none; over a file that can't be read or isn't JSON, after a copy of
    * it is kept beside it (keepUnreadableConfig) and reported to
-   * `onUnreadableKept` once the change is written. A policy with the same
+   * `onUnreadableKept` once the change is written and traced. A policy with the same
    * `name` is replaced IN PLACE when no `position` is given (order preserved);
    * WITH a `position` it is moved there — so re-issuing a rule is also how you
    * reposition it. New policies append
@@ -2237,8 +2241,9 @@ export class EventGate {
    * existing rule, which is almost always the safer way to order a sampler
    * or debounce against a specific catch-all. Fields of the policy the gate
    * reads nowhere, and that aren't a slip of one it does, are left out of
-   * what's written, and named to `onIgnoredFields` once the change is; a
-   * field it reads at another level is a problem, like a slip.
+   * what's written, and named to `onIgnoredFields` once the change is written
+   * and traced. A throw from either callback is logged, and the change stands
+   * (afterChange). A field it reads at another level is a problem, like a slip.
    *
    * Throws, writing nothing, for an invalid policy, a placement it can't make,
    * a gate.json that can't be read or kept, one with no rule list it could
@@ -2289,12 +2294,6 @@ export class EventGate {
       ? { keptPath: this.keepUnreadableConfig(unreadable), reason: unreadable.error }
       : undefined;
     this.writeConfigAfterKeep(top, rules, kept, remedy);
-    if (kept) options?.onUnreadableKept?.(kept);
-    if (ignored.length > 0) {
-      // A caller that doesn't take the notes still gets them said, in the log.
-      if (options?.onIgnoredFields) options.onIgnoredFields(ignored);
-      else console.error(`[gate] ${ignored.join(' ')}`);
-    }
     this.emitTrace({
       type: 'gate:policy-added',
       configPath: this.configPath,
@@ -2302,6 +2301,13 @@ export class EventGate {
       replaced: idx >= 0,
       timestamp: Date.now(),
     });
+    if (kept) afterChange('onUnreadableKept', () => options?.onUnreadableKept?.(kept));
+    if (ignored.length > 0) {
+      // A caller that doesn't take the notes still gets them said, in the log.
+      const onIgnoredFields = options?.onIgnoredFields;
+      if (onIgnoredFields) afterChange('onIgnoredFields', () => onIgnoredFields(ignored));
+      else console.error(`[gate] ${ignored.join(' ')}`);
+    }
     return policy;
   }
 
@@ -2330,13 +2336,13 @@ export class EventGate {
     // The write clears the rule's state once it has succeeded (writeConfig),
     // so a failed keep or write leaves the rule in force with its state.
     this.writeConfigAfterKeep(edit.top, edit.rules.filter((rule) => nameOf(rule) !== name), kept, edit.remedy);
-    if (kept) options?.onUnreadableKept?.(kept);
     this.emitTrace({
       type: 'gate:policy-removed',
       configPath: this.configPath,
       policyName: name,
       timestamp: Date.now(),
     });
+    if (kept) afterChange('onUnreadableKept', () => options?.onUnreadableKept?.(kept));
     return true;
   }
 
@@ -3052,6 +3058,17 @@ export class EventGate {
     }
   }
 
+  /** A turn that continues another (a budget restart, a tool-result-guard
+   *  retry) holds the entry its predecessor kept for it, and takes it again
+   *  where that entry ended in between: at a stop(), whose dispose() clears
+   *  every entry, or at a provider hold that kept the turn from starting,
+   *  whose end queues it again. Unlike onInferenceStarted it leaves a
+   *  pending self-wake alone: the logical turn that armed it is the one
+   *  still running. */
+  onInferenceResumed(agentName: string): void {
+    this.inferring.add(agentName);
+  }
+
   onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
@@ -3449,5 +3466,16 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    // stop() disposes the gate once its streams and event loop have ended (a
+    // turn still compiling then is dropped at its next check, before it sends
+    // anything), and a start() goes on with this gate. An agent left here by
+    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
+    // stop() refused) would make every debounced batch buffer until that
+    // agent's next turn ended. A turn that continues after the start() takes
+    // its entry again (onInferenceResumed). A turn that a start() during the
+    // stop() began before this ran loses its entry too, and runs on without
+    // it, so debounced batches are delivered while it runs: nothing refuses
+    // a start() during a stop() yet.
+    this.inferring.clear();
   }
 }
