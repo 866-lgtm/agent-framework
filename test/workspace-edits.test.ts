@@ -177,18 +177,27 @@ test('identical strings are refused before the path is touched, as an empty oldS
   const { call } = setup(t);
   assert.equal(errorOf(await call('edit', { path: 'nowhere/x.txt', oldString: 'same', newString: 'same' })),
     "The edit did nothing: oldString and newString are the same, so there's nothing to change.");
+  // An edit keeps the file's line ends, so one that changes only those names write.
   assert.equal(errorOf(await call('edit', { path: 'nowhere/x.txt', oldString: 'a\r\nb', newString: 'a\nb' })),
-    "The edit did nothing: oldString and newString are the same once their CRLF line ends are read as LF, so there's nothing to change.");
+    "The edit did nothing: oldString and newString are the same once their CRLF line ends are read as LF, so there's nothing to change: "
+    + "an edit keeps the file's line ends, and write replaces the whole file, line ends included.");
 });
 
 test("an edit that would take a file past its mount's maxFileSize is refused", async (t) => {
   const { call, stored, file } = setup(t, { maxFileSize: 20 });
   await file('s.txt', 'small\n');
-  // Exactly at the limit applies; a byte past it doesn't.
+  // Exactly at the limit applies.
   assert.equal(dataOf(await call('edit', { path: 'work/s.txt', oldString: 'small', newString: 'x'.repeat(19) })).size, 20);
   assert.equal((await call('edit', { path: 'work/s.txt', oldString: 'x'.repeat(19), newString: 'small' })).success, true);
+  // An edit whose counts take the file past the limit is refused before its
+  // text is built, from the least its bytes can be: a byte or more for each
+  // UTF-16 code unit.
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'small', newString: 'much, much, much larger' })),
-    "The edit did nothing: work/s.txt would be 24 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
+    "The edit did nothing: work/s.txt would be at least 24 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
+    + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
+  // One whose code units fit but whose UTF-8 doesn't is built, and refused by its bytes.
+  assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'small', newString: 'é'.repeat(10) })),
+    "The edit did nothing: work/s.txt would be 21 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
     + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
   assert.equal(await stored('s.txt'), 'small\n');
 });
@@ -421,8 +430,9 @@ test('every entry is set in one record: a call that fails after it says every ed
   assert.equal(await stored('a.txt'), 'a\n');
   assert.equal(await stored('b.txt'), 'b\n');
 
-  // A store that fails as it sets them sets neither, and the answer says so,
-  // with what the store said, cut as a problem's first line is.
+  // A store that fails as it sets them, recording nothing, sets neither, as
+  // reading them back shows, and the answer says so, with what the store
+  // said, cut as a problem's first line is.
   let message = 'injected batch failure';
   (store as unknown as { treeBatch: () => never }).treeBatch = () => { throw new Error(message); };
   try {
@@ -436,6 +446,88 @@ test('every entry is set in one record: a call that fails after it says every ed
   }
   assert.equal(await stored('a.txt'), 'a\n');
   assert.equal(await stored('b.txt'), 'b\n');
+});
+
+test('a store that throws after recording the edits is read back: the answer says they are stored, and one it can\'t read back says it can\'t tell', async (t) => {
+  const { store, call, stored, file } = setup(t);
+  await file('a.txt', 'alpha\n');
+  await file('b.txt', 'beta\n');
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const real = { treeBatch: store.treeBatch, treeSet: store.treeSet, treeGet: store.treeGet };
+  const both = (from: [string, string], to: [string, string]) => ({
+    edits: [
+      { path: 'work/a.txt', oldString: from[0], newString: to[0] },
+      { path: 'work/b.txt', oldString: from[1], newString: to[1] },
+    ],
+  });
+  const storedAll = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
+    + "The rest of the call failed: No space left on device (os error 28). ls shows each path's state.";
+  // The record lands, then the store throws, as Chronicle 0.4 does when the
+  // auto-snapshot it writes after recording fails (anima-research/chronicle#39).
+  s.treeBatch = (...args) => { real.treeBatch.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
+  s.treeSet = (...args) => { real.treeSet.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
+  try {
+    assert.equal(errorOf(await call('edit_many', both(['alpha', 'beta'], ['ALPHA', 'BETA']))), storedAll);
+    // One file's edits are set on their own, as edit's are.
+    assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/b.txt', oldString: 'BETA', newString: 'beta' }] })), storedAll);
+    assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' })),
+      'The edit of "work/b.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
+      + "The rest of the call failed: No space left on device (os error 28). ls shows the path's state.");
+  } finally {
+    delete s.treeBatch;
+    delete s.treeSet;
+  }
+  assert.equal(await stored('a.txt'), 'ALPHA\n');
+  assert.equal(await stored('b.txt'), 'BETA\n');
+
+  // A set that throws, and then the entries can't be read back either.
+  let failed = false;
+  s.treeBatch = () => { failed = true; throw new Error('injected batch failure'); };
+  s.treeGet = (...args) => {
+    if (failed) throw new Error('injected read failure');
+    return real.treeGet.apply(store, args as never);
+  };
+  try {
+    assert.equal(errorOf(await call('edit_many', both(['ALPHA', 'BETA'], ['alpha', 'beta']))),
+      "The edit_many call can't tell whether it stored its edits: injected batch failure; reading its entries back failed too (injected read failure), "
+      + "so whether the change is stored isn't known. Read its files before sending it again: a second call can apply its edits twice.");
+  } finally {
+    delete s.treeBatch;
+    delete s.treeGet;
+  }
+  assert.equal(await stored('a.txt'), 'ALPHA\n');
+});
+
+test('an edit names its path plainly: a path with an empty, "." or ".." segment is refused, naming the plain spelling', async (t) => {
+  const { dir, store, workspace, call, stored } = setup(t, { autoMaterialize: true });
+  mkdirSync(join(dir, 'sub'));
+  writeFileSync(join(dir, 'sub', 'b.txt'), 'one\ntwo\n');
+  assert.equal((await call('ls', { path: 'work/sub' })).success, true);
+  const refusal = (path: string) =>
+    `${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from work/sub/b.txt, the same file on disk; name it work/sub/b.txt.`;
+  for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/']) {
+    assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), refusal(path));
+  }
+  // Named two ways in one call, one file would be two plans of one text.
+  assert.equal(errorOf(await call('edit_many', {
+    edits: [
+      { path: 'work/sub/b.txt', oldString: 'one', newString: 'ONE' },
+      { path: 'work/sub//b.txt', oldString: 'two', newString: 'TWO' },
+    ],
+  })), `The edit_many call stored none of its edits: 1 problem.\n\nedit 2: ${refusal('work/sub//b.txt')}`);
+  assert.equal(await stored('sub/b.txt'), 'one\ntwo\n');
+  const treeStateId = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  assert.deepEqual(store.treeList(treeStateId, null).map((entry) => entry.path), ['sub/b.txt']);
+});
+
+test("edits that find more occurrences between them than the file has characters are refused as crowded", async (t) => {
+  const { call, stored, file } = setup(t);
+  await file('x.txt', `${'x'.repeat(100)}\n`);
+  assert.equal(errorOf(await call('edit_many', {
+    edits: ['a', 'b', 'c'].map((newString) => ({ path: 'work/x.txt', oldString: 'x', newString, occurrences: 100 })),
+  })), 'The edit_many call stored none of its edits: 1 problem.\n\n'
+    + 'edits 1–3: they find 300 occurrences between them in work/x.txt, which has 101 characters, so some of their matches overlap; give each its own stretch of text.');
+  assert.equal(await stored('x.txt'), `${'x'.repeat(100)}\n`);
 });
 
 test('every path is checked before any entry is set: a check that fails at the second file stores neither', async (t) => {

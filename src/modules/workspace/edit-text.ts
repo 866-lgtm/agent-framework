@@ -132,6 +132,9 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         ? `edits ${a + 1} and ${b + 1} replace the same text in ${problem.path} (line ${problem.line}); give each its own stretch of text.`
         : `edits ${a + 1} and ${b + 1} overlap in ${problem.path} (from line ${problem.line}); give each its own stretch of text, or make them one edit.`;
     }
+    case 'crowded':
+      return `they find ${problem.found.toLocaleString('en-US')} occurrences between them in ${problem.path}, which has ${problem.length.toLocaleString('en-US')} characters, `
+        + 'so some of their matches overlap; give each its own stretch of text.';
     case 'same':
       return `oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as ${problem.path}'s own, which the file keeps, so there's nothing to change.`;
   }

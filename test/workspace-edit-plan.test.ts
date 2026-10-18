@@ -22,14 +22,14 @@ const spec = (index: number, oldText: string, newText: string, expected: number 
 function plan(text: string | Buffer, specs: EditSpec[]): FilePlan {
   const bytes = typeof text === 'string' ? Buffer.from(text) : text;
   const planned = planFile(decodeForEdit(bytes)!, bytes, specs);
-  if ('problems' in planned) assert.fail(`refused: ${JSON.stringify(planned.problems)}`);
+  if (!('plan' in planned)) assert.fail(`refused: ${JSON.stringify(planned)}`);
   return planned.plan;
 }
 
 function problems(text: string, specs: EditSpec[], hints = hintBudget()): MatchProblem[] {
   const bytes = Buffer.from(text);
   const planned = planFile(decodeForEdit(bytes)!, bytes, specs, hints);
-  if ('plan' in planned) assert.fail('applied');
+  if (!('problems' in planned)) assert.fail('plan' in planned ? 'applied' : `refused as too large: ${JSON.stringify(planned)}`);
   return planned.problems;
 }
 
@@ -81,6 +81,67 @@ test('a replaceAll of millions of occurrences fits a small heap', () => {
   `], { encoding: 'utf8', timeout: 120_000 });
   assert.equal(child.status, 0, child.stderr);
   assert.deepEqual(JSON.parse(child.stdout), { replacements: 3_000_000, size: 3_000_001, last: 'b\n', others: 1 });
+});
+
+test('a file the edits would take past maxBytes is refused before its new text is built, from the least its bytes can be', () => {
+  const bytes = Buffer.from('aaaa\n');
+  const file = decodeForEdit(bytes)!;
+  // Five characters, four of them each made three: at least 13 bytes.
+  assert.deepEqual(planFile(file, bytes, [spec(0, 'a', 'bbb', 'all')], hintBudget(), 12), { tooLarge: 13 });
+  const fits = planFile(file, bytes, [spec(0, 'a', 'bbb', 'all')], hintBudget(), 13);
+  assert.ok('plan' in fits && fits.plan.bytes.length === 13);
+  // A BOM's three bytes count.
+  const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes]);
+  assert.deepEqual(planFile(decodeForEdit(bom)!, bom, [spec(0, 'a', 'bbb', 'all')], hintBudget(), 15), { tooLarge: 16 });
+  // The least counts UTF-16 code units, so a text whose UTF-8 runs longer is
+  // planned, and its bytes are for the caller to check.
+  const wide = planFile(file, bytes, [spec(0, 'a', 'é', 'all')], hintBudget(), 5);
+  assert.ok('plan' in wide && wide.plan.bytes.length === 9);
+});
+
+test('a replaceAll that would grow its file past maxBytes is refused in a small heap', () => {
+  // These 3,000,000 replacements of 200 characters would make a text of
+  // 600,000,001; built, it ran a heap of 512 MiB out of memory. Refused from
+  // its counts, it fits the 80 MiB the replaceAll of millions above needs.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--max-old-space-size=80', '--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const bytes = Buffer.from('a'.repeat(3_000_000) + '\\n');
+    console.log(JSON.stringify(planFile(decodeForEdit(bytes), bytes, [{ index: 0, oldText: 'a', newText: 'x'.repeat(200), expected: 'all' }], undefined, 5 * 1024 * 1024)));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  assert.deepEqual(JSON.parse(child.stdout), { tooLarge: 600_000_001 });
+});
+
+test("edits whose asks past what a refusal shows come to more than the text's characters are named as crowded", () => {
+  const text = `${'x'.repeat(100)}\n`;
+  // Three edits that each find the 100 they ask for: 300 between them in 101
+  // characters, so some overlap.
+  assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 100)]),
+    [{ kind: 'crowded', edits: [0, 1, 2], found: 300, length: 101 }]);
+  // One that finds fewer than it asks for is named as it always is, and the
+  // rest alone don't overflow the text, so nothing else is named.
+  const [count] = problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]);
+  assert.deepEqual(count, { ...count, kind: 'count', edit: 1, found: 100, expected: 150, overlapping: false });
+  assert.equal(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]).length, 1);
+  // Asks that fit past what a refusal shows are matched and named as clashes.
+  assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 21)]).map((problem) => problem.kind), ['count']);
+  assert.deepEqual(problems('x x x\n', [spec(0, 'x', 'a', 3), spec(1, 'x', 'b', 3)]), [{ kind: 'clash', edits: [0, 1], line: 1, same: true }]);
+});
+
+test('edits asking for millions of occurrences each are refused in a small heap', () => {
+  // Twelve edits each asking for all 1,000,000 kept 12,000,000 starts before
+  // their clashes were found. Asking for more than the text holds, they keep
+  // what a refusal shows.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--max-old-space-size=48', '--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const bytes = Buffer.from('a'.repeat(1_000_000));
+    const specs = Array.from({ length: 12 }, (_, index) => ({ index, oldText: 'a', newText: 'b', expected: 1_000_000 }));
+    console.log(JSON.stringify(planFile(decodeForEdit(bytes), bytes, specs)));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  assert.deepEqual(JSON.parse(child.stdout), { problems: [{ kind: 'crowded', edits: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], found: 12_000_000, length: 1_000_000 }] });
 });
 
 test('an occurrence is a position: overlapping occurrences count, and they can\'t each be replaced', () => {

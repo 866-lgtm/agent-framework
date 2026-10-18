@@ -313,6 +313,13 @@ export type MatchProblem =
   /** Two edits' matches overlap, or are the same text. */
   | { kind: 'clash'; edits: [number, number]; line: number; same: boolean }
   /**
+   * Edits that each found the occurrences they ask for, more of them between
+   * them than the text has characters: each takes one or more, and one
+   * edit's don't overlap one another, so some of different edits' do. Named
+   * in place of their clashes, whose places aren't kept (planFile).
+   */
+  | { kind: 'crowded'; edits: number[]; found: number; length: number }
+  /**
    * It matches only without the BOM or the line end's CR its old text
    * carries (readForm), and without them it is the same as its new text.
    */
@@ -416,14 +423,20 @@ function lineFeeds(value: string): number {
  * each occurrence an edit replaces it holds numbers, not objects: the
  * occurrence's start, and with several edits a key in one Float64Array. The
  * new text is built a batch of pieces at a time, and of each edit's
- * replacements it keeps only what a receipt names.
+ * replacements it keeps only what a receipt names. Two bounds keep a call
+ * from holding more than its file: edits whose asks, past what a refusal
+ * shows, come to more occurrences than the text has characters keep no
+ * more starts than a refusal shows, and a file the edits would take past
+ * `maxBytes` is refused as `tooLarge`, at least that many bytes, before its
+ * new text is built.
  */
 export function planFile(
   file: FileText,
   bytes: Buffer,
   specs: EditSpec[],
   hints: HintBudget = hintBudget(),
-): { plan: FilePlan } | { problems: MatchProblem[] } {
+  maxBytes = Infinity,
+): { plan: FilePlan } | { problems: MatchProblem[] } | { tooLarge: number } {
   const { raw, value, crs, lfs } = file;
   const crlf = crs.length > 0;
   const mixed = crlf && crs.length < lfs;
@@ -433,14 +446,22 @@ export function planFile(
   };
   const problems: MatchProblem[] = [];
   // Each edit that matches, with where: the edit as matched (readForm's for an
-  // old text read without its BOM or CR) and its starts, ascending.
-  const applied: Array<{ spec: EditSpec; starts: number[] }> = [];
+  // old text read without its BOM or CR), its starts, ascending, and how many.
+  const applied: Array<{ spec: EditSpec; starts: number[]; count: number }> = [];
   const quoteNormalized: number[] = [];
   const readForms: number[] = [];
   let quoted: string | undefined;
+  // Each edit keeps the starts it asks for, to replace them. What several ask
+  // for past the SHOWN_MATCHES each keeps for a refusal has to fit in the
+  // text, a character or more each; when it doesn't, they can't all apply
+  // (one finds fewer than it asks for, or two overlap), so they keep only
+  // what a refusal shows, and a call asking for millions of each doesn't
+  // hold millions for each.
+  const pastShown = specs.reduce((sum, spec) => sum + (spec.expected === 'all' ? 0 : Math.max(spec.expected - SHOWN_MATCHES, 0)), 0);
+  const crowded = specs.length > 1 && pastShown > value.length;
   for (const spec of specs) {
     // Every occurrence when every one is replaced; otherwise enough to replace or to show.
-    const keep = spec.expected === 'all' ? Infinity : Math.max(spec.expected, SHOWN_MATCHES);
+    const keep = crowded ? SHOWN_MATCHES : spec.expected === 'all' ? Infinity : Math.max(spec.expected, SHOWN_MATCHES);
     let matched = spec;
     let { starts, count, overlapping, atLeast } = scan(value, spec.oldText, keep);
     let normalized = false;
@@ -484,7 +505,14 @@ export function planFile(
       continue;
     }
     if (normalized) quoteNormalized.push(spec.index);
-    applied.push({ spec: matched, starts });
+    applied.push({ spec: matched, starts, count });
+  }
+  if (crowded) {
+    // The edits that found what they ask for found more occurrences than the
+    // text has characters, so some overlap, though where isn't kept.
+    const found = applied.reduce((sum, { count }) => sum + count, 0);
+    if (found > value.length) problems.push({ kind: 'crowded', edits: applied.map(({ spec }) => spec.index), found, length: value.length });
+    return { problems };
   }
   // Every replacement in file order. One edit's starts are that already; for
   // several, each replacement is a number, its start times the edits plus
@@ -552,6 +580,13 @@ export function planFile(
   const lineAt = new Map(lineNumbersAt(value, clashAts).map((line, k) => [clashAts[k]!, line]));
   for (const clash of clashes) problems.push({ kind: 'clash', edits: clash.edits, line: lineAt.get(clash.at)!, same: clash.same });
   if (problems.length) return { problems };
+
+  // The new text's length in UTF-16 code units is known from the counts, and
+  // its UTF-8 bytes are at least that many (each code unit takes one or
+  // more), so a file the edits take past maxBytes is refused before a text
+  // that could run to gigabytes is built.
+  const leastBytes = applied.reduce((length, { spec, count }) => length + count * (spec.newText.length - spec.oldText.length), value.length + (file.bom ? 3 : 0));
+  if (leastBytes > maxBytes) return { tooLarge: leastBytes };
 
   const endingAt = (lf: number) => (crAt(lf) ? '\r\n' : '\n');
   // The line end after a replaced text that holds none: its line's own, found

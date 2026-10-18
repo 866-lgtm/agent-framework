@@ -183,6 +183,41 @@ test('a write, edit or delete that throws after its tree entry is set says the c
   assert.equal(await stored('e.txt'), 'line, edited\n');
 });
 
+test('a write, edit or delete whose store throws after recording it says the change is stored', async (t) => {
+  const { store, dir, call, stored } = setup(t);
+  writeFileSync(join(dir, 'e.txt'), 'line\n');
+  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
+  assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // The record lands, then the store throws, as Chronicle 0.4 does when the
+  // auto-snapshot it writes after recording fails (anima-research/chronicle#39).
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  for (const name of ['treeSet', 'treeRemove']) {
+    const real = s[name]!;
+    s[name] = (...args) => { real.apply(store, args); throw new Error('No space left on device (os error 28)'); };
+  }
+  try {
+    assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'new\n' })),
+      'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. The rest of the call failed: No space left on device (os error 28). ls shows the path\'s state.');
+    assert.equal(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' })),
+      'The edit of "work/e.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
+      + 'The rest of the call failed: No space left on device (os error 28). ls shows the path\'s state.');
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
+      'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The rest of the call failed: No space left on device (os error 28). ls shows the path\'s state.');
+  } finally {
+    delete s.treeSet;
+    delete s.treeRemove;
+  }
+  assert.equal(await stored('w.txt'), 'new\n');
+  assert.equal(await stored('e.txt'), 'line, edited\n');
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, false);
+  // The written path's intent followed the record, so the new file is a draft
+  // the workspace made, not a file disk may have deleted.
+  const edited = await call('edit', { path: 'work/w.txt', oldString: 'new', newString: 'newer' });
+  assert.equal(edited.success, true, edited.error);
+  assert.doesNotMatch(String((edited.data as { note?: string }).note ?? ''), /nothing records/);
+});
+
 // ---------------------------------------------------------------------------
 // Part 2: a read numbers the lines the file has
 // ---------------------------------------------------------------------------

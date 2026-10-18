@@ -8,7 +8,7 @@
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
-import { join, resolve, relative, sep } from 'node:path';
+import { join, posix, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -2054,8 +2054,9 @@ export class WorkspaceModule implements Module {
    * is set, then every entry is set in one record of the store, which takes
    * all of them or none, then each path's intent, with no await between, and
    * one push takes the paths to disk. `onCommitted` is told of each path once
-   * the entries are set. Returns the reason for each path that reached the
-   * workspace but not disk.
+   * the entries are set, also when the store throws after setting them,
+   * whose error then goes on in place of the push (changesLanded). Returns
+   * the reason for each path that reached the workspace but not disk.
    */
   private async commitToolChanges(
     mount: MountState,
@@ -2072,15 +2073,27 @@ export class WorkspaceModule implements Module {
       settleAdoptionBeforeMutation(store, agreement, { name: mount.config.name, treeStateId: mount.treeStateId }, path);
     }
     const entry = (change: ToolChange & { kind: 'set' }) => ({ blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
-    if (changes.length === 1) {
-      const [{ path, change }] = changes as [{ path: string; change: ToolChange }];
-      if (change.kind === 'set') store.treeSet(mount.treeStateId, path, entry(change));
-      else store.treeRemove(mount.treeStateId, path);
-    } else {
-      // One record for every path, so a store that fails partway sets none.
-      store.treeBatch(mount.treeStateId, changes.map(({ path, change }) => (change.kind === 'set'
-        ? { op: 'set', path, entry: entry(change) }
-        : { op: 'remove', path })));
+    // A store can fail after its record lands: Chronicle 0.4 writes a state's
+    // auto-snapshot after appending its update, and that failure reaches the
+    // caller with the update recorded (anima-research/chronicle#39). So a set
+    // that threw is read back, and where every path holds what its change
+    // sets, the record is in: the paths' intents follow, as for any set, and
+    // then the error goes on in place of the push.
+    let landedThenThrew: { error: unknown } | null = null;
+    try {
+      if (changes.length === 1) {
+        const [{ path, change }] = changes as [{ path: string; change: ToolChange }];
+        if (change.kind === 'set') store.treeSet(mount.treeStateId, path, entry(change));
+        else store.treeRemove(mount.treeStateId, path);
+      } else {
+        // One record for every path, so a store that fails partway sets none.
+        store.treeBatch(mount.treeStateId, changes.map(({ path, change }) => (change.kind === 'set'
+          ? { op: 'set', path, entry: entry(change) }
+          : { op: 'remove', path })));
+      }
+    } catch (error) {
+      if (!changesLanded(store, mount.treeStateId, changes, error)) throw error;
+      landedThenThrew = { error };
     }
     // A later intent update or disk push can throw; the tree entries are
     // already set, on the branch current now. If the active branch changes
@@ -2103,6 +2116,7 @@ export class WorkspaceModule implements Module {
         return next;
       });
     }
+    if (landedThenThrew) throw landedThenThrew.error;
     const refused = new Map<string, string>();
     if (!this.pushesOnCommit(mount)) return refused;
 
@@ -2421,7 +2435,9 @@ export class WorkspaceModule implements Module {
    * every problem; the settling is what a read or a listing of its files
    * would take in from disk, and the refusal says what it took in. A failure
    * before the commit sets the entries stores none of them, and edit_many's
-   * answer to it says so.
+   * answer to it says so. A store that throws as it sets them is read back
+   * (commitToolChanges), so the answer says they're stored where its record
+   * landed, and that it can't tell where they couldn't be read back.
    * Under the mount's turn, one pass settles every path with disk, by the
    * rule a listing uses, so the edits apply to what disk now holds. That pass
    * is the only step that awaits before the commit: every file is then read,
@@ -2457,8 +2473,15 @@ export class WorkspaceModule implements Module {
       if (spec.oldText === '') {
         problems.push({ kind: 'input', edit: index, text: '"oldString" is empty, and an empty string matches between every character. Give the text to replace.' });
       } else if (spec.oldText === spec.newText) {
-        const lineEnds = edit.oldString !== edit.newString ? ' once their CRLF line ends are read as LF' : '';
-        problems.push({ kind: 'input', edit: index, text: `oldString and newString are the same${lineEnds}, so there's nothing to change.` });
+        // An edit's new text takes the line ends of the text it replaces, so
+        // one whose only change is its line ends changes nothing.
+        problems.push({
+          kind: 'input',
+          edit: index,
+          text: edit.oldString !== edit.newString
+            ? "oldString and newString are the same once their CRLF line ends are read as LF, so there's nothing to change: an edit keeps the file's line ends, and write replaces the whole file, line ends included."
+            : "oldString and newString are the same, so there's nothing to change.",
+        });
       }
       for (const field of ['oldString', 'newString'] as const) {
         if (LONE_SURROGATE.test(edit[field])) {
@@ -2588,17 +2611,20 @@ export class WorkspaceModule implements Module {
             continue;
           }
           if (!target.specs.length) continue;
-          const planned = planFile(file, blob, target.specs, hints);
+          const planned = planFile(file, blob, target.specs, hints, maxSize);
           if ('problems' in planned) {
             problems.push(...planned.problems.map((problem) => ({ ...problem, path: target.path })));
             continue;
           }
-          if (planned.plan.bytes.length > maxSize) {
+          // The planner refuses a file it would take past the limit before
+          // building it, from the least its bytes can be.
+          if ('tooLarge' in planned || planned.plan.bytes.length > maxSize) {
+            const size = 'tooLarge' in planned ? `at least ${planned.tooLarge.toLocaleString('en-US')}` : planned.plan.bytes.length.toLocaleString('en-US');
             problems.push({
               kind: 'file',
               edits: target.edits,
               path: target.path,
-              text: `${target.path} would be ${planned.plan.bytes.length.toLocaleString('en-US')} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
+              text: `${target.path} would be ${size} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
                 + `past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so the workspace couldn't keep it. `
                 + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.",
               whole: false,
@@ -2632,17 +2658,28 @@ export class WorkspaceModule implements Module {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (committed) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, { threw: message }, maxChars);
-      // The commit sets every entry in one record or none, so nothing is stored.
-      if (tool === 'edit_many') return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
+      if (tool === 'edit_many') {
+        if (error instanceof CommitUnknownError) {
+          return {
+            success: false,
+            isError: true,
+            error: `The edit_many call can't tell whether it stored its edits: ${cutLine(message)}. Read its files before sending it again: a second call can apply its edits twice.`,
+          };
+        }
+        // The commit sets every entry in one record or none, and a set that
+        // threw was read back, so nothing is stored.
+        return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
+      }
       throw error;
     }
   }
 
   /**
    * Where an edit's path is in its mount, or why the call can't edit it: a
-   * path no mount holds, a read-only mount, or for edit_many a generated file.
-   * edit's generated file is refused before it gets here, by the same rule
-   * (handleToolCall checks a call's `path`, which edit_many's input lacks).
+   * path no mount holds, a read-only mount, a path not spelled plainly, or for
+   * edit_many a generated file. edit's generated file is refused before it
+   * gets here, by the same rule (handleToolCall checks a call's `path`, which
+   * edit_many's input lacks).
    */
   private editablePath(
     tool: EditTool,
@@ -2652,6 +2689,14 @@ export class WorkspaceModule implements Module {
     const unusable = (text: string) => ({ kind: 'file' as const, edits: [], path, text, whole: true });
     try {
       const where = this.parsePath(path);
+      // The workspace keeps an entry for each spelling of a path, so a path
+      // with an empty, "." or ".." segment would be an entry apart from the
+      // file's own, and two spellings in one call two plans of one file.
+      const plain = posix.normalize(where.relativePath).replace(/\/$/, '');
+      if (where.relativePath !== '' && plain !== where.relativePath) {
+        const named = `${where.mount.config.name}/${plain}`;
+        return unusable(`${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from ${named}, the same file on disk; name it ${named}.`);
+      }
       if (where.mount.config.mode === 'read-only') return unusable(`Mount "${where.mount.config.name}" is read-only`);
       const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
       if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
@@ -3599,6 +3644,41 @@ interface EditTarget {
   /** Every edit naming it, by index, and the specs of those fit to be matched. */
   edits: number[];
   specs: EditSpec[];
+}
+
+/**
+ * Whether a store's set that threw recorded the changes anyway: every path
+ * holds what its change sets. One record takes all of them or none, so a
+ * change that set an entry to what it already held can't make it look
+ * stored when the rest isn't. Reading them back can fail too, and then
+ * whether they're stored isn't known (CommitUnknownError).
+ */
+function changesLanded(
+  store: JsStore,
+  treeStateId: string,
+  changes: Array<{ path: string; change: ToolChange }>,
+  setError: unknown,
+): boolean {
+  try {
+    return changes.every(({ path, change }) => {
+      const entry = store.treeGet(treeStateId, path);
+      return change.kind === 'set' ? entry?.blobHash === change.blobHash : entry === null;
+    });
+  } catch (readError) {
+    throw new CommitUnknownError(setError, readError);
+  }
+}
+
+/**
+ * A store's set threw, and reading its entries back threw too, so whether the
+ * change is stored isn't known. Its message says so after both errors.
+ */
+class CommitUnknownError extends Error {
+  constructor(setError: unknown, readError: unknown) {
+    const text = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    super(`${text(setError)}; reading its entries back failed too (${text(readError)}), so whether the change is stored isn't known`);
+    this.name = 'CommitUnknownError';
+  }
 }
 
 /**
