@@ -30,6 +30,10 @@ export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
 const STUB_FIELD_CHARS = 120;
+/** A saved copy's path, as its stub shows it. */
+const SAVED_PATH_CHARS = 256;
+/** A reference id's random suffix (see ReferenceRegistry.register). */
+const REF_ID_SUFFIX_CHARS = 4;
 
 export type ReferenceDisposition = 'never' | 'ref';
 
@@ -93,13 +97,21 @@ export function classifyBlock(block: unknown): BlockClassification {
         return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
       }
       if (hasUri) return parseReferenceFields(block);
-      return { kind: 'invalid', reason: `${block.type} block with neither data nor uri` };
+      return { kind: 'invalid', reason: `${block.type} block ${mediaWithoutStringReason(block)}` };
     }
     case 'resource':
       return parseReferenceFields(block);
     default:
       return { kind: 'invalid', reason: `unknown block type: ${block.type}` };
   }
+}
+
+/** What a media block with neither string data nor a string uri has instead:
+ *  nothing, or a field that isn't a string. */
+function mediaWithoutStringReason(block: Record<string, unknown>): string {
+  const notString = (['data', 'uri'] as const).filter((f) => block[f] !== undefined && block[f] !== null);
+  if (notString.length === 0) return 'with neither data nor uri';
+  return notString.length === 2 ? "whose data and uri aren't strings" : `whose ${notString[0]} isn't a string`;
 }
 
 function parseReferenceFields(block: Record<string, unknown>): BlockClassification {
@@ -140,7 +152,7 @@ export function isInlineContradiction(block: unknown): boolean {
 }
 
 export const INLINE_WITHHELD_TEXT =
-  '[inline content withheld: nonconformant bulk disposition on inline data]';
+  '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
 
 /**
  * Why a reference counts as expired, or null when it doesn't: its expiresAt
@@ -173,8 +185,8 @@ export const EXPIRY_REASON = {
 } as const;
 
 /** A reference registered with no server, as the stub, the fetcher's refusal
- *  and save_recent_image's all say it: the fetcher dials only through the
- *  server a reference was registered against. */
+ *  and save_recent_image's all say it: the fetcher dials only through a
+ *  server that delivered the reference. */
 export const UNBOUND_REASON = 'unbound: no server is recorded to fetch it from';
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
@@ -204,7 +216,11 @@ export function formatSizeBytes(n: number): string {
 
 export interface ReferenceRecord {
   refId: string;
-  serverId?: string;
+  /** The servers whose content delivered this uri, each once, in the order
+   *  they did (§6.2). The fetcher dials through the first whose address is on
+   *  the uri's origin. Empty when no server delivered it, as for a reference
+   *  in a module's own tool result. */
+  serverIds: string[];
   testimony: ReferenceTestimony;
   receivedAt: number;
   /** Set by the host-mediated fetcher after a successful, verified fetch. */
@@ -225,20 +241,27 @@ const MAX_RECORDS = 2000;
  * defined miss, never a different record.
  *
  * Process-wide singleton by design: ids are host-local *names*, not
- * capabilities, and the record itself carries serverId for any future
+ * capabilities, and the record carries the servers that delivered it for the
  * origin-bound fetcher.
  */
 export class ReferenceRegistry {
   private records = new Map<string, ReferenceRecord>();
-  /** uri → refId. The uri ALONE is the identity key: stub sites (the two
-   *  tool-result serializers and the three converters) are free functions
-   *  with no server context, while dispatch-time pre-registration carries a
-   *  serverId — keying on both split every reference into two records, the
-   *  model-visible one unbound (fetch_reference failed on it) and the bound
-   *  one invisible. One key, and a later registration that knows the server
-   *  UPGRADES the record's binding instead of forking it. If two servers ever
-   *  reference the same uri, the first binding wins (the record's serverId
-   *  feeds the origin check, which fails closed on a mismatch). */
+  /** uri → refId. The uri ALONE is the identity key: a tool result's stubs
+   *  (tool-result-history.ts's, and framework.ts's tryNativeToolResultContent)
+   *  and a script's demand fetch register with no server context,
+   *  while the registrations that know the server carry its id: a tool
+   *  result's, before it's shown, whether the agent's dispatch or an
+   *  in-process caller made the call, and convertBlock's, for push events,
+   *  render results, channel messages and context injections. Keying on both
+   *  split every reference into two records, the model-visible one unbound
+   *  (fetch_reference failed on it) and the bound one invisible. One key, and
+   *  each registration that knows its server ADDS that server to the record,
+   *  once, in the order they came, instead of forking it. When several
+   *  servers deliver one uri, the fetcher dials through the first whose
+   *  address is on the uri's origin, so a server off that origin delivering
+   *  it first doesn't decide whether it can be fetched; among servers on that
+   *  origin, the first to deliver it is dialed. A server's token goes only to
+   *  its own origin, for a uri it delivered. */
   private byKey = new Map<string, string>();
   private counter = 0;
 
@@ -247,8 +270,8 @@ export class ReferenceRegistry {
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
       if (existing) {
-        if (serverId !== undefined && existing.serverId === undefined) {
-          existing.serverId = serverId;
+        if (serverId !== undefined && !existing.serverIds.includes(serverId)) {
+          existing.serverIds.push(serverId);
         }
         // Refresh testimony while unfetched: a re-issued reference with a new
         // digest/expiry supersedes the stale claims. Once fetched, the record
@@ -261,8 +284,8 @@ export class ReferenceRegistry {
         return existing;
       }
     }
-    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-    const record: ReferenceRecord = { refId, serverId, testimony, receivedAt: Date.now() };
+    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
+    const record: ReferenceRecord = { refId, serverIds: serverId === undefined ? [] : [serverId], testimony, receivedAt: Date.now() };
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
     if (this.records.size > MAX_RECORDS) {
@@ -300,6 +323,22 @@ export function referenceTypeLabel(mimeType: string | undefined): string {
 }
 
 /**
+ * The longest line buildReferenceStub writes, in UTF-16 code units, from its
+ * own bounds: the longest id the registry mints, then the name, the type with
+ * the largest size it shows, and the origin, each at its bound, and the
+ * longest ending, a saved copy's path, with their separators. The other
+ * endings, the fetch hint and the reasons a fetch would be refused, are
+ * shorter. A line shaped like a stub but longer than this is quoted text the
+ * writer can't have written, and no image slot (tool-image-ledger.ts).
+ */
+export const REFERENCE_STUB_MAX_CHARS =
+  `[ref_${MAX_SAFE.toString(36)}_] `.length + REF_ID_SUFFIX_CHARS
+  + STUB_FIELD_CHARS
+  + ' — '.length + STUB_FIELD_CHARS + ', '.length + `${formatSizeBytes(MAX_SAFE)} claimed`.length
+  + ' — '.length + STUB_FIELD_CHARS
+  + ' — '.length + 'saved: '.length + SAVED_PATH_CHARS;
+
+/**
  * Build the model-visible stub for a reference. Output length is bounded by
  * host constants and independent of every server-supplied field length.
  * Under `disposition:"never"` the uri is omitted unconditionally; under
@@ -322,7 +361,7 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   if (record.fetchedPath) {
     // Already materialized by the host-mediated fetcher: hand the model the
     // workspace path (host-generated, §7.3) so existing tools just work.
-    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
+    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, SAVED_PATH_CHARS)}`);
   } else {
     // A reference whose record shows the fetcher would refuse it says why,
     // rather than inviting a fetch_reference call.
@@ -336,13 +375,13 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
  * server registered for it, which the fetcher checks first, or its expiry.
  * Null for a saved copy, which the fetcher serves before any check, and when
  * the record shows neither. The fetcher's other refusals rest on what a record
- * doesn't hold, such as a server gone by the time of the fetch, a uri off the
- * origin its server was dialed at, a claimed size over the ceiling a fetch is
- * given, or a server's fetch budget spent, and it gives those in its own words.
+ * doesn't hold: whether any of its servers is still known to the host and on
+ * the uri's origin, a claimed size over the ceiling a fetch is given, or the
+ * dialed server's fetch budget spent, and it gives those in its own words.
  */
 export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
   if (record.fetchedPath) return null;
-  if (record.serverId === undefined) return UNBOUND_REASON;
+  if (record.serverIds.length === 0) return UNBOUND_REASON;
   const expiry = referenceExpiry(record.testimony, nowMs);
   return expiry ? EXPIRY_REASON[expiry] : null;
 }

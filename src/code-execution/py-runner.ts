@@ -20,10 +20,11 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { buildChildEnv } from '../mcpl/transport.js';
 import { randomBytes } from 'node:crypto';
 import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
@@ -82,6 +83,19 @@ export interface PyRunnerOptions {
   onToolCall: ScriptToolCallHandler;
   /** Log prefix, typically the agent name. */
   label?: string;
+  /** Variables for the interpreter beyond what it inherits, such as
+   *  PYTHONPATH or a venv's. It inherits only what stdio MCPL children do
+   *  (CHILD_ENV_ALLOWLIST and LC_*, CA bundles and proxy variables among
+   *  them, and a proxy URL can carry credentials), then these, then
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING, which the runner sets last.
+   *  Like the allowlist, this limits what the model's code inherits, not
+   *  what a process running as the same user can read. */
+  env?: Record<string, string>;
+  /** Pass the host's whole environment instead of the allowlist, as before
+   *  `env` existed. That hands every host variable, provider keys included,
+   *  to the model's code and to every subprocess a script starts; listing
+   *  what scripts need in `env` is the safer route. */
+  inheritEnv?: boolean;
 }
 
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 270_000;
@@ -508,6 +522,17 @@ interface PendingExec {
   returnCode: number | null;
 }
 
+/**
+ * The interpreter to spawn. A bare name is looked up on PATH. A path with a
+ * separator is resolved against the host's working directory, where it
+ * resolved before the interpreter got a working directory of its own: spawn
+ * would resolve it against the runtime directory instead.
+ */
+function spawnablePath(pythonPath: string): string {
+  const hasSeparator = pythonPath.includes('/') || (process.platform === 'win32' && pythonPath.includes('\\'));
+  return hasSeparator ? resolve(pythonPath) : pythonPath;
+}
+
 export class PyRunner {
   private readonly pythonPath: string;
   private readonly toolCallTimeoutMs: number;
@@ -516,6 +541,7 @@ export class PyRunner {
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
+  private readonly envOptions: { env?: Record<string, string>; inheritEnv?: boolean };
 
   private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
   private child: ChildProcess | null = null;
@@ -543,6 +569,12 @@ export class PyRunner {
     this.idleReclaimMs = options.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
+    // The interpreter runs model-authored code: the same env discipline as an
+    // MCPL connector child (#175), for a child that deserves it more. Stored
+    // as options, not a snapshot — the env is rebuilt at every spawn so a
+    // respawn after idle reclaim sees current host values, as the old
+    // per-spawn `{ ...process.env }` did.
+    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv };
   }
 
   get busy(): boolean {
@@ -710,14 +742,29 @@ export class PyRunner {
     }
     this.teardownChild();
 
-    this.runtimeDir = mkdtempSync(join(tmpdir(), 'af-pytc-'));
+    // Absolute, since the interpreter runs in it: from a relative TMPDIR,
+    // runtime.py's path would otherwise resolve against the directory itself.
+    this.runtimeDir = resolve(mkdtempSync(join(tmpdir(), 'af-pytc-')));
     const runtimePath = join(this.runtimeDir, 'runtime.py');
     writeFileSync(runtimePath, PYTHON_RUNTIME_SOURCE, 'utf8');
 
-    const child = spawn(this.pythonPath, [runtimePath], {
+    const child = spawn(spawnablePath(this.pythonPath), [runtimePath], {
       // fd 0 is /dev/null, the host reads fds 1 and 2, and the protocol has 3 and 4.
       stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      // The runtime directory, not the host's working directory: a script's
+      // relative paths land here, and go at teardown, rather than beside the
+      // host's .env and data. An absolute path still reaches the host's files.
+      cwd: this.runtimeDir,
+      // Set last, over a declared env. The host reads fds 1 and 2 as UTF-8.
+      // The runtime's channel and a script's writers say UTF-8 themselves
+      // (runtime-py.ts), but other Python writing there takes its encoding and
+      // buffering from these: the interpreter's sys.stdout and sys.stderr
+      // between scripts, which a thread a script left running prints through,
+      // and any Python a script starts. So what it writes reaches the host as
+      // it's written, and in UTF-8, where Python before 3.15 on Windows writes
+      // a pipe in the ANSI code page unless told otherwise; a host's own
+      // PYTHONUTF8 no longer reaches the interpreter.
+      env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
     const protoIn = child.stdio[3] as Writable;
@@ -1047,8 +1094,8 @@ export class PyRunner {
       this.reader.close();
       this.reader = null;
     }
-    if (this.child) {
-      const child = this.child;
+    const child = this.child;
+    if (child) {
       const input = this.protoIn;
       this.child = null;
       this.childReady = null;
@@ -1076,13 +1123,24 @@ export class PyRunner {
         child.kill('SIGKILL');
       }
     }
-    if (this.runtimeDir) {
-      try {
-        rmSync(this.runtimeDir, { recursive: true, force: true });
-      } catch {
-        // temp cleanup is best-effort
-      }
-      this.runtimeDir = null;
+    const dir = this.runtimeDir;
+    this.runtimeDir = null;
+    if (dir) {
+      const remove = (): void => {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // temp cleanup is best-effort
+        }
+      };
+      // The directory is the interpreter's working directory, which Windows
+      // won't remove while the process lives, so there it goes once the
+      // process has. Elsewhere it goes now, so a host that exits right after
+      // this doesn't leave it behind. A child that never started has no exit
+      // to wait for.
+      const running = child !== null && child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+      if (running && process.platform === 'win32') child.once('exit', remove);
+      else remove();
     }
   }
 

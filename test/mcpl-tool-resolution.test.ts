@@ -7,8 +7,9 @@
  * for a programmatic call, through the public executeToolCall or a module's
  * ctx.callTool, which also sends the server the tool name the model's call
  * sends; for an MCPL tool's source in the tool presentation; and for the
- * RFC-008 class declarations a server's close forgets. Where two servers list
- * the same full name, the listing holds the one listed last (#265).
+ * RFC-008 class declarations a server's close forgets. Prefixes that meet
+ * are refused at configuration since #265, so the stand-ins below build such
+ * a pair directly, to pin the resolver's own rule.
  */
 
 import { test } from 'node:test';
@@ -385,13 +386,14 @@ async function live(servers: ReturnType<typeof fixture>[], names: string[]) {
 }
 
 test('with fixture servers configured at create(), one on the default prefix, every path reaches the server the model\'s call reaches', async () => {
-  // `plain` takes the default prefix, `mcpl--plain`; `inner`'s begins with it.
+  // `plain` takes the default prefix, `mcpl--plain`, and lists a name with
+  // `--` in it; `inner`'s prefix doesn't meet it (#265).
   const servers = [
     fixture('plain', ['echo', 'inner--qux']),
-    fixture('inner', ['echo'], 'mcpl--plain--inner'),
+    fixture('inner', ['echo'], 'inner'),
   ];
   const calls: Array<[string, string]> = [
-    ['mcpl--plain--inner--echo', 'inner:echo'],
+    ['inner--echo', 'inner:echo'],
     ['mcpl--plain--echo', 'plain:echo'],
     ['mcpl--plain--inner--qux', 'plain:inner--qux'],
   ];

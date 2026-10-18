@@ -8,7 +8,7 @@
 import { isUtf8 } from 'node:buffer';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
+import { open, readFile, readdir, stat, lstat, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
@@ -40,8 +40,8 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, OTHER_MOUNT, filesystemTrustsCtime, inOtherMount, locateRoot, passedOverAt, readPrefix } from './observe.js';
-import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
+import { IGNORED, OTHER_MOUNT, checkDir, filesystemTrustsCtime, inOtherMount, locateRoot, passedOverAt, readPrefix } from './observe.js';
+import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -61,6 +61,14 @@ import {
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
+/**
+ * How long a mount's catch-up pass waits for its watcher to become ready
+ * before it starts anyway (ensureRunning). In a probe on Linux at a load near
+ * 40, chokidar's first scan of 10,000 entries took 1.3 s, about a twentieth of
+ * this. A scan slower than the bound has the pass started beside it, and the
+ * watcher's ready runs the pass again once the scan ends.
+ */
+const CATCH_UP_BOUND_MS = 30_000;
 /** Why a call is refused once the module has stopped. */
 const NOT_RUNNING = 'The workspace has stopped: it takes no more work until it starts again';
 /** The workspace's own deadline must end before the framework's hook bound. */
@@ -751,7 +759,11 @@ export class WorkspaceModule implements Module {
    * second. `ensureRunning()` gates on `ctx && mounts-populated`.
    */
   initStore(store: JsStore): void {
-    this.store = store;
+    // Every mount's states are registered before the module takes the store
+    // or any mount, so a registration that fails leaves the module as it was
+    // before the call, knowing no mount, and a later initStore starts clean.
+    const mounts = new Map<string, MountState>();
+    const intents = new Map<string, BranchIntents>();
 
     // Register tree states for each mount: the workspace tree, and the
     // branch-local intent that qualifies it.
@@ -759,19 +771,15 @@ export class WorkspaceModule implements Module {
       const treeStateId = `workspace/${mount.name}/tree`;
       const intentTreeStateId = `workspace/${mount.name}/intent`;
       for (const id of [treeStateId, intentTreeStateId]) {
-        try {
-          store.registerState({
-            id,
-            strategy: 'tree',
-            deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
-            fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
-          });
-        } catch {
-          // State already registered (restart scenario)
-        }
+        ensureStateRegistered(store, {
+          id,
+          strategy: 'tree',
+          deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
+          fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
+        });
       }
 
-      const mountState: MountState = {
+      mounts.set(mount.name, {
         config: mount,
         treeStateId,
         intentTreeStateId,
@@ -781,10 +789,13 @@ export class WorkspaceModule implements Module {
         lastMaterializedBranchId: null,
         watcherReadyAt: null,
         watcherError: null,
-      };
-      this.mounts.set(mount.name, mountState);
-      this.intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
+      });
+      intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
     }
+
+    this.store = store;
+    for (const [name, state] of mounts) this.mounts.set(name, state);
+    for (const [name, intent] of intents) this.intents.set(name, intent);
 
     // What disk last agreed with, per mount and path: global records, so a
     // branch switch never rewinds it.
@@ -848,6 +859,33 @@ export class WorkspaceModule implements Module {
       catchUpScan: (mount.config.watch ?? 'always') === 'always',
       modesObserved: this.modesObserved,
     };
+  }
+
+  /**
+   * Where a search's walk starts: `base`, its path as given, then each
+   * segment of `beneath` while disk lists it, in the directory reached so
+   * far, as a directory with exactly that spelling. The walk names what it
+   * finds from its start's spelling, and a case-insensitive disk would let
+   * it go on under a spelling disk doesn't list, taking files in under that
+   * spelling beside their own. So the start stops before a segment spelled
+   * any other way, not there, or not a directory, and before a link, which
+   * a walk of the whole mount doesn't go through either. It lists only
+   * directories it has checked lie inside the mount, and none the mount
+   * passes over by design, which the walk then answers for.
+   */
+  private async walkStart(mount: MountState, base: string, beneath: string): Promise<string> {
+    if (beneath === '') return base;
+    const { view, rootReal } = await this.runtime(mount);
+    let start = base;
+    for (const segment of beneath.split('/')) {
+      if (start !== '' && passedOverAt(start, view.ignore, view.others) !== undefined) break;
+      const here = await checkDir(view, rootReal, start);
+      if (here.kind !== 'checked') break;
+      const entry = (await readdir(here.dir.real, { withFileTypes: true }).catch(() => [])).find((e) => e.name === segment);
+      if (entry === undefined || !entry.isDirectory()) break;
+      start = start ? `${start}/${segment}` : segment;
+    }
+    return start;
   }
 
   /** One disk→store pass; the caller holds the mount's turn. Emits its events. */
@@ -1027,7 +1065,45 @@ export class WorkspaceModule implements Module {
 
       const watchMode = mount.config.watch ?? 'always';
       if (watchMode === 'always') {
-        const watcher = new MountWatcher(
+        // Chokidar is started with ignoreInitial:true, so changes made while
+        // the session was down would be invisible. A catch-up pass takes them
+        // in under the three-way rule: only real differences produce tree
+        // changes and events. It takes its turn with the mount's bare syncs,
+        // so on a mount over its walkCap it covers the walkCap entries after
+        // where the last turn stopped, and a change elsewhere waits for the
+        // rotation to reach it, or for a sync of its path.
+        //
+        // The pass runs at each of the watcher's readies, its first and each
+        // re-attach's, when chokidar has called fs.watch on every entry, so a
+        // change made after the pass has looked at a file reaches the watcher.
+        // Started beside chokidar's scan, the pass could finish with a file
+        // before chokidar watched it, and a change between the two reached
+        // neither. A watcher that isn't ready within CATCH_UP_BOUND_MS (from
+        // its start or its re-attach) has the pass started at the bound, and
+        // its ready, if it comes, runs the pass again. Within the mount's
+        // walkCap, that pass covers what the early one missed. Over it, the
+        // pass continues the rotation, and what the early one missed waits for
+        // the rotation to come back, as any change outside a pass's window
+        // does. An error doesn't start the pass: chokidar goes on scanning
+        // after one, and the bound covers a watcher that never becomes ready.
+        // On macOS, a new entry written after ready but before libuv's
+        // FSEventStream exists isn't reported until a later change in its
+        // directory, which this doesn't change.
+        let watcher: MountWatcher | undefined;
+        let bound: ReturnType<typeof setTimeout> | null = null;
+        const catchUp = () => {
+          if (bound) clearTimeout(bound);
+          bound = null;
+          // A watcher the module has since stopped or replaced starts no pass.
+          if (this.watchers.get(name) !== watcher) return;
+          void this.initialScan(name);
+        };
+        const awaitReady = () => {
+          if (bound) clearTimeout(bound);
+          bound = setTimeout(catchUp, CATCH_UP_BOUND_MS);
+          bound.unref?.();
+        };
+        watcher = new MountWatcher(
           mount.config,
           (changes) => {
             this.handleFsChanges(name, changes);
@@ -1036,6 +1112,7 @@ export class WorkspaceModule implements Module {
             onReady: () => {
               mount.watcherReadyAt = Date.now();
               mount.watcherError = null;
+              catchUp();
             },
             onError: (err) => {
               mount.watcherError = err.message;
@@ -1048,7 +1125,7 @@ export class WorkspaceModule implements Module {
             },
             onReattach: () => {
               mount.watcherError = null;
-              void this.initialScan(name);
+              awaitReady();
               this.ctx?.pushEvent({
                 type: 'workspace:watcher-reattached',
                 mount: name,
@@ -1058,17 +1135,9 @@ export class WorkspaceModule implements Module {
           },
           this.othersOf(name),
         );
+        awaitReady();
         watcher.start();
         this.watchers.set(name, watcher);
-
-        // Chokidar is started with ignoreInitial:true, so changes made while
-        // the session was down would be invisible. A catch-up pass takes them
-        // in under the three-way rule: only real differences produce tree
-        // changes and events. It takes its turn with the mount's bare syncs,
-        // so on a mount over its walkCap it covers the walkCap entries after
-        // where the last turn stopped, and a change elsewhere waits for the
-        // rotation to reach it, or for a sync of its path.
-        void this.initialScan(name);
       }
 
       this.ctx.pushEvent({
@@ -1102,11 +1171,13 @@ export class WorkspaceModule implements Module {
     // No new watcher-driven passes, then let every pass and write finish
     // before the store goes away — including any queued behind the ones in
     // flight (a tool call, a scan continuing past its deadline): drained
-    // until no new tail appears.
-    for (const watcher of this.watchers.values()) {
+    // until no new tail appears. The watchers leave this.watchers before they
+    // stop, so a watcher's ready or catch-up bound starts no pass meanwhile.
+    const stopping = [...this.watchers.values()];
+    this.watchers.clear();
+    for (const watcher of stopping) {
       await watcher.stop();
     }
-    this.watchers.clear();
     for (;;) {
       const tails = [...this.mountTurns.values()];
       await Promise.all(tails);
@@ -2677,9 +2748,14 @@ export class WorkspaceModule implements Module {
       ? [this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
+    // Every match lies beneath the pattern's literal directory, so the walk
+    // starts there: past the walk's cap, a walk of the whole scope can stop
+    // before it gets there.
+    const patternDir = literalDirOf(input.pattern);
     for (const { mount, relativePath } of mountsToSearch) {
+      const start = await this.walkStart(mount, relativePath, patternDir);
       const pass = await this.withMount(mount, () =>
-        this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }));
+        this.passUnlocked(mount, { kind: 'dir', dir: start, recursive: true }));
       for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
         const testPath = relativePath ? report.path.slice(relativePath.length + 1) : report.path;
         if (regex.test(testPath)) {
@@ -2713,6 +2789,10 @@ export class WorkspaceModule implements Module {
     }
 
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
+    // The filter matches mount-relative paths, so every file it lets through
+    // lies beneath its literal directory, and the walk starts at the deeper of
+    // that and `path`.
+    const filterDir = input.glob ? literalDirOf(input.glob) : '';
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;
 
@@ -2750,6 +2830,11 @@ export class WorkspaceModule implements Module {
         incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list') });
         continue;
       }
+      // A `path` and a filter whose directories don't overlap leave no file
+      // the filter can let through, so nothing is searched.
+      const deeper = deeperOf(relativePath, filterDir);
+      if (deeper === null) continue;
+      const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
       await this.withMount(mount, async () => {
         // A `path` naming a single file greps just that file; otherwise it is a
         // directory prefix. (A file path once produced the prefix "notes.md/"
@@ -2767,7 +2852,7 @@ export class WorkspaceModule implements Module {
         for (let attempt = 0; attempt < 3 && pass === null; attempt++) {
           const next = await this.passUnlocked(mount, fileScope
             ? { kind: 'paths', paths: [relativePath] }
-            : { kind: 'dir', dir: relativePath, recursive: true });
+            : { kind: 'dir', dir: start, recursive: true });
           if (next.branchId === undefined || next.branchId === store.currentBranch().id) pass = next;
         }
         if (pass === null) {
@@ -3398,10 +3483,10 @@ export class WorkspaceModule implements Module {
     const scan: AgentActionScan = { late: false, settled: Promise.resolve() };
     const pass = this.withMount(mount, () => {
       if (mount.agentActionScanWaiting === scan) mount.agentActionScanWaiting = undefined;
-      // From the mount's start, as a listing walks, keeping no place: on a
-      // mount over its walkCap, every batch's scan takes the first walkCap
-      // entries in the walk's order, and the place that syncs and catch-up
-      // scans resume from stays theirs.
+      // From the mount's root, keeping no place, as a listing keeps none:
+      // on a mount over its walkCap, every batch's scan takes the first
+      // walkCap entries in the walk's order, and the place that syncs and
+      // catch-up scans resume from stays theirs.
       return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
     });
     scan.settled = pass.then(
@@ -3644,6 +3729,31 @@ function globToRegex(pattern: string): RegExp {
     }
   }
   return new RegExp(`^${regex}$`);
+}
+
+/**
+ * The directory a glob pattern names before its first wildcard, beneath
+ * which every path it matches lies: its leading segments that hold none of
+ * globToRegex's wildcards (`*`, `?`, `{`), short of the last segment, which
+ * names the files. '' when the pattern starts with a wildcard or has a
+ * single segment. A segment that's empty, `.` or `..`, which no path
+ * matched holds, is one no directory listing holds either, so walkStart
+ * stops before it.
+ */
+function literalDirOf(pattern: string): string {
+  const dir: string[] = [];
+  for (const segment of pattern.split('/').slice(0, -1)) {
+    if (/[*?{]/.test(segment)) break;
+    dir.push(segment);
+  }
+  return dir.join('/');
+}
+
+/** The deeper of two mount-relative directories, '' being the root, or null when neither holds the other. */
+function deeperOf(a: string, b: string): string | null {
+  if (a === '' || b === a || b.startsWith(a + '/')) return b;
+  if (b === '' || a.startsWith(b + '/')) return a;
+  return null;
 }
 
 /** A glob's refusal of a brace form it can't read, with the way to match a literal "{". */

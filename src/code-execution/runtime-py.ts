@@ -75,6 +75,7 @@ import inspect
 import io
 import json
 import os
+import re
 import select
 import signal
 import sys
@@ -114,9 +115,18 @@ _script_writers = weakref.WeakSet()
 
 _send_lock = threading.Lock()
 
+# A str can hold a lone surrogate, which UTF-8 can't encode: on POSIX,
+# os.fsdecode makes one of each byte in a filename that doesn't decode as
+# UTF-8, and json.loads makes one of a "\ud800" escape. The protocol's channel
+# is strict UTF-8 (_start), so writing one would fail the whole message, and a
+# tool call or a wake carrying one would never reach the host. Each goes as
+# U+FFFD. What a script prints shows it escaped, as backslashreplace writes
+# it (_script_writer).
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
 
 def send(obj):
-    line = json.dumps(obj, ensure_ascii=False, default=str)
+    line = _LONE_SURROGATE.sub("\ufffd", json.dumps(obj, ensure_ascii=False, default=str))
     with _send_lock:
         # A script can close or replace fd 4 before a tool call, as well as
         # before its end, so each message checks it first.
