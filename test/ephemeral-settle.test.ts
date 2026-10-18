@@ -514,11 +514,15 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it("a run whose stream outlasts stop()'s budget is ended by that stop(), while its stream still runs", { timeout: 60_000 }, async () => {
+  it("a run whose stream outlasts stop()'s budget is ended by that stop() with its queue stored, and a later stop() waits for its stream", { timeout: 60_000 }, async () => {
     // The run's stream yields nothing until the test releases it, cancel
     // included, so stop(100)'s wait on it runs out. The caller asked for a
     // bounded stop(), so its sweep ends the run then, rather than leave it to
-    // its idle watchdog, fifteen minutes by default.
+    // its idle watchdog, fifteen minutes by default, and the run's end stores
+    // what was queued for it, as at any run's end. The run's end removes its
+    // stream's activeStreams entry, but the stream is still running, so a
+    // second stop() waits for it too and keeps the store open until it has
+    // settled. Once it does, what it yields late is dropped: the run has left.
     const { tempDir, storePath } = tempStorePath('ephemeral-stop-budget-');
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
@@ -541,20 +545,39 @@ describe('runEphemeralToCompletion settle signal', () => {
         new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), 5_000); }),
       ]).finally(() => clearTimeout(timer));
     };
+    const internals = framework as unknown as {
+      activeStreams: Map<string, unknown>;
+      leftRunning: Map<Promise<unknown>, unknown>;
+      addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: undefined, opts?: { forAgent?: string }): string;
+    };
     try {
       const { agent, contextManager } = await createEphemeral(framework);
+      const stored = (): string[] => contextManager.getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
       framework.start();
       const run = framework.runEphemeralToCompletion(agent, contextManager);
-      const streams = (framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams;
-      for (let i = 0; i < 400 && !streams.has(agent.name); i++) await new Promise((resolve) => setTimeout(resolve, 5));
-      assert.ok(streams.has(agent.name), "the run's stream started");
+      void run.catch(() => {});
+      for (let i = 0; i < 400 && !internals.activeStreams.has(agent.name); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.ok(internals.activeStreams.has(agent.name), "the run's stream started");
+      assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'look left' }], undefined, { forAgent: agent.name }), '',
+        'deferred: the run is streaming');
       const stopped = await within(framework.stop(100));
       assert.ok(stopped instanceof ShutdownTimeoutError
         && stopped.message === `Shutdown timed out after 100 ms; pending: stream:${agent.name}`, String(stopped));
-      // The stream is still held: only the finally below releases it.
       const ended = await within(run);
       assert.ok(ended instanceof Error && /refused: the framework is stopping/.test(ended.message), String(ended));
       assert.equal(framework.getAgent(agent.name), null, 'the run has left');
+      assert.ok(stored().includes('look left'), `its end stored its queue:\n${stored().join('\n')}`);
+      const again = await within(framework.stop(100));
+      assert.ok(again instanceof ShutdownTimeoutError
+        && again.message === `Shutdown timed out after 100 ms; pending: stream:${agent.name}`, String(again));
+      assert.equal(framework.getStore().isClosed(), false, 'the run\'s stream is still running');
+      release();
+      for (let i = 0; i < 400 && internals.leftRunning.size > 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(internals.leftRunning.size, 0, 'the stream settled');
+      assert.ok(!stored().includes('too late'), `what it yielded once the run had left was dropped:\n${stored().join('\n')}`);
+      await framework.stop();
+      assert.equal(framework.getStore().isClosed(), true, 'and a stop() closes the store once it has');
     } finally {
       release();
       await stopAndRemove(framework, tempDir);

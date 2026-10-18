@@ -1760,6 +1760,13 @@ export class AgentFramework {
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
+  /** What a wait of stop()'s left running when its budget ran out, by its
+   * promise: a stream it cancelled or an event loop still in a call. A later
+   * stop() waits for each again, beside what it finds, whatever has happened
+   * since to the entry it was found under (a run's end removes its stream's,
+   * a start() replaces the loop), so a budget never lets the store close
+   * under work still running. Each leaves once it settles. */
+  private readonly leftRunning = new Map<Promise<unknown>, { label: string; kind: 'stream' | 'loop' }>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -2890,19 +2897,25 @@ export class AgentFramework {
    * already running, then on modules and MCPL together. With a budget, a
    * stop() can take up to five of them, besides the withheld-spill deadline
    * of a guard's write still under way. Omit to wait until each settles, as
-   * required by existing module/child contracts. After a wait whose budget
-   * ran out:
-   * - an agent whose stream is still running keeps its deferred writes
-   *   queued, since the stream may still write. The stream's own turn-end
-   *   flush takes them when it settles, if the process lives on, and a later
-   *   stop() takes what that leaves.
+   * required by existing module/child contracts. A wait whose budget runs out
+   * fails the stop() with a ShutdownTimeoutError naming what it waited for;
+   * with more than one, or beside another failure, stop() fails with an
+   * AggregateError of them all. After it:
+   * - an agent still registered whose stream is still running keeps its
+   *   deferred writes queued, since the stream may still write. The stream's
+   *   own turn-end flush takes them when it settles, if the process lives on,
+   *   and a later stop() takes what that leaves; a memory-only queue loses
+   *   them if the process exits first.
    * - every ephemeral run still registered is ended, as after any stop(), and
-   *   its end takes what is queued for it, as at any run's end, whatever its
+   *   its end stores what is queued for it, as at any run's end, whatever its
    *   stream is doing: once a run has left, its stream's late events are
-   *   dropped.
+   *   dropped, though a write the stream already had under way can still
+   *   land in the run's namespace after them.
    * - an event loop still in a call, such as a module's onProcess, finishes
    *   that call and the rest of its iteration, and then exits. A start()
    *   made meanwhile runs its own loop beside that last iteration.
+   * - a later stop() waits again, within its own budget, for any stream or
+   *   loop this one left running, so the store never closes under it.
    */
   stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     try { validateShutdownTimeout(teardownTimeoutMs); }
@@ -3043,21 +3056,38 @@ export class AgentFramework {
     // asked to end, and each takes teardownTimeoutMs, as the waits on cleanup
     // below do. One that runs out is reported with them once teardown has
     // gone on, and keeps the store open for another stop(): what it waited
-    // for may still be running. A rejection settles a wait here as a
-    // resolution does: these are waits on work stop() has asked to end, not
-    // cleanup that can fail.
+    // for may still be running, and stays in leftRunning until it settles,
+    // for a later stop() to wait for again. A rejection settles a wait here
+    // as a resolution does: these are waits on work stop() has asked to end,
+    // not cleanup that can fail.
     const waitsTimedOut: unknown[] = [];
-    const waitFor = async (attempts: Array<{ label: string; promise: Promise<unknown> }>): Promise<void> => {
+    type Running = { label: string; promise: Promise<unknown> };
+    const waitFor = async (attempts: Running[], kind?: 'stream' | 'loop'): Promise<void> => {
       if (attempts.length === 0) return;
       try {
         await waitForShutdown(attempts.map(({ label, promise }) => ({ label, promise: promise.then(() => {}, () => {}) })), teardownTimeoutMs);
       } catch (error) {
         waitsTimedOut.push(error);
+        // Each leaves leftRunning as it settles, those that already have at once.
+        if (kind) for (const { label, promise } of attempts) {
+          this.leftRunning.set(promise, { label, kind });
+          const leave = () => { this.leftRunning.delete(promise); };
+          void promise.then(leave, leave);
+        }
       }
+    };
+    // What this stop() found of a kind, beside what an earlier one's budget
+    // left running, each promise once.
+    const withLeftovers = (kind: 'stream' | 'loop', found: Running[]): Running[] => {
+      const all = new Map<Promise<unknown>, string>(found.map(({ label, promise }) => [promise, label]));
+      for (const [promise, entry] of this.leftRunning) {
+        if (entry.kind === kind && !all.has(promise)) all.set(promise, entry.label);
+      }
+      return [...all].map(([promise, label]) => ({ label, promise }));
     };
 
     // Wait for all stream iteration handles to settle
-    await waitFor([...this.activeStreams].map(([name, stream]) => ({ label: `stream:${name}`, promise: stream })));
+    await waitFor(withLeftovers('stream', [...this.activeStreams].map(([name, promise]) => ({ label: `stream:${name}`, promise }))), 'stream');
 
     // Stop sync timer
     if (this.syncTimer) {
@@ -3070,26 +3100,29 @@ export class AgentFramework {
       this.maintenanceTimer = null;
     }
     // The pass and any over-budget drain kick: a compression in flight lands
-    // before the store closes.
+    // before the store closes. Its bookkeeping outlives a timeout, since no
+    // pass starts while one runs and a drain leaves its set only as it
+    // settles, so it needs no leftRunning entry.
     await waitFor(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []);
 
-    if (this.loopPromise) await waitFor([{ label: 'event loop', promise: this.loopPromise }]);
+    await waitFor(withLeftovers('loop', this.loopPromise ? [{ label: 'event loop', promise: this.loopPromise }] : []), 'loop');
 
-    // Nothing drives an ephemeral run once the loop has ended: no turn starts
-    // after stop() begins, every stream it found was cancelled and has
-    // settled, and a tool result that arrives now is dropped, since the queue
-    // is closed. So a run still registered could only wait for a watchdog,
-    // such as one whose wake was never taken up, whose turn was refused,
-    // whose retry was cancelled, or whose continuation is still queued. End
-    // each one now, while the store is open for its cleanup. After a wait
-    // above whose budget ran out, a run's stream or the loop may still be
-    // running, and every run is ended here all the same: the caller asked
-    // for a bounded stop(), and a run whose stream is still running would
-    // otherwise wait for its idle watchdog. What that stream does once it
-    // settles can still act on what teardown closes. (A start() during a
-    // stop() is #315's. One made before the loop ended keeps a loop running,
-    // so this stop waits for it, up to its budget; one made just after,
-    // before this point, has its runs ended here too.)
+    // Once the waits above have settled, nothing drives an ephemeral run: no
+    // turn starts after stop() begins, every stream it found was cancelled
+    // and has settled, and a tool result that arrives now is dropped, since
+    // the queue is closed. So a run still registered could only wait for a
+    // watchdog, such as one whose wake was never taken up, whose turn was
+    // refused, whose retry was cancelled, or whose continuation is still
+    // queued. End each one now, while the store is open for its cleanup.
+    // After a wait whose budget ran out, a run's stream or the loop may still
+    // be running, and every run is ended all the same: the caller asked for a
+    // bounded stop(), and a run whose stream is still running would otherwise
+    // wait for its idle watchdog. Its end stores its queue, as at any run's
+    // end; that stream's late events are dropped once the run has left, and a
+    // later stop() waits for the stream itself (leftRunning). (A start()
+    // during a stop() is #315's. One made before the loop ended keeps a loop
+    // running, so this stop waits for it, up to its budget; one made just
+    // after, before this point, has its runs ended here too.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
@@ -3192,12 +3225,14 @@ export class AgentFramework {
     // logged and dropped from a persisted one by the boot or resume flush
     // that meets it.
     //
-    // A stream that outlasted its wait may still write, so its agent's
-    // entries stay queued, said once for that agent: no entry lands ahead of
-    // a stream that may still write. When that stream settles in a process
-    // that lives on, its own turn-end flush takes them, as at any turn's end,
-    // and a later stop() takes what that leaves. Until then a persisted queue
-    // keeps them for boot, and a memory-only one loses them at exit.
+    // A registered agent's stream that outlasted its wait may still write,
+    // so that agent's entries stay queued, said once for it: no entry lands
+    // ahead of a stream that may still write. The stream counts as running
+    // while its activeStreams entry stands, as it does for addMessage's own
+    // deferral. When it settles in a process that lives on, its own turn-end
+    // flush takes them, as at any turn's end, and a later stop() takes what
+    // that leaves. Until then a persisted queue keeps them for boot, and a
+    // memory-only one loses them at exit.
     if (this.deferredMessages.length > 0) {
       const entries = [...this.agents.keys()]
         .filter((name) => !this.activeStreams.has(name))
@@ -3207,7 +3242,12 @@ export class AgentFramework {
       for (const name of this.activeStreams.keys()) {
         const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (held > 0) {
-          console.error(`[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream outlasted stop()'s wait and may still write`);
+          console.error(
+            `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream outlasted stop()'s wait and may still write; ` +
+            (this.deferredWritesPersisted || this.quiesced
+              ? 'the persisted queue keeps them for boot'
+              : 'this memory-only queue loses them if the process exits before that stream settles'),
+          );
         }
       }
     }

@@ -27,6 +27,8 @@
  * whose agent's deferred writes wait for its own end, and an event loop in a
  * module's onProcess, which finishes that iteration once the call returns
  * and exits, rather than run beside the loop of a start() made meanwhile.
+ * Two such waits fail it together, and a later stop() waits for what an
+ * earlier one left running, a start() between them or not.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -596,8 +598,9 @@ describe('stop() with work still in flight', () => {
         assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
         assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
         assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
-        assert.ok(logged.some((line) => line.startsWith(
-          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream outlasted stop()'s wait")), logged.join('\n'));
+        assert.ok(logged.includes(
+          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream outlasted stop()'s wait and may still write; " +
+          'this memory-only queue loses them if the process exits before that stream settles'), logged.join('\n'));
         release();
         await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
         assert.ok(storedTexts().includes('a note for later'), `its turn-end flush stored the note:\n${storedTexts().join('\n')}`);
@@ -608,6 +611,27 @@ describe('stop() with work still in flight', () => {
         release();
         await framework.stop().catch(() => {});
       }
+    });
+
+    it("a stream handle that rejects settles stop()'s wait on it, as on main, with a budget or without", { timeout: 30_000 }, async () => {
+      // A driver that crashed rather than ended: stop() waited on the
+      // streams with Promise.allSettled, so a rejection never failed it.
+      for (const budget of [undefined, 100]) {
+        const { framework } = await frameworkWithHeldWork();
+        const streams = (framework as unknown as { activeStreams: Map<string, Promise<void>> }).activeStreams;
+        const crashed = Promise.reject(new Error('the driver crashed'));
+        crashed.catch(() => {});
+        streams.set('assistant', crashed);
+        try {
+          framework.start();
+          await framework.stop(budget);
+          assert.equal(framework.getStore().isClosed(), true, `budget ${budget}: the stop finished`);
+        } finally {
+          streams.delete('assistant');
+          await framework.stop().catch(() => {});
+        }
+      }
+      assert.deepEqual(rejections, []);
     });
 
     it("an event loop still in a module's onProcess when the budget runs out fails the stop, and teardown goes on", { timeout: 30_000 }, async () => {
@@ -624,6 +648,59 @@ describe('stop() with work still in flight', () => {
         letGo('hang');
         await framework.stop();
         assert.equal(framework.getStore().isClosed(), true, 'once the call returns, the loop ends and a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it('a stream and the event loop that both outlast the budget each fail the stop, together as an AggregateError', { timeout: 30_000 }, async () => {
+      const { framework, release, residentStreaming, entered, letGo, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('go');
+        await residentStreaming;
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof AggregateError && !(outcome instanceof ShutdownTimeoutError), String(outcome));
+        assert.deepEqual(outcome.errors.map((error: unknown) => error instanceof ShutdownTimeoutError ? error.pending : String(error)),
+          [['stream:assistant'], ['event loop']]);
+        assert.equal(outcome.message,
+          'Framework shutdown failed: Shutdown timed out after 100 ms; pending: stream:assistant; Shutdown timed out after 100 ms; pending: event loop');
+        assert.equal(framework.getStore().isClosed(), false);
+        release();
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true);
+        assert.deepEqual(rejections, []);
+      } finally {
+        release();
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a stop() after a timed-out one and a start() waits for the old loop too, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
+      // The start() replaces the loop a stop() waits for. What the first
+      // stop()'s budget left running stays the framework's to wait for, so
+      // the second one doesn't close the store under the old loop's call.
+      const { framework, entered, letGo, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const first = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(first instanceof ShutdownTimeoutError && first.pending.includes('event loop'), String(first));
+        framework.start();
+        const second = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(second instanceof ShutdownTimeoutError
+          && second.message === 'Shutdown timed out after 100 ms; pending: event loop', String(second));
+        assert.equal(framework.getStore().isClosed(), false, "the old loop's call is still running");
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the old loop has settled');
         assert.deepEqual(rejections, []);
       } finally {
         letGo('hang');
