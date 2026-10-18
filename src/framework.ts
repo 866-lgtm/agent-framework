@@ -784,6 +784,11 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
  *  Its inference:failed came first, and this says no retry follows it. */
 const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
 
+/** The reason on the inference:aborted that ends a turn whose start waited to
+ *  retry a failed compile across a stop() and a start(): the retry would
+ *  revive the earlier lifecycle's turn in the next one. */
+const RETRY_ACROSS_RESTART = 'a retry waiting while the framework was stopped and started again is dropped before it sends anything';
+
 /** One frame's window while it holds a turn with no stream and one of its
  *  checks is ahead (AgentFramework.checkAhead). `abandoned` is an operator's
  *  quiesce abandon that reached the turn there, which the frame's check
@@ -13616,9 +13621,14 @@ export class AgentFramework {
 
       // An ephemeral watchdog may dispose this Agent while hooks/compile await,
       // and stop() may close provider admission. Do not create a provider
-      // stream after its generation lost ownership, or once admission closed.
-      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
-        const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed' : 'the framework was stopping';
+      // stream after its generation lost ownership, or once admission closed,
+      // or once a stop() and a start() have begun another lifecycle, as after
+      // the compile: these come before a stop kept for the turn, which goes
+      // with it.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
+          : this.providerAdmissionClosed ? 'the framework was stopping'
+            : 'the framework was stopped and started again';
         const reason = `a turn assembled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
@@ -13804,13 +13814,17 @@ export class AgentFramework {
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow);
-        if (this.providerAdmissionClosed) {
+        if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
           // stop() ended the wait: that cancels the retry, it does not hasten
-          // it. The turn ends as one dropped before it sends anything does:
-          // a terminal event saying why, after the inference:failed above,
-          // and its record's end. Nothing is written (the store is closing);
+          // it. A stop() and a start() since this start began cancel it too,
+          // as after the compile: the retry would revive the earlier
+          // lifecycle's turn in the next one, and a stop kept for the turn
+          // goes with it. The turn ends as one dropped before it sends
+          // anything does: a terminal event saying why, after the
+          // inference:failed above, and its record's end. Nothing is written;
           // this frame still owns its token, since no retry frame replaced it.
-          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
+          this.abortDroppedTurn(agent.name, turnToken,
+            this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_ACROSS_RESTART, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);

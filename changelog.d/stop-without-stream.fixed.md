@@ -56,3 +56,12 @@
     restart or a non-streaming turn's tool results waiting to start the
     turn's next call, and a turn a provider-capacity hold or a provider's
     stated wait has parked.
+- **A start whose framework was stopped and started again since it began is
+  dropped before it retries a failed compile.** Its `inference:aborted`
+  reads `a retry waiting while the framework was stopped and started again
+  is dropped before it sends anything`; before, the retry compiled and was
+  sent in the new lifecycle. A start whose hooks ran across a `stop()` and a
+  `start()` is dropped before its compile too, as `a turn assembled while
+  the framework was stopped and started again …`, where before the check
+  after its compile dropped it. Either way a stop kept for the turn goes
+  with it, as for a turn dropped while `stop()` runs.
