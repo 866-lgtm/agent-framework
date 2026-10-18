@@ -387,6 +387,10 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(skippedReason(sync.data, 'flink.txt'), 'disk could not be checked: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
     const read = await call(m, 'read', { path: 'outer/flink.txt' });
     assert.equal(read.error, leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt'));
+    // A write made now, with the link in place, is refused at the tool
+    // (anima-research/agent-framework#530's third case).
+    const write = await call(m, 'write', { path: 'outer/flink.txt', content: 'outer wrote\n' });
+    assert.equal(write.error, leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt'));
     const materialize = await call(m, 'materialize', { path: 'outer/flink.txt', force: true });
     assert.equal(materialize.data.count, 0);
     assert.equal(skippedReason(materialize.data, 'flink.txt'), 'flink.txt: not written: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
