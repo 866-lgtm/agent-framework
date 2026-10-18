@@ -1920,13 +1920,16 @@ export class WorkspaceModule implements Module {
 
   /**
    * Which mounts are nested in which, read afresh at each start. A mount is
-   * nested in another where its configured path, or its real root, lies
-   * beneath the other's. Each root is placed by realBeneath, awaited, so a
-   * root on a share that stops answering holds this start and not the
-   * process, and a root moved while the module was stopped is placed where
-   * it is now. A mount whose real root is the other's own, or holds it, is
-   * nested by its configured path alone, with no real root, since through it
-   * it would claim the other's every path.
+   * nested in another where its configured path lies beneath the other's
+   * root, as configured or as it lies on disk, whatever links the path
+   * reaches that root through, or where its real root lies beneath the
+   * other's. Each root, and each directory above a configured path, is
+   * placed by realBeneath, awaited, so a root on a share that stops
+   * answering holds this start and not the process, and a root moved while
+   * the module was stopped is placed where it is now. A mount whose real
+   * root is the other's own, or holds it, is nested by its configured path
+   * alone, with no real root, since through it it would claim the other's
+   * every path.
    *
    * Each way it lies there is a spelling of its directory (`fromRoots`), and
    * so is the spelling disk lists each of those by, where that differs. On a
@@ -1937,7 +1940,20 @@ export class WorkspaceModule implements Module {
    */
   private async readNesting(): Promise<Map<string, NestedMountEntry[]>> {
     const reals = new Map<string, string>();
-    for (const mount of this.config.mounts) reals.set(mount.name, await realBeneath(resolve(mount.path)));
+    // Each directory above a mount's configured path, with where it lies on
+    // disk, so a path that reaches another mount's root through a link, as
+    // one under macOS's /var reaches /private/var, is still read beneath it.
+    const above = new Map<string, Array<{ dir: string; real: string }>>();
+    for (const mount of this.config.mounts) {
+      const given = resolve(mount.path);
+      reals.set(mount.name, await realBeneath(given));
+      const dirs: Array<{ dir: string; real: string }> = [];
+      for (let dir = dirname(given); ; dir = dirname(dir)) {
+        dirs.push({ dir, real: await realBeneath(dir) });
+        if (dirname(dir) === dir) break;
+      }
+      above.set(mount.name, dirs);
+    }
     const nesting = new Map<string, NestedMountEntry[]>();
     for (const outer of this.config.mounts) {
       const outerPath = resolve(outer.path);
@@ -1945,12 +1961,14 @@ export class WorkspaceModule implements Module {
       for (const inner of this.config.mounts) {
         if (outer === inner) continue;
         const real = reals.get(inner.name)!;
-        const configured = nestedDir(outerPath, resolve(inner.path));
+        const innerPath = resolve(inner.path);
+        const configured = nestedDir(outerPath, innerPath);
         const fromRoots: Array<{ dir: string; root: string }> = [];
         // Its directory as configured, read against this mount's root as
-        // configured and as it really is, and its real root against this
-        // mount's.
-        for (const dir of [configured, nestedDir(outerReal, resolve(inner.path)), nestedDir(outerReal, real)]) {
+        // configured and from each directory above it that is this mount's
+        // root on disk, and its real root against this mount's.
+        const throughRoot = above.get(inner.name)!.filter((a) => a.real === outerReal).map((a) => nestedDir(a.dir, innerPath));
+        for (const dir of [configured, ...throughRoot, nestedDir(outerReal, real)]) {
           if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
         }
         if (fromRoots.length === 0) continue;

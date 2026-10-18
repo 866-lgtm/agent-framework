@@ -198,6 +198,20 @@ describe('a mount root configured through a symlink', () => {
     assert.equal(through.error, '"outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
   });
 
+  test('a mount configured as a link back to the outer mount\'s root keeps the nesting by configured path when its path reaches that root through a link above it', async (t) => {
+    // alias leads to real, as macOS's /var leads to /private/var, and self's
+    // configured path reaches the outer mount's root through it.
+    const env = new Env(t);
+    env.write('real/o/x.txt', "the outer mount's\n");
+    symlinkSync(env.at('real'), env.at('alias'));
+    symlinkSync(env.at('real/o'), env.at('real/o/self'));
+    const m = await env.open(t, [mount('outer', env.at('real/o'), { followSymlinks: true }), mount('self', env.at('alias/o/self'))]);
+    assert.equal((await call(m, 'sync', {})).success, true);
+    assert.deepEqual(env.tree('outer'), ['x.txt'], 'the outer mount passed over the link');
+    const through = await call(m, 'read', { path: 'outer/self/x.txt' });
+    assert.equal(through.error, '"outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+  });
+
   test('a mount configured as a link inside the outer mount to a directory above it is nested by its configured path, and holds the outer mount where it is', async (t) => {
     const env = new Env(t);
     env.write('top/top.txt', "the upper mount's\n");
