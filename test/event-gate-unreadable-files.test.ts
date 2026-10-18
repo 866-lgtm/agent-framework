@@ -414,6 +414,32 @@ test('a copy whose write fails once it is made is removed, so nothing is left be
   assert.deepEqual(gate.getStatus().policies.map((p) => p.name), ['mentions'], 'the rules in force stay');
 });
 
+test("a copy whose open fails isn't removed, since a file of that name may be another's", (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  writeFileSync(configPath, BROKEN);
+  // A file at the copy's name, and an open that fails for another reason than its being there.
+  const there = join(dir, 'gate.json.unreadable-20261015T025905Z');
+  writeFileSync(there, 'not this call\'s');
+  const realWrite = fs.writeFileSync;
+  const write = t.mock.method(fs, 'writeFileSync', (...args: Parameters<typeof fs.writeFileSync>) => {
+    if (!String(args[0]).includes('.unreadable-')) return realWrite(...args);
+    throw Object.assign(new Error('EMFILE: too many open files, open'), { code: 'EMFILE', syscall: 'open' });
+  });
+  syncBuiltinESMExports();
+  let thrown: string;
+  try {
+    thrown = thrownBy(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }));
+  } finally {
+    write.mock.restore();
+    syncBuiltinESMExports();
+  }
+
+  assert.match(thrown, / failed \(EMFILE: too many open files, open\), so nothing was written\./);
+  assert.equal(readFileSync(there, 'utf-8'), 'not this call\'s', "the file at the copy's name is left as it was");
+  assert.equal(readFileSync(configPath, 'utf-8'), BROKEN, 'gate.json is as it was');
+});
+
 test('a write that fails after the copy is kept names the copy', {
   skip: NO_CHMOD ? 'needs a file the test user cannot write' : false,
 }, (t) => {
@@ -597,7 +623,7 @@ test("the start's failure to reconcile gate.json shows beside a gate.json that l
 
   const errors = gate.getStatus().errors;
   assert.equal(errors.length, 1, JSON.stringify(errors));
-  assert.match(errors[0]!, /^At start, the host's starting rules "ambient" couldn't be added to gate\.json \(EACCES[^)]*\), so they weren't put in force\.$/);
+  assert.match(errors[0]!, /^At start, the host's starting rules "ambient" couldn't be added to gate\.json \(EACCES[^)]*\), so they weren't put in force\. Whoever runs this host can fix what kept them out\.$/);
   assert.deepEqual(gate.getStatus().policies.map((p) => p.name), ['mentions'], 'gate.json loaded, without the starting rule it could not add');
 
   // A spell when gate.json can't be read, then the same text again: nothing new decides the rules, so the error stays.

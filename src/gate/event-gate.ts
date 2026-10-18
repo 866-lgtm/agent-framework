@@ -634,8 +634,8 @@ interface RuleReading {
   /** The rule as read, unless a problem has no reading. */
   policy?: GatePolicy;
   /** It wakes on none of what it matches, even where it can't be read: it
-   *  skips or defers, or it's a rate limit with no tokens. Left out, such a
-   *  rule holds back nothing it was written to wake on. */
+   *  skips or defers, or it's a rate limit whose tokens are a number not over
+   *  0. Left out, such a rule holds back nothing it was written to wake on. */
   quiet: boolean;
   /** Every problem it has, in the order its fields are read. */
   problems: RuleProblem[];
@@ -662,7 +662,7 @@ interface Reader {
   file: string;
   problems: RuleProblem[];
   notes: string[];
-  /** Set where its rate limit has no tokens, so it wakes on none of what it matches. */
+  /** Set where its rate limit's tokens are a number not over 0, so it wakes on none of what it matches. */
   noTokens?: boolean;
   /** Set where its match is left with nothing that narrows it, once something in it was named. */
   matchesAll?: boolean;
@@ -833,10 +833,11 @@ function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
  * is read so. One of 0 refilled the bucket once and then never, its clock left
  * at NaN; it's read as refilling at once, every time, so the rule limits
  * nothing, which holds back nothing it woke the agent on (applyRateLimit). A
- * rule whose tokens aren't a positive number is left out, as earlier releases
- * refused it. Tokens that are a number not over 0 ran waking the agent on
- * nothing the rule matched, so that rule is quiet (noTokens): leaving it out
- * holds back nothing.
+ * rule whose tokens aren't a positive number is left out, as earlier releases'
+ * check refused it. Tokens that are a number not over 0, which ran unchecked
+ * from the starting rules, woke the agent on nothing the rule matched, so that
+ * rule is quiet (noTokens): leaving it out holds back nothing it was written
+ * to wake on.
  */
 function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
@@ -1179,7 +1180,7 @@ function heldNames(listed: Listed): Set<string> {
  * it was written to wake on, so the file isn't used, as earlier releases,
  * which refused such a rule and so the file, didn't use it.
  */
-function readConfig(raw: unknown, file: 'gate.json' | 'the starting config'): ConfigReading {
+function readConfig(raw: unknown, file: 'gate.json' | 'the starting config', beside = false): ConfigReading {
   const File = file === 'gate.json' ? file : 'The starting config';
   if (Array.isArray(raw)) {
     return {
@@ -1187,7 +1188,9 @@ function readConfig(raw: unknown, file: 'gate.json' | 'the starting config'): Co
       rules: [],
       sentences: [
         `${File} is a list, where an object is needed, such as {"policies": [{"name": "my-rule", "behavior": "always"}]}, `
-        + 'so none of it is read, and every event gets the default, "always".',
+        + (beside
+          ? 'so none of it is read, and the gate runs the host\'s starting rules beside it, under the default, "always".'
+          : 'so none of it is read, and every event gets the default, "always".'),
       ],
       listed: { noList: `${File} is a list` },
     };
@@ -1220,7 +1223,10 @@ function readConfig(raw: unknown, file: 'gate.json' | 'the starting config'): Co
     return { refused: `${file} "default" must be "always", "defer", or "skip", got: ${shownValue(given)}`, listed };
   }
   const defaultBehavior = given ?? 'always';
-  const noRules = configLeftOut(defaultBehavior).policies;
+  // Beside a start that runs the host's starting rules, since it has no list to add them to, they're what its default meets.
+  const noRules = beside
+    ? `it has no rules, so the gate runs the host's starting rules beside it, under its default, "${defaultBehavior}"`
+    : configLeftOut(defaultBehavior).policies;
   for (const slip of names.slips) {
     let read = SLIP_READ;
     // Where "policies" writes no rules, what a slip of it holds leaves the file with none.
@@ -1334,7 +1340,7 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
     if (!write.names.every((name) => held.has(name))) {
       parts.push(
         `At start, the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}), `
-        + "so they weren't put in force.",
+        + "so they weren't put in force. Whoever runs this host can fix what kept them out.",
       );
     }
   }
@@ -1355,7 +1361,7 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
     return `At start, the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}). `
       + `The gate runs them under gate.json's default, "${write.config.default ?? 'always'}", as if gate.json held them, but `
       + "they aren't saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs this "
-      + 'host can give gate.json a list of rules under "policies", and the next start adds them to it.';
+      + 'host can give gate.json a list of rules under "policies", and a start then adds them to it, as to any gate.json with a list.';
   }
   if (loaded) return null;
   if (write.kind === 'seed-failed') {
@@ -1562,10 +1568,6 @@ export class EventGate {
   /** The rules in force that the start couldn't save (describeUnsaved),
    *  until gate.json is written or a reload applies its text. */
   private startUnsaved: string | null = null;
-  /** Whether the start ran those rules beside the gate.json that loaded,
-   *  which has no rule list to add them to, so a reload finding it unchanged
-   *  leaves them unsaved. */
-  private startRunsBeside = false;
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
@@ -1702,12 +1704,16 @@ export class EventGate {
     // them over it.
     const read = this.readConfigFile();
     if (read.state === 'loaded') {
-      this.startRunsBeside = write.kind === 'reconcile-unsaved';
-      this.config = write.kind === 'reconcile-unsaved' ? write.config : read.config;
+      // Beside a gate.json with no rule list, the host's starting rules it
+      // lacks, and its note says they run beside it.
+      const beside = write.kind === 'reconcile-unsaved';
+      this.config = beside ? write.config : read.config;
       this.configText = read.text;
-      this.configNote = read.note;
-      this.configSource = 'file';
-      if (read.note) console.error(`[gate] ${read.note}`);
+      const asBeside = beside ? readConfig(JSON.parse(read.text), 'gate.json', true) : null;
+      this.configNote = asBeside && 'sentences' in asBeside ? loadNote(asBeside.sentences) : read.note;
+      this.configError = this.configNote;
+      this.configSource = beside ? 'initial' : 'file';
+      if (this.configNote) console.error(`[gate] ${this.configNote}`);
     } else if (write.kind === 'reconcile-failed') {
       this.config = write.config;
       // Its text is what a change then edits, so every rule it holds keeps its name.
@@ -1788,7 +1794,10 @@ export class EventGate {
           error: `${error}, and under its default, "${read.config.default ?? 'always'}", one of them would be left out that could wake the agent`,
         };
       }
-      return { kind: 'reconcile-unsaved', names, error, config: beside.config };
+      // The ones it runs: a starting rule left out is named as the starting rules are read.
+      const running = beside.config.policies.map((policy) => policy.name);
+      if (running.length === 0) return { kind: 'reconcile-failed', names, atOpen: true, config: read.config, error };
+      return { kind: 'reconcile-unsaved', names: running, error, config: beside.config };
     }
     const reconciled = { ...read.listed.top, policies: [...read.listed.rules, ...missing.map((rule) => rule.raw)] };
     // What the write holds, as a load reads it, for a write that fails partway.
@@ -1908,11 +1917,10 @@ export class EventGate {
    */
   private configErrorShown(): string | null {
     if (this.configError === null || !this.configUnused) return this.configError;
-    // Rules from a gate.json text, with the start's unsaved: a start whose
-    // reconcile write left gate.json unable to load runs those, or one that ran
-    // the starting rules a gate.json with no rule list lacks beside it, since a
-    // write of gate.json that lands, or a reload that applies a text, clears
-    // startUnsaved.
+    // Rules from a gate.json text, with the start's unsaved: only a start
+    // whose reconcile write left gate.json unable to load runs those, since a
+    // write of gate.json that lands, or a reload that finds it holding the text
+    // in force or a text that loads, clears startUnsaved.
     const runs = this.configSource === 'file'
       ? this.startUnsaved !== null
         ? 'the rules it read from gate.json at start and the ones it was adding'
@@ -2137,8 +2145,8 @@ export class EventGate {
       // Missing, unchanged or unreadable: the rules in force stay.
       const read = this.readConfigFile({ unlessUnchanged: true });
       // gate.json holds the text in force, so none the start ran is unsaved,
-      // unless the start ran rules beside it that it has no list to hold.
-      if (read.state === 'unchanged' && !this.startRunsBeside) this.startUnsaved = null;
+      // unless what's in force is the host's starting rules, run beside it.
+      if (read.state === 'unchanged' && this.configSource === 'file') this.startUnsaved = null;
       if (read.state !== 'loaded') return;
       const newConfig = read.config;
 

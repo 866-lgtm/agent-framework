@@ -282,7 +282,7 @@ export interface GateStatus {
    */
   shadowWarnings: string[];
   /**
-   * The copies wake-rule changes kept of a gate.json that couldn't be read or
+   * The copies wake-rule changes kept of a gate.json that could be read but
    * isn't JSON (gate.json.unreadable-<UTC time>, beside it), oldest first,
    * each with what to do with it, until it's removed. Nothing in a copy is in
    * force.

@@ -437,7 +437,7 @@ test("under a default that holds events back, a file that leaves out a rule that
   assert.deepEqual(later.gate.getStatus().errors, [
     `In the host's starting rules, ${rawSaid} At start, the host's starting rules "user-input" and "raw" couldn't be added to gate.json `
     + '(with them, gate.json would leave out a rule that could wake the agent, and under its default, "skip", it wouldn\'t be used), '
-    + 'so they weren\'t put in force.',
+    + 'so they weren\'t put in force. Whoever runs this host can fix what kept them out.',
   ]);
   later.gate.dispose();
 });
@@ -1312,67 +1312,90 @@ test("a rule gate.json holds keeps its name from the host's starting rules, read
   held.gate.dispose();
 });
 
-test("a later start over a gate.json with no rule list it could add to without writing over what it holds runs the starting rules it lacks beside it, under its default and unsaved, and says so until gate.json changes", (t) => {
+test("a later start over a gate.json with no rule list it could add to without writing over what it holds runs the starting rules it lacks beside it, under its default and unsaved, and says so until gate.json changes and loads", (t) => {
   const unsaved = (rules: string, why: string, defaultBehavior: string): string =>
     `At start, the host's starting rules ${rules} couldn't be added to gate.json (${why}, so there's no list of rules to add them to `
     + `without writing over what it holds). The gate runs them under gate.json's default, "${defaultBehavior}", as if gate.json held `
     + "them, but they aren't saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs this "
-    + 'host can give gate.json a list of rules under "policies", and the next start adds them to it.';
+    + 'host can give gate.json a list of rules under "policies", and a start then adds them to it, as to any gate.json with a list.';
+  const notPut = (rules: string, why: string): string =>
+    `At start, the host's starting rules ${rules} couldn't be added to gate.json (${why}), so they weren't put in force. `
+    + 'Whoever runs this host can fix what kept them out.';
+  const listRead = 'gate.json is a list, where an object is needed, such as {"policies": [{"name": "my-rule", "behavior": "always"}]}, '
+    + 'so none of it is read, and ';
+  const noListWhy = 'so there\'s no list of rules to add them to without writing over what it holds';
 
   // A list, read as no rules under "always": the starting rule that skips ambient chat runs, as it did once written over the file.
+  // One the starting rules leave out, under their own "always", is named so there, and not as one that runs.
   const quietAmbient = { name: 'quiet-ambient', match: { tagsAny: ['chat:ambient'] }, behavior: 'skip' };
+  const limited = { name: 'limited', match: {}, behavior: { rate_limit: { refillIntervalMs: 60000 } } };
   const { gate, configPath } = makeGate(tempDir(t), {
     file: [{ name: 'dm', behavior: 'always' }],
-    initialConfig: { default: 'skip', policies: [quietAmbient] },
+    initialConfig: { default: 'always', policies: [quietAmbient, limited] },
   });
   assert.deepEqual(onDisk(configPath), [{ name: 'dm', behavior: 'always' }], 'gate.json is as it was');
+  // What the start says, before any event or reload check.
+  const errors = gate.getStatus().errors;
   assert.deepEqual(names(gate), ['quiet-ambient']);
   assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, false, 'ambient chat is skipped');
   assert.equal(gate.evaluate(MENTION).trigger, true, 'and the rest gets gate.json\'s default, "always"');
-  assert.equal(gate.getStatus().configSource, 'file');
-  assert.deepEqual(gate.getStatus().errors, [
-    'gate.json loaded. gate.json is a list, where an object is needed, such as {"policies": [{"name": "my-rule", "behavior": "always"}]}, so '
-    + 'none of it is read, and every event gets the default, "always".',
-    unsaved('"quiet-ambient"', 'gate.json is a list', 'always'),
-  ]);
+  assert.equal(gate.getStatus().configSource, 'initial', 'what runs is the host\'s starting rules');
+  assert.equal(errors[0], `gate.json loaded. ${listRead}the gate runs the host's starting rules beside it, under the default, "always".`);
+  assert.ok(errors[1]!.startsWith('In the host\'s starting rules, Policy "limited" is left out'), errors[1]);
+  assert.equal(errors[2], unsaved('"quiet-ambient"', 'gate.json is a list', 'always'));
+  assert.equal(errors.length, 3);
   gate.dispose();
 
   // A "policies" that isn't a list, under "skip": the mention rule wakes the agent, as it did once written over the file.
   const object = { default: 'skip', policies: { name: 'dm', behavior: 'always' } };
+  const shown = 'gate.json\'s "policies" is {"name":"dm","behavior":"always"}';
   const noList = makeGate(tempDir(t), { file: object, initialConfig: { default: 'skip', policies: [MENTIONS] } });
   t.after(() => noList.gate.dispose());
   assert.deepEqual(onDisk(noList.configPath), object, 'gate.json is as it was');
   assert.equal(noList.gate.evaluate(MENTION).trigger, true);
-  const said = unsaved('"mentions"', 'gate.json\'s "policies" is {"name":"dm","behavior":"always"}', 'skip');
-  assert.equal(noList.gate.getStatus().errors.at(-1), said);
+  const said = [
+    `gate.json loaded. ${shown}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], and it has no rules, `
+    + 'so the gate runs the host\'s starting rules beside it, under its default, "skip".',
+    unsaved('"mentions"', shown, 'skip'),
+  ];
+  assert.deepEqual(noList.gate.getStatus().errors, said);
   // A reload that finds gate.json unchanged keeps them, and says so still.
   (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
   assert.equal(noList.gate.evaluate(MENTION).trigger, true);
-  assert.equal(noList.gate.getStatus().errors.at(-1), said);
+  assert.deepEqual(noList.gate.getStatus().errors, said);
+  // So does one that finds it changed to text that won't load, which names the starting rules as what runs.
+  writeFileSync(noList.configPath, '{"default": "skip", "policies": [');
+  (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(noList.gate.evaluate(MENTION).trigger, true);
+  const [unloadable, ...rest] = noList.gate.getStatus().errors;
+  assert.match(unloadable!, /So what gate\.json holds isn't in force, and the gate runs the host's starting rules\.$/);
+  assert.deepEqual(rest, [said[1]]);
   // Once gate.json changes and loads, what it holds is in force instead.
   writeFileSync(noList.configPath, JSON.stringify({ default: 'skip', policies: [] }));
   (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
   assert.equal(noList.gate.evaluate(MENTION).trigger, false);
   assert.deepEqual(names(noList.gate), []);
-  assert.ok(!noList.gate.getStatus().errors.includes(said), JSON.stringify(noList.gate.getStatus().errors));
+  assert.deepEqual(noList.gate.getStatus().errors, []);
 
   // Where, under gate.json's default, one of them left out could wake the agent, none runs, as where gate.json has a list.
-  const limited = { name: 'limited', match: {}, behavior: { rate_limit: { refillIntervalMs: 60000 } } };
   const none = makeGate(tempDir(t), { file: object, initialConfig: { default: 'always', policies: [limited, MENTIONS] } });
   assert.deepEqual(names(none.gate), []);
   assert.equal(none.gate.evaluate(MENTION).trigger, false);
-  assert.ok(none.gate.getStatus().errors.some((e) => e.endsWith(
-    'At start, the host\'s starting rules "limited" and "mentions" couldn\'t be added to gate.json (gate.json\'s "policies" is '
-    + '{"name":"dm","behavior":"always"}, so there\'s no list of rules to add them to without writing over what it holds, and under its '
-    + 'default, "skip", one of them would be left out that could wake the agent), so they weren\'t put in force.',
-  )), JSON.stringify(none.gate.getStatus().errors));
+  assert.ok(none.gate.getStatus().errors.some((e) => e.endsWith(notPut(
+    '"limited" and "mentions"', `${shown}, ${noListWhy}, and under its default, "skip", one of them would be left out that could wake the agent`,
+  ))), JSON.stringify(none.gate.getStatus().errors));
   none.gate.dispose();
 
-  // And where the starting rules aren't used, none runs either, though under gate.json's "always" they'd read.
-  const unused = makeGate(tempDir(t), { file: { policies: object.policies }, initialConfig: { default: 'skip', policies: [limited, MENTIONS] } });
-  assert.deepEqual(names(unused.gate), []);
-  assert.ok(unused.gate.getStatus().errors.some((e) => e.includes("The gate started with gate.json's rules.")), JSON.stringify(unused.gate.getStatus().errors));
-  unused.gate.dispose();
+  // And where every one of them is left out, or the starting rules aren't used, none runs either.
+  const allOut = makeGate(tempDir(t), { file: [{ name: 'dm', behavior: 'always' }], initialConfig: { default: 'always', policies: [limited] } });
+  assert.deepEqual(names(allOut.gate), []);
+  assert.ok(allOut.gate.getStatus().errors.some((e) => e.endsWith(notPut('"limited"', `gate.json is a list, ${noListWhy}`))),
+    JSON.stringify(allOut.gate.getStatus().errors));
+  allOut.gate.dispose();
+  const notUsed = makeGate(tempDir(t), { file: { policies: object.policies }, initialConfig: { default: 'skip', policies: [limited, MENTIONS] } });
+  assert.deepEqual(names(notUsed.gate), []);
+  assert.ok(notUsed.gate.getStatus().errors.some((e) => e.includes("The gate started with gate.json's rules.")), JSON.stringify(notUsed.gate.getStatus().errors));
+  notUsed.gate.dispose();
 
   // Beside rules under a name it doesn't read, which stay as written, it adds them in a "policies" list, as to a file with none.
   const theirs = { rules: [{ name: 'dm', behavior: 'always' }] };
@@ -1467,7 +1490,7 @@ test('what the start did stays in errors until the next start, through writes an
   });
   const errors = gate.getStatus().errors;
   assert.equal(errors.length, 1);
-  assert.match(errors[0]!, /^At start, the host's starting rules "user-input" couldn't be added to gate\.json \(EACCES[^)]*\), so they weren't put in force\.$/);
+  assert.match(errors[0]!, /^At start, the host's starting rules "user-input" couldn't be added to gate\.json \(EACCES[^)]*\), so they weren't put in force\. Whoever runs this host can fix what kept them out\.$/);
   assert.deepEqual(names(gate), [], 'gate.json\'s rules are in force');
 
   chmodSync(configPath, 0o644);
