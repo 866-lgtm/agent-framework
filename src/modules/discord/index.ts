@@ -101,7 +101,7 @@ const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 /** What the agent reads for a text attachment whose contents couldn't be
  *  fetched: by an error, or by an answer that wasn't OK. */
-function attachmentNotFetched(filename: string): ContentBlock {
+function attachmentNotFetched(filename: string): { type: 'text'; text: string } {
   return { type: 'text', text: `[Attachment: ${filename} (failed to fetch)]` };
 }
 
@@ -199,6 +199,24 @@ function needsRebuild(stored: StoredMessage, message: HistoryMessage): boolean {
   const expected = (own ? 1 : 0) + attachments;
   const counted = own && first?.type === 'text' && first.text === own ? 1 + held(rest) : held(stored.content);
   return counted !== expected || (expected === 0 && !stored.content.some(isEmptyMarker));
+}
+
+/**
+ * Whether a row holds non-blank text besides its message's own text now,
+ * which may be what a file gave.
+ */
+function holdsOtherText(stored: StoredMessage, message: HistoryMessage): boolean {
+  const own = ownText(message.content);
+  const [first, ...rest] = stored.content;
+  const others = own && first?.type === 'text' && first.text === own ? rest : stored.content;
+  return others.some((block) => block.type === 'text' && !isBlankText(block) && !isEmptyMarker(block));
+}
+
+/** Whether a message's conversion holds the note for an attachment of its
+ *  whose text wasn't fetched. */
+function holdsNotFetched(content: ContentBlock[], message: HistoryMessage): boolean {
+  const notes = new Set((message.attachments ?? []).map((attachment) => attachmentNotFetched(attachment.filename).text));
+  return content.some((block) => block.type === 'text' && notes.has(block.text));
 }
 
 /**
@@ -902,8 +920,13 @@ export class DiscordModule implements Module {
       for (const discordMsg of chronologicalMessages) {
         const stored = before.get(discordMsg.id);
         if (stored && (stored.bodyGroupId || !needsRebuild(stored, discordMsg))) continue;
-        converted.set(discordMsg.id, await this.convertMessageToContent(discordMsg));
+        const content = await this.convertMessageToContent(discordMsg);
         if (this.ctx !== ctx) return unchanged;
+        // A rebuild never leaves a row holding less than it had: when a file
+        // wasn't fetched, a row holding other text, which may be that file's,
+        // keeps what it holds, and the next sync tries again.
+        if (stored && holdsNotFetched(content, discordMsg) && holdsOtherText(stored, discordMsg)) continue;
+        converted.set(discordMsg.id, content);
       }
 
       // From here on nothing awaits, so the rows read now are the rows written.

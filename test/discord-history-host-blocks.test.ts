@@ -363,6 +363,39 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     { editMessages: [{ messageId: 'stored-b2', content: [text('newer'), pdfNote] }] });
 });
 
+test('a rebuild whose file wasn\'t fetched writes nothing over a row holding text besides its message\'s own, which a later sync rebuilds once the file is fetched, and gives a row missing its file the notice', async (t) => {
+  let reachable = false;
+  t.mock.method(globalThis, 'fetch', async () => reachable ? new Response('file body', { status: 200 }) : new Response('', { status: 503 }));
+  t.mock.method(console, 'warn', () => {});
+  const more = text('\n--- File: more.txt ---\nmore\n--- End of more.txt ---\n');
+  const notFetched = text('[Attachment: notes.txt (failed to fetch)]');
+  const rows: Row[] = [
+    // A message without text whose row begins with its file's text.
+    row('p1', [fileBlock], false, 1_000),
+    // A file removed while away from a row holding both files' texts.
+    row('p2', [text('both'), fileBlock, more], false, 2_000),
+    // Rows an earlier sync stripped of their file, to blank text and to the
+    // caption: a notice costs them nothing.
+    row('p3', [text('')], false, 3_000),
+    row('p4', [text('caption')], false, 4_000),
+  ];
+  const { harness } = setup(rows, {
+    fetchHistory: async () => [
+      history('p4', 'caption', 4_000, [notes]),
+      history('p3', '', 3_000, [notes]),
+      history('p2', 'both', 2_000, [notes]),
+      history('p1', '', 1_000, [notes]),
+    ],
+  });
+  const held = () => rows.map((r) => r.content);
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 2, deletedMessages: 0 });
+  assert.deepEqual(held(), [[fileBlock], [text('both'), fileBlock, more], [text(''), notFetched], [text('caption'), notFetched]]);
+  reachable = true;
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 2, deletedMessages: 0 });
+  assert.deepEqual(held(), [[text(''), fileBlock], [text('both'), fileBlock], [text(''), notFetched], [text('caption'), notFetched]]);
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
+});
+
 test('a history sync leaves what the live path wrote while it fetched, stores a missed message as it fetched it though a live edit came for it, and writes no row that has gone', async (t) => {
   const pdf: DiscordAttachment = { id: 'a3', filename: 'x.pdf', url: 'https://cdn.example/x.pdf', contentType: 'application/pdf', size: 50 };
   const rows: Row[] = [
