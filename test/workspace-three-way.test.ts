@@ -6922,6 +6922,30 @@ describe('on-agent-action', () => {
     assert.deepEqual(data.incomplete, [{ path: '', reason: 'the selected branch kept changing while the scan ran' }]);
   });
 
+  test("a read whose disk check gives up on a branch that keeps changing says it shows the workspace's copy, and why", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    const data = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
+      () => call(m, 'read', { path: 'work/a.txt' }));
+    assert.equal(data.content, '     1\tA');
+    assert.equal(data.note, "The path couldn't be checked against disk (the selected branch kept changing while the scan ran), so this read shows the workspace's copy.");
+  });
+
+  test("a read of a file the workspace doesn't hold, whose disk check gives up, says disk couldn't be checked", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    env.writeDisk('b.txt', 'B');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    const error = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
+      () => refused(m, 'read', { path: 'work/b.txt' }));
+    assert.equal(error, 'work/b.txt is not in the workspace, and disk could not be checked (the selected branch kept changing while the scan ran).');
+  });
+
   test('a branch switched away during the root check and back during a read is decided on the branch enumerated', async (t) => {
     const env = new Env(t);
     const m = await env.open();

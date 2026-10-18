@@ -2695,7 +2695,11 @@ export class WorkspaceModule implements Module {
         // uses, as an edit's is. Where the stored copy is a draft and disk
         // changed too, the read shows the draft and names the conflict.
         const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
-        const report = pass.reports.get(relativePath);
+        // A pass that gave up (the selected branch kept changing) decided
+        // nothing and leaves no report. It's read as a copy disk couldn't be
+        // checked, with its reason, so the answer says the check didn't finish.
+        const report = pass.reports.get(relativePath)
+          ?? (pass.incomplete.length > 0 ? { path: relativePath, state: 'unverified' as const, note: pass.incomplete[0]!.reason } : undefined);
         const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
