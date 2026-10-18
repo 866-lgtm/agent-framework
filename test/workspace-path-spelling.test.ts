@@ -292,6 +292,30 @@ test('a path whose part after the mount\'s name is absolute keeps its spelling, 
   assert.equal(fromDisk.absolutePath, join(dir, 'src', 'a.ts'));
 });
 
+test('a link into a nested mount\'s directory configured in another spelling than disk\'s is refused as that mount\'s', { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-link-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'inner', 'sub'), { recursive: true });
+  writeFileSync(join(dir, 'inner', 'sub', 'x.txt'), 'inner\n');
+  // The link spells the directory as disk does, and the nested mount is
+  // configured in another spelling.
+  symlinkSync('inner/sub', join(dir, 'l'));
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never' },
+    { name: 'nested', path: join(dir, 'Inner'), mode: 'read-write', watch: 'never' },
+  ] });
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  await assert.rejects(workspace.readFileFromDisk('outer/l/x.txt'), (err: unknown) => {
+    assert.ok(err instanceof WorkspaceReadError, String(err));
+    assert.equal(err.code, 'other_mount', err.message);
+    assert.match(err.message, /it lies in mount "nested", nested in mount "outer": use "nested\/sub" in place of "outer\/l"/);
+    return true;
+  });
+});
+
 test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s is the outer mount\'s own',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
     const { workspace, call } = await setup(t, (d) => {
