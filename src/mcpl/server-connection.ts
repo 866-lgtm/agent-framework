@@ -1006,10 +1006,11 @@ export class McplServerConnection extends EventEmitter {
     this.resetPolicyForTransportBoundary();
 
     // Reject all pending requests. Each message is the whole of what an
-    // agent reads for a tools/call, and reads after a channel tool's own
-    // words for the requests those make, so it names no method; the log line
-    // does. It doesn't say whether this host reconnects: a restart closes the
-    // connection and then connects again.
+    // agent reads for a tools/call, and what follows a channel tool's own
+    // words ("Failed to publish to channel: …") for the requests a channel
+    // tool makes, so it names no method; the log line does. It doesn't say
+    // whether this host reconnects: a restart closes the connection and then
+    // connects again.
     if (this.pendingRequests.size > 0) {
       console.error(`MCPL server "${this.id}": this host closed its connection with ${this.unansweredRequests()}`);
     }
@@ -1517,7 +1518,8 @@ export class McplServerConnection extends EventEmitter {
       );
       pending.reject(new Error(said
         ? `The "${this.id}" server answered with an error: ${said}`
-        : `The "${this.id}" server answered with an error without saying what went wrong.`));
+        : `The "${this.id}" server answered with an error without saying what went wrong, so whether the request took effect is unknown. ` +
+          'Check its effect before trying again.'));
     } else {
       pending.resolve(response.result);
     }

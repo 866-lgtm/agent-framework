@@ -97,9 +97,14 @@ export function classifyBlock(block: unknown): BlockClassification {
       if (hasData) {
         // Inline form claiming bulk disposition (or smuggling a uri beside
         // the data) is the vector-2 contradiction: fail closed, withhold.
+        // A uri of '' counts here too, though it's no link: until the
+        // tool-result lane gives every inline shape a marker of its own,
+        // showing that data would put some of it into history as raw JSON.
+        // Once that lane does, an empty link beside data reads as no link.
         return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
       }
-      // An empty uri is no link, as the push lane's converter reads it.
+      // With no data, an empty uri is no link, as the push lane's converter
+      // reads it.
       if (hasUri && block.uri !== '') return parseReferenceFields(block);
       return { kind: 'invalid', shown: block.type === 'image' ? IMAGE_NO_DATA_TEXT : AUDIO_NO_DATA_TEXT };
     }

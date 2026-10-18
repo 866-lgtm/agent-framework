@@ -19,9 +19,11 @@ import {
   REFERENCE_LIMITS,
   REFERENCE_LINK_TOO_LONG_TEXT,
   REFERENCE_NO_LINK_TEXT,
+  classifyBlock,
   referenceStubOrNull,
 } from '../src/mcpl/references.js';
 import { convertBlock } from '../src/mcpl/convert-block.js';
+import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
@@ -57,6 +59,13 @@ test("a reference block that can't be read says which part is missing, and what 
     assert.equal(referenceStubOrNull(block), text);
     assert.deepEqual(convertBlock(block as never, 'test'), { type: 'text', text });
   }
+  // Beside inline data, any string uri, an empty one too, stays withheld as
+  // on main: the tool-result lane can't show every inline shape yet, and
+  // showing this audio would put its data into history as raw JSON.
+  const audio = { type: 'audio', data: 'aGVsbG8=', mimeType: 'audio/wav', uri: '' };
+  assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: true });
+  const stored = toolResultDataToHistoryString([{ type: 'text', text: 't' }, audio]);
+  assert.ok(stored.includes(INLINE_WITHHELD_TEXT) && !stored.includes('aGVsbG8='), stored);
 });
 
 // ---------------------------------------------------------------------------
@@ -100,6 +109,10 @@ async function within<T>(promise: Promise<T>, what: string): Promise<T> {
   try { return await Promise.race([promise, late]); } finally { clearTimeout(timer); }
 }
 
+/** What a server's error answer with no words reads as. */
+const NO_WORDS = 'The "words" server answered with an error without saying what went wrong, so whether the request took effect is unknown. ' +
+  'Check its effect before trying again.';
+
 /** Whether some console.error line matches. */
 const logged = (calls: ReadonlyArray<{ arguments: unknown[] }>, line: RegExp): boolean =>
   calls.some((call) => line.test(String(call.arguments[0])));
@@ -114,10 +127,10 @@ test("a server's error answer is shown as the server's, and its method, id and c
   assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: /), 'the operator log has the answer');
   // An answer with no words says so, rather than ending on a colon.
   await assert.rejects(connection.sendToolsCall('mute', {}),
-    { message: 'The "words" server answered with an error without saying what went wrong.' });
+    { message: NO_WORDS });
   // A message that isn't a string reads the same, and the log keeps what was sent.
   await assert.rejects(connection.sendToolsCall('odd', {}),
-    { message: 'The "words" server answered with an error without saying what went wrong.' });
+    { message: NO_WORDS });
   assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: 42$/), 'the log has the number');
 });
 
@@ -194,14 +207,15 @@ test('a call pending when this host closes the connection says the outcome is un
   const connection = await McplServerConnection.connect(config(), HOST_CAPS);
   connection.ready();
   // No word on reconnecting: a restart closes the connection, then connects again.
-  const pending = assert.rejects(connection.sendToolsCall('hang', {}), {
+  const unknown = {
     message: `The "words" server didn't answer before this host closed its connection, so whether the request took effect is unknown. ` +
       'Check its effect before trying again.',
-  });
+  };
+  const pending = [assert.rejects(connection.sendToolsCall('hang', {}), unknown), assert.rejects(connection.sendToolsCall('hang', {}), unknown)];
   await connection.close();
-  await pending;
-  assert.ok(logged(errors.mock.calls, /^MCPL server "words": this host closed its connection with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
-    'the operator log has the request');
+  await Promise.all(pending);
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words": this host closed its connection with 2 request\(s\) unanswered: tools\/call \(id=(\d+)\), tools\/call \(id=(?!\1\))\d+\)$/),
+    'the operator log has both requests');
 });
 
 // ---------------------------------------------------------------------------

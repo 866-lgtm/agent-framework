@@ -742,7 +742,7 @@ test('a server\'s error answer that no template can convert settles the host\'s 
   await settle();
   assert.deepEqual(lines, [
     `MCPL server "srv" answered mcpl/manifest (id=${fetch.id}) with error "{\\"toString\\":1}": "{\\"toString\\":1}"`,
-    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): The "srv" server answered with an error without saying what went wrong.',
+    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): The "srv" server answered with an error without saying what went wrong, so whether the request took effect is unknown. Check its effect before trying again.',
   ]);
   assert.deepEqual(traces.filter((e) => e.type === 'mcpl:server-error' || e.type === 'mcpl:request-handler-error'), []);
   assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
