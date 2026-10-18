@@ -120,8 +120,8 @@ export interface ConversationBinding {
 export interface IncomingMessageFacts {
   channelId: string;
   /** The MCPL server the channel belongs to. A spawned fork's name hashes it
-   *  with the channel id (see forkAgentName); left out, the name hashes the
-   *  channel id alone. */
+   *  with the channel id (see forkAgentName); left out, `null` stands in for
+   *  it there. */
   serverId?: string;
   /** Personal mention of the bot (metadata.mentioned from the adapter). */
   mentioned: boolean;
@@ -318,23 +318,24 @@ export class ConversationRouter {
 }
 
 /** The readable part of a fork's name stops here: uniqueness rides on the hash. */
-const FORK_NAME_READABLE_MAX = 48;
+const FORK_NAME_READABLE_MAX = 64;
 
 /**
  * A fork's agent name: `<prefix>-<readable>-g<generation>-<hash>`, such as
- * `conversation-slack-C123-g2-` and 16 hex digits for the channel `slack:C123`.
- * Agent names double as context-manager namespace components, so the readable
- * part is the channel id with each run of characters other than letters,
- * digits, `_` and `-` replaced by `-`, cut to 48 characters. Different ids can
- * read alike (`foo bar`, `foo-bar`), so the hash is the first 64 bits of a
- * SHA-256 of the server and channel ids: two channels' forks share a name, and
+ * `conversation-C123-g2-e08e564271867d16` for Slack's channel `C123` on the
+ * server `slack`. Agent names double as context-manager namespace components,
+ * so the readable part is the channel id with each run of characters other
+ * than letters, digits, `_` and `-` replaced by `-`, cut to 64 characters.
+ * Different ids can read alike (`foo bar`, `foo-bar`), so the hash is the first
+ * 64 bits of a SHA-256 of `JSON.stringify([serverId, channelId])`, where an
+ * absent server id is written as `null`: two channels' forks share a name, and
  * with it a namespace, only if those 64 bits collide. The hash is fixed-length
  * and last, so a name's parts read back unambiguously, and a pattern over its
- * leading part, such as `conversation-slack-C123-g*`, matches each
+ * readable part and `-g`, such as `conversation-C123-g*`, matches each
  * generation's fork.
  */
 export function forkAgentName(prefix: string, serverId: string | undefined, channelId: string, generation: number): string {
   const readable = channelId.replace(/[^A-Za-z0-9_-]+/g, '-').slice(0, FORK_NAME_READABLE_MAX);
-  const hash = createHash('sha256').update(JSON.stringify([serverId ?? null, channelId])).digest('hex').slice(0, 16);
+  const hash = createHash('sha256').update(JSON.stringify([serverId, channelId])).digest('hex').slice(0, 16);
   return `${prefix}-${readable}-g${generation}-${hash}`;
 }

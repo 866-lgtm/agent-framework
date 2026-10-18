@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ConversationRouter, forkAgentName } from '../src/mcpl/conversation-router.js';
+import { globMatch } from '../src/mcpl/tool-glob.js';
 import type { ChannelDescriptor } from '../src/mcpl/types.js';
 
 const T0 = 1_750_000_000_000;
@@ -152,14 +153,28 @@ test('channels whose ids read alike, or one channel id on two servers, get forks
   assert.equal(forkAgentName('conversation', 'srv', 'foo bar', 1), name('srv', 'foo bar'));
 });
 
-test("a fork name's readable part stops at 48 characters, and the hash tells longer ids apart", () => {
+test("a fork name's readable part stops at 64 characters, and the hash tells longer ids apart", () => {
   const topic = 'zulip:general/' + 'a long topic name '.repeat(5);
   const one = forkAgentName('conversation', 'zulip', `${topic} one`, 3);
   const two = forkAgentName('conversation', 'zulip', `${topic} two`, 3);
-  // Sanitized, the id runs to 107 characters; its first 48 are kept.
-  assert.match(one, /^conversation-zulip-general-a-long-topic-name-a-long-topic-nam-g3-[0-9a-f]{16}$/);
+  // Sanitized, the id runs to 107 characters; its first 64 are kept.
+  assert.match(one, /^conversation-zulip-general-a-long-topic-name-a-long-topic-name-a-long-topic-n-g3-[0-9a-f]{16}$/);
   assert.notEqual(one, two);
   assert.equal(one.slice(0, -17), two.slice(0, -17), 'they differ only in the hash');
+});
+
+test("a conversations pattern over a fork name's readable part and -g matches each generation's fork", () => {
+  // A server's toolLifecycle narrowing matches whole agent names with globMatch.
+  const [first, second] = [1, 2].map((g) => forkAgentName('conversation', 'slack', 'C1', g));
+  assert.ok(globMatch('conversation-C1-g*', first) && globMatch('conversation-C1-g*', second));
+  assert.ok(!globMatch('conversation-C1-g1', first), 'a pattern that ends at the generation no longer matches');
+  assert.ok(globMatch('conversation-C1-g1-*', first) && !globMatch('conversation-C1-g1-*', second));
+});
+
+test('a fork name starts with the configured agentPrefix', () => {
+  const d = makeRouter({ agentPrefix: 'chat' }).route({ channelId: 'C1', serverId: 'slack', mentioned: false, kind: 'dm' });
+  if (d.kind !== 'spawn') assert.fail('expected spawn');
+  assert.match(d.agentName, /^chat-C1-g1-[0-9a-f]{16}$/);
 });
 
 test('channelForAgent reverse lookup', () => {

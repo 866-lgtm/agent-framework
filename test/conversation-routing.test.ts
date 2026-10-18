@@ -811,7 +811,8 @@ describe('Conversation routing', () => {
     ]);
     fw1.pushEvent(incomingEvent({ channelId: 'foo bar', text: 'PRIVATE to foo bar', channelType: 'im' }));
     await fw1.runUntilIdle();
-    assert.ok(fw1.getConversationRouter()!.getBinding('foo bar'), 'the first channel spawns its fork');
+    const first = fw1.getConversationRouter()!.getBinding('foo bar')?.agentName;
+    assert.ok(first, 'the first channel spawns its fork');
     await fw1.stop();
 
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello' }]));
@@ -821,6 +822,7 @@ describe('Conversation routing', () => {
 
     const name = fw2.getConversationRouter()!.getBinding('foo-bar')?.agentName;
     assert.ok(name, 'the second channel spawns its fork');
+    assert.notEqual(name, first, "under a name, and so in a namespace, other than the first channel's");
     const contents = fw2.getAgent(name!)!.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
     assert.ok(!contents.some((c) => c.includes('PRIVATE to foo bar')), "the other channel's conversation isn't in it");
     assert.equal(contents.filter((c) => c.includes('HANDBOOK-V1')).length, 1, 'it is seeded from the trunk, once');
