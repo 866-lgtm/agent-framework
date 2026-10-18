@@ -36,6 +36,24 @@ function internals(framework: AgentFramework) {
   };
 }
 
+/** A HeldStream that says when the framework has taken its events: how many it
+ *  yielded, and when it was left, by a consumer's break or at its end. */
+class WatchedHeldStream extends HeldStream {
+  yielded = 0;
+  private finish!: () => void;
+  readonly finished = new Promise<void>((resolve) => { this.finish = resolve; });
+  override async *[Symbol.asyncIterator](): ReturnType<HeldStream[typeof Symbol.asyncIterator]> {
+    try {
+      for await (const event of super[Symbol.asyncIterator]()) {
+        this.yielded++;
+        yield event;
+      }
+    } finally {
+      this.finish();
+    }
+  }
+}
+
 /** A tool whose call makes `speaker`'s reply fail to reach a channel while its
  *  turn is alive, and a tool that does nothing; either can quiesce the host
  *  from inside the turn. */
@@ -426,6 +444,8 @@ describe('notices about an agent\'s own action', () => {
         t.mock.method(state.proseDrafts, 'recordOutcome', () => { throw new Error('journal refused'); });
         await state.deliverWithUnsent(agent, 'words resent', 'unrecorded-channel', state.proseDrafts.get('secondary', held[0]!.id));
         state.bounceProse(agent, 'words whose send threw', 'connection lost', undefined, '>>', round, { outcome: 'unknown' });
+        // Prose with no destination: a bounce, whose notice would wake its speaker.
+        state.bounceProse(agent, 'words with no destination', 'no destination', undefined, '>>', round);
         await framework.runUntilIdle();
       } finally {
         state.agents.set('secondary', agent);
@@ -436,10 +456,12 @@ describe('notices about an agent\'s own action', () => {
       assert.deepEqual(traced, [], 'nothing is traced as added');
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its held-draft notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its unknown-send notice is dropped'));
+      assert.ok(errors.includes('[notice] secondary is no longer registered, so its prose-bounce notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its empty-{{unsent}} notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its in-flight-dismiss notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its refused-{{unsent}} notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its unrecorded-outcome notice is dropped'));
+      assert.ok(!(state.pendingRequests as Array<{ agentName?: string }>).some((r) => r.agentName === 'secondary'), 'no wake is requested for it');
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)), 'not dropped by addMessage instead');
     });
 
@@ -763,6 +785,51 @@ describe('notices about an agent\'s own action', () => {
       assert.deepEqual(tags(), ['stored at home after the agent read on the side branch']);
     });
 
+    it('counts as unread what the current branch has from a branch between it and the one the agent read on', async () => {
+      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const agent = framework.getAgent('secondary')!;
+      const cm = agent.getContextManager();
+      const store = framework.getStore();
+      const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
+      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+
+      notice('read at home');
+      const home = store.currentBranch().name;
+      store.createBranch('between', home);
+      await framework.switchBranch('between');
+      notice('on the branch between');
+      notice('also on the branch between');
+      store.createBranch('current', 'between');
+      await framework.switchBranch(home);
+      for (const n of [1, 2, 3]) notice(`later at home ${n}`);
+      agent.markContextConsumed();
+      // The current branch parts from home where the branch between left it,
+      // below its own branch point, so the agent read none of what it has
+      // from the branch between, though their numbers are within what the
+      // watermark covers at home.
+      await framework.switchBranch('current');
+      assert.deepEqual(tags(), ['on the branch between', 'also on the branch between']);
+    });
+
+    it('counts as unread, across a branch made after the agent read, what was stored after its watermark', async () => {
+      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const agent = framework.getAgent('secondary')!;
+      const cm = agent.getContextManager();
+      const store = framework.getStore();
+      const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
+      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+
+      notice('read');
+      agent.markContextConsumed();
+      notice('stored after the watermark');
+      const home = store.currentBranch().name;
+      store.createBranch('later', home);
+      await framework.switchBranch('later');
+      assert.deepEqual(tags(), ['stored after the watermark']);
+    });
+
     for (const condition of ['ordinary', 'other-tool-cycle', 'quiesced', 'write-fails'] as const) {
       it('handles a failed TTL-closure reply notice at disposal: ' + condition, async (t) => {
         const state = internals(framework);
@@ -989,8 +1056,8 @@ describe('notices about an agent\'s own action', () => {
 
     it('deregisters a run that ends while the host is quiesced at once, and releases its window at resume, landing what it left queued', async () => {
       // A stream that can't carry injected messages leaves the post's failure
-      // notice queued for the run's turn end, where the quiesced host defers
-      // it again.
+      // notice queued for the run's turn end, and the run ends while the host
+      // is quiesced, so it is still queued for the window's release at resume.
       runMembrane.supportsInjectedMessages = false;
       sender.quiesceOnCall = true;
       await run([
@@ -1009,7 +1076,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(state.deferredMessages.length, 0);
       assert.equal(count(await archived(), SEND_FAILED), 1, 'what it left queued landed in its window');
       const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, 'A reply by worker'), 1, 'and, unread, it is passed on by name');
+      assert.equal(count(messages, 'A reply by worker'), 1, 'and, still queued at the release, it goes on to the primary by name');
     });
 
     it('passes a failed reply still queued when a run ends unquiesced on to the primary as the same queue entry', async () => {
@@ -1105,6 +1172,30 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(passed[0]!.metadata?.speaker, 'worker');
     });
 
+    it('completes a release whose window can\'t be read for what it left unread: what was queued lands, logged', async (t) => {
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      t.mock.method(created.agent, 'getConsumedWatermark', () => { throw new Error('watermark unreadable'); });
+      const state = internals(runFramework);
+      (state.deferredMessages as unknown as Array<Record<string, unknown>>).push({
+        id: 'w-q', seq: 1_000_000, participant: 'user', forAgent: 'worker',
+        content: [{ type: 'text', text: 'Queued for the run.' }],
+      });
+
+      await assert.rejects(
+        runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 150 }),
+        /failed to start inference/,
+      );
+
+      assert.equal(state.deferredMessages.length, 0);
+      assert.equal(count(await archived(), 'Queued for the run.'), 1, 'what was queued landed in its window');
+      assert.ok(errors.some((e) => e.includes('[route-failure] worker: could not read its window for unread failed replies')));
+    });
+
     it('resumes past a run that ended while the host was quiesced: resume doesn\'t weigh its context', async (t) => {
       sender.quiesceOnCall = true;
       await run([
@@ -1129,10 +1220,12 @@ describe('notices about an agent\'s own action', () => {
     it('dispatches nothing an ended run\'s stream yields late while the host is quiesced', async (t) => {
       let release!: () => void;
       const released = new Promise<void>((resolve) => { release = resolve; });
+      let held: WatchedHeldStream | undefined;
       runMembrane.streamYielding = (request) => {
         runMembrane.calls.push(request);
         // Yields nothing, cancel included, until released; then a tool call.
-        return new HeldStream(released, [createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use')]);
+        held = new WatchedHeldStream(released, [createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use')]);
+        return held;
       };
       const calls = t.mock.method(sender, 'handleToolCall');
       const created = await runFramework.createEphemeralAgent({
@@ -1141,17 +1234,18 @@ describe('notices about an agent\'s own action', () => {
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const state = internals(runFramework);
       runFramework.start();
-      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 1000, idlePollMs: 50 });
       for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
       state.quiesced = true;
       await assert.rejects(done, /stalled/);
       assert.equal(runFramework.getAgent('worker'), null, 'the ended run is deregistered at once, quiesced or not');
+      assert.ok((state as unknown as { releasesAfterResume: Map<string, unknown> }).releasesAfterResume.has('worker'), 'it ended while quiesced');
 
       release();
-      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await Promise.race([held!.finished, new Promise((resolve) => setTimeout(resolve, 5_000))]);
 
+      assert.equal(held!.yielded, 1, 'its stream yielded the late tool call, and was left there');
       assert.equal(calls.mock.callCount(), 0, 'its late tool call is not dispatched');
       await runFramework.resume({ force: true });
     });
