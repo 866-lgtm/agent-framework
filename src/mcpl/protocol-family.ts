@@ -521,7 +521,9 @@ export function mcplPolicyGrants(config: McplServerConfig): string[] {
 /**
  * Problems with a server configuration's protocol settings, as messages; empty
  * when it is usable. Legacy configurations are checked only for what this
- * design added, so every configuration that worked before still passes.
+ * design added, so every configuration that worked before still passes but
+ * one: `command` and `url` with no `transport`, which was launched as stdio
+ * with its url ignored, and is now refused as naming no transport to use.
  */
 export function serverConfigProblems(config: McplServerConfig): string[] {
   let binding: ServerBinding;

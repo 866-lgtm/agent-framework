@@ -759,7 +759,8 @@ export class McplServerConnection extends EventEmitter {
    * dialed: every problem {@link checkServerConfig} finds, the same check the
    * framework applies, and the modern family, which belongs to
    * ModernMcpConnection (an http(s) url is never dialed as a WebSocket).
-   * Every configuration that worked before still passes.
+   * Every configuration that worked before still passes but the one
+   * serverConfigProblems names.
    */
   private static checkConfig(config: McplServerConfig): void {
     const { family } = checkServerConfig(config);
