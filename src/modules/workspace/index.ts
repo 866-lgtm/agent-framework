@@ -1717,8 +1717,12 @@ export class WorkspaceModule implements Module {
 
   /**
    * Resolve a mount-prefixed path (e.g. "tickets/2026-04-22-foo.md") to its
-   * absolute filesystem path. Returns null if the mount is unknown or the
-   * resolved path escapes the mount root.
+   * absolute filesystem path. Returns null if the mount is unknown or
+   * doesn't hold the path: one that leaves the mount's directory, lies in
+   * another mount's directory nested in it, or falls outside its include (on
+   * a mount with an include, any path with a `..` segment), or one that
+   * can't name a file of it, with a separator right after the mount's name
+   * or a lone UTF-16 surrogate.
    *
    * **Lexical containment only.** The guard reasons about `..` segments in the
    * path string; it knows nothing about what is on disk. A symlink inside the
@@ -1945,7 +1949,8 @@ export class WorkspaceModule implements Module {
    * each segment of the directory, how the directory holding it compares
    * names (foldsAtEach), since a path judged as given can spell a segment a
    * third way where it folds. A directory not on disk keeps its configured
-   * spelling alone, and its levels are taken to fold until a start finds it.
+   * spelling alone, and its levels from the first segment not on disk are
+   * taken to fold until a start finds them.
    * Run at each start.
    */
   private async spellNestedDirs(): Promise<void> {

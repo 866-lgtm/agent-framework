@@ -516,6 +516,24 @@ test('before its first start, resolveAbsolutePath takes a nested mount\'s direct
   for (const path of ['outer/inner/x.txt', 'outer/INNER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
 });
 
+test('before its first start, each level of a nested mount\'s directory is taken to fold, and the outer mount\'s own paths resolve', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-unstarted-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'a', 'caf\u00e9'), { recursive: true });
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never' },
+    { name: 'deep', path: join(dir, 'a', 'caf\u00e9'), mode: 'read-write', watch: 'never' },
+  ] });
+  workspace.initStore(store);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  // Another case at the first level, and the other normalization form at the second.
+  for (const path of ['outer/a/caf\u00e9/x.txt', 'outer/A/caf\u00e9/x.txt', 'outer/a/cafe\u0301/x.txt', 'outer/A/CAFE\u0301/x.txt']) {
+    assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  }
+  assert.equal(workspace.resolveAbsolutePath('outer/a/x.txt'), join(dir, 'a', 'x.txt'), "the outer mount's own path");
+});
+
 test('a stop made while start reads a nested mount\'s directory leaves the workspace stopped, watching nothing', async (t) => {
   // Both mounts watch by default, so a start that went on after the stop
   // would start their watchers and announce the mounts.

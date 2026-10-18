@@ -18141,8 +18141,9 @@ export class AgentFramework {
     // The agent's time_limit_ms (already capped) shortens the lifetime; it never extends it.
     const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
-    // Journal: a file under the agent's first read-write workspace mount so
-    // their existing read/grep/shell tools work on it. Python appends
+    // Journal: a file under the agent's first read-write workspace mount
+    // without an include (firstWritableMountName), so their existing
+    // read/grep/shell tools work on it. Python appends
     // directly to the materialized path; watch-mode mounts sync it back to
     // the chronicle tree on their usual cadence.
     let logPath: string | null = null;
