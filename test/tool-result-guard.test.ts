@@ -3665,8 +3665,11 @@ test("a dropped turn's cancel record is not read by the next turn's stream: its 
   const agent = framework.getAgent('assistant')!;
   const compile = gate();
   const entered = gate();
-  const build = agent.buildActivationRequest.bind(agent);
-  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  // The stream path compiles through the agent's own assembler
+  // (buildActivationRequest is only its wrapper for previews).
+  const hooked = agent as unknown as { assembleActivationRequest: (...args: unknown[]) => Promise<unknown> };
+  const assemble = hooked.assembleActivationRequest.bind(agent);
+  hooked.assembleActivationRequest = async (...args) => { entered.open(); await compile.opened; return assemble(...args); };
   const stream = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (...args) => {
     const result = stream(...args);
