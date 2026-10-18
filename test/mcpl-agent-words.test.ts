@@ -329,6 +329,56 @@ test("a call while this host connects to the tool's server says so, and after a 
   assert.equal((await framework.executeMcplToolCall(call('c6'), 'words', 'words')).error, goneText, "a script's call reads the same");
 });
 
+test('a second connect, or a restart, of a server whose connect is in flight is refused before it writes anything', async () => {
+  // The registry takes the server once its handshake is done, so until then
+  // only the connecting mark says the id is taken. Each handshake here waits for the test.
+  const servers = new Map<string, unknown>();
+  const handshakes: Array<() => void> = [];
+  const { framework } = frameworkWith(null);
+  Object.assign(framework, {
+    mcplServerRegistry: {
+      getServer: (id: string) => servers.get(id) ?? null,
+      addServer: (cfg: { id: string }) => new Promise((resolve) => {
+        handshakes.push(() => {
+          const connection = { on: () => {} };
+          servers.set(cfg.id, connection);
+          resolve(connection);
+        });
+      }),
+    },
+    moduleRegistry: { getAllModules: () => [] },
+    mcplHostCapabilities: {},
+    mcplPrefixMap: new Map(),
+    mcplServerConfigs: new Map(),
+    channelRegistry: null,
+    discordAwarenessOutbox: null,
+    discordAwarenessEmoji: '🔕',
+    wireMcplEvents: () => {},
+    registerMcplServerFeatures: async () => {},
+  });
+  const fw = framework as unknown as {
+    connectMcplServerInternal(config: McplServerConfig, deferAwareness?: boolean): Promise<void>;
+    refuseMcplConnect(config: McplServerConfig, replacing?: string): void;
+  };
+  const words = { id: 'words', url: 'ws://127.0.0.1:9', toolPrefix: 'words' } as McplServerConfig;
+  const other = { id: 'other', url: 'ws://127.0.0.1:9', toolPrefix: 'other' } as McplServerConfig;
+  const connecting = fw.connectMcplServerInternal(words, true);
+  await new Promise<void>((r) => setImmediate(r));
+  assert.equal(handshakes.length, 1, 'the handshake has begun');
+  const inFlight = { message: 'MCPL server "words" has a connect in flight; try again once it settles' };
+  assert.throws(() => fw.refuseMcplConnect(words), inFlight, 'a second connect of it');
+  // A restart's disconnect can't stop the connect in flight, which would register the server after it.
+  assert.throws(() => fw.refuseMcplConnect(words, 'words'), inFlight, 'a restart of it');
+  assert.throws(() => fw.refuseMcplConnect(other, 'words'), inFlight, 'a restart of it into another id');
+  assert.throws(() => fw.refuseMcplConnect(words, 'other'), inFlight, 'a restart of another server into its id');
+  handshakes[0]!();
+  await connecting;
+  // Once the connect settles, the mark is gone: the registry's check refuses a
+  // second connect, and a restart, which disconnects the server first, may go ahead.
+  assert.throws(() => fw.refuseMcplConnect(words), { message: 'MCPL server "words" is already registered' });
+  assert.doesNotThrow(() => fw.refuseMcplConnect(words, 'words'));
+});
+
 test("an MCPL tool's error result with no words says so, and that its effect is unknown", async () => {
   const silent = frameworkWith({ sendToolsCall: async () => ({ isError: true, content: [] }) });
   silent.framework.dispatchMcplToolCall('agent', { id: 'c1', name: 'words--lookup', input: {} }, 'words', 'words');

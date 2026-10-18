@@ -2348,8 +2348,9 @@ export class AgentFramework {
   /** Servers whose connect is in flight (connectMcplServerInternal), from the
    *  registry's handshake until it settles: a call their prefix routes then
    *  finds no server registered, and is told this host is connecting to it.
-   *  One mark per id: the registry holds one connection per id, and two
-   *  connects of one id at once aren't supported. */
+   *  One mark per id: the registry holds one connection per id, and
+   *  refuseMcplConnect refuses a second connect, or a restart, of an id
+   *  whose connect is in flight. */
   private mcplConnecting: Set<string> = new Set();
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
@@ -21254,16 +21255,24 @@ export class AgentFramework {
 
   /**
    * Refuse a runtime connect, or a restart, before it writes anything: an id
-   * already registered, or a tool prefix that equals a module name or another
-   * server's prefix, or meets another server's (prefixesMeet, #265). create()
-   * applies the same prefix rules at startup. The connecting id's own entries
-   * don't count, nor, for a restart, those of the server it replaces
-   * (`replacing`), which it disconnects first.
+   * whose connect is in flight or that's already registered, or a tool prefix
+   * that equals a module name or another server's prefix, or meets another
+   * server's (prefixesMeet, #265). create() applies the same prefix rules at
+   * startup. The connecting id's own entries don't count, nor, for a restart,
+   * those of the server it replaces (`replacing`), which it disconnects first.
    */
   private refuseMcplConnect(
     config: import('./mcpl/types.js').McplServerConfig,
     replacing?: string,
   ): void {
+    // A connect in flight isn't registered until its handshake is done, so
+    // the registry's check below misses it. Its id is taken whether this
+    // connects it or a restart replaces it: the restart's disconnect can't
+    // stop a connect in flight, which would register the server after it.
+    const inFlight = [config.id, replacing].find((id) => id !== undefined && this.mcplConnecting.has(id));
+    if (inFlight !== undefined) {
+      throw new Error(`MCPL server "${inFlight}" has a connect in flight; try again once it settles`);
+    }
     // The registry refuses a second server under one id too, but only once
     // the connect has written its config and prefix over the live server's.
     if (config.id !== replacing && this.mcplServerRegistry?.getServer(config.id)) {
