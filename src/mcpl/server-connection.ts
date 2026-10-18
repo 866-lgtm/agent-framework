@@ -1545,6 +1545,12 @@ export class McplServerConnection extends EventEmitter {
     if (this.closed) {
       return Promise.reject(new McplRequestError(`Cannot send request: connection to "${this.id}" is closed`, 'not-sent'));
     }
+    // The child can't read what's written once its stdin or stdout has
+    // failed, while the transport waits for it to exit.
+    const pipeFailure = this.transport?.pipeFailure;
+    if (pipeFailure) {
+      return Promise.reject(new McplRequestError(`Cannot send request: the stdio pipe of "${this.id}" failed with ${pipeFailure.message}`, 'not-sent'));
+    }
 
     const id = this.nextRequestId++;
     const request: JsonRpcRequest = {
@@ -1835,7 +1841,7 @@ export class McplServerConnection extends EventEmitter {
       this.emit('error', new Error(`MCPL server "${this.id}" transport error: ${err.message}`));
     });
 
-    transport.on('close', (info: TransportCloseInfo) => {
+    const lost = (info: TransportCloseInfo) => {
       if (!this.closed) {
         this.closed = true;
         this.resetPolicyForTransportBoundary();
@@ -1874,6 +1880,20 @@ export class McplServerConnection extends EventEmitter {
           this.scheduleReconnect();
         }
       }
+    };
+    transport.on('close', lost);
+    // A stdio child whose stdin or stdout failed, and that outlived SIGKILL
+    // too: the transport stays open, owning the child. The connection holds
+    // it as a launch it can't reap, as a reconnect does, which halts
+    // reconnecting, and is lost as on a close, with the permanent failure
+    // that raises the alert and takes its tools off the list. Its id stays
+    // held until close() confirms the exit. A close the host has begun
+    // reports the failure itself.
+    transport.on('unreaped', (failure: Error) => {
+      if (this.closed || this.transport !== transport) return;
+      this.holdUnreaped(transport, failure);
+      lost({ reason: `its stdio pipe failed with ${transport.pipeFailure?.message ?? 'an error'}, and its child outlived SIGKILL` });
+      this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     });
   }
 }

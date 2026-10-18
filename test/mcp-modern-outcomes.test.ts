@@ -778,3 +778,64 @@ test('close() during a connect waits for that connect\'s own cleanup, and report
   statics.closeSession = real;
   await connection.close();
 });
+
+test('a server that closes its stdin and ignores SIGTERM is killed 2 s later and reconnected, and a call made after the failure is refused as not sent', { timeout: 40_000 }, async () => {
+  const log = scratchLog();
+  const connection = await connect('ignore-sigterm', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
+  connection.on('error', () => { /* out-of-band SDK errors */ });
+  const closes: string[] = [];
+  connection.on('close', (info: { reason?: string }) => closes.push(info.reason ?? ''));
+  await connection.callTool('deafen', {});
+  await until(() => wire(log).some((e) => e.event === 'deaf'), 'the server to close its stdin');
+  // The first write after that fails with EPIPE. It went out, so its call
+  // isn't answered and isn't refused: it fails with the close.
+  const first = connection.callTool('plain', {}).then(() => 'answered', (error: unknown) => error);
+  await until(() => wire(log).some((e) => e.event === 'sigterm-ignored'), 'the transport to send SIGTERM');
+  // From here on nothing is written: a call is refused at once, as not sent.
+  await assert.rejects(connection.callTool('plain', {}), (error: unknown) => {
+    assert.ok(error instanceof McplRequestError, String(error));
+    assert.equal(error.outcome, 'not-sent');
+    assert.match(error.message, /stdio pipe failed with write EPIPE/);
+    return true;
+  });
+  // SIGKILL ends the child, and the connection reconnects as after any loss.
+  await until(() => wire(log).filter((e) => e.event === 'start').length === 2 && connection.isConnected, 'the next launch, connected', 15_000);
+  assert.equal(closes.length, 1, closes.join('; '));
+  const outcome = await first;
+  assert.ok(outcome instanceof McplRequestError && outcome.outcome !== 'not-sent', `the written call failed with the close: ${String(outcome)}`);
+  assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }], 'the next launch answers');
+});
+
+test("a server that closes its stdin and outlives SIGKILL too is held as a launch that can't be reaped: a permanent failure, no second launch, and close() retries", { timeout: 40_000 }, async () => {
+  const log = scratchLog();
+  const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
+  connection.on('error', () => { /* the held launch, reported */ });
+  const failures: Array<{ error: string; permanent?: boolean }> = [];
+  connection.on('reconnect-failed', (failure: { error: string; permanent?: boolean }) => failures.push(failure));
+  const line = liveLine(connection);
+  const realKill = line.child.kill.bind(line.child);
+  line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  // Before the connection's close(), which then reaps an exited child.
+  cleanups.push(async () => {
+    realKill('SIGKILL');
+    await until(() => !alive(line.child.pid), 'the held child killed');
+  });
+  await connection.callTool('deafen', {});
+  await until(() => wire(log).some((e) => e.event === 'deaf'), 'the server to close its stdin');
+  void connection.callTool('plain', {}).catch(() => { /* its write meets EPIPE */ });
+  await until(() => failures.length > 0, 'the permanent failure', 12_000);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0]!.permanent, true);
+  assert.match(failures[0]!.error, /^its stdio pipe failed with write EPIPE; the previous launch could not be reaped \(stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
+  assert.equal(connection.isConnected, false);
+  assert.equal(connection.willReconnect, false);
+  assert.equal(connection.holdsUnreapedChild, true);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no second launch');
+  // close() retries the reap: refused while the child runs, then done.
+  await assert.rejects(connection.close(), /could not be reaped/);
+  realKill('SIGKILL');
+  await until(() => !alive(line.child.pid), 'the child to be killed');
+  await connection.close();
+  assert.equal(connection.holdsUnreapedChild, false);
+});

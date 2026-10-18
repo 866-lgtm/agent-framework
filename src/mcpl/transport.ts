@@ -44,6 +44,9 @@ export interface TransportCloseInfo {
  *  - `'stderr'` `(line: string)`            diagnostic line (stdio child stderr; never WS)
  *  - `'error'`  `(err: Error)`              transport-level error
  *  - `'close'`  `(info: TransportCloseInfo)` transport closed (once)
+ *  - `'unreaped'` `(failure: Error)`        a stdio child whose pipe failed
+ *    outlived SIGKILL too: the transport stays open, owning the child, and
+ *    close() retries the reap (never WS)
  *
  * Inbound `'line'`/`'stderr'` events are buffered until the first matching
  * listener attaches (and re-buffered whenever there are none), so no message is
@@ -84,6 +87,16 @@ export abstract class McplTransport extends EventEmitter {
    */
   get stderrTail(): string {
     return '';
+  }
+
+  /**
+   * The error a stdio child's stdin or stdout failed with, once one has: no
+   * write reaches the child after it, though the transport stays open until
+   * the child exits. Undefined while writes can go out, and always for a
+   * transport that has no pipes.
+   */
+  get pipeFailure(): Error | undefined {
+    return undefined;
   }
 
   /** Deliver an inbound line, buffering it if nobody is listening yet. */
@@ -198,6 +211,10 @@ export class StdioTransport extends McplTransport {
     return (this.stderrCut ? '…' : '') + this.stderrEnd;
   }
 
+  override get pipeFailure(): Error | undefined {
+    return this.pipeError;
+  }
+
   private constructor(
     /** The server this child serves, named in what its reaping reports. */
     private readonly serverId: string,
@@ -234,16 +251,21 @@ export class StdioTransport extends McplTransport {
     this.child.on('error', (err) => this.emit('error', err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
-    // child even if it's still running. The handler sends a running child
-    // SIGTERM, and the exit's close names the error, so the connection handles
-    // it as any other exit. The close is the report: no 'error' is emitted,
-    // nothing is thrown. Nothing here escalates to SIGKILL, so a child that
-    // ignores SIGTERM keeps running, unreported. A child that stops reading
-    // without closing its stdin raises no error: the writes are buffered, and
-    // only request timeouts bound it (McplServerConfig.requestTimeoutMs).
+    // child even if it's still running. The handler ends the child as close()
+    // does, SIGTERM and then SIGKILL, in the one attempt close() shares, and
+    // the exit's close names the error, so the connection handles it as any
+    // other exit. The close is the report: no 'error' is emitted, nothing is
+    // thrown, and pipeFailure refuses writes meanwhile. A child that outlives
+    // SIGKILL too stays this transport's: 'unreaped' says so, unless the host
+    // is closing it, whose close() reports the failure itself. A child that
+    // stops reading without closing its stdin raises no error: the writes are
+    // buffered, and only request timeouts bound it
+    // (McplServerConfig.requestTimeoutMs).
     const endOnPipeError = (err: Error) => {
       this.pipeError ??= err;
-      if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
+      void this.terminate().catch((failure: unknown) => {
+        if (!this.closed) this.emit('unreaped', failure instanceof Error ? failure : new Error(String(failure)));
+      });
     };
     this.child.stdin?.on('error', endOnPipeError);
     // On the stream itself, since close() closes readline, which takes its own
@@ -314,8 +336,9 @@ export class StdioTransport extends McplTransport {
    * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL.
    * If it still hasn't exited after that bound again, close rejects: an
    * explicit cleanup failure, rather than waiting forever or claiming an
-   * exit that wasn't seen. Calls share one attempt; a later call succeeds if
-   * the child has exited since.
+   * exit that wasn't seen. Calls share one attempt, and so does a pipe
+   * failure that is already ending the child; a later call succeeds if the
+   * child has exited since.
    */
   close(): Promise<void> {
     if (!this.closing) {
@@ -325,7 +348,7 @@ export class StdioTransport extends McplTransport {
     // A later call re-checks a failed verdict: a child that has exited since
     // is reaped now. No new signals are sent.
     return this.closing.catch((error: unknown) => {
-      if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+      if (this.exited()) return;
       throw error;
     });
   }
@@ -333,10 +356,34 @@ export class StdioTransport extends McplTransport {
   private async reap(): Promise<void> {
     this.markClosed({ reason: 'closed by host' });
     this.rl.close();
+    await this.terminate();
+  }
+
+  /** Whether the child has exited, or never started (a spawn error). */
+  private exited(): boolean {
+    return this.child.pid === undefined || this.child.exitCode !== null || this.child.signalCode !== null;
+  }
+
+  private terminating: Promise<void> | null = null;
+
+  /**
+   * End the child: SIGTERM, then SIGKILL once it has outlived SIGTERM by
+   * {@link STDIO_EXIT_GRACE_MS}. Resolves once it has exited; rejects if it
+   * still hasn't that long after SIGKILL. close() and a pipe failure share
+   * one attempt, so no second signal or timer goes out. A failed attempt is
+   * re-checked, not repeated: a child that has exited since resolves it.
+   */
+  private terminate(): Promise<void> {
+    this.terminating ??= this.escalate();
+    return this.terminating.catch((error: unknown) => {
+      if (this.exited()) return;
+      throw error;
+    });
+  }
+
+  private async escalate(): Promise<void> {
     const child = this.child;
-    // Never started (a spawn error): there is no process to reap.
-    if (child.pid === undefined) return;
-    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (this.exited()) return;
     const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
     const exitWithin = (ms: number) => new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), ms);

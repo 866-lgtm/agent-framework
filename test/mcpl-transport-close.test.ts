@@ -16,7 +16,10 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import type { AddressInfo, Socket } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 
 import { McplTransport, StdioTransport, type TransportCloseInfo } from '../src/mcpl/transport.js';
@@ -435,4 +438,192 @@ test("a server that stops reading its stdin without closing it stays connected, 
   assert.match(await within(answer, 'still waiting after 5 s'), /^MCPL server "stops-reading" did not respond to mcpl\/manifest \(id=\d+\) within 500ms/);
   assert.equal(closed, false, 'nothing closed the connection');
   assert.equal(connection.isConnected, true, 'the connection is still up');
+});
+
+/** A child that closes its end of stdin and ignores SIGTERM, appending a line
+ *  to `signals` for each SIGTERM it gets, so only SIGKILL ends it. */
+async function spawnDeafStubbornChild(t: TestContext, id: string, signals: string): Promise<StdioTransport> {
+  const transport = await StdioTransport.spawn({
+    id,
+    command: process.execPath,
+    args: ['-e', [
+      "const fs = require('fs');",
+      `process.on('SIGTERM', () => fs.appendFileSync(${JSON.stringify(signals)}, 'SIGTERM\\n'));`,
+      "fs.closeSync(0); console.log('stdin closed'); setInterval(() => {}, 1 << 30);",
+    ].join(' ')],
+  });
+  t.after(() => transport.close().catch(() => {}));
+  const ready = await within(new Promise<boolean>((resolve) => { transport.once('line', () => resolve(true)); }), false);
+  assert.ok(ready, 'the child said it had closed its stdin within 5 s');
+  return transport;
+}
+
+function signalsFile(t: TestContext): string {
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-pipe-signals-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return join(dir, 'signals.txt');
+}
+const received = (file: string) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).length : 0);
+
+test("a failed write to a child that ignores SIGTERM ends it with SIGKILL 2 s later, and the close still names the failure", { timeout: 15_000 }, async (t) => {
+  const signals = signalsFile(t);
+  const transport = await spawnDeafStubbornChild(t, 'deaf-stubborn', signals);
+  const logged = captureConsoleError(t);
+  const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
+  transport.writeLine('{}');
+  await waitFor(() => transport.pipeFailure !== undefined, 'the write to fail');
+  assert.equal(transport.pipeFailure?.message, 'write EPIPE', 'writes are refused from here on');
+  const info = await within(closed, null, 8000);
+  assert.ok(info, 'the transport closed within 8 s');
+  assert.equal(info.signal, 'SIGKILL', 'SIGKILL ended the child');
+  assert.equal(info.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal(received(signals), 1, 'one SIGTERM, then SIGKILL');
+  assert.equal(logged.filter((line) => line.includes('ignored SIGTERM for 2000ms')).length, 1, logged.join('\n'));
+});
+
+test("close() during a pipe failure's escalation shares its attempt: one SIGTERM, one SIGKILL", { timeout: 15_000 }, async (t) => {
+  const signals = signalsFile(t);
+  const transport = await spawnDeafStubbornChild(t, 'deaf-shared', signals);
+  const logged = captureConsoleError(t);
+  transport.writeLine('{}');
+  await waitFor(() => received(signals) === 1, 'the pipe failure to send SIGTERM');
+  // close() comes inside the 2 s the child has before SIGKILL, and resolves
+  // once that SIGKILL has ended it, with no SIGTERM of its own.
+  await transport.close();
+  const child = (transport as unknown as { child: ChildProcess }).child;
+  assert.equal(child.signalCode, 'SIGKILL');
+  assert.equal(received(signals), 1, 'close() sent no second SIGTERM');
+  assert.equal(logged.filter((line) => line.includes('sending SIGKILL')).length, 1, logged.join('\n'));
+});
+
+test("a pipe failure whose child outlives SIGKILL too leaves the transport open and says 'unreaped'; a close() once the child has exited reaps it", { timeout: 20_000 }, async (t) => {
+  const signals = signalsFile(t);
+  const transport = await spawnDeafStubbornChild(t, 'deaf-unreaped', signals);
+  captureConsoleError(t);
+  const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: string) => boolean } }).child;
+  const realKill = child.kill.bind(child);
+  child.kill = () => true; // signals never arrive: the child outlives both bounds
+  t.after(() => { realKill('SIGKILL'); });
+  const unreaped = new Promise<Error>((resolve) => { transport.once('unreaped', resolve); });
+  transport.writeLine('{}');
+  const failure = await within(unreaped, null, 10_000);
+  assert.ok(failure, "'unreaped' within 10 s");
+  assert.match(failure.message, /^stdio child \d+ of MCP server "deaf-unreaped" did not exit within 2000ms of SIGKILL; it could not be reaped$/);
+  assert.equal(transport.closed, false, 'the transport stays open, owning the child');
+  // The child exits at last: its exit closes the transport, naming the pipe
+  // failure, and the first close() after it re-checks the failed attempt
+  // rather than repeating its verdict.
+  const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
+  realKill('SIGKILL');
+  assert.equal((await within(closed, null))?.reason, 'child process exited, and its pipe failed with write EPIPE');
+  await transport.close();
+});
+
+test("a host close() during an unreapable child's pipe escalation reports the failure itself, with no 'unreaped'", { timeout: 20_000 }, async (t) => {
+  const signals = signalsFile(t);
+  const transport = await spawnDeafStubbornChild(t, 'deaf-host-close', signals);
+  captureConsoleError(t);
+  const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: string) => boolean } }).child;
+  const realKill = child.kill.bind(child);
+  child.kill = () => true;
+  t.after(() => { realKill('SIGKILL'); });
+  let saidUnreaped = false;
+  transport.on('unreaped', () => { saidUnreaped = true; });
+  transport.writeLine('{}');
+  await waitFor(() => transport.pipeFailure !== undefined, 'the write to fail');
+  await assert.rejects(transport.close(), /could not be reaped/);
+  await new Promise<void>((done) => { setTimeout(done, 50); });
+  assert.equal(saidUnreaped, false);
+});
+
+/** A legacy MCPL server that answers initialize, then, once the initialized
+ *  notification is in, closes its stdin, ignoring SIGTERM, and says so on
+ *  stderr. */
+const DEAF_AND_STUBBORN = [
+  "process.on('SIGTERM', () => console.error('ignored SIGTERM'));",
+  "const rl = require('readline').createInterface({ input: process.stdin });",
+  "rl.on('line', (line) => {",
+  '  const message = JSON.parse(line);',
+  "  if (message.method === 'initialize') {",
+  "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } }, serverInfo: { name: 'deaf-and-stubborn', version: '0.0.0' } } }) + '\\n');",
+  "  } else if (message.method === 'notifications/initialized') {",
+  "    process.stdin.once('close', () => { try { require('fs').closeSync(0); } catch {} console.error('closed stdin'); });",
+  '    rl.close(); process.stdin.destroy();',
+  '  }',
+  '});',
+  'setInterval(() => {}, 1 << 30);',
+].join('\n');
+
+test('a legacy request made after a stdin failure is refused as not sent, and the server, which ignores SIGTERM, is killed and reconnected', { timeout: 60_000 }, async (t) => {
+  const connection = await McplServerConnection.connectWithReconnect(
+    { id: 'deaf-and-stubborn', command: process.execPath, args: ['-e', DEAF_AND_STUBBORN], reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 10 },
+    { version: '0.5' },
+  );
+  t.after(() => connection.close());
+  captureConsoleError(t);
+  const stderr: string[] = [];
+  connection.on('stderr', ({ line }: { line: string }) => { stderr.push(line); });
+  const closed = new Promise<{ reason?: string; signal?: string | null }>((resolve) => {
+    connection.once('close', (_code: unknown, _signal: unknown, info: { reason?: string; signal?: string | null }) => resolve(info));
+  });
+  const reconnected = new Promise<void>((resolve) => { connection.once('reconnect', () => resolve()); });
+  connection.ready();
+  await waitFor(() => stderr.includes('closed stdin'), 'the server to close its stdin');
+  // The first write after that fails with EPIPE. It went out, so its request
+  // waits for the close, as possibly executed.
+  const first = connection.sendManifestRequest(30_000).then(() => 'answered', (error: Error) => error.message);
+  await waitFor(() => stderr.includes('ignored SIGTERM'), 'the transport to send SIGTERM');
+  // From here on nothing is written: a request is refused at once.
+  await assert.rejects(connection.sendManifestRequest(30_000), (error: unknown) => {
+    assert.ok(error instanceof Error && (error as { outcome?: string }).outcome === 'not-sent', String(error));
+    assert.match((error as Error).message, /^Cannot send request: the stdio pipe of "deaf-and-stubborn" failed with write EPIPE$/);
+    return true;
+  });
+  const info = await within(closed, null, 10_000);
+  assert.equal(info?.signal, 'SIGKILL', 'SIGKILL ended it');
+  assert.equal(info?.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.match(await within(first, 'still waiting', 10_000), /disconnected unexpectedly .*while awaiting mcpl\/manifest/);
+  assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
+});
+
+test("a legacy server whose stdin fails and whose child outlives SIGKILL is held as a launch it can't reap: a permanent failure, and close() retries", { timeout: 60_000 }, async (t) => {
+  const connection = await McplServerConnection.connectWithReconnect(
+    { id: 'deaf-unreapable', command: process.execPath, args: ['-e', DEAF_AND_STUBBORN], reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 10 },
+    { version: '0.5' },
+  );
+  captureConsoleError(t);
+  const child = (connection as unknown as { transport: { child: ChildProcess & { kill: (signal?: string) => boolean } } }).transport.child;
+  const realKill = child.kill.bind(child);
+  child.kill = () => true; // signals never arrive: the child outlives both bounds
+  t.after(async () => {
+    realKill('SIGKILL');
+    await waitFor(() => child.signalCode !== null, 'the held child killed');
+    await connection.close();
+  });
+  const stderr: string[] = [];
+  connection.on('stderr', ({ line }: { line: string }) => { stderr.push(line); });
+  const order: string[] = [];
+  const failures: Array<{ error: string; permanent?: boolean }> = [];
+  connection.on('close', (_code: unknown, _signal: unknown, info: { reason?: string }) => {
+    order.push(`close: ${info.reason} (holds its child: ${connection.holdsUnreapedChild})`);
+  });
+  connection.on('reconnect-failed', (failure: { error: string; permanent?: boolean }) => { order.push('reconnect-failed'); failures.push(failure); });
+  connection.ready();
+  await waitFor(() => stderr.includes('closed stdin'), 'the server to close its stdin');
+  void connection.sendManifestRequest(30_000).catch(() => {}); // its write meets EPIPE
+  await within(new Promise<void>((resolve) => { connection.once('reconnect-failed', () => resolve()); }), null, 10_000);
+  assert.deepEqual(order, [
+    'close: its stdio pipe failed with write EPIPE, and its child outlived SIGKILL (holds its child: true)',
+    'reconnect-failed',
+  ]);
+  assert.equal(failures[0]!.permanent, true);
+  assert.match(failures[0]!.error, /^the previous launch could not be reaped \(stdio child \d+ of MCP server "deaf-unreapable" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
+  assert.equal(connection.isConnected, false);
+  assert.equal(connection.willReconnect, false);
+  // close() retries the reap: refused while the child runs, then done.
+  await assert.rejects(connection.close(), /could not be reaped/);
+  realKill('SIGKILL');
+  await waitFor(() => child.signalCode !== null, 'the child to be killed');
+  await connection.close();
+  assert.equal(connection.holdsUnreapedChild, false);
 });

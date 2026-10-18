@@ -23,9 +23,10 @@
 // arguments.leg1 'exit' exits just after the first leg's answer, and
 // 'elicit' asks for elicitation input instead), task (a result type this
 // revision doesn't define), bare (a result with no resultType), die (exits),
-// vanish (exits without answering).
+// vanish (exits without answering), deafen (answers, then closes its stdin and
+// stays up, so the next write to it fails with EPIPE).
 import { createInterface } from 'node:readline';
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, readFileSync } from 'node:fs';
 
 const [flagList = '', log] = process.argv.slice(2);
 const flags = new Set(flagList.split(',').filter(Boolean));
@@ -43,7 +44,8 @@ const SUB = 'io.modelcontextprotocol/subscriptionId';
 let listens = 0;
 let subscription = null;
 
-createInterface({ input: process.stdin }).on('line', (line) => {
+const lines = createInterface({ input: process.stdin });
+lines.on('line', (line) => {
   let m;
   try { m = JSON.parse(line); } catch { return; }
   note({ event: m.id === undefined ? 'notification' : 'request', method: m.method, id: m.id ?? null, ...(m.method === 'tools/call' ? { tool: m.params?.name } : {}) });
@@ -103,6 +105,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           { name: 'bare', inputSchema: { type: 'object' } },
           { name: 'die', inputSchema: { type: 'object' } },
           { name: 'vanish', inputSchema: { type: 'object' } },
+          { name: 'deafen', inputSchema: { type: 'object' } },
         ],
       });
     case 'tools/call': {
@@ -117,6 +120,20 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       }
       if (name === 'die') { setTimeout(() => process.exit(5), 10); return result(m.id, { content: [{ type: 'text', text: 'bye' }] }); }
       if (name === 'vanish') process.exit(6);
+      if (name === 'deafen') {
+        result(m.id, { content: [{ type: 'text', text: 'deaf now' }] });
+        // Node keeps a stdio descriptor open when its stream is destroyed, so
+        // the read end is closed by hand once the stream is done with it.
+        process.stdin.once('close', () => {
+          try { closeSync(0); } catch { /* already closed */ }
+          note({ event: 'deaf' });
+        });
+        lines.close();
+        process.stdin.destroy();
+        // Nothing else keeps the process up once its stdin is gone.
+        setInterval(() => {}, 1 << 30);
+        return;
+      }
       if (name === 'task') return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'task', taskId: 'task-1' } });
       if (name === 'bare') return send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'no resultType' }] } });
       if (name === 'nullframe') {

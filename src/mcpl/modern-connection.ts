@@ -270,6 +270,10 @@ class SpawnerStdioTransport implements Transport {
   constructor(
     private readonly config: McplServerConfig,
     private readonly onStderr: (line: string) => void,
+    /** The child's pipe failed and it outlived SIGKILL too, so the line
+     *  stays open, owning it (the line's 'unreaped'): `reason` names the
+     *  pipe's error. */
+    private readonly onUnreaped: (reason: string) => void,
   ) {
     this.recorded = serverTextRedactor(config);
   }
@@ -303,10 +307,15 @@ class SpawnerStdioTransport implements Transport {
     line.on('stderr', (text: string) => this.onStderr(text));
     line.on('error', (error: Error) => this.onerror?.(error));
     line.on('close', () => this.onclose?.());
+    line.on('unreaped', () => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`));
   }
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
+    // The child can't read what's written once its stdin or stdout has
+    // failed, while the line waits for it to exit.
+    const failed = this.line.pipeFailure;
+    if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`);
     this.line.writeLine(JSON.stringify(message));
   }
 
@@ -566,7 +575,13 @@ export class ModernMcpConnection extends EventEmitter {
     // generation's failures.
     this.relistenAttempts = 0;
     const inner: Transport = this.transportKind === 'stdio'
-      ? new SpawnerStdioTransport(this.config, (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); })
+      ? new SpawnerStdioTransport(
+        this.config,
+        (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); },
+        // A loss whose reap fails: handleLost's reap finds the child still
+        // running and holds the launch, as for any launch it can't reap.
+        (reason) => { if (this.isCurrent(generation)) this.handleLost(generation, reason); },
+      )
       : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
     const wire = new ObservedTransport(inner);
 
