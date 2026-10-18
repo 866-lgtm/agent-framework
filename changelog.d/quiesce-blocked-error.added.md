@@ -1,0 +1,1 @@
+- `QuiesceBlockedError`, exported beside `ResumeBlockedError`: what `quiesce()` throws when it refuses a queue of deferred context writes over its cap, with the host's mode as it was. The HTTP `/quiesce` route answers it with a 409 and the host's mode, and `host/command` with `ok: false` and the host's mode, as they answer `resume()`'s `ResumeBlockedError`.
