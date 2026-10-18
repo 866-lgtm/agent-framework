@@ -171,8 +171,11 @@ def _take_std_fds():
     _own(_STD_ERR, "cannot reach the output pipes any more", "the runtime's copy of fd 2")
     # A crash's own text goes where the host reads it, a pipe that outlives the
     # process: faulthandler adds a traceback for a segfault or an abort, where
-    # CPython alone writes nothing.
-    faulthandler.enable(file=_STD_ERR, all_threads=False)
+    # CPython alone writes nothing. Python 3.14 adds the C stack after it,
+    # native frames a script can't act on, which would push the error's own
+    # line out of the end of it that the host logs, so it's left out.
+    faulthandler.enable(file=_STD_ERR, all_threads=False,
+                        **({"c_stack": False} if sys.version_info >= (3, 14) else {}))
 
 
 def _identity(fd):
