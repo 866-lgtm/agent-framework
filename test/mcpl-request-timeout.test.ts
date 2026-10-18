@@ -11,6 +11,9 @@ import assert from 'node:assert/strict';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
+// What the stub's tools/list answer says when it wrote a held reply ahead of it.
+const RELEASED = 'released a held reply first';
+
 // Stdio server: answers initialize and tools/list, but swallows tools/call —
 // the "zulip HTML-error / event-loop-wedge" profile (alive, deaf). A test can
 // make it hold a reply in `held` instead, and the next tools/list then writes
@@ -28,8 +31,9 @@ process.stdin.on('data', (c) => {
     const reply = (result, id = m.id) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
     if (m.method === 'initialize') reply({ capabilities: {} });
     else if (m.method === 'tools/list') {
+      const released = held !== null;
       if (held) { reply(held.result, held.id); held = null; }
-      reply({ tools: [{ name: 'stuck', description: 's', inputSchema: { type: 'object' } }] });
+      reply({ tools: [{ name: 'stuck', description: released ? '${RELEASED}' : 's', inputSchema: { type: 'object' } }] });
     }
     // tools/call: deliberately NO response, connection stays open.
   }
@@ -51,6 +55,13 @@ function config(overrides?: Partial<McplServerConfig>): McplServerConfig {
     args: ['-e', HUNG_SERVER],
     ...overrides,
   };
+}
+
+/** Lift a connection's request timeout, so the tools/list that releases a
+ *  held reply has no watchdog of its own to race. It sets a private field,
+ *  which sendRequest reads for each request. */
+function liftRequestTimeout(c: McplServerConnection): void {
+  (c as unknown as { requestTimeoutMs: number }).requestTimeoutMs = 0;
 }
 
 let connection: McplServerConnection | null = null;
@@ -94,15 +105,19 @@ test('requestTimeoutMs: 0 disables the per-request watchdog', async (t) => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
   connection.ready();
 
-  // On a mocked clock, past the 60 s default: a watchdog that 0 failed to
-  // disable would have fired by then.
+  // On a mocked clock, past the longest delay setTimeout takes (2^31 - 1 ms):
+  // a watchdog that 0 failed to disable, the 60 s default or any other, would
+  // have fired by then.
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let settled = false;
   const call = connection.sendToolsCall('stuck', {}).catch(() => {}).finally(() => { settled = true; });
-  t.mock.timers.tick(60_001);
-  await new Promise((r) => setImmediate(r));
+  try {
+    t.mock.timers.tick(2_147_483_647);
+    await new Promise((r) => setImmediate(r));
+  } finally {
+    t.mock.timers.reset();
+  }
   assert.equal(settled, false, 'with timeout disabled the request stays pending');
-  t.mock.timers.reset();
 
   // Cleanup: closing the connection rejects the pending request.
   await connection.close();
@@ -140,11 +155,17 @@ test('a timed-out request that later receives a response does not crash (orphane
   );
   connection.ready();
 
+  const orphaned: unknown[] = [];
+  connection.on('orphaned-response', (info) => orphaned.push(info));
+
   await assert.rejects(connection.sendToolsCall('stuck', {}), /did not respond/);
-  // The late reply arrives ahead of the list's own, on the same stream, so by
-  // the time the list resolves it has been handled: ignored, not a crash.
+  liftRequestTimeout(connection);
+  // The next tools/list makes the stub write the late reply ahead of the
+  // list's own, on the same stream, so by the time the list resolves the late
+  // reply has been handled: ignored, with no event and no crash.
   const list = await connection.sendToolsList();
-  assert.equal(list.tools.length, 1);
+  assert.equal(list.tools[0]?.description, RELEASED, 'the stub wrote the late reply first');
+  assert.deepEqual(orphaned, [], 'a plain late reply is ignored, not surfaced');
 });
 
 test('a late STATEFUL orphaned response is surfaced via mcpl:orphaned-response (not silently dropped)', { timeout: 30_000 }, async () => {
@@ -166,11 +187,12 @@ test('a late STATEFUL orphaned response is surfaced via mcpl:orphaned-response (
   connection.on('orphaned-response', (info) => orphaned.push(info));
 
   await assert.rejects(connection.sendToolsCall('stuck', {}), /did not respond/);
-  // The next request releases the late reply ahead of its own answer, so it
+  liftRequestTimeout(connection);
+  // The next tools/list releases the late reply ahead of its own answer, so it
   // has been handled by the time the list resolves, and the connection still
   // works afterwards.
   const list = await connection.sendToolsList();
-  assert.equal(list.tools.length, 1);
+  assert.equal(list.tools[0]?.description, RELEASED, 'the stub wrote the late reply first');
 
   assert.equal(orphaned.length, 1, 'the dropped stateful response must be surfaced');
   assert.equal(orphaned[0].hadState, true, 'the event records that state was carried');
@@ -194,8 +216,9 @@ test('a mandatory call deadline overrides requestTimeoutMs: 0 and surfaces its l
     /outcome is unknown.*verify state before retrying/i,
   );
   // Only the deadline could settle the call, since the server sends nothing
-  // until the next request, which releases the late reply ahead of its own.
-  await connection.sendToolsList();
+  // until the next tools/list, which releases the late reply ahead of its own.
+  const list = await connection.sendToolsList();
+  assert.equal(list.tools[0]?.description, RELEASED, 'the stub wrote the late reply first');
 
   assert.deepEqual(orphaned, [{
     method: 'tools/call',
