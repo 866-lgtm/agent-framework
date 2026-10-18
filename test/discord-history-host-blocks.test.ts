@@ -11,7 +11,7 @@
  *
  * Run: node --import tsx --test test/discord-history-host-blocks.test.ts
  */
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { Collection } from 'discord.js';
 import { DiscordModule, DiscordJsClient } from '../src/modules/discord/index.js';
@@ -36,7 +36,10 @@ interface Row {
 interface Harness {
   ctx: ModuleContext | null;
   handleDiscordMessage(message: DiscordMessageData): Promise<void>;
+  handleDiscordMessageEdit(messageId: string, newContent: string, attachments?: DiscordAttachment[]): void;
+  handleDiscordMessageDelete(messageId: string): void;
   syncChannelHistory(channelId: string): Promise<{ newMessages: number; editedMessages: number; deletedMessages: number }>;
+  replyContexts: Map<string, { channelId: string }>;
 }
 
 const image: DiscordAttachment = { id: 'a1', filename: 'cat.png', url: 'https://cdn.example/cat.png', contentType: 'image/png', size: 2_000 };
@@ -60,7 +63,9 @@ function row(id: string, content: Block[], textFirst: boolean, timestamp = 1_000
   };
 }
 
-function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}) {
+/** `storeAdds`: the context's addMessage stores a row, as the store does,
+ *  for tests where a later lookup must find what a sync added. */
+function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { storeAdds = false } = {}) {
   const module = new DiscordModule({ sendTyping: async () => {}, ...client } as unknown as DiscordClientInterface, { token: 't', autoTyping: false });
   const harness = module as unknown as Harness;
   const events: ProcessEvent[] = [];
@@ -92,9 +97,11 @@ function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}) {
       return { messages, totalCount: messages.length };
     },
     getAgents: () => [{ name: 'Sol' }],
-    addMessage: (_participant: string, content: Block[], metadata: Record<string, unknown>) => {
+    addMessage: (participant: string, content: Block[], metadata: Record<string, unknown>) => {
       added.push({ content, metadata });
-      return `stored-new-${added.length}`;
+      const id = `stored-new-${added.length}`;
+      if (storeAdds) rows.push({ id, participant, content, metadata: metadata as Row['metadata'], timestamp: new Date(metadata.timestamp as number) });
+      return id;
     },
     editMessage: (id: string, content: Block[]) => { edit(id, content); edits.push({ id, content }); },
     removeMessage: (id: string) => { remove(id); removed.push(id); },
@@ -538,9 +545,10 @@ test('a message stored as a body is removed whole by a live delete and the histo
   assert.deepEqual(warned, ['Discord: An update to message s1 wasn\'t applied: it\'s stored in shards, which can\'t be edited, so if its text changed, the agent still has the earlier text']);
   assert.deepEqual(await apply({ type: 'discord:delete', discordMessageId: 's4' }), { removeMessages: ['stored-s4a'] });
   // As far as the sync can tell, s1's text changed, s2 was deleted and s3
-  // gained a file. It removes s2 whole, and fetches nothing for a body.
+  // gained a file. It removes s2 whole, by its first shard, and fetches
+  // nothing for a body.
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 1 });
-  assert.deepEqual([edits, removed, fetched], [[], ['stored-s2b'], []]);
+  assert.deepEqual([edits, removed, fetched], [[], ['stored-s2a'], []]);
   assert.deepEqual(rows.map((r) => r.id), ['stored-s1a', 'stored-s1b', 'stored-s3a', 'stored-s3b']);
 });
 
@@ -598,4 +606,182 @@ test('the client passes on an edit that leaves no text, and not a partial messag
   emitter.emit('messageUpdate', {}, { id: 'm2', content: null });
   emitter.emit('messageUpdate', {}, { id: 'm3', content: 'edited' });
   assert.deepEqual(seen, [['m1', ''], ['m3', 'edited']]);
+});
+
+// ---- The live path's creates against the history sync ----
+
+/** A fetch that answers only once released, so a file's conversion waits. */
+function heldFetch(t: TestContext): () => void {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  t.mock.method(globalThis, 'fetch', async () => { await gate; return new Response('file body', { status: 200 }); });
+  return release;
+}
+
+const created = (id: string, content: string) => ({
+  type: 'discord:message', discordMessageId: id, channelId: 'c1', guildId: 'g1', authorId: 'u1', authorName: 'User',
+  content, contentBlocks: [text(content)], timestamp: 1_000, attachments: [], shouldTriggerInference: true,
+});
+
+test('a live create whose message a history sync stored first adds no second row, and still sets the reply context and asks for inference', async () => {
+  const rows: Row[] = [];
+  const { harness, apply } = setup(rows, { fetchHistory: async () => [history('n1', 'hello', 1_000, [])] }, { storeAdds: true });
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 1, editedMessages: 0, deletedMessages: 0 });
+  const response = await apply(created('n1', 'hello'));
+  assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-new-1', [text('hello')]]]);
+  assert.deepEqual([response.addMessages, response.requestInference], [undefined, true]);
+  assert.equal(harness.replyContexts.get('default')?.channelId, 'c1');
+});
+
+test('a history sync stores nothing for a message whose live create is still converting its file, which the create then stores once', async (t) => {
+  const rows: Row[] = [];
+  const release = heldFetch(t);
+  const { harness, events, apply } = setup(rows, { fetchHistory: async () => [history('n2', 'with a file', 1_000, [])] }, { storeAdds: true });
+  const creating = harness.handleDiscordMessage(live('n2', 'with a file', [notes]));
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
+  release();
+  await creating;
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-n2', [text('with a file'), fileBlock]]]);
+});
+
+test('a history sync that writes after a live create was handled, and before the framework wrote it, stores nothing for it; by the next Discord event a sync may store one whose create never landed', async () => {
+  const rows: Row[] = [];
+  let fetched: HistoryMessage[] = [];
+  const { module, harness, events, state, apply } = setup(rows, { fetchHistory: async () => fetched }, { storeAdds: true });
+  // Handled: onProcess has answered, and the framework hasn't written it yet.
+  await harness.handleDiscordMessage(live('n3', 'late'));
+  const answer = await module.onProcess(events.shift()!, state);
+  fetched = [history('n3', 'late', 1_000, [])];
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
+  // The framework writes the answer, as it does before the next event.
+  for (const message of answer.addMessages ?? []) rows.push({ id: 'stored-n3', participant: message.participant, content: message.content as Block[], metadata: message.metadata as Row['metadata'], timestamp: new Date(1_000) });
+  assert.deepEqual(rows.map((r) => r.id), ['stored-n3']);
+  // A create whose answer never landed: once the next Discord event reaches
+  // onProcess, the framework has written all it will, and a sync stores it.
+  await harness.handleDiscordMessage(live('n4', 'lost'));
+  await module.onProcess(events.shift()!, state);
+  await apply({ type: 'discord:delete', discordMessageId: 'unrelated' });
+  fetched = [history('n4', 'lost', 1_000, []), history('n3', 'late', 1_000, [])];
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 1, editedMessages: 0, deletedMessages: 0 });
+  assert.deepEqual(rows.map((r) => r.id), ['stored-n3', 'stored-new-1']);
+});
+
+test('of a message stored twice, a live edit and a history sync both change the first row, and a live delete or a sync\'s delete takes every row', async () => {
+  const rows: Row[] = [
+    row('d1', [text('first')], true, 1_000), { ...row('d1', [text('first')], true, 1_000), id: 'stored-d1-copy' },
+    row('d2', [text('two')], true, 2_000), { ...row('d2', [text('two')], true, 2_000), id: 'stored-d2-copy' },
+  ];
+  // Complete history, which holds d1 and not d2.
+  const { harness, apply } = setup(rows, { fetchHistory: async () => [history('d1', 'synced text', 1_000)] });
+  await apply({ type: 'discord:edit', discordMessageId: 'd1', newContent: 'edited live' });
+  assert.deepEqual(rows.map((r) => [r.id, r.content]).slice(0, 2), [['stored-d1', [text('edited live')]], ['stored-d1-copy', [text('first')]]]);
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 1, deletedMessages: 1 });
+  assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-d1', [text('synced text')]], ['stored-d1-copy', [text('first')]]]);
+  await apply({ type: 'discord:delete', discordMessageId: 'd1' });
+  assert.deepEqual(rows, []);
+});
+
+test('a delete that comes while its create converts a file drops the create: nothing is stored and nobody is woken', async (t) => {
+  const rows: Row[] = [];
+  const release = heldFetch(t);
+  const { harness, events, apply } = setup(rows);
+  const creating = harness.handleDiscordMessage(live('x1', 'oops', [notes]));
+  harness.handleDiscordMessageDelete('x1');
+  release();
+  await creating;
+  assert.deepEqual(events.map((e) => e.type), ['discord:delete']);
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  assert.deepEqual(rows.map((r) => r.id), []);
+  // The next message is stored as ever.
+  await harness.handleDiscordMessage(live('x9', 'next', [notes]));
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  assert.deepEqual(rows.map((r) => r.id), ['stored-x9']);
+});
+
+test('a delete that comes while its create waits in the queue drops it when handled: no row, no reply context, no inference', async () => {
+  const rows: Row[] = [];
+  const { harness, events, apply } = setup(rows);
+  await harness.handleDiscordMessage(live('x3', 'queued'));
+  harness.handleDiscordMessageDelete('x3');
+  const answers = [];
+  for (const event of events.splice(0)) answers.push(await apply(event as unknown as Record<string, unknown>));
+  assert.deepEqual(answers, [{}, {}]);
+  assert.deepEqual([rows, harness.replyContexts.has('default')], [[], false]);
+});
+
+test('an edit that comes while its create converts a file is folded into the create: its text, without the blocks of the attachments it took away', async (t) => {
+  const rows: Row[] = [];
+  const release = heldFetch(t);
+  const { harness, events, apply } = setup(rows);
+  const creating = harness.handleDiscordMessage(live('x2', 'first wording', [image, notes]));
+  harness.handleDiscordMessageEdit('x2', 'second wording', [notes]);
+  release();
+  await creating;
+  for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
+  assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-x2', [text('second wording'), fileBlock]]]);
+});
+
+test('an edit that takes attachments away drops their blocks from a text-first row: an image by its URL whatever its query, a file by its header, a note by its filename; a block another attachment of its name may stand for stays, and so do a row stored before the mark and one the client passed no attachments for', async () => {
+  const pdf: DiscordAttachment = { id: 'a3', filename: 'x.pdf', url: 'https://cdn.example/x.pdf', contentType: 'application/pdf', size: 50 };
+  const pdfNote = text('[Attachment: x.pdf (application/pdf)]');
+  const rows: Row[] = [
+    row('p1', [text('look'), imageBlock, fileBlock, pdfNote], true),
+    row('p2', [text('two files'), fileBlock, fileBlock], true),
+    row('p3', [text('old'), imageBlock], false),
+    row('p4', [text(''), imageBlock], true),
+  ];
+  const { apply } = setup(rows);
+  const content = (id: string) => rows.find((r) => r.id === `stored-${id}`)?.content;
+  // The image's URL comes signed afresh; its file and note are gone.
+  await apply({ type: 'discord:edit', discordMessageId: 'p1', newContent: 'look', attachments: [{ ...image, url: `${image.url}?ex=2&hm=b` }] });
+  assert.deepEqual(content('p1'), [text('look'), imageBlock]);
+  // One of two files of one name is gone: either block may be its.
+  assert.deepEqual(await apply({ type: 'discord:edit', discordMessageId: 'p2', newContent: 'two files', attachments: [notes] }), {});
+  // Before the mark, the text rule alone, which leaves an unchanged text.
+  assert.deepEqual(await apply({ type: 'discord:edit', discordMessageId: 'p3', newContent: 'old', attachments: [] }), {});
+  // Nothing left: the empty marker, as a message with neither gets.
+  await apply({ type: 'discord:edit', discordMessageId: 'p4', newContent: '', attachments: [] });
+  assert.deepEqual(content('p4'), [text(''), text('[Empty message]')]);
+  // A client that passes no attachments changes the text alone.
+  await apply({ type: 'discord:edit', discordMessageId: 'p1', newContent: 'look again' });
+  assert.deepEqual(content('p1'), [text('look again'), imageBlock]);
+});
+
+test('the client passes an edit\'s attachments as the update left them, and none for a partial message', async (t) => {
+  const client = new DiscordJsClient({ token: 't' });
+  t.after(() => client.disconnect());
+  const seen: unknown[][] = [];
+  client.onMessageEdit((...args) => { seen.push(args); });
+  const emitter = (client as unknown as { client: { emit(event: string, ...args: unknown[]): boolean } }).client;
+  const attachment = { id: 'a1', name: 'cat.png', url: image.url, contentType: 'image/png', size: 2_000 };
+  emitter.emit('messageUpdate', {}, { id: 'm4', content: 'kept', partial: false, attachments: new Collection([['a1', attachment]]) });
+  emitter.emit('messageUpdate', {}, { id: 'm5', content: 'none left', partial: false, attachments: new Collection() });
+  emitter.emit('messageUpdate', {}, { id: 'm6', content: 'partial', partial: true, attachments: new Collection() });
+  assert.deepEqual(seen, [['m4', 'kept', [image]], ['m5', 'none left', []], ['m6', 'partial', undefined]]);
+});
+
+test('a create still converting when the module stops writes nothing and throws nothing, and a stop forgets the creates on their way', async (t) => {
+  const release = heldFetch(t);
+  const { module, harness, events } = setup([], { disconnect: async () => {}, fetchHistory: async () => [history('q1', 'queued at the stop', 1_000, [])] });
+  const converting = harness.handleDiscordMessage(live('s1', 'late', [notes]));
+  await harness.handleDiscordMessage(live('q1', 'queued at the stop'));
+  await module.stop();
+  release();
+  await assert.doesNotReject(converting);
+  assert.deepEqual(events.map((e) => (e as { discordMessageId?: string }).discordMessageId), ['q1']);
+  // Started again: the queued create was never handled, and a sync stores its message.
+  harness.ctx = setup([], {}, { storeAdds: true }).harness.ctx;
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 1, editedMessages: 0, deletedMessages: 0 });
+});
+
+test('a create whose conversion throws leaves its message to the history sync', async () => {
+  const rows: Row[] = [];
+  const { module, harness } = setup(rows, { fetchHistory: async () => [history('t1', 'thrown', 1_000, [])] }, { storeAdds: true });
+  const converter = module as unknown as { convertMessageToContent: (message: unknown) => Promise<unknown> };
+  const convert = converter.convertMessageToContent.bind(module);
+  converter.convertMessageToContent = async () => { throw new Error('conversion failed'); };
+  await assert.rejects(harness.handleDiscordMessage(live('t1', 'thrown')), /conversion failed/);
+  converter.convertMessageToContent = convert;
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 1, editedMessages: 0, deletedMessages: 0 });
 });
