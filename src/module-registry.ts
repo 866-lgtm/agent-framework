@@ -765,21 +765,23 @@ class ModuleContextImpl implements ModuleContext {
     const key = `${source}:${externalId}`;
     const entry = this.externalIdMap.get(key);
     if (entry === undefined) return null;
-    // A stored id answers while the store holds its row. Otherwise, as for
-    // the '' a held write keeps here (addMessage), the message is looked up
-    // in the store by its external id, held rows included, and the first row
-    // found is taken, as context-manager's findByExternalId takes it. A held
-    // row answers by its handle and leaves the entry as it is. A stored row's
-    // id becomes the entry. With nothing found, the entry goes.
-    if (entry !== '' && this.getMessageFn(entry)) return entry;
-    const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
-    if (row?.held) return row.id;
-    if (row) {
-      if (row.id !== entry) {
+    // A stored id answers while the store holds its row, and once the row is
+    // gone the entry goes, as removeMessage drops it. The '' a held write
+    // keeps here (addMessage) names no row, so the message is looked up in
+    // the store by its external id, held rows included, and the first row
+    // found is taken, as context-manager's findByExternalId takes it: a held
+    // row answers by its handle and leaves the entry as it is, and a stored
+    // row's id becomes the entry. With nothing found, the entry goes.
+    if (entry !== '') {
+      if (this.getMessageFn(entry)) return entry;
+    } else {
+      const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
+      if (row?.held) return row.id;
+      if (row) {
         this.externalIdMap.set(key, row.id);
         this.persistExternalIdMap();
+        return row.id;
       }
-      return row.id;
     }
     this.externalIdMap.delete(key);
     this.persistExternalIdMap();

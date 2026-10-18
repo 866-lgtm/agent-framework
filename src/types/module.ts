@@ -49,7 +49,8 @@ export type ModuleMessage = StoredMessage & {
  */
 export interface MessageQueryResult {
   /** The matching stored rows, then, as the newest, the matching rows of
-   *  writes the framework holds (ModuleMessage.held) */
+   *  writes the framework holds (ModuleMessage.held): before the stored rows
+   *  in a reversed query */
   messages: ModuleMessage[];
   totalCount: number;
 }
@@ -299,10 +300,11 @@ export interface ModuleContext {
 
   /**
    * Find the message for an external ID this context added a message under:
-   * the row it added, while the store holds it, else the first row the store
-   * shows under that external ID, held rows included, a held row by its
-   * handle. Null when this context added none under it, or the store shows
-   * none.
+   * the row it added, while the store holds it. For a write the framework
+   * held, whose id this context doesn't keep, the first row the store shows
+   * under that external ID, held rows included, a held row by its handle.
+   * Null when this context added none under it, when the row it added is
+   * gone, or when the store shows none for a held write.
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
 
@@ -315,7 +317,8 @@ export interface ModuleContext {
    * Query messages by filter criteria.
    * Useful for finding messages from external sources, by participant, etc.
    * The rows of writes the framework holds come after the stored rows, as
-   * the newest, marked `held` (ModuleMessage).
+   * the newest, or before them in a reversed query, marked `held`
+   * (ModuleMessage).
    */
   queryMessages(filter: MessageQuery): MessageQueryResult;
 

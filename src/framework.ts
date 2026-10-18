@@ -19313,8 +19313,11 @@ export class AgentFramework {
   ): MessageId {
     // `deferredWriteId` is the framework's: a write from the queue is stored
     // under its own (withDeferredWriteId), and boot's dedup and a module's
-    // handle (landedRow) find the write by it. Any other write drops one its
-    // metadata carries, such as one a module copied from a stored row.
+    // handle (landedRow) find the write by it. Any other write through here
+    // drops one its metadata carries, such as one a module or a process
+    // answer copied from a stored row. The channel writes that go straight to
+    // a conversation fork's store keep their metadata as given: no handle
+    // reads a fork's store, which is isolated.
     if (!opts?.fromQueue && metadata && 'deferredWriteId' in metadata) {
       const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
       metadata = rest as MessageMetadata;

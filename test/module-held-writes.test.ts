@@ -95,6 +95,11 @@ test('a module reads a held write: addMessage answers a handle, and getMessage a
   await withProbe(async ({ framework, ctx }) => {
     const storedId = ctx.addMessage('user', text('stored first'), external('s1'));
     assert.ok(!storedId.startsWith('held:'), `a write that isn't held is stored: ${storedId}`);
+    assert.equal(
+      (ctx.getState<{ externalIdMap: Record<string, string> }>()!).externalIdMap['probe:s1'],
+      storedId,
+      "a stored write's entry is its id",
+    );
     await framework.quiesce({ reason: 'test' });
     const before = Date.now();
     const handle = ctx.addMessage('user', text('held'), { external: { source: 'probe', id: 'h1' }, channelId: 'c1' } as never);
@@ -304,6 +309,26 @@ test("a lookup by external id doesn't answer the id of a row that's gone, whatev
     ctx.pushEvent({ type: 'module-event', source: 'probe', eventType: 'answer', payload: null });
     await waitFor('the answer to be applied', () => ctx.getMessage(stored) === null);
     assert.equal(ctx.findMessageByExternalId('probe', 'r2'), null);
+  });
+});
+
+test('with two rows under one external id, a lookup for a held write answers the first, and an entry whose row is gone answers null', async () => {
+  await withProbe(async ({ framework, ctx, module }) => {
+    framework.start();
+    const first = ctx.addMessage('user', text('stored first'), external('d1'));
+    await framework.quiesce({ reason: 'test' });
+    const second = ctx.addMessage('user', text('held second'), external('d1'));
+    assert.equal(ctx.findMessageByExternalId('probe', 'd1'), first, 'while the second is held');
+    await framework.resume();
+    assert.ok(!ctx.getMessage(second)!.id.startsWith('held:'), 'the second has landed');
+    assert.equal(ctx.findMessageByExternalId('probe', 'd1'), first, 'once the second has landed');
+    // The entry names the first row now, and once that row is gone the entry
+    // goes, though the second is still stored under the external id.
+    module.answer = { removeMessages: [first] };
+    ctx.pushEvent({ type: 'module-event', source: 'probe', eventType: 'answer', payload: null });
+    await waitFor('the answer to be applied', () => ctx.getMessage(first) === null);
+    assert.equal(ctx.findMessageByExternalId('probe', 'd1'), null);
+    assert.equal(ctx.getState<{ externalIdMap: Record<string, string> }>()!.externalIdMap['probe:d1'], undefined);
   });
 });
 
