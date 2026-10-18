@@ -664,7 +664,7 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
-  it('a fork whose closure turn ends while the host is quiesced is left to the reaper, which disposes it once resume() has stored its write', async () => {
+  it('a fork whose closure turn ends while the host is quiesced is disposed at the turn\'s end, and what was held for it is logged as lost', async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
@@ -679,8 +679,6 @@ describe('Conversation routing', () => {
     const internals = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
       deferredMessages: Array<{ forAgent?: string }>;
-      lastConversationSweep: number;
-      sweepExpiredConversations(): void;
     };
     // While the closure turn is alive, a write for the fork is deferred to
     // the turn's end, and an operator quiesces the host, which waits for the
@@ -705,17 +703,14 @@ describe('Conversation routing', () => {
       await framework.runUntilIdle();
       await quiescing;
       assert.equal(deferred, '', 'deferred: the closure turn was alive');
-      assert.ok(framework.getAgent(fork), 'not disposed while the host is quiesced');
-      assert.equal(queued(), 1, 'its write is still queued');
+      assert.equal(framework.getAgent(fork), null, 'disposed at its closure turn\'s end, though the host is quiesced');
+      assert.equal(queued(), 0, 'nothing is left queued for the fork');
 
       await framework.resume();
-      assert.ok(lastStored().includes('one more thing'), `resume() stored it in the fork:\n${lastStored()}`);
-      internals.lastConversationSweep = 0;
-      internals.sweepExpiredConversations();
-      assert.equal(framework.getAgent(fork), null, 'the reaper disposed it after resume()');
-      assert.equal(queued(), 0, 'nothing is left queued for the fork');
+      assert.ok(!lastStored().includes('one more thing'), `not stored in the fork:\n${lastStored()}`);
     } finally { console.error = error; }
-    assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
+    assert.ok(errors.some((e) => e.includes(`disposal of conversation fork ${fork}: deferred write `)
+      && e.includes(`(alice: text) for ${fork} is lost: its agent has left the framework`)), errors.join('\n'));
 
     await framework.stop();
   });
@@ -847,7 +842,7 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
-  it('the reaper leaves a closing fork registered while the host is quiesced, and disposes it after resume() has stored its write', async () => {
+  it('the reaper disposes a closing fork on a quiesced host too, and its queued write is logged as lost', async () => {
     const { framework, fork, sweep, lastStored, queued } = await closingForkWithAQueuedWrite('slack:D9');
     const errors: string[] = [];
     const error = console.error;
@@ -855,16 +850,14 @@ describe('Conversation routing', () => {
     try {
       await framework.quiesce({ reason: 'test window' });
       sweep();
-      assert.ok(framework.getAgent(fork), 'not disposed while the host is quiesced');
-      assert.equal(queued(), 1, 'its write is still queued');
+      assert.equal(framework.getAgent(fork), null, 'disposed, though the host is quiesced');
+      assert.equal(queued(), 0, 'nothing is left queued for the fork');
 
       await framework.resume();
-      assert.ok(lastStored().includes('one more thing'), `resume() stored it in the fork:\n${lastStored()}`);
-      sweep();
-      assert.equal(framework.getAgent(fork), null, 'disposed after resume()');
-      assert.equal(queued(), 0, 'nothing is left queued for the fork');
+      assert.ok(!lastStored().includes('one more thing'), `not stored in the fork:\n${lastStored()}`);
     } finally { console.error = error; }
-    assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
+    assert.ok(errors.some((e) => e.includes(`disposal of conversation fork ${fork}: deferred write `)
+      && e.includes(`(alice: text) for ${fork} is lost: its agent has left the framework`)), errors.join('\n'));
 
     await framework.stop();
   });

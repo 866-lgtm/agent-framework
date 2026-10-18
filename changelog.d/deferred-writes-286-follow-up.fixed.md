@@ -2,17 +2,16 @@
   the deferred-write queue with it, at that moment, and the host log names
   each entry as lost, with the agent and where it left. An agent leaves at an
   ephemeral run's end and at a conversation fork's disposal. The last flush
-  before it leaves can leave an entry there: one whose store threw, or, at an
-  ephemeral run's end on a quiesced host, one that flush deferred again. A
-  conversation fork isn't disposed while the host is quiesced: the end of its
-  closure turn leaves it to the fallback reaper, which waits for `resume()` to
-  store what is queued for it. Before, a closing fork's entry stayed queued
-  for the disposed fork, where no flush could store it. An ephemeral run's,
-  once the run's stream had ended, was dropped by the run's own turn-end
-  flush, which runs after the run is deregistered, with a line saying its
-  delivery target isn't a registered agent.
-- On a host with no primary (`agents: []`), a write with no target goes to
-  the first registered agent, such as an ephemeral run. Deferred, it now names
+  before it leaves can leave an entry there: one whose store threw, or, on a
+  quiesced host, one that flush deferred again, at an ephemeral run's end and
+  at a fork's disposal alike: a quiesce doesn't put off an agent's leaving.
+  Before, a closing fork's entry stayed queued for the disposed fork, where no
+  flush could store it. An ephemeral run's, once the run's stream had ended,
+  was dropped by the run's own turn-end flush, which runs after the run is
+  deregistered, with a line saying its delivery target isn't a registered
+  agent.
+- On a host with no primary (`agents: []`), a write with no target goes to the
+  first registered agent, such as an ephemeral run. Deferred, it now names
   that agent in its queue entry, so it is that agent's as a targeted write is:
   the agent's own flushes store it, and it leaves with the agent. Before, the
   entry named no agent, so neither the run's flushes nor its end took it:
@@ -22,14 +21,13 @@
   stream and no request left for it, as when its closure turn never ran, now
   first stores what is still queued for the fork in the fork's own store, past
   its deferral, as the end of a closure turn and the end of an ephemeral run
-  do. It waits to dispose the fork until that can be done: not while a turn
-  token is held for it, as a puppet call or a surgery holds one, nor while the
-  host is quiesced. The puppet call's end, the surgery's release and
-  `resume()` each store the fork's queue, and a later sweep disposes it. Only
-  what its store throws on then leaves with the fork, as above. Before, the
-  reaper disposed such a fork while a token was held or the host was quiesced
-  too, nothing stored what was queued for it, and that stayed queued for the
-  disposed fork.
+  do. It doesn't dispose the fork while a turn token is held for it, as a
+  puppet call or a surgery holds one: the call's end and the surgery's release
+  each flush what they held, as for any agent, and a later sweep stores what
+  is left and disposes the fork. On a quiesced host that store defers the
+  queue again, and it leaves with the fork, as above. Before, the reaper
+  disposed such a fork while a token was held too, nothing stored what was
+  queued for it, and that stayed queued for the disposed fork.
 - Boot recovery numbers the restored deferred-write queue 1, 2, 3, … in the
   order it restores it, and later deferrals are numbered on from there.
   Before, it kept each entry's `seq` and numbered only the entries without a
