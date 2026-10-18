@@ -11355,6 +11355,7 @@ export class AgentFramework {
     let unreadable: { agent: string; error: unknown } | undefined;
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
+      isStoredUnread: (p) => this.isStoredUnreadPlacement(p),
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
@@ -11749,7 +11750,13 @@ export class AgentFramework {
   private isUnreadPlacement(p: CoalescingPlacement): boolean {
     this.resolvePlacement(p);
     if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
-    if (!p.messageId) return false;
+    return this.isStoredUnreadPlacement(p);
+  }
+
+  /** Stored, a deferred entry once its flush has stored it, and unread. */
+  private isStoredUnreadPlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId || !p.messageId) return false;
     const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
   }
@@ -13186,10 +13193,16 @@ export class AgentFramework {
     // boundary — after the deferred flush (same window: turn alive, compile
     // not yet run) and before the checkpoint (they are the turn's inputs).
     // Not on a context-budget restart: that continues the same logical turn.
+    // A turn whose only causes are deferred batches assembles even when no
+    // batch is pending: its batch may have been withdrawn after its wake was
+    // dispatched, or be rendering for another agent's assembly, and only the
+    // assembly can say whether the turn has anything to read.
+    const batchSubjects = trigger?.coalescingBatchSubjects;
     let assembly: AssemblyResult | undefined;
-    if (attempt === 0 && !resumesTurn && this.pushCoalescer?.pendingBatches()) {
+    if (attempt === 0 && !resumesTurn && this.pushCoalescer
+      && (batchSubjects?.length || this.pushCoalescer.pendingBatches())) {
       try {
-        assembly = await this.pushCoalescer.assemble(agent.name);
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects);
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
@@ -13198,15 +13211,17 @@ export class AgentFramework {
     // A turn whose only causes were deferred batches, none of which gave it
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
     // render-start that could not be made durable, whose batch then waits for
-    // its recovery wake; a batch whose audience doesn't include the agent),
-    // has nothing new to show: running it would wake the model to
-    // `[Continue]` or an older message, an uncaused wake. Stop before the
-    // checkpoint, locus, typing and compile. Any batch this assembly
-    // materialized keeps the turn, including one that was not among its
-    // causes (a batch whose wake the freeze withdrew, or one that never
-    // qualified for a wake). A cause this assembly did not settle (rendered
-    // elsewhere, not yet frozen) keeps the turn, as before.
-    const batchSubjects = trigger?.coalescingBatchSubjects;
+    // its recovery wake; a batch whose audience doesn't include the agent; a
+    // render placed in another agent's deferred queue; a batch withdrawn,
+    // displaced or consumed by another request before this assembly), has
+    // nothing new to show: running it would wake the model to `[Continue]` or
+    // an older message, an uncaused wake. Stop before the checkpoint, locus,
+    // typing and compile. Any batch this assembly materialized keeps the
+    // turn, including one that was not among its causes (a batch whose wake
+    // the freeze withdrew, or one that never qualified for a wake), and so
+    // does a cause whose delivery is stored and still unread. A cause this
+    // assembly did not settle (the host stopping, or its subject moving on
+    // during the audience lookup) keeps the turn, as before.
     if (assembly && batchSubjects?.length && assembly.materialized.size === 0
       && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
