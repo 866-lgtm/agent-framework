@@ -200,13 +200,13 @@ const isSilencingTool = (name: string): boolean => {
  * neither clear explicit-send suppression nor re-pin a turn's locus at a tool
  * boundary. An edit can also be the first version of a message the agent
  * sees: when the coalescer replaced a message of which the agent had been
- * shown no version while it waited in the deferred queue, the host marks
- * the replacement (`replacesUnread`), and an edit so marked counts as the
- * message it replaced. A reaction or
- * deletion so marked is still a notice about that message and stays a
- * marker. An edit of a message the host never received looks like any other
- * edit and stays a marker too. A marker that wakes the agent can still set
- * that turn's speech channel (agent-framework#189).
+ * shown no version, still waiting in the deferred queue or stored at once
+ * outside it, the host marks the replacement (`replacesUnread`), and an edit
+ * so marked counts as the message it replaced. A reaction or deletion so
+ * marked is still a notice about that message and stays a marker. An edit of
+ * a message the host never received looks like any other edit and stays a
+ * marker too. A marker that wakes the agent can still set that turn's speech
+ * channel (agent-framework#189).
  */
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
@@ -15458,7 +15458,7 @@ export class AgentFramework {
        */
       deferredWriteId?: string;
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
-      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
+      placement?: { agent?: string; messageId?: MessageId; deferredId?: string; direct?: true };
       /**
        * RFC-006 assembly: the named agent's turn is alive but its compile has
        * not run yet (the same window the turn-start deferred flush writes
@@ -15540,7 +15540,7 @@ export class AgentFramework {
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
-    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.direct = true; }
     // Stored while none of the agent's turns is alive, or assembled for the
     // start now beginning: no tool boundary will weigh it.
     if (!this.activeTurnTokens.has(agent.name) || opts?.bypassDeferralFor === agent.name) {

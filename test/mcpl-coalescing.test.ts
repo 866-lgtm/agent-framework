@@ -12,7 +12,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
 import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, crash, ok, TS } from './helpers/coalescing-fixture.js';
 
@@ -1283,6 +1284,81 @@ for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane})
   assert.equal(outcome, 'appended');
   assert(r.injected[0].includes('edit_claiming_first_view'), 'the edit reached the boundary');
   assert(!r.injected[0].includes('replacesUnread'), "the server's own mark was dropped");
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+/** An organization acceleration 429, which holds the turn for a later compile. */
+const accelerationLimit = (request: NormalizedRequest): MembraneError => new MembraneError({
+  type: 'rate_limit', retryable: true, httpStatus: 429,
+  message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+  rawError: { status: 429 }, rawRequest: request,
+});
+
+/**
+ * A turn, started by a mention in `chat`, whose first stream sends into
+ * `chat` and then ends with an acceleration 429, so the turn waits for a
+ * later compile with none of its streams running. `during` runs while it
+ * waits. Returns the channel the turn's next start spoke into.
+ */
+async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>): Promise<unknown> {
+  let streams = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request as never);
+    if (++streams > 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'prose_after_hold' }] as ContentBlock[])]);
+    const stream = new MockYieldingStream([
+      createMockResponse([{ type: 'tool_use', id: 'p0', name: 'channel_publish', input: { channelId: 'chat', content: 'explicit_send' } }] as ContentBlock[], 'tool_use'),
+      createMockResponse([] as ContentBlock[]),
+    ]);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        if ((event as { type?: string }).type === 'complete') { yield { type: 'error' as const, error: accelerationLimit(request) }; return; }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  await f.framework.runUntilIdle();
+  const internals = f.framework as unknown as {
+    providerAccelerationCooldowns: Map<string, { until: number }>;
+    releaseProviderAccelerationCooldown(agentName: string): void;
+  };
+  const hold = internals.providerAccelerationCooldowns.get('agent');
+  assert.ok(hold, 'the turn is held after its first stream');
+  await during();
+  hold.until = Date.now();
+  internals.releaseProviderAccelerationCooldown('agent');
+  await f.framework.runUntilIdle();
+  assert.equal(streams, 2, 'one deferred compile');
+  return f.published.find((p) => JSON.stringify(p.content).includes('prose_after_hold'))?.channelId;
+}
+
+test("#157: an edit that addresses the agent, of a follow-up stored while the turn waits out a capacity hold and not yet seen, moves the turn to the follow-up's channel", async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register(); await f.register('other');
+  let outcome: string | undefined;
+  const channel = await heldTurnSpeaksInto(f, async () => {
+    await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
+    outcome = (await f.send('push/event', {
+      ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
+    })).result.coalesce.outcome;
+  });
+  assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
+  assert.equal(channel, 'other');
+});
+
+test('#157: an edit of a follow-up stored at once, which a compile then showed the agent, stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // Stored at once, with no turn alive. The turn it wakes shows it to the agent in its compile.
+  await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'follow_up_wiht_typo', { initial: true }, 'chat', 'm2'), tags: ['chat:ambient', 'chat:from-human'] }] });
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'one turn ran');
+  assert(JSON.stringify(f.membrane.calls[0]).includes('follow_up_wiht_typo'), "that turn's compile showed the agent the follow-up");
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await pushTagged(f, ['chat:edited']); });
+  assert.equal(outcome, 'appended', 'the edit came after the agent read the follow-up, so it replaced nothing');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('replacesUnread'), 'the edit reached the boundary unmarked');
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });

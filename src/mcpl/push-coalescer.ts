@@ -66,6 +66,10 @@ export interface CoalescingPlacement {
   messageId?: string;
   /** Entry id in the framework's deferred-write queue (turn-alive deferral). */
   deferredId?: string;
+  /** Stored at once, outside the deferred queue: while none of the agent's
+   *  turns was alive, or assembled for a start before its compile. No tool
+   *  boundary drained it, so the agent sees it first at a compile. */
+  direct?: true;
 }
 
 export interface CoalescingScope { kind: 'featureSet' | 'channel'; id: string }
@@ -98,9 +102,10 @@ export interface CoalescedOccurrence<E = unknown> {
   deliverTo?: string;
   /** Set by the coalescer when a plain occurrence replaces one that was the
    *  agent's first view of the subject (its `initial` birth, or a
-   *  replacement so marked) and is still waiting in the host's deferred
-   *  queue, so never shown to the agent: the replacement is then the agent's
-   *  first view. No other path sets it. */
+   *  replacement so marked) and that the agent was never shown: still
+   *  waiting in the host's deferred queue, or stored at once, outside it
+   *  (CoalescingPlacement.direct). The replacement is then the agent's first
+   *  view. No other path sets it. */
   replacesUnread?: boolean;
 }
 
@@ -605,9 +610,11 @@ export class PushCoalescer<E = unknown> {
       const prior = state.occupant;
       // The replacement is the agent's first view only when its prior was
       // one and the agent was never shown it: still waiting in the host's
-      // deferred queue, not even injected at a tool boundary. An occupant
-      // that isn't a first view ends the chain for every later replacement.
-      const firstView = prior.firstView === true && prior.placement.deferredId !== undefined;
+      // deferred queue, or stored at once, outside it. One drained from the
+      // queue may have been injected at a tool boundary, which leaves it
+      // unread, so it doesn't count. An occupant that isn't a first view
+      // ends the chain for every later replacement.
+      const firstView = prior.firstView === true && (prior.placement.deferredId !== undefined || prior.placement.direct === true);
       this.host.audit({ kind: 'displaced', subject, eventId: prior.eventId });
       if (this.host.remove(prior.placement)) {
         this.host.cancelWake(subject);
