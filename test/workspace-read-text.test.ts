@@ -300,6 +300,26 @@ test('a character page stops at the result limit too, with nextOffsetChars', asy
   }
 });
 
+test('a character page moved on by a whole character keeps a surrogate pair whole, and one holding all it was asked for names no stop', async t => {
+  // A limit too small for the page's own fields still moves the page on, by a
+  // whole character: an emoji's two code units.
+  const { read } = await setup(t, '😀abc');
+  assert.deepEqual((await read({ offsetChars: 0, limitChars: 100 }, 50)).data, {
+    path: 'work/text.txt', totalChars: 5, offsetChars: 0, nextOffsetChars: 2,
+    note: 'Stopped at character 2 to stay within the 50-character result limit; continue with offsetChars=2.',
+    content: '😀',
+  });
+  // Where that step reaches what the page was asked for, the page holds all of it.
+  const { read: readOne } = await setup(t, 'a');
+  assert.deepEqual((await readOne({ offsetChars: 0, limitChars: 1 }, 50)).data, {
+    path: 'work/text.txt', totalChars: 1, offsetChars: 0, nextOffsetChars: null, content: 'a',
+  });
+  const { read: readSix } = await setup(t, 'abcdef');
+  assert.deepEqual((await readSix({ offsetChars: 0, limitChars: 1 }, 50)).data, {
+    path: 'work/text.txt', totalChars: 6, offsetChars: 0, nextOffsetChars: 1, content: 'a',
+  });
+});
+
 test('character mode can be selected by either parameter and reports EOF', async t => {
   const { read } = await setup(t, 'a'.repeat(3000));
   assert.deepEqual((await read({ offsetChars: 0 })).data, {

@@ -172,7 +172,8 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
     to += step(to);
   }
   // A page always moves on, by one character at least, though a limit too
-  // small for the page's own fields then passes it.
+  // small for the page's own fields then passes it. Where that reaches the
+  // page's own end, it holds all it was asked for, so it names no stop.
   if (to === start) to = Math.min(end, start + step(start));
-  return { success: true, data: page(to, joined([stoppedNote(to), ...notes])) };
+  return { success: true, data: page(to, joined([to < end ? stoppedNote(to) : null, ...notes])) };
 }
