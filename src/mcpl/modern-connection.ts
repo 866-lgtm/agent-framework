@@ -891,7 +891,8 @@ export class ModernMcpConnection extends EventEmitter {
    * Close one generation: the transport first (during discovery the SDK
    * hasn't attached it yet, so only closing it ends the probe), then the
    * client. The transport's close is the reaping verdict, and its failure is
-   * returned, never swallowed.
+   * returned, never swallowed. It never rejects, which lossReaped() and the
+   * framework's unguarded wait on it rely on.
    */
   private static async closeSession(session: Session): Promise<Error | null> {
     let failure: Error | null = null;
