@@ -1865,6 +1865,10 @@ function jsonKind(value: unknown): string {
         : `a ${typeof value}`;
 }
 
+/** Why the framework cancelled a stream it owns: the mark it records, by
+ *  agent and stream, before the cancel, for the stream's terminal to read. */
+type FrameworkCancelKind = 'turn_ended' | 'budget_restart' | 'quiesce_abandoned' | 'shutdown';
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -2045,7 +2049,7 @@ export class AgentFramework {
    *  `inference:exhausted` (which also pollutes the failure streak). Kept
    *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
    *  for resident agents too, and the key is per-stream, not per-agent. */
-  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart' | 'quiesce_abandoned' | 'shutdown'> = new Map();
+  private frameworkCancelledStreams: Map<string, FrameworkCancelKind> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Ephemeral namespaces/names are single-generation for this framework
@@ -4615,9 +4619,10 @@ export class AgentFramework {
    * Terminal for a stop the framework itself made: stop()'s shutdown and an
    * operator's quiesce abandon, each recorded in frameworkCancelledStreams
    * before the cancel. A stream may report that cancel as `aborted`, as
-   * `error`, or by just closing, and each of those ends here, so the three
-   * cannot drift: settle the turn (an ephemeral run rejects with the stop's
-   * own text), an attributable inference-log terminal, ONE inference:aborted
+   * `error`, by just closing, or by throwing, and each of those ends here
+   * (through endFrameworkCancel()), so the four cannot drift: settle the
+   * turn (an ephemeral run rejects with the stop's own text), an
+   * attributable inference-log terminal, ONE inference:aborted
    * carrying the framework's reason, gate release. No [turn-interrupted]
    * marker, since nobody stopped the agent, and none of the failure
    * accounting that inference:failed / inference:exhausted drive.
@@ -14818,6 +14823,15 @@ export class AgentFramework {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));
       }
+      // The agent's window at the event gate ends here too, while this start
+      // still holds the turn token, as at the provider-wait hold above. A
+      // start that resumes a turn (a budget restart, a tool-result-guard
+      // retry) arrives with the window its predecessor kept open for it, and
+      // a start that got as far as the typing indicator has taken the window
+      // itself. No frame would close it otherwise, and while it is open every
+      // gate event buffers, for every agent. A newer start holding the token
+      // owns the window now, so it's left alone.
+      if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
       throw error;
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
@@ -15683,6 +15697,74 @@ export class AgentFramework {
       }
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
+
+    // How a stream the framework cancelled ends, by the mark it recorded,
+    // however the stream reports its end: an `aborted` or an `error` event,
+    // a close with no terminal event, or a throw. It runs only for a stream
+    // that still owns its agent: the loop's head drops every other stream's
+    // events, and the silent close and the catch check. A mark is never a
+    // failure: no errorPolicy retry and no inference:exhausted, which would
+    // relaunch a turn endTurn ended or the stream a budget restart replaced,
+    // reject an ephemeral's promise mid-run and bump the failure streak. The
+    // gate window ends here for every mark but a budget restart's, whose new
+    // stream continues it; a stop or a quiesce abandon settles (and resets
+    // the agent) through settleFrameworkCancel(). `finally` does the rest of
+    // the stream's teardown.
+    const endFrameworkCancel = async (
+      cancelKey: string,
+      cancelKind: FrameworkCancelKind,
+      closes: TurnRouting | undefined,
+    ): Promise<void> => {
+      this.frameworkCancelledStreams.delete(cancelKey);
+      lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
+      // A budget restart continues the same EventGate window. Do not
+      // end it here or in finally; the replacement owns final release.
+      if (cancelKind === 'budget_restart') {
+        preserveEventGateForSuccessor = true;
+      } else if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+        this.eventGate?.onInferenceEnded(agent.name);
+      }
+      if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
+        // An operator's cancel during a quiesce drain, or
+        // AgentFramework.stop() with this stream still live. Settle
+        // the turn honestly, so an ephemeral run's promise rejects
+        // now instead of riding out its idle watchdog — and
+        // deliberately NO inference:exhausted: that trace centrally
+        // drives the consecutive-failure streak, hard-down ops
+        // alerts, and the poison-history breaker, none of which a
+        // stop represents. No chronicle marker of any kind either:
+        // nobody stopped the agent, and a resident must not read
+        // after restart that someone did. inference:aborted and the
+        // inference-log row carry the observability instead.
+        this.settleFrameworkCancel({
+          agent, myStreamId, startTime, compiledRequest,
+          kind: cancelKind,
+          closes,
+          log: logStream,
+        });
+        return;
+      }
+      // endTurn IS a logical turn end — earlier rounds may have
+      // live-routed prose (narrate → skip_reply is a real shape),
+      // so settle the delivery chain and drop the receipt. A
+      // budget restart keeps the same turn's routing and tallies;
+      // the continuation stream's end writes one receipt for it.
+      if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
+        await turnSpeechChain;
+        this.appendProseDeliveryReceipt(agent, streamRouting);
+      }
+      // A `!` an earlier round asked for still starts its
+      // continuation when a tool ends the turn, once the turn's
+      // deliveries have run. Explicit mode doesn't hold the turn
+      // for them, so it checks at the end of its chain.
+      if (cancelKind === 'turn_ended') {
+        if (turnProseRouting === 'explicit') {
+          void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
+        } else {
+          this.requestProseContinuation(agent, streamRouting);
+        }
+      }
+    };
 
     const adoptInjectedRound = (): void => {
       if (silenceBeforeRefusal !== undefined) {
@@ -16624,26 +16706,21 @@ export class AgentFramework {
             const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
             const callerCancel = agent.takeCancel();
 
-            if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
-              // Same contract as the aborted branch: settle honestly, no
-              // errorPolicy retry (which would relaunch inference
-              // mid-maintenance-window), no inference:exhausted (which feeds
-              // the failure streak / hard-down / poison-history accounting),
-              // and — a framework-owned cancel — no [turn-interrupted]
-              // marker: nobody stopped the agent. §10.5 lifecycle reads
-              // 'aborted' (not 'completed'), and the gate is released only
-              // for THIS agent instance — a name re-registered meanwhile
-              // (ephemeral disposal, conversation replacement) owns its own
-              // gate liveness.
-              this.frameworkCancelledStreams.delete(cancelKey);
-              lifecyclePhase = 'aborted';
-              this.settleFrameworkCancel({
-                agent, myStreamId, startTime, compiledRequest,
-                kind: cancelKind,
-                closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
-                log: logStream,
-              });
-              break;
+            if (cancelKind !== undefined) {
+              // Same contract as the aborted branch, for every mark: no
+              // errorPolicy retry (which would relaunch the inference the
+              // framework cancelled), no inference:failed or
+              // inference:exhausted (which feed the failure streak /
+              // hard-down / poison-history accounting), and — a
+              // framework-owned cancel — no [turn-interrupted] marker:
+              // nobody stopped the agent. The loop's head has dropped every
+              // event of a stream that no longer owns its agent, so this one
+              // does, and the turn's routing is its own. Leave the loop, as
+              // the aborted case does: asking the iterator for more would let
+              // a stream that throws after its terminal event end the turn a
+              // second time, through the catch.
+              await endFrameworkCancel(cancelKey, cancelKind, streamRouting);
+              return;
             }
 
             if (cancelKind === undefined && callerCancel !== undefined) {
@@ -16667,7 +16744,8 @@ export class AgentFramework {
                   log: logStream,
                 });
               }
-              break;
+              // Leave the loop, as above: the stop is this stream's end.
+              return;
             }
 
             this.emitTrace({
@@ -16757,66 +16835,13 @@ export class AgentFramework {
             // framework-owned cancel (stop() also goes through cancelStream)
             // must not leave a caller record behind for a later stream.
             const callerCancel = agent.takeCancel();
-            // Framework-initiated, non-terminal cancels (endTurn tool result,
-            // context-budget restart) also surface here as `aborted` — but
-            // the turn either already settled (endTurn) or a replacement
-            // stream is queued (budget restart). Neither is a failure: no
-            // reset, no settle, no spurious inference:exhausted (which would
-            // reject an ephemeral's promise mid-run and bump the failure
-            // streak). Gate release + stream teardown happen in `finally`.
+            // Framework-initiated cancels (endTurn tool result, context-budget
+            // restart, a quiesce abandon, stop()) end by their mark.
             {
               const cancelKey = `${agent.name}:${myStreamId}`;
               const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
               if (cancelKind !== undefined) {
-                this.frameworkCancelledStreams.delete(cancelKey);
-                lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
-                // A budget restart continues the same EventGate window. Do not
-                // end it here or in finally; the replacement owns final release.
-                if (cancelKind === 'budget_restart') {
-                  preserveEventGateForSuccessor = true;
-                } else if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
-                  this.eventGate?.onInferenceEnded(agent.name);
-                }
-                if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
-                  // An operator's cancel during a quiesce drain, or
-                  // AgentFramework.stop() with this stream still live. Settle
-                  // the turn honestly, so an ephemeral run's promise rejects
-                  // now instead of riding out its idle watchdog — and
-                  // deliberately NO inference:exhausted: that trace centrally
-                  // drives the consecutive-failure streak, hard-down ops
-                  // alerts, and the poison-history breaker, none of which a
-                  // stop represents. No chronicle marker of any kind either:
-                  // nobody stopped the agent, and a resident must not read
-                  // after restart that someone did. inference:aborted and the
-                  // inference-log row carry the observability instead.
-                  this.settleFrameworkCancel({
-                    agent, myStreamId, startTime, compiledRequest,
-                    kind: cancelKind,
-                    closes: streamRouting,
-                    log: logStream,
-                  });
-                  return;
-                }
-                // endTurn IS a logical turn end — earlier rounds may have
-                // live-routed prose (narrate → skip_reply is a real shape),
-                // so settle the delivery chain and drop the receipt. A
-                // budget restart keeps the same turn's routing and tallies;
-                // the continuation stream's end writes one receipt for it.
-                if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
-                  await turnSpeechChain;
-                  this.appendProseDeliveryReceipt(agent, streamRouting);
-                }
-                // A `!` an earlier round asked for still starts its
-                // continuation when a tool ends the turn, once the turn's
-                // deliveries have run. Explicit mode doesn't hold the turn
-                // for them, so it checks at the end of its chain.
-                if (cancelKind === 'turn_ended') {
-                  if (turnProseRouting === 'explicit') {
-                    void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
-                  } else {
-                    this.requestProseContinuation(agent, streamRouting);
-                  }
-                }
+                await endFrameworkCancel(cancelKey, cancelKind, streamRouting);
                 return;
               }
             }
@@ -17008,26 +17033,22 @@ export class AgentFramework {
       // stop, marker and all. The caller record decides only when the
       // framework marked nothing. It is collected here only while this
       // stream still owns the agent; a record left behind is cleared when
-      // the agent's next stream starts. A shutdown and an operator's quiesce
-      // abandon end through the framework's terminal, as their twins do. A
-      // silent end nobody asked for, or one after endTurn or a budget
-      // restart (whose own paths have settled the turn or handed it on),
-      // keeps the prior behaviour (the finally still releases the gate).
+      // the agent's next stream starts. A framework mark on a stream that
+      // still owns its agent ends through endFrameworkCancel(), as it does
+      // from the `aborted` and `error` events and a throw: a shutdown and an
+      // operator's quiesce abandon settle as stops; endTurn writes its turn's
+      // receipt and starts a continuation it was asked for; a budget restart
+      // keeps the gate window its successor owns, which the finally would
+      // otherwise end. Only a silent end nobody asked for keeps the prior
+      // behaviour.
       // Greptile on #172, 2026-09-28; Anarchid's review, 2026-10-12.
       if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
         const callerCancel = agent.takeCancel();
         const cancelKey = `${agent.name}:${myStreamId}`;
         const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
-        if (cancelKind === 'shutdown' || cancelKind === 'quiesce_abandoned') {
-          this.frameworkCancelledStreams.delete(cancelKey);
-          lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
-          this.settleFrameworkCancel({
-            agent, myStreamId, startTime, compiledRequest,
-            kind: cancelKind,
-            closes: streamRouting,
-            log: logStream,
-          });
-        } else if (cancelKind === undefined && callerCancel !== undefined) {
+        if (cancelKind !== undefined) {
+          await endFrameworkCancel(cancelKey, cancelKind, streamRouting);
+        } else if (callerCancel !== undefined) {
           lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
           this.settleDeliberateCancel({
             agent, myStreamId, startTime, compiledRequest,
@@ -17045,6 +17066,35 @@ export class AgentFramework {
         lifecyclePhase = 'aborted';
         stream.cancel();
         return;
+      }
+      // A stream cancelled on purpose that then throws has reported its end
+      // a fourth way. As at the other three ends, the framework's mark
+      // decides first, and a caller's record decides when the framework
+      // marked nothing: a turn meant to end ends, and a caller's stop ends
+      // as a stop, not as a failure. Whatever threw, the cancel's own report
+      // or a failure that landed after the cancel, is said here, since the
+      // turn's end records the cancel and not the throw.
+      {
+        const cancelKey = `${agent.name}:${myStreamId}`;
+        const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
+        const callerCancel = agent.takeCancel();
+        if (cancelKind !== undefined || callerCancel !== undefined) {
+          console.error(`[stream] ${agent.name}: the stream threw after ${cancelKind !== undefined ? `the framework's cancel (${cancelKind})` : `a caller's stop (${callerCancel?.reason ?? 'user'})`}; its turn ends as that: ${describeFailureWithFrames(error)}`);
+        }
+        if (cancelKind !== undefined) {
+          await endFrameworkCancel(cancelKey, cancelKind, streamRouting);
+          return;
+        }
+        if (callerCancel !== undefined) {
+          lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
+          this.settleDeliberateCancel({
+            agent, myStreamId, startTime, compiledRequest,
+            reason: callerCancel.reason ?? 'user',
+            closes: streamRouting,
+            log: logStream,
+          });
+          return;
+        }
       }
       // Stream itself threw. Organization acceleration is deferred from a
       // fresh compile; every other throw keeps the ordinary exhausted path.
