@@ -41,7 +41,9 @@ export interface ProcessLoggingConfig {
  * the agent already has broader host access through its tools).
  */
 export interface CodeExecutionConfig {
-  /** Master switch — the tool is only synthesized when true. */
+  /** Master switch — only `true` synthesizes the tool. `create()` refuses a
+   *  value that isn't a boolean, a quoted "false" included; `null` or leaving
+   *  it out counts as off. */
   enabled: boolean;
   /** Python interpreter to spawn (default: 'python3' from PATH). */
   pythonPath?: string;
@@ -210,7 +212,8 @@ export interface FrameworkConfig {
 
   /**
    * Client-side programmatic tool calling (`code_execution` tool). Omitted or
-   * `enabled: false` → tool absent, no python is ever spawned.
+   * `enabled: false` → tool absent, no python is ever spawned. A value that
+   * isn't an object is refused at `create()`.
    */
   codeExecution?: CodeExecutionConfig;
 
