@@ -201,7 +201,7 @@ never do.
 ```bash
 npm install
 npm run build         # tsc; tests run from dist/, so build first
-npm test              # node --test dist/test/*.test.js
+npm test              # node --test --test-force-exit dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
 npx tsc --noEmit      # typecheck
 ```
 
