@@ -158,6 +158,10 @@ interface PendingExec {
   backgroundCeilingMs: number | undefined;
   /** A background exec has its interpreter to itself, so no earlier script's state is lost with it. */
   background: boolean;
+  /** Set once the script went to the interpreter. Before that, the exec is
+   *  waiting for the interpreter to start, and an interpreter that exits then
+   *  failed to start (see exec). */
+  sent: boolean;
 }
 
 export class PyRunner {
@@ -178,8 +182,6 @@ export class PyRunner {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private execCounter = 0;
   private disposed = false;
-  /** An exec has passed the busy check but is still awaiting the interpreter. */
-  private starting = false;
 
   constructor(options: PyRunnerOptions) {
     this.pythonPath = options.pythonPath ?? 'python3';
@@ -192,7 +194,7 @@ export class PyRunner {
   }
 
   get busy(): boolean {
-    return this.pending !== null || this.starting;
+    return this.pending !== null;
   }
 
   /**
@@ -234,79 +236,90 @@ export class PyRunner {
     }
     this.clearIdleTimer();
 
-    this.starting = true; // claimed before the await: a same-tick second exec must see it
+    // The exec claims the runner before the await: a same-tick second exec
+    // sees it busy, and abort() or dispose() while the interpreter starts
+    // settles this exec, whose script then never runs.
+    let resolveResult!: (result: ExecResult) => void;
+    const settled = new Promise<ExecResult>((resolve) => {
+      resolveResult = resolve;
+    });
+    const pending: PendingExec = {
+      id: `e${++this.execCounter}`,
+      resolve: resolveResult,
+      deadlineTimer: null,
+      killTimer: null,
+      settled: false,
+      deadlineMs: null,
+      ceilingMs: opts?.ceilingMs,
+      backgroundCeilingMs: opts?.backgroundCeilingMs,
+      background: background !== undefined,
+      sent: false,
+    };
+    this.pending = pending;
     try {
       await this.ensureChild();
     } catch (err) {
-      this.reclaim('spawn-failed');
-      return {
-        stdout: '',
-        stderr: startFailure(this.pythonPath, err),
-        returnCode: 1,
-        aborted: true,
-      };
-    } finally {
-      this.starting = false; // `pending` is set below, with no await in between
+      // Settled already when an abort or dispose reclaimed the interpreter
+      // as it started; another exec may have claimed the runner since.
+      if (!pending.settled) {
+        this.settlePending({
+          stdout: '',
+          stderr: startFailure(this.pythonPath, err),
+          returnCode: 1,
+          aborted: true,
+        });
+        this.reclaim('spawn-failed');
+      }
+      return settled;
     }
+    if (pending.settled) return settled;
 
-    const execId = `e${++this.execCounter}`;
+    const execId = pending.id;
     // Clamped: a deadline past Node's timer range would fire at once instead of never.
     const deadlineMs = Math.min(MAX_TIMER_MS, background?.lifetimeMs ?? opts?.deadlineMs ?? this.scriptTimeoutMs);
     this.onWake = background?.onWake ?? null;
-    const result = await new Promise<ExecResult>((resolve) => {
-      const pending: PendingExec = {
-        id: execId,
-        resolve,
-        deadlineTimer: null,
-        killTimer: null,
-        settled: false,
-        deadlineMs: null,
-        ceilingMs: opts?.ceilingMs,
-        backgroundCeilingMs: opts?.backgroundCeilingMs,
-        background: background !== undefined,
-      };
-      this.pending = pending;
+    pending.deadlineTimer = setTimeout(() => {
+      pending.deadlineMs = deadlineMs;
+      // Deadline: ask politely first (script sees CancelledError and its
+      // exec_result still flows back), then kill on unresponsiveness.
+      this.send({ op: 'cancel', id: execId, reason: 'deadline' });
+      // The cancel lands only when the script awaits. Blocking code (time.sleep, a
+      // busy loop, a blocking read) never does, so interrupt it as well: the runtime
+      // raises KeyboardInterrupt in the script's own code, or schedules the
+      // cancellation of a script that is waiting. Repeated, because a waiting script
+      // can resume into blocking code before that cancellation runs; the runtime
+      // ignores the repeats once the script was interrupted or cancelled.
+      this.interruptChild();
+      pending.interruptTimer = setInterval(() => this.interruptChild(), INTERRUPT_REPEAT_MS);
+      pending.killTimer = setTimeout(() => {
+        pending.deadlineMs = null; // this message already says why
+        this.settlePending({
+          stdout: '',
+          stderr:
+            `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, so it was killed` +
+            (pending.background ? '. ' : ' and the interpreter restarted (variables from earlier scripts are gone). ') +
+            limitRemedy(deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs),
+          returnCode: 1,
+          aborted: true,
+        });
+        this.reclaim('deadline-kill');
+      }, this.cancelGraceMs);
+    }, deadlineMs);
+    // A day-scale background deadline must not hold the process open.
+    if (background) pending.deadlineTimer.unref?.();
 
-      pending.deadlineTimer = setTimeout(() => {
-        pending.deadlineMs = deadlineMs;
-        // Deadline: ask politely first (script sees CancelledError and its
-        // exec_result still flows back), then kill on unresponsiveness.
-        this.send({ op: 'cancel', id: execId, reason: 'deadline' });
-        // The cancel lands only when the script awaits. Blocking code (time.sleep, a
-        // busy loop, a blocking read) never does, so interrupt it as well: the runtime
-        // raises KeyboardInterrupt in the script's own code, or schedules the
-        // cancellation of a script that is waiting. Repeated, because a waiting script
-        // can resume into blocking code before that cancellation runs; the runtime
-        // ignores the repeats once the script was interrupted or cancelled.
-        this.interruptChild();
-        pending.interruptTimer = setInterval(() => this.interruptChild(), INTERRUPT_REPEAT_MS);
-        pending.killTimer = setTimeout(() => {
-          pending.deadlineMs = null; // this message already says why
-          this.settlePending({
-            stdout: '',
-            stderr:
-              `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, so it was killed` +
-              (pending.background ? '. ' : ' and the interpreter restarted (variables from earlier scripts are gone). ') +
-              limitRemedy(deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs),
-            returnCode: 1,
-            aborted: true,
-          });
-          this.reclaim('deadline-kill');
-        }, this.cancelGraceMs);
-      }, deadlineMs);
-      // A day-scale background deadline must not hold the process open.
-      if (background) pending.deadlineTimer.unref?.();
-
-      this.send({
-        op: 'init',
-        tools: tools.map((t) => ({ py_name: t.pyName, tool_name: t.toolName })),
-        call_timeout_s: Math.round(this.toolCallTimeoutMs / 1000),
-        ...(background
-          ? { background: true, log_path: background.logPath ?? null }
-          : {}),
-      });
-      this.send({ op: 'exec', id: execId, code });
+    pending.sent = true;
+    this.send({
+      op: 'init',
+      tools: tools.map((t) => ({ py_name: t.pyName, tool_name: t.toolName })),
+      call_timeout_s: Math.round(this.toolCallTimeoutMs / 1000),
+      ...(background
+        ? { background: true, log_path: background.logPath ?? null }
+        : {}),
     });
+    this.send({ op: 'exec', id: execId, code });
+
+    const result = await settled;
 
     this.onWake = null;
     if (!background) this.armIdleTimer();
@@ -314,9 +327,12 @@ export class PyRunner {
   }
 
   /**
-   * Abort a running script (turn cancelled, agent reset/stopped). The
-   * interpreter is reclaimed: after an abort its state is suspect (a script
-   * died midway), and the next exec gets a fresh one.
+   * Abort the runner's script (its turn ended or is reset to run again, or the
+   * agent was reset or stopped), whether it's running or still waiting for its
+   * interpreter to start; a waiting script then never runs. The exec settles
+   * at once, and the interpreter is reclaimed, a starting one too: after an
+   * abort its state is suspect (a script died midway), and the next exec gets
+   * a fresh one.
    */
   abort(reason: string): void {
     if (!this.pending) return;
@@ -369,16 +385,38 @@ export class PyRunner {
       console.error(`[pytc:${this.label}] ${chunk.trimEnd()}`);
     });
 
+    // A write to an interpreter that no longer reads its input fails on the
+    // stream after write() returns; with no listener, that error is thrown as
+    // an uncaught exception. Such an interpreter can go on running, as after a
+    // script closes file descriptor 0, and every later message to it is lost:
+    // its exec would wait out its time limit. So end it, and its exit settles
+    // the exec now. One already dead or killed is left to its own exit.
+    let inputFailed = false;
+    child.stdin.on('error', (err) => {
+      console.error(`[pytc:${this.label}] write to the python runtime failed: ${err.message}`);
+      if (child.exitCode === null && !child.killed && child.pid !== undefined) {
+        inputFailed = true;
+        child.kill('SIGKILL');
+      }
+    });
+
     child.on('error', (err) => {
       // Spawn failure lands here (e.g. python3 missing); readiness rejects.
       console.error(`[pytc:${this.label}] python process error: ${err.message}`);
     });
 
     child.on('exit', (exitCode, signal) => {
-      if (this.pending) {
+      // An exec still waiting for the interpreter is settled by exec, as a
+      // runtime that failed to start.
+      if (this.pending?.sent) {
         this.settlePending({
           stdout: '',
-          stderr: interpreterExit(exitCode, signal, this.pending.background),
+          stderr:
+            inputFailed && signal === 'SIGKILL'
+              ? 'python runtime stopped reading its input, so it was killed and the interpreter restarted ' +
+                '(variables from earlier scripts are gone). A script that closes its standard input ' +
+                '(file descriptor 0) does this.'
+              : interpreterExit(exitCode, signal, this.pending.background),
           returnCode: 1,
           aborted: true,
         });
@@ -411,10 +449,12 @@ export class PyRunner {
       const cleanup = () => {
         clearTimeout(timeout);
         this.readyResolver = null;
+        this.readyFailer = null;
         child.off('exit', onExit);
         child.off('error', onError);
       };
       this.readyResolver = onReady;
+      this.readyFailer = onError;
       child.on('exit', onExit);
       child.on('error', onError);
     });
@@ -422,6 +462,8 @@ export class PyRunner {
   }
 
   private readyResolver: (() => void) | null = null;
+  /** Fails the readiness of an interpreter that is still starting (see reclaim). */
+  private readyFailer: ((err: Error) => void) | null = null;
 
   private handleLine(line: string, child: ChildProcessWithoutNullStreams): void {
     let msg: { op?: string; id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
@@ -500,8 +542,10 @@ export class PyRunner {
     if (pending.deadlineMs !== null && result.returnCode !== 0) {
       const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit. `
         + `${limitRemedy(pending.deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs)}\n`;
+      // On a line of its own: the runner's own texts, such as an interpreter's exit, end without a newline.
+      const withNote = (text: string) => (text === '' || text.endsWith('\n') ? text : `${text}\n`) + note;
       // A background script reports its output tail, so the note goes there too.
-      result = { ...result, stderr: result.stderr + note, ...(result.tail !== undefined ? { tail: result.tail + note } : {}) };
+      result = { ...result, stderr: withNote(result.stderr), ...(result.tail !== undefined ? { tail: withNote(result.tail) } : {}) };
     }
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
     if (pending.killTimer) clearTimeout(pending.killTimer);
@@ -560,6 +604,12 @@ export class PyRunner {
     if (this.child) {
       console.error(`[pytc:${this.label}] reclaiming python interpreter (${reason})`);
     }
+    // An interpreter killed as it starts never says it's ready: fail its
+    // readiness now, so an exec waiting on it returns at once rather than at
+    // the 15 s timeout. Here rather than in teardownChild, which an
+    // interpreter's own exit also runs, so that one still reads "exited as
+    // it started".
+    this.readyFailer?.(new Error(`python runtime reclaimed (${reason}) before it was ready`));
     this.teardownChild();
     this.clearIdleTimer();
   }
@@ -574,13 +624,19 @@ export class PyRunner {
       this.child = null;
       this.childReady = null;
       this.readyResolver = null;
+      this.readyFailer = null;
       child.removeAllListeners('exit');
       try {
         child.stdin.end();
       } catch {
         // stream may already be destroyed
       }
-      if (child.exitCode === null && !child.killed) {
+      // A child whose spawn failed has no pid, and its exitCode stays null
+      // until Node's 'error' for it, a tick later. A kill() in that tick, as
+      // from an abort or dispose on the tick exec was called, signals no
+      // child of ours but whatever pid Node's handle held: the host's own
+      // process group on Node 20.20.2, another process's pid on 24.19.
+      if (child.exitCode === null && !child.killed && child.pid !== undefined) {
         child.kill('SIGKILL');
       }
     }

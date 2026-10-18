@@ -13,22 +13,23 @@ import { describe, test, type TestContext } from 'node:test';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DISK_AGREEMENT_RECORD_TYPE, DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import { RecordJournal } from '../src/record-journal.js';
-import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
+import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
+import { changedAfterFstat, withFileHandle } from './helpers/file-handle.js';
 
 const FAULT_FIXTURE = join(import.meta.dirname, 'fixtures/workspace-fault.mjs');
 const TREE = 'workspace/work/tree';
@@ -190,22 +191,30 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** The hash evidence and disk facts carry for this text. */
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
-/** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
+/**
+ * Run `fn` with each file a pass reads switching branches as `onRead` says,
+ * once per file, just before its read starts: at a FileHandle readFile, or at
+ * a handle's first FileHandle read at position 0 (a file that grew past the
+ * size limit is read from its start again, on the same handle, to hash it).
+ * Any other such read in the window counts too, such as a write's
+ * verification or a listing's head read.
+ */
 async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
-  const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
-  const proto = Object.getPrototypeOf(probe) as { readFile: (...args: unknown[]) => Promise<Buffer> };
-  await probe.close();
-  const readFile = proto.readFile;
   let calls = 0;
-  proto.readFile = async function (this: unknown, ...args: unknown[]) {
-    onRead(++calls);
-    return readFile.apply(this, args);
-  };
-  try {
-    return await fn();
-  } finally {
-    proto.readFile = readFile;
-  }
+  const started = new WeakSet<object>();
+  return withFileHandle({
+    readFile: (readFile) => async function (this: unknown, ...args: unknown[]) {
+      onRead(++calls);
+      return readFile.apply(this, args);
+    },
+    read: (read) => async function (this: object, ...args: unknown[]) {
+      if (args[3] === 0 && !started.has(this)) {
+        started.add(this);
+        onRead(++calls);
+      }
+      return read.apply(this, args);
+    },
+  }, fn);
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
@@ -499,7 +508,7 @@ describe('workspace deletes', () => {
 
     env.writeDisk('b.txt', 'edited in the shell');
     const error = await refused(m, 'delete', { path: 'work/b.txt' });
-    assert.match(error, /did not unlink/);
+    assert.match(error, /^The deletion of "work\/b\.txt" is stored in the workspace, so don't send it again\. Its push to disk didn't complete: /);
     assert.equal(env.readDisk('b.txt'), 'edited in the shell', 'the shell edit survives');
   });
 });
@@ -709,6 +718,658 @@ describe('a sync says what it passed over (agent-framework #276)', () => {
       .filter((r) => r.reason === 'ignored by the mount').map((r) => r.path).sort();
     assert.deepEqual(regions, ['LOG.md', 'vendor']);
     assert.equal(bare.passedOver, undefined, 'a region reported as incomplete is not also passed over');
+  });
+});
+
+/** The walk's reason for an editor's swap or backup file. */
+const EDITOR = "an editor's swap or backup file";
+
+/** Waits, polling, until `ok` holds. */
+async function until(ok: () => boolean, what: string, ms = 5000): Promise<void> {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 25))) if (ok()) return;
+  assert.fail(what);
+}
+
+describe("editors' swap and backup files are passed over by name (connectome-host #278)", () => {
+
+  test('a sync without a path passes over them by their own whole name, wherever they are, and counts them', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    // A directory with such a name is passed over with what lies beneath it.
+    for (const f of ['.gate.json.swp', '.gate.json.swx', 'gate.json~', '.x.subl3f9.tmp', 'deep/dir/.notes.md.swp', 'drafts~/x.txt']) env.writeDisk(f, 'editor state');
+    // Not editors' names: one dot before `swp`, no leading dot, another
+    // backup suffix, a tilde mid-name, Sublime's form not the whole name, and
+    // a plain name under a directory with a dot in its name.
+    const taken = ['gate.json', 'notes.swp', 'report.v2.swp', 'backup.txt.bak', 'notes~draft.md', 'notes.sublime.tmpl', 'a.subl.tmp.csv', '.cfg/notes.swp'];
+    for (const f of taken) env.writeDisk(f, 'taken in');
+
+    const data = await call(m, 'sync', {});
+    assert.equal(data.totalSynced, taken.length);
+    assert.deepEqual(env.store.treeList(TREE).map((e: { path: string }) => e.path).sort(), [...taken].sort());
+    assert.deepEqual(data.passedOver, [{ mount: 'work', reason: EDITOR, count: 6 }]);
+    assert.equal((await listing(m)).has('gate.json~'), false, 'a listing passes over them too');
+
+    // Naming a path beneath such a directory syncs it, and says why a sync
+    // without one won't.
+    const named = await call(m, 'sync', { path: 'work/drafts~/x.txt' });
+    assert.equal(named.totalSynced, 1);
+    assert.deepEqual(named.ignored, [{ mount: 'work', path: 'drafts~/x.txt',
+      note: "it has an editor's swap or backup file name, or lies under one, so a sync without a path won't maintain it" }]);
+  });
+
+  test('a stored copy is treated as one the ignore list covers: a change on disk is passed over, a deletion is taken', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['*.md'] });
+    env.writeDisk('LOG.md', 'v1');
+    env.writeDisk('gate.json~', 'v1');
+
+    // Naming a path syncs it, and the result says a sync without one won't.
+    const named = await call(m, 'sync', { path: 'work/gate.json~' });
+    assert.equal(named.totalSynced, 1);
+    assert.deepEqual(named.ignored, [{ mount: 'work', path: 'gate.json~',
+      note: "it has an editor's swap or backup file name, or lies under one, so a sync without a path won't maintain it" }]);
+    await call(m, 'sync', { path: 'work/LOG.md' });
+    const stored = (f: string) => env.store.treeGet(TREE, f)?.blobHash;
+    const v1 = { 'LOG.md': stored('LOG.md'), 'gate.json~': stored('gate.json~') };
+    assert.ok(v1['LOG.md'] && v1['gate.json~'], 'both are stored');
+
+    env.writeDisk('LOG.md', 'v2');
+    env.writeDisk('gate.json~', 'v2');
+    const bare = await call(m, 'sync', {});
+    assert.equal(bare.totalSynced, 0);
+    for (const f of ['LOG.md', 'gate.json~'] as const) {
+      assert.equal(stored(f), v1[f], `${f}: the stored copy stays as it was`);
+      assert.equal((await listing(m)).get(f)?.state, 'unverified', f);
+      // A grep that reaches it by its own path passes over it too.
+      await call(m, 'grep', { pattern: 'v', path: `work/${f}` });
+      assert.equal(stored(f), v1[f], `${f}: nor by a grep naming it`);
+    }
+    assert.deepEqual((bare.incomplete as Array<{ path: string; reason: string }>).map(({ path, reason }) => [path, reason]).sort(),
+      [['LOG.md', 'ignored by the mount'], ['gate.json~', EDITOR]]);
+
+    // A complete listing of the directory lacks them: absent, as anything it lacks.
+    env.rmDisk('LOG.md');
+    env.rmDisk('gate.json~');
+    await call(m, 'sync', {});
+    for (const f of ['LOG.md', 'gate.json~']) assert.equal(env.store.treeGet(TREE, f), null, `${f}: its deletion is taken`);
+  });
+
+  test('a materialize treats a stored copy as any file the workspace holds, as it treats one the ignore list covers', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['*.md'] });
+    const files = ['LOG.md', 'gate.json~', 'plain.txt'];
+    const disk = (f: string) => (existsSync(env.disk(f)) ? readFileSync(env.disk(f), 'utf8') : null);
+    for (const f of files) {
+      env.writeDisk(f, 'v1');
+      await call(m, 'sync', { path: `work/${f}` });
+    }
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('earlier', main);
+    // Deleted on disk, and the deletion taken in by a sync without a path.
+    for (const f of files) env.rmDisk(f);
+    await call(m, 'sync', {});
+    for (const f of files) assert.equal(env.store.treeGet(TREE, f), null, f);
+
+    // A branch whose history holds them writes them back where disk lacks them.
+    env.store.switchBranch('earlier');
+    await m.materializeMount('work');
+    for (const f of files) assert.equal(disk(f), 'v1', `${f} is written back`);
+
+    // A change the workspace owes goes to disk while disk has the copy they agreed on.
+    for (const f of files) await call(m, 'write', { path: `work/${f}`, content: 'v2' });
+    const owed = await call(m, 'materialize', { path: 'work' });
+    assert.deepEqual((owed.materialized as Array<{ path: string }>).map((w) => w.path).sort(), [...files].sort());
+    for (const f of files) assert.equal(disk(f), 'v2', f);
+
+    // A change disk made is left alone, as a conflict, unless forced.
+    for (const f of files) {
+      await call(m, 'write', { path: `work/${f}`, content: 'v3' });
+      env.writeDisk(f, 'edited on disk');
+    }
+    const left = await call(m, 'materialize', { path: 'work' });
+    assert.deepEqual((left.skipped as Array<{ reason: string }>).map((s) => s.reason.split(':')[0]).sort(), [...files].sort());
+    for (const s of left.skipped as Array<{ reason: string }>) assert.match(s.reason, /\(conflict: both-changed\)/);
+    for (const f of files) assert.equal(disk(f), 'edited on disk', f);
+    await call(m, 'materialize', { path: 'work', force: true });
+    for (const f of files) assert.equal(disk(f), 'v3', `${f}: forced`);
+  });
+});
+
+describe('a listing, glob or grep inside a directory passed over by design', () => {
+  for (const [kind, ignore, dir, reason] of [
+    ["an editor's name", [], 'drafts~', EDITOR],
+    ['a bare-name ignore entry', ['node_modules'], 'node_modules', 'ignored by the mount'],
+    ['a path ignore entry', ['cache/**'], 'cache', 'ignored by the mount'],
+  ] as const) {
+    test(`takes nothing in there and names the region, so it tracks nothing (${kind})`, async (t) => {
+      const env = new Env(t);
+      env.writeDisk(`${dir}/a.txt`, 'x');
+      env.writeDisk(`${dir}/pkg/index.js`, 'x');
+      const m = await env.open({ ignore: [...ignore] });
+      // The region says why, and how to take what's there in on purpose.
+      const region = (path: string) => ({ path, reason: `${reason}: a sync that names this path takes in what's there, editors' files aside` });
+      // At the directory, and at a scope beneath it, which a directory above
+      // passes over too.
+      for (const scope of [dir, `${dir}/pkg`]) {
+        for (const recursive of [false, true]) {
+          const ls = await call(m, 'ls', { path: `work/${scope}`, recursive });
+          assert.deepEqual(ls.entries, [], `ls ${scope} (recursive ${recursive})`);
+          assert.deepEqual(ls.incomplete, [region(scope)], `ls ${scope} (recursive ${recursive}) names the region`);
+        }
+        const globbed = await call(m, 'glob', { pattern: '**', path: `work/${scope}` });
+        assert.deepEqual(globbed.matches, [], `glob ${scope}`);
+        assert.deepEqual(globbed.incomplete, [region(`work/${scope}`)], `glob ${scope}`);
+        const grepped = await call(m, 'grep', { pattern: 'x', path: `work/${scope}` });
+        assert.deepEqual(grepped.results, [], `grep ${scope}`);
+        assert.deepEqual(grepped.incomplete, [region(`work/${scope}`)], `grep ${scope}`);
+      }
+      assert.deepEqual(env.store.treeList(TREE), [], 'nothing beneath it is tracked');
+      // A sync that names it still syncs what's there (#276).
+      const named = await call(m, 'sync', { path: `work/${dir}` });
+      assert.equal(named.totalSynced, 2);
+      const stored = () => env.store.treeList(TREE).map((e: { path: string; blobHash: string }) => `${e.path} ${e.blobHash}`).sort();
+      const before = stored();
+      assert.deepEqual(before.map((e) => e.split(' ')[0]), [`${dir}/a.txt`, `${dir}/pkg/index.js`], 'the named sync stored both');
+      // The copies it stored are listed, unobserved, and a change on disk
+      // isn't taken in by a listing, glob or grep there.
+      env.writeDisk(`${dir}/a.txt`, 'changed on disk');
+      const listed = await listing(m, `work/${dir}`);
+      assert.deepEqual([...listed.keys()].sort(), [`${dir}/a.txt`, `${dir}/pkg/index.js`]);
+      for (const e of listed.values()) assert.equal(e.state, 'unverified', `${e.path} is unobserved`);
+      await call(m, 'glob', { pattern: '**', path: `work/${dir}` });
+      await call(m, 'grep', { pattern: 'x', path: `work/${dir}` });
+      assert.deepEqual(stored(), before, 'nothing was taken in');
+    });
+  }
+});
+
+describe('a file tool naming a path passed over by design', () => {
+  // The last column: what a sync without a path then reports under skipped.
+  // Beneath a directory passed over by design, no walk can show the deleted
+  // file gone either, so its evidence is reported too, as on main; a file
+  // passed over by its own name is shown absent by the walk of its directory.
+  for (const [kind, ignore, read, edit, gone, skipped] of [
+    ['beneath a directory an ignore entry covers', ['node_modules'], 'node_modules/pkg/index.d.ts', 'node_modules/pkg/edit.d.ts', 'node_modules/pkg/gone.d.ts',
+      ['node_modules/pkg/edit.d.ts', 'node_modules/pkg/gone.d.ts', 'node_modules/pkg/index.d.ts']],
+    ['that an ignore entry covers by its own name', ['*.log'], 'build.log', 'edit.log', 'gone.log', ['build.log', 'edit.log']],
+    ["that is an editor's backup file", [], 'draft.md~', 'edit.md~', 'gone.md~', ['draft.md~', 'edit.md~']],
+  ] as const) {
+    test(`reads, edits and deletes a file ${kind} that the store doesn't hold, as a sync naming it takes it in (#276)`, async (t) => {
+      const env = new Env(t);
+      for (const f of [read, edit, gone]) env.writeDisk(f, `${f} v1\n`);
+      const m = await env.open({ ignore: [...ignore], autoMaterialize: true });
+      await call(m, 'sync', {});
+      assert.deepEqual(env.store.treeList(TREE), [], 'a sync without a path passes over all three');
+      assert.equal((await call(m, 'read', { path: `work/${read}` })).content, `     1\t${read} v1`);
+      await call(m, 'edit', { path: `work/${edit}`, oldString: 'v1', newString: 'v2' });
+      assert.equal(env.readDisk(edit), `${edit} v2\n`, 'the edit reached disk');
+      assert.equal((await call(m, 'delete', { path: `work/${gone}` })).deleted, true);
+      assert.equal(existsSync(env.disk(gone)), false, 'the deletion reached disk');
+      const paths = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).sort();
+      assert.deepEqual(paths(), [edit, read].sort(), 'the read and the edit took their files in');
+      // What they took in stays passed over by a sync without a path, which says so.
+      const bare = await call(m, 'sync', {});
+      assert.deepEqual((bare.skipped as Array<{ path: string }>).map((s) => s.path).sort(), [...skipped]);
+      assert.deepEqual(paths(), [edit, read].sort());
+    });
+  }
+
+  test("the nested mount's refusal comes first, and the lazy pass takes nothing in from another mount's directory", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('node_modules/pkg/inner.txt', 'inner');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+      { name: 'deep', path: env.disk('node_modules/pkg'), mode: 'read-write', watch: 'never' },
+    ] });
+    for (const [tool, input] of [
+      ['read', { path: 'work/node_modules/pkg/inner.txt' }],
+      ['edit', { path: 'work/node_modules/pkg/inner.txt', oldString: 'inner', newString: 'outer' }],
+      ['delete', { path: 'work/node_modules/pkg/inner.txt' }],
+    ] as const) {
+      const said = await refused(m, tool, input);
+      assert.ok(said.includes('mount "deep"') && said.includes('"deep/inner.txt"'), `${tool}: ${said}`);
+    }
+    // The lazy pass itself, reached past the refusal, observes nothing there.
+    const mount = (m as any).mounts.get('work');
+    await (m as any).withMount(mount, () => (m as any).ensureSynced(mount, 'node_modules/pkg/inner.txt'));
+    assert.deepEqual(env.store.treeList(TREE), [], 'the outer store gains nothing');
+    assert.equal(env.readDisk('node_modules/pkg/inner.txt'), 'inner');
+  });
+});
+
+describe('a mount nested inside another', () => {
+  test('is passed over by the outer mount as the directory it is, and nothing else is', async (t) => {
+    const env = new Env(t);
+    for (const f of ['top.txt', 'cat.txt', 'a/b/inner.txt', 'c/near.txt', 'sub/c', 'sub/x/c/f.txt', '..cache/f.txt']) env.writeDisk(f, f);
+    const m = await env.open({}, { mounts: [
+      // `a/b` listed by hand matches nothing, so it doesn't stand in for the
+      // nested mount's entry.
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', ignore: ['a/b'] },
+      { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+      { name: 'near', path: env.disk('c'), mode: 'read-write', watch: 'never' },
+      // A name that only begins with two dots is inside the outer mount.
+      { name: 'dots', path: env.disk('..cache'), mode: 'read-write', watch: 'never' },
+    ] });
+    const OTHER = "another mount's directory";
+    const bare = await call(m, 'sync', { mount: 'work' });
+    // None of the nested mounts' files, and the entries that only share a
+    // nested mount's name.
+    const tree = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).sort();
+    // cat.txt only begins with the nested mount c's name.
+    assert.deepEqual(tree(), ['cat.txt', 'sub/c', 'sub/x/c/f.txt', 'top.txt']);
+    assert.deepEqual((bare.passedOver as Array<{ reason: string; count: number }>).filter((p) => p.reason === OTHER).map((p) => p.count), [3],
+      'it passes over the three nested mounts, each as its directory');
+    // A sync that names a nested mount's directory, or a path beneath it,
+    // takes nothing in, and its region gives no advice: no sync of this
+    // mount does.
+    for (const [path, use] of [['a/b', 'deep'], ['a/b/inner.txt', 'deep/inner.txt'], ['c', 'near']]) {
+      const named = await call(m, 'sync', { path: `work/${path}` });
+      assert.equal(named.totalSynced, 0, path);
+      assert.deepEqual((named.ignored as Array<{ note: string }>).map((i) => i.note),
+        [`it lies in mount "${use.split('/')[0]}", nested in this one, which no sync of this mount takes in: use "${use}"`], path);
+      // A named file is a paths pass, which makes no region; a directory's
+      // walk names it, with the mount that holds it.
+      assert.deepEqual(((named.incomplete ?? []) as Array<{ path: string; reason: string }>).map((r) => [r.path, r.reason]),
+        path === 'a/b/inner.txt' ? [] : [[path, `it lies in mount "${use}", nested in this one: use "${use}"`]], path);
+    }
+    // A listing, glob or grep of it lists and searches nothing beneath it,
+    // takes nothing in, and names the region under `incomplete`.
+    for (const [tool, input, list, region] of [
+      ['ls', { path: 'work/a/b' }, 'entries', 'a/b'],
+      ['glob', { path: 'work/a/b', pattern: '*' }, 'matches', 'work/a/b'],
+      ['grep', { path: 'work/a/b', pattern: 'inner' }, 'results', 'work/a/b'],
+    ] as const) {
+      const listed = await call(m, tool, input as Record<string, unknown>);
+      assert.deepEqual(listed[list], [], `${tool} lists nothing beneath it`);
+      assert.deepEqual((listed.incomplete as Array<{ path: string; reason: string }>).map((r) => [r.path, r.reason]),
+        [[region, 'it lies in mount "deep", nested in this one: use "deep"']], tool);
+    }
+    assert.deepEqual(tree(), ['cat.txt', 'sub/c', 'sub/x/c/f.txt', 'top.txt'], 'nothing of theirs was taken in');
+    // A file that only shares a nested mount's name is this mount's, named or not.
+    env.writeDisk('sub/c', 'changed');
+    const subc = await call(m, 'sync', { path: 'work/sub/c' });
+    assert.equal(subc.totalSynced, 1);
+  });
+
+  test("never reaches the outer mount's tree while both mounts' watchers run", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'always', watchDebounceMs: 50 },
+      { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'always', watchDebounceMs: 50 },
+    ] });
+    const mount = (m as any).mounts.get('work');
+    const deep = (m as any).mounts.get('deep');
+    const tree = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).sort();
+    const deepTree = () => env.store.treeList('workspace/deep/tree').map((e: { path: string }) => e.path).sort();
+    await until(() => !!mount.watcherReadyAt && !!deep.watcherReadyAt && tree().includes('top.txt') && deepTree().includes('inner.txt'),
+      'both watchers are ready and their catch-up scans ran');
+    // The inner mount takes its new file in, so the change has reached the
+    // watchers; the outer mount's own new file, written after it, is taken
+    // in after that. (MountWatcher's own test pins the outer watcher's filter.)
+    env.writeDisk('a/b/new.txt', 'nested');
+    await until(() => deepTree().includes('new.txt'), 'the inner mount takes its new file in');
+    env.writeDisk('later.txt', 'outer');
+    await until(() => tree().includes('later.txt'), 'the outer mount takes its own new file in');
+    assert.deepEqual(tree(), ['later.txt', 'top.txt']);
+  });
+});
+
+describe("another mount's directory, to the outer mount's file tools and pushes", () => {
+  const nested = (env: Env): Partial<WorkspaceConfig> => ({ mounts: [
+    { name: 'work', path: env.dir, mode: 'read-write', watch: 'never' },
+    { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+  ] });
+
+  test('every file tool of the outer mount refuses a path there, naming the mount that holds it and the path to use', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, nested(env));
+    for (const [tool, input, use] of [
+      ['read', { path: 'work/a/b/inner.txt' }, 'deep/inner.txt'],
+      ['write', { path: 'work/a/b/inner.txt', content: 'outer' }, 'deep/inner.txt'],
+      ['edit', { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }, 'deep/inner.txt'],
+      ['delete', { path: 'work/a/b/inner.txt' }, 'deep/inner.txt'],
+      ['write', { path: 'work/a/b/sub/new.txt', content: 'outer' }, 'deep/sub/new.txt'],
+      ['read', { path: 'work/a/b' }, 'deep'],
+    ] as const) {
+      const said = await refused(m, tool, input as Record<string, unknown>);
+      assert.ok(said.includes('mount "deep"') && said.includes(`"${use}"`), `${tool} ${input.path}: ${said}`);
+    }
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner');
+    assert.equal(existsSync(env.disk('a/b/sub/new.txt')), false);
+    assert.equal(env.store.treeList(TREE).some((e: { path: string }) => e.path.startsWith('a/b/')), false, 'the outer store gains nothing there');
+    await assert.rejects(m.readFileFromDisk('work/a/b/inner.txt'), (err: unknown) => (err as { code?: string }).code === 'other_mount');
+    assert.equal(m.resolveAbsolutePath('work/a/b/inner.txt'), null);
+    const binary = await m.readBinary('work/a/b/inner.txt');
+    assert.ok('error' in binary && binary.error.includes('"deep/inner.txt"'), JSON.stringify(binary));
+    const fromDisk = await m.readBinaryFromDisk('work/a/b/inner.txt');
+    assert.ok('error' in fromDisk && fromDisk.error.includes('"deep/inner.txt"'), JSON.stringify(fromDisk));
+    const written = await m.writeBinary('work/a/b/img.png', Buffer.from('png'), 'image/png');
+    assert.ok(!written.success && String(written.error).includes('"deep/img.png"'), JSON.stringify(written));
+    const image = await refused(m, 'read_image', { path: 'work/a/b/img.png' });
+    assert.ok(image.includes('"deep/img.png"'), image);
+    // The path it names works, and the outer mount's own files stay its own.
+    assert.match((await call(m, 'read', { path: 'deep/inner.txt' })).content, /inner/);
+    assert.match((await call(m, 'read', { path: 'work/top.txt' })).content, /top/);
+  });
+
+  test('a spelling that lands in its directory is refused as the path it lands on, and one that lands beside it is not', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, nested(env));
+    for (const path of ['work/./a/b/inner.txt', 'work/a/c/../b/inner.txt', 'work/a//b/inner.txt']) {
+      const said = await refused(m, 'read', { path });
+      assert.ok(said.includes('mount "deep"') && said.includes('"deep/inner.txt"'), `${path}: ${said}`);
+      await assert.rejects(m.readFileFromDisk(path), (err: unknown) => (err as { code?: string }).code === 'other_mount', path);
+      assert.equal(m.resolveAbsolutePath(path), null, path);
+      const fromDisk = await m.readBinaryFromDisk(path);
+      assert.ok('error' in fromDisk && fromDisk.error.includes('"deep/inner.txt"'), `${path}: ${JSON.stringify(fromDisk)}`);
+    }
+    // A spelling that climbs back out of it is the outer mount's own path,
+    // judged where it lands: read through what doesn't touch the store.
+    env.writeDisk('a/x.txt', 'x');
+    for (const [path, content] of [['work/a/b/../x.txt', 'x'], ['work/a/b/../../top.txt', 'top']]) {
+      assert.equal((await m.readFileFromDisk(path)).bytes.toString(), content, path);
+      assert.notEqual(m.resolveAbsolutePath(path), null, path);
+    }
+  });
+
+  test("grep of the outer mount returns nothing of its copy of a path there, and names the region", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    let m = await env.open();
+    await call(m, 'sync', {});
+    await env.shutdown(m);
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open({}, nested(env));
+    const bytes = Buffer.from('stale outer copy');
+    env.store.treeSet(TREE, 'a/b/inner.txt', { blobHash: env.store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+    const regions = (found: { incomplete?: Array<{ path: string; reason: string }> }) => (found.incomplete ?? []).map((r) => [r.path, r.reason]);
+    // Beneath a scope, the nested directory is passed over by design.
+    const whole = await call(m, 'grep', { path: 'work', pattern: 'stale' });
+    assert.deepEqual(whole.results, []);
+    assert.deepEqual(regions(whole), []);
+    // Named, it's the answer to what was asked: its region names the holder.
+    for (const [path, use] of [['work/a/b', 'deep'], ['work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'deep/inner.txt']]) {
+      const found = await call(m, 'grep', { path, pattern: 'stale' });
+      assert.deepEqual(found.results, [], path);
+      assert.deepEqual(regions(found), [[path, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
+    }
+    // A file there the outer store doesn't hold is named too.
+    env.writeDisk('a/b/other.txt', 'stale words');
+    const unheld = await call(m, 'grep', { path: 'work/a/b/other.txt', pattern: 'stale' });
+    assert.deepEqual(unheld.results, []);
+    assert.deepEqual(regions(unheld), [['work/a/b/other.txt', 'it lies in mount "deep", nested in this one: use "deep/other.txt"']]);
+  });
+
+  test('every nested-mount check reads a path as disk access lands it: doubled and trailing separators and dot segments included', () => {
+    for (const [path, inside] of [
+      ['a/b', true], ['a/b/x', true], ['a//b/x', true], ['a/b/', true], ['./a/b/x', true], ['a/c/../b/x', true],
+      ['a/b/../x', false], ['a/bc/x', false], ['a', false], ['', false],
+    ] as const) assert.equal(inOtherMount(path, ['a/b']), inside, path);
+  });
+
+  test('a doubled or trailing separator is the nested directory too: a sync or a listing of it takes nothing in, and no push of the outer mount writes there', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, nested(env));
+    const nestedKeys = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).filter((p: string) => inOtherMount(p, ['a/b']));
+    for (const path of ['work/a//b', 'work/a/b/', 'work/a//b/inner.txt']) {
+      const synced = await call(m, 'sync', { path });
+      assert.equal(synced.totalSynced, 0, path);
+      assert.deepEqual(nestedKeys(), [], `${path}: nothing of theirs taken in`);
+      const listed = await call(m, 'ls', { path });
+      assert.deepEqual(listed.entries, [], path);
+    }
+    // An outer copy spelled that way, as chronicle keeps it.
+    const bytes = Buffer.from('outer copy');
+    env.store.treeSet(TREE, 'a//b/inner.txt', { blobHash: env.store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+    await call(m, 'materialize', {});
+    await m.materializeMount('work');
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner', "the nested mount's file is as it was");
+  });
+
+  test("an outer copy in a nested mount's directory is passed over by design: no sync reports it incomplete, no count or bare materialize takes it up, and listings name its holder", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    let m = await env.open();
+    await call(m, 'sync', {});
+    await env.shutdown(m);
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open({}, nested(env));
+    const bytes = Buffer.from('stale outer copy');
+    env.store.treeSet(TREE, 'a/b/inner.txt', { blobHash: env.store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+    // A conflict and a workspace deletion recorded there, as main's bug could leave them.
+    const intents = (m as any).intents.get('work');
+    intents.put('a/b/inner.txt', { conflict: { kind: 'both-changed', at: Date.now(), disk: null } });
+    intents.put('a/b/gone.txt', { tombstone: { hash: 'f'.repeat(64) } });
+    const bare = await call(m, 'sync', { mount: 'work' });
+    assert.deepEqual(bare.incomplete ?? [], [], 'nothing incomplete: the sync looked everywhere it should');
+    assert.deepEqual((bare.passedOver as Array<{ reason: string; count: number }>).filter((p) => p.reason === "another mount's directory").map((p) => p.count), [1]);
+    const status = (await call(m, 'status', {})).work;
+    assert.deepEqual([status.pendingChanges, status.conflicts, status.pendingWorkspaceDeletions], [0, 0, 0]);
+    const pushed = await call(m, 'materialize', {});
+    assert.equal(JSON.stringify(pushed).includes('a/b/'), false, JSON.stringify(pushed));
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner');
+    // A materialize naming an ancestor, forced, leaves it out too.
+    const ancestor = await call(m, 'materialize', { path: 'work/a', force: true });
+    assert.equal(JSON.stringify(ancestor).includes('a/b/'), false, JSON.stringify(ancestor));
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner');
+    // The copy stays in the outer branch's tree, and a listing shows it with its holder.
+    assert.ok(env.store.treeGet(TREE, 'a/b/inner.txt'));
+    const listed = await call(m, 'ls', { path: 'work', recursive: true });
+    const entry = (listed.entries as Array<{ path: string; note?: string }>).find((e) => e.path === 'a/b/inner.txt');
+    assert.equal(entry?.note, 'it lies in mount "deep", nested in this one: use "deep/inner.txt"');
+    const globbed = await call(m, 'glob', { path: 'work', pattern: '**/*.txt' });
+    const match = (globbed.matches as Array<{ path: string; note?: string }>).find((e) => e.path === 'work/a/b/inner.txt');
+    assert.equal(match?.note, 'it lies in mount "deep", nested in this one: use "deep/inner.txt"');
+  });
+
+  test("a materialize naming a path in a nested mount's directory, however spelled, pushes nothing and names the holder", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/b/inner.txt', 'inner');
+    let m = await env.open();
+    await call(m, 'sync', {});
+    await env.shutdown(m);
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open({}, nested(env));
+    const bytes = Buffer.from('outer copy');
+    env.store.treeSet(TREE, 'a/b/inner.txt', { blobHash: env.store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+    for (const [path, use] of [['work/a/b', 'deep'], ['work/a/b/', 'deep'], ['work/a//b/inner.txt', 'deep/inner.txt'], ['work/a/b/inner.txt', 'deep/inner.txt']]) {
+      const pushed = await call(m, 'materialize', { path, force: true });
+      assert.deepEqual(pushed.materialized ?? [], [], path);
+      assert.ok(JSON.stringify(pushed.skipped ?? []).includes(`use \\"${use}\\"`), `${path}: ${JSON.stringify(pushed)}`);
+    }
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner');
+  });
+
+  test('a mount configured with a relative path contains its own paths and its root, generated files included', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/b/inner.txt', 'inner');
+    env.writeDisk('top.txt', 'top');
+    const rel = relative(process.cwd(), env.dir);
+    assert.ok(!isAbsolute(rel), 'the test runs from somewhere the mount can be named relative to');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: rel, mode: 'read-write', watch: 'never' },
+      { name: 'deep', path: relative(process.cwd(), env.disk('a/b')), mode: 'read-write', watch: 'never' },
+    ] });
+    assert.match((await call(m, 'read', { path: 'work/top.txt' })).content, /top/);
+    assert.ok((await call(m, 'ls', { path: 'work' })).entries.some((e: { name: string }) => e.name === 'top.txt'), 'the root lists');
+    assert.deepEqual((await call(m, 'ls', { path: 'deep' })).entries.map((e: { name: string }) => e.name), ['inner.txt']);
+    const said = await refused(m, 'read', { path: 'work/a/b/inner.txt' });
+    assert.ok(said.includes('use "deep/inner.txt"'), said);
+    m.registerGeneratedTextFile('work/generated.md', () => 'generated', 'resident');
+    const generated = await m.handleToolCall({ id: 't', name: 'read', callerAgentName: 'resident', input: { path: 'work/generated.md' } });
+    assert.equal(generated.success, true, generated.error);
+    assert.match(JSON.stringify(generated.data), /generated/);
+  });
+
+  test('the path a refusal names works on a mount whose root is configured with a trailing separator', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir + '/', mode: 'read-write', watch: 'never' },
+      { name: 'deep', path: env.disk('a/b') + '/', mode: 'read-write', watch: 'never' },
+    ] });
+    const said = await refused(m, 'read', { path: 'work/a/b' });
+    assert.ok(said.includes('use "deep"'), said);
+    const listed = await call(m, 'ls', { path: 'deep' });
+    assert.deepEqual((listed.entries as Array<{ name: string }>).map((e) => e.name), ['inner.txt']);
+    assert.match((await call(m, 'read', { path: 'deep/inner.txt' })).content, /inner/);
+  });
+
+  test('a path in a mount nested two deep is named by its innermost mount', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/b/c/x.txt', 'x');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never' },
+      { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+      { name: 'deeper', path: env.disk('a/b/c'), mode: 'read-write', watch: 'never' },
+    ] });
+    for (const path of ['work/a/b/c/x.txt', 'deep/c/x.txt']) {
+      const said = await refused(m, 'read', { path });
+      assert.ok(said.includes('mount "deeper"') && said.includes('"deeper/x.txt"'), `${path}: ${said}`);
+    }
+  });
+
+  test("no push of the outer mount writes a path there that its store holds: a bare materialize leaves it out, and a named one says why, forced or not", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('top.txt', 'top');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    // The outer mount stored it before the inner one was configured.
+    let m = await env.open();
+    await call(m, 'sync', {});
+    assert.ok(env.store.treeGet(TREE, 'a/b/inner.txt'));
+    await env.shutdown(m);
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open({}, nested(env));
+    // Its copy moves on, as a write through the outer mount once left it.
+    const bytes = Buffer.from('outer copy');
+    env.store.treeSet(TREE, 'a/b/inner.txt', { blobHash: env.store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+    const SKIPPED = 'a/b/inner.txt: it lies in mount "deep", nested in this one, which no push of this mount writes: use "deep/inner.txt"';
+    const reasons = (pushed: { skipped?: Array<{ reason: string }> }) =>
+      (pushed.skipped ?? []).map((x) => x.reason).filter((r) => r.startsWith('a/b/inner.txt'));
+    // A bare materialize leaves it out: it isn't this mount's to push.
+    const bare = await call(m, 'materialize', { mount: 'work' });
+    assert.deepEqual(reasons(bare), []);
+    // Named, the caller is told whose it is, forced or not.
+    const forced = await call(m, 'materialize', { path: 'work/a/b/inner.txt', force: true });
+    assert.deepEqual(reasons(forced), [SKIPPED]);
+    // An undo's or a branch switch's push, forced over every tree path.
+    const written = await m.materializeMount('work');
+    assert.equal(written.some((p) => p.endsWith('a/b/inner.txt')), false);
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner', "the inner mount's file is as it was");
+  });
+
+  test('a nested mount beneath a directory the ignore list covers is still another mount\'s directory to a sync that names a path', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('vendor/own.txt', 'own');
+    env.writeDisk('vendor/lib/x.txt', 'x');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', ignore: ['vendor'] },
+      { name: 'lib', path: env.disk('vendor/lib'), mode: 'read-write', watch: 'never' },
+    ] });
+    const OTHER = 'it lies in mount "lib", nested in this one, which no sync of this mount takes in: use "lib/x.txt"';
+    const file = await call(m, 'sync', { path: 'work/vendor/lib/x.txt' });
+    assert.equal(file.totalSynced, 0);
+    assert.deepEqual((file.ignored as Array<{ note: string }>).map((i) => i.note), [OTHER]);
+    // Naming the ignored directory takes in its own files (#276), and none of the nested mount's.
+    await call(m, 'sync', { path: 'work/vendor' });
+    const tree = env.store.treeList(TREE).map((e: { path: string }) => e.path).sort();
+    assert.deepEqual(tree, ['vendor/own.txt']);
+  });
+});
+
+describe('a named sync of a directory, beneath which a directory is passed over by design', () => {
+  test('keeps a copy stored beneath the passed-over directory, whether that directory is there or gone', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('src/main.txt', 'main');
+    env.writeDisk('src/cache/x', 'v1');
+    const m = await env.open({ ignore: ['cache'] });
+    await call(m, 'sync', { path: 'work/src/cache/x' });
+    const v1 = env.store.treeGet(TREE, 'src/cache/x')?.blobHash;
+    assert.ok(v1, 'a sync naming the file stores it (#276)');
+    env.writeDisk('src/cache/x', 'v2');
+    await call(m, 'sync', { path: 'work/src' });
+    assert.equal(env.store.treeGet(TREE, 'src/cache/x')?.blobHash, v1, 'present and changed: unobserved');
+    rmSync(env.disk('src/cache'), { recursive: true, force: true });
+    await call(m, 'sync', { path: 'work/src' });
+    assert.equal(env.store.treeGet(TREE, 'src/cache/x')?.blobHash, v1, 'gone: still unobserved, not taken as deleted');
+    // Naming the passed-over directory itself takes in what's there, as #276 has it.
+    await call(m, 'sync', { path: 'work/src/cache' });
+    assert.equal(env.store.treeGet(TREE, 'src/cache/x'), null, 'a sync naming it takes its deletion');
+  });
+});
+
+describe('a copy stored beneath a directory passed over by design', () => {
+  for (const [kind, ignore, dir, reason] of [
+    ['the ignore list covers', ['cache/**'], 'cache', 'ignored by the mount'],
+    ["with an editor's name", [], 'drafts~', EDITOR],
+  ] as const) {
+    test(`is unobserved there, and stays when it is deleted on disk, since no walk lists that directory (${kind})`, async (t) => {
+      const env = new Env(t);
+      env.writeDisk(`${dir}/x`, 'v1');
+      const m = await env.open({ ignore: [...ignore] });
+      await call(m, 'sync', { path: `work/${dir}/x` });
+      const v1 = env.store.treeGet(TREE, `${dir}/x`)?.blobHash;
+      assert.ok(v1, 'a named sync stores it');
+      env.writeDisk(`${dir}/x`, 'v2');
+      const bare = await call(m, 'sync', {});
+      assert.deepEqual((bare.incomplete as Array<{ path: string; reason: string }>).map(({ path, reason }) => [path, reason]), [[dir, reason]]);
+      assert.equal((await listing(m)).get(`${dir}/x`)?.state, 'unverified');
+      assert.equal(env.store.treeGet(TREE, `${dir}/x`)?.blobHash, v1, 'a change on disk is passed over');
+      // A grep that names the file reaches it by its path, and still takes
+      // nothing in: what the mount passes over by design stays unobserved,
+      // however a pass reaches it.
+      await call(m, 'grep', { pattern: 'v', path: `work/${dir}/x` });
+      assert.equal(env.store.treeGet(TREE, `${dir}/x`)?.blobHash, v1, 'nor by a grep naming it');
+      env.rmDisk(`${dir}/x`);
+      await call(m, 'sync', {});
+      assert.ok(env.store.treeGet(TREE, `${dir}/x`), 'a sync without a path leaves it as it was');
+      // With the directory itself gone, the root's listing would prove the
+      // copy absent, but the mount passes over that directory by design.
+      rmSync(env.disk(dir), { recursive: true, force: true });
+      await call(m, 'sync', {});
+      assert.ok(env.store.treeGet(TREE, `${dir}/x`), 'and so does one after the directory is gone');
+    });
+  }
+});
+
+describe("an editor's save by rename, with the watcher running", () => {
+  test('reaches a wake as a change, not a deletion, when the new copy is written at once, and the new file goes on being watched', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    // A short debounce, so a pass can run soon after the rename.
+    const m = await env.open({ watch: 'always', watchDebounceMs: 50 });
+    const mount = (m as any).mounts.get('work');
+    const blob = () => env.store.treeGet(TREE, 'gate.json')?.blobHash;
+    await until(() => !!mount.watcherReadyAt && blob() !== undefined, 'the watcher is ready and the catch-up scan took gate.json');
+    const v1 = blob();
+    env.events.length = 0;
+
+    // vim's save with a backup: the old file moves aside, the new one is
+    // written in its place, and the backup is removed.
+    renameSync(env.disk('gate.json'), env.disk('gate.json~'));
+    env.writeDisk('gate.json', 'v2');
+    unlinkSync(env.disk('gate.json~'));
+    const named = (type: string, path: string) => env.events.some((e: any) => e.type === type && e.paths?.includes(path));
+    await until(() => blob() !== v1 && named('workspace:modified', 'work/gate.json'), 'the save is taken in, as a change');
+    // Time for anything that shouldn't come to arrive.
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(!named('workspace:deleted', 'work/gate.json'), 'no wake sees a deletion');
+    assert.ok(!env.events.some((e: any) => e.paths?.includes('work/gate.json~')), 'nor the backup');
+    assert.equal(env.store.treeGet(TREE, 'gate.json~'), null);
+
+    const v2 = blob();
+    env.writeDisk('gate.json', 'v3');
+    await until(() => blob() !== v2, 'a later edit of the new file is taken in');
   });
 });
 
@@ -1053,6 +1714,33 @@ describe('restarts and faults', () => {
     assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
     assert.equal(await contentOf(m, 'a.txt'), 'C');
     assert.equal(await stateOf(m, 'a.txt'), 'synced');
+  });
+
+  test('an edit of a path the ignore list covers sees the disk version its settled adoption takes in too, since it names the path', async (t) => {
+    const env = new Env(t);
+    let m = await pendingAdoption(env);
+    m = await env.restart(m, { ignore: ['a.txt'] });
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending');
+    env.writeDisk('a.txt', 'C');
+    const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
+    assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.equal(await contentOf(m, 'a.txt'), 'C');
+  });
+
+  test('a delete of a path the ignore list covers settles its pending adoption first too, since it names the path, and deletes what the workspace then holds', async (t) => {
+    // Since #456 an edit makes a pass of its own; write, delete and
+    // writeBinary settle through settleBeforeMutation's.
+    const env = new Env(t);
+    let m = await pendingAdoption(env);
+    m = await env.restart(m, { ignore: ['a.txt'] });
+    env.writeDisk('a.txt', 'C');
+    await call(m, 'delete', { path: 'work/a.txt' });
+    // The deletion is of disk's C, which the settled adoption took in, so a
+    // materialize of the path that applies deletions carries it to disk.
+    // Settled at the commit instead, from the adoption's B, it would leave C
+    // as a copy disk changed since.
+    await call(m, 'materialize', { path: 'work/a.txt', applyDeletions: true });
+    assert.equal(existsSync(env.disk('a.txt')), false, "disk's C, the copy the deletion took in, is unlinked");
   });
 
   test('a delete settles the pending adoption first, and deletes what the workspace then holds', async (t) => {
@@ -1900,6 +2588,40 @@ describe('trust and identity at the point of use', () => {
     }
   });
 
+  // A fractional limit, too, which allows the whole bytes in it.
+  for (const limit of [1024, 1024.5]) {
+    test(`a file within the size limit (${limit}) at its fstat that grows past it before the read is hashed as oversize, not loaded whole`, async (t) => {
+      const env = new Env(t);
+      const rootReal = realpathSync(env.dir);
+      env.writeDisk('grow.txt', 'a'.repeat(100));
+      const path = env.disk('grow.txt');
+      const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(4000)),
+        () => readPath(viewOf(env.dir), rootReal, 'grow.txt', limit));
+      assert.equal(read.kind, 'read');
+      if (read.kind !== 'read') return;
+      assert.equal(read.bytes, null, 'over the limit as read, so not kept, and so not ingested');
+      assert.equal(read.size, 4100, 'hashed to its end');
+      assert.equal(read.hash, createHash('sha256').update('a'.repeat(100) + 'b'.repeat(4000)).digest('hex'));
+      assert.equal(read.head.toString(), 'a'.repeat(100) + 'b'.repeat(4000), 'its head, as for any oversize file');
+    });
+  }
+
+  test('a file that grows within the size limit after its fstat is read whole, as the read found it', async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    env.writeDisk('grow.txt', 'a'.repeat(10));
+    const path = env.disk('grow.txt');
+    const grown = 'a'.repeat(10) + 'b'.repeat(200 * 1024);
+    const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(200 * 1024)),
+      () => readPath(viewOf(env.dir), rootReal, 'grow.txt', 1024 * 1024));
+    assert.equal(read.kind, 'read');
+    if (read.kind !== 'read') return;
+    assert.equal(read.bytes?.toString(), grown, 'read on, in larger buffers, past the 10 bytes its fstat gave');
+    assert.equal(read.size, grown.length);
+    assert.equal(read.fp.size, grown.length, 'the fingerprint gives the size of the bytes hashed');
+    assert.equal(read.hash, createHash('sha256').update(grown).digest('hex'));
+  });
+
   /** A root identified as it is now, and a way to replace it: renamed away, with an empty `sub` in its place. */
   const replaceable = (env: Env) => {
     mkdirSync(env.disk('sub'), { recursive: true });
@@ -2127,6 +2849,20 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null);
   });
 
+  test('a listing, and an agent-action scan, prove a deletion in a directory larger than the cap too', async (t) => {
+    for (const via of ['ls', 'agent-action'] as const) {
+      const env = new Env(t);
+      const m = await env.open({ walkCap: 2, ...(via === 'agent-action' ? { watch: 'on-agent-action' } : {}) });
+      for (const f of ['big/a.txt', 'big/b.txt', 'big/c.txt', 'big/d.txt', 'big/e.txt']) await seedSynced(env, m, f, f);
+      env.rmDisk('big/e.txt');
+      // Each takes a.txt and b.txt; big's listing, read whole, lacks e.txt.
+      if (via === 'ls') await call(m, 'ls', { path: 'work/big' });
+      else await m.onToolBatchComplete('agent');
+      assert.equal(env.store.treeGet(TREE, 'big/e.txt'), null, via);
+      assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null, via);
+    }
+  });
+
   test('a listing starts at its scope every time, and leaves no place behind', async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);
@@ -2141,8 +2877,11 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const env = new Env(t);
     for (const f of ['d/a.txt', 'd/b.txt', 'd/c.txt', 'top.txt']) env.writeDisk(f, f);
     const m = await env.open({ walkCap: 2 });
-    await call(m, 'sync', { path: 'work/d' });
+    const first = await call(m, 'sync', { path: 'work/d' });
     assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt']);
+    assert.ok(first.incomplete.some((r: { path: string; reason: string }) =>
+      r.path === 'd' && r.reason === 'the walk cap (2) was reached: the next sync of this directory resumes after work/d/b.txt'),
+      JSON.stringify(first.incomplete));
     await call(m, 'sync', { path: 'work/d' });
     assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt', 'd/c.txt']);
     assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), undefined, 'the mount root keeps its own place');
@@ -2234,21 +2973,68 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const synced = await call(m, 'sync', {});
     const resumes = synced.incomplete.filter((r: { reason: string }) => /resumes after/.test(r.reason));
     assert.deepEqual(resumes.map((r: { mount: string; path: string; reason: string }) => [r.mount, r.path, r.reason]),
-      [['work', '', 'the walk cap (1) was reached: the next sync or scan of this scope resumes after work/a.txt']]);
+      [['work', '', 'the walk cap (1) was reached: the next sync of the mount resumes after work/a.txt']]);
     // z/q.txt sits beneath z/, which wasn't listed: its reason is z/'s, not
     // that of the root, which holds an untaken b.txt.
     const skipped = synced.skipped?.find((x: { path: string }) => x.path === 'z/q.txt');
     assert.match(skipped?.reason ?? '', /not visited: the walk cap \(1\) was reached/, JSON.stringify(synced.skipped));
   });
 
-  test('agent-action scans resume where the last stopped', async (t) => {
+  test("the sync tool's description says how the walk takes turns", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({});
+    const sync = m.getTools().find((tool: { name: string }) => tool.name === 'sync');
+    assert.ok(sync);
+    assert.match(sync.description, /the next sync of the same mount or directory picks up where the last turn stopped/);
+    assert.match(sync.description, /its own catch-up scan, at start and when its watcher reattaches, takes turns with its whole-mount syncs/);
+  });
+
+  test("a watched mount's capped sync names its catch-up scan as the other turn", async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 1 });
+    // Read as a watched mount from here; opened unwatched, so no watcher runs.
+    (m as any).mounts.get('work').config.watch = 'always';
+    const synced = await call(m, 'sync', {});
+    assert.ok(synced.incomplete.some((r: { path: string; reason: string }) => r.path === ''
+      && r.reason === 'the walk cap (1) was reached: the next sync of the mount, or its catch-up scan if that comes first, resumes after work/a.txt'),
+      JSON.stringify(synced.incomplete));
+  });
+
+  test("an agent-action scan takes the mount's start after every batch, and leaves the syncs' place alone", async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
     const m = await env.open({ watch: 'on-agent-action', walkCap: 2 });
+    const agreement = (m as any).agreementOrThrow();
+    const stored = (p: string) => {
+      const e = env.store.treeGet(TREE, p);
+      return e ? env.store.getBlob(e.blobHash)?.toString('utf8') : null;
+    };
+    const capReports = () => env.events.filter((e) => e.type === 'workspace:agent-action-scan-incomplete').length;
+    // What a shell tool did to the first file in the walk's order is in the
+    // workspace after every batch, and each capped scan says where the cap
+    // stopped it.
+    for (const edit of ['edit one', 'edit number two', 'the third edit, longest']) {
+      env.writeDisk('a.txt', edit);
+      const reported = capReports();
+      await m.onToolBatchComplete('agent');
+      assert.equal(stored('a.txt'), edit);
+      assert.equal(capReports(), reported + 1, 'the batch\'s scan reported its cap');
+    }
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt'], 'the same two files every time');
+    assert.equal(agreement.walkResumesAfter('work', ''), undefined, 'and no place');
+    // A bare sync keeps its place, and a batch's scan between two syncs
+    // doesn't move it.
+    await call(m, 'sync', {});
+    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
     await m.onToolBatchComplete('agent');
-    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt']);
-    await m.onToolBatchComplete('agent');
+    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
+    await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+    // A file a shell tool deleted among them is gone after the batch.
+    env.rmDisk('b.txt');
+    await m.onToolBatchComplete('agent');
+    assert.equal(stored('b.txt'), null);
   });
 
   test("a watched mount's catch-up scan resumes where the last stopped", async (t) => {
@@ -2675,16 +3461,156 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), 'b.txt');
   });
 
-  test('a place is recorded after the root it was gathered under, even by a pass that records no evidence', async (t) => {
+  test('a pass that records only a place binds no root, so a replaced root is read as it is', async (t) => {
     const env = new Env(t);
-    // Files too large to take in: the pass records no evidence for them.
-    for (const f of ['a.txt', 'b.txt']) env.writeDisk(f, 'more than one byte');
+    // A file too large to take in: the passes record no evidence for it.
+    env.writeDisk('a.txt', 'more than one byte');
     const m = await env.open({ walkCap: 1, maxFileSize: 1 });
-    await call(m, 'sync', {});
     const agreement = (m as any).agreementOrThrow();
-    assert.equal(agreement.walkResumesAfter('work', ''), 'a.txt');
-    const st = statSync(env.dir, { bigint: true });
-    assert.deepEqual(agreement.rootIdentity('work'), { dev: String(st.dev), ino: String(st.ino) });
+    await call(m, 'sync', {});
+    assert.equal(agreement.walkResumesAfter('work', ''), undefined, 'the walk covered the mount');
+    assert.equal(agreement.rootIdentity('work'), undefined, 'and bound no root');
+    env.writeDisk('b.txt', 'more than one byte');
+    await call(m, 'sync', {});
+    assert.equal(agreement.walkResumesAfter('work', ''), 'a.txt', 'a capped walk keeps its place');
+    assert.equal(agreement.rootIdentity('work'), undefined, 'and binds no root either');
+    // Another directory takes the root's place. With no evidence to guard,
+    // the mount reads it as it is, and the walk takes its turn after the
+    // place there.
+    renameSync(env.dir, `${env.dir}-away`);
+    mkdirSync(env.dir);
+    for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, 'more than one byte');
+    const synced = await call(m, 'sync', {});
+    assert.ok(!synced.incomplete.some((r: { reason: string }) => /disk last agreed with/.test(r.reason)), JSON.stringify(synced.incomplete));
+    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
+  });
+
+  test("a whole mount's catch-up scan takes turns with its bare syncs", async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+    await call(m, 'sync', {});
+    await (m as any).initialScan('work');
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt'], 'the scan took the next two');
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt'], 'and the sync the two after those');
+  });
+
+  test('a pass that moves only its place makes no store sync', async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+    // Without ctime trust no fingerprint vouches, so no pass re-records one
+    // once the files are older than the racy window, however slowly this
+    // runs: what's left to record is the place alone.
+    (m as any).ctimeTrust.set(realpathSync(env.dir), null);
+    await call(m, 'sync', {});
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+    const agreement = (m as any).agreementOrThrow();
+    const sync = env.store.sync.bind(env.store);
+    let syncs = 0;
+    env.store.sync = () => {
+      syncs++;
+      return sync();
+    };
+    // Nothing on disk changes from here, so each pass records only where it
+    // stopped: a place that's lost costs coverage, never a decision.
+    const places: Array<string | undefined> = [];
+    for (let i = 0; i < 4; i++) {
+      await call(m, 'sync', {});
+      places.push(agreement.walkResumesAfter('work', ''));
+    }
+    assert.deepEqual(places, ['b.txt', 'd.txt', 'b.txt', 'd.txt'], 'the place moved on every pass');
+    assert.equal(syncs, 0, 'with no store sync');
+  });
+
+  test('a model of the walk: on random trees that change between passes, each pass takes the cyclic window after its place', async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    const view = { root: env.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [], others: [] } as unknown as MountView;
+    // A seeded generator, so a failure replays.
+    let seed = 272;
+    const rand = (n: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return (seed >>> 8) % n;
+    };
+    // U+FF21 sorts before U+1F600 by UTF-8 byte and after it by UTF-16 code
+    // unit, the walk's order; U+E000 sorts before both by UTF-8 byte and
+    // between them by UTF-16 code unit.
+    const names = ['a', 'b', 'm', 'z', '\uFF21', '\u{1F600}', '\uE000'];
+    const pick = <T>(xs: T[]): T => xs[rand(xs.length)]!;
+    const randomPath = (): string => {
+      const parts: string[] = [];
+      for (let depth = rand(3); depth > 0; depth--) parts.push(pick(names));
+      return [...parts, `${pick(names)}.${rand(4) === 0 ? 'lnk' : 'txt'}`].join('/');
+    };
+    const add = (path: string): void => {
+      const full = env.disk(path);
+      mkdirSync(dirname(full), { recursive: true });
+      if (lstatSync(full, { throwIfNoEntry: false })) return;
+      if (path.endsWith('.lnk')) symlinkSync('nowhere', full); // dangling: an entry that isn't a file
+      else writeFileSync(full, path);
+    };
+    /** Every entry that isn't a directory, as readdir shows it now. */
+    const entries = (dir = ''): string[] => {
+      const out: string[] = [];
+      for (const d of readdirSync(env.disk(dir), { withFileTypes: true })) {
+        const path = dir ? `${dir}/${d.name}` : d.name;
+        if (d.isDirectory()) out.push(...entries(path));
+        else out.push(path);
+      }
+      return out;
+    };
+    // The walk's order, worked out independently: in each directory, its
+    // entries that aren't directories by name, then its subdirectories by
+    // name, each with everything beneath it.
+    const order = (a: string, b: string): number => {
+      const pa = a.split('/');
+      const pb = b.split('/');
+      for (let i = 0; ; i++) {
+        const leafA = i === pa.length - 1;
+        const leafB = i === pb.length - 1;
+        if (leafA !== leafB) return leafA ? -1 : 1;
+        if (pa[i] !== pb[i]) return pa[i]! < pb[i]! ? -1 : 1;
+        if (leafA) return 0;
+      }
+    };
+
+    for (let tree = 0; tree < 25; tree++) {
+      rmSync(env.dir, { recursive: true, force: true });
+      mkdirSync(env.dir);
+      for (let i = 4 + rand(16); i > 0; i--) add(randomPath());
+      const cap = 1 + rand(8);
+      let place: string | undefined;
+      for (let pass = 0; pass < 12; pass++) {
+        // Changes between passes: entries added, removed, the place itself
+        // removed, and whole directories removed.
+        for (let change = rand(4); change > 0; change--) {
+          const now = entries();
+          const kind = rand(4);
+          if (kind === 0 || now.length === 0) add(randomPath());
+          else if (kind === 1) rmSync(env.disk(pick(now)));
+          else if (kind === 2 && place !== undefined && now.includes(place)) rmSync(env.disk(place));
+          else {
+            const dirs = now.filter((p) => p.includes('/')).map((p) => p.slice(0, p.lastIndexOf('/')));
+            if (dirs.length > 0) rmSync(env.disk(pick(dirs)), { recursive: true, force: true });
+          }
+        }
+        const all = entries().sort(order);
+        const after = place === undefined ? [] : all.filter((p) => order(p, place!) > 0);
+        const upto = place === undefined ? all : all.filter((p) => order(p, place!) <= 0);
+        const window = [...after, ...upto].slice(0, cap);
+        const walk = await walkScope(view, rootReal, '', true, cap, place === undefined ? {} : { resumeAfter: place });
+        const taken = [...walk.files, ...walk.othersTaken];
+        const where = `tree ${tree}, pass ${pass}, cap ${cap}, after ${place}`;
+        assert.deepEqual(taken.sort(order), [...window].sort(order), `${where}: took the cyclic window`);
+        for (const p of all) assert.equal(provenAbsent(walk, p), false, `${where}: ${p} is on disk`);
+        if (walk.stoppedAfter !== undefined) assert.equal(walk.stoppedAfter, window.at(-1), `${where}: the place is the last entry taken`);
+        else assert.ok(all.length <= cap, `${where}: no place only once the walk took everything`);
+        place = walk.stoppedAfter;
+      }
+    }
   });
 
   test('places go through a checkpoint, and a scope a walk covered stays cleared', (t) => {
@@ -2734,7 +3660,7 @@ describe('the mount boundary', () => {
     mkdirSync(env.disk('sub'), { recursive: true });
     env.writeDisk('sub/a.txt', 'A');
     const st = statSync(env.dir, { bigint: true });
-    const view = { root: env.dir, rootIdentity: { dev: String(st.dev), ino: String(st.ino) }, followSymlinks: false, maxFileSize: 1e6, ignore: [] } as unknown as MountView;
+    const view = { root: env.dir, rootIdentity: { dev: String(st.dev), ino: String(st.ino) }, followSymlinks: false, maxFileSize: 1e6, ignore: [], others: [] } as unknown as MountView;
     const away = `${env.dir}-away`;
     // The code checks the root by its resolved path (on macOS the temp
     // directory is under /var, a symlink to /private/var).
@@ -3019,7 +3945,7 @@ describe('the mount boundary', () => {
     const data = await call(m, 'materialize', {});
     const skip = JSON.stringify(data);
     assert.match(skip, /match neither what was being written there nor what disk last agreed with/);
-    assert.match(skip, /pass force to write the workspace copy over it/);
+    assert.match(skip, /check the file, then materialize it with force to overwrite it, or sync this path/);
     assert.equal(env.readDisk('a.txt'), 'v2, cut off');
     await call(m, 'materialize', { force: true });
     assert.equal(env.readDisk('a.txt'), 'v2');
