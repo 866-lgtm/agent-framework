@@ -634,9 +634,11 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     // another branch, say, that landed.
     await call(m, 'write', { path: 'work/agreed.txt', content: 'v1\n' });
     agreement.set('work', 'agreed.txt', { kind: 'content', hash: env.store.treeGet(TREE, 'agreed.txt')!.blobHash, size: 3 });
-    // A store-origin draft whose push is pending: it may have reached disk.
+    // A store-origin draft whose push is pending, with its bytes on disk: our
+    // own effect shows there, never confirmed, so it may have landed.
     await call(m, 'write', { path: 'work/pushed.txt', content: 'v1\n' });
     agreement.intend('work', 'pushed.txt', { effect: 'disk', prior: null, expect: { kind: 'content', hash: env.store.treeGet(TREE, 'pushed.txt')!.blobHash }, branchId: env.store.currentBranch().id });
+    env.writeDisk('pushed.txt', 'v1\n');
     // An entry from before the evidence: no P and no origin.
     env.store.treeSet(TREE, 'legacy.txt', { blobHash: blob('v1\n'), size: 3, mode: 0o644 });
     for (const path of ['agreed.txt', 'pushed.txt', 'legacy.txt']) await call(m, 'delete', { path: `work/${path}` });
