@@ -774,11 +774,14 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
   const posted = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
   assert.equal(posted.success, true);
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
-  // Shaped as routeSpeech's trace is, with the surface's message id.
+  // Shaped as routeSpeech's trace is, but without the surface's message id,
+  // though the server named one ('m-77').
   assert.deepEqual(routed(), [{
     type: 'mcpl:speech-routed', conversationId: 'Subconscious', serverId: 'body', channelId: 'body:home',
-    delivered: true, textLen: 'a thought'.length, text: 'a thought', messageId: 'm-77',
-  }]);
+    delivered: true, textLen: 'a thought'.length, text: 'a thought',
+  }], "no messageId: connectome-host's TTS relay keeps every routed trace without reading conversationId, "
+    + 'and when an interruption of the resident matches no entry it edits the newest traced message in the '
+    + "channel, so an id here would let it trim the subconscious's post");
 });
 
 test('publishForAgent traces a publish the server reports undelivered as failed, not routed', async () => {

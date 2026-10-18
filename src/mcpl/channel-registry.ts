@@ -2133,6 +2133,9 @@ export class ChannelRegistry {
    * as the channel_publish tool. Its traces carry the agent's name and follow
    * the outcome as routeSpeech's do: speech-routed after a publish the server
    * accepted and didn't report undelivered, and speech-route-failed otherwise.
+   * The routed trace carries no message id, as before: nothing here reads one,
+   * and a consumer that edits the newest traced message in a channel would
+   * have this post to edit when an interruption of the resident matches none.
    */
   async publishForAgent(
     channelId: string,
@@ -2144,7 +2147,7 @@ export class ChannelRegistry {
     const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
     const seen: { rejection?: 'error-response' | 'other' } = {};
     const result = await this.handleToolPublish({ channelId, content: text }, seen);
-    const reply = result.data as { delivered?: boolean; messageId?: string } | undefined;
+    const reply = result.data as { delivered?: boolean } | undefined;
     if (result.success && reply?.delivered !== false) {
       this.emitTraceFn({
         type: 'mcpl:speech-routed',
@@ -2154,7 +2157,6 @@ export class ChannelRegistry {
         delivered: true,
         textLen: text.length,
         text,
-        ...(reply?.messageId !== undefined ? { messageId: reply.messageId } : {}),
       });
     } else {
       // What the host knows of the text, as routeSpeech's trace says it: an

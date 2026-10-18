@@ -31,7 +31,7 @@
   It carries the server's own message, cut at 200 characters, or says it
   sent none, and an `mcpl:speech-route-failed` trace goes out with
   `outcome: "unknown"`. The marker's and the trace's `outcome` is
-  `"failed"` for every other failure of plain speech. Before, the error was
+  `"failed"` for every other failure that gets a marker. Before, the error was
   only logged, unless the text had a hybrid `>>>` target, which bounced it.
   Any other failed publish still rejects as before: one that times out or
   loses its connection before an answer, which the server may or may not
@@ -55,8 +55,8 @@
 - Speech into a channel that is removed while the host opens it is refused,
   and nothing is published to it.
 - `speak_in_channel`'s `mcpl:speech-routed` trace now follows a publish the
-  server accepted and didn't report undelivered, with the fields
-  `routeSpeech`'s trace has (`serverId`, `delivered`, `textLen` and the
-  surface's `messageId`). Any other outcome, as the tool's result reports
+  server accepted and didn't report undelivered, with `serverId`,
+  `delivered` and `textLen` as `routeSpeech`'s trace has them. It carries no
+  `messageId`, as before. Any other outcome, as the tool's result reports
   it, is traced as `mcpl:speech-route-failed`: a refusal, a publish the
   server reported undelivered, or one that failed, a timeout included.

@@ -1462,8 +1462,30 @@ describe('explicit prose routing', () => {
 
     const stream = membrane.lastStream!;
     assert.equal(stream.receivedToolResults.length, 1);
-    const result = JSON.stringify(stream.receivedToolResults[0]);
-    assert.ok(result.includes('destination'), 'help text served as tool result');
+    const strings: string[] = [];
+    JSON.stringify(stream.receivedToolResults[0], (_key, value) => {
+      if (typeof value === 'string') strings.push(value);
+      return value;
+    });
+    // The help is the agent's only full reference for a destination's rule,
+    // so each of its clauses is pinned, read across the text's line breaks.
+    // The result's content is the help as a JSON string, so it's decoded first.
+    const decoded = strings.map((s) => {
+      try {
+        const value: unknown = JSON.parse(s);
+        return typeof value === 'string' ? value : s;
+      } catch {
+        return s;
+      }
+    });
+    const help = decoded.join(' ').replace(/\s+/g, ' ');
+    for (const clause of [
+      'A destination applies to the rest of that turn, until another is named.',
+      'A name that matches no channel, or several, bounces and leaves it as it was.',
+      'A channel its server declared inbound-only is refused, and clears it.',
+    ]) {
+      assert.ok(help.includes(clause), `the help says: ${clause}`);
+    }
     assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
 
     await framework.stop();
