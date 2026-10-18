@@ -345,6 +345,12 @@ describe('channel_publish answers by the receipt rule', () => {
   it('answers a request refused before it was written as failed, and an error response or a plain throw as unconfirmed', async () => {
     const notSent = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent'); });
     assert.match(notSent.error ?? '', /^Publish to c failed: Cannot send request: connection to "discord" is closed\. Nothing was posted\.$/);
+    // The connection's messages are sentences, and the answer adds its own ending.
+    const sentence = await publishWith(async () => {
+      throw new McplRequestError('The request wasn\'t sent: the connection to the "discord" server is closed, so nothing ran. This host is reconnecting to it; try again later.', 'not-sent');
+    });
+    assert.equal(sentence.error, 'Publish to c failed: The request wasn\'t sent: the connection to the "discord" server is closed, so nothing ran. ' +
+      'This host is reconnecting to it; try again later. Nothing was posted.');
     const answered = await publishWith(async () => { throw new McplRequestError('MCPL server "discord" returned error for channels/publish: [-32000] part 2 failed', 'error-response', { posted: ['111'] }); });
     assert.match(answered.error ?? '', /^Publish to c wasn't confirmed: .*part 2 failed \(delivery uncertain\)\. It may or may not have been posted/);
     // What the connector says was posted reaches the answer, as it does the marker.

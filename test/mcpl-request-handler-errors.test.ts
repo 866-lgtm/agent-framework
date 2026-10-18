@@ -19,7 +19,7 @@ function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) 
   // Main's trace listeners are registrations (#318), which onTrace makes.
   framework.traceListeners = [];
   framework.onTrace((event: unknown) => traces.push(event));
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: connection.id });
   return { framework, connection, traces };
 }
 
@@ -678,7 +678,16 @@ test('a manifest refresh deferred by the fetch floor reports a failure other tha
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   // The last refresh completed just now, so this announcement waits out the floor.
   framework.manifestRefreshState = new Map([['srv', { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
-  framework.mcplServerConfigs = { get() { throw new Error('the deferred refresh failed before its fetch'); } };
+  // Each run reads the server's configuration before anything else: the
+  // announcement's own run finds it, and the deferred run fails there.
+  let lookups = 0;
+  framework.mcplServerConfigs = {
+    get() {
+      lookups++;
+      if (lookups > 1) throw new Error('the deferred refresh failed before its fetch');
+      return { id: 'srv' };
+    },
+  };
   connection.emit('manifest-changed', { revision: 'r2' });
   await settle();
   assert.deepEqual(failureTraces(traces), [], 'nothing has run yet');
@@ -698,11 +707,13 @@ test('a manifest refresh queued behind a fetch in flight reports a failure other
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   framework.manifestRefreshState = new Map();
+  // Each run reads the server's configuration before anything else: both
+  // announcements' own runs find it, and the queued re-run fails there.
   let lookups = 0;
   framework.mcplServerConfigs = {
     get() {
       lookups++;
-      if (lookups > 1) throw new Error('the queued refresh failed before its fetch');
+      if (lookups > 2) throw new Error('the queued refresh failed before its fetch');
       return { id: 'srv' };
     },
   };
@@ -721,7 +732,7 @@ test('a manifest refresh queued behind a fetch in flight reports a failure other
   assert.equal(failures.length, 1);
   assert.equal(failures[0].event, 'manifest-changed');
   assert.match(failures[0].error, /the queued refresh failed before its fetch/);
-  assert.equal(lookups, 2);
+  assert.equal(lookups, 3);
   assert.ok(lines.includes('[mcpl] srv manifest-changed handler failed: "the queued refresh failed before its fetch"'), lines.join('\n'));
 });
 
@@ -741,13 +752,16 @@ test('a server\'s error answer that no template can convert settles the host\'s 
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: fetch.id, error: { code: { toString: 1 }, message: { toString: 1 } } }));
   await settle();
   assert.deepEqual(lines, [
-    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): MCPL server "srv" returned error for mcpl/manifest: [[object Object]] [object Object]',
+    `MCPL server "srv" answered mcpl/manifest (id=${fetch.id}) with error "{\\"toString\\":1}": "{\\"toString\\":1}"`,
+    '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): The "srv" server answered with an error without saying what went wrong, so whether the request took effect is unknown. Check its effect before trying again.',
   ]);
   assert.deepEqual(traces.filter((e) => e.type === 'mcpl:server-error' || e.type === 'mcpl:request-handler-error'), []);
   assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
 });
 
-test('a server\'s error code and message in the error a host request rejects with are bounded: control, format and line characters replaced, and each cut after 200 code points', async () => {
+test('a server\'s error message in the error a host request rejects with is bounded: control, format and line characters replaced, and cut after 200 code points; its code goes to the log line instead, as logValue prints it', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const transport = new ResponseTransport();
   const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
   connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
@@ -756,7 +770,7 @@ test('a server\'s error code and message in the error a host request rejects wit
   const fetch = JSON.parse(transport.lines.at(-1)!);
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: fetch.id, error: { code: -32000, message: `line one\nline two\u202e${'x'.repeat(300)}` } }));
   await assert.rejects(fetched, {
-    message: `MCPL server "srv" returned error for mcpl/manifest: [-32000] line one?line two?${'x'.repeat(182)}…`,
+    message: `The "srv" server answered with an error: line one?line two?${'x'.repeat(182)}…`,
   });
   // JSON-RPC's code is an integer, but a server can send a string, and it's
   // the server's text as much as the message is.
@@ -764,8 +778,10 @@ test('a server\'s error code and message in the error a host request rejects wit
   const second = JSON.parse(transport.lines.at(-1)!);
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: second.id, error: { code: `E\nx\u202e${'y'.repeat(300)}`, message: 'refused' } }));
   await assert.rejects(again, {
-    message: `MCPL server "srv" returned error for mcpl/manifest: [E?x?${'y'.repeat(196)}…] refused`,
+    message: 'The "srv" server answered with an error: refused',
   });
+  // The code is the operator's, so it's in the log line, escaped and cut there.
+  assert.ok(lines.some((line) => line.startsWith(`MCPL server "srv" answered mcpl/manifest (id=${second.id}) with error "E\\nx\\u202e${'y'.repeat(252)}"…(304): refused`)), lines.join('\n'));
 });
 
 test('a throw from the wired tools/list_changed handler is contained, traced and logged as the other handlers\' are', (t) => {

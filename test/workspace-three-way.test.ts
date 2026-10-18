@@ -13,7 +13,7 @@ import { describe, test, type TestContext } from 'node:test';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -1419,6 +1419,18 @@ describe('the catch-up pass at start', () => {
     for (const end = performance.now() + ms; performance.now() < end;) await new Promise((r) => setImmediate(r));
   };
   const reattached = (env: Env) => env.events.some((e) => e.type === 'workspace:watcher-reattached');
+  /**
+   * Asserts the passes counted once the watcher is ready: `expected` with no re-attach, and at most one more for each
+   * re-attach the watcher reports, since a re-attached watcher's ready runs its own pass (here always long before its
+   * own bound). A watcher can re-attach just after its first ready. On macOS, by libuv's src/unix/fsevents.c, an
+   * FSEvents event for the watched directory itself, when it carries no modification flags, reaches fs.watch as a
+   * rename under the directory's own name, and the watcher's raw handler re-attaches on any rename named like its root.
+   */
+  const assertPassesOnceReady = (env: Env, passes: number, expected: number) => {
+    const reattaches = env.events.filter((e) => e.type === 'workspace:watcher-reattached').length;
+    assert.ok(passes >= expected && passes <= expected + reattaches,
+      `expected ${expected} passes, and at most one more per re-attach; got ${passes} with ${reattaches} re-attaches`);
+  };
 
   // On macOS a write made right after ready can fall before libuv's FSEventStream exists and go unreported until a
   // later change in its directory, which this change doesn't close, so the two tests that write then and wait for
@@ -1480,7 +1492,9 @@ describe('the catch-up pass at start', () => {
         scan.open();
         const mount = (m as any).mounts.get('work');
         await until(() => !!mount.watcherReadyAt, 'the watcher became ready');
-        assert.equal(counted.passes, 2, 'a second pass at ready');
+        // Counted a little after ready, so a second pass the same ready started late would show.
+        await elapse(200);
+        assertPassesOnceReady(env, counted.passes, 2);
       } finally {
         t.mock.timers.reset();
       }
@@ -1494,15 +1508,33 @@ describe('the catch-up pass at start', () => {
     await withChokidarReaddir(scan.wait, async () => {
       let counted = { passes: 0 };
       const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
-      // An error chokidar reports while its scan goes on, through the path its 'error' event takes.
-      (m as any).watchers.get('work').reportError(Object.assign(new Error("EACCES: permission denied, scandir 'sub'"), { code: 'EACCES' }));
+      // An error chokidar reports while its scan goes on, sent as chokidar's own 'error' event.
+      (m as any).watchers.get('work').watcher.emit('error', Object.assign(new Error("EACCES: permission denied, scandir 'sub'"), { code: 'EACCES' }));
       assert.ok(env.events.some((e) => e.type === 'workspace:watcher-error'), 'the error was reported');
+      // With the scan still held, a pass the error scheduled for later would show here.
+      await elapse(100);
       assert.equal(counted.passes, 0, 'no pass at the error');
       scan.open();
       const mount = (m as any).mounts.get('work');
       await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the pass ran at ready');
-      assert.equal(counted.passes, 1);
+      await elapse(200);
+      assertPassesOnceReady(env, counted.passes, 1);
     });
+  });
+
+  test("a watcher re-attached just after its ready runs one more pass, which the count allows", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    let counted = { passes: 0 };
+    const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
+    const mount = (m as any).mounts.get('work');
+    await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the pass ran at ready');
+    // The rename macOS reports for an FSEvents event on the root itself, sent to the watcher's chokidar instance.
+    (m as any).watchers.get('work').watcher.emit('raw', 'rename', 'work', {});
+    await until(() => counted.passes >= 2, "the re-attached watcher's ready ran its pass");
+    await elapse(200);
+    assert.ok(reattached(env), 'the watcher re-attached');
+    assertPassesOnceReady(env, counted.passes, 1);
   });
 
   test('a re-attach before the first ready restarts the bound, so the new watcher gets its own', async (t) => {
@@ -3859,6 +3891,32 @@ describe('restarts and faults', () => {
     assert.equal(agreement.needsBarrier, true);
   });
 
+  test('a rebuild whose append fails partway leaves memory as it was, whole, with the identity a disk read checks', (t) => {
+    // Nothing reaches this today: after the open, a rebuild finds every
+    // mount's record and appends none. A later open with a moved mount does.
+    const env = new Env(t);
+    const agreement = new DiskAgreement(env.store);
+    agreement.open([{ name: 'work', root: '/srv/work' }, { name: 'other', root: '/srv/other' }]);
+    const identity = { dev: '1', ino: '2' };
+    agreement.recordRootIdentity('other', identity);
+    const store = env.store as unknown as { appendJson: (type: string, payload: unknown) => unknown };
+    const append = store.appendJson;
+    store.appendJson = function (this: unknown, type: string, payload: unknown) {
+      if (type === DISK_AGREEMENT_RECORD_TYPE) throw new Error('injected: the store refused the append');
+      return append.call(this, type, payload);
+    };
+    try {
+      // 'work' has moved, so the rebuild appends its record before it reaches 'other'.
+      assert.throws(() => agreement.open([{ name: 'work', root: '/srv/moved' }, { name: 'other', root: '/srv/other' }]), /injected/);
+    } finally {
+      store.appendJson = append;
+    }
+    // Through a structural type, so this builds against a DiskAgreement
+    // without the accessor too, and fails there rather than not building.
+    const read = agreement as unknown as { rootIdentityForRead(mount: string): unknown };
+    assert.deepEqual(read.rootIdentityForRead('other'), identity, 'the mount after the failed append keeps its identity');
+  });
+
   test('an append that fails inside the store leaves no decision to stale evidence: passes refuse until a reopen, which finds the evidence', async (t) => {
     const env = new Env(t);
     let m = await env.open();
@@ -4711,6 +4769,40 @@ describe('trust and identity at the point of use', () => {
     assert.equal(read.size, grown.length);
     assert.equal(read.fp.size, grown.length, 'the fingerprint gives the size of the bytes hashed');
     assert.equal(read.hash, createHash('sha256').update(grown).digest('hex'));
+  });
+
+  test("a FIFO swapped in at a checked directory's path doesn't hold up its sync", { skip: process.platform === 'win32' ? 'no FIFOs or directory syncs' : false }, async (t) => {
+    const env = new Env(t);
+    mkdirSync(env.disk('sub'), { recursive: true });
+    const rootReal = realpathSync(env.dir);
+    const dir = join(rootReal, 'sub');
+    let swapped = false;
+    const synced = withFsPromises('open', (original) => async (...args: any[]) => {
+      if (!swapped && args[0] === dir) {
+        swapped = true; // checked as a directory, then a FIFO put at its path before the sync opens it
+        rmSync(dir, { recursive: true });
+        assert.equal(spawnSync('mkfifo', [dir]).status, 0, 'mkfifo');
+      }
+      return original(...args);
+    }, () => syncDirectories(viewOf(env.dir), rootReal, ['sub']));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const failed = await Promise.race([synced, new Promise<never>((_, reject) => {
+        // Only a sync held by the FIFO comes near this: without one, it settles at once.
+        timer = setTimeout(() => reject(new Error('the sync waited on the FIFO')), 10_000);
+      })]);
+      assert.equal(swapped, true, 'the swap ran');
+      assert.match(failed.get('sub') ?? '', /changed while it was observed/);
+    } finally {
+      clearTimeout(timer);
+      // An open still waiting on the FIFO is let go before the mount is removed.
+      try {
+        closeSync(openSync(dir, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+      } catch {
+        // ENXIO: nothing is waiting.
+      }
+      await synced.catch(() => {});
+    }
   });
 
   /** A root identified as it is now, and a way to replace it: renamed away, with an empty `sub` in its place. */
@@ -6067,7 +6159,9 @@ describe('the mount boundary', () => {
     const res = await call(m, 'materialize', { force: true });
     const reasons = ((res.skipped ?? []) as Array<{ reason: string }>).map((s) => s.reason).join('\n');
     assert.match(reasons, /link\.txt: not written: a symlink, which this mount does not follow/);
-    assert.match(reasons, /linkdir\/inner\.txt: not written: a parent directory resolves outside the mount/);
+    // This mount doesn't follow symlinks, so a symlinked directory on the way
+    // is refused as such, wherever it leads.
+    assert.match(reasons, /linkdir\/inner\.txt: not written: "work\/linkdir" is a symlink leading outside the mount, which this mount does not follow/);
     assert.equal(readFileSync(outside, 'utf8'), 'outside, untouched');
     assert.throws(() => readFileSync(join(env.root, 'outdir', 'inner.txt')), /ENOENT/);
   });
@@ -6129,7 +6223,7 @@ describe('the mount boundary', () => {
       const pushed = await pushWith(env, m, ['sub/a.txt'], { force, beforeEffect: () => swapForSymlink(env, 'sub', outside) });
       assert.equal(readFileSync(join(outside, 'a.txt'), 'utf8'), 'outside, untouched');
       assert.deepEqual(pushed.written, []);
-      assert.match(pushed.skipped[0]!.reason, /^not written: a parent directory resolves outside the mount$/);
+      assert.match(pushed.skipped[0]!.reason, /^not written: "work\/sub" is a symlink leading outside the mount, which this mount does not follow$/);
       assert.deepEqual((m as any).agreement.get('work', 'sub/a.txt'), before, 'its evidence is exactly as before the intent');
       assert.equal(env.readDisk('saved/a.txt'), 'original');
     });
@@ -6147,7 +6241,7 @@ describe('the mount boundary', () => {
     const pushed = await pushWith(env, m, ['sub/gone.txt'], { applyDeletions: true, beforeEffect: () => swapForSymlink(env, 'sub', outside) });
     assert.equal(readFileSync(join(outside, 'gone.txt'), 'utf8'), 'outside, untouched');
     assert.deepEqual(pushed.deleted, []);
-    assert.match(pushed.skipped[0]!.reason, /^not unlinked: a parent directory resolves outside the mount$/);
+    assert.match(pushed.skipped[0]!.reason, /^not unlinked: "work\/sub" is a symlink leading outside the mount, which this mount does not follow$/);
   });
 
   test('a disk edit made after planning is not overwritten without force, and reads as a conflict', async (t) => {
@@ -6402,11 +6496,18 @@ describe('the mount boundary', () => {
       symlinkSync(outside, env.disk('escape'));
 
       const error = await refused(m, 'read', { path: 'work/escape/secret.txt' });
-      assert.match(error, /outside the mount/);
+      // A mount that follows symlinks finds where this one leads; one that
+      // doesn't refuses the link itself, wherever it leads.
+      assert.match(error, followSymlinks ? /outside the mount/ : /"work\/escape" is a symlink leading outside the mount, which this mount does not follow/);
       assert.doesNotMatch(error, /OUTSIDE_SENTINEL/);
       const scoped = await call(m, 'ls', { path: 'work/escape', recursive: true });
       assert.deepEqual(scoped.entries, []);
-      assert.deepEqual(scoped.incomplete, [{ path: 'escape', reason: 'the directory resolves outside the mount' }]);
+      assert.deepEqual(scoped.incomplete, [{
+        path: 'escape',
+        reason: followSymlinks
+          ? 'the directory resolves outside the mount'
+          : '"work/escape" is a symlink leading outside the mount, which this mount does not follow',
+      }]);
       const whole = await listing(m);
       assert.equal([...whole.keys()].some((p) => p.startsWith('escape/')), false);
       assert.deepEqual((await call(m, 'grep', { pattern: 'OUTSIDE_SENTINEL' })).results, []);
@@ -7409,4 +7510,21 @@ describe('the mount root', () => {
     const m = await env.open();
     assert.match(await refused(m, 'sync', { path: 'work/a.txt', acceptRoot: true }), /whole mount/);
   });
+});
+
+// anima-research/agent-framework#530 (slimepriestess): an outer mount's forced
+// materialize through a file link wrote into a nested mount's file. Her probe,
+// as the issue gives it.
+for (const autoMaterialize of [false, true]) test(`a forced materialize through a file link into a nested mount leaves the inner mount's file alone (autoMaterialize ${autoMaterialize})`, async (t) => {
+  const env = new Env(t);
+  env.writeDisk('a/b/x.txt', "the inner mount's");
+  const m = await env.open({}, { mounts: [
+    { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks: true, autoMaterialize },
+    { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+  ] });
+  await m.handleToolCall({ id: 't', name: 'write', input: { path: 'work/flink.txt', content: 'outer wrote' } });
+  if (existsSync(env.disk('flink.txt'))) rmSync(env.disk('flink.txt'));
+  symlinkSync(env.disk('a/b/x.txt'), env.disk('flink.txt'));
+  await m.handleToolCall({ id: 't', name: 'materialize', input: { path: 'work/flink.txt', force: true } });
+  assert.equal(readFileSync(env.disk('a/b/x.txt'), 'utf8'), "the inner mount's");
 });

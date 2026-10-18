@@ -5,7 +5,16 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import {
+  AUDIO_NO_DATA_TEXT,
+  AUDIO_NO_MEDIA_TYPE_TEXT,
+  IMAGE_NO_DATA_TEXT,
+  IMAGE_NO_MEDIA_TYPE_TEXT,
+  INLINE_WITHHELD_TEXT,
+  isInlineContradiction,
+  referenceStubOrNull,
+  unknownBlockText,
+} from './references.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
 import type { McplContentBlock } from './types.js';
 
@@ -17,8 +26,8 @@ import type { McplContentBlock } from './types.js';
  * shows as NON_STRING_TEXT_PLACEHOLDER. `provenance` is what a reference stub
  * says the reference came on, such as 'attachment on push event'. `serverId`
  * is the server that sent the content: a reference is registered with it, as
- * a tool result's references are, so fetch_reference can fetch it from that
- * server.
+ * a tool result's references are, so fetch_reference can fetch it through that
+ * server's address, where it has one.
  */
 export function convertBlock(block: McplContentBlock, provenance: string, serverId: string): ContentBlock {
   switch (block.type) {
@@ -51,7 +60,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
           source: { type: 'url', url: block.uri },
         } as ContentBlock;
       }
-      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? IMAGE_NO_MEDIA_TYPE_TEXT : IMAGE_NO_DATA_TEXT };
 
     case 'audio':
       if (isInlineContradiction(block)) {
@@ -70,7 +79,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? AUDIO_NO_MEDIA_TYPE_TEXT : AUDIO_NO_DATA_TEXT };
 
     case 'resource':
       // RFC-005: reference blocks become bounded stubs — never raw URIs
@@ -82,8 +91,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
       // that isn't a string is no type, and is never converted to one: an
       // object can throw when it is.
-      const type: unknown = (block as { type?: unknown }).type;
-      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
+      return { type: 'text', text: unknownBlockText(block) };
     }
   }
 }
