@@ -24,8 +24,10 @@ const CORE_IMPLIES: Readonly<Record<string, readonly string[]>> = {
  * of an existing message. These are markers, not turns — they must not clear
  * explicit-send suppression, count as a new conversational round, or
  * retarget the default publish channel. An edit can also be the first
- * version of a message the agent sees; isConversationalInjection reads the
- * host's mark for the case the coalescer knows (`replacesUnread`). Tags are
+ * version of a message the agent sees, and then counts as that message:
+ * isMarkerTagged reads the host's mark for the case the coalescer knows
+ * (`replacesUnread`), for isConversationalInjection and for the channel
+ * registry's publish channel and reply anchor. Tags are
  * still never authority (§16.6): this set only ever WITHHOLDS default
  * conversational treatment, it never grants anything.
  */

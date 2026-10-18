@@ -127,10 +127,9 @@ interface DeferredBatch<E> {
   /** The batch opened on the agent's first view of its subject: a fresh
    *  `initial` birth, or a first-view occupant it displaced that nothing had
    *  shown. Its first delivery is a first view too, while nothing of the
-   *  subject has been read since and no other version of it is placed. A
-   *  later notice that may have taken away the first view (it displaced an
-   *  occupant something may have shown, or found the subject read) clears
-   *  it, whether the batch is pending or rendering. */
+   *  subject has been read since and no other version of it is placed. It is
+   *  cleared when the subject's first view ends while the batch is pending
+   *  or rendering (occupantLeaves). */
   firstView?: true;
 }
 
@@ -174,6 +173,11 @@ interface SubjectState<E> {
   identity?: CoalescedOccurrence['identity'];
   /** Agent that received the last delivery; replacements and notices follow it. */
   audienceAgent?: string;
+  /** The agent's first view of the subject has ended: an occupant that may
+   *  have been shown left it without handing a first view on
+   *  (occupantLeaves). No later batch or birth of the subject is a first
+   *  view. */
+  firstViewEnded?: true;
   touchedAt: number;
 }
 
@@ -189,6 +193,11 @@ export interface CoalescingSnapshot {
     identity?: CoalescedOccurrence['identity'];
     occupant?: { eventId: string; placement: CoalescingPlacement };
     audienceAgent?: string;
+    /** The subject's first view has ended (SubjectState.firstViewEnded). A
+     *  snapshot written before this field existed has none and reads as not
+     *  ended, so once after an upgrade a subject whose first view had
+     *  already ended can give one delivery a spurious `replacesUnread`. */
+    firstViewEnded?: true;
     /** `firstView` only on a batch that wasn't rendering: one that was may
      *  have been shown. */
     batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean; firstView?: true };
@@ -398,9 +407,11 @@ export class PushCoalescer<E = unknown> {
   /** `committed`: the durability barrier succeeded after this receipt was
    *  written. An uncommitted receipt deduplicates effects but is not an
    *  acknowledgement until a commit succeeds. `firstView`: the admission it
-   *  records delivered its occurrence as the agent's first view
-   *  (`replacesUnread`), so a retry answered from it says so too. Kept in
-   *  memory only: a receipt restored from a snapshot reads as no first view. */
+   *  records handed its occurrence to the host's delivery marked as the
+   *  agent's first view (`replacesUnread`), whether or not the host placed
+   *  it, so a retry answered from it says so too. Kept in memory only: a
+   *  receipt restored from a snapshot or the crash-window bridge reads as no
+   *  first view. */
   private readonly receipts = new Map<string, ReceiptEntry>();
   /** Set by a delivery that carries `replacesUnread`. admit() clears it before
    *  an admission's effects and reads it after them; every delivery runs
@@ -596,6 +607,24 @@ export class PushCoalescer<E = unknown> {
     return false;
   }
 
+  /**
+   * An unread occupant leaves the subject: a notice or a plain occurrence
+   * displaces it, or a retraction withdraws it. Returns whether it was a
+   * first view that nothing may have shown (isUnshown), which a replacement
+   * carries on. Any other occupant may have been seen, and this is the last
+   * point where the host can say so, since the removal takes its placement:
+   * the subject's first view ends here, for a batch pending or rendering,
+   * whose first delivery would come after it, and for every later batch and
+   * birth (firstViewEnded).
+   */
+  private occupantLeaves(state: SubjectState<E>, occupant: NonNullable<SubjectState<E>['occupant']>): boolean {
+    if (occupant.firstView === true && this.host.isUnshown(occupant.placement)) return true;
+    state.firstViewEnded = true;
+    if (state.batch) delete state.batch.firstView;
+    if (state.rendering) delete state.rendering.batch.firstView;
+    return false;
+  }
+
   private scheduleRecovery(subject: string, state: SubjectState<E>): void {
     const prior = this.recovery.get(subject);
     if (prior?.timer) clearTimeout(prior.timer);
@@ -645,6 +674,7 @@ export class PushCoalescer<E = unknown> {
 
   private async retract(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     if (occupantUnread && state.occupant) {
+      this.occupantLeaves(state, state.occupant);
       this.host.audit({ kind: 'removed', subject, eventId: state.occupant.eventId });
       if (!this.host.remove(state.occupant.placement)) {
         // Still in context and possibly about to be read: say so, append the notice.
@@ -679,10 +709,9 @@ export class PushCoalescer<E = unknown> {
     if (occupantUnread && state.occupant) {
       const prior = state.occupant;
       // The replacement is the agent's first view only when its prior was
-      // one and nothing may have shown it to the agent (isUnshown). An
-      // occupant that isn't a first view ends the chain for every later
-      // replacement.
-      const firstView = prior.firstView === true && this.host.isUnshown(prior.placement);
+      // one and nothing may have shown it to the agent. Otherwise the
+      // subject's first view ends here (occupantLeaves).
+      const firstView = this.occupantLeaves(state, prior);
       this.host.audit({ kind: 'displaced', subject, eventId: prior.eventId });
       if (this.host.remove(prior.placement)) {
         this.host.cancelWake(subject);
@@ -703,9 +732,10 @@ export class PushCoalescer<E = unknown> {
     }
     if (hadBatch) this.host.cancelWake(subject);
     const outcome: CoalesceOutcome = hadBatch ? 'replaced' : state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
-    // The subject's `initial` birth is the agent's first view of it, and so
-    // is an occurrence that takes a first-view batch's place.
-    const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first';
+    // The subject's `initial` birth is the agent's first view of it unless
+    // that view has ended, and so is an occurrence that takes a first-view
+    // batch's place (a batch's own first view ends with the subject's).
+    const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first' && !state.firstViewEnded;
     const placement = await this.deliver(hadBatch && firstView ? { ...occurrence, replacesUnread: true } : occurrence);
     state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
@@ -714,17 +744,16 @@ export class PushCoalescer<E = unknown> {
 
   private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     let outcome: CoalesceOutcome = 'first';
-    // Whether the agent can still get its first view of the subject from a
-    // batch: nothing read, and a first-view occupant this notice displaces
-    // that nothing has shown. It decides a batch this notice opens, and a
-    // pending or rendering batch keeps its own first view only while it holds
-    // (below). A render still under way is weighed when a batch's first
-    // delivery is.
-    let firstView = state.history === 'none';
+    // Whether a batch this notice opens is the agent's first view of the
+    // subject: nothing of it read, its first view not ended, and a first-view
+    // occupant this notice displaces that nothing has shown (occupantLeaves,
+    // which otherwise ends the first view for the batches already open too).
+    // A render still under way is weighed when a batch's first delivery is.
+    let firstView = state.history === 'none' && !state.firstViewEnded;
     if (occupantUnread && state.occupant) {
       // §5.1: a notice displaces an unread plain occurrence and opens a batch
       // — in the audience that held the plain occurrence (§3.2).
-      firstView = state.occupant.firstView === true && this.host.isUnshown(state.occupant.placement);
+      if (!this.occupantLeaves(state, state.occupant)) firstView = false;
       this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
       if (this.host.remove(state.occupant.placement)) {
         outcome = 'replaced';
@@ -735,15 +764,6 @@ export class PushCoalescer<E = unknown> {
     } else if (state.batch?.latest.deliverTo) {
       // Later notices stay in the batch's audience.
       occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
-    }
-    // A batch opened as the agent's first view stays one only while nothing
-    // may have shown the agent a version of the subject. A notice that
-    // displaced an occupant something may have shown, or that finds the
-    // subject read, ends that for the batch it joins and for one already
-    // rendering, whose render settles after this notice.
-    if (!firstView) {
-      if (state.batch) delete state.batch.firstView;
-      if (state.rendering) delete state.rendering.batch.firstView;
     }
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
@@ -985,6 +1005,7 @@ export class PushCoalescer<E = unknown> {
         consumedEventId: s.occupant?.eventId ?? s.consumedEventId,
         identity: s.identity,
         audienceAgent: s.audienceAgent ?? s.occupant?.placement.agent,
+        ...(s.firstViewEnded ? { firstViewEnded: true as const } : {}),
         touchedAt: now,
       };
       if (s.batch) {
@@ -1060,6 +1081,7 @@ export class PushCoalescer<E = unknown> {
       subjects: [...this.subjects].map(([subject, s]) => ({
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
         ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
+        ...(s.firstViewEnded ? { firstViewEnded: true as const } : {}),
         ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
         ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}) } }
           : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }

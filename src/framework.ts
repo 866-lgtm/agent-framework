@@ -12250,7 +12250,11 @@ export class AgentFramework {
       // The registry's anchor follows a delivery the coalescer marked as the
       // agent's first view, as the turn's locus does. The receipt says so for
       // this acceptance, and for a retry it answers, whose first attempt
-      // delivered the message but failed before its acknowledgement.
+      // delivered the message but failed before its acknowledgement. A
+      // receipt restored after a restart carries no mark, so a retry it
+      // answers leaves the anchor where a marker would, as the host already
+      // counts what was stored before a restart as shown: every agent's
+      // shown watermark starts at the head at boot.
       const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
       return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
     });

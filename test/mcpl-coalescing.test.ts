@@ -2311,13 +2311,15 @@ test("#157: a notice's render that lands while an earlier render of its subject 
   assert.deepEqual(delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'n2' }], 'only the first render is the first view');
 });
 
-/** A coalescer whose every render lands in the deferred queue of 'other', an
- *  agent whose turn is alive, unless `stored` names the event, whose render is
- *  then stored and so materialized for the assembling turn. The renders of
- *  `held` wait for `release`. `state` answers the host's read and shown
- *  questions for every placement. (slimepriestess's probe for #168, with the
- *  held renders and the stored placement added.) */
-function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'], stored = [] as string[] } = {}) {
+/** A coalescer whose every delivery lands in the deferred queue of 'other',
+ *  an agent whose turn is alive, unless `stored` names the event, whose
+ *  delivery is then stored and so materialized for the assembling turn, or
+ *  `unplaced` does, whose delivery is placed nowhere. The renders of `held`
+ *  wait for `release`, and those of `blank` come back blank. `state` answers
+ *  the host's read and shown questions for every placement.
+ *  (slimepriestess's probe for #168, with the held renders and the other
+ *  options added.) */
+function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
   const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
   const releases = new Map<string, () => void>();
   const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
@@ -2327,6 +2329,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'
     isUnread: () => !state.read, isUnshown: () => !state.shown && !state.read, remove: () => true,
     deliver: async (occ) => {
       delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) });
+      if (unplaced.includes(occ.eventId)) return undefined;
       return stored.includes(occ.eventId)
         ? { agent: 'agent', messageId: `stored-${delivered.length}` }
         : { agent: 'other', deferredId: `deferred-${delivered.length}` };
@@ -2336,7 +2339,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'
     render: async (occ) => {
       started.get(occ.eventId)?.();
       await gates.get(occ.eventId);
-      return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] };
+      return { content: [{ type: 'text', text: blank.includes(occ.eventId) ? ' ' : `diff_${occ.eventId}` }] };
     },
     audit: () => {}, save: () => {},
   };
@@ -2346,7 +2349,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'
     retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
   });
   return {
-    coalescer, delivered, occurrence,
+    coalescer, host, delivered, occurrence,
     release: (id: string) => releases.get(id)!(),
     renderStarted: (id: string) => renderStarted.get(id)!,
   };
@@ -2415,6 +2418,143 @@ test('#157: a plain edit that takes the place of a pending first-view batch afte
   const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
   assert.equal(e1.coalesce?.outcome, 'replaced');
   assert.deepEqual(p.delivered.at(-1), { eventId: 'e1' });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view,
+ *  and `shown` says whether the agent is then shown it. n2 displaces it, and
+ *  n2's batch starts rendering for 'other', whose audience it took; n3 opens
+ *  a new batch during that render. Returns the held assembly, wrapped, since
+ *  an async function returning it would wait for it. */
+async function firstViewEndedDuringRender(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const n2 = await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  assert.equal(n2.coalesce?.outcome, 'replaced', 'n2 displaced the queued render');
+  const second = p.coalescer.assemble('other');
+  await settles(p.renderStarted('n2'), "n2's render");
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true }));
+  assert.equal(n3.coalesce?.outcome, 'first', 'n3 opened a new batch during the render');
+  return { second };
+}
+
+for (const shown of [false, true]) test(`#157: a plain edit that takes the place of a batch opened during the render that followed a displaced first-view render ${shown ? 'the agent was shown is no first view' : 'nothing had shown is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n2'] });
+  const { second } = await firstViewEndedDuringRender(p, state, shown);
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', "e1 took the pending batch's place");
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered.at(-1)?.eventId, 'e1');
+  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: after a displaced first-view render ${shown ? 'the agent was shown, a batch opened while its successor rendered blank is no first view' : 'nothing had shown, a batch opened while its successor rendered blank is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n2'], blank: ['n2'] });
+  const { second } = await firstViewEndedDuringRender(p, state, shown);
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered.length, 1, "n2's blank render delivered nothing");
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n3');
+  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view;
+ *  `shown` says whether the agent is then shown it, and a retraction
+ *  withdraws it. */
+async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  // Later versions haven't been shown, whatever happened to n1.
+  state.shown = false;
+}
+
+for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, the next batch is no first view' : 'nothing had shown, the next batch is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, shown);
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n2');
+  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, a plain birth is no first view, nor its edit' : 'nothing had shown, a plain birth is the first view, and so is its edit'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, shown);
+  const p1 = await p.coalescer.accept(p.occurrence('p1', {}));
+  assert.equal(p1.coalesce?.outcome, 'first');
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread birth');
+  assert.equal(p.delivered.at(-1)?.eventId, 'e1');
+  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: a plain occurrence that displaces a first-view render ${shown ? 'the agent was shown and is placed nowhere leaves the next batch no first view' : 'nothing had shown and is placed nowhere leaves the next batch the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], unplaced: ['p1'] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  state.shown = shown;
+  const p1 = await p.coalescer.accept(p.occurrence('p1', { tags: ['chat:edited'] }));
+  assert.equal(p1.coalesce?.outcome, 'replaced');
+  assert.equal(p.delivered.at(-1)?.eventId, 'p1');
+  state.shown = false;
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n2');
+  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+});
+
+test("#157: a snapshot keeps a subject's ended first view, so a restored coalescer's next batch is no first view", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, true);
+  const snapshot = p.coalescer.snapshot();
+  assert.equal((snapshot.subjects[0] as { firstViewEnded?: unknown }).firstViewEnded, true, 'the snapshot carries the end');
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
+});
+
+test("#157: a receipt keeps an admission's first view in memory only, so a restored receipt has none", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', replacesUnread: true });
+  assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'e1'), true, "the receipt records e1's first view");
+  assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'n1'), false, "n1's admission delivered nothing");
+  const snapshot = p.coalescer.snapshot();
+  for (const [, entry] of snapshot.receipts) assert.deepEqual(Object.keys(entry).sort(), ['at', 'result'], "a snapshot's receipt is its declared shape");
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  assert.equal(restored.receiptFirstView('editor', 'binding', 'e1'), false, 'a restored receipt has no first view');
+});
+
+test('#157: a plain edit that arrives while a first-view batch renders takes its place as the first view', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await settles(p.renderStarted('n1'), "n1's render");
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 cancelled the render and took its place');
+  p.release('n1');
+  await first;
+  assert.deepEqual(p.delivered, [{ eventId: 'e1', replacesUnread: true }]);
 });
 
 for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
@@ -2501,10 +2641,15 @@ test("#157: a channel edit that is the agent's first view moves context.incoming
   const message = { ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] };
   const first = await f.send('channels/incoming', { messages: [message] });
   assert.equal(first.result.results[0].accepted, false, 'the failed commit leaves the edit unacknowledged');
-  assert(isMarked(storedWith(f, 'question_fixed')), "the edit was delivered as the agent's first view");
+  const delivered = storedWith(f, 'question_fixed');
+  assert(isMarked(delivered), "the edit was delivered as the agent's first view");
   assert.equal(incomingAnchor(f)?.messageId, 'mb', 'an unacknowledged acceptance moves no anchor');
   const retry = await f.send('channels/incoming', { messages: [message] });
-  assert.equal(retry.result.results[0].coalesce.outcome, 'replaced', "the retry is answered from the first attempt's receipt");
+  // A second admission would replace the first attempt's delivery of a2
+  // itself, and say so.
+  assert.equal(retry.result.results[0].coalesce.outcome, 'replaced');
+  assert.equal(retry.result.results[0].coalesce.priorEventId, 'a1', "the retry is answered from the first attempt's receipt");
+  assert.equal(storedWith(f, 'question_fixed')?.id, delivered!.id, 'and delivers nothing again');
   assert(!('firstView' in retry.result.results[0]), "the host's mark isn't in the answer to the server");
   assert.equal(incomingAnchor(f)?.channelId, 'other', "the anchor moved to the edit's channel");
   assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
