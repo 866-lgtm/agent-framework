@@ -35,13 +35,16 @@ import { EXPIRY_REASON, isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, s
 export const DEFAULT_FETCH_MAX_BYTES = 256 * 1024 * 1024;
 /** Eager (autofetch) threshold: at most what could have shipped inline. */
 export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
-/** Cumulative per-server budget for this process: every byte fetched from a
- *  server counts against it, whether or not it's kept. */
+/** Cumulative per-server budget for this process: every byte the fetcher
+ *  reads from a server's references counts against it, whether or not it's
+ *  kept. */
 export const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 60_000;
-/** What a refusal by the per-server budget adds: the budget isn't renewed
- *  while this process runs, so a second try meets the same refusal. */
-const BUDGET_LASTS = "the budget isn't renewed while this host runs, so calling again won't change that";
+/** What a refusal by the per-server budget adds: the total isn't renewed
+ *  while this process runs, so a second try meets the same refusal unless
+ *  the server's budget is raised (its config's autofetch.maxTotalBytes, which
+ *  each fetch reads afresh). */
+const BUDGET_LASTS = "the budget isn't renewed while this host runs, so calling again won't change that unless whoever runs this host raises it";
 const EAGER_FETCH_TIMEOUT_MS = 10_000;
 
 export interface ResolvedServerBinding {
@@ -106,9 +109,9 @@ export function normalizedOrigin(url: string): string | null {
 }
 
 export class ReferenceFetcher {
-  /** Bytes fetched from each server in this process, charged as they arrive,
-   *  kept or not. Concurrent fetches from one server share the total, so each
-   *  checks what the others have taken. */
+  /** Bytes read from each server's references in this process, charged as
+   *  each chunk is read, kept or not. Concurrent fetches from one server share
+   *  the total, so each checks what the others have taken. */
   private totals = new Map<string, number>();
   private inFlight = new Map<string, Promise<FetchOutcome>>();
 
@@ -175,15 +178,18 @@ export class ReferenceFetcher {
     if (expiry) return { ok: false, error: `reference ${EXPIRY_REASON[expiry]}` };
 
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
-    // Vector 4: a claim already over the ceiling refuses without dialing.
-    if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
-      return { ok: false, error: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}` };
-    }
+    // The budget is checked before the ceiling, here and while reading: a
+    // larger max_bytes lifts the ceiling, and nothing the caller does lifts
+    // the budget, so a fetch past both is told about the budget.
     const serverId = record.serverId;
     const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     const used = this.totals.get(serverId) ?? 0;
     if (used >= budget) {
       return { ok: false, error: `per-server fetch budget exhausted (${used}/${budget} bytes); ${BUDGET_LASTS}` };
+    }
+    // Vector 4: a claim already over the ceiling refuses without dialing.
+    if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
+      return { ok: false, error: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}` };
     }
 
     const controller = new AbortController();
@@ -206,17 +212,17 @@ export class ReferenceFetcher {
         const { done, value } = await reader.read();
         if (done) break;
         received += value.byteLength;
-        // What arrived is charged at once, kept or not: other fetches from
+        // What's read is charged at once, kept or not: other fetches from
         // this server read the same total, so none spends what another took.
         const total = (this.totals.get(serverId) ?? 0) + value.byteLength;
         this.totals.set(serverId, total);
+        if (total > budget) {
+          controller.abort();
+          return { ok: false, error: `aborted: per-server fetch budget exhausted (${total}/${budget} bytes); ${BUDGET_LASTS}` };
+        }
         if (received > ceiling) {
           controller.abort();
           return { ok: false, error: `aborted: actual bytes exceeded ceiling at ${received}` };
-        }
-        if (total > budget) {
-          controller.abort();
-          return { ok: false, error: `aborted: actual bytes exceeded per-server budget at ${received}; ${BUDGET_LASTS}` };
         }
         const buf = Buffer.from(value);
         hash.update(buf);
