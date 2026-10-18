@@ -91,16 +91,16 @@ function skippedReason(data: any, path: string): string {
   return entry.reason;
 }
 
-/** Run `fn` with node:fs/promises' `lstat` replaced by `make(original)`, as the code under test sees it. */
-async function withLstat<T>(make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+/** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
+async function withFsp<T>(name: 'lstat' | 'realpath', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
-  const original = fsp.lstat!;
-  fsp.lstat = make(original);
+  const original = fsp[name]!;
+  fsp[name] = make(original);
   syncBuiltinESMExports();
   try {
     return await fn();
   } finally {
-    fsp.lstat = original;
+    fsp[name] = original;
     syncBuiltinESMExports();
   }
 }
@@ -405,7 +405,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(image.error, leadsInto('work/l/img.png', 'work', 'inner', 'inner/sub/img.png'));
   });
 
-  test('a file link into it is taken in by no sync, and a copy held from before is neither read nor pushed through it', async (t) => {
+  test('a file link into it is taken in by no sync, and a copy held from before is neither read, searched nor pushed through it', async (t) => {
     const env = new Env(t);
     env.write('outer/a/b/x.txt', "the inner mount's\n");
     env.write('outer/flink.txt', "the outer mount's copy\n");
@@ -417,6 +417,11 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(skippedReason(sync.data, 'flink.txt'), 'disk could not be checked: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
     const read = await call(m, 'read', { path: 'outer/flink.txt' });
     assert.equal(read.error, leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt'));
+    for (const path of ['outer', 'outer/flink.txt']) {
+      const grep = await call(m, 'grep', { pattern: 'copy', path });
+      assert.deepEqual(grep.data.results, [], `grep of ${path} searched none of the copy held from before`);
+      assert.deepEqual(grep.data.skipped, [{ file: 'outer/flink.txt', reason: leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt') }], path);
+    }
     // A write made now, with the link in place, is refused at the tool
     // (anima-research/agent-framework#530's third case).
     const write = await call(m, 'write', { path: 'outer/flink.txt', content: 'outer wrote\n' });
@@ -425,6 +430,37 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(materialize.data.count, 0);
     assert.equal(skippedReason(materialize.data, 'flink.txt'), 'flink.txt: not written: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), "the inner mount's\n");
+  });
+
+  test('grep gives each file with the states of the branch its text comes from, when a branch is selected while it asks about a held copy', async (t) => {
+    // grep asks whether each path whose disk its pass couldn't check leads
+    // into a nested mount, which awaits a realpath. A branch selected in that
+    // await mustn't have its text labelled with the states of the pass.
+    const env = new Env(t);
+    env.write('work/l/x.txt', 'outer copy\n');
+    env.write('work/nested/sub/keep.txt', 'inner\n');
+    env.write('work/z.txt', 'main\n');
+    const m = await env.open(t, [mount('work', env.at('work'), { followSymlinks: true }), mount('inner', env.at('work/nested'))]);
+    assert.equal((await call(m, 'sync', {})).success, true);
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.store.switchBranch('other');
+    assert.equal((await call(m, 'write', { path: 'work/z.txt', content: 'OTHER\n' })).success, true);
+    env.store.switchBranch(main);
+    rmSync(env.at('work/l'), { recursive: true });
+    symlinkSync('nested/sub', env.at('work/l'));
+    let switched = false;
+    const grep = await withFsp('realpath', (realpath) => async (path: string, ...rest: unknown[]) => {
+      if (!switched && String(path) === env.at('work/l/x.txt')) {
+        switched = true;
+        env.store.switchBranch('other');
+      }
+      return realpath(path, ...rest);
+    }, () => call(m, 'grep', { pattern: 'main|OTHER', path: 'work' }));
+    assert.ok(switched, 'a branch was selected while grep asked');
+    const settled = await call(m, 'grep', { pattern: 'main|OTHER', path: 'work' });
+    assert.notEqual(settled.data.results[0]?.state, 'synced', "z.txt's state on the other branch isn't main's");
+    assert.deepEqual(grep.data.results, settled.data.results, "grep gave the other branch's text with that branch's states");
   });
 
   for (const autoMaterialize of [false, true]) test(`a draft made before a file link into it took the path's place gets the path to use from a push, unforced and forced (autoMaterialize ${autoMaterialize})`, async (t) => {
@@ -532,7 +568,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     env.write('work/nested/sub/x.txt', 'inner file\n');
     const m = await env.open(t, [mount('work', env.at('work'), { followSymlinks: true }), mount('inner', env.at('work/nested'))]);
     let swapped = false;
-    await withLstat((lstat) => async (path: string, ...rest: unknown[]) => {
+    await withFsp('lstat', (lstat) => async (path: string, ...rest: unknown[]) => {
       // The reader's lstat of the path comes after the tools' check, which
       // found it the outer mount's: the directory becomes a link between.
       if (!swapped && String(path) === env.at('work/l/x.txt')) {
@@ -563,7 +599,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal((await call(m, 'sync', {})).success, true);
     assert.ok(env.tree('work').includes('l/img.png'), 'the outer mount holds the copy');
     let swapped = false;
-    await withLstat((lstat) => async (path: string, ...rest: unknown[]) => {
+    await withFsp('lstat', (lstat) => async (path: string, ...rest: unknown[]) => {
       if (!swapped && String(path) === env.at('work/l/img.png')) {
         swapped = true;
         renameSync(env.at('work/l'), env.at('work/l-was'));

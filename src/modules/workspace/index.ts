@@ -2038,22 +2038,31 @@ export class WorkspaceModule implements Module {
   private async parseFilePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const parsed = this.refuseNested(await this.parsePath(path));
     // A path can also reach a nested mount's directory through a symlink on
-    // its way. No push of this mount writes it there and no read reads it
-    // (nestedAtReal), so it's refused here, before anything is stored, and
-    // the checks where disk is acted on refuse it again. On a mount that
-    // doesn't follow the link, its refusal is the link's own (linkWords), as
-    // the readers and pushes give it. A mount with nothing nested has nothing
-    // to find, so it pays nothing.
-    const { mount, relativePath } = parsed;
+    // its way. No push of this mount writes it there and no read reads it,
+    // so it's refused here, before anything is stored, and the checks where
+    // disk is acted on refuse it again.
+    const refusal = await this.leadsIntoNested(parsed.mount, parsed.relativePath, parsed.path);
+    if (refusal) throw refusal;
+    return parsed;
+  }
+
+  /**
+   * The refusal for a path of `mount` that reaches a nested mount's directory
+   * through a symlink on its way (nestedAtReal), or null where it doesn't. On
+   * a mount that doesn't follow the link, the refusal is the link's own
+   * (linkWords), as the readers and pushes give it. A mount with nothing
+   * nested has nothing to find, so it pays nothing.
+   */
+  private async leadsIntoNested(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
     const nested = this.nestedOf(mount.config.name);
-    if (nested.length === 0) return parsed;
+    if (nested.length === 0) return null;
     const holder = nestedAtReal(await realBeneath(resolve(mount.config.path, relativePath)), nested);
-    if (!holder) return parsed;
+    if (!holder) return null;
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
-      if (found !== null) throw await linkReadError(mount, found, parsed.path, nested);
+      if (found !== null) return await linkReadError(mount, found, path, nested);
     }
-    throw new NestedMountError(parsed.path, mount.config.name, holder.name, holder.use, 'leads into');
+    return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
 
   /** A parsed path, refused if it lies in a nested mount's directory (parseFilePath). */
@@ -3237,12 +3246,29 @@ export class WorkspaceModule implements Module {
         // on: one selected in between would label its content with the other
         // branch's states. So a pass whose branch is no longer selected runs
         // again, and a branch that keeps changing leaves the scope unsearched.
+        //
+        // A copy held at a path that now leads into a nested mount's directory
+        // through a link is that mount's file too: read refuses it
+        // (parseFilePath), so grep searches none of it and says why. The pass
+        // can't check such a path's disk, so only an unverified one can be
+        // one. Asking awaits disk, so it's done before the branch is
+        // compared, and a branch selected meanwhile runs the pass again.
         let pass: PassResult | null = null;
+        let refused = new Map<string, string>();
         for (let attempt = 0; attempt < 3 && pass === null; attempt++) {
           const next = await this.passUnlocked(mount, fileScope
             ? { kind: 'paths', paths: [relativePath] }
             : { kind: 'dir', dir: start, recursive: true });
-          if (next.branchId === undefined || next.branchId === store.currentBranch().id) pass = next;
+          const asked = new Map<string, string>();
+          for (const report of next.reports.values()) {
+            if (report.state !== 'unverified') continue;
+            const refusal = await this.leadsIntoNested(mount, report.path, `${mount.config.name}/${report.path}`);
+            if (refusal) asked.set(report.path, refusal.message);
+          }
+          if (next.branchId === undefined || next.branchId === store.currentBranch().id) {
+            pass = next;
+            refused = asked;
+          }
         }
         if (pass === null) {
           incomplete.push({
@@ -3272,6 +3298,11 @@ export class WorkspaceModule implements Module {
           // none of this mount's copy of it, as read refuses it. Beneath a
           // scope it's passed over by design, like the directory.
           if (inOtherMount(report.path, this.othersOf(mount.config.name))) continue;
+          const refusal = refused.get(report.path);
+          if (refusal !== undefined) {
+            skipped.push({ file, reason: refusal });
+            continue;
+          }
           // The workspace's version, labelled with the path's state.
           const entry = store.treeGet(mount.treeStateId, report.path);
           const blob = entry ? store.getBlob(entry.blobHash) : null;
