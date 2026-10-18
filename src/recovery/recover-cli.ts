@@ -1,21 +1,7 @@
 #!/usr/bin/env node
 
-import { userInfo } from 'node:os';
-import { JsStore } from '@animalabs/chronicle';
 import { createOfflineRecoveryBranch } from './offline-branch.js';
-import {
-  DiscordAwarenessOutbox,
-  DISCORD_AWARENESS_ENTRY_LIFT,
-  boundDiscordAwarenessText,
-  defaultDiscordAwarenessOutboxPath,
-  type DiscordAwarenessMarks,
-} from './discord-awareness-outbox.js';
-import {
-  OperatorLog,
-  defaultOperatorLogPath,
-  type OperatorLogInput,
-  type OperatorRequester,
-} from '../operator-log.js';
+import type { DiscordAwarenessMarks } from './discord-awareness-outbox.js';
 
 interface CliOptions {
   storePath?: string;
@@ -31,21 +17,12 @@ interface CliOptions {
   outboxPath?: string;
   emoji?: string;
   marks: 'none' | 'addressed' | 'all';
-  awareness?: { verb: 'list' | 'cancel' | 'retract'; target?: string };
   dryRun: boolean;
-  /** Every option given, as typed, so a combination can be refused rather
-   *  than some of it ignored. */
-  given: string[];
 }
-
-/** What an awareness verb takes besides itself; every other option belongs to a recovery. */
-const AWARENESS_OPTIONS = new Set(['--store', '--outbox', '--awareness']);
 
 function usage(): string {
   return `Usage:
   agent-framework-recover --store <path> --agent <name> <anchor> [options]
-  agent-framework-recover --store <path> --awareness <list|cancel ID|retract ID|all>
-                              (cancel takes a batch id or a retract request id)
 
 Creates and activates a Chronicle recovery branch while the normal host is
 down. The recovery is local to the resident: by default no Discord reaction is
@@ -69,42 +46,16 @@ Options:
   --outbox <path>             A pre-journal awareness ledger to import
                               (default: <store>/recovery/discord-awareness-outbox.json)
   --emoji <emoji>             Marker reaction (default: 💤)
-  --dry-run                   Inspect a recovery's counts/addresses without
-                              writing (a recovery only; refused with --awareness)
+  --dry-run                   Inspect counts/addresses without writing
   --help                      Show this help
 
-Awareness journal (host stopped):
-  --awareness list            Each batch: scope, counts by status
-  --awareness cancel <ID>     Stop further sends of a batch's marks, or of a
-                              retract's removals (never undoes anything)
-  --awareness retract <ID|all>
-                              Queue removal of this bot's marks (through each
-                              ref's configured MCPL route) on a batch's refs,
-                              or on every ref an add was ever sent for
-  Each acts at once: inspect first with --awareness list. The awareness verbs
-  take only --store and --outbox; anything else is refused.
-
-Queued work is delivered when the host next connects to the Discord server.
-Each recovery, and each cancel or retract, is recorded, best-effort,
-in <store>/operator-actions.jsonl (where the host keeps its operator log,
-unless its operatorLogPath puts it elsewhere), with the OS account that ran
-it, whether it was carried out or refused: a log that can't be written says
-so on stderr, and the act stands. A dry run and a list write no entry. A
-list imports a pre-journal ledger if one is present, as the host's next
-start would: the marks agent-framework 0.22.x had still to add or remove
-are never sent, and stderr names the batches they belonged to. A batch
-0.22.x never activated placed no marks; retracting a batch takes off the
-mark of its emoji from each of its messages, whichever batch placed it. The
-store must exist: neither
-creates one.
 The agent host must be stopped before running this command.`;
 }
 
 function parseArgs(args: string[]): CliOptions {
-  const options: CliOptions = { dryRun: false, suppressMessageIds: [], suppressRanges: [], marks: 'none', given: [] };
+  const options: CliOptions = { dryRun: false, suppressMessageIds: [], suppressRanges: [], marks: 'none' };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg.startsWith('--')) options.given.push(arg);
     const value = () => {
       const next = args[++i];
       if (!next) throw new Error(`${arg} requires a value`);
@@ -146,17 +97,6 @@ function parseArgs(args: string[]): CliOptions {
         options.marks = marks;
         break;
       }
-      case '--awareness': {
-        const verb = value();
-        if (verb === 'list') {
-          options.awareness = { verb };
-        } else if (verb === 'cancel' || verb === 'retract') {
-          options.awareness = { verb, target: value() };
-        } else {
-          throw new Error('--awareness must be list, cancel <ID> or retract <ID|all>');
-        }
-        break;
-      }
       case '--dry-run': options.dryRun = true; break;
       case '--help':
       case '-h':
@@ -168,108 +108,8 @@ function parseArgs(args: string[]): CliOptions {
   return options;
 }
 
-/** Who ran the command, as far as the CLI can say: the OS account. */
-function cliRequester(): OperatorRequester {
-  try {
-    return { via: 'cli', name: userInfo().username };
-  } catch {
-    return { via: 'cli' };
-  }
-}
-
-/**
- * Record an act in the store's operator log (`<store>/operator-actions.jsonl`,
- * where the host records its own unless its `operatorLogPath` moves it),
- * whether it was done or refused, like the live surfaces' acts. Best-effort:
- * a logging failure never fails the act.
- */
-function recordOperatorAction(storePath: string, entry: OperatorLogInput): void {
-  new OperatorLog(defaultOperatorLogPath(storePath)).append(entry);
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function awareness(options: CliOptions): void {
-  // The journal lives in the store; with the host stopped, this process is
-  // its only writer.
-  const store = openExistingStore(options.storePath!);
-  try {
-    const outbox = new DiscordAwarenessOutbox(store, {
-      legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath!),
-    });
-    const { verb, target } = options.awareness!;
-    // Every verb reads the journal first, so a journal that can't be read is
-    // refused saying so, and what ends it, before anything else is decided.
-    const view = () => {
-      try {
-        return outbox.view();
-      } catch (error) {
-        throw new Error(
-          'The Discord awareness journal, or the pre-journal ledger it imports (--outbox), can\'t be read ' +
-            `(${boundDiscordAwarenessText(errorMessage(error))}), so no batch is listed or changed, and running this ` +
-            `again lists or changes none until both can be read: ${DISCORD_AWARENESS_ENTRY_LIFT}`,
-          { cause: error },
-        );
-      }
-    };
-    if (verb === 'list') {
-      console.log(JSON.stringify({ store: options.storePath, batches: view() }, null, 2));
-      return;
-    }
-    const by = 'agent-framework-recover';
-    // Logged as the live controls log theirs.
-    const logBase: OperatorLogInput = {
-      kind: `awareness-${verb}`,
-      agent: '*',
-      requester: cliRequester(),
-      params: { target },
-    };
-    let result: object;
-    try {
-      view();
-      result = verb === 'cancel' ? outbox.cancel(target!, by) : outbox.retract(target!, by);
-    } catch (error) {
-      recordOperatorAction(options.storePath!, { ...logBase, error: errorMessage(error) });
-      throw error;
-    }
-    recordOperatorAction(options.storePath!, { ...logBase, result: { ...result } });
-    console.log(JSON.stringify(result, null, 2));
-  } finally {
-    store.close();
-  }
-}
-
-/** The store at `path`, which must exist: a mistyped path is refused, never created. */
-function openExistingStore(path: string): JsStore {
-  try {
-    return JsStore.open({ path });
-  } catch (error) {
-    throw new Error(`No Chronicle store could be opened at ${path}: ${errorMessage(error)}`);
-  }
-}
-
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  if (options.awareness) {
-    if (!options.storePath) {
-      throw new Error(`--awareness needs --store\n\n${usage()}`);
-    }
-    // A recovery's options with an awareness verb are refused, never
-    // ignored: the operator would believe a choice applied that didn't.
-    const foreign = [...new Set(options.given.filter((arg) => !AWARENESS_OPTIONS.has(arg) && arg !== '--dry-run'))];
-    if (foreign.length > 0) {
-      throw new Error(`--awareness takes only --store and --outbox; ${foreign.join(', ')} belong to a recovery`);
-    }
-    // There is no preview of a control: refuse rather than act on a command
-    // that asked not to change anything.
-    if (options.dryRun) {
-      throw new Error('--dry-run previews a recovery; it does not apply to --awareness (inspect with --awareness list)');
-    }
-    awareness(options);
-    return;
-  }
   if (
     !options.storePath
     || !options.agentName
@@ -278,65 +118,25 @@ async function main(): Promise<void> {
     throw new Error(`--store, --agent, and one anchor (--message-id, --context-id, or --messages) are required\n\n${usage()}`);
   }
 
-  // A path that holds no store is refused before anything else, and gets no
-  // log entry: the log lives in the store.
-  openExistingStore(options.storePath).close();
-
   // A CLI choice and its application are the same moment (the host is
   // stopped), so the scope is evaluated now rather than frozen to refs.
   const marks: DiscordAwarenessMarks = options.marks === 'none' ? 'none' : { scope: options.marks };
-  // A real recovery is recorded in the operator log, done or failed, with
-  // its marks choice and receipt, as a live rollback or suppression is. A
-  // dry run changes nothing and records nothing.
-  const logBase: OperatorLogInput = {
-    kind: 'recovery',
-    agent: options.agentName,
-    requester: cliRequester(),
-    params: {
-      ...(options.messageId !== undefined ? { messageId: options.messageId } : {}),
-      ...(options.contextId !== undefined ? { contextId: options.contextId } : {}),
-      ...(options.messages !== undefined ? { messages: options.messages } : {}),
-      ...(options.suppressMessageIds.length > 0 ? { suppressMessageIds: options.suppressMessageIds } : {}),
-      ...(options.suppressRanges.length > 0 ? { suppressRanges: options.suppressRanges } : {}),
-      marks: marks === 'none' ? 'none' : { scope: marks.scope },
-    },
-  };
-  let result: Awaited<ReturnType<typeof createOfflineRecoveryBranch>>;
-  try {
-    result = await createOfflineRecoveryBranch({
-      storePath: options.storePath,
-      agentName: options.agentName,
-      messageId: options.messageId,
-      contextId: options.contextId,
-      messages: options.messages,
-      suppressMessageIds: options.suppressMessageIds,
-      suppressRanges: options.suppressRanges,
-      branchName: options.branchName,
-      namespace: options.namespace,
-      discordServerId: options.discordServerId,
-      outboxPath: options.outboxPath,
-      emoji: options.emoji,
-      marks,
-      dryRun: options.dryRun,
-    });
-  } catch (error) {
-    if (!options.dryRun) recordOperatorAction(options.storePath, { ...logBase, error: errorMessage(error) });
-    throw error;
-  }
-  if (!result.dryRun) {
-    recordOperatorAction(options.storePath, {
-      ...logBase,
-      result: {
-        sourceBranch: result.sourceBranch,
-        targetBranch: result.targetBranch,
-        messagesRemoved: result.messagesRemoved,
-        messagesSuppressed: result.messagesSuppressed,
-        discordRefs: result.discordAddressable,
-        ...(result.markers ? { markers: result.markers } : {}),
-        ...(result.suppressionJournal ? { suppressionJournal: result.suppressionJournal } : {}),
-      },
-    });
-  }
+  const result = await createOfflineRecoveryBranch({
+    storePath: options.storePath,
+    agentName: options.agentName,
+    messageId: options.messageId,
+    contextId: options.contextId,
+    messages: options.messages,
+    suppressMessageIds: options.suppressMessageIds,
+    suppressRanges: options.suppressRanges,
+    branchName: options.branchName,
+    namespace: options.namespace,
+    discordServerId: options.discordServerId,
+    outboxPath: options.outboxPath,
+    emoji: options.emoji,
+    marks,
+    dryRun: options.dryRun,
+  });
 
   console.log(JSON.stringify({
     ...result,

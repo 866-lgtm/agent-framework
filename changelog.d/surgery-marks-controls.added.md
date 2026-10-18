@@ -16,13 +16,6 @@
     target, since a start on a branch with that name would apply them there.
 
   The same controls are the `host/command` `marks` verb (`action: list |
-  cancel | retract`, `target`) and, with the host stopped,
-  `agent-framework-recover --awareness list|cancel|retract`. Each control
-  that changes the journal is recorded in the operator log, and refuses
-  once `stop()` has begun, like every operator entry point.
-- `agent-framework-recover` records its acts in the store's operator log
-  (`<store>/operator-actions.jsonl`), done or refused, with the OS account
-  that ran it: each `--awareness` cancel and retract, and each recovery with
-  its marks choice and receipt (kind `recovery`). A list, and a recovery's
-  dry run, record nothing. `--dry-run` with `--awareness` is refused: a
-  control has no preview.
+  cancel | retract`, `target`). Each control that changes the journal is
+  recorded in the operator log, and refuses once `stop()` has begun, like
+  every operator entry point.

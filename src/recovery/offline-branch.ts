@@ -99,13 +99,7 @@ export async function createOfflineRecoveryBranch(
   // message.
   const marks = checkedDiscordAwarenessMarks(options.marks);
 
-  // The store must exist: a mistyped path is refused, never created.
-  let store: JsStore;
-  try {
-    store = JsStore.open({ path: options.storePath });
-  } catch (error) {
-    throw new Error(`No Chronicle store could be opened at ${options.storePath}: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  const store = JsStore.openOrCreate({ path: options.storePath });
   let contextManager: ContextManager | null = null;
   try {
     contextManager = await ContextManager.open({

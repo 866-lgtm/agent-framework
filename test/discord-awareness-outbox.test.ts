@@ -1771,8 +1771,8 @@ test('the start that imports a pre-journal ledger raises one alert naming each b
     message: 'This start imports the pre-journal awareness ledger, and the marks agent-framework 0.22.x had still to add '
       + `or remove won't be sent, since nobody chose them: ${named}. A batch 0.22.x never activated placed no marks. To `
       + 'take off the marks it placed for a batch it activated, retract that batch through the host command marks '
-      + '(action retract), or, with the host stopped, agent-framework-recover --awareness retract: a retract takes off '
-      + 'the mark of the batch\'s emoji from each of its messages, whichever batch placed it',
+      + '(action retract): a retract takes off the mark of the batch\'s emoji from each of its messages, whichever '
+      + 'batch placed it',
   }]);
   assert.deepEqual(logged, [
     `[discord-awareness] importing ${basename(h.legacyPath)}: 2 batch(es) had marks agent-framework 0.22.x had still `

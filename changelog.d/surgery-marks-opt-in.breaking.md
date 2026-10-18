@@ -59,5 +59,4 @@
   (and the CLI's JSON output) no longer has `outboxPath`, since the journal is
   in the store. `discordMarkersQueued` is the marks queued (planned, for a dry
   run), with `markers`, the receipt, beside it, and `discordAddressable`,
-  `marksScope`, `unmarked` and `notRemoved` are new. Both need a store that
-  exists: a path that holds none is refused, where it used to be created.
+  `marksScope`, `unmarked` and `notRemoved` are new.

@@ -193,12 +193,10 @@ awareness journal kept in the store itself, and the marks are delivered when
 the host and that agent's `discord-mcpl` bot next connect (see
 [Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
 If the branch is made but the marks can't be recorded, the output's `markers`
-says so and the branch stands. Like a live surgery, the recovery (with its
-marks choice and receipt) is recorded in the store's operator log,
-`operator-actions.jsonl`, with the OS account that ran it; so is each
-`--awareness` cancel and retract. A dry run and a list record
-nothing. The store must exist: a path that holds none is refused, never
-created.
+says so and the branch stands. The live controls described below list, cancel
+and retract marks; with the host stopped there are none, so a chosen batch is
+stopped by starting the host and cancelling it, and a few of its marks may go
+out first.
 Portal and other non-Discord records are ignored.
 
 When the safe point is an assistant/tool-side record rather than a Discord
@@ -241,11 +239,6 @@ For old stores whose messages lack `metadata.serverId`, supply
 `--discord-server discord` (or the configured Discord MCPL server id). The
 normal agent host must be stopped while this command has the Chronicle store
 open.
-
-With the host stopped, the same command inspects and controls the awareness
-journal: `--awareness list`, `--awareness cancel <batch|retract-request>` and
-`--awareness retract <batch|all>` behave as the live controls described below. They take only `--store` and `--outbox`,
-and refuse a recovery's options given with them.
 
 For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. When the awareness ledger exists but can't be read, a runtime connect reads it first and refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart refuses before it stops the running child. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
 

@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
@@ -1181,6 +1183,43 @@ test('offline recovery refuses a marks choice the live methods refuse, before an
         });
       }
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the recover CLI places no marks unless --marks chooses them, and refuses a mistyped choice', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-'));
+  const storePath = join(dir, 'store');
+  const cli = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
+  const recover = (...args: string[]) => spawnSync(process.execPath, [cli, '--store', storePath, '--agent', 'cairn', ...args], { encoding: 'utf8' });
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'safe' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe' });
+    cm.addMessage('user', [{ type: 'text', text: 'one' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-1', tags: ['chat:addressed'] });
+    cm.addMessage('user', [{ type: 'text', text: 'two' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-2', tags: ['chat:ambient'] });
+    cm.close();
+    store.close();
+
+    const typo = recover('--message-id', 'm-safe', '--marks', 'adressed');
+    assert.equal(typo.status, 1);
+    assert.match(typo.stderr, /--marks must be none, addressed or all/);
+    // A dry run shows what the choice covers, and changes nothing.
+    const planned = recover('--message-id', 'm-safe', '--marks', 'addressed', '--dry-run');
+    assert.equal(planned.status, 0, planned.stderr);
+    const plan = JSON.parse(planned.stdout);
+    assert.equal(plan.marksScope, 'addressed');
+    assert.deepEqual(plan.refs.map((ref: { messageId: string }) => ref.messageId), ['m-1']);
+    assert.equal(plan.unmarked, 1);
+    // Left out, the choice is none: the recovery is local to the resident.
+    const local = recover('--message-id', 'm-safe', '--branch', 'recovery/cairn/1');
+    assert.equal(local.status, 0, local.stderr);
+    const result = JSON.parse(local.stdout);
+    assert.equal(result.marksScope, 'none');
+    assert.deepEqual(result.markers, { scope: 'none', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 });
+    assert.equal(result.messagesRemoved, 2);
+    readJournal(storePath, (outbox) => assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

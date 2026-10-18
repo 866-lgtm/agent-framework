@@ -21336,9 +21336,8 @@ export class AgentFramework {
         unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
           `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
         '. A batch 0.22.x never activated placed no marks. To take off the marks it placed for a batch it ' +
-        'activated, retract that batch through the host command marks (action retract), or, with the host ' +
-        'stopped, agent-framework-recover --awareness retract: a retract takes off the mark of the batch\'s emoji ' +
-        'from each of its messages, whichever batch placed it',
+        'activated, retract that batch through the host command marks (action retract): a retract takes off ' +
+        'the mark of the batch\'s emoji from each of its messages, whichever batch placed it',
       { data: { batches: unsent } },
     );
   }
