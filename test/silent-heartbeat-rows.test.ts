@@ -212,7 +212,16 @@ function rowWith(framework: AgentFramework, text: string) {
   return row;
 }
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Wait for what a test's next assertions need, rather than for a length of
+ * time: a timer the framework set (a retry's backoff, a cooldown's release)
+ * can fire late on a loaded host. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 describe('silent heartbeat stored rows', () => {
   it('keeps a tick reply out of the previous assistant message on the wire', async () => {
@@ -735,7 +744,7 @@ describe('replies to a [Continue] turn', () => {
       await x.framework.runUntilIdle();
       assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
       await wake(x, ordinaryEvent('arrived during the cooldown'));
-      await sleep(1_100);
+      await waitFor(() => internal.providerAccelerationCooldowns.size === 0, 'the cooldown\'s release');
       await x.framework.runUntilIdle();
       assert.equal(membrane.calls.length, 4, 'first, the continued reply, its held restart, the resumed attempt');
 
@@ -800,7 +809,7 @@ describe('replies to a [Continue] turn', () => {
         [createMockResponse(signed('sig-c2', 'all done'))]);
       (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
       await x.framework.runUntilIdle();
-      await sleep(50);
+      await waitFor(() => membrane.calls.length >= 4, 'the retry\'s call');
       await x.framework.runUntilIdle();
       assert.equal(membrane.calls.length, 4, 'first, the continued reply, its failed restart, the retry');
       assert.ok(membrane.calls[3]!.messages.at(-1)!.content.some((b) => b.type === 'tool_result'));
