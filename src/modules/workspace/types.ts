@@ -40,6 +40,74 @@ export interface MountConfig {
    * - Extension glob: "*.pyc" (any file ending in .pyc)
    */
   ignore?: string[];
+  /**
+   * The files this mount holds, when it holds only some of what is under its
+   * path: the same pattern forms as `ignore`, read for files. A name or an
+   * extension glob covers a file by its own name, at any depth, and a
+   * directory glob (`dir/**`) covers what lies beneath that directory, and not
+   * a file named like it. Unlike `ignore`, a pattern that matches a
+   * directory's name covers nothing beneath it, since each file is covered by
+   * its own name: `["gate.json"]` holds every file named `gate.json`, and no
+   * other file beneath a directory of that name. A subtree is named with
+   * `dir/**`. It's the mount's boundary. A
+   * file or link it doesn't cover is outside the mount: walks and the watcher
+   * pass over it, and a materialize doesn't write it back even when the
+   * workspace's history holds it. A materialize that names a directory inside
+   * the mount counts each such entry beneath it under `passedOver`, with the
+   * reason and without its path, a deletion or conflict held there included;
+   * one of the whole mount takes none of them up. No tool names a file the
+   * include doesn't cover, beyond echoing a path it was given. Every tool
+   * refuses a path with a `..` segment on
+   * such a mount, whatever it reaches, before it looks the path up (text the
+   * host registers aside, below), and the refusal says to give the path from
+   * the mount's root with no `..` in it. The
+   * file operations (read, write, edit, delete, and the module's binary and
+   * disk reads and writes) refuse any path it doesn't cover as outside the
+   * mount's include, a directory's included, and `resolveAbsolutePath` returns
+   * null for one; the mount's root is inside when it's named without a `..`.
+   * Directories are walked unless `ignore` covers them, and no link the walk
+   * meets is walked,
+   * so a listing that isn't recursive names each directory directly beneath
+   * its path that disk has, whether or not anything beneath it is covered,
+   * and each that a covered entry in the workspace's history implies; the
+   * files it shows are only those the include covers. A sync, materialize,
+   * grep, glob or ls that names a path the include doesn't cover takes it as
+   * a directory, its scope, exactly where a listing names one: where disk has
+   * a directory reached from the mount's root through directories, with no
+   * link among them, or the workspace's history holds an entry beneath it
+   * that the include covers. The one exception is a directory `ignore`
+   * covers, which a listing passes over and which is still a scope when it's
+   * named. It refuses any other path the include doesn't cover the same way,
+   * so a name outside the include gets the same answer whether a file is
+   * there, on disk or in history, or not. Where covered history makes a name
+   * a scope and disk has since put a link there, a pass of that scope follows
+   * the link, as a link among a path's parent directories is followed on any
+   * mount (below), so its answer shows whether the link leads out of the
+   * mount. A covered path is a file to a sync,
+   * materialize or grep when disk or history has a file there, and otherwise
+   * a directory; a glob takes its path as a directory. Beneath a directory,
+   * each passes over what the include doesn't cover.
+   * `ignore` still applies to what `include` covers. It names paths: a link
+   * among a covered path's parent directories is followed as it is on any
+   * mount, and on a mount that follows symlinks, a link it covers is read and
+   * written through its own name, wherever the link leads inside the mount.
+   * Text the host registers for a path (`registerGeneratedTextFile`) is served
+   * there whatever the include says, since it isn't one of the mount's files:
+   * it's matched by the file a path reaches before anything else checks the
+   * path, so every spelling that reaches it reads it, a `..` one included, and
+   * none writes it.
+   * The framework keeps its own files (`tool-results/`, `refs/`,
+   * `background-scripts/`) only in a writable mount without an include, and
+   * what it kept in a mount before the mount had one is outside the mount once
+   * it has one, unless the include covers it. Left out, the mount holds
+   * everything under its path. Given, it's a list of at least one string, each
+   * a name, an `*.ext` glob or a `dir/**` glob, whose directory may be nested
+   * (`a/b/**`). The module refuses a pattern with a `/` that isn't such a
+   * glob, a `*` anywhere but a leading `*.` or that trailing `/**`, and an
+   * empty, `.` or `..` segment. Any other pattern is a file name, matched
+   * literally, so `[id].tsx` names the file of that name.
+   */
+  include?: string[];
   /** Whether to follow symlinks (default: false) */
   followSymlinks?: boolean;
   /** Maximum file size in bytes (default: 5MB) */

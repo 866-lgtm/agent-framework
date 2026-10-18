@@ -56,6 +56,8 @@ export interface MountView {
   /** Text above this size is not ingested. */
   maxFileSize: number;
   ignore: string[];
+  /** The mount's `include`: files and links it doesn't cover are outside the mount. Absent, everything is inside. */
+  include?: readonly string[];
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -774,6 +776,74 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
   return false;
 }
 
+/** Why a walk passes over a name the mount's `ignore` covers. */
+export const IGNORED_BY_MOUNT = 'ignored by the mount';
+/** Why a walk passes over a file or link the mount's `include` doesn't cover, and a push leaves one alone. */
+export const OUTSIDE_INCLUDE = "outside the mount's include";
+
+/** Whether a walk passed over a name because of the mount's patterns, rather than leaving it untaken. */
+function passedOverByPatterns(reason: string | undefined): boolean {
+  return reason === IGNORED_BY_MOUNT || reason === OUTSIDE_INCLUDE;
+}
+
+/**
+ * The segments of a path after its mount's name, as the workspace reads them
+ * everywhere: split at `/`, and at `\` too where that's the platform's
+ * separator, with no empty or `.` segment. A `..` segment stays, for the
+ * path's mount to refuse or resolve.
+ */
+export function pathSegments(path: string, platformSep: string = sep): string[] {
+  return (platformSep === '\\' ? path.replaceAll('\\', '/') : path).split('/').filter((s) => s !== '' && s !== '.');
+}
+
+/**
+ * Whether a mount-relative path is spelled as the workspace's parsing spells
+ * one: segments between single `/`, none empty, `.` or `..`, with no `\`
+ * where that's the separator, or '' for the root. A walk and the watcher name
+ * paths this way. An earlier version stored a path as it was written, so the
+ * store can hold a key such as `a//b.txt` or `c/`, which no spelling names.
+ */
+export function parsedSpelling(relativePath: string, platformSep: string = sep): boolean {
+  if (relativePath === '') return true;
+  const segments = pathSegments(relativePath, platformSep);
+  return !segments.includes('..') && segments.join('/') === relativePath;
+}
+
+/**
+ * Whether a mount-relative path is inside its mount: spelled as parsing spells
+ * one (parsedSpelling), and covered by the mount's `include` when it has one.
+ * The mount's root, '', is inside. A store key no spelling names is outside,
+ * as an entry the include doesn't cover is: nothing lists, counts, syncs or
+ * writes it, and history keeps it as it was.
+ */
+export function insideMount(relativePath: string, include: readonly string[] | undefined): boolean {
+  if (!parsedSpelling(relativePath)) return false;
+  if (include === undefined || relativePath === '') return true;
+  return coveredByInclude(relativePath, include);
+}
+
+/**
+ * Whether a mount's include covers a mount-relative path. Its patterns take
+ * `ignore`'s forms, read for files: a name or `*.ext` pattern covers a path by
+ * its own last segment, at any depth, and `dir/**` covers what lies beneath
+ * `dir`, and not a file named `dir`. Unlike `ignore`, a pattern that matches
+ * a directory's name covers nothing beneath it: each file is covered by its
+ * own name, so `gate.json` covers `x/gate.json` and not `x/gate.json/run.sh`,
+ * and a subtree is named with `dir/**`. A directory is no file, so it needs
+ * no covering: where one is a scope, refusesAsOutside (index.ts) decides.
+ */
+function coveredByInclude(relativePath: string, include: readonly string[]): boolean {
+  const name = relativePath.slice(relativePath.lastIndexOf('/') + 1);
+  for (const pattern of include) {
+    if (pattern.endsWith('/**')) {
+      if (relativePath.startsWith(pattern.slice(0, -2))) return true;
+    } else if (pattern === name || (pattern.startsWith('*.') && name.endsWith(pattern.slice(1)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Simple ignore patterns, as the watcher and the old walk read them. */
 export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
@@ -951,8 +1021,16 @@ export async function walkScope(
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (isIgnored(childRel, entry.name, ignore)) {
-        others.push([childRel, 'ignored by the mount']);
-        regions.push({ path: childRel, reason: 'ignored by the mount', kind: 'ignored' });
+        others.push([childRel, IGNORED_BY_MOUNT]);
+        regions.push({ path: childRel, reason: IGNORED_BY_MOUNT, kind: 'ignored' });
+        continue;
+      }
+      // A file or link the mount's include doesn't cover is outside the
+      // mount, a named scope's too. A directory is walked, since a name or an
+      // extension glob in include can match beneath it.
+      if (!entry.isDirectory() && !insideMount(childRel, view.include)) {
+        others.push([childRel, OUTSIDE_INCLUDE]);
+        regions.push({ path: childRel, reason: OUTSIDE_INCLUDE, kind: 'ignored' });
         continue;
       }
       if (entry.isDirectory()) {
@@ -1046,7 +1124,7 @@ export async function walkScope(
   const capped = `the walk cap (${cap}) was reached`;
   const holdingUntaken = new Set<string>();
   for (const f of walk.seen) holdingUntaken.add(parentOf(f));
-  for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && !walk.othersTaken.has(p)) holdingUntaken.add(parentOf(p));
+  for (const [p, why] of walk.others) if (!passedOverByPatterns(why) && !walk.othersTaken.has(p)) holdingUntaken.add(parentOf(p));
   for (const d of holdingUntaken) {
     walk.incomplete.push({ path: d, reason: `${capped} before everything here was taken`, kind: 'cap' });
   }

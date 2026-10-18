@@ -207,8 +207,8 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A writable workspace existed but the oversized-result spill write
-       * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
+       * The workspace had a writable mount without an include, where spills
+       * go, but the oversized-result spill write failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
        * retained. Distinct from the no-workspace fallback, which is silent
        * by design (nothing unexpected happened).
        */

@@ -3920,7 +3920,7 @@ export class AgentFramework {
   }
 
   /** RFC-005 host-mediated reference fetcher (lazy; needs server configs +
-   *  a writable workspace mount for storage). */
+   *  a read-write workspace mount without an include for storage). */
   private referenceFetcherInstance?: ReferenceFetcher;
   private getReferenceFetcher(): ReferenceFetcher {
     if (!this.referenceFetcherInstance) {
@@ -14303,7 +14303,7 @@ export class AgentFramework {
       data: {
         status: 'background script started',
         script_id: scriptId,
-        log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
+        log: logPath ?? 'not kept: background script logs go to a writable workspace mount without an include, and this setup has none. Its output is not retrievable; only wake_agent() reaches you',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
         lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
@@ -14311,13 +14311,19 @@ export class AgentFramework {
     };
   }
 
-  /** First read-write mount name, or null. */
+  /**
+   * The first read-write mount without an include, or null. The framework
+   * keeps its own files there (`tool-results/`, `refs/`,
+   * `background-scripts/`). A mount with an include holds only the files it
+   * names, so it would refuse them, and a setup whose only writable mount
+   * has one is treated as having none.
+   */
   private firstWritableMountName(workspace: WorkspaceModule): string | null {
     const mounts = (workspace as unknown as {
-      getMounts?: () => Array<{ name: string; mode: string }>;
+      getMounts?: () => Array<{ name: string; mode: string; include?: readonly string[] }>;
     }).getMounts?.();
     if (mounts) {
-      const rw = mounts.find((m) => m.mode !== 'read-only');
+      const rw = mounts.find((m) => m.mode !== 'read-only' && m.include === undefined);
       return rw?.name ?? null;
     }
     return null;
@@ -14453,7 +14459,7 @@ export class AgentFramework {
    * file (readable with the agent's own tools — deterministic name, kept
    * until the workspace owner deletes it) and replaced by a truncated head +
    * a trailing file reference. Falls back to EXPLICIT plain truncation when
-   * there is no writable workspace. Cap resolution lives in
+   * there is no read-write mount without an include. Cap resolution lives in
    * resolveToolResultInlineCap; callers pass the resolved cap.
    */
   /**
@@ -14505,8 +14511,8 @@ export class AgentFramework {
   }
 
   /** Where a tool result labelled `label` is written: `<first writable
-   *  mount>/tool-results/<label>.txt`, or null when there is no writable
-   *  workspace. */
+   *  mount without an include>/tool-results/<label>.txt` (see
+   *  firstWritableMountName), or null when there is no such mount. */
   private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
     const workspace = this.getWorkspaceModule();
     const mountName = workspace ? this.firstWritableMountName(workspace) : null;
@@ -14580,7 +14586,8 @@ export class AgentFramework {
   /**
    * Write one tool result's text to its tool-results file (see
    * toolResultFilePlace): the one place both the inline cap's spill and the
-   * guard's withheld originals go. null when there is no writable workspace.
+   * guard's withheld originals go. null when there is no writable mount
+   * without an include.
    * A failed write is reported, traced and logged here, never thrown. With a
    * branch, the file lands on that branch or isn't written (see writeBinary).
    */
@@ -14677,7 +14684,7 @@ export class AgentFramework {
     }
     return {
       text: head
-        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace, full content not retained]'
+        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]'
         + kept,
       filePath: null,
     };

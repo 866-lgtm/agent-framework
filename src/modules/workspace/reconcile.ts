@@ -57,6 +57,7 @@ import {
   type MountView,
   ROOT_REPLACED,
   type Walk,
+  insideMount,
   fingerprintVouches,
   locateRoot,
   looksBinary,
@@ -623,16 +624,20 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   }
 
   // Which paths to decide: what disk shows, and what the store, P and intent
-  // track. The tracked ones are read synchronously, on this branch.
+  // track. The tracked ones are read synchronously, on this branch. A path
+  // the mount's include doesn't cover is outside the mount, so no pass
+  // decides it: the workspace's history may hold it from before the include,
+  // and it stays there as it is.
   const candidates = new Set<string>();
+  const inside = (p: string): boolean => insideMount(p, mount.view.include);
   let walk: Walk | null = null;
   if (scope.kind === 'paths') {
-    for (const p of scope.paths) candidates.add(p);
+    for (const p of scope.paths) if (inside(p)) candidates.add(p);
   } else {
     const prefix = scope.dir ? scope.dir + '/' : undefined;
-    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope)) candidates.add(e.path);
-    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
-    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
+    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope) && inside(e.path)) candidates.add(e.path);
+    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope) && inside(p)) candidates.add(p);
+    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope) && inside(p)) candidates.add(p);
     if (rootUnavailable === null) {
       const resumeAfter = opts.resume ? agreement.walkResumesAfter(mount.name, scope.dir) : undefined;
       walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? mount.walkCap, {

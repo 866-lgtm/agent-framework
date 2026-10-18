@@ -108,7 +108,7 @@ export class ReferenceFetcher {
   constructor(
     private readonly resolveServer: (serverId: string) => ResolvedServerBinding | undefined,
     /** Persist the payload; returns a mount-prefixed path or null when no
-     *  writable workspace exists. File name is host-generated (§7.3). */
+     *  writable mount without an include exists. File name is host-generated (§7.3). */
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
   ) {}
 
@@ -230,7 +230,7 @@ export class ReferenceFetcher {
       const ext = EXT_BY_MIME.get(observedMime) ?? EXT_BY_MIME.get(headerMime ?? '') ?? EXT_BY_MIME.get(claimedMime ?? '') ?? 'bin';
       // §7.3: host-generated storage name; the server's `name` is display-only.
       const path = await this.saveFile(`${record.refId}.${ext}`, data, observedMime);
-      if (path === null) return { ok: false, error: 'no writable workspace mount to store the payload' };
+      if (path === null) return { ok: false, error: 'no writable workspace mount without an include to store the payload' };
 
       this.totals.set(record.serverId, used + data.length);
       record.fetchedPath = path;
