@@ -11960,6 +11960,7 @@ export class AgentFramework {
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      wakeToRead: (occ, agentName) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }, true),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -12347,8 +12348,16 @@ export class AgentFramework {
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+    this.cancelCoalescedWakes(coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key));
+    await this.queueCoalescedWakes(occ);
+  }
+
+  /** Queue a wake for each agent of the batch's audience, when its latest
+   *  occurrence triggers inference. `plain`: an ordinary push wake, without
+   *  the subject a withdrawal of the batch's wakes goes by, for a render
+   *  placed in its agent's deferred queue (wakeToRead). */
+  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
-    this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
@@ -12364,8 +12373,7 @@ export class AgentFramework {
         channelId,
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
-        coalescingSubject: subject,
-        coalescingBatch: true,
+        ...(plain ? {} : { coalescingSubject: subject, coalescingBatch: true }),
       });
     }
   }
@@ -12931,6 +12939,13 @@ export class AgentFramework {
         coalescingBatchSubjects: batchOnly
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
+        // A withdrawal of a subject's wakes takes a wake whose sole cause is
+        // that subject (§4.2), so the merged trigger carries a subject only
+        // when it is every merged request's: withdrawing it then never takes
+        // the merge's other causes, such as an ordinary wake, another
+        // subject's batch, or a retry past its gate.
+        coalescingSubject: requests.every((r) => r.coalescingSubject === trigger?.coalescingSubject)
+          ? trigger?.coalescingSubject : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
@@ -15060,10 +15075,16 @@ export class AgentFramework {
     // boundary — after the deferred flush (same window: turn alive, compile
     // not yet run) and before the checkpoint (they are the turn's inputs).
     // Not on a context-budget restart: that continues the same logical turn.
+    // A turn whose only causes are deferred batches assembles even when no
+    // batch is pending: its batch may have been withdrawn after its wake was
+    // dispatched or be rendering for another agent's assembly, and only the
+    // assembly can say whether the turn has anything to read.
+    const batchSubjects = trigger?.coalescingBatchSubjects;
     let assembly: AssemblyResult | undefined;
-    if (attempt === 0 && !resumesTurn && this.pushCoalescer?.pendingBatches()) {
+    if (attempt === 0 && !resumesTurn && this.pushCoalescer
+      && (batchSubjects?.length || this.pushCoalescer.pendingBatches())) {
       try {
-        assembly = await this.pushCoalescer.assemble(agent.name);
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects);
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
@@ -15072,15 +15093,16 @@ export class AgentFramework {
     // A turn whose only causes were deferred batches, none of which gave it
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
     // render-start that could not be made durable, whose batch then waits for
-    // its recovery wake; a batch whose audience doesn't include the agent),
-    // has nothing new to show: running it would wake the model to
-    // `[Continue]` or an older message, an uncaused wake. Stop before the
-    // checkpoint, locus, typing and compile. Any batch this assembly
-    // materialized keeps the turn, including one that was not among its
-    // causes (a batch whose wake the freeze withdrew, or one that never
-    // qualified for a wake). A cause this assembly did not settle (rendered
-    // elsewhere, not yet frozen) keeps the turn, as before.
-    const batchSubjects = trigger?.coalescingBatchSubjects;
+    // its recovery wake; a batch whose audience doesn't include the agent; a
+    // render placed in another agent's deferred queue; a batch another
+    // assembly froze, or one withdrawn, displaced or consumed by another
+    // request before this assembly), has nothing new to show: running it would
+    // wake the model to `[Continue]` or an older message, an uncaused wake.
+    // Stop before the checkpoint, locus, typing and compile. Any batch this
+    // assembly materialized keeps the turn, including one that was not among
+    // its causes (a batch whose wake the freeze withdrew, or one that never
+    // qualified for a wake). A cause this assembly did not settle (the host
+    // stopping) keeps the turn, as before.
     if (assembly && batchSubjects?.length && assembly.materialized.size === 0
       && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
@@ -15097,6 +15119,20 @@ export class AgentFramework {
         this.ackDeferredWrites();
       }
       return false;
+    }
+    // The turn has passed its gate, so from here it goes on with a copy of
+    // its trigger without a batch wake's marks. A retry of it then comes back
+    // as an ordinary wake by whatever door it takes (a provider hold's
+    // release, the auxiliary park's requeue, the tool-result guard's
+    // restart): this gate doesn't withdraw it for finding its batches
+    // consumed, and no withdrawal of the subject's wakes reaches it (§4.2
+    // withdraws a wake whose sole cause is the subject, and a merge carries
+    // a subject only when it is every merged request's). This frame's
+    // activeTurnTriggers entry keeps the trigger as it came; a retry's frame
+    // records the copy it carries.
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, ...retry } = trigger;
+      trigger = retry;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
