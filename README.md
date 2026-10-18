@@ -446,9 +446,8 @@ const result = await framework.rollbackToMessage('cairn', {
   `hide` or turn `undo` records its batch and the batch's activation as one
   entry.
 - **A start never activates a surgery's marks.** A batch an interrupted
-  surgery left (prepared, or held by a pre-release build of this journal) is
-  retired at the next start, none of its marks sent. One that had marks to
-  apply raises a `discord-awareness-not-scheduled` ops alert that names the
+  surgery left prepared is retired at the next start, none of its marks
+  sent. One that had marks to apply raises a `discord-awareness-not-scheduled` ops alert that names the
   surgery, its agent and its branches, and the redo that applies the marks:
   run the surgery again from the source onto a new branch name, choosing
   marks again, if the source still has every message the surgery removed (a

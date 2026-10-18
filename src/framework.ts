@@ -18356,8 +18356,8 @@ export class AgentFramework {
     if (planned.retired.length > 0 || planned.unknownAttempts > 0) {
       const gone = planned.retired.filter((retirement) => retirement.reason === 'branch-gone').length;
       console.error(
-        `[discord-awareness] startup: retiring ${planned.retired.length - gone} batch(es) a surgery or an in-place ` +
-          `change left unfinished, none of their marks sent; giving up ${gone} suppression(s) whose branch doesn't ` +
+        `[discord-awareness] startup: retiring ${planned.retired.length - gone} batch(es) a surgery left ` +
+          `unfinished, none of their marks sent; giving up ${gone} suppression(s) whose branch doesn't ` +
           `exist; recording ${planned.unknownAttempts} unanswered attempt(s) as unknown`,
       );
     }
@@ -18432,10 +18432,8 @@ export class AgentFramework {
    * as a rollback's, or as a suppression's when the recovery suppressed, so
    * the report names both. One with marks not applied, or a body given up, raises an ops alert; one
    * with neither (no marks chosen, or its marks cancelled, and its body
-   * finished) is only logged. An in-place change's batch (a hide or a turn
-   * undo, which a pre-release build recorded in two appends) has nothing to
-   * redo: its change stands on its branch, and its alert says only that its
-   * marks weren't applied.
+   * finished) is only logged. A hide or turn undo records its batch and its
+   * activation as one entry, so it never leaves a batch for a start.
    */
   private reportRetiredAwareness(retirement: DiscordAwarenessRetirement, opts: { finished?: boolean } = {}): void {
     const { batchId, agentName, sourceBranch, targetBranch, marks } = retirement;
@@ -18456,27 +18454,6 @@ export class AgentFramework {
       }
       const body = opts.finished ? `, having finished its removals on ${targetBranch}` : '';
       console.error(`[discord-awareness] this start retires imported awareness batch ${batchId} of ${agentName}${body}`);
-      return;
-    }
-    if (!retirement.suppression && sourceBranch === targetBranch) {
-      // An in-place change (a hide, a turn undo) left between its batch and
-      // its activation, as a pre-release build's two appends could: the
-      // change stands on its branch, and there's nothing to redo it from.
-      if (marks === 0) {
-        console.error(
-          `[discord-awareness] A hide or turn undo of ${agentName} on ${targetBranch} (awareness batch ${batchId}) ` +
-            'stands, and this start retires its batch, with no marks to apply',
-        );
-        return;
-      }
-      this.opsAlert(
-        'discord-awareness-not-scheduled',
-        agentName,
-        `A hide or turn undo of ${agentName} on ${targetBranch} (awareness batch ${batchId}) stands, but its ` +
-          `${marks} awareness mark(s) weren't applied: the process ended before they were activated, and a start ` +
-          'never activates a surgery\'s marks. The change itself stands on that branch, so there is nothing to redo',
-        { data: { batchId, marks }, key: batchId },
-      );
       return;
     }
     const kind = retirement.suppression ? 'a suppression, or an offline recovery that suppressed' : 'a rollback, or an offline recovery';

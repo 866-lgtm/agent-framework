@@ -225,9 +225,6 @@ export interface DiscordAwarenessBatch extends DiscordAwarenessBatchRecord {
   /** Journal position of the surgery's marks choice (its prepare): the
    *  authorization of the adds its activation requests. */
   authorization?: number;
-  /** Journal position of a release a pre-release build of this journal
-   *  recorded: the authorization of the requests that release queued. */
-  releaseAuthorization?: number;
   cancelled?: { at: number; by?: string };
 }
 
@@ -247,8 +244,7 @@ export interface DiscordAwarenessAttempt {
 }
 
 export interface DiscordAwarenessOpCause {
-  /** `release`: a release a pre-release build of this journal recorded. */
-  kind: 'batch' | 'retract' | 'release' | 'import';
+  kind: 'batch' | 'retract';
   batchId?: string;
   requestId?: string;
 }
@@ -268,14 +264,14 @@ export interface DiscordAwarenessOp {
   cause: DiscordAwarenessOpCause;
   /**
    * Journal position of the act that authorized this request: a surgery's
-   * marks choice (its prepare, even when activation comes later), a retract,
-   * or a release. Between opposite requests for one reaction, the later
+   * marks choice (its prepare, even when activation comes later) or a
+   * retract. Between opposite requests for one reaction, the later
    * authorization wins, whenever each request was created.
    */
   authorization: number;
   requestedAt: number;
   attempts: DiscordAwarenessAttempt[];
-  cancelled?: { at: number; reason: 'batch-cancelled' | 'request-cancelled' | 'superseded' | 'imported' };
+  cancelled?: { at: number; reason: 'batch-cancelled' | 'request-cancelled' | 'superseded' };
 }
 
 /** One dispatch: the head operation for a reaction key, plus any consecutive
@@ -567,21 +563,6 @@ type JournalRecord =
    *  a certificate that a suppression's body completed. */
   | { t: 'legacy-activated'; at: number; batchId: string }
   | { t: 'discarded'; at: number; batchId: string }
-  /** A pre-release build of this journal held an imported batch's
-   *  undelivered work, or its surgery's batch, for an operator's release:
-   *  read as nothing, so the work is never sent, as an import now retires
-   *  it, and the batch stays as it was. */
-  | {
-      t: 'held';
-      at: number;
-      batchId: string;
-      reason: string;
-      releaseActions: Array<DiscordAwarenessRef & { emoji: string; action: DiscordAwarenessAction }>;
-    }
-  /** A pre-release build of this journal released a held batch, a
-   *  surgery's or an import's: history, since its requests were recorded
-   *  with it. */
-  | { t: 'released'; at: number; batchId: string; by?: string }
   | { t: 'cancelled'; at: number; batchId: string; by?: string }
   | {
       t: 'requested';
@@ -591,7 +572,7 @@ type JournalRecord =
       action: DiscordAwarenessAction;
       cause: DiscordAwarenessOpCause;
     }
-  | { t: 'op-cancelled'; at: number; opId: string; reason: 'batch-cancelled' | 'request-cancelled' | 'superseded' | 'imported' }
+  | { t: 'op-cancelled'; at: number; opId: string; reason: 'batch-cancelled' | 'request-cancelled' | 'superseded' }
   | { t: 'dispatching'; at: number; opId: string; attempt: number; dispatchId?: string }
   | {
       t: 'outcome';
@@ -946,8 +927,7 @@ export class DiscordAwarenessOutbox {
    * or active, cancelled or not. Activation records a surgery's body complete, so
    * these are a surgery's leftovers (prepared), an imported ledger's
    * batches, since the old ledger could record activation before the
-   * redactions were synced, and a batch a pre-release build released without
-   * finishing its body. A start
+   * redactions were synced. A start
    * on that branch finishes their removals (the framework's
    * resumePreparedDiscordSuppressions). The same set claims the name: a
    * branch made under it by anything else would have those removals applied
@@ -1120,8 +1100,7 @@ export class DiscordAwarenessOutbox {
       inFlight: 0,
       unknown: 0,
       confirmed: 0,
-      // Every request the batch itself made: its adds, and what a release a
-      // pre-release build recorded for it queued.
+      // Every request the batch itself made: its adds.
       unresolvedAttempts: unresolvedDispatches(
         [...state.ops.values()].filter((op) => op.cause.batchId === batchId),
         (op, attempt) => this.attemptUnresolved(op, attempt),
@@ -1745,7 +1724,7 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
           batch.status = 'active';
           // Only a surgery (or its resume) activates a suppression, after its
           // last redaction synced: activation records the body complete.
-          // Release does not, and neither does an imported `active`.
+          // An import records its `active` as `legacy-activated`, which doesn't.
           if (batch.suppressionIntervals?.length) batch.suppressionComplete = true;
         }
         break;
@@ -1759,21 +1738,6 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
         // A retirement, of a prepared batch (isSurgeryLeftover).
         const batch = state.batches.get(record.batchId);
         if (batch && isSurgeryLeftover(batch)) batch.status = 'discarded';
-        break;
-      }
-      case 'held':
-        // A pre-release build's hold: nothing it held is ever sent, and the
-        // batch stays as it was (see the record's type).
-        break;
-      case 'released': {
-        // A pre-release build's release of a held batch, a surgery's or an
-        // import's: its requests follow in the same entry, under this
-        // authorization.
-        const batch = state.batches.get(record.batchId);
-        if (batch && batch.status !== 'discarded' && batch.releaseAuthorization === undefined) {
-          batch.status = 'active';
-          batch.releaseAuthorization = position;
-        }
         break;
       }
       case 'cancelled': {
@@ -1897,7 +1861,6 @@ function opEnded(op: DiscordAwarenessOp): boolean {
 /** The journal position of the act a request carries out. */
 function authorizationOf(state: JournalState, cause: DiscordAwarenessOpCause): number | undefined {
   if (cause.kind === 'batch' && cause.batchId) return state.batches.get(cause.batchId)?.authorization;
-  if (cause.kind === 'release' && cause.batchId) return state.batches.get(cause.batchId)?.releaseAuthorization;
   if (cause.kind === 'retract' && cause.requestId) return state.retracts.get(cause.requestId)?.authorization;
   return undefined;
 }
