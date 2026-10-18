@@ -397,6 +397,29 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), "the inner mount's\n");
   });
 
+  test('a deletion stored before a link into it took the path\'s place is refused by a forced push, through a final link and through a directory link', async (t) => {
+    // anima-research/agent-framework#530's unlink side. On `main` the push
+    // unlinked the final link, and through the directory link it unlinked
+    // the inner mount's file.
+    const env = new Env(t);
+    env.write('outer/a/b/x.txt', "the inner mount's\n");
+    env.write('outer/flink.txt', "the outer mount's\n");
+    env.write('outer/alias/x.txt', "the outer mount's\n");
+    const m = await env.open(t, [mount('outer', env.at('outer'), { followSymlinks: true }), mount('inner', env.at('outer/a/b'))]);
+    assert.equal((await call(m, 'sync', {})).success, true);
+    for (const path of ['outer/flink.txt', 'outer/alias/x.txt']) assert.equal((await call(m, 'delete', { path })).success, true, path);
+    rmSync(env.at('outer/flink.txt'));
+    symlinkSync(env.at('outer/a/b/x.txt'), env.at('outer/flink.txt'));
+    rmSync(env.at('outer/alias'), { recursive: true });
+    symlinkSync(env.at('outer/a/b'), env.at('outer/alias'));
+    const finalLink = await call(m, 'materialize', { path: 'outer/flink.txt', force: true, applyDeletions: true });
+    assert.equal(skippedReason(finalLink.data, 'flink.txt'), 'flink.txt: not unlinked: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
+    const throughDir = await call(m, 'materialize', { path: 'outer/alias/x.txt', force: true, applyDeletions: true });
+    assert.equal(skippedReason(throughDir.data, 'alias/x.txt'), 'alias/x.txt: not unlinked: "outer/alias" leads into mount "inner", nested in mount "outer": use "inner" in its place');
+    assert.equal(lstatSync(env.at('outer/flink.txt')).isSymbolicLink(), true, 'the link stays');
+    assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), "the inner mount's\n");
+  });
+
   test('a copy taken in through a file link before the nested mount was configured is no longer vouched for by its fingerprint', async (t) => {
     // A listing's pass takes a file whose recorded fingerprint still matches
     // as unchanged, without reading it, so only the observation of the link
