@@ -131,7 +131,9 @@ interface Found {
  * at is more than those shown. Otherwise a needle that overlaps itself,
  * such as a run of spaces, would be compared in full at every position of a
  * long run of the same, at a cost of the run's length times the needle's.
- * With `accept`, only the positions it accepts are occurrences.
+ * With `accept`, only the positions it accepts are occurrences, and the stop
+ * can't apply to the positions it passes over, so those are found in one
+ * pass over the haystack (everyOccurrence).
  */
 function scan(haystack: string, needle: string, keep: number, accept?: (at: number) => boolean): Found {
   const starts: number[] = [];
@@ -141,15 +143,52 @@ function scan(haystack: string, needle: string, keep: number, accept?: (at: numb
   // an empty old text, and this keeps any other caller from looping.
   if (!needle) return { starts, count, overlapping, atLeast: false };
   let previous = -Infinity;
-  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
-    if (accept && !accept(at)) continue;
+  // Takes the occurrence at `at`, and says whether to look for the next.
+  const take = (at: number): boolean => {
+    if (accept && !accept(at)) return true;
     if (at < previous + needle.length) overlapping = true;
     if (count < keep) starts.push(at);
     count++;
     previous = at;
-    if (overlapping && count > SHOWN_MATCHES) return { starts, count, overlapping, atLeast: true };
+    return !(overlapping && count > SHOWN_MATCHES);
+  };
+  if (accept) {
+    // Run before the answer is made, since the answer reads what it counts.
+    const stopped = !everyOccurrence(haystack, needle, take);
+    return { starts, count, overlapping, atLeast: stopped };
+  }
+  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+    if (!take(at)) return { starts, count, overlapping, atLeast: true };
   }
   return { starts, count, overlapping, atLeast: false };
+}
+
+/**
+ * Every position needle starts at in haystack, overlapping ones included,
+ * each given to `visit` in turn until it returns false, in one pass over the
+ * haystack however the needle repeats itself (Knuth–Morris–Pratt). Whether it
+ * read the haystack to its end.
+ */
+function everyOccurrence(haystack: string, needle: string, visit: (at: number) => boolean): boolean {
+  // border[i]: how long the needle's longest prefix is that also ends its
+  // first i + 1 code units, short of all of them.
+  const border = new Int32Array(needle.length);
+  for (let i = 1, k = 0; i < needle.length; i++) {
+    const c = needle.charCodeAt(i);
+    while (k > 0 && c !== needle.charCodeAt(k)) k = border[k - 1]!;
+    if (c === needle.charCodeAt(k)) k++;
+    border[i] = k;
+  }
+  for (let i = 0, k = 0; i < haystack.length; i++) {
+    const c = haystack.charCodeAt(i);
+    while (k > 0 && c !== needle.charCodeAt(k)) k = border[k - 1]!;
+    if (c === needle.charCodeAt(k)) k++;
+    if (k === needle.length) {
+      if (!visit(i - k + 1)) return false;
+      k = border[k - 1]!;
+    }
+  }
+  return true;
 }
 
 /**

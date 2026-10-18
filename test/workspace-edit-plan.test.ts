@@ -193,6 +193,27 @@ test('line numbers are found in one pass over the text, past its last line end t
   assert.ok(read <= text.length, `read ${read} code units of a ${text.length}-unit text`);
 });
 
+test('a match that starts on a line end is on the line that line end ends', () => {
+  const [count] = problems('one\ntwo\none\ntwo\n', [spec(0, '\ntwo', 'X')]);
+  assert.ok(count!.kind === 'count');
+  assert.deepEqual(count.lines, [1, 3]);
+});
+
+test("a long matched line's excerpt keeps each surrogate pair whole at its cuts", () => {
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  // Emoji on both sides of the match, starting at either parity, so that
+  // some cut falls between a pair's halves.
+  for (const lead of ['', 'x']) {
+    for (const gap of ['', 'y']) {
+      const long = `${lead}${'😀'.repeat(600)}${gap}target${'😀'.repeat(600)}`;
+      const [count] = problems(`target\n${long}\n`, [spec(0, 'target', 'z')]);
+      assert.ok(count!.kind === 'count');
+      assert.doesNotMatch(count.shown, lone, `lead ${JSON.stringify(lead)}, gap ${JSON.stringify(gap)}`);
+      assert.match(count.shown.split('\n')[1]!, /^     2\t….*target.*…$/su);
+    }
+  }
+});
+
 test('a count that differs names each matched line once, and a long line as an excerpt around its match', () => {
   const long = `${'x'.repeat(500)} target ${'y'.repeat(500)}`;
   const [count] = problems(`target\nnone\ntarget target\n${long}\n`, [spec(0, 'target', 'z')]);
@@ -225,18 +246,27 @@ test('many edits matching one text cost their replacements, not their pairs at e
   // Every pair of these 2,000 edits overlaps at each of 500 places. Walking
   // the pairs at every place, the planner took 34 s on this case, on Linux
   // with Node 24.22.0; linking past each named edit's replacements takes
-  // 0.3 s. The child is stopped at 5 s.
+  // 0.3 s. The child reports the CPU time its planning took, which a slow or
+  // throttled machine doesn't stretch as it does the wall clock, and is
+  // stopped at 120 s.
   const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
     const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
     const bytes = Buffer.from('x '.repeat(500));
     const specs = Array.from({ length: 2000 }, (_, index) => ({ index, oldText: 'x', newText: 'y', expected: 'all' }));
+    const before = process.cpuUsage();
     const planned = planFile(decodeForEdit(bytes), bytes, specs);
-    console.log(JSON.stringify(planned.problems.map((problem) => [problem.kind, problem.edits, problem.same])));
-  `], { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 });
+    const used = process.cpuUsage(before);
+    console.log(JSON.stringify({
+      ms: (used.user + used.system) / 1000,
+      problems: planned.problems.map((problem) => [problem.kind, problem.edits, problem.same]),
+    }));
+  `], { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });
   assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  const { ms, problems: named } = JSON.parse(child.stdout) as { ms: number; problems: unknown };
+  assert.ok(ms < 5_000, `planning took ${ms} ms of CPU`);
   // Each edit after the first is named once, with the first, as the same text.
-  assert.deepEqual(JSON.parse(child.stdout), Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
+  assert.deepEqual(named, Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
 });
 
 test('each clash names its own line', () => {
@@ -269,6 +299,12 @@ test("one call's misses search at most HINT_MAX_CHARS for closest regions, and a
   assert.match((problems(big, [spec(0, 'absent', 'y')])[0] as { hint: string }).hint, /^\(No closest region for a file over 2,097,152 UTF-16 code units/);
 });
 
+test('an exact match is taken before straight and curly quotes are read as equal', () => {
+  const planned = plan('it\'s here; it’s there\n', [spec(0, "it's", 'it is')]);
+  assert.equal(planned.bytes.toString(), 'it is here; it’s there\n');
+  assert.deepEqual(planned.quoteNormalized, []);
+});
+
 test('straight and curly quotes match as a second chance, and the plan names the edit', () => {
   const planned = plan('She said “hello” and it’s fine\n', [spec(0, 'said "hello" and it\'s', 'said "bye" and it is'), spec(1, 'fine', 'good')]);
   assert.equal(planned.bytes.toString(), 'She said "bye" and it is good\n');
@@ -290,6 +326,10 @@ test('a mixed file keeps its mixture: each line end of a replaced span by positi
   const planned = plan(bytes, [spec(0, 'b', 'b1\nb2', 'all')]);
   assert.equal(planned.bytes.toString(), 'a\r\nb1\nb2\nc\r\nd\n', 'a span with no line end takes its own line\'s');
   assert.deepEqual([planned.crlf, planned.mixed], [true, true]);
+});
+
+test('each occurrence of a text that gains lines takes the line end of its own line', () => {
+  assert.equal(plan('a\r\na\n', [spec(0, 'a', 'A\nB', 'all')]).bytes.toString(), 'A\r\nB\r\nA\nB\n');
 });
 
 test("a match at a CRLF's line end takes its CR along, and an unterminated last line takes the line end before it", () => {
@@ -315,6 +355,25 @@ test("an old text carrying a line's CR at its end matches before a CRLF line end
   // The CR was all it changed, so there's nothing to change; one that doesn't match is a miss.
   assert.deepEqual(problems('alpha\r\nbeta\r\n', [spec(0, 'alpha\r', 'alpha')]), [{ kind: 'same', edit: 0 }]);
   assert.equal(problems('beta\r\n', [spec(0, 'alpha\r', 'alpha')])[0]!.kind, 'miss');
+});
+
+test('an old text read without its BOM or CR is found in one pass over a long run of the same', () => {
+  // Only the text's start, or a place before a CRLF line end, takes such an
+  // old text, so the places it passes over are most of the run. Searching
+  // again from each, the planner compared the old text in full at every
+  // place: about 2 s of CPU for each of these, on Linux with Node 24.22.0.
+  const run = 'a'.repeat(200_000);
+  const needle = 'a'.repeat(50_000);
+  for (const [text, oldText, newText, after] of [
+    [`\uFEFF${run}`, `\uFEFF${needle}`, '\uFEFFb', `\uFEFFb${'a'.repeat(150_000)}`],
+    [`${run}\r\n`, `${needle}\r`, 'b\r', `${'a'.repeat(150_000)}b\r\n`],
+  ]) {
+    const before = process.cpuUsage();
+    const planned = plan(text!, [spec(0, oldText!, newText!)]);
+    const used = process.cpuUsage(before);
+    assert.ok((used.user + used.system) / 1000 < 500, `${(used.user + used.system) / 1000} ms of CPU`);
+    assert.equal(planned.bytes.toString(), after);
+  }
 });
 
 test("an old text carrying the file's BOM at its start matches at the text's start, keeping one BOM", () => {

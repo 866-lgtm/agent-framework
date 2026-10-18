@@ -205,10 +205,11 @@ describe('ToolCall.resultMaxChars', () => {
     try {
       const run = { action: 'run', name: 'probe--peek', args: {} };
       await framework.executeToolCall({ id: 'bare-look', name: 'probe--look', input: {}, callerAgentName: 'prime' });
+      await framework.executeToolCall({ id: 'capped-look', name: 'probe--look', input: {}, callerAgentName: 'prime', resultMaxChars: 4321 });
       await framework.executeToolCall({ id: 'bare-utility', name: 'utils', input: run, callerAgentName: 'prime' });
       await framework.executeToolCall({ id: 'capped-utility', name: 'utils', input: run, callerAgentName: 'prime', resultMaxChars: 1234 });
       const caps = new Map(probe.calls.map((call) => [call.id, call.resultMaxChars]));
-      assert.deepEqual([...caps.entries()], [['bare-look', undefined], ['bare-utility', undefined], ['capped-utility', 1234]]);
+      assert.deepEqual([...caps.entries()], [['bare-look', undefined], ['capped-look', 4321], ['bare-utility', undefined], ['capped-utility', 1234]]);
     } finally {
       await done();
     }

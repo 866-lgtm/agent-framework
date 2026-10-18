@@ -86,10 +86,15 @@ function countLines(problem: { found: number; atLeast: boolean; lines: number[] 
     : `on ${onLines(problem.lines)}`;
 }
 
-/** The edit a problem sorts by: its first. */
+/**
+ * The edit a problem sorts by: its first. A loop rather than Math.min's
+ * spread, since a call's edits can be more than a spread passes as arguments.
+ */
 function firstEdit(problem: EditProblem): number {
-  if ('edits' in problem) return Math.min(...problem.edits);
-  return problem.edit;
+  if (!('edits' in problem)) return problem.edit;
+  let first = Infinity;
+  for (const edit of problem.edits) if (edit < first) first = edit;
+  return first;
 }
 
 const plural = (count: number, one: string, many = `${one}s`) => (count === 1 ? one : many);
@@ -319,8 +324,8 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
   const firsts = plan.edits.map((edit) => edit.first).sort((a, b) => a.at - b.at);
   const regions: Region[] = [];
   for (const change of firsts) {
+    // An emptied file's region holds no line, and shows as nothing.
     const region = regionOf(plan.updated, change);
-    if (region.to < region.from) continue;
     const last = regions.at(-1);
     if (last && region.from <= last.to + 1) {
       last.to = Math.max(last.to, region.to);
@@ -330,37 +335,62 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
   const out: string[] = [];
   const omitted: string[] = [];
   for (const region of regions) {
-    const slice = plan.updated.slice(region.start, region.end);
-    const lines = slice.split('\n');
-    if (slice.endsWith('\n')) lines.pop();
-    // A line too long to show whole shows its start, or, where edits' first
-    // changes start on it, a stretch from shortly before each.
-    let lineStart = region.start;
-    const shown = lines.map((text, k) => {
-      const n = region.from + k;
+    // The region's lines, numbered, built one at a time while they fit, so a
+    // region of millions of lines, which is named by its lines, isn't built
+    // whole first. The line before it ("…" between regions, or the line end)
+    // counts too, and each line feed between its lines.
+    let cost = out.length ? jsonLength('\n…\n') : jsonLength('\n');
+    const lines: string[] = [];
+    let fits = !omitted.length;
+    for (let lineStart = region.start, n = region.from; fits && lineStart < region.end; n++) {
+      const newline = plan.updated.indexOf('\n', lineStart);
+      const lineEnd = newline === -1 || newline >= region.end ? region.end : newline;
+      const text = plan.updated.slice(lineStart, lineEnd);
+      // A line too long to show whole shows its start, or, where edits' first
+      // changes start on it, a stretch from shortly before each.
       const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];
       const numberedText = columns.length ? excerptLine(text, n, columns) : numberedLine(text, n);
-      lineStart += text.length + 1;
-      return numberedText;
-    }).join('\n');
-    // The line before it ("…" between regions, or the line end) counts too.
-    const cost = jsonLength(shown) + (out.length ? jsonLength('\n…\n') : jsonLength('\n'));
-    if (!omitted.length && cost <= budget.left) {
+      cost += jsonLength(numberedText) + (lines.length ? jsonLength('\n') : 0);
+      if (cost > budget.left) fits = false;
+      else lines.push(numberedText);
+      lineStart = lineEnd + 1;
+    }
+    if (fits) {
       budget.left -= cost;
       if (out.length) out.push('…');
-      out.push(shown);
+      out.push(lines.join('\n'));
     } else {
       budget.left = 0;
       omitted.push(region.from === region.to ? `${region.from}` : `${region.from}–${region.to}`);
     }
   }
   if (omitted.length) {
-    const one = omitted.length === 1 && !omitted[0]!.includes('–');
     const listed = omitted.slice(0, SHOWN_MATCHES);
-    const more = omitted.length > listed.length ? `, and ${omitted.length - listed.length} more` : '';
-    out.push(`[not shown, to keep this answer within ${maxChars.toLocaleString('en-US')} characters: ${plural(one ? 1 : 2, 'line')} ${listed.join(', ')}${more}]`);
+    out.push(regionsLeftOut(maxChars, listed, omitted.length - listed.length, omitted.length === 1 && !omitted[0]!.includes('–')));
   }
   return out;
+}
+
+/** The note naming the regions of a file a receipt leaves out: the lines of SHOWN_MATCHES at most, and how many more. */
+function regionsLeftOut(maxChars: number, listed: string[], more: number, oneLine: boolean): string {
+  return `[not shown, to keep this answer within ${maxChars.toLocaleString('en-US')} characters: ${plural(oneLine ? 1 : 2, 'line')} ${listed.join(', ')}${more ? `, and ${more} more` : ''}]`;
+}
+
+/**
+ * edit_many's last line, counting what its receipt leaves out: files it
+ * doesn't list, and of those it lists, the regions, notes and edit numbers it
+ * doesn't show. Null when it leaves out nothing.
+ */
+function filesLeftOut(maxChars: number, total: number, counts: { notListed: number; unshown: number; notes: number; edits: number }): string | null {
+  const left = [
+    ...(counts.notListed ? [`${counts.notListed} of the call's ${total} ${plural(total, 'file')}`] : []),
+    ...(counts.unshown ? [`the changed regions of ${counts.unshown} more ${plural(counts.unshown, 'file')}`] : []),
+    ...(counts.notes ? [`the notes of ${counts.notes} ${plural(counts.notes, 'file')}`] : []),
+    ...(counts.edits ? [`the edit numbers of ${counts.edits} ${plural(counts.edits, 'file')}`] : []),
+  ];
+  if (!left.length) return null;
+  const list = left.length < 2 ? left[0] : `${left.slice(0, -1).join(', ')} and ${left.at(-1)}`;
+  return `[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.]`;
 }
 
 /** A receipt's note on a file's line ends, if they need one. */
@@ -402,11 +432,22 @@ export interface StoredFile {
 }
 
 /**
- * What a receipt keeps aside for what it adds after its budget is spent: one
- * file's note naming the regions past it (at most SHOWN_MATCHES of them), and
- * the line counting the files whose regions and notes aren't shown.
+ * What a receipt keeps aside for what it adds after its budget is spent, at
+ * its longest for this call, as fitted keeps a refusal's last line: one
+ * file's note naming the regions past it, SHOWN_MATCHES of them with the
+ * most lines any of its files could have, and a count of the rest, which are
+ * fewer than its edits; and edit_many's last line, every count at its most.
+ * Each with the line feed or blank line before it.
  */
-const RECEIPT_RESERVE = 600;
+function receiptReserve(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): number {
+  let lines = 1;
+  for (const { plan } of files) lines = Math.max(lines, plan.updated.length + 1);
+  const range = `${lines}–${lines}`;
+  const regions = jsonLength('\n') + jsonLength(regionsLeftOut(maxChars, Array.from({ length: SHOWN_MATCHES }, () => range), editCount, false));
+  if (tool === 'edit') return regions;
+  const most = files.length;
+  return regions + jsonLength('\n\n') + jsonLength(filesLeftOut(maxChars, most, { notListed: most, unshown: most, notes: most, edits: most })!);
+}
 
 /**
  * The receipt of edits stored: each file's size, replacements and notes, and
@@ -419,6 +460,7 @@ const RECEIPT_RESERVE = 600;
  * region where those alone pass `maxChars`.
  */
 export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): Record<string, unknown> {
+  const reserve = receiptReserve(tool, files, editCount, maxChars);
   const notesOf = ({ plan, notes }: StoredFile): string[] => {
     const lineEnds = lineEndNote(plan);
     return [
@@ -445,7 +487,7 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
       ...(file.modeKept ? { modeKept: file.modeKept } : {}),
       changed: '',
     };
-    const budget = { left: maxChars - JSON.stringify(data).length - RECEIPT_RESERVE };
+    const budget = { left: maxChars - JSON.stringify(data).length - reserve };
     data.changed = shownRegions(file.plan, budget, maxChars).join('\n');
     return data;
   }
@@ -458,12 +500,13 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   };
   const fits = (entry: Record<string, unknown>) => {
     listed.push(entry);
-    const fit = JSON.stringify(data).length <= maxChars - RECEIPT_RESERVE;
+    const fit = JSON.stringify(data).length <= maxChars - reserve;
     listed.pop();
     return fit;
   };
   let notesLeftOut = 0;
   let editsLeftOut = 0;
+  let notListed = 0;
   for (const [i, file] of files.entries()) {
     const notes = notesOf(file);
     const bare = {
@@ -481,14 +524,15 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
       bare,
     ].find(fits);
     if (!entry) {
-      data.filesNotListed = files.length - i;
+      notListed = files.length - i;
+      data.filesNotListed = notListed;
       break;
     }
     listed.push(entry);
     if (notes.length && !('note' in entry)) notesLeftOut++;
     if (!('edits' in entry)) editsLeftOut++;
   }
-  const budget = { left: maxChars - JSON.stringify(data).length - RECEIPT_RESERVE };
+  const budget = { left: maxChars - JSON.stringify(data).length - reserve };
   const sections: string[] = [];
   let unshown = 0;
   for (const file of files.slice(0, listed.length)) {
@@ -500,13 +544,8 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     budget.left -= heading;
     sections.push(`${file.path}\n${shownRegions(file.plan, budget, maxChars).join('\n')}`);
   }
-  const left = [
-    ...(unshown ? [`the changed regions of ${unshown} more ${plural(unshown, 'file')}`] : []),
-    ...(notesLeftOut ? [`the notes of ${notesLeftOut} ${plural(notesLeftOut, 'file')}`] : []),
-    ...(editsLeftOut ? [`the edit numbers of ${editsLeftOut} ${plural(editsLeftOut, 'file')}`] : []),
-  ];
-  const list = left.length < 2 ? left[0] : `${left.slice(0, -1).join(', ')} and ${left.at(-1)}`;
-  if (left.length) sections.push(`[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.]`);
+  const last = filesLeftOut(maxChars, files.length, { notListed, unshown, notes: notesLeftOut, edits: editsLeftOut });
+  if (last !== null) sections.push(last);
   data.changed = sections.join('\n\n');
   return data;
 }
