@@ -128,10 +128,11 @@ test("fetch_reference reaches a push event's reference through its server's own 
   await push('ws-command-srv', 'fetch-ws-command', [`${origin}/binding/ws-command.png`]);
   await push('stdio-url-srv', 'fetch-stdio-url', [`${origin}/binding/stdio-url.png`]);
   await push('ws-http-srv', 'fetch-ws-http', [`${origin}/binding/ws-http.png`]);
-  const [own, elsewhere, stdio, gone, spawned, wsCommand, stdioUrl, wsHttp] = stubRecords(JSON.stringify(pushed));
+  await push('ws-fragment-srv', 'fetch-ws-fragment', [`${origin}/binding/ws-fragment.png`]);
+  const [own, elsewhere, stdio, gone, spawned, wsCommand, stdioUrl, wsHttp, wsFragment] = stubRecords(JSON.stringify(pushed));
   assert.deepEqual(
-    [own, elsewhere, stdio, gone, spawned, wsCommand, stdioUrl, wsHttp].map((record) => record?.serverIds),
-    [['push-srv'], ['push-srv'], ['stdio-srv'], ['gone-srv'], ['spawned-srv'], ['ws-command-srv'], ['stdio-url-srv'], ['ws-http-srv']],
+    [own, elsewhere, stdio, gone, spawned, wsCommand, stdioUrl, wsHttp, wsFragment].map((record) => record?.serverIds),
+    [['push-srv'], ['push-srv'], ['stdio-srv'], ['gone-srv'], ['spawned-srv'], ['ws-command-srv'], ['stdio-url-srv'], ['ws-http-srv'], ['ws-fragment-srv']],
   );
   // The framework's own fetcher, resolving each server from its MCPL config:
   // push-srv has an address; stdio-srv, as a stdio server, has none, nor
@@ -140,8 +141,9 @@ test("fetch_reference reaches a push event's reference through its server's own 
   // configured at all. An explicit transport decides as the host connects:
   // ws-command-srv is a WebSocket server though its config holds a command,
   // and stdio-url-srv is spawned though its config holds only a url.
-  // ws-http-srv is a WebSocket server whose url the transport won't dial,
-  // since it isn't ws:// or wss://.
+  // ws-http-srv and ws-fragment-srv are WebSocket servers whose url the
+  // transport won't dial: the first isn't ws:// or wss://, and the second,
+  // on the uri's origin, has a fragment.
   type Answer = { result: { success: boolean; data?: string; error?: string } };
   const framework = Object.create(AgentFramework.prototype) as {
     pushEvent(event: unknown): void;
@@ -155,6 +157,7 @@ test("fetch_reference reaches a push event's reference through its server's own 
       ['ws-command-srv', { id: 'ws-command-srv', transport: 'websocket', command: 'stdio-server', url: wsOrigin }],
       ['stdio-url-srv', { id: 'stdio-url-srv', transport: 'stdio', url: wsOrigin }],
       ['ws-http-srv', { id: 'ws-http-srv', transport: 'websocket', url: origin }],
+      ['ws-fragment-srv', { id: 'ws-fragment-srv', url: `${wsOrigin}/mcpl#frag` }],
     ]),
     getWorkspaceModule: () => ({ writeBinary: async () => ({ success: true }) }),
     firstWritableMountName: () => 'scratch',
@@ -193,7 +196,10 @@ test("fetch_reference reaches a push event's reference through its server's own 
   const undialable = await fetchReference(wsHttp!.refId);
   assert.equal(undialable.success, false);
   assert.equal(undialable.error, noAddressReason('ws-http-srv'));
-  assert.equal(dialed, 2, 'nothing dialed for the last two');
+  const fragment = await fetchReference(wsFragment!.refId);
+  assert.equal(fragment.success, false);
+  assert.equal(fragment.error, noAddressReason('ws-fragment-srv'));
+  assert.equal(dialed, 2, 'nothing dialed for the last three');
 });
 
 /** The admin puppet's route to an MCPL tool, executeMcplToolCall, with a

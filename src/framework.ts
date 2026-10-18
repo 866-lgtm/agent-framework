@@ -4694,7 +4694,8 @@ export class AgentFramework {
           // A server's address is the url the host dials it at, as the
           // transport decides: none for a server the host spawns, as a stdio
           // server, nor for a WebSocket server whose url the transport won't
-          // dial, which buildWebSocketUrl refuses (not ws:// or wss://).
+          // dial, which buildWebSocketUrl refuses: one that isn't a ws:// or
+          // wss:// url, or has a fragment.
           if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
           try {
             buildWebSocketUrl(cfg, null);
