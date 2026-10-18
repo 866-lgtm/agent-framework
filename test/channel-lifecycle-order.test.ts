@@ -297,6 +297,26 @@ test('speech does not replace a pending explicit close with a new open decision'
   assert.equal(f.notices.length, 0);
 });
 
+test('a draft published into a channel with a close pending waits for it and posts nothing, as speech does', async () => {
+  // Drafts publish through the same open step as routed speech, so they meet
+  // the channel's queued lifecycle work as speech and replies do.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.held.add('x');
+  const close = f.tool('close');
+  await tick();
+  const draft = f.registry.publish('resident', 'a draft', { serverId: 'test', channelId: 'x' });
+  await f.drain(close, draft);
+  assert.equal((await close).success, true);
+  const outcome = await draft;
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+  assert.equal(f.isOpen(), false);
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  assert.equal(f.notices.length, 0);
+});
+
 test('waiting for a backscroll does not issue new opens or auto-open notices for each speech', async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
