@@ -763,6 +763,44 @@ test("a disconnect during a connect's tool listing ends the connect", async () =
   });
 });
 
+test("a disconnect during a restart's tool listing ends the restart, which says the server is down", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    await framework.connectMcplServer(modern('a', '', join(dir, 'raw-a.jsonl')));
+    await framework.connectMcplServer(modern('m', '', join(dir, 'raw-m.jsonl')));
+    const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
+    const before = servers.get('m');
+    // Hold a's listings made once the restart has registered the new m: its
+    // connect's. The teardown's refresh, and the disconnect's below, come
+    // while no m is registered, and pass.
+    const a = servers.get('a') as { listTools(): Promise<unknown[]> };
+    const realList = a.listTools.bind(a);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let held = 0;
+    a.listTools = async () => {
+      const tools = await realList();
+      if (!servers.has('m') || servers.get('m') === before) return tools;
+      held += 1;
+      await gate;
+      return tools;
+    };
+    const restarting = framework.restartMcplServer('m');
+    // Handled here too, so an assertion that fails first leaves no
+    // unhandled rejection behind.
+    void restarting.catch(() => {});
+    let disconnecting: Promise<void> | undefined;
+    try {
+      await until(() => held > 0, "the restart's connect, listing tools, waits on a");
+      disconnecting = framework.disconnectMcplServer('m');
+      await until(() => !servers.has('m'), 'the new m is removed');
+    } finally {
+      release();
+    }
+    await assert.rejects(restarting, /^Error: MCP server "m" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "m" was not connected: it was disconnected or lost while its tools were being listed$/);
+    await disconnecting;
+  });
+});
+
 test("a disconnect still under way when a connect's tool listing ends fails the connect", async () => {
   await withFramework(async ({ framework, dir }) => {
     await framework.connectMcplServer(modern('a', '', join(dir, 'raw-a.jsonl')));
