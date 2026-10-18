@@ -13724,6 +13724,10 @@ export class AgentFramework {
         }
       }
 
+      // The turn has a live stream from here, which carries a stop: this
+      // start's checks are behind it, so its window closes now, before
+      // driveStream can report a stream that fails at once.
+      if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
       const handle = this.driveStream(
         agent,
         stream,
