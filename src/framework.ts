@@ -780,8 +780,6 @@ interface TurnRouting {
   deliveries: string[];
   /** Plain-prose segments the turn suppressed without drafts (proseRouting=disabled), reported by its receipt. */
   suppressed: number;
-  /** An operator-facing non-channel surface receives this logical turn's stream. */
-  consoleAttended: boolean;
   /**
    * Drafts held during the turn (src/prose-drafts.ts), which its receipt
    * names by their state at its end, and which settleTurnDrafts records as
@@ -828,7 +826,7 @@ function freshTurnRouting(): TurnRouting {
   return {
     turnId: ++lastTurnId,
     engaged: new Set(), destination: null,
-    continuation: false, deliveries: [], suppressed: 0, consoleAttended: false, drafts: [], keptPrivate: 0, arrivals: [],
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
   };
 }
 
@@ -866,18 +864,6 @@ const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stoppin
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
-}
-
-function isConsoleAttendedEvent(event: ProcessEvent): boolean {
-  const channelId = (event as unknown as { channelId?: unknown }).channelId;
-  return !event.type.startsWith('mcpl:')
-    && (event.type === 'external-message' || event.type === 'api:message'
-      || event.type === 'api:inference-request')
-    && channelId === undefined;
-}
-
-function isConsoleAttendedTurn(trigger: InferenceRequest | undefined): boolean {
-  return trigger?.consoleAttendedOrigin === true;
 }
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
@@ -10516,7 +10502,6 @@ export class AgentFramework {
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              consoleAttendedOrigin: this.activeTurnTriggers.get(agent.name)?.consoleAttendedOrigin,
             });
           } else if (currentState.stream) {
             // What this round appends is in the next call's prompt. If that
@@ -10719,7 +10704,6 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            consoleAttendedOrigin: isConsoleAttendedEvent(event),
           });
         }
       }
@@ -12637,12 +12621,6 @@ export class AgentFramework {
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
-        // Fresh batches are console-attended if ANY cause is shown on an
-        // operator surface. Continuations keep the original logical turn's
-        // provenance rather than adopting a newly-batched request.
-        consoleAttendedOrigin: budgetRestart
-          ? trigger?.consoleAttendedOrigin
-          : requests.some((request) => request.consoleAttendedOrigin === true) || undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
@@ -13505,7 +13483,7 @@ export class AgentFramework {
     if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
-        ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
+        ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
         : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
@@ -13514,19 +13492,17 @@ export class AgentFramework {
     // since the turn held it may have had such an attempt: its state is
     // unknown now.
     const uncertain = unconfirmed.length > 0 || dismissedAtRisk.length > 0 || letGo.length > 0;
-    // A disabled-mode turn that an operator-facing surface attended was shown
-    // there, and no prose was published automatically. Disabled mode holds no
-    // drafts, so such a turn is never uncertain; if one were, the uncertain
-    // wording would show, since a send whose outcome is unknown matters more
-    // to the resident than where the reply was shown.
+    // In disabled mode, routing posts no plain speech to any channel, and the
+    // words stay in the transcript. The receipt says only that. Who watched
+    // the turn's stream is for the host to know, and an explicit send
+    // reports itself in its tool result. Disabled mode holds no drafts, so
+    // it is never uncertain.
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : uncertain
-          ? `[delivered] nothing confirmed — ${suppressedNote}`
-          : routing.consoleAttended && agent.proseRouting === 'disabled'
-            ? `[delivered] shown on the attending surface; no automatic prose publish attempted — ${suppressedNote}`
-            : `[delivered] nothing — ${suppressedNote}`;
+        : agent.proseRouting === 'disabled'
+          ? `[delivered] plain speech → no channel — ${suppressedNote}`
+          : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -14807,7 +14783,6 @@ export class AgentFramework {
       }
     }
     this.turnRouting.set(agent.name, routing);
-    if (trigger?.consoleAttendedOrigin === true) routing.consoleAttended = true;
 
     if (resumesTurn) {
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
@@ -14829,7 +14804,6 @@ export class AgentFramework {
     }
 
     if (opensTurn) {
-      routing.consoleAttended = trigger?.consoleAttendedOrigin === true;
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, and none for a heartbeat / no-trigger
       // turn, which falls back to the global default rather than inheriting
@@ -16379,12 +16353,11 @@ export class AgentFramework {
             // receipt. Queued deliveries and holds settled before final
             // dispatch, even when the last response is empty, so the receipt
             // and the continuation see the last rounds' deliveries;
-            // trailing/text-only segments were awaited in-loop. Locus and
-            // hybrid modes only; explicit-mode envelopes acknowledge
-            // themselves through the prose gateway.
+            // trailing/text-only segments were awaited in-loop. Every mode
+            // but explicit, whose envelopes acknowledge themselves through
+            // the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent, streamRouting);
-
             }
 
             // A `!` continuation this turn asked for. This gives prose the
@@ -16604,7 +16577,6 @@ export class AgentFramework {
                   } else {
                     this.requestProseContinuation(agent, streamRouting);
                   }
-
                 }
                 return;
               }

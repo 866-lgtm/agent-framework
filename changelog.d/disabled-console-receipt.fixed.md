@@ -1,1 +1,1 @@
-- Disabled prose routing now reports that suppressed prose was shown on an attending non-channel surface and that no channel publish was attempted, instead of claiming nothing was delivered.
+- Under `proseRouting: "disabled"`, the turn-end receipt now reads `[delivered] plain speech → no channel — N plain-speech segment(s) kept in the transcript (…)` instead of `[delivered] nothing — N plain-speech segment(s) suppressed (…)`, which read to a resident talking with its operator through a console or Web UI as if its replies had reached no one (#225).
