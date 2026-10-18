@@ -1780,7 +1780,7 @@ export class HistoryModule implements Module {
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
           droppedOffBranch,
-          /** Hits for messages whose current text has nothing indexable (edited blank; the index delete is pending). */
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
           droppedStale,
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,
@@ -2467,7 +2467,9 @@ function codePointBefore(s: string, i: number): string | undefined {
 }
 
 /**
- * First occurrence of `needle` in `text`. With `wholeWord`, an occurrence
+ * First occurrence of `needle` in `text`, as the units of `text` it covers.
+ * Without `caseSensitive`, `needle` is lower case already, and is found in
+ * `text.toLowerCase()`. With `wholeWord`, an occurrence
  * only counts when it isn't glued to a letter/digit/underscore on either
  * side (Unicode-aware, so Cyrillic words work too) — "mission" no longer
  * hits inside "uncommissioned". Word-ness is checked only on the sides
@@ -2476,6 +2478,13 @@ function codePointBefore(s: string, i: number): string | undefined {
  */
 function matchSubstring(text: string, needle: string, caseSensitive: boolean, wholeWord = false): MatchHit | null {
   const haystack = caseSensitive ? text : text.toLowerCase();
+  const hit = firstOccurrence(haystack, needle, wholeWord);
+  // Lowering can lengthen a character, as it does `İ` (one unit to two). Then
+  // the lowered text's units aren't the text's, and the snippet cuts the text.
+  return hit !== null && haystack.length !== text.length ? inTextUnits(text, hit) : hit;
+}
+
+function firstOccurrence(haystack: string, needle: string, wholeWord: boolean): MatchHit | null {
   if (!wholeWord) {
     const index = haystack.indexOf(needle);
     return index === -1 ? null : { index, length: needle.length };
@@ -2491,6 +2500,26 @@ function matchSubstring(text: string, needle: string, caseSensitive: boolean, wh
     }
     from = index + 1;
   }
+}
+
+/**
+ * The units of `text` that a hit in `text.toLowerCase()` covers. Each code
+ * point of `text` takes as many units there as its own lower case has, so a
+ * hit that starts or ends inside a character's lower case takes in the whole
+ * character.
+ */
+function inTextUnits(text: string, hit: MatchHit): MatchHit {
+  const end = hit.index + hit.length;
+  let start = -1;
+  let lowered = 0;
+  let at = 0;
+  while (at < text.length && lowered < end) {
+    const cp = text.codePointAt(at)!;
+    lowered += String.fromCodePoint(cp).toLowerCase().length;
+    if (start === -1 && lowered > hit.index) start = at;
+    at += cp > 0xffff ? 2 : 1;
+  }
+  return { index: start, length: at - start };
 }
 
 // ============================================================================
