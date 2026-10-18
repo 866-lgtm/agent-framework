@@ -670,8 +670,10 @@ function decide(
     const recorded = p?.kind === 'content' ? p : null;
     // Re-record only when P says something else, or a fresh fingerprint can
     // replace one that no longer vouches. A fresh one exists only where it's
-    // trusted, so both are judged as trusted here.
-    const stale = !recorded || recorded.hash !== agreed.hash || recorded.size !== agreed.size || recorded.mode !== agreed.mode ||
+    // trusted, so both are judged as trusted here. Evidence a resolution left
+    // unrecorded, a stopped push's narrowing, is stale too: the agreement
+    // replaces that push's intent, and the mode rule gives the store's mode.
+    const stale = unrecorded !== undefined || !recorded || recorded.hash !== agreed.hash || recorded.size !== agreed.size || recorded.mode !== agreed.mode ||
       (agreed.fp !== undefined && fingerprintVouches(agreed.fp, agreed.fp, true) &&
         !fingerprintVouches(recorded.fp, agreed.fp, true));
     const mode = agreed.mode === undefined ? undefined : modeAction(agreed.mode, s!.mode, recorded?.mode);
@@ -1186,7 +1188,8 @@ export async function pushPaths(
         /**
          * For a push that re-plans over our own narrowing push stopped before
          * its bytes, the modes its intent carries: from the old bytes' own
-         * mode, the stopped push's `from`, to the store's mode now.
+         * mode, the stopped push's `from`, to the store's mode now, or where
+         * the store records none, the mode the stopped push narrowed to.
          */
         ownModes?: { from: number; to: number };
       }
@@ -1307,8 +1310,9 @@ export async function pushPaths(
     // its intent carries the stopped push's prior, the old bytes at their own
     // mode, never the mode it narrowed them to, and modes from that mode, so a
     // stop of this push too reads disk's narrowed mode as the push's own.
-    const stopped = p?.kind === 'pending' && p.effect === 'disk' && p.modes !== undefined &&
-      !v.unconfirmed && v.p === undefined && v.prior !== undefined ? p : undefined;
+    // Past the adoptions handled above, a verdict carries a prior with P still
+    // pending only from that narrowing, whose push recorded its modes.
+    const stopped = v.prior !== undefined && p?.kind === 'pending' ? p : undefined;
     if (v.mode === 'push' && s && d.kind === 'file') {
       // Forced, disk takes the store's mode whatever it holds now, as it takes its bytes.
       plans.push({ path, kind: 'chmod', mode: s.mode!, ...(opts.force ? {} : { from: d.mode }), hash: s.hash, size: s.size, prior, before: agreement.get(mount.name, path), expect });
@@ -1407,7 +1411,9 @@ export async function pushPaths(
       (dm === undefined || opts.force === true || own || priorMode === dm) ? s.mode : undefined;
     plans.push({
       path, kind: 'write', blob, hash: s.hash, prior: stopped ? stopped.prior : prior, before: agreement.get(mount.name, path), expect,
-      ...(stopped ? { ownModes: { from: stopped.modes!.from, to: s.mode ?? stopped.modes!.to } } : {}),
+      // With no mode in the store's entry, its `to` is the mode the push
+      // leaves, the one the stopped push narrowed to: it claims none it lacks.
+      ...(stopped ? { ownModes: { from: stopped.modes!.from, to: s.mode ?? (stopped.modes!.from & stopped.modes!.to) } } : {}),
       ...(apply !== undefined ? { apply } : {}),
       ...(apply !== undefined && dm !== undefined && opts.force !== true ? { from: dm } : {}),
       // Forced over a mode disk changed: without force, the bytes would keep it.
@@ -1434,11 +1440,13 @@ export async function pushPaths(
       prior: step.prior,
       expect: step.kind === 'write' ? { kind: 'content', hash: step.hash } : ABSENT,
       branchId,
-      // A write that gives a mode records the modes it may leave, so a stop
-      // is read by them: the mode it saw, or for a file it creates the one it
-      // creates it at, and the one it gives. One that goes on as our own
-      // stopped narrowing records that push's, from the old bytes' own mode,
-      // whether or not it gives a mode itself.
+      // A write whose plan gives a mode (`apply`) records the modes it may
+      // leave, so a stop is read by them: the mode it saw, or for a file it
+      // creates the one it creates it at, and the one it gives. A file a
+      // forced push creates at its entry's mode with no mode planned records
+      // none. One that goes on as our own stopped narrowing records that
+      // push's, from the old bytes' own mode, whether or not it gives a mode
+      // itself.
       ...(step.kind === 'write' && step.ownModes !== undefined ? { modes: step.ownModes }
         : step.kind === 'write' && step.apply !== undefined
           ? { modes: { from: step.seenMode ?? step.apply, to: step.apply } } : {}),

@@ -70,11 +70,12 @@ export interface Pending {
   /** Branch the intent was recorded on (an adoption's meaning is branch-relative). */
   branchId: string;
   /**
-   * For a write that gives the file a mode: the mode it saw (`from`) and the
-   * one it gives (`to`); a write that creates the file records `to` for
-   * both. A push that goes on as our own narrowing push, stopped before its
-   * bytes, records that push's `from`, the old bytes' own mode, and the
-   * store's mode now, whether or not it gives a mode itself. It narrows to
+   * For a write whose plan gives the file a mode: the mode it saw (`from`)
+   * and the one it gives (`to`); a write that creates the file records `to`
+   * for both. A push that goes on as our own narrowing push, stopped before
+   * its bytes, records that push's `from`, the old bytes' own mode, and the
+   * store's mode now, or where the store records none, the mode the stopped
+   * push narrowed to, whether or not it gives a mode itself. It narrows to
    * `from & to` before the bytes and widens to `to` after them, so a stop
    * leaves disk at one of those three, with the old bytes or the new, and
    * those are the push's own. A file that has setuid or setgid

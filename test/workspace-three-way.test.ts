@@ -1152,7 +1152,7 @@ describe("a file's mode is kept with its bytes", () => {
   });
 
   for (const between of ['nothing', 'a bare sync']) {
-    test(`a push that completes a narrowing push stopped before its bytes, and stops before its own bytes too, with ${between} between, leaves the old bytes' own mode for a sync that names the file`, async (t) => {
+    test(`a push that runs again over a narrowing push stopped before its bytes, and stops before its own bytes too, with ${between} between, leaves the old bytes' own mode for a sync that names the file`, async (t) => {
       const env = new Env(t);
       const m = await env.open();
       await narrowingPush(env, m, 'mixed.txt');
@@ -1211,7 +1211,7 @@ describe("a file's mode is kept with its bytes", () => {
     assert.equal(modeOf(env, 'mixed.txt'), 0o604, 'the mode they last agreed on takes the store\'s');
   });
 
-  test("a push that completes a pure narrowing stopped before its bytes plans no chmod, and stopped before its own bytes too, leaves the old bytes' own mode", async (t) => {
+  test("a push that runs again over a pure narrowing stopped before its bytes, where disk already has the store's mode, and stops before its own bytes too, leaves the old bytes' own mode", async (t) => {
     const env = new Env(t);
     const m = await env.open();
     env.writeDisk('p.txt', 'v1');
@@ -1246,8 +1246,12 @@ describe("a file's mode is kept with its bytes", () => {
     // The store refuses the adoption's tree commit, after its intent is durable.
     const store = env.store as unknown as { treeSet: (...args: unknown[]) => unknown };
     const treeSet = store.treeSet;
+    let refused = 0;
     store.treeSet = function (this: unknown, ...args: unknown[]) {
-      if (args[1] === 'mixed.txt') throw new Error('refused');
+      if (args[1] === 'mixed.txt') {
+        refused++;
+        throw new Error('refused');
+      }
       return treeSet.apply(env.store, args);
     };
     try {
@@ -1255,10 +1259,63 @@ describe("a file's mode is kept with its bytes", () => {
     } finally {
       store.treeSet = treeSet;
     }
+    assert.equal(refused, 1, 'the sync reached its tree commit');
+    const left = (m as any).agreement.get('work', 'mixed.txt') as { kind: string; effect?: string };
+    assert.deepEqual([left.kind, left.effect], ['pending', 'adopt'], "the adoption's intent is left");
     assert.equal(storedText(env, 'mixed.txt'), 'v2', "the adoption didn't land");
     await call(m, 'materialize', {});
     assert.equal(env.readDisk('mixed.txt'), 'v2');
     assert.equal(modeOf(env, 'mixed.txt'), 0o604);
+  });
+
+  test("on a filesystem whose ctime isn't trusted, a narrowing push stopped before its bytes is settled once the store holds disk's bytes at disk's mode", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('p.txt', 'v1');
+    chmodSync(env.disk('p.txt'), 0o644);
+    await call(m, 'sync', {});
+    // No fingerprint vouches for a file here, so only the evidence itself can be stale.
+    (m as any).ctimeTrust.set(realpathSync((m as any).mounts.get('work').config.path), null);
+    await call(m, 'write', { path: 'work/p.txt', content: 'v2' });
+    const e = env.store.treeGet(TREE, 'p.txt')!;
+    env.store.treeSet(TREE, 'p.txt', { blobHash: e.blobHash, size: e.size, mode: 0o100600 });
+    const restore = await stopAt('truncate', 1);
+    try {
+      await call(m, 'materialize', { path: 'work/p.txt' });
+    } finally {
+      restore();
+    }
+    assert.equal(modeOf(env, 'p.txt'), 0o600, "the old bytes at the narrowed mode, which is the store's");
+    await call(m, 'write', { path: 'work/p.txt', content: 'v1' });
+    await call(m, 'materialize', {});
+    const p = (m as any).agreement.get('work', 'p.txt') as { kind: string; mode?: number };
+    assert.deepEqual([p.kind, p.mode], ['content', 0o600], 'the agreement replaces the stopped push');
+    assert.equal((await call(m, 'status', {})).work.pendingChanges, 0, 'and nothing is owed');
+  });
+
+  test("a push that runs again over a narrowing push stopped before its bytes, where the store's entry now records no mode, leaves the new bytes as disk has them for a sync that names the file", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await narrowingPush(env, m, 'mixed.txt');
+    let restore = await stopAt('truncate', 1);
+    try {
+      await call(m, 'materialize', { path: 'work/mixed.txt' });
+    } finally {
+      restore();
+    }
+    // The entry goes back to recording no mode, as one from before modes were recorded.
+    const e = env.store.treeGet(TREE, 'mixed.txt')!;
+    env.store.treeSet(TREE, 'mixed.txt', { blobHash: e.blobHash, size: e.size, mode: 0o644 });
+    // Run again, the push writes its bytes and stops before making them durable.
+    restore = await stopAt('sync', 1);
+    try {
+      await call(m, 'materialize', { path: 'work/mixed.txt' });
+    } finally {
+      restore();
+    }
+    assert.deepEqual([env.readDisk('mixed.txt'), modeOf(env, 'mixed.txt')], ['v2', 0o600], 'the new bytes at the narrowed mode, which it gives none over');
+    await call(m, 'sync', { path: 'work/mixed.txt' });
+    assert.equal(storedMode(env, 'mixed.txt'), 0o100600, "the named sync took disk's mode, as the store records none");
   });
 
   for (const force of [true, false]) {
