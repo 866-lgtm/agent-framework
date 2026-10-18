@@ -840,6 +840,9 @@ describe('mount include', () => {
       for (const [name, extra] of tools) {
         assert.match(await refused(m, name, { path: 'work/x.txt', ...extra }), /outside the mount's include/, name);
       }
+      // A `..` is refused before anything looks the path up, the nested
+      // mount's directory included, and the refusal says how to give it.
+      assert.match(await refused(m, 'read', { path: 'work/a/b/../b/x.txt' }), /has a "\.\." segment/);
     } finally {
       await m.stop();
     }

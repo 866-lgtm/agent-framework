@@ -368,6 +368,22 @@ test('a link into a nested mount\'s directory configured in another spelling tha
   });
 });
 
+test('resolveAbsolutePath takes a nested mount\'s directory in any spelling disk folds to it as that mount\'s', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'inner'), { recursive: true });
+    writeFileSync(join(d, 'inner', 'x.txt'), 'inner\n');
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'inner', path: join(d, 'inner'), mode: 'read-write', watch: 'never', include: ['a.json'] },
+    ];
+  });
+  // Configured and listed as `inner`, so the last three spell it neither way.
+  for (const path of ['outer/inner/x.txt', 'outer/INNER/x.txt', 'outer/Inner/x.txt', 'outer/INNER']) {
+    assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  }
+  assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+});
+
 test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s is the outer mount\'s own',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
     const { workspace, call } = await setup(t, (d) => {

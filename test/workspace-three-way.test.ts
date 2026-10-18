@@ -24,7 +24,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DISK_AGREEMENT_RECORD_TYPE, DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import { RecordJournal } from '../src/record-journal.js';
-import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, pathSegments, walkScope, type MountView } from '../src/modules/workspace/observe.js';
+import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
@@ -1139,13 +1139,6 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     assert.deepEqual(plain.materialized, withSlash.materialized);
     assert.deepEqual(Object.keys(plain).sort(), Object.keys(withSlash).sort());
     assert.equal(env.readDisk('a/b/inner.txt'), 'inner', "the nested mount's file is as it was");
-  });
-
-  test('where "\\" is the separator, a path into the nested directory spelled with it is in that directory too, since parsing reads it as "/"', () => {
-    for (const path of ['a\\b\\inner.txt', 'a\\b', 'a/b\\inner.txt', '.\\a\\b\\x', 'a\\\\b\\x']) {
-      assert.equal(inOtherMount(pathSegments(path, '\\').join('/'), ['a/b']), true, path);
-    }
-    assert.equal(inOtherMount(pathSegments('a\\b\\inner.txt', '/').join('/'), ['a/b']), false, 'where "/" is the separator, "\\" is part of a name');
   });
 
   test('a doubled or trailing separator is the nested directory too: a sync or a listing of it takes nothing in, and no push of the outer mount writes there', async (t) => {

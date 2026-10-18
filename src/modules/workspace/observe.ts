@@ -333,6 +333,37 @@ const flippedCase = (name: string): string =>
     return [...other].length === 1 && otherCase(other) === c ? other : c;
   }).join('');
 
+/**
+ * Whether the disk folds names at the directory `relativePath` beneath
+ * `root`: a variant of the path, its letters' case flipped or its other
+ * Unicode normalization form, reaches the same directory (device and inode),
+ * as listedName tests a segment. No directory there, or no variant, says no.
+ */
+export async function foldsNames(root: string, relativePath: string): Promise<boolean> {
+  const own = await lstat(join(root, ...relativePath.split('/')), { bigint: true }).catch(() => null);
+  if (own === null || !own.isDirectory()) return false;
+  const variants = new Set([flippedCase(relativePath), relativePath.normalize('NFC'), relativePath.normalize('NFD')]);
+  variants.delete(relativePath);
+  for (const variant of variants) {
+    const other = await lstat(join(root, ...variant.split('/')), { bigint: true }).catch(() => null);
+    if (other !== null && sameFile(other, own)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the absolute path `candidate` lies within the absolute `root` on a
+ * disk that folds names, comparing them as listedName compares a name with
+ * disk's: as NFC in lower case, then more loosely.
+ */
+export function containedFolded(root: string, candidate: string): boolean {
+  return [folded, foldedLoosely].some((fold) => {
+    const base = fold(root);
+    const path = fold(candidate);
+    return path === base || path.startsWith(base.endsWith(sep) ? base : base + sep);
+  });
+}
+
 /** Names compared as NFC in lower case. */
 const folded = (name: string): string => name.normalize('NFC').toLowerCase();
 
