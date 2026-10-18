@@ -142,6 +142,43 @@ import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
+/** An MCPL tool call refused because its server isn't in the registry: one
+ *  closed for good, one removed, or one whose connect failed without
+ *  reconnect, which this host doesn't bring back on its own. A server that's
+ *  reconnecting stays registered, as does the stub a failed connect with
+ *  reconnect leaves, and its closed connection answers the call instead. One
+ *  this host is connecting to isn't registered yet, and
+ *  mcplServerConnectingText answers for it. */
+function mcplServerGoneText(serverId: string, toolName: string): string {
+  return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
+    "so the call didn't run. If you need it, ask whoever runs this host.";
+}
+
+/** An MCPL tool call refused while this host connects to its server, in a
+ *  runtime connect or a restart's: the server's prefix routes calls to it
+ *  before the registry holds it, which it does once the handshake is done. */
+function mcplServerConnectingText(serverId: string, toolName: string): string {
+  return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
+    'Try again in a moment.';
+}
+
+/** An MCPL tool call its server's tool policy denies. The policy hides the
+ *  tool from the list it's offered in, so this is a call to a tool the agent
+ *  wasn't offered. */
+function mcplToolDeniedText(serverId: string, toolName: string): string {
+  return `${toolName} isn't allowed by this host's policy for the "${serverId}" server, so the call didn't run, ` +
+    "and calling it again won't change that. If you need it, ask whoever runs this host.";
+}
+
+/** A runtime connect, restart or disconnect refused because a connect of the
+ *  server is in flight (mcplConnecting). The registry takes a server only once
+ *  its handshake is done, and nothing can stop that connect meanwhile, so it
+ *  would register the server after whatever ran beside it. Whoever asked reads
+ *  it: an operator, or an agent through a host's tool that passes it on. */
+function mcplConnectInFlightError(serverId: string): Error {
+  return new Error(`MCPL server "${serverId}" has a connect in flight; try again once it settles`);
+}
+
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
  *  Returns undefined for non-image content. */
@@ -340,13 +377,23 @@ function mcplResultText(content: McpToolResultContent[] | undefined): string {
 
 /**
  * An MCPL tools/call result the server marked `isError`, as a failure: its
- * text is the error, or `Tool call failed` when it has none, and its other
- * blocks aren't kept. The model's dispatch and an in-process caller
- * (`executeToolCall`, `ModuleContext.callTool`) both take a server's error
- * from here, so it reads the same on each path.
+ * text is the error, and with none, or only whitespace, as a server's error
+ * answer reads it, the error says the server gave no words and that whether
+ * the call did anything is unknown. Its other blocks aren't kept. The model's
+ * dispatch and an in-process caller (`executeToolCall`,
+ * `ModuleContext.callTool`) both take a server's error from here, so it reads
+ * the same on each path. `callName` is the tool's name as it was called.
  */
-function mcplToolFailure(content: McpToolResultContent[] | undefined): ToolResult {
-  return { success: false, error: mcplResultText(content) || 'Tool call failed', isError: true };
+function mcplToolFailure(content: McpToolResultContent[] | undefined, serverId: string, callName: string): ToolResult {
+  const said = mcplResultText(content);
+  return {
+    success: false,
+    error: said.trim()
+      ? said
+      : `The "${serverId}" server reported an error for ${callName} without saying what went wrong. ` +
+        'Whether it did anything is unknown: check before calling it again.',
+    isError: true,
+  };
 }
 
 /**
@@ -2375,6 +2422,13 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
+  /** Servers whose connect is in flight (connectMcplServerInternal), from the
+   *  registry's handshake until it settles: a call their prefix routes then
+   *  finds no server registered, and is told this host is connecting to it.
+   *  One mark per id: the registry holds one connection per id, and a
+   *  second connect, a restart or a disconnect of an id whose connect is in
+   *  flight is refused (refuseMcplConnect, runDisconnectMcplServer). */
+  private mcplConnecting: Set<string> = new Set();
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -17769,22 +17823,18 @@ export class AgentFramework {
     }
     const server = this.mcplServerRegistry.getServer(serverId);
     if (!server) {
-      return { success: false, error: `MCPL server ${serverId} not found`, isError: true };
+      return { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true };
     }
     const toolName = call.name.slice(prefix.length + 2); // Strip prefix + '--'
     if (!isToolAllowed(toolName, this.mcplServerConfigs.get(serverId))) {
-      return {
-        success: false,
-        error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
-        isError: true,
-      };
+      return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
     try {
       const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
       // A server's error is a failure here too, as the model's dispatch
       // reads it. A success is the server's own blocks, for the caller to
       // use in process.
-      if (result.isError) return mcplToolFailure(result.content);
+      if (result.isError) return mcplToolFailure(result.content, serverId, call.name);
       // RFC-005 §6.2: register the result's references with this server, so
       // a stub later made of them is bound and fetch_reference can fetch
       // them through this server's address, where it has one. Nothing is
@@ -21404,7 +21454,18 @@ export class AgentFramework {
         }),
       });
     }
-    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    // The prefix above routes this server's tool calls already, and addServer
+    // registers the server only once its handshake is done, so until it
+    // settles a call is told this host is connecting to it. A connect that
+    // fails without reconnect leaves it unregistered, and a call is told it's
+    // gone; with reconnect, the stub it leaves is registered and answers.
+    this.mcplConnecting.add(config.id);
+    let connection: McplServerConnection;
+    try {
+      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    } finally {
+      this.mcplConnecting.delete(config.id);
+    }
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -21948,16 +22009,22 @@ export class AgentFramework {
 
   /**
    * Refuse a runtime connect, or a restart, before it writes anything: an id
-   * already registered, or a tool prefix that equals a module name or another
-   * server's prefix, or meets another server's (prefixesMeet, #265). create()
-   * applies the same prefix rules at startup. The connecting id's own entries
-   * don't count, nor, for a restart, those of the server it replaces
-   * (`replacing`), which it disconnects first.
+   * whose connect is in flight or that's already registered, or a tool prefix
+   * that equals a module name or another server's prefix, or meets another
+   * server's (prefixesMeet, #265). create() applies the same prefix rules at
+   * startup. The connecting id's own entries don't count, nor, for a restart,
+   * those of the server it replaces (`replacing`), which it disconnects first.
    */
   private refuseMcplConnect(
     config: import('./mcpl/types.js').McplServerConfig,
     replacing?: string,
   ): void {
+    // A connect in flight isn't registered until its handshake is done, so
+    // the registry's check below misses it. Its id is taken whether this
+    // connects it or a restart replaces it: the restart's disconnect can't
+    // stop a connect in flight, which would register the server after it.
+    const inFlight = [config.id, replacing].find((id) => id !== undefined && this.mcplConnecting.has(id));
+    if (inFlight !== undefined) throw mcplConnectInFlightError(inFlight);
     // The registry refuses a second server under one id too, but only once
     // the connect has written its config and prefix over the live server's.
     if (config.id !== replacing && this.mcplServerRegistry?.getServer(config.id)) {
@@ -21997,6 +22064,10 @@ export class AgentFramework {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
+    // A connect in flight would register the server after this disconnect,
+    // with its config and prefix gone, where only another disconnect reaches
+    // it; refused as a second connect of it is (refuseMcplConnect).
+    if (this.mcplConnecting.has(id)) throw mcplConnectInFlightError(id);
     const config = this.mcplServerConfigs.get(id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
@@ -22963,6 +23034,14 @@ export class AgentFramework {
     }
   }
 
+  /** The refusal of an MCPL tool call whose server isn't in the registry, for
+   *  the model's call and a script's alike. */
+  private mcplServerAbsentText(serverId: string, toolName: string): string {
+    return this.mcplConnecting.has(serverId)
+      ? mcplServerConnectingText(serverId, toolName)
+      : mcplServerGoneText(serverId, toolName);
+  }
+
   /**
    * Dispatch a tool call to an MCPL server.
    * Strips the configured toolPrefix and routes to the server.
@@ -22980,7 +23059,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
+        result: { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true },
       });
       return;
     }
@@ -22995,11 +23074,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: {
-          success: false,
-          error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
-          isError: true,
-        },
+        result: { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true },
       });
       return;
     }
@@ -23077,7 +23152,7 @@ export class AgentFramework {
         // string for backward compatibility with callers that expect data to
         // be string-ish.
         const converted: ToolResult = result.isError
-          ? mcplToolFailure(result.content)
+          ? mcplToolFailure(result.content, serverId, call.name)
           : {
               success: true,
               data: result.content?.some((c) => c.type !== 'text')
@@ -23210,7 +23285,7 @@ export class AgentFramework {
       };
 
       if (call.name === 'channel_open') {
-        reject(`This conversation is bound to channel ${home}; conversation agents cannot open channels.`);
+        reject(`This conversation is bound to channel "${home}", so it can't open other channels, and nothing was opened. Reply in "${home}".`);
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {

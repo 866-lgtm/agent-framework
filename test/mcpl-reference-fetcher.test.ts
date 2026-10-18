@@ -149,7 +149,7 @@ test('third-party origin refused (v1 policy: dialed origin only)', async () => {
 test('vector 16: expired (and unparseable-expiry) references refuse locally, and take no eager slot', async () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: ORIGIN } });
-  for (const [expiresAt, why] of [['2001-01-01T00:00:00Z', /has passed/], ['not-a-date', /does not parse/]] as const) {
+  for (const [expiresAt, why] of [['2001-01-01T00:00:00Z', /^reference expired$/], ['not-a-date', /^reference treated as expired, since its expiry time can't be read$/]] as const) {
     // Small, sized and from the dialed origin: only its expiry keeps it from the eager default.
     const rec = makeRecord(reg, `${ORIGIN}/ok?e=${expiresAt}`, { expiresAt, sizeBytes: PAYLOAD.length });
     assert.equal(f.isEagerEligible(rec), false, `${expiresAt}: the eager default would only be refused`);
@@ -171,7 +171,7 @@ test('vector 16: an expiry rejected as a field refuses locally, with nothing dia
     assert.equal(f.isEagerEligible(rec), false, `${label}: the eager default would only be refused`);
     const out = await f.fetch(rec);
     assert.equal(out.ok, false, label);
-    assert.match(out.error!, /rejected as a field/, label);
+    assert.equal(out.error, "reference treated as expired, since its expiry time isn't in a form this host accepts", label);
   }
   assert.equal(saved.length, before, 'nothing saved');
   assert.equal(lastAuth, 'untouched', 'the origin was never dialed');
