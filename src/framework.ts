@@ -329,18 +329,21 @@ function mcplResultText(content: McpToolResultContent[] | undefined): string {
 
 /**
  * An MCPL tools/call result the server marked `isError`, as a failure: its
- * text is the error, and with none, the error says the server gave no words
- * and that whether the call did anything is unknown. Its other blocks aren't
- * kept. The model's dispatch and an in-process caller (`executeToolCall`,
+ * text is the error, and with none, or only whitespace, as a server's error
+ * answer reads it, the error says the server gave no words and that whether
+ * the call did anything is unknown. Its other blocks aren't kept. The model's
+ * dispatch and an in-process caller (`executeToolCall`,
  * `ModuleContext.callTool`) both take a server's error from here, so it reads
  * the same on each path. `callName` is the tool's name as it was called.
  */
 function mcplToolFailure(content: McpToolResultContent[] | undefined, serverId: string, callName: string): ToolResult {
+  const said = mcplResultText(content);
   return {
     success: false,
-    error: mcplResultText(content) ||
-      `The "${serverId}" server reported an error for ${callName} without saying what went wrong. ` +
-      'Whether it did anything is unknown: check before calling it again.',
+    error: said.trim()
+      ? said
+      : `The "${serverId}" server reported an error for ${callName} without saying what went wrong. ` +
+        'Whether it did anything is unknown: check before calling it again.',
     isError: true,
   };
 }

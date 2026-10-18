@@ -17,6 +17,8 @@ const ANSWERS: Record<string, unknown> = {
   two: { isError: true, content: [{ type: 'text', text: 'first' }, { type: 'text', text: 'second' }] },
   notString: { isError: true, content: [{ type: 'text', text: { a: 1 } }] },
   noText: { isError: true, content: [] },
+  // Whitespace alone is no words, as a server's error answer reads it.
+  blankText: { isError: true, content: [{ type: 'text', text: '  ' }, { type: 'text', text: '\n' }] },
   // A nonconformant server's: no content, or content that isn't a list.
   noContent: { isError: true },
   notList: { isError: true, content: 'not a list' },
@@ -38,6 +40,7 @@ const ERRORS: Record<string, string> = {
   two: 'first\nsecond',
   notString: NON_STRING_TEXT_PLACEHOLDER,
   noText: NO_WORDS,
+  blankText: NO_WORDS,
   noContent: NO_WORDS,
   notList: NO_WORDS,
   blank: 'after a blank',
@@ -122,6 +125,15 @@ test('the admin puppet stores a server\'s error as an error result, and traces i
   assert.equal(stored.isError, true);
   assert.equal(stored.content, 'no such row');
   assert.deepEqual(traces.slice(before).filter((e) => e.type === 'puppet:tool-call').map((e) => e.isError), [true]);
+  // With no words, the puppet returns and stores the text the other paths read.
+  const silent = await f.framework.puppetToolCall('agent', 'mcpl--editor--lookup', { case: 'noText' });
+  assert.deepEqual(fields(silent.result), { success: false, data: undefined, error: NO_WORDS, isError: true });
+  const storedSilent = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+    .flatMap((m) => m.content as unknown as Array<Record<string, unknown>>)
+    .find((b) => b.type === 'tool_result' && b.toolUseId === silent.toolUseId);
+  assert.ok(storedSilent, 'the no-words pair is stored');
+  assert.equal(storedSilent.isError, true);
+  assert.equal(storedSilent.content, NO_WORDS);
 });
 
 test('a server\'s error through the model\'s call is traced as tool:failed with its error, and a success as tool:completed', { timeout: 20_000 }, async (t) => {

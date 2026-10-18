@@ -73,7 +73,7 @@ test("a reference block that can't be read says which part is missing, and what 
 // ---------------------------------------------------------------------------
 
 // Stdio server: answers initialize and tools/list; tools/call "refuse" gets a
-// JSON-RPC error, "mute" one with an empty message, "odd" one whose message
+// JSON-RPC error, "mute" one with a blank message, "odd" one whose message
 // isn't a string, "exit" ends the process with the call pending,
 // "answer-then-exit" answers and then ends it, and "hang" is never answered.
 const SERVER = `
