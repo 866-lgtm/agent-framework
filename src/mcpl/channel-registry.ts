@@ -252,6 +252,20 @@ interface McplChannelIncomingEvent {
 // Channel Tool Definitions
 // ============================================================================
 
+/**
+ * `journal`'s description. It tells the model to call `skip_reply` to end the
+ * turn only where the agent may call it: the framework builds each agent's
+ * surface with that agent's permission, and a refused `skip_reply` leaves the
+ * turn going on.
+ */
+export function journalToolDescription(canSkipReply: boolean): string {
+  return 'Write an entry in your private journal. The entry stays in your own context and ' +
+    'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
+    'than a line that you want to keep for yourself — reflections, what you decided and ' +
+    'why, notes for later. It does not end your turn and does not affect where ordinary ' +
+    'text is routed' + (canSkipReply ? '; to end the turn without replying, call skip_reply afterwards.' : '.');
+}
+
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
@@ -329,6 +343,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'think',
+    // No agent's surface shows this description: getToolsForAgent gives every
+    // agent its own think (buildThinkTool), which names skip_reply only where
+    // that agent may call it.
     description:
       'Reason privately. The content stays in your own context and is NOT sent to any ' +
       'channel or surface. Same-round routing of ordinary text beside think() depends on ' +
@@ -348,12 +365,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'journal',
-    description:
-      'Write an entry in your private journal. The entry stays in your own context and ' +
-      'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
-      'than a line that you want to keep for yourself — reflections, what you decided and ' +
-      'why, notes for later. It does not end your turn and does not affect where ordinary ' +
-      'text is routed; to end the turn without replying, call skip_reply afterwards.',
+    description: journalToolDescription(true),
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2993,7 +3005,8 @@ export class ChannelRegistry {
    * Handle the synthesized `think` tool — a private reasoning scratchpad. It
    * sends nothing, and (unlike before) does NOT silence the turn: trailing
    * plain text is still routed as the reply. The thought stays in the agent's
-   * own context/chronicle. To deliberately not reply, the agent uses skip_reply.
+   * own context/chronicle. To deliberately not reply, an agent that may call
+   * skip_reply uses it.
    */
   private handleToolThink(input: { content?: string }): ToolResult {
     return {
@@ -3002,10 +3015,12 @@ export class ChannelRegistry {
       // tool_use block; don't duplicate it in the result.
       data: {
         noted: true,
+        // No tool to end the turn with: this handler can't see whether the
+        // caller may call skip_reply, and think's own description says so
+        // where it may.
         note:
           'Thought recorded (private — not sent anywhere). Same-round text routing depends on ' +
-          'your current same_round_think_text_policy; use agent_settings get to inspect it, or ' +
-          'call skip_reply to end the turn without replying.',
+          'your current same_round_think_text_policy; use agent_settings get to inspect it.',
       },
     };
   }

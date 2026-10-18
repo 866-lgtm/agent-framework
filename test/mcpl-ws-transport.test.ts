@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { McplServerConnection, type McplConnectionCloseInfo } from '../src/mcpl/server-connection.js';
 import { buildWebSocketUrl, isWebSocketTransport } from '../src/mcpl/transport.js';
@@ -82,6 +82,13 @@ test('buildWebSocketUrl validates protocol and appends the token as a query para
   );
   assert.throws(() => buildWebSocketUrl({ id: 's', url: 'http://example.com' }), /ws:\/\/ or wss:\/\//);
   assert.throws(() => buildWebSocketUrl({ id: 's', command: 'x' }), /requires "url"/);
+});
+
+test('buildWebSocketUrl refuses a url with a fragment, which the ws library refuses to dial', () => {
+  assert.throws(() => buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl#x' }), /must not have a fragment, got "#x"/);
+  assert.throws(() => new WebSocket('wss://example.com/mcpl#x'), /fragment identifier/);
+  // An empty fragment is no fragment to either.
+  assert.equal(buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl#' }), 'wss://example.com/mcpl#');
 });
 
 test('isWebSocketTransport selects the transport from config shape', () => {
