@@ -7395,17 +7395,12 @@ export class AgentFramework {
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
-        // turn's end, goes to its store now, past its deferral: once the run
-        // is deregistered, a flush finds no agent to take it and drops it.
-        // The run's namespace stays in the store for investigation, so the
-        // messages stay with it. A quiesced host defers them again instead,
-        // as stop() does, and the run's window release at resume lands them
-        // (releaseWindowNowOrAfterResume).
-        const queued = this.drainDeferredFor(agent.name);
-        if (queued.length > 0) {
-          this.readdDrained(queued, `end of ephemeral run ${agent.name}`, { bypassDeferral: !this.quiesced });
-          this.ackDeferredWrites();
-        }
+        // turn's end, is left to its window's release below
+        // (releaseWindowNowOrAfterResume), as for a disposed fork: it lands
+        // there in the run's store, which keeps the run's namespace for
+        // investigation, now or, while quiesced, at resume. A failed reply
+        // among it goes on to the primary as the same queue entry, so no ack
+        // comes between the entry and the primary's notice.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched.

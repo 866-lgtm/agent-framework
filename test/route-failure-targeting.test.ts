@@ -977,6 +977,47 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(messages, 'A reply by worker'), 1, 'and, unread, it is passed on by name');
     });
 
+    it('passes a failed reply still queued when a run ends unquiesced on to the primary as the same queue entry', async () => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      runMembrane.streamYielding = (request) => {
+        runMembrane.calls.push(request);
+        return new HeldStream(released, []);
+      };
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const state = internals(runFramework);
+      runFramework.start();
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
+      // A failed reply queued for the run's turn end, which the run's stall
+      // then ends first.
+      (state.deferredMessages as unknown as Array<Record<string, unknown>>).push({
+        id: 'w-late', seq: 1_000_000, participant: 'user', forAgent: 'worker',
+        content: [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
+        metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 },
+      });
+      await assert.rejects(done, /stalled/);
+      release();
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(state.deferredMessages.length, 0);
+      const idOf = (m: { metadata?: unknown } | undefined) => (m?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
+      const archive = await ContextManager.open({
+        store: runFramework.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),
+      });
+      const record = archive.getAllMessages().filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
+      assert.equal(record.length, 1, 'it landed in the run\'s window');
+      assert.equal(idOf(record[0]), 'w-late');
+      const told = runFramework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('A reply by worker'));
+      assert.equal(told.length, 1, 'the primary is told once');
+      assert.equal(idOf(told[0]), 'w-late', 'as the same entry, under its id');
+    });
+
     it('resumes past a run that ended while the host was quiesced: resume doesn\'t weigh its context', async (t) => {
       sender.quiesceOnCall = true;
       await run([
