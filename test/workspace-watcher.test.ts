@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
+import fs, { existsSync, mkdtempSync, mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, statSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -179,8 +180,50 @@ async function changesFlow(root: string, batches: FsChange[][], dirs: readonly s
  * system timing in it.
  */
 function emitChokidar(watcher: MountWatcher, events: Array<['add' | 'change' | 'unlink', string]>): void {
-  const chokidar = (watcher as unknown as { watcher: { emit(event: string, path: string): boolean } }).watcher;
+  const chokidar = chokidarOf(watcher);
   for (const [event, path] of events) chokidar.emit(event, join(tmp, path));
+}
+
+/** The watcher's chokidar instance, an EventEmitter, so a test can hand it an event as chokidar emits one. */
+function chokidarOf(watcher: MountWatcher): { emit(event: string, ...args: unknown[]): boolean } {
+  return (watcher as unknown as { watcher: { emit(event: string, ...args: unknown[]): boolean } }).watcher;
+}
+
+/**
+ * The process's open descriptors of `path`, a real path, as Linux's /proc names
+ * them: the path, or the path and " (deleted)" once it has been removed.
+ */
+function descriptorsOf(path: string): string[] {
+  return readdirSync('/proc/self/fd').flatMap((fd) => {
+    let target: string;
+    try {
+      target = readlinkSync(`/proc/self/fd/${fd}`);
+    } catch {
+      return []; // closed since the listing, as the listing's own is
+    }
+    return target === path || target === `${path} (deleted)` ? [target] : [];
+  });
+}
+
+/**
+ * Runs `fn` with node:fs's `openSync` refusing `path` as at the process's file
+ * limit. The watcher imports it by name, so the binding is synced both ways.
+ */
+async function withOpenRefused<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const original = fs.openSync;
+  fs.openSync = ((file: fs.PathLike, ...rest: unknown[]) => {
+    if (String(file) === path) {
+      throw Object.assign(new Error(`EMFILE: too many open files, open '${path}'`), { code: 'EMFILE', syscall: 'open', path });
+    }
+    return (original as (...args: unknown[]) => number)(file, ...rest);
+  }) as typeof fs.openSync;
+  syncBuiltinESMExports();
+  try {
+    return await fn();
+  } finally {
+    fs.openSync = original;
+    syncBuiltinESMExports();
+  }
 }
 
 describe('MountWatcher mergeOp', () => {
@@ -334,19 +377,16 @@ describe('MountWatcher lifecycle', () => {
   }, async () => {
     let readyCount = 0;
     let reattachCount = 0;
-    const { watcher, batches } = collectWithNative(
-      {
-        onReady: () => { readyCount++; },
-        onReattach: () => { reattachCount++; },
-      },
-      // The root poll is past the test's deadline, so within it only the raw
-      // rename event can re-attach.
-      { ...makeConfig(), watchRootPollMs: EVENT_MS * 6 },
-    );
+    const { watcher, batches } = collectWithNative({
+      onReady: () => { readyCount++; },
+      onReattach: () => { reattachCount++; },
+    });
 
     try {
       await waitFor(() => readyCount > 0, 'expected initial watcher ready');
 
+      // The watcher holds its root open, so the root's removal sends no rename
+      // until the hold ends, and the root poll finds the root made again.
       rmSync(tmp, { recursive: true, force: true });
       mkdirSync(tmp, { recursive: true });
 
@@ -443,6 +483,190 @@ describe('MountWatcher lifecycle', () => {
       assert.ok(!existsSync(tmp), 'read-only mount must not recreate its deleted root');
       assert.strictEqual(readyCount, 1, 'a read-only mount must not watch its missing root again');
       assert.strictEqual(reattachCount, 0);
+    } finally {
+      await watcher.stop();
+    }
+  });
+
+  // libuv reports a rename of an entry named like the root under that name,
+  // as it reports the root's own removal or move. On Linux the watcher holds
+  // its root, whose identity tells them apart.
+  it("doesn't re-attach for an entry named like its held root, made, saved over or removed anywhere beneath it", {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const root = join(tmp, 'work');
+    mkdirSync(join(root, 'sub'), { recursive: true });
+    let ready = false;
+    let reattachCount = 0;
+    const { watcher, batches } = collectWithNative(
+      { onReady: () => { ready = true; }, onReattach: () => { reattachCount++; } },
+      // The root poll is past the test's deadline, so within it only a rename
+      // could re-attach.
+      { ...makeConfig(), path: root, watchRootPollMs: EVENT_MS * 6 },
+    );
+    // Each step waits for the batch its change comes in, which comes after
+    // the change's rename and the check that rename runs, or for a re-attach,
+    // which loses the change's events.
+    const step = async (what: string, change: () => void, path: string, op?: FsChange['op']) => {
+      batches.length = 0;
+      change();
+      const reported = () => batches.flat().some((c) => c.path === path && (op === undefined || c.op === op));
+      await waitFor(() => reported() || reattachCount > 0, `expected ${op ? `a ${op} entry` : 'a change'} for ${path}`);
+      assert.strictEqual(reattachCount, 0, `${what} re-attached the watcher`);
+    };
+
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+      await step('a file named like the root, made', () => writeFileSync(join(root, 'work'), 'v1'), 'work', 'created');
+      await step('a file named like the root, made in a subdirectory', () => writeFileSync(join(root, 'sub', 'work'), 'v1'), 'sub/work', 'created');
+      await step('a file named like the root, saved over by a rename', () => {
+        writeFileSync(join(root, '.work.tmp'), 'v2');
+        renameSync(join(root, '.work.tmp'), join(root, 'work'));
+      }, 'work');
+      await step('a file named like the root, removed', () => unlinkSync(join(root, 'work')), 'work', 'deleted');
+      await step('a file named like the root, removed from a subdirectory', () => unlinkSync(join(root, 'sub', 'work')), 'sub/work', 'deleted');
+      // A directory's own making isn't reported, so this step waits for a
+      // file made in it after it.
+      await step('a directory named like the root, made', () => {
+        mkdirSync(join(root, 'work'));
+        writeFileSync(join(root, 'work', 'x.md'), 'x');
+      }, 'work/x.md', 'created');
+    } finally {
+      await watcher.stop();
+    }
+  });
+
+  // On Linux a removed directory's inode number can go to the next directory
+  // made, as ext4 gives it, so a root made again could look unchanged. The
+  // watcher holds its root open, and a number held isn't given out.
+  it('holds its root open while it watches, so a root made again takes another inode number', {
+    skip: process.platform !== 'linux',
+  }, async (t) => {
+    // Whether this disk gives a removed directory's number to the next one
+    // made. tmpfs doesn't, and there the test has nothing to show.
+    const scratch = join(tmp, 'scratch');
+    mkdirSync(scratch);
+    const scratchIno = statSync(scratch).ino;
+    rmdirSync(scratch);
+    mkdirSync(scratch);
+    if (statSync(scratch).ino !== scratchIno) {
+      t.skip("this disk didn't give the removed directory's inode number to the next one made");
+      return;
+    }
+    const root = join(realpathSync(tmp), 'work');
+    mkdirSync(root);
+    let readyCount = 0;
+    let reattachCount = 0;
+    const { watcher } = collectWithNative(
+      { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
+      { ...makeConfig(), path: root },
+    );
+
+    try {
+      await waitFor(() => readyCount > 0, 'expected initial watcher ready');
+      assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds its root');
+      const held = statSync(root).ino;
+      rmdirSync(root);
+      mkdirSync(root);
+      assert.notStrictEqual(statSync(root).ino, held, "the root made again took the held root's inode number");
+      await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected the watcher to re-attach to the root made again');
+      assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds the root made again, having let the removed one go');
+    } finally {
+      await watcher.stop();
+    }
+    assert.deepStrictEqual(descriptorsOf(root), [], 'a stopped watcher holds nothing of its root');
+  });
+
+  it('lets go of its root at a stop whose close of chokidar fails', {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const root = join(realpathSync(tmp), 'work');
+    mkdirSync(root);
+    let ready = false;
+    const { watcher } = collectWithNative({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root });
+    await waitFor(() => ready, 'expected initial watcher ready');
+    const chokidar = chokidarOf(watcher) as unknown as { close(): Promise<void> };
+    const close = chokidar.close.bind(chokidar);
+    chokidar.close = async () => {
+      await close();
+      throw new Error('close failed');
+    };
+    await assert.rejects(watcher.stop(), /close failed/);
+    assert.deepStrictEqual(descriptorsOf(root), [], 'the stopped watcher still holds its root');
+  });
+
+  // A root the watcher doesn't hold has its identity read from its path,
+  // which a root made again can share with the removed one, so a rename named
+  // like it forces a re-attach, as it always did. On Linux that's a root it
+  // can't open, as without read permission or at the process's file limit;
+  // elsewhere it holds no root.
+  it("reads a root it doesn't hold from its path, and re-attaches at a rename named like it", async () => {
+    const root = join(tmp, 'work');
+    mkdirSync(root);
+    const unheld = <T>(fn: () => Promise<T>): Promise<T> => (process.platform === 'linux' ? withOpenRefused(root, fn) : fn());
+    await unheld(async () => {
+      let readyCount = 0;
+      let reattachCount = 0;
+      const { watcher } = withPollingBackend(() => collect(
+        { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
+        { ...makeConfig(), path: root },
+      ));
+      try {
+        await waitFor(() => readyCount > 0, 'expected initial watcher ready');
+        // Root polls run through this wait, and none finds the root changed.
+        // A rename named otherwise comes meanwhile, and leaves it be.
+        chokidarOf(watcher).emit('raw', 'rename', 'other.md', { watchedPath: root });
+        await wait(WATCH_ROOT_POLL_MS * 4);
+        assert.strictEqual(readyCount, 1, 'the watcher attached to its unchanged root again');
+        // The rename libuv reports for the root's own removal, as chokidar emits it.
+        chokidarOf(watcher).emit('raw', 'rename', 'work', { watchedPath: root });
+        await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected the rename to re-attach the watcher');
+      } finally {
+        await watcher.stop();
+      }
+    });
+  });
+
+  // libuv gives a rename without a name for a file whose path it can't read
+  // (its kqueue backend, macOS's for files).
+  it('passes over a rename that comes without a name', async () => {
+    let ready = false;
+    let reattachCount = 0;
+    const { watcher } = withPollingBackend(() => collect({ onReady: () => { ready = true; }, onReattach: () => { reattachCount++; } }));
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+      chokidarOf(watcher).emit('raw', 'rename', null, { watchedPath: join(tmp, 'a.md') });
+      await wait(WATCH_ROOT_POLL_MS * 2);
+      assert.strictEqual(reattachCount, 0);
+    } finally {
+      await watcher.stop();
+    }
+  });
+
+  // A root moved away is found at its rename, which comes for a move even
+  // while the root is held: the check finds nothing at the root's path.
+  it('re-attaches at the rename when its root is moved away', {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const root = join(tmp, 'work');
+    mkdirSync(root);
+    let readyCount = 0;
+    let reattachCount = 0;
+    const { watcher, batches } = collectWithNative(
+      { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
+      // The root poll is past the test's deadline, so within it only the
+      // rename re-attaches.
+      { ...makeConfig(), path: root, watchRootPollMs: EVENT_MS * 6 },
+    );
+
+    try {
+      await waitFor(() => readyCount > 0, 'expected initial watcher ready');
+      renameSync(root, `${root}.away`);
+      await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected the watcher to re-attach at the rename');
+      // A read-write mount makes its root again, and the watcher reports what's
+      // written there.
+      writeFileSync(join(root, 'after.md'), 'x');
+      await changeFor(batches, 'after.md', 'created');
     } finally {
       await watcher.stop();
     }

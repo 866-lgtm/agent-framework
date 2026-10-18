@@ -6,7 +6,7 @@
  */
 
 import { watch, type FSWatcher } from 'chokidar';
-import { mkdirSync, statSync } from 'node:fs';
+import { closeSync, fstatSync, mkdirSync, openSync, statSync, type Stats } from 'node:fs';
 import { basename, sep } from 'node:path';
 import { passedOverAt } from './observe.js';
 import { type MountConfig } from './types.js';
@@ -43,6 +43,8 @@ interface RootIdentity {
   birthtimeMs: number;
 }
 
+const identityOf = (stat: Stats): RootIdentity => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs });
+
 /**
  * Manages filesystem watching for a single mount.
  * Handles debouncing, ignore patterns, and write suppression.
@@ -58,6 +60,8 @@ export class MountWatcher {
   private suppressedPaths = new Set<string>();
   private suppressionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private rootIdentity: RootIdentity | null = null;
+  // The root as last attached, held open on Linux (see holdRoot).
+  private rootFd: number | null = null;
   private detached = false;
   private attaching = false;
   private stopped = true;
@@ -165,13 +169,19 @@ export class MountWatcher {
     this.watcher.on('error', (err) => {
       this.reportError(err);
     });
-    this.watcher.on('raw', (event: string, rawPath: string, _details: unknown) => {
-      if (event !== 'rename') return;
-      // A rename on the watched root's path/basename is the one signal that
-      // survives inode reuse on Linux, where unlinkDir/error never fire.
-      if (this.isRootPath(rawPath) || basename(rawPath) === basename(this.config.path)) {
-        void this.checkRootLiveness({ force: true });
-      }
+    this.watcher.on('raw', (event: string, rawPath: string | null) => {
+      // libuv reports the root's own removal or move as a rename under the
+      // root's name, and the same for an entry beneath it with that name and,
+      // on macOS, for an FSEvents event on the root that carries no
+      // modification flags, such as its making just before the watch. A held
+      // root's identity tells these apart, so the rename runs the poll's
+      // check at once. A root that isn't held can be made again with the old
+      // one's identity, so there the rename forces a re-attach. A rename
+      // without a name, as libuv gives for a file whose path it can't read,
+      // is passed over.
+      if (event !== 'rename' || typeof rawPath !== 'string') return;
+      if (basename(rawPath) !== basename(this.config.path)) return;
+      void this.checkRootLiveness({ force: this.rootFd === null });
     });
 
     this.captureRootIdentity();
@@ -196,6 +206,8 @@ export class MountWatcher {
     this.suppressionTimers.clear();
     this.suppressedPaths.clear();
     this.pendingChanges.clear();
+    // Before the close, so a close that fails still lets go of the root.
+    this.releaseRoot();
 
     if (this.watcher) {
       await this.watcher.close();
@@ -291,6 +303,12 @@ export class MountWatcher {
     this.rootPollTimer.unref();
   }
 
+  /**
+   * Whether the root is still the directory the watcher attached to. One
+   * that's gone, or replaced by another directory at its path, is attached
+   * to again, and with `force` so is one that looks unchanged. It runs every
+   * `watchRootPollMs`, and at a rename under the root's name.
+   */
   private async checkRootLiveness(opts: { force?: boolean } = {}): Promise<void> {
     if (this.stopped || this.attaching) return;
 
@@ -350,8 +368,9 @@ export class MountWatcher {
   }
 
   private captureRootIdentity(): void {
+    this.releaseRoot();
     try {
-      this.rootIdentity = this.readRootIdentity();
+      this.rootIdentity = this.holdRoot();
       this.detached = false;
     } catch (err) {
       if (this.isErrno(err, 'ENOENT')) {
@@ -365,14 +384,40 @@ export class MountWatcher {
     }
   }
 
+  /**
+   * The root's identity, with the root held open on Linux until the next
+   * attach or the stop. There a removed directory's inode number can go to
+   * the next directory made, as ext4 gives it, so a root made again could
+   * look unchanged, and a number held open isn't given out. Elsewhere, or
+   * where the root can't be opened, as without read permission or at the
+   * process's file limit, it isn't held, and its identity is read from its
+   * path.
+   */
+  private holdRoot(): RootIdentity {
+    if (process.platform !== 'linux') return this.readRootIdentity();
+    let fd: number;
+    try {
+      fd = openSync(this.config.path, 'r');
+    } catch {
+      return this.readRootIdentity();
+    }
+    this.rootFd = fd;
+    return identityOf(fstatSync(fd));
+  }
+
+  private releaseRoot(): void {
+    if (this.rootFd === null) return;
+    const fd = this.rootFd;
+    this.rootFd = null;
+    closeSync(fd);
+  }
+
   private readRootIdentity(): RootIdentity {
-    const stat = statSync(this.config.path);
-    return { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs };
+    return identityOf(statSync(this.config.path));
   }
 
   private sameIdentity(a: RootIdentity, b: RootIdentity): boolean {
-    // birthtimeMs is only a secondary tripwire: sub-millisecond replacements
-    // can reuse both the inode and timestamp, so raw rename remains essential.
+    // Where the root isn't held, birthtimeMs tells most replacements apart.
     return a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
   }
 
